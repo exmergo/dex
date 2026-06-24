@@ -1,0 +1,108 @@
+# ─── Local Claude Code guidance (kept private; see discussion) ───────────────
+# The v7 design lists CLAUDE.md as a committed repo surface (a thin pointer to
+# AGENTS.md + principles). We're keeping the current, opinionated CLAUDE.md
+# local for now. Revisit when splitting baseline-shareable guidance from sauce.
+CLAUDE.md
+CLAUDE.local.md
+
+# ─── Secrets & credentials (NEVER commit — dex connects to prod warehouses) ──
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.p8                      # Snowflake key-pair (RSA) private keys
+*.key
+credentials.json
+service-account*.json
+gcp-*.json
+connections.toml          # Snowflake ~/.snowflake/connections.toml if dropped locally
+.databrickscfg
+pg_service.conf
+# dbt profiles carry warehouse secrets; keep them in ~/.dbt, not the repo.
+# (Test fixtures that intentionally ship a profiles.yml can be force-added.)
+profiles.yml
+
+# ─── dex runtime artifacts ───────────────────────────────────────────────────
+# .dex/ is meant to live in an END-USER's repo. In THIS dev repo a root-level
+# .dex/ is just local-testing residue. Anchored to root so test fixtures that
+# intentionally include a .dex/ deeper in the tree are preserved.
+/.dex/
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+MANIFEST
+# NOTE: uv.lock is committed on purpose (reproducible builds, §15) — do not add it.
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Test / coverage / type-check / lint caches ──────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+.pyre/
+
+# ─── Jupyter / notebooks ─────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── dbt build artifacts (generated; compiled manifest, packages, logs) ──────
+target/
+dbt_packages/
+dbt_modules/
+logs/
+.user.yml
+
+# ─── Benchmark run outputs (Tier-3 results; runners/config stay committed) ───
+# Adjust to match the harnesses' actual output dirs as they land in Phase 5.
+benchmarks/**/results/
+benchmarks/**/runs/
+benchmarks/**/.out/
+
+# ─── Logs & temp ─────────────────────────────────────────────────────────────
+*.log
+tmp/
+*.tmp
+
+# ─── OS cruft ────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ─── Editors / IDEs ──────────────────────────────────────────────────────────
+# NOTE: .cursor/, .windsurf/, and .github/copilot-instructions.md are committed
+# cross-agent surfaces (Phase 0 deliverables) — intentionally NOT ignored.
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
