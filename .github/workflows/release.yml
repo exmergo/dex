@@ -1,0 +1,89 @@
+name: Release
+
+# A semver tag drives the whole chain: gates, build, PyPI publish via Trusted
+# Publishing (OIDC, no stored tokens), the anti-squat dex-core stub, then the
+# engine-to-plugin version coupling. Commit-back of the bumped pins and the
+# catalog update are not yet enabled.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Sync (duckdb + dev extras)
+        run: uv sync --extra duckdb --extra dev
+      - name: Tier-1 + safety-critical gate
+        run: uv run pytest -q
+      # A safety-assertion regression blocks the release regardless of pass-rate;
+      # representative Tier-2 agent evals run here once they are wired into CI.
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # OIDC for PyPI Trusted Publishing; no API tokens stored.
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Publish to PyPI (Trusted Publishing)
+        run: uv publish
+      # Optionally emit PEP 740 / Sigstore attestations for provenance.
+
+  # Anti-squat: claim and hold the short name `dex-core`, which redirects users to
+  # exmergo-dex-core. Idempotent: --check-url skips the upload when the stub
+  # version already exists on PyPI, so this is a no-op on every release after the
+  # first. Needs its own PyPI Trusted Publisher for the `dex-core` project, with a
+  # DISTINCT environment (pypi-stub): PyPI rejects two pending publishers that
+  # share an identical owner/repo/workflow/environment, so the engine job uses
+  # `pypi` and this one uses `pypi-stub`.
+  reserve-dex-core:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: pypi-stub
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/dex-core-stub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build the dex-core stub
+        run: uv build
+      - name: Publish the stub (idempotent; skips if already on PyPI)
+        run: uv publish --check-url https://pypi.org/simple/
+
+  bump-and-couple:
+    needs: publish
+    runs-on: ubuntu-latest
+    # The engine release drives the plugin release: rewrite the DEX_CORE_PIN line
+    # in all three wrappers to the published version, bump plugin.json, then
+    # update the dex entry in the exmergo catalog. Commit-back needs contents:
+    # write and is not yet enabled.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump wrapper pins to the released version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for skill in explore transform model; do
+            sed -i -E \
+              "s/exmergo-dex-core\[duckdb\]==[0-9]+\.[0-9]+\.[0-9]+/exmergo-dex-core[duckdb]==${VERSION}/" \
+              "skills/${skill}/scripts/run.py"
+          done
+          echo "Pinned wrappers to ${VERSION}. plugin.json + catalog update not yet automated."
