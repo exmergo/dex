@@ -1,0 +1,14 @@
+# Ruff runs locally before every commit, mirroring the Lint CI workflow so
+# contributors catch issues before they push. The hooks read ruff.toml at the
+# repo root, so the same rules apply everywhere.
+#
+# Install once with: pre-commit install
+# When bumping Ruff, keep `rev` here, the version in .github/workflows/lint.yml,
+# and the `ruff==` pin in packages/dex-core/pyproject.toml [dev] in lockstep.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.19
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
