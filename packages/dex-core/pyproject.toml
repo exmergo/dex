@@ -43,7 +43,7 @@ snowflake = ["snowflake-connector-python>=3", "sqlglot>=25"]
 bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25"]
 databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=25"]
 postgres = ["psycopg[binary]>=3", "sqlglot>=25"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff==0.15.19"]
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"
