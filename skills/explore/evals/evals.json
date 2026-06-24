@@ -1,0 +1,43 @@
+{
+  "skill_name": "explore",
+  "triggering": {
+    "positive": [
+      "What's in this warehouse?",
+      "Which tables actually matter here?",
+      "What does the customers table contain?",
+      "How do orders and customers join?",
+      "Profile the columns in the events table and flag any PII."
+    ],
+    "negative": [
+      "Build a staging model for the orders table.",
+      "Refactor this dbt model and add tests.",
+      "Define a revenue metric on top of fct_orders.",
+      "Maintain the dbt semantic models for the finance domain."
+    ]
+  },
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "I just connected a DuckDB file with a few dozen tables. Help me understand what's in it and which tables are worth my attention.",
+      "expected_output": "A ranked landscape and a draft .dex/ map produced from inventory and rank, without dumping the full schema into context.",
+      "files": [],
+      "assertions": [
+        "Drives the engine via the wrapper and reads the JSON envelope; does not invent results",
+        "Output is sense-making (ranked, selective), not a full schema dump (Principle 1)",
+        "No raw rows and no credentials appear anywhere in the output (clean envelope)",
+        "Any PII is reported as (column, category, confidence) with no example values"
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "Profile the customers table and tell me about data quality and any sensitive columns.",
+      "expected_output": "Column profiles built from aggregates plus PII flags; no example values surfaced.",
+      "files": [],
+      "assertions": [
+        "Profiles are aggregate-derived, never raw rows (Principle 2)",
+        "PII flagged as (column, category, confidence), never surfaced (Principle 6)",
+        "The connection is read-only and generated SQL is SELECT-only (Principle 3)"
+      ]
+    }
+  ]
+}
