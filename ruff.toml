@@ -1,0 +1,31 @@
+# Ruff lints and formats every Python tree in the monorepo (the engine under
+# packages/, the PEP 723 skill wrappers under skills/, and the helper scripts).
+# It is run from the repo root so a single config governs all of them; Ruff's
+# upward config discovery means editor and pre-commit invocations find it too.
+
+target-version = "py311"
+line-length = 88
+
+[lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # isort
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "C4",   # flake8-comprehensions
+  "SIM",  # flake8-simplify
+  "N",    # pep8-naming
+  "S",    # flake8-bandit (security)
+  "PTH",  # flake8-use-pathlib
+  "PERF", # perflint
+  "RUF",  # Ruff-specific rules
+]
+
+[lint.per-file-ignores]
+# assert is the idiom in pytest, and test fixtures are not a security surface.
+"packages/dex-core/tests/**" = ["S101"]
+
+[lint.isort]
+known-first-party = ["exmergo_dex_core"]
