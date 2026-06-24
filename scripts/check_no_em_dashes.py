@@ -22,9 +22,10 @@ The goal is to catch dashes doing the work of sentence punctuation, not to
 
 import re
 import sys
+from pathlib import Path
 
 EM_DASH = "—"  # — the real thing
-EN_DASH = "–"  # – sometimes used as a stand-in between words
+EN_DASH = "–"  # – sometimes used as a stand-in between words  # noqa: RUF001, RUF003
 HORIZONTAL_BAR = "―"  # ― another look-alike
 
 GENERIC_FIX = (
@@ -67,9 +68,9 @@ def is_markdown_dash_structure(line):
     stripped = line.strip()
     if re.fullmatch(r"-{3,}", stripped):
         return True
-    if "|" in stripped and "-" in stripped and re.fullmatch(r"[\s|:-]+", stripped):
-        return True
-    return False
+    return bool(
+        "|" in stripped and "-" in stripped and re.fullmatch(r"[\s|:-]+", stripped)
+    )
 
 
 def find_hits(line):
@@ -125,7 +126,7 @@ def read_input(argv):
     if argv:
         chunks = []
         for path in argv:
-            with open(path, encoding="utf-8") as fh:
+            with Path(path).open(encoding="utf-8") as fh:
                 chunks.append((path, fh.read()))
         return chunks
     return [("<stdin>", sys.stdin.read())]

@@ -22,10 +22,18 @@ select = [
   "PERF", # perflint
   "RUF",  # Ruff-specific rules
 ]
+# UP042 (replace-str-enum) would rewrite the `(str, Enum)` wire-format enums to
+# StrEnum, which changes their `str()` output and risks the serialized envelope.
+# That is a deliberate engine decision, not a side effect of adopting a linter.
+ignore = ["UP042"]
 
 [lint.per-file-ignores]
-# assert is the idiom in pytest, and test fixtures are not a security surface.
-"packages/dex-core/tests/**" = ["S101"]
+# Tests: assert is the pytest idiom (S101), and the safety-spine tests
+# deliberately assert that *any* exception is raised on a refused write (B017).
+"packages/dex-core/tests/**" = ["S101", "B017"]
+# The skill wrappers shell out to the pinned dex CLI by design; the command is
+# a fixed path plus an argv passthrough, not untrusted input (S603).
+"skills/**/scripts/run.py" = ["S603"]
 
 [lint.isort]
 known-first-party = ["exmergo_dex_core"]
