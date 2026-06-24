@@ -57,7 +57,9 @@ def save_config(config: DexConfig, repo_root: Path | str = ".") -> Path:
     dex_dir.mkdir(parents=True, exist_ok=True)
     path = dex_dir / CONFIG_FILE
     path.write_text(
-        yaml.safe_dump(config.model_dump(mode="json", exclude_none=True), sort_keys=False),
+        yaml.safe_dump(
+            config.model_dump(mode="json", exclude_none=True), sort_keys=False
+        ),
         encoding="utf-8",
     )
     return path

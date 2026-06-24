@@ -23,8 +23,8 @@ The goal is to catch dashes doing the work of sentence punctuation, not to
 import re
 import sys
 
-EM_DASH = "—"        # — the real thing
-EN_DASH = "–"        # – sometimes used as a stand-in between words
+EM_DASH = "—"  # — the real thing
+EN_DASH = "–"  # – sometimes used as a stand-in between words
 HORIZONTAL_BAR = "―"  # ― another look-alike
 
 GENERIC_FIX = (
@@ -45,11 +45,11 @@ def mask_code_and_urls(line):
         for i in range(match.start(), match.end()):
             masked[i] = " "
 
-    for m in re.finditer(r"`[^`]*`", line):       # inline code: `like this`
+    for m in re.finditer(r"`[^`]*`", line):  # inline code: `like this`
         blank(m)
     for m in re.finditer(r"https?://\S+", line):  # bare URLs
         blank(m)
-    for m in re.finditer(r"\S+/\S+", line):        # file paths / slashed tokens
+    for m in re.finditer(r"\S+/\S+", line):  # file paths / slashed tokens
         blank(m)
     return "".join(masked)
 
@@ -89,22 +89,16 @@ def find_hits(line):
     # 2. En dash used between letters or padded with spaces (a stand-in pause).
     #    A digit-to-digit en dash (a real range) is left alone.
     for m in re.finditer(rf"(?<=[^\W\d])\s*{EN_DASH}\s*(?=[^\W\d])", scan):
-        yield m.start(), m.group(), (
-            "En dash used as a pause. " + GENERIC_FIX
-        )
+        yield m.start(), m.group(), ("En dash used as a pause. " + GENERIC_FIX)
 
     # 3. Double hyphen standing in for an em dash: word--word or spaced -- .
     for m in re.finditer(r"(?<=\w)--(?=\w)|(?<=\s)--(?=\s)|(?<=\s)--(?=\S)", scan):
-        yield m.start(), m.group(), (
-            "Double hyphen used as a dash. " + GENERIC_FIX
-        )
+        yield m.start(), m.group(), ("Double hyphen used as a dash. " + GENERIC_FIX)
 
     # 4. Hyphen padded with spaces between two words (letter - letter).
     #    Skips a list marker at line start and digit-to-digit ranges/minus signs.
     for m in re.finditer(r"(?<=[^\W\d])\s-\s(?=[^\W\d])", scan):
-        yield m.start(), m.group(), (
-            "Spaced hyphen used as a pause. " + GENERIC_FIX
-        )
+        yield m.start(), m.group(), ("Spaced hyphen used as a pause. " + GENERIC_FIX)
 
 
 def check(text):
@@ -131,7 +125,7 @@ def read_input(argv):
     if argv:
         chunks = []
         for path in argv:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 chunks.append((path, fh.read()))
         return chunks
     return [("<stdin>", sys.stdin.read())]

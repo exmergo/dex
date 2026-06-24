@@ -44,8 +44,14 @@ def test_valid_document_passes():
     [
         {"semantic_model": []},  # missing version
         {"version": "9.9.9", "semantic_model": []},  # wrong version const
-        {"version": "0.2.0.dev0", "semantic_model": [{"name": "x"}]},  # dataset-less model
-        {"version": "0.2.0.dev0", "semantic_model": [{"name": "x", "datasets": [{"name": "d"}]}]},  # source-less dataset
+        {
+            "version": "0.2.0.dev0",
+            "semantic_model": [{"name": "x"}],
+        },  # dataset-less model
+        {
+            "version": "0.2.0.dev0",
+            "semantic_model": [{"name": "x", "datasets": [{"name": "d"}]}],
+        },  # source-less dataset
     ],
 )
 def test_invalid_documents_are_rejected(doc):

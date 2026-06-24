@@ -20,6 +20,8 @@ def duckdb_file(tmp_path: Path) -> Path:
     path = tmp_path / "warehouse.duckdb"
     conn = duckdb.connect(str(path))
     conn.execute("CREATE TABLE customers (id INTEGER, email VARCHAR)")
-    conn.execute("INSERT INTO customers VALUES (1, 'a@example.com'), (2, 'b@example.com')")
+    conn.execute(
+        "INSERT INTO customers VALUES (1, 'a@example.com'), (2, 'b@example.com')"
+    )
     conn.close()
     return path

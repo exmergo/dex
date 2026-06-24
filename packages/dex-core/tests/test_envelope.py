@@ -61,7 +61,11 @@ def test_sanitize_allows_aggregates_and_flags():
                 "identifier": "main.main.customers",
                 "row_count": 2,
                 "columns": [
-                    {"name": "email", "null_fraction": 0.0, "pii": {"category": "email", "confidence": 0.9}}
+                    {
+                        "name": "email",
+                        "null_fraction": 0.0,
+                        "pii": {"category": "email", "confidence": 0.9},
+                    }
                 ],
             }
         ]

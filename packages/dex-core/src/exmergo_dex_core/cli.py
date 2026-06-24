@@ -39,11 +39,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     # Global, connection-oriented options so every command shares one resolution
     # path. Cost-spending commands additionally require --confirm + --budget.
-    parser.add_argument("--connector", default=None, help="connector name (default: from .dex/config.yml)")
-    parser.add_argument("--path", default=None, help="DuckDB file path (DuckDB connector)")
+    parser.add_argument(
+        "--connector",
+        default=None,
+        help="connector name (default: from .dex/config.yml)",
+    )
+    parser.add_argument(
+        "--path", default=None, help="DuckDB file path (DuckDB connector)"
+    )
     parser.add_argument("--repo-root", default=".", help="repo root holding .dex/")
-    parser.add_argument("--confirm", action="store_true", help="confirm a command that would spend")
-    parser.add_argument("--budget", type=float, default=None, help="per-session cost ceiling")
+    parser.add_argument(
+        "--confirm", action="store_true", help="confirm a command that would spend"
+    )
+    parser.add_argument(
+        "--budget", type=float, default=None, help="per-session cost ceiling"
+    )
 
     groups = parser.add_subparsers(dest="group", required=True)
     for group, subcommands in COMMAND_SURFACE.items():
@@ -71,7 +81,9 @@ def _connect_test(args: argparse.Namespace) -> env.Envelope:
 
 
 def dispatch(args: argparse.Namespace) -> env.Envelope:
-    command = args.group + (f" {args.subcommand}" if getattr(args, "subcommand", None) else "")
+    command = args.group + (
+        f" {args.subcommand}" if getattr(args, "subcommand", None) else ""
+    )
 
     if args.group == "connect" and args.subcommand == "test":
         return _connect_test(args)
@@ -89,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
         # loudly in tests and CI rather than shipping a leak.
         raise
-    except Exception as exc:  # noqa: BLE001 - the boundary turns errors into envelopes
+    except Exception as exc:
         envelope = env.error(env.redact(str(exc)))
 
     env.emit(envelope)

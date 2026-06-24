@@ -105,7 +105,9 @@ def _scan(value: Any, path: str = "data") -> None:
                     f"secret-like key '{key}' at {path}: credentials never cross "
                     "the stdout boundary"
                 )
-            if any(pat in key_l for pat in _RAW_ROW_KEY_PATTERNS) and _looks_like_rows(sub):
+            if any(pat in key_l for pat in _RAW_ROW_KEY_PATTERNS) and _looks_like_rows(
+                sub
+            ):
                 raise SanitizationError(
                     f"raw-row payload at {path}.{key}: profile-don't-exfiltrate; "
                     "emit aggregates and flags, not row values"
