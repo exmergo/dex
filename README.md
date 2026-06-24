@@ -75,6 +75,12 @@ land.
 - References (connectors, the contract, the canonical model, evaluation):
   [`references/`](references/).
 
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, the Ruff lint and
+format workflow, and the pre-commit hook. Every pull request into `main` must
+pass the Lint workflow and CI before it can merge.
+
 ## Maintainers: post-scaffold runbook
 
 A few Phase 0 steps need accounts or network. Run them with the appropriate
