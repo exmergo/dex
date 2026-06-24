@@ -1,0 +1,25 @@
+name: Benchmarks (Tier 3)
+
+# Scheduled, cost-capped external benchmarks (v7 §14.4, §15.3). Wired in Phase 5.
+# Not run per-commit because the cloud tracks cost real warehouse money; the free
+# DuckDB tracks (ADE-bench --db duckdb, Spider2.0-DBT) lead. A pass-rate or
+# cost/turn regression blocks a release.
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Weekly. Pre-release runs are triggered from the release workflow.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tier-3 harness lands in Phase 5
+        run: |
+          echo "ADE-bench plugin-set runner (vs none / vs all-dbt-skills),"
+          echo "Spider2.0-DBT (lead) + Lite/Snow, and the SemBench seed are added"
+          echo "in Phase 5 under a cost ceiling. See benchmarks/ for the runbooks."
