@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "exmergo-dex-core"
+version = "0.0.0"
+description = "Analytics engineering for Claude Code and any agent: data warehouse exploration, data transformation, and semantic model maintenance, emitting governed-ready dbt and OSI semantic models."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Exmergo, Inc.", email = "support@exmergo.com" }]
+keywords = [
+  "analytics-engineering",
+  "dbt",
+  "claude-code",
+  "text-to-sql",
+  "semantic-layer",
+  "duckdb",
+  "data-engineering",
+  "agent",
+  "osi",
+]
+
+# Base dependencies are connector-agnostic: the canonical model (pydantic),
+# config parsing (pyyaml), and OSI validation against the pinned schema
+# (jsonschema). Connector client libraries live behind the extras below, so the
+# zero-credential DuckDB on-ramp never pulls the cloud client stack.
+dependencies = [
+  "pydantic>=2",
+  "pyyaml>=6",
+  "jsonschema>=4.18",
+]
+
+[project.scripts]
+dex = "exmergo_dex_core.cli:main"
+
+[project.optional-dependencies]
+# The on-ramp extra: duckdb + the dialect engine, nothing else.
+duckdb = ["duckdb>=1", "sqlglot>=25"]
+snowflake = ["snowflake-connector-python>=3", "sqlglot>=25"]
+bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25"]
+databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=25"]
+postgres = ["psycopg[binary]>=3", "sqlglot>=25"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://www.exmergo.com/dex"
+Repository = "https://github.com/exmergo/dex"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/exmergo_dex_core"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
