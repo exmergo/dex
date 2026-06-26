@@ -1,0 +1,27 @@
+{
+  "name": "dex",
+  "description": "Analytics engineering for Claude Code and any agent: data warehouse exploration, data transformation, and semantic model maintenance on dbt.",
+  "version": "0.0.0",
+  "author": {
+    "name": "Exmergo, Inc.",
+    "email": "support@exmergo.com",
+    "url": "https://www.exmergo.com"
+  },
+  "homepage": "https://www.exmergo.com/dex",
+  "repository": "https://github.com/exmergo/dex",
+  "license": "Apache-2.0",
+  "keywords": [
+    "analytics-engineering",
+    "dbt",
+    "claude-code",
+    "text-to-sql",
+    "semantic-layer",
+    "duckdb",
+    "snowflake",
+    "bigquery",
+    "databricks",
+    "data-engineering",
+    "agent",
+    "metricflow"
+  ]
+}

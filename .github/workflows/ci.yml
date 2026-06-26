@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Tier 1: engine correctness + the safety-critical assertions. Deterministic,
+  # fast, free (DuckDB is the test engine). The always-on release gate.
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (duckdb + dev extras)
+        run: uv sync --extra duckdb --extra dev --python ${{ matrix.python-version }}
+      - name: Tier-1 unit tests
+        run: uv run pytest -q
+
+  # The safety spine is broken out as its own gate so a regression on a
+  # safety-critical assertion is unmistakable in the checks list. Strict: an
+  # unexpected pass (a Phase 1+ placeholder going green early) is fine; a real
+  # failure blocks the merge regardless of any benchmark score.
+  safety:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (duckdb + dev extras)
+        run: uv sync --extra duckdb --extra dev
+      - name: Safety-critical assertions
+        run: uv run pytest -q tests/test_safety_spine.py
+
+  # On brand for Exmergo: all shipped prose is em-dash free.
+  em-dashes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Repo prose must be em-dash clean
+        run: |
+          git ls-files '*.md' '*.mdc' '*.txt' \
+            | xargs python scripts/check_no_em_dashes.py

@@ -1,0 +1,41 @@
+{
+  "skill_name": "transform",
+  "triggering": {
+    "positive": [
+      "Build a staging model for the raw orders table.",
+      "Refactor stg_customers and add not_null and unique tests.",
+      "Create a marts model that joins orders and customers.",
+      "Add documentation and tests to this dbt model."
+    ],
+    "negative": [
+      "What's in this warehouse and which tables matter?",
+      "Profile the events table and flag PII.",
+      "Define a revenue metric as a dbt semantic model.",
+      "Maintain the semantic layer for the finance domain."
+    ]
+  },
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Create a staging model for the raw orders table with appropriate tests, against my DuckDB dbt project.",
+      "expected_output": "Proposed dbt model SQL and schema.yml tests presented as a reviewable diff; nothing applied until confirmed.",
+      "files": [],
+      "assertions": [
+        "Changes are presented as diffs, not silently written (Principle 8)",
+        "Generated SQL is valid dbt and SELECT-only against source data",
+        "Any dev-target build surfaces a cost preflight before running (cost before spend)",
+        "Prod-target execution is never proposed (dev-target only)"
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "Refactor this model to be more readable and add tests, but don't run anything against the warehouse yet.",
+      "expected_output": "A refactor proposed as a diff with tests added; no warehouse execution.",
+      "files": [],
+      "assertions": [
+        "Human-written dbt is treated as authoritative; no silent overwrite",
+        "No warehouse build runs without explicit confirmation and a budget"
+      ]
+    }
+  ]
+}
