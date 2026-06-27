@@ -54,3 +54,7 @@ packages = ["src/exmergo_dex_core"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# importlib mode imports each test file as a unique module without sys.path
+# manipulation, so the package-mirroring test tree can reuse basenames (e.g. a
+# test_commands.py per capability) without import-file-mismatch collisions.
+addopts = "--import-mode=importlib"
