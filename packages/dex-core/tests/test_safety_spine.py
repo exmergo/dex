@@ -29,15 +29,40 @@ def test_read_only_duckdb_refuses_writes(duckdb_file: Path):
         adapter.close()
 
 
-@pytest.mark.xfail(
-    reason="SELECT-only SQL generation not yet implemented (explore)", strict=False
-)
-def test_generated_sql_is_select_only():
-    from exmergo_dex_core import profile
+def test_generated_sql_is_select_only(duckdb_file: Path):
+    # The profiling SQL the adapter generates must parse as a single read-only
+    # SELECT. Built without executing, so the generator itself is what is asserted.
+    from exmergo_dex_core.adapters.base import ColumnMeta
+    from exmergo_dex_core.sql_guard import assert_select_only
 
-    # When profiling exists it must only ever generate SELECT/aggregate SQL.
-    sql = profile.profile(objects=["customers"])  # raises NotImplementedError today
-    assert sql.strip().lower().startswith("select")
+    adapter = DuckDBAdapter(duckdb_file)
+    try:
+        sql, _plan = adapter._build_aggregate_sql(
+            "memory.main.customers",
+            [
+                ColumnMeta("id", "INTEGER", True, 0),
+                ColumnMeta("email", "VARCHAR", True, 1),
+            ],
+            safe={"id"},
+        )
+    finally:
+        adapter.close()
+    assert sql.lstrip().upper().startswith("SELECT")
+    # Idempotent: passing it through the guard again must not raise.
+    assert assert_select_only(sql) == sql
+
+
+def test_select_only_guard_rejects_writes():
+    from exmergo_dex_core.sql_guard import NotSelectOnlyError, assert_select_only
+
+    for bad in (
+        "DELETE FROM customers",
+        "INSERT INTO customers VALUES (3, 'c@example.com')",
+        "DROP TABLE customers",
+        "SELECT 1; DROP TABLE customers",
+    ):
+        with pytest.raises(NotSelectOnlyError):
+            assert_select_only(bad)
 
 
 @pytest.mark.xfail(
