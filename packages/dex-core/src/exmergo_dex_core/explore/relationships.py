@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .cache import (
+from ..cache import (
     ColumnProfile,
     Dataset,
     Relationship,

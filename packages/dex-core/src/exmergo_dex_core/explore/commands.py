@@ -12,15 +12,15 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 
-from . import command_args
-from . import envelope as env
+from .. import command_args
+from .. import envelope as env
+from ..adapters.base import Adapter, ObjectMeta
+from ..cache import Dataset, DexCache, DexStore
+from ..config import DexConfig, load_config
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
 from . import relationships as rel_mod
-from .adapters.base import Adapter, ObjectMeta
-from .cache import Dataset, DexCache, DexStore
-from .config import DexConfig, load_config
 
 # Below this many objects, profile everything: enumeration is cheap and complete.
 # Above it, profile only the top-ranked unless --full is passed.

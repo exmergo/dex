@@ -14,8 +14,8 @@ import re
 from datetime import date, datetime, time
 from decimal import Decimal
 
-from .adapters.base import Adapter, ColumnAggregate
-from .cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..adapters.base import Adapter, ColumnAggregate
+from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # lowercased column name with word-ish boundaries so "email" hits but "emailable"

@@ -12,8 +12,8 @@ from __future__ import annotations
 import math
 import re
 
-from .adapters.base import ObjectMeta
-from .cache import Relationship
+from ..adapters.base import ObjectMeta
+from ..cache import Relationship
 
 # Weights sum to 1.0; score lands in [0, 1].
 _W_SIZE = 0.35

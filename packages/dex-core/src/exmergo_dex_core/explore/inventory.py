@@ -7,7 +7,7 @@ selective drill-down possible without scanning the warehouse.
 
 from __future__ import annotations
 
-from .adapters.base import Adapter, ObjectMeta
+from ..adapters.base import Adapter, ObjectMeta
 
 
 def inventory(adapter: Adapter, *, include_views: bool = True) -> list[ObjectMeta]:
