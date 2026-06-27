@@ -107,13 +107,13 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
         return _connect_test(args)
 
     if args.group == "explore":
-        from . import explore
+        from .explore import commands as explore_cmds
 
         handlers = {
-            "inventory": explore.cmd_inventory,
-            "profile": explore.cmd_profile,
-            "relationships": explore.cmd_relationships,
-            "map": explore.cmd_map,
+            "inventory": explore_cmds.cmd_inventory,
+            "profile": explore_cmds.cmd_profile,
+            "relationships": explore_cmds.cmd_relationships,
+            "map": explore_cmds.cmd_map,
         }
         return handlers[args.subcommand](args)
 

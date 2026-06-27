@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..envelope import Paradigm
-from ..sql_guard import assert_select_only
+from ..guards.sql_guard import assert_select_only
 from .base import ColumnAggregate, ColumnMeta, ObjectMeta
 
 # Conservative defaults so auto-invoked profiling cannot exhaust the machine.

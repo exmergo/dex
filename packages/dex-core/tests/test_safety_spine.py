@@ -33,7 +33,7 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # The profiling SQL the adapter generates must parse as a single read-only
     # SELECT. Built without executing, so the generator itself is what is asserted.
     from exmergo_dex_core.adapters.base import ColumnMeta
-    from exmergo_dex_core.sql_guard import assert_select_only
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = DuckDBAdapter(duckdb_file)
     try:
@@ -53,7 +53,7 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
 
 
 def test_select_only_guard_rejects_writes():
-    from exmergo_dex_core.sql_guard import NotSelectOnlyError, assert_select_only
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
 
     for bad in (
         "DELETE FROM customers",
@@ -81,7 +81,7 @@ def test_prod_target_execution_is_refused():
     reason="connector-aware cost guard not yet implemented", strict=False
 )
 def test_cost_guard_blocks_over_ceiling():
-    from exmergo_dex_core import cost_guard
+    from exmergo_dex_core.guards import cost_guard
 
     cost_guard.preflight(estimate=10_000, ceiling=10)  # must block; not built yet
 
