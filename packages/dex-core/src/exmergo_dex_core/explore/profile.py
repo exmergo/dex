@@ -6,6 +6,12 @@ value (Principle 6), and min/max are surfaced only for columns where the extreme
 value is not itself sensitive: numeric and temporal types that carry no PII flag.
 For any string column, or any column flagged PII, min/max are suppressed at the
 source so the value never leaves the engine.
+
+A categorical sketch (the most-frequent values with counts) is surfaced for short,
+low-cardinality, non-PII text columns so the agent can see a column's actual
+categories without raw rows. Value frequencies are aggregates, not rows; the gate
+is layered (PII flag, a stricter deny-list, a value-length cap, a cardinality cap)
+so it never rests on name-based detection alone.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 
 from ..adapters.base import Adapter, ColumnAggregate
-from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag, ValueCount
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # lowercased column name with word-ish boundaries so "email" hits but "emailable"
@@ -68,6 +74,27 @@ _BOOLEAN_HINTS = ("BOOL",)
 
 _MAX_CONFIDENCE = 0.95
 
+# Value sketching surfaces real cell values (aggregated), so it is gated harder
+# than min/max. A column qualifies only if non-PII, not on this deny-list, short-
+# valued, and low-cardinality. The deny-list is deliberately broader and blunter
+# (substring match) than the PII patterns: a missed name here surfaces up to K real
+# values, not one, so it also catches special-category data (gender, ethnicity,
+# religion, health) and free-text-ish names (note, comment, description) that the
+# PII patterns do not, plus bare identity names ("name") the PII patterns require
+# a prefix for.
+_SKETCH_DENY = re.compile(
+    r"name|email|phone|address|gender|sex|ethnic|race|religi|diagnos|marital|"
+    r"national|citizen|disab|orientation|politic|biometric|health|medical|patient|"
+    r"comment|note|desc|reason|remark|message|body|content|summary|title|subject",
+    re.IGNORECASE,
+)
+# A column reads as categorical only below this many distinct values; above it, the
+# sketch is neither useful nor bounded.
+_CATEGORICAL_MAX_DISTINCT = 50
+# Values longer than this read as free text (and a likely PII carrier), never a
+# category. A structural, name-independent backstop to the deny-list.
+_MAX_CATEGORICAL_VALUE_LEN = 64
+
 
 def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     """Classify a column as PII from its name (and, loosely, type). Never a value.
@@ -98,6 +125,17 @@ def is_min_max_safe(data_type: str, pii: PIIFlag | None) -> bool:
     )
 
 
+def is_sketch_name_safe(column_name: str, pii: PIIFlag | None) -> bool:
+    """Name/PII half of the value-sketch gate: a column may be sketched only if it
+    carries no PII flag and its name is not on the stricter sketch deny-list. The
+    cardinality, length, and type checks are applied separately from the aggregate
+    results (text columns carry a ``max_length``; non-text columns do not)."""
+
+    if pii is not None:
+        return False
+    return _SKETCH_DENY.search(column_name) is None
+
+
 def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles."""
 
@@ -117,6 +155,28 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
             for a in adapter.column_aggregates(identifier, columns, safe_min_max=safe)
         }
 
+        # Second pass: value-sketch only columns that pass every gate. Eligibility
+        # needs distinct_count and max_length (known only after the aggregate pass),
+        # so this cannot fold into the first pass. max_length being present means the
+        # adapter classified the column as text (the type half of the gate).
+        sketch_cols = [
+            c
+            for c in columns
+            if is_sketch_name_safe(c.name, prelim_pii[c.name])
+            and (agg := aggregates.get(c.name)) is not None
+            and agg.max_length is not None
+            and agg.max_length <= _MAX_CATEGORICAL_VALUE_LEN
+            and agg.distinct_count is not None
+            and 1 <= agg.distinct_count <= _CATEGORICAL_MAX_DISTINCT
+        ]
+        sketches = (
+            adapter.column_top_values(
+                identifier, sketch_cols, k=_CATEGORICAL_MAX_DISTINCT
+            )
+            if sketch_cols
+            else {}
+        )
+
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
         if meta.row_count == 0:
@@ -125,6 +185,12 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
         for col in columns:
             agg = aggregates.get(col.name)
             pii = _refine_confidence(prelim_pii[col.name], agg)
+            sketch = sketches.get(col.name)
+            top_values = (
+                [ValueCount(value=str(_json_safe(v)), count=c) for v, c in sketch]
+                if sketch
+                else None
+            )
             profiles.append(
                 ColumnProfile(
                     name=col.name,
@@ -136,6 +202,7 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                     min_value=_json_safe(agg.min_value) if agg else None,
                     max_value=_json_safe(agg.max_value) if agg else None,
                     pii=pii,
+                    top_values=top_values,
                 )
             )
 

@@ -150,6 +150,59 @@ def test_pii_flag_structure_from_aggregates(duckdb_file: Path, capsys):
     assert cols["id"]["pii"] is None
 
 
+# --- categorical sketch (top-K values) ---------------------------------------
+
+
+def _profile_cols(table: str, path: Path, capsys) -> dict:
+    payload = _run(["explore", "profile", table, "--path", str(path)], capsys)
+    return {c["name"]: c for c in payload["data"]["datasets"][0]["columns"]}
+
+
+def test_profile_surfaces_categorical_top_values(sketch_duckdb: Path, capsys):
+    cols = _profile_cols("catalog", sketch_duckdb, capsys)
+    status = cols["status"]["top_values"]
+    # Frequency descending, ties broken by value ascending; the empty string is a
+    # legitimate value and is surfaced.
+    assert [(t["value"], t["count"]) for t in status] == [
+        ("active", 3),
+        ("archived", 2),
+        ("pending", 2),
+        ("", 1),
+    ]
+
+
+def test_profile_suppresses_top_values_for_pii_denylist_long_and_numeric(
+    sketch_duckdb: Path, capsys
+):
+    cols = _profile_cols("catalog", sketch_duckdb, capsys)
+    assert cols["email"]["top_values"] is None  # PII
+    assert cols["diagnosis"]["top_values"] is None  # deny-listed name (non-PII pattern)
+    assert cols["note"]["top_values"] is None  # a value exceeds the length cap
+    assert cols["id"]["top_values"] is None  # numeric type
+    assert cols["tier"]["top_values"] is not None  # short, low-card, non-PII text
+
+
+def test_profile_omits_top_values_for_high_cardinality(sketch_duckdb: Path, capsys):
+    cols = _profile_cols("bulk", sketch_duckdb, capsys)
+    assert cols["code"]["top_values"] is None  # 60 distinct > the categorical cap
+
+
+def test_profile_top_values_survives_sanitizer_with_secret_like_value(
+    sketch_duckdb: Path, capsys
+):
+    payload = _run(
+        ["explore", "profile", "catalog", "--path", str(sketch_duckdb)], capsys
+    )
+    # `tier` values contain "token" (a secret-like substring) but as data, not keys,
+    # so the sketch must pass sanitize. (_run already emitted it once; assert again.)
+    env.sanitize(env.ok(payload["data"]))
+    cols = {c["name"]: c for c in payload["data"]["datasets"][0]["columns"]}
+    assert {t["value"] for t in cols["tier"]["top_values"]} == {
+        "token_pro",
+        "token_basic",
+    }
+
+
 # --- relationships -----------------------------------------------------------
 
 
@@ -231,4 +284,7 @@ def test_empty_table_and_view_profile_without_error(edge_duckdb: Path, capsys):
     empty = ds["empty_t"]
     assert any("empty" in note for note in empty["data_quality"])
     assert empty["columns"][0]["null_fraction"] is None  # no rows -> undefined
+    # An empty text column has no distinct count, so it is not sketched (no crash).
+    note_col = next(c for c in empty["columns"] if c["name"] == "note")
+    assert note_col["top_values"] is None
     assert "people_v" in ds  # a view profiles fine

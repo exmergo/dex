@@ -57,7 +57,9 @@ class ColumnAggregate:
     engine has marked safe (numeric / temporal, non-PII); for everything else they
     stay ``None`` so a sensitive or free-text value never crosses the boundary.
     ``distinct_count`` is approximate (``approx_count_distinct``) for scale, so
-    ``is_unique`` derived from it is a signal, not a proof.
+    ``is_unique`` derived from it is a signal, not a proof. ``max_length`` is the
+    longest value's length for text columns, computed so the engine can gate value
+    sketching on it; it stays ``None`` for non-text columns.
     """
 
     name: str
@@ -66,6 +68,7 @@ class ColumnAggregate:
     is_unique: bool | None
     min_value: object | None
     max_value: object | None
+    max_length: int | None = None
 
 
 @runtime_checkable
@@ -110,6 +113,24 @@ class Adapter(Protocol):
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
         be computed; all others get ``None`` so values never leave the engine."""
+        ...
+
+    def column_top_values(
+        self,
+        identifier: str,
+        columns: list[ColumnMeta],
+        *,
+        k: int = 50,
+    ) -> dict[str, list[tuple[object, int]]]:
+        """The most-frequent values with their counts, per column, capped at ``k``.
+
+        Returns ``{column_name: [(value, count), ...]}`` ordered by descending
+        count. The engine passes only columns it has already gated as safe to
+        sketch (non-PII, low-cardinality, short-valued text); a value frequency is
+        an aggregate, not a raw row. The return is built from plain tuples so this
+        contract carries no dependency on the cache models. Cloud adapters should
+        implement this as a single-scan dialect feature (e.g. BigQuery
+        ``APPROX_TOP_COUNT``) and surface its cost before spending."""
         ...
 
     def close(self) -> None: ...

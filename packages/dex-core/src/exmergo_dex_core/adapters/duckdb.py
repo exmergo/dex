@@ -27,6 +27,10 @@ _COLUMN_BATCH = 50
 # Nested types DuckDB cannot apply approx_count_distinct / min / max to cleanly.
 _NESTED_TYPE_PREFIXES = ("STRUCT", "MAP", "LIST", "UNION")
 
+# Text-like types eligible for value sketching. UUID is excluded: it reads as text
+# but is an identifier, never a category.
+_TEXTUAL_TYPE_HINTS = ("VARCHAR", "CHAR", "TEXT", "STRING", "ENUM")
+
 
 class DuckDBReadOnlyError(Exception):
     """Raised when a DuckDB path cannot be opened read-only.
@@ -184,6 +188,40 @@ class DuckDBAdapter:
             )
         return results
 
+    def column_top_values(
+        self,
+        identifier: str,
+        columns: list[ColumnMeta],
+        *,
+        k: int = 50,
+    ) -> dict[str, list[tuple[object, int]]]:
+        # One GROUP BY per column. The engine has already gated these to non-PII,
+        # low-cardinality, short-valued text columns, so each scan is bounded; this
+        # knowingly forgoes the batching the aggregate pass uses, because top-K
+        # cannot share a single statement across columns without grouping-set
+        # gymnastics. NULLs are excluded (null_fraction already conveys them). The
+        # value is the deterministic tie-break, which is well-defined because
+        # GROUP BY makes the values distinct.
+        out: dict[str, list[tuple[object, int]]] = {}
+        table = self._quote(identifier)
+        limit = int(k)
+        for col in columns:
+            if self._is_nested(col.data_type):
+                continue
+            qcol = _quote_ident(col.name)
+            # Interpolated parts are quoted identifiers and an int limit, never
+            # values; _run_select refuses anything but a read-only SELECT.
+            sql = (
+                f"SELECT {qcol} AS sketch_value, COUNT(*) AS sketch_count "  # noqa: S608
+                f"FROM {table} WHERE {qcol} IS NOT NULL "
+                f"GROUP BY {qcol} ORDER BY sketch_count DESC, sketch_value ASC "
+                f"LIMIT {limit}"
+            )
+            rows = self._run_select(sql)
+            if rows:
+                out[col.name] = [(value, int(count)) for value, count in rows]
+        return out
+
     def _aggregate_batch(
         self, identifier: str, columns: list[ColumnMeta], safe: set[str]
     ) -> list[ColumnAggregate]:
@@ -196,7 +234,7 @@ class DuckDBAdapter:
 
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max in plan:
+        for i, col, wants_distinct, wants_min_max, wants_length in plan:
             nn = int(values[f"nn_{i}"])
             null_fraction = (1 - nn / n_total) if n_total > 0 else None
             distinct = (
@@ -207,6 +245,9 @@ class DuckDBAdapter:
                 if distinct is not None
                 else None
             )
+            # NULL when the column is all-null (max of no rows); leave it None then.
+            ml = values.get(f"ml_{i}") if wants_length else None
+            max_length = int(ml) if ml is not None else None
             aggregates.append(
                 ColumnAggregate(
                     name=col.name,
@@ -215,20 +256,23 @@ class DuckDBAdapter:
                     is_unique=is_unique,
                     min_value=values.get(f"mn_{i}") if wants_min_max else None,
                     max_value=values.get(f"mx_{i}") if wants_min_max else None,
+                    max_length=max_length,
                 )
             )
         return aggregates
 
     def _build_aggregate_sql(
         self, identifier: str, columns: list[ColumnMeta], safe: set[str]
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
         # One aggregate query for the whole batch: COUNT(*) once, plus per column a
-        # non-null count, an approximate distinct, and min/max only where allowed.
-        # Returns the SQL and a plan mapping each column to which aggregates it got,
-        # so results read back by alias unambiguously. Pure: builds no connection,
-        # so it is unit-testable (SELECT-only) without touching the database.
+        # non-null count, an approximate distinct, min/max only where allowed, and
+        # for text columns the longest value's length (so the engine can gate value
+        # sketching without an extra scan). Returns the SQL and a plan mapping each
+        # column to which aggregates it got, so results read back by alias
+        # unambiguously. Pure: builds no connection, so it is unit-testable
+        # (SELECT-only) without touching the database.
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -240,7 +284,10 @@ class DuckDBAdapter:
             if wants_min_max:
                 select_parts.append(f"min({qcol}) AS mn_{i}")
                 select_parts.append(f"max({qcol}) AS mx_{i}")
-            plan.append((i, col, wants_distinct, wants_min_max))
+            wants_length = self._is_textual(col.data_type) and not nested
+            if wants_length:
+                select_parts.append(f"max(length(CAST({qcol} AS VARCHAR))) AS ml_{i}")
+            plan.append((i, col, wants_distinct, wants_min_max, wants_length))
         # Interpolated parts are quoted+escaped identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         cols_sql = ", ".join(select_parts)
@@ -251,6 +298,13 @@ class DuckDBAdapter:
     def _is_nested(data_type: str) -> bool:
         upper = data_type.upper()
         return upper.endswith("[]") or upper.startswith(_NESTED_TYPE_PREFIXES)
+
+    @staticmethod
+    def _is_textual(data_type: str) -> bool:
+        upper = data_type.upper()
+        if "UUID" in upper:
+            return False
+        return any(h in upper for h in _TEXTUAL_TYPE_HINTS)
 
     @staticmethod
     def _split(identifier: str) -> tuple[str, str, str]:
