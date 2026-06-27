@@ -99,11 +99,28 @@ class Relationship(BaseModel):
     confidence: float | None = None
 
 
+def tool_version() -> str | None:
+    """The installed engine version, for stamping into cache provenance.
+
+    Falls back to the in-tree ``__version__`` when package metadata is not
+    available, e.g. an editable or source checkout that was never installed.
+    """
+
+    try:
+        from importlib.metadata import version
+
+        return version("exmergo-dex-core")
+    except Exception:
+        from . import __version__
+
+        return __version__
+
+
 class CacheProvenance(BaseModel):
     connector: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
-    tool_version: str | None = None
+    tool_version: str | None = Field(default_factory=tool_version)
 
 
 class DexCache(BaseModel):
