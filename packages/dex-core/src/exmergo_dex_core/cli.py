@@ -32,36 +32,56 @@ COMMAND_SURFACE: dict[str, list[str]] = {
 }
 
 
+def _sub_connection_options() -> argparse.ArgumentParser:
+    """The connection options as a parent for subparsers, with SUPPRESS defaults.
+
+    Shared by every subparser so the options also work AFTER the subcommand (the
+    contract documents them there, e.g. ``connect test --path X``). SUPPRESS means
+    an option absent after the subcommand does not clobber a value passed before
+    it; the top-level parser carries the real defaults so the attribute always
+    exists. Net: both ``dex --path X connect test`` and
+    ``dex connect test --path X`` resolve identically.
+    """
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--connector", default=argparse.SUPPRESS)
+    common.add_argument("--path", default=argparse.SUPPRESS)
+    common.add_argument("--repo-root", default=argparse.SUPPRESS)
+    common.add_argument("--confirm", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--budget", type=float, default=argparse.SUPPRESS)
+    return common
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dex",
         description="dex-core command contract (Explore. Transform. Model.)",
     )
-    # Global, connection-oriented options so every command shares one resolution
-    # path. Cost-spending commands additionally require --confirm + --budget.
-    parser.add_argument(
-        "--connector",
-        default=None,
-        help="connector name (default: from .dex/config.yml)",
-    )
-    parser.add_argument(
-        "--path", default=None, help="DuckDB file path (DuckDB connector)"
-    )
-    parser.add_argument("--repo-root", default=".", help="repo root holding .dex/")
-    parser.add_argument(
-        "--confirm", action="store_true", help="confirm a command that would spend"
-    )
-    parser.add_argument(
-        "--budget", type=float, default=None, help="per-session cost ceiling"
-    )
+    # Real defaults live on the top-level parser so every namespace has them.
+    parser.add_argument("--connector", default=None)
+    parser.add_argument("--path", default=None)
+    parser.add_argument("--repo-root", default=".")
+    parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--budget", type=float, default=None)
 
+    common = _sub_connection_options()
     groups = parser.add_subparsers(dest="group", required=True)
     for group, subcommands in COMMAND_SURFACE.items():
-        gp = groups.add_parser(group)
+        gp = groups.add_parser(group, parents=[common])
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
             for name in subcommands:
-                sp = sub.add_parser(name)
+                sp = sub.add_parser(name, parents=[common])
+                if group == "explore" and name == "inventory":
+                    sp.add_argument(
+                        "--rank", action="store_true", default=argparse.SUPPRESS
+                    )
+                if group == "explore" and name == "profile":
+                    sp.add_argument("objects", nargs="+")
+                if group == "explore" and name == "map":
+                    sp.add_argument(
+                        "--full", action="store_true", default=argparse.SUPPRESS
+                    )
                 # transform plan/apply take a positional argument in later phases.
                 if group == "transform" and name in {"plan", "apply"}:
                     sp.add_argument("argument", nargs="?", default=None)
@@ -69,11 +89,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _connect_test(args: argparse.Namespace) -> env.Envelope:
-    from .connect import open_adapter
+    from .command_args import open_from_args
 
-    adapter = open_adapter(
-        connector=args.connector, path=args.path, repo_root=args.repo_root
-    )
+    adapter = open_from_args(args)
     try:
         return env.ok(adapter.capabilities())
     finally:
@@ -87,6 +105,17 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
 
     if args.group == "connect" and args.subcommand == "test":
         return _connect_test(args)
+
+    if args.group == "explore":
+        from .explore import commands as explore_cmds
+
+        handlers = {
+            "inventory": explore_cmds.cmd_inventory,
+            "profile": explore_cmds.cmd_profile,
+            "relationships": explore_cmds.cmd_relationships,
+            "map": explore_cmds.cmd_map,
+        }
+        return handlers[args.subcommand](args)
 
     # Everything else is scaffolded against the contract but not yet built.
     return env.not_implemented(command)

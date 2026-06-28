@@ -42,6 +42,9 @@ class DexConfig(BaseModel):
     dbt_target: str | None = None
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
+    # How many top-ranked objects `explore map` deep-profiles on a large
+    # warehouse; the rest stay inventory-only. Selective by default, overridable.
+    profile_top_n: int = 25
 
 
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:

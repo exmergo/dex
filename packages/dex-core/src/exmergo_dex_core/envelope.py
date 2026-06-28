@@ -85,6 +85,11 @@ _SECRET_KEY_PATTERNS = (
 # A "raw row" payload is profiling's forbidden output: a list of records keyed by
 # column name. Profiling must emit aggregates and flags, never row values. We flag
 # any list of dicts living under a key that reads like row data.
+#
+# Note: ColumnProfile.top_values (the categorical sketch) is an intentional
+# list-of-dicts of {value, count} aggregates. It is sanctioned precisely because
+# its key ("top_values") is not in this list, so a future addition here must avoid
+# colliding with it (the collision would wrongly reject a legitimate sketch).
 _RAW_ROW_KEY_PATTERNS = ("rows", "records", "sample_rows", "raw", "preview_rows")
 
 

@@ -15,12 +15,21 @@ _VALID_STATUSES = {s.value for s in env.Status}
 
 
 def _all_commands() -> list[list[str]]:
-    """Every (group, subcommand) pair in the surface, as argv lists."""
+    """Every (group, subcommand) pair in the surface, as argv lists.
+
+    Commands with a required positional get a placeholder so argparse accepts
+    them; with no connection target they return a valid error envelope, which
+    still satisfies the contract (one parseable envelope, valid status).
+    """
 
     argvs: list[list[str]] = []
     for group, subcommands in COMMAND_SURFACE.items():
         if subcommands:
-            argvs.extend([group, sub] for sub in subcommands)
+            for sub in subcommands:
+                argv = [group, sub]
+                if group == "explore" and sub == "profile":
+                    argv.append("some_table")
+                argvs.append(argv)
         else:
             argvs.append([group])
     return argvs
@@ -40,12 +49,29 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
 
 
 def test_unbuilt_commands_report_not_implemented(capsys):
-    assert main(["explore", "inventory"]) == 0
+    assert main(["model", "define"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
 
 
 def test_connect_test_against_duckdb_is_ok(duckdb_file: Path, capsys):
-    rc = main(["--path", str(duckdb_file), "connect", "test"])
+    # The contract documents the flag AFTER the subcommand (connect test --path X).
+    rc = main(["connect", "test", "--path", str(duckdb_file)])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["status"] == "ok"
+    assert payload["data"]["read_only"] is True
+
+
+@pytest.mark.parametrize(
+    "argv_builder",
+    [
+        lambda f: ["--path", f, "connect", "test"],  # global flag before
+        lambda f: ["connect", "test", "--path", f],  # global flag after
+    ],
+    ids=["flag-before-subcommand", "flag-after-subcommand"],
+)
+def test_global_options_work_in_either_position(argv_builder, duckdb_file, capsys):
+    rc = main(argv_builder(str(duckdb_file)))
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["status"] == "ok"

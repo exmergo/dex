@@ -48,6 +48,14 @@ class PIIFlag(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class ValueCount(BaseModel):
+    """One value and how often it occurs: an element of a column's categorical
+    sketch. ``value`` is always a string (sketching is gated to text columns)."""
+
+    value: str
+    count: int
+
+
 class ColumnProfile(BaseModel):
     """Aggregate-derived understanding of one column, built from SQL aggregates and
     never from raw rows in context."""
@@ -61,6 +69,11 @@ class ColumnProfile(BaseModel):
     min_value: object | None = None
     max_value: object | None = None
     pii: PIIFlag | None = None
+    # The categorical sketch: most-frequent values with counts, only for short,
+    # low-cardinality, non-PII text columns. Value frequencies are aggregates, not
+    # rows. This is an INTENTIONAL list-of-dicts once serialized; its field name
+    # must never match envelope._RAW_ROW_KEY_PATTERNS or emit() would reject it.
+    top_values: list[ValueCount] | None = None
 
 
 class Dataset(BaseModel):
@@ -99,11 +112,28 @@ class Relationship(BaseModel):
     confidence: float | None = None
 
 
+def tool_version() -> str | None:
+    """The installed engine version, for stamping into cache provenance.
+
+    Falls back to the in-tree ``__version__`` when package metadata is not
+    available, e.g. an editable or source checkout that was never installed.
+    """
+
+    try:
+        from importlib.metadata import version
+
+        return version("exmergo-dex-core")
+    except Exception:
+        from . import __version__
+
+        return __version__
+
+
 class CacheProvenance(BaseModel):
     connector: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
-    tool_version: str | None = None
+    tool_version: str | None = Field(default_factory=tool_version)
 
 
 class DexCache(BaseModel):
