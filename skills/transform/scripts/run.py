@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 # Rewritten by scripts/prepare_release.sh to exmergo-dex-core[duckdb]==X.Y.Z.
-DEX_CORE_PIN = "exmergo-dex-core[duckdb]==0.0.0"
+DEX_CORE_PIN = "exmergo-dex-core[duckdb]==0.1.0a1"
 
 
 def _engine_spec() -> list[str]:
