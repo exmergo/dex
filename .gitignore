@@ -22,6 +22,11 @@ pg_service.conf
 # dbt profiles carry warehouse secrets; keep them in ~/.dbt, not the repo.
 # (Test fixtures that intentionally ship a profiles.yml can be force-added.)
 profiles.yml
+# Index credentials. Publishing runs through Trusted Publishing (OIDC), so no
+# PyPI or TestPyPI token should ever sit in the tree.
+*token*.txt
+*.token
+.pypirc
 
 # ─── dex runtime artifacts ───────────────────────────────────────────────────
 # .dex/ is meant to live in an END-USER's repo. In THIS dev repo a root-level
