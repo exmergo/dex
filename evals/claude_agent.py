@@ -40,7 +40,7 @@ def _require_claude(binary: str) -> str:
 def _invoke(binary: str, args: list[str], prompt: str, timeout: int) -> str:
     """Run ``claude -p`` and return its textual result, or raise on failure."""
 
-    proc = subprocess.run(  # noqa: S603 - binary is PATH-resolved via shutil.which; args are internal, not user shell input
+    proc = subprocess.run(
         [binary, "-p", prompt, "--output-format", "json", *args],
         capture_output=True,
         text=True,
