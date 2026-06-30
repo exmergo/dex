@@ -50,7 +50,21 @@ jobs:
       - name: Safety-critical assertions
         run: uv run pytest -q tests/test_safety_spine.py
 
-  # On brand for Exmergo: all shipped prose is em-dash free.
+  # The Tier-2 eval harness scoring core (triggering, output-quality, uplift math),
+  # exercised with fake backends: deterministic, free, no model in the loop. The
+  # live Claude-driven evals run on release, not here. Stdlib only, so uvx supplies
+  # pytest and the harness needs no install.
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Eval scoring-core tests
+        run: uvx pytest evals -q
+
+  # On brand for Exmergo (easter egg): all shipped prose is em-dash free.
   em-dashes:
     runs-on: ubuntu-latest
     steps:
