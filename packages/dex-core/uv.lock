@@ -387,7 +387,6 @@ wheels = [
 
 [[package]]
 name = "exmergo-dex-core"
-version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
@@ -441,7 +440,7 @@ requires-dist = [
     { name = "sqlglot", marker = "extra == 'postgres'", specifier = ">=25" },
     { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=25" },
 ]
-provides-extras = ["duckdb", "snowflake", "bigquery", "databricks", "postgres", "dev"]
+provides-extras = ["bigquery", "databricks", "dev", "duckdb", "postgres", "snowflake"]
 
 [[package]]
 name = "filelock"

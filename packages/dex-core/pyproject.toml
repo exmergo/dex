@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "exmergo-dex-core"
-version = "0.0.0"
+dynamic = ["version"]
 description = "Analytics engineering for Claude Code and any agent: data warehouse exploration, data transformation, and semantic model maintenance, emitting governed-ready dbt and OSI semantic models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -51,6 +51,19 @@ Repository = "https://github.com/exmergo/dex"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/exmergo_dex_core"]
+
+# The version is the git tag (v0.1.0 -> 0.1.0): one source of truth, never a
+# hand-edited literal that can drift from the tag the release pipeline cuts.
+# fallback_version keeps source builds that cannot reach .git (for example a
+# build in an isolated temp dir) from failing; CI guards against an accidental
+# fallback by asserting the built version equals the tag before publishing.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# This package lives in a subdirectory; the repository .git is two levels up.
+root = "../.."
+fallback_version = "0.0.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

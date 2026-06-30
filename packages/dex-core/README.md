@@ -42,10 +42,14 @@ the full surface and the envelope spec.
 
 ## Status
 
-v0.1 is the full Explore. Transform. Model. loop on DuckDB. This is the Phase 0
-foundation: the command contract, the dex-native canonical model and `.dex/`
-layout, the OSI validator against a pinned schema, and the eval + safety spine.
-The explore/transform/model/reconcile engines are filled in Phases 1 through 3.
+Early and under active development; expect pre-release versions. Today the engine
+runs the Explore loop on DuckDB end to end: it ranks what matters in an unfamiliar
+warehouse, profiles columns selectively, flags PII, and infers joins, all
+read-only. Transform, Model, and Reconcile, and the cloud connectors (BigQuery,
+Snowflake, Databricks, PostgreSQL), are in progress and report `not_implemented`
+until they land. The foundations are in place: the command contract, the
+canonical model and `.dex/` layout, the OSI validator against a pinned schema,
+and the eval and safety spine.
 
 ## License
 

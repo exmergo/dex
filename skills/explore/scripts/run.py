@@ -15,8 +15,8 @@ Two execution modes, chosen automatically:
   - Installed plugin: no local package is present, so the pinned PyPI release is
     installed hermetically by uv.
 
-`DEX_CORE_PIN` is the single line the release pipeline rewrites on every version
-bump; nothing else in this file changes between releases.
+`DEX_CORE_PIN` is the single line bumped at release time, by
+scripts/prepare_release.sh before the tag; nothing else here changes per release.
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Rewritten by the release workflow to exmergo-dex-core[duckdb]==X.Y.Z.
-DEX_CORE_PIN = "exmergo-dex-core[duckdb]==0.0.0"
+# Rewritten by scripts/prepare_release.sh to exmergo-dex-core[duckdb]==X.Y.Z.
+DEX_CORE_PIN = "exmergo-dex-core[duckdb]==0.1.0a1"
 
 
 def _engine_spec() -> list[str]:

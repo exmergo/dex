@@ -103,54 +103,6 @@ def test_pii_flag_lives_on_the_column_profile():
     assert col.pii is not None and col.pii.category.value == "email"
 
 
-def test_categorical_sketch_never_surfaces_pii_or_sensitive_columns(
-    sketch_duckdb: Path,
-):
-    # The sketch surfaces real values, so its gate must hold even where the
-    # name-based PII detector does not fire. Assert the structural invariant
-    # (a sketch implies a non-PII column within the bounds), not the gate against
-    # itself: email (PII), diagnosis (deny-listed, NOT a PII pattern), and note
-    # (a value over the length cap) must all be suppressed.
-    from exmergo_dex_core.explore.profile import (
-        _CATEGORICAL_MAX_DISTINCT,
-        is_sketch_name_safe,
-        profile,
-    )
-
-    adapter = DuckDBAdapter(sketch_duckdb)
-    try:
-        ids = [
-            m.identifier
-            for m in adapter.list_objects()
-            if m.identifier.endswith(".catalog")
-        ]
-        dataset = profile(adapter, ids)[0]
-    finally:
-        adapter.close()
-
-    cols = {c.name: c for c in dataset.columns}
-    assert cols["email"].top_values is None
-    assert cols["diagnosis"].top_values is None
-    assert cols["note"].top_values is None
-
-    for col in dataset.columns:
-        if col.top_values is not None:
-            assert col.pii is None
-            assert is_sketch_name_safe(col.name, col.pii)
-            assert col.distinct_count is not None
-            assert 1 <= col.distinct_count <= _CATEGORICAL_MAX_DISTINCT
-            assert all(len(v.value) <= 64 for v in col.top_values)
-
-
-def test_envelope_accepts_top_values_but_still_blocks_raw_rows():
-    # The categorical sketch is a sanctioned list-of-dicts; a genuine raw-row
-    # payload under a row-like key must still be refused.
-    sketch = {"columns": [{"top_values": [{"value": "a", "count": 2}]}]}
-    env.emit(env.ok({"datasets": [sketch]}))
-    with pytest.raises(env.SanitizationError):
-        env.emit(env.ok({"sample_rows": [{"id": 1, "v": "x"}]}))
-
-
 # --- Family 4: propose-don't-impose ------------------------------------------
 
 

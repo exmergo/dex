@@ -1,9 +1,10 @@
 name: Release
 
-# A semver tag drives the whole chain: gates, build, PyPI publish via Trusted
-# Publishing (OIDC, no stored tokens), the anti-squat dex-core stub, then the
-# engine-to-plugin version coupling. Commit-back of the bumped pins and the
-# catalog update are not yet enabled.
+# A semver tag drives the whole chain: a test gate, a coupling check, build, then
+# PyPI publish via Trusted Publishing (OIDC, no stored tokens) and the anti-squat
+# dex-core stub. The wrapper pins are bumped before tagging (scripts/
+# prepare_release.sh), so this workflow never writes back; it only verifies the
+# tagged commit is self-consistent before it publishes.
 on:
   push:
     tags: ["v*.*.*"]
@@ -27,8 +28,36 @@ jobs:
       # A safety-assertion regression blocks the release regardless of pass-rate;
       # representative Tier-2 agent evals run here once they are wired into CI.
 
+  # Read-only guard, run before publishing: the wrapper pins are bumped before
+  # the tag (scripts/prepare_release.sh), so the tagged commit must already pin
+  # the version this tag will publish. If it does not, the tag was cut without
+  # running the prepare script, and shipping it would couple the plugin to the
+  # wrong engine version (especially once the public catalog pins this tag), so
+  # we fail before anything reaches PyPI. No writes, so branch protection is moot.
+  verify-coupling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wrapper pins must match the tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          fail=0
+          for skill in explore transform model; do
+            f="skills/${skill}/scripts/run.py"
+            if ! grep -qF "exmergo-dex-core[duckdb]==${VERSION}\"" "$f"; then
+              echo "${f} is not pinned to ${VERSION}:"
+              grep -n "DEX_CORE_PIN" "$f" || true
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then
+            echo "Run scripts/prepare_release.sh ${VERSION}, commit, and re-tag."
+            exit 1
+          fi
+          echo "All wrapper pins match ${VERSION}."
+
   publish:
-    needs: gate
+    needs: [gate, verify-coupling]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -38,9 +67,24 @@ jobs:
         working-directory: packages/dex-core
     steps:
       - uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives the version from the tag; it needs full history
+          # and the tags, which the default shallow checkout omits.
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
       - name: Build sdist + wheel
         run: uv build
+      - name: Assert built version matches the tag
+        # Hard stop against the version-drift class of bug: if hatch-vcs fell
+        # back (or the tag was unreadable), the wheel would not carry the tag
+        # version and we must not publish it.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! ls dist/exmergo_dex_core-"${VERSION}"-*.whl >/dev/null 2>&1; then
+            echo "Built artifacts do not match tag version ${VERSION}:"
+            ls -1 dist/
+            exit 1
+          fi
       - name: Publish to PyPI (Trusted Publishing)
         run: uv publish
       # Optionally emit PEP 740 / Sigstore attestations for provenance.
@@ -68,22 +112,3 @@ jobs:
         run: uv build
       - name: Publish the stub (idempotent; skips if already on PyPI)
         run: uv publish --check-url https://pypi.org/simple/
-
-  bump-and-couple:
-    needs: publish
-    runs-on: ubuntu-latest
-    # The engine release drives the plugin release: rewrite the DEX_CORE_PIN line
-    # in all three wrappers to the published version, bump plugin.json, then
-    # update the dex entry in the exmergo catalog. Commit-back needs contents:
-    # write and is not yet enabled.
-    steps:
-      - uses: actions/checkout@v4
-      - name: Bump wrapper pins to the released version
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          for skill in explore transform model; do
-            sed -i -E \
-              "s/exmergo-dex-core\[duckdb\]==[0-9]+\.[0-9]+\.[0-9]+/exmergo-dex-core[duckdb]==${VERSION}/" \
-              "skills/${skill}/scripts/run.py"
-          done
-          echo "Pinned wrappers to ${VERSION}. plugin.json + catalog update not yet automated."

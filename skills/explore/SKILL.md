@@ -26,9 +26,7 @@ Subcommands, in the usual order:
 2. `explore inventory --rank` returns a ranked object summary (counts and sizes,
    never rows).
 3. `explore profile <objects>` returns column profiles and PII flags recorded as
-   (column, category, confidence), never example values. For short, low-cardinality,
-   non-PII text columns it also returns a categorical sketch (the most frequent
-   values with counts) so you can see a column's categories without raw rows.
+   (column, category, confidence), never example values.
 4. `explore relationships` returns inferred and declared joins.
 5. `explore map` writes or updates the `.dex/` cache and prints a summary.
 

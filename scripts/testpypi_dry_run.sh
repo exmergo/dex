@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Prove the publish-and-pin loop on TestPyPI before any automation (v7 §15.1,
-# "mechanism early, automation late"). Run this manually with your TestPyPI
-# credentials; it is intentionally not wired into CI.
+# Prove the publish-and-pin loop on TestPyPI before any automation (mechanism
+# early, automation late). Run this manually with your TestPyPI credentials; it
+# is intentionally not wired into CI.
 #
 # Steps:
 #   1. Build the engine sdist + wheel with uv.
@@ -21,8 +21,10 @@ TESTPYPI="https://test.pypi.org/legacy/"
 
 echo "==> build ${VERSION}"
 # Clean dist/ so only the freshly built version is published (uv build does not
-# clear stale artifacts from earlier versions).
-( cd "${PKG}" && rm -rf dist && uv version "${VERSION}" && uv build )
+# clear stale artifacts from earlier versions). The engine version is dynamic
+# (hatch-vcs reads the git tag), so a dry run with no tag pins the version with
+# setuptools-scm's pretend-version env var rather than writing pyproject.toml.
+( cd "${PKG}" && rm -rf dist && SETUPTOOLS_SCM_PRETEND_VERSION="${VERSION}" uv build )
 
 echo "==> publish to TestPyPI"
 ( cd "${PKG}" && uv publish --publish-url "${TESTPYPI}" )

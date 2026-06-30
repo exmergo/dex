@@ -6,4 +6,10 @@ thin wrapper over the command contract in :mod:`exmergo_dex_core.cli`.
 
 from __future__ import annotations
 
-__version__ = "0.0.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("exmergo-dex-core")
+except PackageNotFoundError:
+    # Running from a source tree with no installed distribution metadata.
+    __version__ = "0.0.0"

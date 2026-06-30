@@ -42,23 +42,14 @@ it issues one batched aggregate query (a non-null count, an approximate distinct
 count, and conditionally a min and max), batching wide tables so a single
 statement never balloons. From those it derives null fraction, distinct count, and
 a uniqueness signal. The distinct count is approximate for scale, so uniqueness is
-treated as a candidate signal, never a proven key. For short, low-cardinality,
-non-PII text columns it adds a categorical sketch: the most frequent values with
-their counts, so a column's actual categories are visible to the agent without raw
-rows. A value frequency is an aggregate, never a row value.
+treated as a candidate signal, never a proven key.
 
-Three safety rules are enforced at the source, in the SQL that is generated:
+Two safety rules are enforced at the source, in the SQL that is generated:
 
 - **min and max are surfaced only where the extreme value is not itself
   sensitive**: numeric and temporal columns that carry no PII flag. For any string
   column, or any column flagged as PII, min and max are never even computed, so a
   raw or sensitive value never leaves the engine.
-- **Categorical sketches are surfaced only for short, low-cardinality, non-PII
-  text columns.** Because a sketch surfaces real values, its gate is layered: no
-  PII flag, a deny-list broader than the PII patterns (it also covers
-  special-category names like gender or diagnosis and free-text names like comment
-  or description), a value-length cap, and a cardinality cap. It never rests on
-  name-based detection alone, and the counts are aggregates, not rows.
 - **All generated SQL is read-only.** Beyond the read-only connection, every
   statement is parsed and refused if it is not a single read-only SELECT.
 

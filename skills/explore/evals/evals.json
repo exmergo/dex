@@ -19,24 +19,37 @@
     {
       "id": 0,
       "prompt": "I just connected a DuckDB file with a few dozen tables. Help me understand what's in it and which tables are worth my attention.",
-      "expected_output": "A ranked landscape and a draft .dex/ map produced from inventory and rank, without dumping the full schema into context.",
+      "expected_output": "A ranked landscape from inventory and a draft .dex/ map, reported as counts and a ranked shortlist, without dumping the full schema into context.",
       "files": [],
       "assertions": [
-        "Drives the engine via the wrapper and reads the JSON envelope; does not invent results",
-        "Output is sense-making (ranked, selective), not a full schema dump (Principle 1)",
-        "No raw rows and no credentials appear anywhere in the output (clean envelope)",
-        "Any PII is reported as (column, category, confidence) with no example values"
+        "Drives the engine via the wrapper (explore inventory --rank and/or explore map) and reads the JSON envelope; does not invent results",
+        "Reports a ranked shortlist of objects, not all of them; no per-column listing appears for the full warehouse (sense-making, not enumeration)",
+        "When map is run, it reports the cache summary by counts (object_count, profiled_count, relationship_count, pii_column_count), not by pasting the cache contents",
+        "No raw rows and no credentials appear anywhere in the output (clean envelope)"
       ]
     },
     {
       "id": 1,
       "prompt": "Profile the customers table and tell me about data quality and any sensitive columns.",
-      "expected_output": "Column profiles built from aggregates plus PII flags; no example values surfaced.",
+      "expected_output": "Column profiles built from aggregates plus PII flags; min/max suppressed on string and PII columns; no example values surfaced.",
       "files": [],
       "assertions": [
-        "Profiles are aggregate-derived, never raw rows (Principle 2)",
-        "PII flagged as (column, category, confidence), never surfaced (Principle 6)",
-        "The connection is read-only and generated SQL is SELECT-only (Principle 3)"
+        "Profiles are aggregate-derived (null_fraction, distinct_count, is_unique), never raw rows",
+        "PII is reported as (column, category, confidence) with no example value; the email column is flagged",
+        "min_value and max_value are absent (null) for string and PII columns, and present only for safe numeric or temporal columns",
+        "Stated as read-only against the data"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "How do the tables in this warehouse relate? Show me the joins.",
+      "expected_output": "Inferred joins (and declared ones if a dbt project is present), each labeled by kind with a confidence, derived from metadata rather than by scanning data.",
+      "files": [],
+      "assertions": [
+        "Relationships are returned with from/to datasets and columns and a kind of inferred or declared",
+        "Inferred joins carry a confidence and are clearly distinguished from declared (dbt) joins",
+        "No raw rows are read to establish the joins; the result is metadata-derived",
+        "The output is a relationship summary, not a full schema dump"
       ]
     }
   ]

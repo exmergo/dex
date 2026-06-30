@@ -20,6 +20,24 @@ Run the test suite with:
 uv run pytest
 ```
 
+## Agent evals (`evals/`)
+
+The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from
+the engine: it drives a concrete agent (Claude today) to test the skills, so it
+sits with the skills it tests, not in the published `exmergo-dex-core` wheel.
+
+It is **stdlib only by design**: no `pyproject.toml`, no `uv.lock`, no
+third-party runtime dependency. Run its deterministic core tests with:
+
+```
+uvx pytest evals
+```
+
+Run a skill's live suite (needs the `claude` CLI on PATH and the plugin
+installed) with `python -m evals skills/<skill>`. If a future backend needs a
+real Python dependency, promote `evals/` to its own uv project at that point and
+not before. See `evals/README.md` for the rationale and full usage.
+
 ## Linting and formatting (Ruff)
 
 We use [Ruff](https://docs.astral.sh/ruff/) as both the linter and the

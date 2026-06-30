@@ -27,7 +27,7 @@ phase lands.
 ```
 dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
-dex explore profile <objects>     -> column profiles + PII flags (column, category, confidence) + categorical value sketches
+dex explore profile <objects>     -> column profiles + PII flags (column, category, confidence)
 dex explore relationships         -> inferred + declared joins
 dex explore map                   -> write/update the .dex cache; print a summary
 dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet)
