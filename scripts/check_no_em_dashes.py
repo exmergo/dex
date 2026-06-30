@@ -35,10 +35,14 @@ GENERIC_FIX = (
 
 
 def mask_code_and_urls(line):
-    """Blank out inline code spans and URLs so hyphens inside them are ignored.
+    """Blank out markup that legitimately contains hyphens so it is not scanned.
 
-    Returns a copy of the line where those regions are replaced by spaces, which
-    preserves column numbers for everything else on the line.
+    Inline code spans, URLs, file paths, and HTML comment delimiters all use
+    hyphens as markup rather than sentence punctuation. We blank those regions
+    (replacing them with spaces, which preserves column numbers for everything
+    else on the line) so they cannot trip the dash checks. Only the comment
+    delimiters themselves are blanked, so prose written inside an HTML comment is
+    still scanned for real stand-ins.
     """
     masked = list(line)
 
@@ -51,6 +55,8 @@ def mask_code_and_urls(line):
     for m in re.finditer(r"https?://\S+", line):  # bare URLs
         blank(m)
     for m in re.finditer(r"\S+/\S+", line):  # file paths / slashed tokens
+        blank(m)
+    for m in re.finditer(r"<!--|-->", line):  # HTML comment delimiters
         blank(m)
     return "".join(masked)
 

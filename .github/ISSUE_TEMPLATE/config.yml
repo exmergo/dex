@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/exmergo/dex/security/advisories/new
+    about: >-
+      Do not open a public issue for a security problem. Report it privately
+      here, or email security@exmergo.com. See SECURITY.md.

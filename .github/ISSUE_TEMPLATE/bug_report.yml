@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a defect in dex or the dex-core engine.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for filing a bug. Please do not paste credentials, connection
+        strings, or raw warehouse rows. dex sanitizes its own output; keep your
+        report sanitized too. For security issues, use the private channel in
+        SECURITY.md instead of this form.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: connector
+    attributes:
+      label: Connector
+      description: Which connector were you using? Only DuckDB is implemented today.
+      options:
+        - DuckDB
+        - BigQuery (not yet implemented)
+        - Snowflake (not yet implemented)
+        - Databricks (not yet implemented)
+        - PostgreSQL (not yet implemented)
+        - Not connector-specific
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dex-core version
+      description: The pinned `exmergo-dex-core` version, or the git commit if running from source.
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python version, and how you invoked dex (Claude Code skill, AGENTS.md, or direct CLI).
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: The sanitized JSON envelope or error text. Redact anything sensitive.
+      render: shell
