@@ -66,6 +66,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         datasets = profile_mod.profile(adapter, identifiers)
     finally:
         adapter.close()
+    _annotate_grain(datasets)
     return env.ok({"datasets": [d.model_dump(mode="json") for d in datasets]})
 
 
@@ -87,6 +88,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "relationships": [r.model_dump(mode="json") for r in rels],
             "declared_count": len(declared),
             "inferred_count": len(inferred),
+            "notes": _relationship_notes(datasets, declared, inferred),
         }
     )
 
@@ -107,9 +109,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     finally:
         adapter.close()
 
-    for ds in profiled:
-        ds.candidate_keys = rel_mod.candidate_keys(ds)
-        ds.grain = rel_mod.detect_grain(ds)
+    _annotate_grain(profiled)
 
     inferred = rel_mod.infer_relationships(profiled)
     declared = rel_mod.declared_relationships(repo_root)
@@ -131,6 +131,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     path = store.save_cache(cache, now=now)
 
     pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
+    quality_notes = sum(len(d.data_quality) for d in profiled)
     top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
     return env.ok(
         {
@@ -139,15 +140,56 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             "profiled_count": len(profiled),
             "relationship_count": len(relationships),
             "pii_column_count": pii_columns,
+            "data_quality_note_count": quality_notes,
             "top_objects": [
                 {"identifier": d.identifier, "rank_score": d.rank_score} for d in top
             ],
+            "notes": _relationship_notes(profiled, declared, inferred),
             "updated_at": now.isoformat(),
         }
     )
 
 
 # --- helpers -----------------------------------------------------------------
+
+
+def _annotate_grain(datasets: list[Dataset]) -> None:
+    """Attach the interpretation layer to raw profiles: candidate keys, the likely
+    grain, and the data-quality warnings an analyst would write (non-unique own
+    key, unknown grain). Shared by profile and map so a single-table profile
+    surfaces a broken grain without requiring a full map."""
+
+    for ds in datasets:
+        ds.candidate_keys = rel_mod.candidate_keys(ds)
+        ds.grain = rel_mod.detect_grain(ds)
+        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
+
+
+def _relationship_notes(
+    datasets: list[Dataset],
+    declared: list,
+    inferred: list,
+) -> list[str]:
+    """Explain the inference result so an empty array is distinguishable from
+    'no relationships exist': what was examined and why nothing survived."""
+
+    fk_columns = rel_mod.fk_candidate_count(datasets)
+    notes = [
+        f"inference examined {fk_columns} id-shaped column(s) "
+        f"across {len(datasets)} profiled object(s)"
+    ]
+    if not declared:
+        notes.append(
+            "no declared relationships (no dbt project or no declared foreign keys)"
+        )
+    if fk_columns and not inferred:
+        notes.append(
+            "no id-shaped column matched a parent table by name; joins may exist "
+            "that name-based inference cannot see"
+        )
+    if not fk_columns:
+        notes.append("no id-shaped columns found, so there was nothing to infer from")
+    return notes
 
 
 def _select_for_profiling(
@@ -190,11 +232,14 @@ def _resolve_identifiers(adapter: Adapter, requested: list[str]) -> list[str]:
 
     Accepts an exact identifier, a ``schema.name`` suffix, or a bare object name,
     and fails cleanly on an unknown or ambiguous name rather than guessing.
+    Comma-joined lists (``profile a,b,c``) are as natural a first guess as
+    space-separated ones, so both are accepted.
     """
 
     known = [m.identifier for m in adapter.list_objects()]
+    names = [part.strip() for raw in requested for part in raw.split(",")]
     resolved: list[str] = []
-    for name in requested:
+    for name in (n for n in names if n):
         matches = [
             ident
             for ident in known
