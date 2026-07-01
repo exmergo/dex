@@ -9,6 +9,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.0a3] - 2026-07-01
+
+### Changed
+
+- Skill wrappers pin only the engine version; the connector extra is now selected
+  at runtime from the active connector (an explicit `--connector`, then
+  `.dex/config.yml`, then DuckDB), so a published release is connector-neutral
+  instead of hard-coded to `[duckdb]`. The release tooling verifies the version
+  pin rather than a connector-specific string.
+
+### Added
+
+- An `all` extra on `exmergo-dex-core` that installs every connector at once, for
+  users who drive more than one warehouse. The light default and the `[duckdb]`
+  on-ramp are unchanged.
+
 ## [0.1.0a2] - 2026-07-01
 
 The ETM taxonomy correction. The three motions are now Explore, Transform, and
@@ -64,6 +80,7 @@ the rest of the loop is scaffolded and reports `not_implemented` until it lands.
 - The cloud and operational connectors (BigQuery, Snowflake, Databricks,
   PostgreSQL) and their cost paradigms.
 
-[Unreleased]: https://github.com/exmergo/dex/compare/v0.1.0a2...HEAD
+[Unreleased]: https://github.com/exmergo/dex/compare/v0.1.0a3...HEAD
+[0.1.0a3]: https://github.com/exmergo/dex/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/exmergo/dex/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/exmergo/dex/releases/tag/v0.1.0a1

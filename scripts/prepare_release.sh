@@ -2,11 +2,13 @@
 # Couple the plugin to a specific engine release BEFORE tagging it.
 #
 # The engine version is the git tag (hatch-vcs derives it at build time), but the
-# skill wrappers install the engine by an exact pin (DEX_CORE_PIN). This script
-# rewrites that pin in all three wrappers so the tagged commit is self-consistent:
-# checking out the tag, or pinning the catalog to it, installs exactly the engine
-# the tag publishes. The release workflow only verifies this coupling; it never
-# writes back. Run this, review the diff, commit, then tag.
+# skill wrappers pin the engine to an exact version (DEX_CORE_VERSION). This script
+# rewrites that version in all three wrappers so the tagged commit is
+# self-consistent: checking out the tag, or pinning the catalog to it, installs
+# exactly the engine the tag publishes. The connector extra is not part of the pin;
+# the wrapper selects it at runtime, so a release is connector-neutral. The release
+# workflow only verifies this coupling; it never writes back. Run this, review the
+# diff, commit, then tag.
 #
 # Usage:
 #   scripts/prepare_release.sh <engine-version> [plugin-semver]
@@ -29,7 +31,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for skill in explore transform maintain; do
   f="${ROOT}/skills/${skill}/scripts/run.py"
   sed -i.bak -E \
-    "s/exmergo-dex-core\[duckdb\]==[0-9][^\"]*/exmergo-dex-core[duckdb]==${ENGINE_VERSION}/" \
+    "s/DEX_CORE_VERSION = \"[^\"]*\"/DEX_CORE_VERSION = \"${ENGINE_VERSION}\"/" \
     "$f"
   rm -f "${f}.bak"
   echo "pinned ${f#"${ROOT}/"} -> ${ENGINE_VERSION}"

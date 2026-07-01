@@ -44,9 +44,9 @@ jobs:
           fail=0
           for skill in explore transform maintain; do
             f="skills/${skill}/scripts/run.py"
-            if ! grep -qF "exmergo-dex-core[duckdb]==${VERSION}\"" "$f"; then
+            if ! grep -qF "DEX_CORE_VERSION = \"${VERSION}\"" "$f"; then
               echo "${f} is not pinned to ${VERSION}:"
-              grep -n "DEX_CORE_PIN" "$f" || true
+              grep -n "DEX_CORE_VERSION" "$f" || true
               fail=1
             fi
           done
@@ -94,12 +94,16 @@ jobs:
       # Optionally emit PEP 740 / Sigstore attestations for provenance.
 
   # Anti-squat: claim and hold the short name `dex-core`, which redirects users to
-  # exmergo-dex-core. Idempotent: --check-url skips the upload when the stub
-  # version already exists on PyPI, so this is a no-op on every release after the
-  # first. Needs its own PyPI Trusted Publisher for the `dex-core` project, with a
-  # DISTINCT environment (pypi-stub): PyPI rejects two pending publishers that
-  # share an identical owner/repo/workflow/environment, so the engine job uses
-  # `pypi` and this one uses `pypi-stub`.
+  # exmergo-dex-core. This is a one-time reservation, so it must be idempotent
+  # across releases. `uv publish --check-url` does NOT achieve that: it skips a
+  # file only when the remote copy is byte-identical, and a rebuilt static-version
+  # (0.0.0) stub wheel is not reproducible, so its hash differs from the copy
+  # published on the first release and uv errors ("Local file and index file do
+  # not match") instead of skipping. So we gate on whether the project already
+  # exists on PyPI and no-op if it does. Needs its own PyPI Trusted Publisher for
+  # the `dex-core` project, with a DISTINCT environment (pypi-stub): PyPI rejects
+  # two pending publishers that share an identical owner/repo/workflow/environment,
+  # so the engine job uses `pypi` and this one uses `pypi-stub`.
   reserve-dex-core:
     needs: publish
     runs-on: ubuntu-latest
@@ -113,7 +117,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - name: Build the dex-core stub
-        run: uv build
-      - name: Publish the stub (idempotent; skips if already on PyPI)
-        run: uv publish --check-url https://pypi.org/simple/
+      - name: Reserve dex-core on PyPI (once; no-op if the name already exists)
+        run: |
+          # Publish only on a definite 404 (name not yet reserved). On 200 the
+          # name is already held, so skip. On any other response (network/5xx)
+          # skip too, rather than risk the non-idempotent publish path above.
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://pypi.org/pypi/dex-core/json)
+          case "$code" in
+            200) echo "dex-core is already reserved on PyPI; nothing to do."; exit 0 ;;
+            404) echo "dex-core not found on PyPI; building and publishing the stub." ;;
+            *)   echo "Unexpected HTTP ${code} from PyPI; skipping to avoid a bad publish."; exit 0 ;;
+          esac
+          uv build
+          uv publish

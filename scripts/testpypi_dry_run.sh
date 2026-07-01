@@ -66,9 +66,9 @@ TMP="$(mktemp -d)"
 )
 
 echo "==> hand-bump wrapper pins to ${VERSION} (the release pipeline automates this)"
-for skill in explore transform model; do
+for skill in explore transform maintain; do
   sed -i.bak -E \
-    "s/exmergo-dex-core\[duckdb\]==[0-9][^\"]*/exmergo-dex-core[duckdb]==${VERSION}/" \
+    "s/DEX_CORE_VERSION = \"[^\"]*\"/DEX_CORE_VERSION = \"${VERSION}\"/" \
     "${ROOT}/skills/${skill}/scripts/run.py"
   rm -f "${ROOT}/skills/${skill}/scripts/run.py.bak"
 done

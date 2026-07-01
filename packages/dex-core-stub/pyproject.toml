@@ -5,9 +5,8 @@ build-backend = "hatchling.build"
 # Anti-squat placeholder that reserves the short name `dex-core` on PyPI and
 # points users at the real distribution, `exmergo-dex-core`. It ships no working
 # code on purpose. The version is independent of the engine and rarely changes;
-# the release workflow publishes it idempotently (uv publish --check-url), so the
-# name is claimed on the first release and the upload is skipped on every release
-# after.
+# the release workflow reserves the name once, gating on whether the project
+# already exists on PyPI and building and publishing the stub only if it does not.
 [project]
 name = "dex-core"
 version = "0.0.0"
