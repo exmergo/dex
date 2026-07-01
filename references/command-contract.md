@@ -1,6 +1,6 @@
 # The dex-core command contract
 
-This is the integration keystone (v9 system design, §10.1). It is the boundary between the agent
+This is the integration keystone. It is the boundary between the agent
 and the engine, and it is what keeps every agent surface thin: each surface calls
 the same subcommands and reads the same envelope, so no surface re-implements
 logic.

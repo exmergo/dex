@@ -1,12 +1,11 @@
 # ADE-bench (home benchmark)
 
-ADE-bench (dbt Labs, Apache-2.0) is dex's home benchmark (v8 §14.4). It runs
+ADE-bench (dbt Labs, Apache-2.0) is dex's home benchmark. It runs
 Claude Code with plugin-sets and a real `--plugin-set none` baseline, supports
 `--agent claude / codex / gemini`, grades by dbt tests plus table-equality against
 answer-key seeds, runs on DuckDB or Snowflake, and reports cost, tokens, and
 turns. There is no official leaderboard, so dex publishes its own attributed
-numbers. Semantic-model maintenance is a confirmed gap dex contributes into
-(§14.5).
+numbers. Semantic-model maintenance is a confirmed gap dex contributes into.
 
 ## Phase 0 spike (run locally, with your environment)
 

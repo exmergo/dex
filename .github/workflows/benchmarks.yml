@@ -1,6 +1,6 @@
 name: Benchmarks (Tier 3)
 
-# Scheduled, cost-capped external benchmarks (v7 §14.4, §15.3). Wired in Phase 5.
+# Scheduled, cost-capped external benchmarks.
 # Not run per-commit because the cloud tracks cost real warehouse money; the free
 # DuckDB tracks (ADE-bench --db duckdb, Spider2.0-DBT) lead. A pass-rate or
 # cost/turn regression blocks a release.

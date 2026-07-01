@@ -1,7 +1,7 @@
 # Semantic-model-maintenance benchmark (own the gap)
 
 Semantic-model maintenance is the least-benchmarked of the three jobs, and it is
-confirmed uncovered by ADE-bench and Spider 2.0 (v8 §14.5). This is dex's unique
+confirmed uncovered by ADE-bench and Spider 2.0. This is dex's unique
 layer, so dex defines its own measurement.
 
 Plan (Phase 5): contribute semantic-model-maintenance tasks to ADE-bench first

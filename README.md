@@ -56,9 +56,7 @@ cost/turn efficiency, Spider2.0-DBT) land with v0.3.
 This repository is currently at the foundation stage: the command contract, the
 dbt-project-as-source-of-truth model with a non-canonical `.dex/` cache, a dormant
 OSI exporter (validator against a pinned schema, not emitted in v1), and the
-three-tier eval and safety spine. See `dex-execution-plan.md` for the program and
-`dex-v9-system-design.md` for the system design (`dex-v8-system-design.md` and
-`dex-v7-system-design.md` are kept as the historical record).
+three-tier eval and safety spine.
 
 ## Beyond Claude Code
 

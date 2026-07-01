@@ -1,7 +1,7 @@
 # Evaluation: the three-tier pyramid
 
 dex is built eval-driven: a change does not ship unless its evals pass and it
-still beats the no-skill baseline (v9 §14). Evaluation is three things at once: a
+still beats the no-skill baseline. Evaluation is three things at once: a
 quality moat, a safety mechanism, and a marketing asset (published benchmark
 scores).
 

@@ -1,7 +1,7 @@
 # Connector: DuckDB
 
 DuckDB is a first-class product connector and, at the same time, the engine behind
-dex's evals and benchmarks (v9 §9). One adapter, three uses: the zero-credential
+dex's evals and benchmarks. One adapter, three uses: the zero-credential
 on-ramp, the dev and CI engine, and the eval and benchmark engine.
 
 ## Auth and target
