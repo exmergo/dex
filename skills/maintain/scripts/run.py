@@ -110,7 +110,11 @@ def main() -> int:
         "exmergo_dex_core",
         *argv,
     ]
-    return subprocess.call(cmd)
+    # The engine runs in uv's own ephemeral environment, so an inherited
+    # VIRTUAL_ENV (e.g. the user's activated venv) is irrelevant here and only
+    # makes uv print a mismatch warning on every call. Drop it.
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    return subprocess.call(cmd, env=env)
 
 
 if __name__ == "__main__":
