@@ -44,9 +44,9 @@ jobs:
           fail=0
           for skill in explore transform maintain; do
             f="skills/${skill}/scripts/run.py"
-            if ! grep -qF "exmergo-dex-core[duckdb]==${VERSION}\"" "$f"; then
+            if ! grep -qF "DEX_CORE_VERSION = \"${VERSION}\"" "$f"; then
               echo "${f} is not pinned to ${VERSION}:"
-              grep -n "DEX_CORE_PIN" "$f" || true
+              grep -n "DEX_CORE_VERSION" "$f" || true
               fail=1
             fi
           done
