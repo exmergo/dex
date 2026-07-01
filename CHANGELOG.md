@@ -9,6 +9,29 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.0a2] - 2026-07-01
+
+The ETM taxonomy correction. The three motions are now Explore, Transform, and
+Maintain (previously Explore, Transform, Model). Explore remains the only live
+stage; Transform and Maintain report `not_implemented` until they land.
+
+### Changed
+
+- The tagline and third motion: **Explore. Transform. Maintain.** "Model" is
+  retired as a verb because it is overloaded (dbt model, data modeling, semantic
+  model, LookML, ML); the ETM acronym is preserved.
+- Semantic-layer authoring folds into the `transform` skill as a first-class
+  capability. There is no separate `model` skill; both dbt SQL models and dbt
+  semantic models are authored as reviewable diffs to the dbt project.
+- Reconcile is promoted from an unnamed cross-skill behavior to the `maintain`
+  skill, now backed by a real command group: `snapshot` (baseline), `check`
+  (sweep), the per-axis detectors `schema` / `grain` / `semantic`, and
+  `reconcile` (propose fixing diffs). Detection is read-only; only reconcile
+  emits diffs. Manual and free; continuous, governed maintenance stays the
+  commercial product.
+- The engine CLI renames the `model` command group to `semantic`
+  (`semantic define|update`), removing the "model" overload from the surface.
+
 ## [0.1.0a1] - 2026-06-30
 
 First public alpha. The Explore stage of the ETM loop runs end to end on DuckDB;
@@ -41,5 +64,6 @@ the rest of the loop is scaffolded and reports `not_implemented` until it lands.
 - The cloud and operational connectors (BigQuery, Snowflake, Databricks,
   PostgreSQL) and their cost paradigms.
 
-[Unreleased]: https://github.com/exmergo/dex/compare/v0.1.0a1...HEAD
+[Unreleased]: https://github.com/exmergo/dex/compare/v0.1.0a2...HEAD
+[0.1.0a2]: https://github.com/exmergo/dex/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/exmergo/dex/releases/tag/v0.1.0a1
