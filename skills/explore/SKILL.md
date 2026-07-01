@@ -1,6 +1,6 @@
 ---
 name: explore
-description: Use this to make sense of an unfamiliar data warehouse or DuckDB database: inventory and rank what is there, profile columns, detect PII, and infer how tables join, producing a draft map of the warehouse without dumping the schema into context. Trigger it for questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", or "profile these columns". This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).
+description: Use this to make sense of a database, warehouse, or DuckDB file: inventory and rank what is there, profile columns, detect PII, flag grain and data-quality problems, and infer how tables join, producing a draft map without dumping the schema into context. Trigger it for casual, artifact-first prompts like "what's in my duckdb", "what's in this database", "what data do I have", "take a look at data.duckdb", or "any PII in here", as well as analyst questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", "is this data any good", or "profile these columns". Any mention of exploring, inspecting, or understanding a .duckdb or .db file, a warehouse connection, or unfamiliar data qualifies. This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).
 ---
 
 # Explore
@@ -25,9 +25,13 @@ Subcommands, in the usual order:
    reports capabilities.
 2. `explore inventory --rank` returns a ranked object summary (counts and sizes,
    never rows).
-3. `explore profile <objects>` returns column profiles and PII flags recorded as
-   (column, category, confidence), never example values.
-4. `explore relationships` returns inferred and declared joins.
+3. `explore profile <objects>` (space- or comma-separated) returns column
+   profiles, PII flags recorded as (column, category, confidence) and never
+   example values, plus candidate keys, the likely grain, and data-quality
+   warnings (e.g. a non-unique id that will fan out on joins).
+4. `explore relationships` returns inferred and declared joins with confidences,
+   plus notes explaining what the inference examined (so an empty list is
+   meaningful).
 5. `explore map` writes or updates the `.dex/` cache and prints a summary.
 
 ## Guardrails (enforced in the engine, not here)

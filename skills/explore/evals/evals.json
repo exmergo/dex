@@ -3,6 +3,12 @@
   "triggering": {
     "positive": [
       "What's in this warehouse?",
+      "What's in my duckdb?",
+      "What's in this database?",
+      "What data do I have here?",
+      "Take a look at data.duckdb and tell me what's there.",
+      "Do we have any PII in this database?",
+      "Is this data any good?",
       "Which tables actually matter here?",
       "What does the customers table contain?",
       "How do orders and customers join?",
