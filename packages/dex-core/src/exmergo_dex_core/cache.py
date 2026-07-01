@@ -20,7 +20,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 # Bump when the on-disk cache shape changes in a way old readers cannot handle.
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 
 class PIICategory(str, Enum):
@@ -33,6 +33,9 @@ class PIICategory(str, Enum):
     CREDENTIAL = "credential"
     LOCATION = "location"
     DOB = "date_of_birth"
+    # Free-text fields (comments, notes, message bodies) reliably carry names and
+    # contact details even though the column name itself is not a PII token.
+    FREE_TEXT = "free_text"
     OTHER = "other"
 
 
