@@ -44,7 +44,7 @@ Cloud warehouse: **BigQuery**, **Snowflake**, **Databricks**. Operational
 database: **PostgreSQL**. Embedded analytical: **DuckDB** (the zero-credential
 on-ramp, and the engine behind the eval and benchmark suites). Each client library
 is behind an optional extra, so the DuckDB on-ramp installs only `duckdb` and
-`sqlglot`.
+`sqlglot`. To pull every connector at once, install `exmergo-dex-core[all]`.
 
 ## Status
 

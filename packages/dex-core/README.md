@@ -25,6 +25,7 @@ exmergo-dex-core[snowflake]
 exmergo-dex-core[bigquery]
 exmergo-dex-core[databricks]
 exmergo-dex-core[postgres]
+exmergo-dex-core[all]          # every connector at once
 ```
 
 ## The command contract

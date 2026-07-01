@@ -600,6 +600,16 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "databricks-sdk" },
+    { name = "databricks-sql-connector" },
+    { name = "dbt-duckdb" },
+    { name = "duckdb" },
+    { name = "google-cloud-bigquery" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "snowflake-connector-python" },
+    { name = "sqlglot" },
+]
 bigquery = [
     { name = "google-cloud-bigquery" },
     { name = "sqlglot" },
@@ -629,25 +639,33 @@ snowflake = [
 
 [package.metadata]
 requires-dist = [
+    { name = "databricks-sdk", marker = "extra == 'all'", specifier = ">=0.30" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.30" },
+    { name = "databricks-sql-connector", marker = "extra == 'all'", specifier = ">=3" },
     { name = "databricks-sql-connector", marker = "extra == 'databricks'", specifier = ">=3" },
+    { name = "dbt-duckdb", marker = "extra == 'all'", specifier = ">=1.9" },
     { name = "dbt-duckdb", marker = "extra == 'duckdb'", specifier = ">=1.9" },
+    { name = "duckdb", marker = "extra == 'all'", specifier = ">=1" },
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1" },
+    { name = "google-cloud-bigquery", marker = "extra == 'all'", specifier = ">=3" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3" },
     { name = "jsonschema", specifier = ">=4.18" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.19" },
+    { name = "snowflake-connector-python", marker = "extra == 'all'", specifier = ">=3" },
     { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3" },
+    { name = "sqlglot", marker = "extra == 'all'", specifier = ">=25" },
     { name = "sqlglot", marker = "extra == 'bigquery'", specifier = ">=25" },
     { name = "sqlglot", marker = "extra == 'databricks'", specifier = ">=25" },
     { name = "sqlglot", marker = "extra == 'duckdb'", specifier = ">=25" },
     { name = "sqlglot", marker = "extra == 'postgres'", specifier = ">=25" },
     { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=25" },
 ]
-provides-extras = ["bigquery", "databricks", "dev", "duckdb", "postgres", "snowflake"]
+provides-extras = ["all", "bigquery", "databricks", "dev", "duckdb", "postgres", "snowflake"]
 
 [[package]]
 name = "filelock"
