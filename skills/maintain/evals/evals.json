@@ -1,0 +1,43 @@
+{
+  "skill_name": "maintain",
+  "triggering": {
+    "positive": [
+      "What changed in the warehouse since I last looked?",
+      "Did anything drift in my dbt project?",
+      "Is my dbt project still in sync with the source schema?",
+      "Reconcile my models with the current warehouse schema.",
+      "Which of my models are stale after the upstream change?"
+    ],
+    "negative": [
+      "What's in this warehouse and which tables matter?",
+      "Profile the events table and flag PII.",
+      "Build a staging model for raw orders.",
+      "Define a revenue metric on top of fct_orders."
+    ]
+  },
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "The upstream orders table gained a column and dropped another. Tell me what drifted in my dbt project and how to fix it.",
+      "expected_output": "A drift report from diffing the current warehouse and dbt against the last .dex/ snapshot, with proposed edits as reviewable diffs; nothing applied.",
+      "files": [],
+      "assertions": [
+        "Drift is computed from the .dex/ snapshot and metadata, not by scanning source rows",
+        "The report distinguishes added, dropped, and type-changed columns and the models they affect",
+        "Proposed reconciliation edits are reviewable diffs, never silently applied",
+        "No raw rows and no credentials appear in the output (clean envelope)"
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "A metric definition changed in the business. Check whether my semantic model still matches and propose a reconciliation.",
+      "expected_output": "Semantic/definition drift surfaced against the snapshot, with a proposed diff to bring the dbt semantic model back in sync; conflicts with hand-written intent surfaced and asked about.",
+      "files": [],
+      "assertions": [
+        "Human dbt edits are authoritative by construction (dbt is the source of truth)",
+        "Definition drift is surfaced as a proposed diff, never a silent overwrite",
+        "On ambiguity the engine surfaces the divergence and asks rather than overwriting"
+      ]
+    }
+  ]
+}
