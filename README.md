@@ -1,14 +1,14 @@
 # dex: the agent-native analytics engineering toolkit
 
-**Explore. Transform. Model. (ETM)**
+**Explore. Transform. Maintain. (ETM)**
 
 dex is analytics engineering for Claude Code and any agent: data warehouse
-exploration, data transformation, and semantic model maintenance on dbt. Point it
-at your warehouse (or a local DuckDB file) and your dbt project; it learns the
-landscape, writes and refactors your dbt transformations, maintains your dbt
-semantic models, and tells you what to fix when anything drifts. The dbt project
-is the source of truth; every change is a reviewable diff. Read-only against your
-data.
+exploration, dbt transformation and semantic modeling, and schema-drift
+maintenance on dbt. Point it at your warehouse (or a local DuckDB file) and your
+dbt project; it learns the landscape, writes and refactors your dbt transformations
+and semantic models, and tells you what to fix when anything drifts. The dbt
+project is the source of truth; every change is a reviewable diff. Read-only
+against your data.
 
 It closes the gap a general coding agent still has: agents re-learn the schema
 each session, have no strategy for thousands of tables, are blind to warehouse
@@ -20,12 +20,12 @@ time. dex owns exactly that loop.
 
 - **Explore** an unfamiliar warehouse: rank what matters, profile selectively,
   infer joins, persist a draft map. Fully read-only.
-- **Transform** raw data into dbt models (staging to marts) with tests and docs.
+- **Transform** the dbt project: author dbt models (staging to marts) with tests
+  and docs, and the semantic layer on top (entities, dimensions, measures,
+  metrics) as dbt semantic models (MetricFlow YAML), with a free Viz preview.
   Validated against a dev target, cost-guarded.
-- **Model** a semantic layer on top (entities, dimensions, measures, metrics),
-  written as dbt semantic models (MetricFlow YAML), with a free Viz preview.
-- **Reconcile** drift: diff the warehouse and dbt against the last snapshot and
-  propose edits.
+- **Maintain** the project as it drifts: diff the warehouse and dbt against the
+  last snapshot, surface schema and definition drift, and propose edits.
 
 ## Install (Claude Code)
 
@@ -35,7 +35,7 @@ time. dex owns exactly that loop.
 ```
 
 Update later with `/plugin marketplace update exmergo`. The skills appear as
-`/dex:explore`, `/dex:transform`, and `/dex:model` and auto-trigger on matching
+`/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
 intent.
 
 ## Connectors
@@ -57,8 +57,8 @@ This repository is currently at the foundation stage: the command contract, the
 dbt-project-as-source-of-truth model with a non-canonical `.dex/` cache, a dormant
 OSI exporter (validator against a pinned schema, not emitted in v1), and the
 three-tier eval and safety spine. See `dex-execution-plan.md` for the program and
-`dex-v8-system-design.md` for the system design (`dex-v7-system-design.md` is kept
-as the historical record).
+`dex-v9-system-design.md` for the system design (`dex-v8-system-design.md` and
+`dex-v7-system-design.md` are kept as the historical record).
 
 ## Beyond Claude Code
 
@@ -89,8 +89,8 @@ credentials:
 - **GitHub repo metadata:** set the repo **description** to the keyword sentence
   at the top of this README, and add **Topics**: `analytics-engineering`, `dbt`,
   `claude-code`, `text-to-sql`, `semantic-layer`, `duckdb`, `snowflake`,
-  `bigquery`, `databricks`, `data-engineering`, `agent`, `metricflow`. This is
-  where discovery lives, not the slug.
+  `bigquery`, `databricks`, `data-engineering`, `agent`, `metricflow`,
+  `schema-drift`, `data-contracts`. This is where discovery lives, not the slug.
 - **TestPyPI dry-run:** `scripts/testpypi_dry_run.sh` proves the publish-and-pin
   loop before automation.
 - **PyPI Trusted Publishing (both projects):** configure a pending publisher for
