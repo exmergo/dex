@@ -25,9 +25,13 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": ["inventory", "profile", "relationships", "map"],
     "transform": ["plan", "apply", "build"],
-    "model": ["define", "maintain"],
+    "semantic": ["define", "update"],
     "emit": ["dbt", "osi"],
-    "reconcile": [],
+    # maintain: keep the dbt project correct as the world drifts. `snapshot`
+    # captures the known-good baseline; `check` sweeps every axis against it;
+    # `schema`/`grain`/`semantic` are the per-axis deep detectors; `reconcile`
+    # proposes the fixing diffs. Detection is read-only; only reconcile emits diffs.
+    "maintain": ["snapshot", "check", "schema", "grain", "semantic", "reconcile"],
     "viz": ["preview"],
 }
 
@@ -55,7 +59,7 @@ def _sub_connection_options() -> argparse.ArgumentParser:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dex",
-        description="dex-core command contract (Explore. Transform. Model.)",
+        description="dex-core command contract (Explore. Transform. Maintain.)",
     )
     # Real defaults live on the top-level parser so every namespace has them.
     parser.add_argument("--connector", default=None)
@@ -85,6 +89,17 @@ def _build_parser() -> argparse.ArgumentParser:
                 # transform plan/apply take a positional argument in later phases.
                 if group == "transform" and name in {"plan", "apply"}:
                     sp.add_argument("argument", nargs="?", default=None)
+                # maintain detectors take an optional object scope (default: whole
+                # project); reconcile takes an optional drift class to fix.
+                if group == "maintain" and name in {"schema", "grain", "semantic"}:
+                    sp.add_argument("objects", nargs="*")
+                if group == "maintain" and name == "reconcile":
+                    sp.add_argument(
+                        "drift_class",
+                        nargs="?",
+                        choices=["schema", "grain", "semantic"],
+                        default=None,
+                    )
     return parser
 
 

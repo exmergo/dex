@@ -1,6 +1,6 @@
 # The dex-core command contract
 
-This is the integration keystone (v8 system design, §10.1). It is the boundary between the agent
+This is the integration keystone (v9 system design, §10.1). It is the boundary between the agent
 and the engine, and it is what keeps every agent surface thin: each surface calls
 the same subcommands and reads the same envelope, so no surface re-implements
 logic.
@@ -33,11 +33,22 @@ dex explore map                   -> write/update the .dex cache; print a summar
 dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet)
 dex transform apply <plan-id>     -> write diffs into the dbt project (a reviewable git diff)
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget
-dex model define|maintain ...     -> dbt semantic model edits as diffs
-dex emit dbt                      -> write/refresh dbt semantic YAML from the model edits
-dex reconcile                     -> diff warehouse + dbt vs the last .dex snapshot; propose edits
+dex semantic define|update ...    -> dbt semantic model edits as diffs (fronted by transform)
+dex emit dbt                      -> write/refresh dbt semantic YAML from the semantic edits
+dex maintain snapshot             -> capture/refresh the known-good baseline in .dex/snapshot.json
+dex maintain check                -> sweep every drift axis vs the snapshot; ranked drift report (read-only)
+dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed; nullability
+dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join fanout
+dex maintain semantic [<objects>] -> definition drift: metric/measure/dimension/entity defs, new values, dangling refs
+dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as diffs (never applied)
 dex viz preview                   -> emit the dbt semantic model to the free Viz preview
 ```
+
+Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
+fronts `transform`, `semantic`, `emit`, and `viz`; `maintain` fronts the whole
+`maintain` group. Within `maintain`, `snapshot` manages the baseline, `check`
+plus `schema`/`grain`/`semantic` detect drift (read-only), and `reconcile` is the
+only verb that emits diffs.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--repo-root`, `--confirm`, `--budget`.

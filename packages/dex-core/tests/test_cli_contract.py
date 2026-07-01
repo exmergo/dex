@@ -49,7 +49,9 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
 
 
 def test_unbuilt_commands_report_not_implemented(capsys):
-    assert main(["model", "define"]) == 0
+    assert main(["semantic", "define"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
+    assert main(["maintain", "check"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
 
 
