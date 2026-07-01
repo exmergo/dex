@@ -9,7 +9,8 @@ files as reviewable diffs; dex never holds a competing copy, so human dbt edits 
 authoritative by construction.
 
 Absent a dbt project, explore still works (writing only to the `.dex/` cache), but
-transform and model require one, since dbt is what they edit. Not yet implemented.
+transform and maintain require one, since dbt is what they edit and diff. Not yet
+implemented.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ class DbtProjectError(Exception):
 
 def load(project_dir: Path | str = ".") -> Any:
     """Load the dbt project (manifest + source files) into an in-memory view that
-    is the source of truth for transform and model."""
+    is the source of truth for transform and maintain."""
 
     raise NotImplementedError
 

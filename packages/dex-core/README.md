@@ -6,9 +6,9 @@ Claude Code skills and the cross-agent `AGENTS.md` are thin wrappers that drive 
 through one stable command contract.
 
 dex is the agent-native analytics engineering toolkit: explore an unfamiliar
-warehouse, transform raw data into clean dbt models, and maintain a semantic model
-on top, then keep all three in sync as the data underneath changes. Read-only
-against your data; every change is a reviewable diff.
+warehouse, transform raw data into clean dbt models and a semantic layer on top,
+and maintain all of it as the data underneath changes. Read-only against your data;
+every change is a reviewable diff.
 
 ## Install
 
@@ -43,11 +43,12 @@ the full surface and the envelope spec.
 ## Status
 
 Early and under active development; expect pre-release versions. Today the engine
-runs the Explore loop on DuckDB end to end: it ranks what matters in an unfamiliar
+runs the Explore stage on DuckDB end to end: it ranks what matters in an unfamiliar
 warehouse, profiles columns selectively, flags PII, and infers joins, all
-read-only. Transform, Model, and Reconcile, and the cloud connectors (BigQuery,
-Snowflake, Databricks, PostgreSQL), are in progress and report `not_implemented`
-until they land. The foundations are in place: the command contract, the
+read-only. Transform (dbt models and the semantic layer) and Maintain (drift and
+reconcile), and the cloud connectors (BigQuery, Snowflake, Databricks,
+PostgreSQL), are in progress and report `not_implemented` until they land. The
+foundations are in place: the command contract, the
 canonical model and `.dex/` layout, the OSI validator against a pinned schema,
 and the eval and safety spine.
 

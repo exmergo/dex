@@ -42,7 +42,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           fail=0
-          for skill in explore transform model; do
+          for skill in explore transform maintain; do
             f="skills/${skill}/scripts/run.py"
             if ! grep -qF "exmergo-dex-core[duckdb]==${VERSION}\"" "$f"; then
               echo "${f} is not pinned to ${VERSION}:"

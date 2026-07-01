@@ -44,7 +44,9 @@ informs proposals, never the source of truth:
   config.yml      non-secret config: connector + dbt target, budgets, ranking hints
   cache.json      exploration artifacts (DexCache): profiles, PII flags, relationships,
                   candidate keys, grain, rankings, data-quality observations
-  snapshot.json   the last reconcile snapshot (a frozen fingerprint of dbt + warehouse)
+  snapshot.json   the maintain baseline: a frozen fingerprint of the warehouse schema, the
+                  dbt manifest state, and declared grain/semantic assumptions. Written by
+                  `maintain snapshot`; the drift detectors diff current reality against it.
 ```
 
 Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the dbt
@@ -68,7 +70,7 @@ OSI until the format matures. See `osi-map-schema.md`.
 
 ## The round-trip rule (reconcile, simplified)
 
-1. Re-read the dbt project and warehouse on every transform, model, or reconcile.
+1. Re-read the dbt project and warehouse on every transform or maintain run.
 2. Human edits are already authoritative (dbt is canonical); there is no internal
    copy to reconcile against, only the `.dex/` snapshot used to detect change.
 3. Diff the current dbt project and warehouse against the snapshot; propose edits.

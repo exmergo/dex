@@ -1,7 +1,7 @@
 {
   "name": "dex",
-  "description": "Analytics engineering for Claude Code and any agent: data warehouse exploration, data transformation, and semantic model maintenance on dbt.",
-  "version": "0.1.0-alpha.1",
+  "description": "Analytics engineering for Claude Code and any agent: data warehouse exploration, dbt transformation and semantic modeling, and schema-drift maintenance on dbt.",
+  "version": "0.1.0-alpha.2",
   "author": {
     "name": "Exmergo, Inc.",
     "email": "support@exmergo.com",
@@ -22,6 +22,8 @@
     "databricks",
     "data-engineering",
     "agent",
-    "metricflow"
+    "metricflow",
+    "schema-drift",
+    "data-contracts"
   ]
 }
