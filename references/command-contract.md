@@ -9,7 +9,9 @@ logic.
 
 - A surface (SKILL.md or AGENTS.md) tells the agent which subcommand to run.
 - A thin PEP 723 wrapper (`skills/<skill>/scripts/run.py`) runs it via `uv run`
-  against the pinned engine.
+  against the pinned engine version, installing the connector extra it resolves at
+  runtime (an explicit `--connector`, then `.dex/config.yml`, then DuckDB), so the
+  pin stays connector-neutral.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.
