@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "exmergo-dex-core"
 dynamic = ["version"]
-description = "Analytics engineering for Claude Code and any agent: data warehouse exploration, data transformation, and semantic model maintenance, emitting governed-ready dbt and OSI semantic models."
+description = "Analytics engineering for Claude Code and any agent: data warehouse exploration, dbt transformation and semantic modeling, and schema-drift maintenance on dbt."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -37,8 +37,13 @@ dependencies = [
 dex = "exmergo_dex_core.cli:main"
 
 [project.optional-dependencies]
-# The on-ramp extra: duckdb + the dialect engine, nothing else.
-duckdb = ["duckdb>=1", "sqlglot>=25"]
+# The DuckDB on-ramp and the full local ETM loop: the duckdb client, the dialect
+# engine, and dbt-duckdb (which pulls dbt-core). All three skills install this one
+# extra, and transform/maintain author and build a dbt project against a DuckDB
+# dev target, so dbt-duckdb belongs here. (This makes the on-ramp heavier than a
+# pure explore-only install would need; a separate lighter explore extra can be
+# split out later if that tradeoff matters.)
+duckdb = ["duckdb>=1", "sqlglot>=25", "dbt-duckdb>=1.9"]
 snowflake = ["snowflake-connector-python>=3", "sqlglot>=25"]
 bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25"]
 databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=25"]
