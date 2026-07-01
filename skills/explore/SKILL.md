@@ -1,6 +1,6 @@
 ---
 name: explore
-description: Use this to make sense of an unfamiliar data warehouse or DuckDB database: inventory and rank what is there, profile columns, detect PII, and infer how tables join, producing a draft map of the warehouse without dumping the schema into context. Trigger it for questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", or "profile these columns". This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models (use transform) or to define metrics and the semantic layer (use model).
+description: Use this to make sense of an unfamiliar data warehouse or DuckDB database: inventory and rank what is there, profile columns, detect PII, and infer how tables join, producing a draft map of the warehouse without dumping the schema into context. Trigger it for questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", or "profile these columns". This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).
 ---
 
 # Explore

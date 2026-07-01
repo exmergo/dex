@@ -26,7 +26,7 @@ ENGINE_VERSION="${ENGINE_VERSION#v}"
 PLUGIN_VERSION="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-for skill in explore transform model; do
+for skill in explore transform maintain; do
   f="${ROOT}/skills/${skill}/scripts/run.py"
   sed -i.bak -E \
     "s/exmergo-dex-core\[duckdb\]==[0-9][^\"]*/exmergo-dex-core[duckdb]==${ENGINE_VERSION}/" \

@@ -12,7 +12,7 @@
       "Build a staging model for the orders table.",
       "Refactor this dbt model and add tests.",
       "Define a revenue metric on top of fct_orders.",
-      "Maintain the dbt semantic models for the finance domain."
+      "What changed in the warehouse and did my dbt project drift?"
     ]
   },
   "evals": [

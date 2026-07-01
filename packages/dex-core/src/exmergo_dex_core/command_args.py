@@ -3,8 +3,8 @@
 These adapt an ``argparse.Namespace`` into the inputs the engine speaks: an open
 adapter and a repo root. They live at the command layer, deliberately not in the
 engine core, so ``inventory``/``profile``/``rank``/``relationships`` never depend
-on argparse. Every ``cmd_*`` module shares them (explore today; transform, model,
-and reconcile as they land).
+on argparse. Every ``cmd_*`` module shares them (explore today; transform,
+semantic, and maintain as they land).
 """
 
 from __future__ import annotations

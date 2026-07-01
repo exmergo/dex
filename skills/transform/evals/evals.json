@@ -5,13 +5,17 @@
       "Build a staging model for the raw orders table.",
       "Refactor stg_customers and add not_null and unique tests.",
       "Create a marts model that joins orders and customers.",
-      "Add documentation and tests to this dbt model."
+      "Add documentation and tests to this dbt model.",
+      "Define a revenue metric on top of fct_orders.",
+      "Add a customer_region dimension to the customer entity.",
+      "Build dbt semantic models (MetricFlow) for the orders mart.",
+      "Preview this semantic model in Viz."
     ],
     "negative": [
       "What's in this warehouse and which tables matter?",
       "Profile the events table and flag PII.",
-      "Define a revenue metric as a dbt semantic model.",
-      "Maintain the semantic layer for the finance domain."
+      "What changed in the warehouse since I last looked?",
+      "Reconcile my dbt project with the current source schema."
     ]
   },
   "evals": [
@@ -35,6 +39,18 @@
       "assertions": [
         "Human-written dbt is treated as authoritative; no silent overwrite",
         "No warehouse build runs without explicit confirmation and a budget"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Define a revenue metric and a couple of dimensions on top of my orders mart as dbt semantic models.",
+      "expected_output": "Semantic-layer edits written as dbt semantic models (MetricFlow YAML) in the dbt project, presented as a reviewable diff.",
+      "files": [],
+      "assertions": [
+        "The dbt project is the source of truth; edits are diffs to dbt semantic YAML, not a parallel model",
+        "Emitted dbt semantic models are valid MetricFlow YAML",
+        "PII flags propagate into emitted dbt (model and column meta); no example values",
+        "Nothing is applied silently; the change is a reviewable diff"
       ]
     }
   ]

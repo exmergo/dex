@@ -1,7 +1,7 @@
 # Connector: DuckDB
 
 DuckDB is a first-class product connector and, at the same time, the engine behind
-dex's evals and benchmarks (v8 §9). One adapter, three uses: the zero-credential
+dex's evals and benchmarks. One adapter, three uses: the zero-credential
 on-ramp, the dev and CI engine, and the eval and benchmark engine.
 
 ## Auth and target
@@ -36,7 +36,7 @@ true`, `paradigm: free_local`, the engine version, and the resource bounds.
 
 ## Why it anchors v0.1
 
-The full Explore, Transform, Model loop is built and proven on DuckDB first, with
+The full Explore, Transform, Maintain loop is built and proven on DuckDB first, with
 no cloud accounts, fully deterministic in CI. The cloud connectors and their cost
 paradigms layer onto the proven loop in Phase 4. It also matches ADE-bench's
 DuckDB mode and Spider2.0-DBT's dbt engine, so the test engine and the benchmark

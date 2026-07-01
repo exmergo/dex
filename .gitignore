@@ -1,9 +1,14 @@
-# ─── Local Claude Code guidance (kept private; see discussion) ───────────────
-# The v7 design lists CLAUDE.md as a committed repo surface (a thin pointer to
-# AGENTS.md + principles). We're keeping the current, opinionated CLAUDE.md
-# local for now. Revisit when splitting baseline-shareable guidance from sauce.
+# ─── Local Claude Code guidance (kept private) ───────────────────────────────
+# CLAUDE.md is kept local and opinionated for now (a private pointer to
+# AGENTS.md plus the principles), not committed. Revisit when splitting
+# baseline-shareable guidance from the private guidance.
 CLAUDE.md
 CLAUDE.local.md
+
+# ─── Private planning docs (maintainer's steering docs; NEVER commit) ─────────
+# The maintainer's private steering docs. They guide the project but are private;
+# committed files must never reference them or their versions.
+unversioned-docs/
 
 # ─── Secrets & credentials (NEVER commit — dex connects to prod warehouses) ──
 .env
@@ -47,7 +52,7 @@ wheels/
 *.egg-info/
 .eggs/
 MANIFEST
-# NOTE: uv.lock is committed on purpose (reproducible builds, §15) — do not add it.
+# NOTE: uv.lock is committed on purpose (reproducible builds); do not add it.
 
 # ─── Virtual environments ────────────────────────────────────────────────────
 .venv/

@@ -7,5 +7,4 @@ validator: OSI documents validate against the pinned
 `packages/dex-core/src/exmergo_dex_core/schemas/osi-schema.json` via `jsonschema`,
 and richness OSI cannot express rides in `custom_extensions` under the `DEX` vendor
 name. The pin and its provenance are documented in `schemas/PINNED.md`. The
-exporter (`exporters/osi.py`) is switched on when OSI matures. See the v8 system
-design, §8.
+exporter (`exporters/osi.py`) is switched on when OSI matures.

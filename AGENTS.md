@@ -2,19 +2,22 @@
 
 dex is the agent-native analytics engineering toolkit. All logic lives in one
 portable engine, `exmergo-dex-core`; this file tells any coding agent how to drive
-it. On Claude Code the three skills (`explore`, `transform`, `model`) auto-trigger
-and do this for you. On other agents, follow the contract below directly. The
-guardrails and outputs are identical because they live in the engine, not here.
+it. On Claude Code the three skills (`explore`, `transform`, `maintain`)
+auto-trigger and do this for you. On other agents, follow the contract below
+directly. The guardrails and outputs are identical because they live in the
+engine, not here.
 
-## The loop: Explore, Transform, Model (ETM)
+## The loop: Explore, Transform, Maintain (ETM)
 
 1. **Explore** an unfamiliar warehouse or DuckDB database: rank what matters,
    profile selectively, infer joins, persist a draft map.
-2. **Transform** raw data into dbt models (staging to marts) with tests and docs.
-3. **Model** a semantic layer on top (entities, dimensions, measures, metrics),
-   written as dbt semantic models (MetricFlow YAML) in the dbt project.
-4. **Reconcile** is a cross-skill behavior: diff the warehouse and dbt against the
-   last `.dex/` snapshot and propose edits.
+2. **Transform** the dbt project: author and refactor dbt SQL models (staging to
+   marts) with tests and docs, and author the semantic layer on top (entities,
+   dimensions, measures, metrics) as dbt semantic models (MetricFlow YAML). Both
+   are the same job, reviewable diffs to the dbt project.
+3. **Maintain** the project as the world changes: diff the current warehouse and
+   dbt against the last `.dex/` snapshot, surface schema and definition drift, and
+   propose the reconciling edits.
 
 ## The command contract
 
@@ -38,10 +41,21 @@ uv run scripts/run.py <subcommand> [flags]
 | `transform plan "<intent>"` | proposed dbt edits as diffs (nothing applied) |
 | `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff) |
 | `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget |
-| `model define\|maintain ...` | dbt semantic model edits as diffs |
-| `emit dbt` | write/refresh dbt semantic YAML from the model edits |
-| `reconcile` | diff warehouse + dbt vs the last `.dex/` snapshot; propose edits |
+| `semantic define\|update ...` | dbt semantic model edits as diffs |
+| `emit dbt` | write/refresh dbt semantic YAML from the semantic edits |
+| `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` |
+| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only) |
+| `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed |
+| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, fanout |
+| `maintain semantic [<objects>]` | definition drift: metric/measure/dimension/entity defs, new values, dangling refs |
+| `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as diffs (never applied) |
 | `viz preview` | emit the dbt semantic model to the free Viz preview |
+
+Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
+fronts `transform`, `semantic`, `emit`, and `viz`; `maintain` fronts the whole
+`maintain` group. Within `maintain`, detection (`check`, `schema`, `grain`,
+`semantic`) is read-only; only `reconcile` emits diffs. The engine does not care
+which skill fronts a subcommand.
 
 ### The envelope
 
