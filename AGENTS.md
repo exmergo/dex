@@ -42,8 +42,8 @@ release is connector-neutral.
 |---|---|
 | `connect test` | capabilities, dialect, `read_only: true` |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
-| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) |
-| `explore relationships` | inferred + declared joins |
+| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings |
+| `explore relationships` | inferred + declared joins with confidences, plus notes on what inference examined |
 | `explore map` | writes/updates the `.dex/` map; prints a summary |
 | `transform plan "<intent>"` | proposed dbt edits as diffs (nothing applied) |
 | `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff) |
