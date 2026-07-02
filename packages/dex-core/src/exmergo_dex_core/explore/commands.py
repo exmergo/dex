@@ -10,13 +10,19 @@ adapter; ``map`` is the only one that writes, and only to the ``.dex/`` cache.
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import UTC, datetime
 
 from .. import command_args
 from .. import envelope as env
-from ..adapters.base import Adapter, ObjectMeta
-from ..cache import Dataset, DexCache, DexStore
-from ..config import DexConfig, load_config
+from ..adapters.base import Adapter, ObjectMeta, QueryResult
+from ..cache import Dataset, DexCache, DexStore, match_identifier
+from ..config import DexConfig, QueryLimits, load_config
+from ..guards.query_firewall import (
+    InspectedQuery,
+    QueryRefusedError,
+    inspect_query,
+)
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
@@ -71,26 +77,100 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
 
 
 def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
+    verify = getattr(args, "verify", False)
+    config = load_config(command_args.repo_root(args)) or DexConfig()
+
     adapter = command_args.open_from_args(args)
     try:
         # Relationship inference needs uniqueness signals, so profile every object
         # first (free and local on DuckDB), then infer across the full set.
         metas = inventory_mod.inventory(adapter)
         datasets = profile_mod.profile(adapter, [m.identifier for m in metas])
+        inferred = rel_mod.infer_relationships(datasets)
+        if verify:
+            rel_mod.verify_relationships(
+                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+            )
     finally:
         adapter.close()
 
-    inferred = rel_mod.infer_relationships(datasets)
     declared = rel_mod.declared_relationships(command_args.repo_root(args))
     rels = declared + inferred
+    notes = _relationship_notes(datasets, declared, inferred)
+    if verify and inferred:
+        notes.append(
+            f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
+        )
     return env.ok(
         {
             "relationships": [r.model_dump(mode="json") for r in rels],
             "declared_count": len(declared),
             "inferred_count": len(inferred),
-            "notes": _relationship_notes(datasets, declared, inferred),
+            "notes": notes,
         }
     )
+
+
+def cmd_query(args: argparse.Namespace) -> env.Envelope:
+    """Run one agent-authored SELECT through the query firewall.
+
+    The cache gate comes first: the PII policy is computed from `.dex/` flags,
+    so probing requires profiling. Every decision, allowed or refused, lands in
+    `.dex/queries.jsonl`.
+    """
+
+    repo_root = command_args.repo_root(args)
+    store = DexStore(repo_root)
+    cache = store.load_cache()
+    at = datetime.now(UTC).isoformat()
+    if cache is None:
+        return env.error(
+            "no .dex/cache.json in this repo; run `explore map` first so the "
+            "query firewall knows the schema and the PII flags"
+        )
+
+    config = load_config(repo_root) or DexConfig()
+    limits = config.query
+    try:
+        inspected = inspect_query(args.sql, cache, limits)
+    except QueryRefusedError as exc:
+        store.append_query_log(
+            {"at": at, "sql": args.sql, "decision": "refused", "reason": str(exc)}
+        )
+        return env.error(f"query refused: {exc}")
+
+    adapter = command_args.open_from_args(args)
+    try:
+        result = adapter.run_query(
+            inspected.sql,
+            max_rows=inspected.row_cap,
+            timeout_seconds=limits.timeout_seconds,
+        )
+    except Exception as exc:
+        store.append_query_log(
+            {
+                "at": at,
+                "sql": inspected.sql,
+                "decision": "failed",
+                "reason": env.redact(str(exc)),
+            }
+        )
+        raise
+    finally:
+        adapter.close()
+
+    data = _shape_query_payload(result, inspected, limits)
+    store.append_query_log(
+        {
+            "at": at,
+            "sql": inspected.sql,
+            "decision": "allowed",
+            "tables": inspected.tables,
+            "row_count": data["row_count"],
+            "truncated": data["truncated"],
+        }
+    )
+    return env.ok(data)
 
 
 def cmd_map(args: argparse.Namespace) -> env.Envelope:
@@ -106,12 +186,14 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         first_pass = rank_mod.rank(metas, None, config.ranking_hints)
         selected = _select_for_profiling(metas, first_pass, config, full)
         profiled = profile_mod.profile(adapter, [m.identifier for m in selected])
+        _annotate_grain(profiled)
+        inferred = rel_mod.infer_relationships(profiled)
+        if getattr(args, "verify", False):
+            rel_mod.verify_relationships(
+                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+            )
     finally:
         adapter.close()
-
-    _annotate_grain(profiled)
-
-    inferred = rel_mod.infer_relationships(profiled)
     declared = rel_mod.declared_relationships(repo_root)
     relationships = declared + inferred
 
@@ -151,6 +233,59 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
 
 
 # --- helpers -----------------------------------------------------------------
+
+
+def _shape_query_payload(
+    result: QueryResult,
+    inspected: InspectedQuery,
+    limits: QueryLimits,
+) -> dict:
+    """Cap the result for agent context: columnar cells, cell-width truncation,
+    and a total payload byte cap, each announced in `notes` so a cut result is
+    never mistaken for a complete one."""
+
+    notes: list[str] = []
+
+    clipped = 0
+    cells: list[list] = []
+    for row in result.cells:
+        shaped: list = []
+        for value in row:
+            if isinstance(value, str) and len(value) > limits.max_cell_chars:
+                shaped.append(value[: limits.max_cell_chars] + "...")
+                clipped += 1
+            else:
+                shaped.append(value)
+        cells.append(shaped)
+    if clipped:
+        notes.append(f"{clipped} cell(s) truncated to {limits.max_cell_chars} chars")
+
+    dropped = 0
+    while cells and len(json.dumps(cells)) > limits.max_payload_bytes:
+        cells.pop()
+        dropped += 1
+    if dropped:
+        notes.append(
+            f"dropped {dropped} row(s) to fit the {limits.max_payload_bytes}-byte "
+            "payload cap; aggregate further or select fewer columns"
+        )
+
+    truncated = (result.truncated and inspected.capped_by_engine) or dropped > 0
+    if result.truncated and inspected.capped_by_engine:
+        notes.append(
+            f"result truncated to {inspected.row_cap} rows (engine cap); refine "
+            "the query, or raise query.max_rows in .dex/config.yml"
+        )
+
+    return {
+        "columns": result.columns,
+        "types": result.types,
+        "cells": cells,
+        "row_count": len(cells),
+        "truncated": truncated,
+        "tables": inspected.tables,
+        "notes": notes,
+    }
 
 
 def _annotate_grain(datasets: list[Dataset]) -> None:
@@ -240,14 +375,7 @@ def _resolve_identifiers(adapter: Adapter, requested: list[str]) -> list[str]:
     names = [part.strip() for raw in requested for part in raw.split(",")]
     resolved: list[str] = []
     for name in (n for n in names if n):
-        matches = [
-            ident
-            for ident in known
-            if ident == name
-            or ident.endswith(f".{name}")
-            or ident.split(".")[-1] == name
-        ]
-        unique = sorted(set(matches))
+        unique = match_identifier(name, known)
         if not unique:
             raise ValueError(f"no object named '{name}' in this connection")
         if len(unique) > 1:

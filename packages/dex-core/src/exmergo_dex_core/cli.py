@@ -23,7 +23,7 @@ from . import envelope as env
 # special-cased as the only live command today.
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
-    "explore": ["inventory", "profile", "relationships", "map"],
+    "explore": ["inventory", "profile", "relationships", "map", "query"],
     "transform": ["plan", "apply", "build"],
     "semantic": ["define", "update"],
     "emit": ["dbt", "osi"],
@@ -82,9 +82,15 @@ def _build_parser() -> argparse.ArgumentParser:
                     )
                 if group == "explore" and name == "profile":
                     sp.add_argument("objects", nargs="+")
+                if group == "explore" and name == "query":
+                    sp.add_argument("sql")
                 if group == "explore" and name == "map":
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
+                    )
+                if group == "explore" and name in {"relationships", "map"}:
+                    sp.add_argument(
+                        "--verify", action="store_true", default=argparse.SUPPRESS
                     )
                 # transform plan/apply take a positional argument in later phases.
                 if group == "transform" and name in {"plan", "apply"}:
@@ -129,6 +135,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             "profile": explore_cmds.cmd_profile,
             "relationships": explore_cmds.cmd_relationships,
             "map": explore_cmds.cmd_map,
+            "query": explore_cmds.cmd_query,
         }
         return handlers[args.subcommand](args)
 
