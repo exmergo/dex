@@ -11,10 +11,8 @@ source so the value never leaves the engine.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, time
-from decimal import Decimal
 
-from ..adapters.base import Adapter, ColumnAggregate
+from ..adapters.base import Adapter, ColumnAggregate, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
@@ -191,8 +189,8 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                     null_fraction=agg.null_fraction if agg else None,
                     distinct_count=agg.distinct_count if agg else None,
                     is_unique=agg.is_unique if agg else None,
-                    min_value=_json_safe(agg.min_value) if agg else None,
-                    max_value=_json_safe(agg.max_value) if agg else None,
+                    min_value=json_safe(agg.min_value) if agg else None,
+                    max_value=json_safe(agg.max_value) if agg else None,
                     pii=pii,
                 )
             )
@@ -233,15 +231,3 @@ def _refine_confidence(
     ):
         confidence = max(0.1, confidence - 0.3)
     return PIIFlag(category=pii.category, confidence=round(confidence, 4))
-
-
-def _json_safe(value: object | None) -> object | None:
-    """Coerce a DuckDB scalar to a JSON-serializable primitive for the envelope."""
-
-    if value is None or isinstance(value, (int, float, bool, str)):
-        return value
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (date, datetime, time)):
-        return value.isoformat()
-    return str(value)
