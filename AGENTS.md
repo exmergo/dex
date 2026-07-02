@@ -46,24 +46,30 @@ release is connector-neutral.
 | `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
 | `explore map [--verify]` | writes/updates the `.dex/` map; prints a summary |
 | `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled, PII-cleared columns; requires the `.dex/` cache (`explore map` first) |
-| `transform plan "<intent>"` | proposed dbt edits as diffs (nothing applied) |
-| `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff) |
-| `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget |
-| `semantic define\|update ...` | dbt semantic model edits as diffs |
-| `emit dbt` | write/refresh dbt semantic YAML from the semantic edits |
+| `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
+| `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite |
+| `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget; prod-looking targets refused outright |
+| `semantic define\|update ... --edits-file <f>` | dbt semantic model edits as diffs (MetricFlow-validated) |
+| `emit dbt [plan-id]` | write the semantic plan's YAML into the dbt project (latest unapplied plan by default) |
 | `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` |
 | `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only) |
 | `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed |
 | `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, fanout |
 | `maintain semantic [<objects>]` | definition drift: metric/measure/dimension/entity defs, new values, dangling refs |
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as diffs (never applied) |
-| `viz preview` | emit the dbt semantic model to the free Viz preview |
+| `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
 fronts `transform`, `semantic`, `emit`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, detection (`check`, `schema`, `grain`,
 `semantic`) is read-only; only `reconcile` emits diffs. The engine does not care
 which skill fronts a subcommand.
+
+Authored content reaches the engine through `--edits-file <path>` (or `-` for
+stdin): a JSON payload of `{"edits": [{"path", "kind", "content"}, ...]}` with
+`kind` one of `model_sql`, `schema_yml`, `semantic_yml`. The engine validates,
+diffs, and stores the plan under `.dex/plans/`; nothing touches the dbt project
+until `transform apply` / `emit dbt`. See `references/command-contract.md`.
 
 ### The envelope
 
