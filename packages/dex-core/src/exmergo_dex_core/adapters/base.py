@@ -6,15 +6,21 @@ aggregate-profiling path. DuckDB is the only adapter with real logic today; the
 cloud adapters are stubs. Keeping the surface here means the explore and transform
 engines code against the protocol, not a specific warehouse.
 
-The introspection types below carry only metadata and aggregates. None of them
-has a field that can hold a raw row, so the "profile, don't exfiltrate" guarantee
-holds by construction at the type level: whatever an adapter returns to the engine
-is already an aggregate or a flag, never row values.
+The introspection types below carry only metadata and aggregates, so the
+"profile, don't exfiltrate" guarantee holds by construction at the type level,
+with one deliberate exception: :class:`QueryResult` can hold result cells, and it
+exists only for agent-authored queries that have already passed the query
+firewall (``guards/query_firewall.py``), which refuses any expression that would
+carry values out of a PII-flagged or unprofiled column. Values reach a
+``QueryResult`` only from profiled, PII-cleared columns, and the command layer
+caps and truncates them before the envelope.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
 from ..envelope import Paradigm
@@ -68,6 +74,35 @@ class ColumnAggregate:
     max_value: object | None
 
 
+@dataclass(frozen=True)
+class QueryResult:
+    """The result of one firewall-approved agent query, columnar.
+
+    ``cells`` is a list of rows, each a list of JSON-safe scalars, deliberately
+    NOT a list of dicts: the columnar shape is cheaper in tokens (no repeated
+    keys) and keeps the envelope sanitizer's list-of-dicts raw-row rule intact as
+    a backstop against accidental record dumps elsewhere. ``truncated`` is set by
+    the adapter when the query produced more rows than requested.
+    """
+
+    columns: list[str]
+    types: list[str]
+    cells: list[list]
+    truncated: bool
+
+
+def json_safe(value: object | None) -> object | None:
+    """Coerce a connector scalar to a JSON-serializable primitive for the envelope."""
+
+    if value is None or isinstance(value, (int, float, bool, str)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime, time)):
+        return value.isoformat()
+    return str(value)
+
+
 @runtime_checkable
 class Adapter(Protocol):
     """Behavioral contract for a connector adapter.
@@ -110,6 +145,21 @@ class Adapter(Protocol):
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
         be computed; all others get ``None`` so values never leave the engine."""
+        ...
+
+    def run_query(
+        self,
+        sql: str,
+        *,
+        max_rows: int,
+        timeout_seconds: float,
+    ) -> QueryResult:
+        """Execute one firewall-approved SELECT and return a columnar result.
+
+        Callers MUST pass SQL that has already been through
+        ``guards.query_firewall.inspect_query``; the adapter re-asserts
+        SELECT-only as defense in depth but performs no PII policy of its own.
+        Fetches at most ``max_rows`` rows and flags truncation."""
         ...
 
     def close(self) -> None: ...

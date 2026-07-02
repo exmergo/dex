@@ -9,11 +9,12 @@ deterministic in CI.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from ..envelope import Paradigm
 from ..guards.sql_guard import assert_select_only
-from .base import ColumnAggregate, ColumnMeta, ObjectMeta
+from .base import ColumnAggregate, ColumnMeta, ObjectMeta, QueryResult, json_safe
 
 # Conservative defaults so auto-invoked profiling cannot exhaust the machine.
 # Overridable from .dex/config.yml.
@@ -261,6 +262,51 @@ class DuckDBAdapter:
 
     def _quote(self, identifier: str) -> str:
         return ".".join(_quote_ident(p) for p in self._split(identifier))
+
+    def run_query(
+        self,
+        sql: str,
+        *,
+        max_rows: int,
+        timeout_seconds: float,
+    ) -> QueryResult:
+        """Execute one firewall-approved SELECT, bounded in rows and wall time.
+
+        SELECT-only is re-asserted as defense in depth; the PII policy already
+        ran in the firewall. The watchdog interrupts the connection if the query
+        outlives its budget, so a runaway scan cannot hold the session hostage.
+        """
+
+        assert_select_only(sql, dialect=self.dialect)
+        expired = threading.Event()
+
+        def _interrupt() -> None:
+            expired.set()
+            self._conn.interrupt()
+
+        watchdog = threading.Timer(timeout_seconds, _interrupt)
+        watchdog.start()
+        try:
+            cursor = self._conn.execute(sql)
+            rows = cursor.fetchmany(max_rows + 1)
+        except Exception as exc:
+            if expired.is_set():
+                raise TimeoutError(
+                    f"query exceeded {timeout_seconds:g}s and was interrupted; "
+                    "narrow it (tighter filter, fewer columns) and retry"
+                ) from exc
+            raise
+        finally:
+            watchdog.cancel()
+
+        columns = [d[0] for d in self._conn.description]
+        types = [str(d[1]) for d in self._conn.description]
+        return QueryResult(
+            columns=columns,
+            types=types,
+            cells=[[json_safe(v) for v in row] for row in rows[:max_rows]],
+            truncated=len(rows) > max_rows,
+        )
 
     def _run_select(self, sql: str, params: list | None = None):
         # Single read-only door for every query: parsed and refused if it is not a
