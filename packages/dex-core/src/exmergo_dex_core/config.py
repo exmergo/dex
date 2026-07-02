@@ -33,6 +33,19 @@ class DuckDBTarget(BaseModel):
     path: str
 
 
+class QueryLimits(BaseModel):
+    """Hard bounds on `explore query` results, enforced in the engine.
+
+    The caps protect agent context from token blowups: an oversized result is
+    truncated with an explicit note rather than trusted to agent frugality.
+    """
+
+    max_rows: int = 50
+    max_cell_chars: int = 256
+    max_payload_bytes: int = 16384
+    timeout_seconds: float = 30.0
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``. Only the DuckDB target is wired in v0.1;
     cloud connector targets are not yet implemented."""
@@ -42,6 +55,7 @@ class DexConfig(BaseModel):
     dbt_target: str | None = None
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
+    query: QueryLimits = Field(default_factory=QueryLimits)
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25
