@@ -1,6 +1,6 @@
 ---
 name: explore
-description: Use this to make sense of an unfamiliar data warehouse or DuckDB database: inventory and rank what is there, profile columns, detect PII, and infer how tables join, producing a draft map of the warehouse without dumping the schema into context. Trigger it for questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", or "profile these columns". This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).
+description: Use this to make sense of a database, warehouse, or DuckDB file: inventory and rank what is there, profile columns, detect PII, flag grain and data-quality problems, infer and verify how tables join, and answer ad-hoc data questions with guarded SQL probes, producing a draft map without dumping the schema into context. Trigger it for casual, artifact-first prompts like "what's in my duckdb", "what's in this database", "what data do I have", "take a look at data.duckdb", or "any PII in here", as well as analyst questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", "is this data any good", "profile these columns", or ad-hoc counts and distributions like "how many orders have no customer". Any mention of exploring, inspecting, querying, or understanding a .duckdb or .db file, a warehouse connection, or unfamiliar data qualifies. This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).
 ---
 
 # Explore
@@ -25,10 +25,29 @@ Subcommands, in the usual order:
    reports capabilities.
 2. `explore inventory --rank` returns a ranked object summary (counts and sizes,
    never rows).
-3. `explore profile <objects>` returns column profiles and PII flags recorded as
-   (column, category, confidence), never example values.
-4. `explore relationships` returns inferred and declared joins.
-5. `explore map` writes or updates the `.dex/` cache and prints a summary.
+3. `explore profile <objects>` (space- or comma-separated) returns column
+   profiles, PII flags recorded as (column, category, confidence) and never
+   example values, plus candidate keys, the likely grain, and data-quality
+   warnings (e.g. a non-unique id that will fan out on joins).
+4. `explore relationships` returns inferred and declared joins with confidences,
+   plus notes explaining what the inference examined (so an empty list is
+   meaningful). Add `--verify` to measure each inferred join with an aggregate
+   overlap probe (orphan fraction, confidence adjusted).
+5. `explore map` writes or updates the `.dex/` cache and prints a summary
+   (`--verify` works here too).
+6. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
+   don't cover: you write the SQL, the engine's query firewall refuses or bounds
+   it. Requires the `.dex/` cache (run `map` first). Results come back columnar
+   and capped; a refusal names the offending column and the fix, so one rewrite
+   is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
+   writing a probe: it maps common questions to effective probe shapes.
+
+Rules of engagement for `query`: prefer the fixed commands when they answer the
+question; one probe answers one question; batch related measures into a single
+query rather than issuing many; aggregates over PII-flagged columns must be
+measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
+(MIN, ANY_VALUE, STRING_AGG). Never fall back to raw Python or a database CLI to
+run SQL; the firewall path is the only sanctioned one.
 
 ## Guardrails (enforced in the engine, not here)
 
@@ -36,5 +55,6 @@ Subcommands, in the usual order:
   SELECT-only. Never propose a write to source data.
 - Sense-making, not enumeration. Rank and drill selectively; never paste a full
   schema into context.
-- Profile, don't exfiltrate. Understanding comes from aggregates. Raw rows never
-  cross the envelope, and PII is flagged, never surfaced.
+- Profile, don't exfiltrate. Understanding comes from aggregates. PII is flagged,
+  never surfaced, and the query firewall enforces it on your own SQL: values
+  cross the envelope only from profiled, PII-cleared columns, bounded and capped.

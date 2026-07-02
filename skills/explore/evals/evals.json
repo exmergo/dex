@@ -3,10 +3,18 @@
   "triggering": {
     "positive": [
       "What's in this warehouse?",
+      "What's in my duckdb?",
+      "What's in this database?",
+      "What data do I have here?",
+      "Take a look at data.duckdb and tell me what's there.",
+      "Do we have any PII in this database?",
+      "Is this data any good?",
       "Which tables actually matter here?",
       "What does the customers table contain?",
       "How do orders and customers join?",
-      "Profile the columns in the events table and flag any PII."
+      "Profile the columns in the events table and flag any PII.",
+      "How many listings have no matching host in this database?",
+      "Run a quick query to check whether order dates have any gaps."
     ],
     "negative": [
       "Build a staging model for the orders table.",
@@ -48,8 +56,21 @@
       "assertions": [
         "Relationships are returned with from/to datasets and columns and a kind of inferred or declared",
         "Inferred joins carry a confidence and are clearly distinguished from declared (dbt) joins",
-        "No raw rows are read to establish the joins; the result is metadata-derived",
+        "No raw rows are read to establish the joins; the result is metadata-derived (or verified with --verify aggregate probes)",
         "The output is a relationship summary, not a full schema dump"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "How many orders point at a customer that doesn't exist, and what are the most common order statuses?",
+      "expected_output": "Two answers derived through guarded probes: an orphan count from an overlap-shaped query and a top-K status distribution, both via `explore query` after mapping, never via raw Python or a database CLI.",
+      "files": [],
+      "assertions": [
+        "Runs `explore map` (or confirms the .dex cache exists) before probing, because the query firewall requires the cache",
+        "Answers through `explore query` via the wrapper; does not open the database with ad-hoc Python, duckdb CLI, or any path around the engine",
+        "Probes are aggregate-shaped (counts, GROUP BY on a non-PII column); no SELECT * and no value-carrying aggregate over a PII-flagged column",
+        "If a query is refused by the firewall, the agent rewrites it per the refusal message instead of retrying the same shape or routing around the engine",
+        "Reports the counts and distribution from the envelope's columnar result; respects and mentions truncation notes if present"
       ]
     }
   ]

@@ -39,7 +39,7 @@ from pathlib import Path
 # Rewritten by scripts/prepare_release.sh to the tagged version. The connector
 # extra is deliberately NOT part of this pin: it is chosen at runtime (see
 # _resolve_connector), so a release artifact is connector-neutral.
-DEX_CORE_VERSION = "0.1.0a3"
+DEX_CORE_VERSION = "0.1.0a4"
 
 # Connector id -> packaging extra. The engine's connector ids and the pyproject
 # extras share names, so this is the identity set today. An unknown or unset
@@ -110,7 +110,11 @@ def main() -> int:
         "exmergo_dex_core",
         *argv,
     ]
-    return subprocess.call(cmd)
+    # The engine runs in uv's own ephemeral environment, so an inherited
+    # VIRTUAL_ENV (e.g. the user's activated venv) is irrelevant here and only
+    # makes uv print a mismatch warning on every call. Drop it.
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    return subprocess.call(cmd, env=env)
 
 
 if __name__ == "__main__":

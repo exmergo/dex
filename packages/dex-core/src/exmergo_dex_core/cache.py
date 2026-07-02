@@ -13,6 +13,7 @@ not a service). Secrets never live here.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -20,7 +21,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 # Bump when the on-disk cache shape changes in a way old readers cannot handle.
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 
 class PIICategory(str, Enum):
@@ -33,6 +34,9 @@ class PIICategory(str, Enum):
     CREDENTIAL = "credential"
     LOCATION = "location"
     DOB = "date_of_birth"
+    # Free-text fields (comments, notes, message bodies) reliably carry names and
+    # contact details even though the column name itself is not a PII token.
+    FREE_TEXT = "free_text"
     OTHER = "other"
 
 
@@ -89,7 +93,11 @@ class RelationshipKind(str, Enum):
 
 
 class Relationship(BaseModel):
-    """A join between two datasets, declared (FK / dbt) or inferred (heuristic)."""
+    """A join between two datasets, declared (FK / dbt) or inferred (heuristic).
+
+    ``verified`` and ``orphan_fraction`` are set only by the opt-in ``--verify``
+    overlap probe: an inferred join stays a name-based guess until measured.
+    """
 
     from_dataset: str
     from_columns: list[str]
@@ -97,6 +105,28 @@ class Relationship(BaseModel):
     to_columns: list[str]
     kind: RelationshipKind = RelationshipKind.INFERRED
     confidence: float | None = None
+    verified: bool = False
+    orphan_fraction: float | None = None
+
+
+def match_identifier(name: str, known: list[str]) -> list[str]:
+    """All fully-qualified identifiers that ``name`` could mean, case-insensitive.
+
+    Accepts an exact identifier, a dotted suffix (``schema.table``), or a bare
+    object name. Shared by everything that maps user- or agent-supplied names to
+    warehouse identifiers, so profile arguments and query table references
+    resolve identically.
+    """
+
+    q = name.lower()
+    matches = [
+        ident
+        for ident in known
+        if ident.lower() == q
+        or ident.lower().endswith(f".{q}")
+        or ident.rsplit(".", 1)[-1].lower() == q
+    ]
+    return sorted(set(matches))
 
 
 def tool_version() -> str | None:
@@ -144,6 +174,7 @@ class DexCache(BaseModel):
 DEX_DIR = ".dex"
 CACHE_FILE = "cache.json"
 SNAPSHOT_FILE = "snapshot.json"
+QUERIES_FILE = "queries.jsonl"
 
 
 class DexStore:
@@ -185,4 +216,18 @@ class DexStore:
         self.dex_dir.mkdir(parents=True, exist_ok=True)
         path = self.dex_dir / SNAPSHOT_FILE
         path.write_text(cache.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def append_query_log(self, entry: dict) -> Path:
+        """Append one `explore query` decision to `.dex/queries.jsonl`.
+
+        Refusals are logged too: the log is the audit trail and the product
+        signal for which probe shapes recur often enough to deserve promotion
+        to a named command. SQL text only, never result values.
+        """
+
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        path = self.dex_dir / QUERIES_FILE
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
         return path

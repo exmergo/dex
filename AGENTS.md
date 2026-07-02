@@ -42,9 +42,10 @@ release is connector-neutral.
 |---|---|
 | `connect test` | capabilities, dialect, `read_only: true` |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
-| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) |
-| `explore relationships` | inferred + declared joins |
-| `explore map` | writes/updates the `.dex/` map; prints a summary |
+| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings |
+| `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
+| `explore map [--verify]` | writes/updates the `.dex/` map; prints a summary |
+| `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled, PII-cleared columns; requires the `.dex/` cache (`explore map` first) |
 | `transform plan "<intent>"` | proposed dbt edits as diffs (nothing applied) |
 | `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff) |
 | `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget |
@@ -73,18 +74,24 @@ Every command prints exactly one JSON object and nothing else:
 ```
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that would
-spend requires an explicit `--confirm` and a session budget. Credentials and raw
-rows never appear in `data`.
+spend requires an explicit `--confirm` and a session budget. Credentials never
+appear in `data`, and result values appear only in `explore query`'s columnar
+payload after the query firewall has cleared them.
 
 ## Guardrails (non-negotiable, enforced in the engine)
 
 1. Sense-making, not enumeration. Never dump a schema.
 2. Profile, don't exfiltrate. Understanding is built from aggregates, not raw rows.
 3. Read-only against data; writes confined to the repo. DuckDB opens read-only;
-   generated SQL is SELECT-only; builds run against a dev target only, never prod.
+   generated SQL is SELECT-only; agent-authored SQL runs only through the query
+   firewall; builds run against a dev target only, never prod.
 4. Cost-aware by connector. Nothing runs without a ceiling.
-5. Credentials and raw data never enter agent context. Only the envelope does.
-6. PII is flagged (column, category, confidence), never surfaced.
+5. Nothing reaches agent context except through the sanitized envelope.
+   Credentials never; data values only from profiled, PII-cleared columns,
+   bounded and capped.
+6. PII is flagged (column, category, confidence), never surfaced. The query
+   firewall enforces this on agent SQL: any expression that would carry a
+   flagged column's values is refused.
 7. Persistence is git, not a service. The dbt project is the source of truth; the
    `.dex/` directory is a non-canonical cache (exploration artifacts and the
    reconcile snapshot).

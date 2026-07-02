@@ -19,7 +19,8 @@ time. dex owns exactly that loop.
 ## The loop
 
 - **Explore** an unfamiliar warehouse: rank what matters, profile selectively,
-  infer joins, persist a draft map. Fully read-only.
+  infer and verify joins, answer ad-hoc questions with guarded SQL probes behind
+  a PII-aware query firewall, persist a draft map. Fully read-only.
 - **Transform** the dbt project: author dbt models (staging to marts) with tests
   and docs, and the semantic layer on top (entities, dimensions, measures,
   metrics) as dbt semantic models (MetricFlow YAML), with a free Viz preview.

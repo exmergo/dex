@@ -65,6 +65,47 @@ def test_select_only_guard_rejects_writes():
             assert_select_only(bad)
 
 
+def _firewall_cache():
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.customers",
+                columns=[
+                    ColumnProfile(name="id", data_type="INTEGER"),
+                    ColumnProfile(
+                        name="email",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="email", confidence=0.9),
+                    ),
+                ],
+            )
+        ]
+    )
+
+
+def test_query_firewall_refuses_writes_pragmas_and_multistatement():
+    # Agent-authored SQL gets a stricter gate than engine SQL: even the
+    # read-only introspection roots (PRAGMA/DESCRIBE) are refused.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "DELETE FROM customers",
+        "INSERT INTO customers VALUES (3, 'x')",
+        "SELECT 1; DROP TABLE customers",
+        "PRAGMA database_list",
+        "DESCRIBE customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits())
+
+
 @pytest.mark.xfail(
     reason="dev-target build / prod-target refusal not yet implemented", strict=False
 )
@@ -103,6 +144,29 @@ def test_pii_flag_lives_on_the_column_profile():
     assert col.pii is not None and col.pii.category.value == "email"
 
 
+def test_query_firewall_enforces_pii_flagged_never_surfaced():
+    # The flag is not just metadata: any expression that would carry a flagged
+    # column's values into the projection is refused, including through
+    # aggregates that return values (MIN) and through CTE laundering.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "SELECT email FROM customers",
+        "SELECT MIN(email) FROM customers",
+        "SELECT * FROM customers",
+        "WITH x AS (SELECT email AS e FROM customers) SELECT e FROM x",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits())
+    # Measuring the flagged column is fine: a statistic is not a value.
+    inspect_query("SELECT COUNT(DISTINCT email) FROM customers", cache, QueryLimits())
+
+
 # --- Family 4: propose-don't-impose ------------------------------------------
 
 
@@ -127,3 +191,10 @@ def test_envelope_blocks_secrets_in_data():
 def test_envelope_blocks_raw_rows_in_data():
     with pytest.raises(env.SanitizationError):
         env.emit(env.ok({"rows": [{"id": 1, "email": "a@example.com"}]}))
+
+
+def test_query_results_are_columnar_and_pass_the_sanitizer(capsys):
+    # The query path's list-of-lists shape crosses cleanly; the dict-row rule
+    # above still guards every other command against accidental record dumps.
+    env.emit(env.ok({"columns": ["id", "n"], "cells": [[1, 3], [2, 5]]}))
+    assert capsys.readouterr().out

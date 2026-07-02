@@ -11,15 +11,15 @@ source so the value never leaves the engine.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, time
-from decimal import Decimal
 
-from ..adapters.base import Adapter, ColumnAggregate
+from ..adapters.base import Adapter, ColumnAggregate, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
-# lowercased column name with word-ish boundaries so "email" hits but "emailable"
-# does not over-trigger. Detection never inspects values, only names and types.
+# snake-normalized column name (camelCase is split first, so "firstName" matches
+# the same as "first_name") with word-ish boundaries so "email" hits but
+# "emailable" does not over-trigger. Detection never inspects values, only names
+# and types.
 _PII_PATTERNS: list[tuple[re.Pattern[str], PIICategory, float]] = [
     (re.compile(r"(^|_)(e_?mail|email_address)(_|$)"), PIICategory.EMAIL, 0.9),
     (re.compile(r"(^|_)(phone|mobile|cell|fax|msisdn)(_|$)"), PIICategory.PHONE, 0.8),
@@ -62,24 +62,80 @@ _PII_PATTERNS: list[tuple[re.Pattern[str], PIICategory, float]] = [
     ),
 ]
 
+# Generic person-name detection: any bare `name` or `*_name` column. Weaker than
+# the exact person tokens above (a `name` could be a product), so it carries a
+# lower confidence, applies only to string columns, and a denylist of clearly
+# technical/organizational qualifiers stops the obvious false positives. The
+# denylist errs toward flagging: a false positive merely suppresses a min/max,
+# while a false negative reads as an all-clear on sensitive data.
+_GENERIC_NAME = re.compile(r"(^|_)name(_|$)")
+_NONPERSON_NAME_QUALIFIERS = frozenset(
+    {
+        "table",
+        "column",
+        "file",
+        "schema",
+        "db",
+        "database",
+        "model",
+        "type",
+        "product",
+        "brand",
+        "company",
+        "app",
+        "service",
+    }
+)
+
+# Free-text fields carry PII in their values regardless of the column name, so
+# any comment/notes/message-shaped string column is flagged FREE_TEXT.
+_FREE_TEXT = re.compile(
+    r"(^|_)(comments?|notes?|message|body|feedback|review_text|bio|about)(_|$)"
+)
+
 _NUMERIC_HINTS = ("INT", "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "HUGEINT")
 _TEMPORAL_HINTS = ("DATE", "TIME", "TIMESTAMP", "INTERVAL")
 _BOOLEAN_HINTS = ("BOOL",)
+_STRING_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
 
 _MAX_CONFIDENCE = 0.95
+
+# Splits camelCase boundaries so patterns written against snake_case also match
+# camelCase warehouses ("firstName" -> "first_name", "reviewerName" -> "reviewer_name").
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _normalize(column_name: str) -> str:
+    return _CAMEL_BOUNDARY.sub("_", column_name).lower()
+
+
+def _is_string_type(data_type: str) -> bool:
+    upper = data_type.upper()
+    return any(h in upper for h in _STRING_HINTS)
 
 
 def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     """Classify a column as PII from its name (and, loosely, type). Never a value.
 
     Returns the first matching category with a base confidence; aggregate signals
-    refine the confidence later in :func:`_refine_confidence`.
+    refine the confidence later in :func:`_refine_confidence`. The exact-token
+    patterns apply to any type; the weaker generic-name and free-text patterns
+    apply only to string columns (a numeric `comments` count is not PII).
     """
 
-    name = column_name.lower()
+    name = _normalize(column_name)
     for pattern, category, confidence in _PII_PATTERNS:
         if pattern.search(name):
             return PIIFlag(category=category, confidence=confidence)
+
+    if _is_string_type(data_type):
+        match = _GENERIC_NAME.search(name)
+        if match is not None:
+            qualifier = name[: match.start()].rstrip("_").rsplit("_", 1)[-1]
+            if qualifier not in _NONPERSON_NAME_QUALIFIERS:
+                return PIIFlag(category=PIICategory.NAME, confidence=0.6)
+        if _FREE_TEXT.search(name):
+            return PIIFlag(category=PIICategory.FREE_TEXT, confidence=0.5)
     return None
 
 
@@ -133,8 +189,8 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                     null_fraction=agg.null_fraction if agg else None,
                     distinct_count=agg.distinct_count if agg else None,
                     is_unique=agg.is_unique if agg else None,
-                    min_value=_json_safe(agg.min_value) if agg else None,
-                    max_value=_json_safe(agg.max_value) if agg else None,
+                    min_value=json_safe(agg.min_value) if agg else None,
+                    max_value=json_safe(agg.max_value) if agg else None,
                     pii=pii,
                 )
             )
@@ -175,15 +231,3 @@ def _refine_confidence(
     ):
         confidence = max(0.1, confidence - 0.3)
     return PIIFlag(category=pii.category, confidence=round(confidence, 4))
-
-
-def _json_safe(value: object | None) -> object | None:
-    """Coerce a DuckDB scalar to a JSON-serializable primitive for the envelope."""
-
-    if value is None or isinstance(value, (int, float, bool, str)):
-        return value
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (date, datetime, time)):
-        return value.isoformat()
-    return str(value)
