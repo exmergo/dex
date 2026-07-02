@@ -1,11 +1,13 @@
 """Explore: candidate keys, grain, and declared/inferred joins.
 
-All inference here is metadata-only: it reads the profiles already gathered (names,
-types, uniqueness signals) and never scans data to verify referential integrity.
-That keeps relationship inference free and read-only, at the cost of confidence,
-so every inferred join carries a confidence the agent can weigh. Declared joins
-come from the dbt project; absent one, they are simply empty (explore is designed
-to work without a dbt project).
+Inference is metadata-only: it reads the profiles already gathered (names, types,
+uniqueness signals) and never scans data, which keeps it free at the cost of
+confidence, so every inferred join carries a confidence the agent can weigh. The
+one deliberate exception is the opt-in ``--verify`` pass
+(:func:`verify_relationships`), which runs one bounded, engine-authored aggregate
+probe per inferred join to measure the actual key overlap. Declared joins come
+from the dbt project; absent one, they are simply empty (explore is designed to
+work without a dbt project).
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from ..adapters.base import Adapter
 from ..cache import (
     ColumnProfile,
     Dataset,
@@ -161,6 +164,74 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
     if not candidate_keys(dataset):
         notes.append("no candidate key detected; grain unknown")
     return notes
+
+
+def verify_relationships(
+    adapter: Adapter,
+    relationships: list[Relationship],
+    *,
+    timeout_seconds: float = 30.0,
+) -> None:
+    """Measure each inferred join with one overlap probe and adjust in place.
+
+    The probe counts non-null foreign-key values and how many have no match in
+    the parent (orphans). Full containment raises confidence; a high orphan rate
+    is strong evidence the name-based guess was wrong and demotes it well below
+    the emission threshold rather than deleting it, so the agent still sees what
+    was tried. Aggregate counts only; no key value ever leaves the engine.
+    """
+
+    for rel in relationships:
+        if rel.kind is not RelationshipKind.INFERRED:
+            continue
+        sql = _overlap_probe_sql(rel)
+        result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
+        values = dict(zip(result.columns, result.cells[0], strict=True))
+        nonnull = int(values["nonnull_fk"] or 0)
+        orphans = int(values["orphans"] or 0)
+
+        rel.verified = True
+        if nonnull == 0:
+            rel.orphan_fraction = None
+            continue
+        fraction = orphans / nonnull
+        rel.orphan_fraction = round(fraction, 4)
+
+        confidence = rel.confidence or 0.5
+        if fraction == 0.0:
+            confidence += 0.1
+        elif fraction <= 0.02:
+            confidence += 0.05
+        elif fraction >= 0.2:
+            confidence -= 0.25
+        else:
+            confidence -= 0.1
+        rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
+
+
+def _overlap_probe_sql(rel: Relationship) -> str:
+    child = _quote_identifier(rel.from_dataset)
+    parent = _quote_identifier(rel.to_dataset)
+    fk = _quote_part(rel.from_columns[0])
+    key = _quote_part(rel.to_columns[0])
+    # Aggregate-only by construction: two counts, no value in the projection.
+    # NOT EXISTS keeps the orphan count correct even when the parent key is not
+    # unique (a join would fan out and inflate it).
+    return (
+        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
+        f"COUNT(*) FILTER (WHERE c.{fk} IS NOT NULL AND NOT EXISTS ("
+        f"SELECT 1 FROM {parent} p WHERE p.{key} = c.{fk})) AS orphans "
+        f"FROM {child} c"
+    )
+
+
+def _quote_identifier(identifier: str) -> str:
+    return ".".join(_quote_part(p) for p in identifier.split("."))
+
+
+def _quote_part(name: str) -> str:
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
 
 
 def declared_relationships(repo_root: Path | str = ".") -> list[Relationship]:
