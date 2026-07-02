@@ -161,6 +161,23 @@ def error(message: str, **kwargs: Any) -> Envelope:
     return Envelope(status=Status.ERROR, errors=[message], **kwargs)
 
 
+def needs_confirmation(
+    data: dict[str, Any] | None = None, cost: Cost | None = None, **kwargs: Any
+) -> Envelope:
+    """A command that would spend (or overwrite) but was not confirmed.
+
+    Carries the preflight cost so the agent can surface it and re-issue the
+    command with ``--confirm``.
+    """
+
+    return Envelope(
+        status=Status.NEEDS_CONFIRMATION,
+        data=data or {},
+        cost=cost or Cost(),
+        **kwargs,
+    )
+
+
 # Re-exported for callers that build messages and want to avoid leaking secrets
 # into error/warning strings (e.g. a DSN that embeds a password).
 def redact(text: str) -> str:
