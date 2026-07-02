@@ -9,6 +9,67 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.0a4] - 2026-07-02
+
+### Added
+
+- `explore query "<SELECT ...>"`: guarded ad-hoc SQL. The agent authors the
+  query; the engine's new query firewall refuses or bounds it. Values may cross
+  the envelope only from profiled, PII-cleared columns (every value path from a
+  flagged column must pass through a measuring aggregate such as COUNT or AVG;
+  MIN/ANY_VALUE/STRING_AGG and unknown functions fail closed). Results are
+  columnar and hard-capped (rows, cell width, payload bytes, wall time), with
+  every cut announced. Requires the `.dex/` cache, so profiling precedes probing.
+- `.dex/queries.jsonl`: an audit log of every query decision (allowed, refused,
+  failed) with SQL text and counts, never result values.
+- `--verify` on `explore relationships` and `explore map`: measures each
+  inferred join with one aggregate overlap probe and adjusts its confidence;
+  relationships now carry `verified` and `orphan_fraction`.
+- A probe playbook shipped with the `explore` skill: recipes mapping common
+  analyst questions to effective, firewall-friendly probe shapes.
+- Configurable `query:` limits in `.dex/config.yml` (`max_rows`,
+  `max_cell_chars`, `max_payload_bytes`, `timeout_seconds`).
+
+### Changed
+
+- The boundary guarantee is stated precisely: nothing reaches agent context
+  except through the sanitized envelope; credentials never, and data values only
+  from profiled, PII-cleared columns, bounded and capped. Previously the docs
+  said "raw rows never cross", which the guarded query path deliberately
+  refines.
+- The adapter protocol gains `run_query` (bounded, watchdog-interrupted
+  execution of firewall-approved SQL); DuckDB implements it, cloud stubs do not
+  yet.
+
+- PII detection catches common name and contact columns, not just exact tokens:
+  bare `name` and generic `*_name` columns (with a denylist of technical
+  qualifiers like `table_name`), camelCase names (`firstName`), and free-text
+  fields (`comments`, `notes`, `message`, `feedback`) under a new `free_text`
+  category. Every new flag suppresses min/max the same way existing categories do.
+- Grain and data-quality interpretation in `explore profile` and `explore map`:
+  a non-unique id column now produces an explicit fan-out warning with the
+  duplicate count, a table with no candidate key reports "grain unknown", and
+  `profile` populates `candidate_keys` and `grain` (previously `map`-only).
+- `explore relationships` and `explore map` envelopes carry `notes` explaining
+  what inference examined, so an empty relationships array is distinguishable
+  from "did not try".
+- `explore profile` accepts comma-separated object lists in addition to
+  space-separated ones.
+
+### Changed
+
+- Relationship inference now recognizes camelCase foreign keys (`raceId`),
+  strips warehouse-layer prefixes (`raw_`, `stg_`, `dim_`, ...) when matching
+  parent tables, matches parents keyed on `<entity>Id` / `<entity>_id` (not just
+  `id`), and refines confidence with distinct-count and numeric-range
+  containment from the aggregates already profiled. A parent whose key is not
+  unique still yields the join at reduced confidence instead of being dropped.
+- The `.dex/` cache schema version is now 2 (new `free_text` PII category).
+- The skill wrappers drop `VIRTUAL_ENV` from the engine subprocess environment,
+  silencing uv's mismatch warning on every call.
+- The `explore` skill description triggers on casual, artifact-first prompts
+  ("what's in my duckdb") in addition to analyst phrasings.
+
 ## [0.1.0a3] - 2026-07-01
 
 ### Changed
