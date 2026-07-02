@@ -29,6 +29,10 @@ def _all_commands() -> list[list[str]]:
                 argv = [group, sub]
                 if group == "explore" and sub == "profile":
                     argv.append("some_table")
+                if group == "explore" and sub == "query":
+                    # A missing repo-root means no .dex cache, so the firewall
+                    # refuses cleanly and nothing is written anywhere.
+                    argv += ["SELECT 1", "--repo-root", "missing-dex-fixture-dir"]
                 argvs.append(argv)
         else:
             argvs.append([group])

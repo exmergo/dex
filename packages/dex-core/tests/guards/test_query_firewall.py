@@ -1,0 +1,183 @@
+"""The query firewall's decision matrix: what agent SQL may run, refuse, or be
+rewritten. Pure unit tests over a hand-built cache; no database is touched, which
+is the point: the policy is static analysis."""
+
+from __future__ import annotations
+
+import pytest
+
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+from exmergo_dex_core.config import QueryLimits
+from exmergo_dex_core.guards.query_firewall import (
+    QueryRefusedError,
+    inspect_query,
+)
+
+
+@pytest.fixture
+def cache() -> DexCache:
+    """Airbnb-shaped: RAW_HOSTS.NAME is flagged, RAW_LISTINGS is fully clear,
+    and one inventory-only (unprofiled) table exists."""
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.RAW_HOSTS",
+                columns=[
+                    ColumnProfile(name="ID", data_type="INTEGER"),
+                    ColumnProfile(
+                        name="NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                ],
+            ),
+            Dataset(
+                identifier="db.main.RAW_LISTINGS",
+                columns=[
+                    ColumnProfile(name="ID", data_type="INTEGER"),
+                    ColumnProfile(name="HOST_ID", data_type="INTEGER"),
+                ],
+            ),
+            Dataset(identifier="db.main.UNPROFILED"),  # inventory-only
+        ]
+    )
+
+
+LIMITS = QueryLimits()
+
+
+def _refusal(sql: str, cache: DexCache) -> str:
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(sql, cache, LIMITS)
+    return str(excinfo.value)
+
+
+# --- allowed: measuring aggregates and cleared values ---------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1",
+        "SELECT COUNT(*) FROM RAW_HOSTS",
+        "SELECT COUNT(NAME) FROM RAW_HOSTS",
+        "SELECT COUNT(DISTINCT NAME) FROM RAW_HOSTS",
+        "SELECT APPROX_COUNT_DISTINCT(NAME) FROM RAW_HOSTS",
+        "SELECT AVG(LENGTH(NAME)) FROM RAW_HOSTS",
+        "SELECT HOST_ID, COUNT(*) AS n FROM RAW_LISTINGS GROUP BY 1 ORDER BY 2 DESC",
+        "SELECT * FROM RAW_LISTINGS",
+        "SELECT MIN(ID), MAX(ID) FROM RAW_LISTINGS",  # min/max fine on cleared cols
+        "SELECT COUNT(*) FROM RAW_HOSTS WHERE NAME = 'Ada'",  # values flow in
+        "SELECT COUNT(*) FROM RAW_HOSTS GROUP BY NAME",  # group key not projected
+        "SELECT COUNT(*) FILTER (WHERE NAME LIKE 'A%') FROM RAW_HOSTS",
+        "WITH x AS (SELECT NAME FROM RAW_HOSTS) SELECT COUNT(NAME) FROM x",
+        "SELECT ID FROM (SELECT ID, NAME FROM RAW_HOSTS) t",
+        "SELECT l.HOST_ID FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID",
+        "SELECT ID FROM RAW_LISTINGS UNION ALL SELECT ID FROM RAW_HOSTS",
+        "SELECT COUNT(*) OVER () FROM RAW_LISTINGS",
+        "SELECT main.RAW_LISTINGS.ID FROM main.RAW_LISTINGS",  # qualified table
+    ],
+)
+def test_allowed(sql: str, cache: DexCache):
+    inspected = inspect_query(sql, cache, LIMITS)
+    assert inspected.sql
+    assert inspected.row_cap <= LIMITS.max_rows
+
+
+# --- refused: value-carrying paths from flagged columns -------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT NAME FROM RAW_HOSTS",
+        "SELECT MIN(NAME) FROM RAW_HOSTS",
+        "SELECT MAX(NAME) FROM RAW_HOSTS",
+        "SELECT ANY_VALUE(NAME) FROM RAW_HOSTS",
+        "SELECT STRING_AGG(NAME, ',') FROM RAW_HOSTS",
+        "SELECT ARRAY_AGG(NAME) FROM RAW_HOSTS",
+        "SELECT SUBSTR(NAME, 1, 1) FROM RAW_HOSTS",
+        "SELECT UPPER(NAME) FROM RAW_HOSTS",
+        "SELECT NAME, COUNT(*) FROM RAW_HOSTS GROUP BY 1",  # projected group key
+        "SELECT NAME LIKE 'A%' FROM RAW_HOSTS",  # per-row predicate is derived PII
+        "SELECT CASE WHEN NAME IS NULL THEN 1 ELSE 0 END FROM RAW_HOSTS",
+        "SELECT * FROM RAW_HOSTS",  # expansion includes the flagged column
+        "SELECT RAW_HOSTS.* FROM RAW_HOSTS",
+        "SELECT h.NAME FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID",
+        "WITH x AS (SELECT NAME FROM RAW_HOSTS) SELECT NAME FROM x",  # CTE smuggle
+        "WITH x AS (SELECT NAME AS n FROM RAW_HOSTS) SELECT n FROM x",  # aliased
+        "SELECT t.NAME FROM (SELECT ID, NAME FROM RAW_HOSTS) t",  # subquery smuggle
+        "SELECT (SELECT MIN(NAME) FROM RAW_HOSTS)",  # scalar subquery
+        "SELECT ID FROM RAW_LISTINGS UNION ALL SELECT NAME FROM RAW_HOSTS",
+        "SELECT some_unknown_udf(NAME) FROM RAW_HOSTS",  # unknown fn: fail closed
+    ],
+)
+def test_refused_pii_carrying(sql: str, cache: DexCache):
+    message = _refusal(sql, cache)
+    assert "NAME" in message or "PII" in message
+
+
+def test_refusal_names_column_category_and_fix(cache: DexCache):
+    message = _refusal("SELECT MIN(NAME) FROM RAW_HOSTS", cache)
+    assert "RAW_HOSTS.NAME" in message
+    assert "(name)" in message  # the flag category
+    assert "COUNT" in message  # the fix
+
+
+# --- refused: shape, resolution, and introspection -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "fragment"),
+    [
+        ("SELECT nope FROM RAW_HOSTS", "nope"),
+        ("SELECT ID FROM missing_table", "not in the .dex cache"),
+        ("SELECT ID FROM UNPROFILED", "not profiled"),
+        ("SELECT ID FROM RAW_LISTINGS l, RAW_HOSTS h", "ambiguous"),
+        ("PRAGMA database_list", "Pragma"),
+        ("DESCRIBE RAW_HOSTS", "Describe"),
+        ("SELECT 1; SELECT 2", "exactly one statement"),
+        ("INSERT INTO RAW_HOSTS VALUES (1, 'x')", "SELECT"),
+        ("DELETE FROM RAW_HOSTS", "SELECT"),
+        ("DROP TABLE RAW_HOSTS", "SELECT"),
+        (
+            "WITH x AS (SELECT 1) INSERT INTO RAW_HOSTS SELECT * FROM x",
+            "SELECT",
+        ),
+    ],
+)
+def test_refused_shape_and_resolution(sql: str, fragment: str, cache: DexCache):
+    assert fragment.lower() in _refusal(sql, cache).lower()
+
+
+# --- LIMIT rewriting -------------------------------------------------------------
+
+
+def test_limit_injected_when_absent(cache: DexCache):
+    inspected = inspect_query("SELECT ID FROM RAW_LISTINGS", cache, LIMITS)
+    assert f"LIMIT {LIMITS.max_rows + 1}" in inspected.sql
+    assert inspected.row_cap == LIMITS.max_rows
+    assert inspected.capped_by_engine is True
+
+
+def test_limit_clamped_when_above_cap(cache: DexCache):
+    inspected = inspect_query("SELECT ID FROM RAW_LISTINGS LIMIT 5000", cache, LIMITS)
+    assert f"LIMIT {LIMITS.max_rows + 1}" in inspected.sql
+    assert inspected.capped_by_engine is True
+
+
+def test_agent_limit_at_or_under_cap_is_respected(cache: DexCache):
+    inspected = inspect_query("SELECT ID FROM RAW_LISTINGS LIMIT 5", cache, LIMITS)
+    assert "LIMIT 5" in inspected.sql
+    assert inspected.row_cap == 5
+    assert inspected.capped_by_engine is False
+
+
+def test_tables_are_reported_for_the_query_log(cache: DexCache):
+    inspected = inspect_query(
+        "SELECT l.HOST_ID FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID",
+        cache,
+        LIMITS,
+    )
+    assert inspected.tables == ["db.main.RAW_HOSTS", "db.main.RAW_LISTINGS"]

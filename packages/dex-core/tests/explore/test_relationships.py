@@ -221,6 +221,51 @@ def test_relationships_envelope_explains_itself(airbnb_duckdb: Path, capsys):
     assert any("no declared relationships" in n for n in notes)
 
 
+def test_verify_measures_overlap_and_lifts_clean_joins(airbnb_duckdb: Path, capsys):
+    """Every airbnb FK value has a parent, so verification confirms both joins:
+    zero orphans, confidence up, and the broken-grain parent still capped below
+    the trusted tier."""
+
+    baseline = _run(["explore", "relationships", "--path", str(airbnb_duckdb)], capsys)[
+        "data"
+    ]["relationships"]
+    verified = _run(
+        ["explore", "relationships", "--verify", "--path", str(airbnb_duckdb)], capsys
+    )["data"]
+    assert all(not r["verified"] for r in baseline)
+
+    by_fk = {tuple(r["from_columns"]): r for r in verified["relationships"]}
+    base_by_fk = {tuple(r["from_columns"]): r for r in baseline}
+    for fk in (("HOST_ID",), ("LISTING_ID",)):
+        assert by_fk[fk]["verified"] is True
+        assert by_fk[fk]["orphan_fraction"] == 0.0
+        assert by_fk[fk]["confidence"] >= base_by_fk[fk]["confidence"]
+    assert by_fk[("HOST_ID",)]["confidence"] < 0.85  # parent key still not unique
+    assert any("overlap probes" in n for n in verified["notes"])
+
+
+def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orphans.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    # 2 of 5 orders point at real customers; 3 are orphans (fraction 0.6).
+    conn.execute(
+        "INSERT INTO orders VALUES (10, 1), (11, 2), (12, 7), (13, 8), (14, 9)"
+    )
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.6
+    assert rel["confidence"] < 0.5, "measured non-containment demotes the guess"
+
+
 def test_empty_result_is_explained_not_silent(tmp_path: Path, capsys):
     duckdb = pytest.importorskip("duckdb")
     path = tmp_path / "flat.duckdb"
