@@ -53,6 +53,9 @@ class DexConfig(BaseModel):
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
     dbt_target: str | None = None
+    # Pins the dbt project directory (relative to the repo root) when discovery
+    # would be ambiguous; by default the project is located automatically.
+    dbt_project_dir: str | None = None
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
     query: QueryLimits = Field(default_factory=QueryLimits)
