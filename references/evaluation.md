@@ -29,7 +29,8 @@ benchmark score:
 3. PII flagged as (column, category, confidence), never surfaced.
 4. Propose-don't-impose: changes are diffs, hand-written dbt never silently
    overwritten.
-5. Sanitized envelope: credentials and raw rows never appear in stdout `data`.
+5. Sanitized envelope: credentials never appear in stdout `data`, and data
+   values only via `explore query`'s firewall-cleared columnar results.
 
 The spine lives in `tests/test_safety_spine.py`. Families whose engine lands in a
 later phase are wired as explicit `xfail` placeholders so the spine is complete

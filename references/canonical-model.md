@@ -47,6 +47,10 @@ informs proposals, never the source of truth:
   snapshot.json   the maintain baseline: a frozen fingerprint of the warehouse schema, the
                   dbt manifest state, and declared grain/semantic assumptions. Written by
                   `maintain snapshot`; the drift detectors diff current reality against it.
+  queries.jsonl   the `explore query` audit log: one line per firewall decision (allowed,
+                  refused, or failed) with the SQL text and result counts, never result
+                  values. Doubles as product signal: probe shapes that recur here are
+                  candidates for promotion to named commands.
 ```
 
 Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the dbt
