@@ -6,10 +6,11 @@ envelope to stdout and nothing else. Subcommands are stateless (state lives in t
 dbt project, which is the source of truth, plus the ``.dex/`` cache), so the agent
 orchestrates multi-step flows.
 
-Only ``connect test`` does real work today (a read-only DuckDB probe). Every other
-subcommand returns a valid envelope with status ``not_implemented`` so the
-contract, the wrappers, and the eval harness can all be exercised before the
-engine logic exists. Capabilities, not final spelling.
+``connect test``, the ``explore`` group, and the authoring surface (``transform``,
+``semantic``, ``emit dbt``) are live. The ``maintain`` group, ``emit osi``, and
+``viz preview`` return a valid envelope with status ``not_implemented`` so the
+contract, the wrappers, and the eval harness can be exercised before their engine
+logic exists.
 """
 
 from __future__ import annotations
@@ -19,8 +20,7 @@ import sys
 
 from . import envelope as env
 
-# The full command surface. Group -> its subcommands. ``connect test`` is
-# special-cased as the only live command today.
+# The full command surface. Group -> its subcommands.
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": ["inventory", "profile", "relationships", "map", "query"],
@@ -92,9 +92,21 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
-                # transform plan/apply take a positional argument in later phases.
+                # transform plan takes the intent; apply takes the plan id.
                 if group == "transform" and name in {"plan", "apply"}:
                     sp.add_argument("argument", nargs="?", default=None)
+                if group == "transform" and name == "plan":
+                    # The agent-authored edits payload: a JSON file, or - for stdin.
+                    sp.add_argument("--edits-file", default=None)
+                    sp.add_argument("--scaffold", action="append", default=None)
+                if group == "transform" and name == "build":
+                    sp.add_argument("--target", default=None)
+                    sp.add_argument("--select", default=None)
+                if group == "semantic":
+                    sp.add_argument("argument", nargs="?", default=None)
+                    sp.add_argument("--edits-file", default=None)
+                if group == "emit" and name == "dbt":
+                    sp.add_argument("plan_id", nargs="?", default=None)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {"schema", "grain", "semantic"}:
@@ -138,6 +150,31 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             "query": explore_cmds.cmd_query,
         }
         return handlers[args.subcommand](args)
+
+    # The transform skill fronts the authoring surface (transform, semantic,
+    # emit dbt); they share one plan store and one write path, so one command
+    # module serves them all. `emit osi` stays reserved for the dormant exporter,
+    # and `viz preview` stays a stub until the Viz integration lands.
+    transform_surface = {
+        ("transform", "plan"),
+        ("transform", "apply"),
+        ("transform", "build"),
+        ("semantic", "define"),
+        ("semantic", "update"),
+        ("emit", "dbt"),
+    }
+    if (args.group, args.subcommand) in transform_surface:
+        from .transform import commands as transform_cmds
+
+        handlers = {
+            ("transform", "plan"): transform_cmds.cmd_plan,
+            ("transform", "apply"): transform_cmds.cmd_apply,
+            ("transform", "build"): transform_cmds.cmd_build,
+            ("semantic", "define"): transform_cmds.cmd_semantic_define,
+            ("semantic", "update"): transform_cmds.cmd_semantic_update,
+            ("emit", "dbt"): transform_cmds.cmd_emit_dbt,
+        }
+        return handlers[(args.group, args.subcommand)](args)
 
     # Everything else is scaffolded against the contract but not yet built.
     return env.not_implemented(command)

@@ -10,6 +10,7 @@ semantic, and maintain as they land).
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from .adapters.base import Adapter
 from .connect import open_adapter
@@ -25,3 +26,16 @@ def open_from_args(args: argparse.Namespace) -> Adapter:
         path=getattr(args, "path", None),
         repo_root=repo_root(args),
     )
+
+
+def project_dir(args: argparse.Namespace) -> Path:
+    """The dbt project directory: the config pin wins, discovery is the default."""
+
+    from .config import load_config
+    from .dbt_project import find_project
+
+    root = repo_root(args)
+    config = load_config(root)
+    if config and config.dbt_project_dir:
+        return Path(root) / config.dbt_project_dir
+    return find_project(root)

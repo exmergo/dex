@@ -31,3 +31,50 @@ def duckdb_file(tmp_path: Path) -> Path:
     conn.execute("INSERT INTO orders VALUES (1, 1, 9.99), (2, 1, 5.00), (3, 2, 12.50)")
     conn.close()
     return path
+
+
+@pytest.fixture
+def dbt_project_dir(tmp_path: Path) -> Path:
+    """A minimal dbt project with a project-local profiles.yml.
+
+    The profile carries a duckdb ``dev`` target (a fresh writable file, distinct
+    from the read-only ``duckdb_file`` fixture) and a ``prod`` target so the
+    prod-refusal path has something real to refuse. One staging model plus its
+    schema.yml gives load/plan/apply a hand-written file to respect.
+    """
+
+    project = tmp_path / "analytics"
+    (project / "models" / "staging").mkdir(parents=True)
+
+    (project / "dbt_project.yml").write_text(
+        "name: dex_test\n"
+        'version: "1.0.0"\n'
+        "profile: dex_test\n"
+        'model-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (project / "profiles.yml").write_text(
+        "dex_test:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n"
+        "    prod:\n"
+        "      type: duckdb\n"
+        f"      path: {tmp_path / 'prod.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, 'a@example.com' as email\n", encoding="utf-8"
+    )
+    (project / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    return project

@@ -53,10 +53,11 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
 
 
 def test_unbuilt_commands_report_not_implemented(capsys):
-    assert main(["semantic", "define"]) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
-    assert main(["maintain", "check"]) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
+    # The maintain group, the dormant OSI exporter, and the Viz preview are the
+    # remaining stubs; viz lands later as an integration with the Viz product.
+    for argv in (["maintain", "check"], ["emit", "osi"], ["viz", "preview"]):
+        assert main(argv) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
 
 
 def test_connect_test_against_duckdb_is_ok(duckdb_file: Path, capsys):

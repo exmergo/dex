@@ -1,6 +1,6 @@
 ---
 name: transform
-description: Use this to author and change a dbt project: write or refactor dbt model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Trigger it for requests like "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Every change is a reviewable diff to the dbt project; any warehouse build is dev-target only, gated, and cost-surfaced first. It also offers a free Viz preview of the semantic layer. Do not use it to explore or profile a warehouse (use explore) or to detect drift and reconcile a project that has fallen out of sync (use maintain).
+description: Use this to author and change a dbt project: write or refactor dbt model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Trigger it for requests like "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Every change is a reviewable diff to the dbt project; any warehouse build is dev-target only, gated, and cost-surfaced first. Do not use it to explore or profile a warehouse (use explore) or to detect drift and reconcile a project that has fallen out of sync (use maintain).
 ---
 
 # Transform
@@ -17,31 +17,61 @@ writes only to the repo, as reviewable diffs, and runs against a dev target only
 uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
+You author the dbt file content; the engine validates it, computes the diffs,
+and stores the proposal as a plan. Hand content over with `--edits-file <path>`
+(or `-` to read stdin), a JSON payload:
+
+```json
+{"edits": [
+  {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
+  {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."}
+]}
+```
+
+`kind` is `model_sql`, `schema_yml`, or `semantic_yml` (optional on
+`semantic define|update`, which imply it). Model SQL must be a single read-only
+SELECT once its jinja is stripped; semantic YAML is validated against
+MetricFlow's schemas.
+
 ### dbt SQL models
 
-- `transform plan "<intent>"` returns proposed dbt edits as diffs. Nothing is
-  applied yet.
-- `transform apply <plan-id>` writes the diffs into the dbt project. The result is
-  still a reviewable git diff for the user.
-- `transform build --target dev` runs a dbt build against a dev target. The
-  engine surfaces a cost preflight first and runs only with `--confirm` and a
-  budget.
+- `transform plan "<intent>" --edits-file <path|->` validates the edits and
+  returns them as diffs with a plan id. Nothing is applied yet. Add
+  `--scaffold <table>` (repeatable) to generate a staging skeleton
+  (`stg_<table>.sql` plus per-model YAML with key tests and PII meta) from the
+  `.dex/` cache instead of, or on top of, hand-authored edits.
+- `transform apply <plan-id>` writes the plan into the dbt project. The result is
+  still a reviewable git diff for the user. If a human edited a file after the
+  plan was made, nothing is written: the divergence comes back as diffs with
+  `needs_confirmation`, and you should re-plan against current state (or, only
+  when the user says so, re-run with `--confirm`).
+- `transform build --target dev` runs `dbt build` against a dev target. The
+  engine surfaces a cost preflight first and runs only with `--confirm` (plus a
+  `--budget` on billed connectors). Production-looking targets are refused
+  outright; `--confirm` cannot override that.
 
 ### The semantic layer
 
-- `semantic define ...` and `semantic update ...` author and evolve the dbt
-  semantic models (entities, dimensions, measures, metrics) as diffs to the dbt
-  project. This is dex's unique layer and Viz's input.
-- `emit dbt` writes or refreshes the dbt semantic YAML from those edits.
-- `viz preview` emits the dbt semantic model to the free Viz preview (the taste;
-  the governed serve loop is the commercial product).
+- `semantic define ... --edits-file <path|->` and `semantic update ...` author
+  and evolve the dbt semantic models (entities, dimensions, measures, metrics)
+  as plans. `define` refuses names that already exist (use `update`); `update`
+  refuses names that do not (use `define`).
+- `emit dbt [plan-id]` writes the semantic plan's YAML into the dbt project (the
+  latest unapplied semantic plan when no id is given).
+- dbt cannot parse semantic models in a project without a MetricFlow **time
+  spine**; the engine warns when one is missing. Author it like any other model
+  (a day-grain date model plus YAML with a `time_spine:` config) in the same or
+  a separate plan.
+- `viz preview` is not yet implemented (it returns `not_implemented`); the Viz
+  integration arrives later.
 
 Export to other formats (OSI and others) is a future capability and is not emitted
 in v1.
 
 ## Guardrails (enforced in the engine, not here)
 
-- Writes confined to the repo. dex never writes to source warehouse data.
+- Writes confined to the repo, and within it to the dbt project's model paths.
+  dex never writes to source warehouse data.
 - Dev-target only. Prod-target execution is never initiated by dex.
 - Cost surfaced before any spend. A build that would spend requires explicit
   confirmation and a session budget.

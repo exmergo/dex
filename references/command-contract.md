@@ -24,9 +24,10 @@ from profiled, PII-cleared columns, bounded and capped by the query firewall.
 
 ## The command surface
 
-Capabilities, not final spelling. Implemented incrementally: `connect test` is
-real in Phase 0; the rest return a valid `not_implemented` envelope until their
-phase lands.
+Capabilities, not final spelling. Implemented incrementally: `connect test`, the
+`explore` group, and the authoring surface (`transform`, `semantic`, `emit dbt`)
+are live; the `maintain` group, `emit osi`, and `viz preview` return a valid
+`not_implemented` envelope until they land.
 
 ```
 dex connect test                  -> {capabilities, dialect, read_only: true}
@@ -46,8 +47,43 @@ dex maintain schema [<objects>]   -> structural drift: columns/tables added, dro
 dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join fanout
 dex maintain semantic [<objects>] -> definition drift: metric/measure/dimension/entity defs, new values, dangling refs
 dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as diffs (never applied)
-dex viz preview                   -> emit the dbt semantic model to the free Viz preview
+dex viz preview                   -> emit the dbt semantic model to the Viz preview (not yet implemented;
+                                     the Viz integration arrives later)
 ```
+
+### How authored content reaches the engine
+
+The engine has no model of its own; the agent authors the dbt file content and
+hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
+
+```json
+{"edits": [
+  {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
+  {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."}
+]}
+```
+
+`kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
+`semantic define|update`, which imply `semantic_yml`). The engine validates each
+edit (model SQL must be a single read-only SELECT once jinja is stripped; YAML
+must parse; semantic YAML must satisfy MetricFlow's schemas), pins it to the
+sha256 of the file it would change, computes the diffs, and stores the plan under
+`.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
+
+- `transform plan` also accepts `--scaffold <table>` (repeatable): a
+  deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
+  tests and PII flags in column `meta`) generated from the `.dex/` cache.
+- `transform apply <plan-id>` re-hashes every file first. A file edited by a
+  human after the plan was made is a **conflict**: nothing is written, the
+  divergence is returned as diffs with `needs_confirmation`, and only an explicit
+  `--confirm` overrides it. A clean apply is all-or-nothing.
+- `transform build` accepts `--target` and `--select`. The target must be `dev`
+  (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
+  are refused outright, before the cost gate, and `--confirm` cannot override
+  the refusal.
+- `semantic define` refuses names that already exist in the project (use
+  `update`); `update` refuses names that do not (use `define`). `emit dbt`
+  applies a semantic plan (the latest unapplied one, or an explicit plan id).
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
 fronts `transform`, `semantic`, `emit`, and `viz`; `maintain` fronts the whole
@@ -112,7 +148,10 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
 Rules the envelope enforces, all of them Tier-2 eval targets:
 
 - **Cost before spend.** `cost` is a preflight estimate. Any command that would
-  spend returns `needs_confirmation` unless given `--confirm` and a `--budget`.
+  spend returns `needs_confirmation` unless given `--confirm` (and a `--budget`
+  on billed connectors; DuckDB is free, so the confirm handshake alone gates it).
+  An estimate over the ceiling is refused outright; confirmation cannot override
+  it.
 - **Diffs, not silent writes.** Proposed changes appear in `diffs`; being there
   does not apply them. The user applies through their normal review and PR flow.
 - **No secrets, no uncleared values.** `data` is scanned before printing
@@ -124,7 +163,7 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
 
 ## Why this is the first artifact
 
-Because every skill, test, and benchmark depends on it, the contract is locked
-before the engine logic is built. Phase 0 ships the contract, a real `connect
-test`, and the sanitized envelope; Phases 1 through 3 fill in the subcommands
-against this fixed boundary.
+Because every skill, test, and benchmark depends on it, the contract was locked
+before the engine logic was built, and the subcommands fill in against this
+fixed boundary. Exploration and authoring are live today; maintain is the next
+group to land.
