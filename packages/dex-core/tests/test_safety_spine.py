@@ -106,25 +106,34 @@ def test_query_firewall_refuses_writes_pragmas_and_multistatement():
             inspect_query(bad, cache, QueryLimits())
 
 
-@pytest.mark.xfail(
-    reason="dev-target build / prod-target refusal not yet implemented", strict=False
-)
 def test_prod_target_execution_is_refused():
     from exmergo_dex_core import transform
 
-    transform.build(target="prod")  # must refuse; raises NotImplementedError today
+    # The refusal fires before the cost gate and before any project resolution:
+    # confirmation cannot push a build at production.
+    for target in ("prod", "production", "PROD", "live"):
+        with pytest.raises(transform.ProdTargetRefusedError):
+            transform.build(target=target, confirmed=True)
+    # A misconfigured dbt_target cannot whitelist production either.
+    with pytest.raises(transform.ProdTargetRefusedError):
+        transform.build(target="prod", configured_target="prod", confirmed=True)
+    # Nor does an arbitrary non-dev target slip through.
+    with pytest.raises(transform.ProdTargetRefusedError):
+        transform.build(target="staging", confirmed=True)
 
 
 # --- Family 2: cost-guard binds ----------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="connector-aware cost guard not yet implemented", strict=False
-)
 def test_cost_guard_blocks_over_ceiling():
     from exmergo_dex_core.guards import cost_guard
 
-    cost_guard.preflight(estimate=10_000, ceiling=10)  # must block; not built yet
+    # Over-ceiling blocks first, before the confirmation check, so a blown budget
+    # can never be pushed through with --confirm.
+    with pytest.raises(cost_guard.OverCeilingError):
+        cost_guard.preflight(estimate=10_000, ceiling=10, confirmed=True)
+    with pytest.raises(cost_guard.OverCeilingError):
+        cost_guard.preflight(estimate=10_000, ceiling=10)
 
 
 # --- Family 3: PII flagged, never surfaced -----------------------------------
@@ -170,14 +179,46 @@ def test_query_firewall_enforces_pii_flagged_never_surfaced():
 # --- Family 4: propose-don't-impose ------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="diff-based apply (never silent overwrite) not yet implemented", strict=False
-)
-def test_changes_are_diffs_not_silent_writes():
+def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     from exmergo_dex_core import transform
 
-    result = transform.apply(plan_id="x")  # must return reviewable diffs, not write
-    assert result.diffs
+    new_model = dbt_project_dir / "models" / "staging" / "stg_new.sql"
+    edits = [
+        transform.PlanEdit(
+            path="models/staging/stg_new.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as id\n",
+        )
+    ]
+    _plan, diffs, _warnings = transform.plan(
+        "add stg_new", edits, dbt_project_dir, repo_root=dbt_project_dir.parent
+    )
+    # Planning returns reviewable diffs and touches nothing in the project.
+    assert diffs and diffs[0]["unified"]
+    assert not new_model.exists()
+
+
+def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
+    from exmergo_dex_core import transform
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    edits = [
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as id\n",
+        )
+    ]
+    planned, _diffs, _warnings = transform.plan(
+        "trim stg_customers", edits, dbt_project_dir, repo_root=dbt_project_dir.parent
+    )
+    # A human edits the file after the plan was made; their edit is authoritative.
+    model.write_text("select 99 as id -- hand-tuned\n", encoding="utf-8")
+
+    result = transform.apply(planned.plan_id, dbt_project_dir.parent)
+    assert result.written == []
+    assert result.conflicts
+    assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
 
 
 # --- Family 5: credentials and raw rows never enter stdout data ---------------
