@@ -9,6 +9,58 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.0a5] - 2026-07-03
+
+The authoring half of the loop goes live on DuckDB. `transform plan|apply|build`,
+`semantic define|update`, and `emit dbt` now do real work; `maintain`, `emit osi`,
+and `viz preview` still report `not_implemented`.
+
+### Added
+
+- The dbt project reader/writer (`dbt_project.py`): loads `dbt_project.yml`, the
+  source files under the model paths, and `target/manifest.json` when compiled;
+  resolves profile targets to name and adapter type only (credentials never leave
+  the engine); writes plan edits back all-or-nothing with sha256 conflict
+  detection, so a human edit made after planning is surfaced as a diff and never
+  overwritten.
+- Transform plans: agent-authored edits arrive via `--edits-file <path|->` (JSON:
+  `{"edits": [{"path", "kind", "content"}]}`), are validated per kind (model SQL
+  must be a single read-only SELECT once jinja is stripped; YAML must parse;
+  semantic YAML is validated against MetricFlow's schemas via
+  dbt-semantic-interfaces), diffed against the current project, and stored under
+  `.dex/plans/<plan-id>.json`. Plan ids are content-addressed, so re-planning the
+  same change is idempotent.
+- `transform plan --scaffold <table>` (repeatable): deterministic staging
+  skeletons (`stg_<table>.sql`, per-model YAML, one shared sources file) from the
+  `.dex/` cache, with key tests and PII flags propagated into column `meta`,
+  never example values.
+- `transform build`: dev-target `dbt build` as an isolated subprocess with
+  `--target`/`--select`, summarized from `run_results.json` (no raw log text in
+  the envelope). Prod-looking targets (`prod`, `production`, `prd`, `live`,
+  `release`, `main`) are refused outright, before the cost gate, and config
+  cannot whitelist them.
+- The cost guard (`guards/cost_guard.py`): preflight-before-spend with a strict
+  order (over-ceiling blocks even when confirmed; billed paradigms require a
+  ceiling; unconfirmed commands return `needs_confirmation` with the cost).
+  DuckDB is free but the confirm handshake still gates `transform build`.
+- Semantic authoring: `semantic define` refuses names already in the project,
+  `semantic update` requires them; `emit dbt [plan-id]` applies the semantic
+  plan's YAML (latest unapplied by default) through the same conflict-checked
+  write path.
+- Unified-diff rendering (`diffs.py`) feeding the envelope's `diffs` field, and a
+  `needs_confirmation` envelope builder.
+- `dbt_project_dir` in `.dex/config.yml` to pin the dbt project when discovery
+  would be ambiguous.
+
+### Changed
+
+- Transform logic moved into its own `transform/` package (commands over pure
+  engine modules), mirroring the `explore/` layout; the pre-refactor top-level
+  stubs (`transform.py`, `semantic.py`, and the explore-era orphans) are removed.
+- The three transform-touching safety-spine tests (prod-target refused,
+  cost-guard binds, changes-are-diffs) are now real assertions instead of
+  `xfail` placeholders, joined by an apply-refuses-overwrite case.
+
 ## [0.1.0a4] - 2026-07-02
 
 ### Added
