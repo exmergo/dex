@@ -9,6 +9,69 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-03
+
+
+Hardening pass from two same-day dogfooding sessions across the full
+explore/transform/semantic loop. The theme: stop layers from vouching for
+something they did not fully check, and stop assuming a repo with nothing already
+in it.
+
+### Added
+
+- `transform deps`: install or refresh dbt packages (repo-confined, no warehouse
+  spend, no cost gate). `transform build` now also runs `dbt deps` automatically
+  when the project declares packages but `dbt_packages/` is missing, so a project
+  with dependencies builds on the first try.
+- `semantic plan`: accepts a mix of new and existing names in one payload and
+  classifies per name, reporting `defined` and `updated`, so one logical change no
+  longer forces separate define and update calls.
+- Authoritative validation for semantic plans: beyond MetricFlow's schemas, the
+  engine resolves every metric input (ratio and derived inputs must reference
+  metrics, not measures) and runs the emitted YAML through dbt's own parser against
+  a throwaway copy of the project before the plan is stored. A plan that cannot
+  parse is never stored. When dbt is unavailable the check degrades to a warning;
+  `--no-parse` skips it.
+- `transform plans`: list stored plans, pending and applied, newest first.
+
+### Changed
+
+- `explore map` no longer caps silently: past 50 objects it profiles the top
+  `profile_top_n` (default 25) by rank and states the cutoff and `skipped_count` in
+  the summary. On a re-map, objects outside this run's top set carry their prior
+  profiles forward (`carried_forward_count`), each stamped with its own
+  `profiled_at`, so coverage accumulates across runs.
+- `transform apply` with no plan id applies the latest unapplied plan of any kind
+  (semantic plans included), absorbing the one behavior `emit dbt` used to add.
+
+### Removed
+
+- The `emit` command group is gone. `emit dbt` was a redundant spelling of
+  `transform apply` for semantic plans; its only distinct behavior (default to the
+  latest unapplied plan) now lives on `transform apply`, so a stored semantic plan
+  is applied the same way as any model plan. `emit osi` and the dormant OSI
+  exporter (`exporters/`, the pinned `osi-schema.json`, and the OSI reference docs)
+  are removed with it: dex reasons over the dbt project and authors into it
+  directly, and does not project the model back out into other formats. This is a
+  deliberate contract break, taken while pre-1.0; update any `emit dbt` call to
+  `transform apply`. The base `jsonschema` dependency, which only the OSI validator
+  used directly, is dropped.
+
+### Fixed
+
+- False "grain unknown" verdicts: approximate distinct counts could overshoot a
+  genuinely unique column and hide a real key. Profiling now escalates near-unique
+  columns to an exact `COUNT(DISTINCT)` (batched, read-only, bounded per table),
+  and only an exact count is allowed to confirm a key or a table's grain.
+- dbt subprocesses now pin their cwd to the project dir, so a relative `path:` in
+  `profiles.yml` resolves inside the project instead of silently creating a stray
+  empty database at the caller's shell cwd. A missing dev DuckDB database is an
+  actionable refusal when the project reads from sources, a warning otherwise.
+- Build failure envelopes surface the real cause: `errors[0]` carries the first
+  actual dbt message, the rest land in `warnings`, deduplicated and per-entry
+  capped, with a pointer to the full log when anything was trimmed (previously the
+  cause was buried under kilobytes of duplicated tracebacks).
+
 ## [0.1.0a6] - 2026-07-03
 
 ### Added

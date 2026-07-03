@@ -206,6 +206,99 @@ def test_map_summary_is_counts_not_a_schema_dump(
     assert payload["data"]["profiled_count"] <= payload["data"]["object_count"]
 
 
+def test_map_announces_profile_cutoff(many_tables_duckdb: Path, tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--path",
+            str(many_tables_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert payload["data"]["object_count"] == 60
+    assert payload["data"]["profiled_count"] == 25
+    assert payload["data"]["skipped_count"] == 35
+    note = next(n for n in payload["data"]["notes"] if "profile_top_n" in n)
+    assert "--full" in note
+
+
+def test_map_full_has_no_cutoff(many_tables_duckdb: Path, tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--path",
+            str(many_tables_duckdb),
+            "--repo-root",
+            str(repo),
+            "--full",
+        ],
+        capsys,
+    )
+    assert payload["data"]["profiled_count"] == 60
+    assert payload["data"]["skipped_count"] == 0
+    assert not any("profile_top_n" in n for n in payload["data"]["notes"])
+
+
+def test_map_carries_forward_prior_profiles(
+    many_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(many_tables_duckdb),
+        "--repo-root",
+        str(repo),
+    ]
+    _run([*argv, "--full"], capsys)
+    store = DexStore(repo)
+    first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
+    assert all(first_stamps.values()), "a full map stamps every profile"
+
+    payload = _run(argv, capsys)
+    assert payload["data"]["profiled_count"] == 25
+    assert payload["data"]["carried_forward_count"] == 35
+    assert any("carried forward 35" in n for n in payload["data"]["notes"])
+
+    cache = store.load_cache()
+    # Nothing degraded to inventory-only: every dataset kept full column detail.
+    assert all(d.columns for d in cache.datasets)
+    unchanged = [
+        d.identifier
+        for d in cache.datasets
+        if d.profiled_at == first_stamps[d.identifier]
+    ]
+    assert len(unchanged) == 35, "carried profiles keep their original stamp"
+
+
+def test_cache_without_new_fields_still_loads():
+    from exmergo_dex_core.cache import DexCache
+
+    old_shape = {
+        "schema_version": 2,
+        "datasets": [
+            {
+                "identifier": "db.main.t",
+                "columns": [{"name": "id", "data_type": "INTEGER"}],
+            }
+        ],
+        "relationships": [],
+    }
+    cache = DexCache.model_validate(old_shape)
+    assert cache.datasets[0].profiled_at is None
+    assert cache.datasets[0].columns[0].distinct_count_exact is False
+
+
 # --- edge cases --------------------------------------------------------------
 
 

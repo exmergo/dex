@@ -34,6 +34,42 @@ def airbnb_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def near_unique_duckdb(tmp_path: Path) -> Path:
+    """Tables big enough for approx_count_distinct to genuinely err: a 50k-row
+    table with an exactly-unique key (the field failure: HLL noise made every
+    real key read non-unique) and one with true near-threshold duplication."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "near_unique.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE results AS "
+        'SELECT range::INTEGER AS "resultId", 1.0::DOUBLE AS points '
+        "FROM range(50000)"
+    )
+    conn.execute(
+        "CREATE TABLE dupes AS SELECT (range % 45000)::INTEGER AS id FROM range(50000)"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def many_tables_duckdb(tmp_path: Path) -> Path:
+    """Sixty tiny tables, enough to push `explore map` past the auto-profile-all
+    threshold and into the ranked top-N cutoff."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "many_tables.duckdb"
+    conn = duckdb.connect(str(path))
+    for i in range(60):
+        conn.execute(f"CREATE TABLE t_{i:02d} (id INTEGER, v INTEGER)")
+        conn.execute(f"INSERT INTO t_{i:02d} VALUES (1, {i})")  # noqa: S608
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def f1_duckdb(tmp_path: Path) -> Path:
     """A camelCase star schema: parents key on <entity>Id (not `id`), and the
     fact table's foreign keys use the same camelCase names."""

@@ -20,17 +20,14 @@ keywords = [
   "duckdb",
   "data-engineering",
   "agent",
-  "osi",
 ]
 
-# Base dependencies are connector-agnostic: the canonical model (pydantic),
-# config parsing (pyyaml), and OSI validation against the pinned schema
-# (jsonschema). Connector client libraries live behind the extras below, so the
-# zero-credential DuckDB on-ramp never pulls the cloud client stack.
+# Base dependencies are connector-agnostic: the canonical model (pydantic) and
+# config parsing (pyyaml). Connector client libraries live behind the extras
+# below, so the zero-credential DuckDB on-ramp never pulls the cloud client stack.
 dependencies = [
   "pydantic>=2",
   "pyyaml>=6",
-  "jsonschema>=4.18",
 ]
 
 [project.scripts]

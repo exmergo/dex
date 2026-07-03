@@ -1,15 +1,16 @@
 """Semantic-layer authoring: dbt semantic models / MetricFlow YAML as plan edits.
 
 ``define`` and ``update`` are plan producers into the same store as model SQL;
-``emit dbt`` applies them. The engine validates the YAML the agent authored;
-MetricFlow's own schemas (via ``dbt-semantic-interfaces``, pulled in by
-dbt-duckdb) are the validator of record, with a structural fallback when that
-package is absent so validation degrades to a warning, never to silence.
+``transform apply`` writes them into the project. The engine validates the YAML
+the agent authored; MetricFlow's own schemas (via ``dbt-semantic-interfaces``,
+pulled in by dbt-duckdb) are the validator of record, with a structural fallback
+when that package is absent so validation degrades to a warning, never to silence.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -59,10 +60,48 @@ def validate_semantic_yaml(path: str, parsed: dict[str, Any]) -> list[str]:
     return []
 
 
-def existing_semantic_names(view: DbtProjectView) -> set[str]:
-    """Names of semantic models and metrics already declared in the project."""
+class SemanticNamespace(NamedTuple):
+    """Every name the semantic layer can address, split by role.
 
-    names: set[str] = set()
+    ``metrics`` includes the implicit metric a ``create_metric: true`` measure
+    declares: dbt's parser sees those even though no ``metrics:`` entry exists,
+    so collision checks and reference resolution must see them too.
+    """
+
+    semantic_models: set[str]
+    metrics: set[str]
+    measures: set[str]
+
+
+def collect_namespace(documents: Iterable[Any]) -> SemanticNamespace:
+    """Gather the semantic namespace declared by the given parsed YAML documents."""
+
+    semantic_models: set[str] = set()
+    metrics: set[str] = set()
+    measures: set[str] = set()
+    for parsed in documents:
+        if not isinstance(parsed, dict):
+            continue
+        for entry in parsed.get("semantic_models") or []:
+            if not isinstance(entry, dict) or not entry.get("name"):
+                continue
+            semantic_models.add(entry["name"])
+            for measure in entry.get("measures") or []:
+                if not isinstance(measure, dict) or not measure.get("name"):
+                    continue
+                measures.add(measure["name"])
+                if measure.get("create_metric"):
+                    metrics.add(measure["name"])
+        for entry in parsed.get("metrics") or []:
+            if isinstance(entry, dict) and entry.get("name"):
+                metrics.add(entry["name"])
+    return SemanticNamespace(semantic_models, metrics, measures)
+
+
+def project_namespace(view: DbtProjectView) -> SemanticNamespace:
+    """The semantic namespace already declared across the project's YAML files."""
+
+    documents = []
     for source in view.files.values():
         if not source.path.endswith((".yml", ".yaml")):
             continue
@@ -70,14 +109,15 @@ def existing_semantic_names(view: DbtProjectView) -> set[str]:
             parsed = yaml.safe_load(source.content)
         except yaml.YAMLError:
             continue  # a broken hand-written file is not this command's problem
-        if not isinstance(parsed, dict):
-            continue
-        for entry in (parsed.get("semantic_models") or []) + (
-            parsed.get("metrics") or []
-        ):
-            if isinstance(entry, dict) and entry.get("name"):
-                names.add(entry["name"])
-    return names
+        documents.append(parsed)
+    return collect_namespace(documents)
+
+
+def existing_semantic_names(view: DbtProjectView) -> set[str]:
+    """Names of semantic models and metrics already declared in the project."""
+
+    ns = project_namespace(view)
+    return ns.semantic_models | ns.metrics
 
 
 def time_spine_warning(
@@ -86,8 +126,8 @@ def time_spine_warning(
     """Warn when semantic YAML lands in a project with no MetricFlow time spine.
 
     dbt refuses to parse a project that has semantic models but no time spine
-    model, so a first `emit dbt` without one produces a project that cannot
-    build. The engine cannot author the model itself (propose-don't-impose), so
+    model, so a first semantic plan applied without one produces a project that
+    cannot build. The engine cannot author the model itself (propose-don't-impose), so
     it warns at plan time instead of letting the build be the first signal.
     """
 
@@ -120,8 +160,14 @@ def time_spine_warning(
 
 def check_mode(
     mode: str, parsed_edits: list[dict[str, Any]], view: DbtProjectView
-) -> None:
-    """Enforce define-vs-update: define refuses existing names, update requires them."""
+) -> dict[str, list[str]]:
+    """Classify every proposed name as new or existing; enforce the strict modes.
+
+    ``define`` refuses existing names and ``update`` refuses new ones (both are
+    typo guards); ``plan`` accepts a mix, so one payload can evolve existing
+    definitions and add the helpers they depend on. Returns the classification:
+    ``{"defined": [new names], "updated": [existing names]}``.
+    """
 
     existing = existing_semantic_names(view)
     proposed = {
@@ -136,15 +182,104 @@ def check_mode(
         if clashes:
             raise EditValidationError(
                 f"already defined in the project: {', '.join(clashes)}; use "
-                "`semantic update` to evolve an existing definition"
+                "`semantic update` to evolve an existing definition, or "
+                "`semantic plan` to mix new and existing names"
             )
     elif mode == "update":
         missing = sorted(proposed - existing)
         if missing:
             raise EditValidationError(
                 f"not defined in the project: {', '.join(missing)}; use "
-                "`semantic define` to add a new definition"
+                "`semantic define` to add a new definition, or "
+                "`semantic plan` to mix new and existing names"
             )
+    return {
+        "defined": sorted(proposed - existing),
+        "updated": sorted(proposed & existing),
+    }
+
+
+def check_references(parsed_edits: list[dict[str, Any]], view: DbtProjectView) -> None:
+    """Resolve every metric input against the merged namespace (project plus
+    the proposed edits, so references across edits in one payload work).
+
+    The jsonschema validation is shape-only: a metric whose input names nothing
+    real still passes it and then fails ``dbt build`` two commands later. The
+    load-bearing rule is dbt's: ratio and derived inputs reference *metrics*,
+    not measures, and a measure only becomes a metric via ``create_metric``.
+    All problems are collected and raised together so one round-trip fixes the
+    payload.
+    """
+
+    project_ns = project_namespace(view)
+    proposed_ns = collect_namespace(parsed_edits)
+    metrics = project_ns.metrics | proposed_ns.metrics
+    measures = project_ns.measures | proposed_ns.measures
+
+    problems: list[str] = []
+
+    def metric_ref(metric_name: str, role: str, value: Any) -> None:
+        name = _ref_name(value)
+        if name is None or name in metrics:
+            return
+        if name in measures:
+            problems.append(
+                f"metric '{metric_name}': {role} '{name}' is a measure, not a "
+                "metric; add create_metric: true to the measure or reference "
+                "a metric"
+            )
+        else:
+            problems.append(
+                f"metric '{metric_name}': {role} references unknown metric '{name}'"
+            )
+
+    def measure_ref(metric_name: str, role: str, value: Any) -> None:
+        name = _ref_name(value)
+        if name is not None and name not in measures:
+            problems.append(
+                f"metric '{metric_name}': {role} references unknown measure '{name}'"
+            )
+
+    for parsed in parsed_edits:
+        if not isinstance(parsed, dict):
+            continue
+        for entry in parsed.get("metrics") or []:
+            if not isinstance(entry, dict) or not entry.get("name"):
+                continue
+            name = entry["name"]
+            metric_type = str(entry.get("type", "")).lower()
+            params = entry.get("type_params")
+            if not isinstance(params, dict):
+                continue
+            if metric_type in {"simple", "cumulative"}:
+                measure_ref(name, "measure", params.get("measure"))
+            elif metric_type == "ratio":
+                metric_ref(name, "numerator", params.get("numerator"))
+                metric_ref(name, "denominator", params.get("denominator"))
+            elif metric_type == "derived":
+                for input_metric in params.get("metrics") or []:
+                    metric_ref(name, "input metric", input_metric)
+            elif metric_type == "conversion":
+                conversion = params.get("conversion_type_params")
+                if isinstance(conversion, dict):
+                    measure_ref(name, "base_measure", conversion.get("base_measure"))
+                    measure_ref(
+                        name, "conversion_measure", conversion.get("conversion_measure")
+                    )
+            # Unknown metric types are left to the schema validator and dbt.
+    if problems:
+        raise EditValidationError("; ".join(problems))
+
+
+def _ref_name(value: Any) -> str | None:
+    """A metric/measure input is either a bare name or {name: ...}."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        name = value.get("name")
+        return name if isinstance(name, str) else None
+    return None
 
 
 def _validate_with(

@@ -133,7 +133,7 @@ def test_non_unique_id_gets_fan_out_warning(airbnb_duckdb: Path, capsys):
     )
     hosts = payload["data"]["datasets"][0]
     warning = next(n for n in hosts["data_quality"] if "not unique" in n)
-    assert "ID is not unique: 2 distinct over 3 rows" in warning
+    assert "ID is not unique: ~2 distinct over 3 rows" in warning
     assert "fan out" in warning
     # With no unique column at all, the grain is explicitly unknown, not silent.
     assert any("grain unknown" in n for n in hosts["data_quality"])
@@ -173,3 +173,125 @@ def test_profile_accepts_comma_separated_objects(airbnb_duckdb: Path, capsys):
     )
     names = {d["identifier"].split(".")[-1] for d in payload["data"]["datasets"]}
     assert names == {"RAW_HOSTS", "RAW_LISTINGS", "RAW_REVIEWS"}
+
+
+# --- exact-count escalation ----------------------------------------------------
+
+
+def test_near_unique_key_escalates_to_exact_and_confirms_grain(
+    near_unique_duckdb: Path, capsys
+):
+    payload = _run(
+        ["explore", "profile", "results", "--path", str(near_unique_duckdb)], capsys
+    )
+    results = payload["data"]["datasets"][0]
+    key = {c["name"]: c for c in results["columns"]}["resultId"]
+    assert key["distinct_count"] == 50000
+    assert key["distinct_count_exact"] is True
+    assert key["is_unique"] is True
+    assert ["resultId"] in results["candidate_keys"]
+    assert results["grain"] == ["resultId"]
+    assert not any("not unique" in n for n in results["data_quality"])
+    assert not any("grain unknown" in n for n in results["data_quality"])
+
+
+def test_true_duplicates_still_warn_with_exact_counts(near_unique_duckdb: Path, capsys):
+    payload = _run(
+        ["explore", "profile", "dupes", "--path", str(near_unique_duckdb)], capsys
+    )
+    dupes = payload["data"]["datasets"][0]
+    warning = next(n for n in dupes["data_quality"] if "not unique" in n)
+    assert "id is not unique: 45000 distinct over 50000 rows" in warning
+    assert "fan out" in warning
+
+
+class _StubAdapter:
+    """Metadata-only double: crafted approximate aggregates, recorded escalations."""
+
+    name = "stub"
+    dialect = "duckdb"
+
+    def __init__(self, rows: int, approx: dict[str, int]):
+        self.rows = rows
+        self.approx = approx
+        self.calls: list[list[str]] = []
+
+    def table_metadata(self, identifier):
+        from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+
+        meta = ObjectMeta(
+            identifier=identifier,
+            object_type="table",
+            schema="s",
+            name=identifier.rsplit(".", 1)[-1],
+            row_count=self.rows,
+            byte_size=None,
+            column_count=len(self.approx),
+        )
+        columns = [
+            ColumnMeta(name=n, data_type="INTEGER", nullable=True, ordinal=i)
+            for i, n in enumerate(self.approx)
+        ]
+        return meta, columns
+
+    def column_aggregates(self, identifier, columns, *, safe_min_max=None):
+        from exmergo_dex_core.adapters.base import ColumnAggregate
+
+        return [
+            ColumnAggregate(
+                name=c.name,
+                null_fraction=0.0,
+                distinct_count=self.approx[c.name],
+                is_unique=False,
+                min_value=None,
+                max_value=None,
+            )
+            for c in columns
+        ]
+
+    def exact_distinct_counts(self, identifier, columns):
+        self.calls.append(list(columns))
+        return {n: (self.rows if n == "overshoot" else self.rows - 10) for n in columns}
+
+
+def test_escalation_policy_is_bounded_and_targeted():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    # An approx overshooting the row count (the field signature of a real key),
+    # ten in-band columns to overflow the cap, and one far below the band.
+    approx = {
+        "overshoot": 1010,
+        **{f"near_{i}": 950 + i for i in range(10)},
+        "low": 600,
+    }
+    adapter = _StubAdapter(rows=1000, approx=approx)
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+
+    assert len(adapter.calls) == 1, "all escalations batch into one adapter call"
+    chosen = adapter.calls[0]
+    assert len(chosen) == 8
+    assert "overshoot" in chosen, "smallest gaps win and overshoot's gap is 10"
+    assert "low" not in chosen
+    assert "near_0" not in chosen and "near_1" not in chosen
+
+    cols = {c.name: c for c in datasets[0].columns}
+    assert cols["overshoot"].distinct_count == 1000
+    assert cols["overshoot"].distinct_count_exact is True
+    assert cols["overshoot"].is_unique is True
+    assert cols["near_9"].distinct_count == 990
+    assert cols["near_9"].is_unique is False
+    assert cols["low"].distinct_count == 600
+    assert cols["low"].distinct_count_exact is False
+
+
+def test_adapter_without_exact_counts_degrades_gracefully():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(rows=1000, approx={"id": 990})
+    adapter.exact_distinct_counts = None  # shadow the method: adapter can't escalate
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    col = datasets[0].columns[0]
+    assert col.distinct_count == 990
+    assert col.distinct_count_exact is False
+    # In the noise band and unproven: no non-uniqueness verdict.
+    assert not any("not unique" in n for n in datasets[0].data_quality)

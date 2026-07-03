@@ -62,8 +62,10 @@ class ColumnAggregate:
     ``min_value`` / ``max_value`` are populated by the adapter only for columns the
     engine has marked safe (numeric / temporal, non-PII); for everything else they
     stay ``None`` so a sensitive or free-text value never crosses the boundary.
-    ``distinct_count`` is approximate (``approx_count_distinct``) for scale, so
-    ``is_unique`` derived from it is a signal, not a proof.
+    ``distinct_count`` is approximate (``approx_count_distinct``) for scale unless
+    ``distinct_count_exact`` is set, in which case the engine escalated it to an
+    exact ``COUNT(DISTINCT)`` and ``is_unique`` derived from it is a proof, not a
+    signal.
     """
 
     name: str
@@ -72,6 +74,7 @@ class ColumnAggregate:
     is_unique: bool | None
     min_value: object | None
     max_value: object | None
+    distinct_count_exact: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +148,15 @@ class Adapter(Protocol):
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
         be computed; all others get ``None`` so values never leave the engine."""
+        ...
+
+    def exact_distinct_counts(
+        self, identifier: str, columns: list[str]
+    ) -> dict[str, int]:
+        """Exact ``COUNT(DISTINCT)`` for the named columns, batched into as few
+        statements as possible. The engine calls this only for columns whose
+        approximate distinct landed within noise of the non-null count, so the
+        spend is bounded and deliberate; a metered adapter never self-escalates."""
         ...
 
     def run_query(

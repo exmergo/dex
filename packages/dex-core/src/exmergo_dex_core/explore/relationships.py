@@ -22,6 +22,7 @@ from ..cache import (
     Relationship,
     RelationshipKind,
 )
+from .profile import NEAR_UNIQUE_RATIO
 
 # Warehouse-layer prefixes stripped from a table name before entity matching, so
 # RAW_HOSTS, stg_races, and dim_customers all match FKs named after the bare entity.
@@ -57,8 +58,10 @@ def _is_id_shaped(column_name: str) -> bool:
 def candidate_keys(dataset: Dataset) -> list[list[str]]:
     """Single-column candidate keys: unique and non-null. Composite keys deferred.
 
-    Uniqueness rests on an approximate distinct count, so these are candidates the
-    engine and agent treat as signals, not proven primary keys.
+    Uniqueness on near-unique columns is escalated to an exact COUNT(DISTINCT)
+    at profile time (``distinct_count_exact``), so these are proven where it
+    matters; a column whose uniqueness still rests on the approximate count is
+    a signal, not a proof.
     """
 
     return [
@@ -153,11 +156,21 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
         )
         if not own_key or col.distinct_count is None:
             continue
+        if (
+            not col.distinct_count_exact
+            and col.distinct_count >= NEAR_UNIQUE_RATIO * dataset.row_count
+        ):
+            # Within approximation noise of unique: unproven either way, so no
+            # verdict. Exact counts always speak; a shortfall too large for
+            # noise (an approx 500 distinct over 1,125 rows) still warns.
+            continue
         if col.distinct_count < dataset.row_count:
             duplicates = dataset.row_count - col.distinct_count
+            # An unescalated count is honest about being approximate.
+            marker = "" if col.distinct_count_exact else "~"
             notes.append(
-                f"{col.name} is not unique: {col.distinct_count} distinct over "
-                f"{dataset.row_count} rows (~{duplicates} duplicate rows); "
+                f"{col.name} is not unique: {marker}{col.distinct_count} distinct "
+                f"over {dataset.row_count} rows (~{duplicates} duplicate rows); "
                 "joins on it will fan out"
             )
 

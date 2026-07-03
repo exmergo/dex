@@ -197,12 +197,14 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     declared = rel_mod.declared_relationships(repo_root)
     relationships = declared + inferred
 
-    final_scores = rank_mod.rank(metas, relationships, config.ranking_hints)
-    datasets = _compose_datasets(metas, profiled, final_scores)
-
     store = DexStore(repo_root)
     now = datetime.now(UTC)
     prior = store.load_cache()
+    # Prior profiles are only reusable when they came from the same connector.
+    reusable = prior if prior and prior.provenance.connector == adapter.name else None
+    final_scores = rank_mod.rank(metas, relationships, config.ranking_hints)
+    datasets, carried = _compose_datasets(metas, profiled, final_scores, reusable)
+
     cache = DexCache(datasets=datasets, relationships=relationships)
     cache.provenance.connector = adapter.name
     cache.provenance.created_at = (
@@ -212,6 +214,21 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     )
     path = store.save_cache(cache, now=now)
 
+    notes = _relationship_notes(profiled, declared, inferred)
+    skipped = len(metas) - len(profiled)
+    if skipped > 0:
+        notes.append(
+            f"profiled top {len(profiled)} of {len(metas)} objects by rank "
+            f"(profile_top_n={config.profile_top_n}; all objects are profiled "
+            f"automatically at {_AUTO_PROFILE_ALL} or fewer); pass --full to "
+            "profile everything"
+        )
+    if carried > 0:
+        notes.append(
+            f"carried forward {carried} prior profile(s) for objects not "
+            "re-profiled this run; per-dataset profiled_at marks their age"
+        )
+
     pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
     quality_notes = sum(len(d.data_quality) for d in profiled)
     top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
@@ -220,13 +237,15 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             "cache_path": str(path),
             "object_count": len(metas),
             "profiled_count": len(profiled),
+            "skipped_count": skipped,
+            "carried_forward_count": carried,
             "relationship_count": len(relationships),
             "pii_column_count": pii_columns,
             "data_quality_note_count": quality_notes,
             "top_objects": [
                 {"identifier": d.identifier, "rank_score": d.rank_score} for d in top
             ],
-            "notes": _relationship_notes(profiled, declared, inferred),
+            "notes": notes,
             "updated_at": now.isoformat(),
         }
     )
@@ -343,23 +362,44 @@ def _compose_datasets(
     metas: list[ObjectMeta],
     profiled: list[Dataset],
     scores: dict[str, float],
-) -> list[Dataset]:
+    prior: DexCache | None,
+) -> tuple[list[Dataset], int]:
+    """Merge this run's profiles over the full inventory. Returns the composed
+    datasets plus how many prior profiles were carried forward.
+
+    An object not profiled this run reuses its prior profile wholesale (columns,
+    keys, grain, notes, and its original ``profiled_at``, which marks the age)
+    rather than silently degrading to an inventory-only entry; only the rank
+    score is refreshed. ``row_count`` stays the prior one so the carried record
+    is internally consistent with its own notes and counts. Carried profiles do
+    not feed relationship inference, which runs on this run's profiles only.
+    """
+
     by_id = {d.identifier: d for d in profiled}
+    prior_by_id = (
+        {d.identifier: d for d in prior.datasets if d.columns} if prior else {}
+    )
     datasets: list[Dataset] = []
+    carried = 0
     for meta in metas:
         ds = by_id.get(meta.identifier)
         if ds is None:
-            # Not profiled this run: keep it as an inventory-only entry so the
-            # landscape stays complete without scanning every object.
-            ds = Dataset(
-                identifier=meta.identifier,
-                object_type=meta.object_type,
-                row_count=meta.row_count,
-                byte_size=meta.byte_size,
-            )
+            previous = prior_by_id.get(meta.identifier)
+            if previous is not None:
+                ds = previous.model_copy(deep=True)
+                carried += 1
+            else:
+                # Never profiled: an inventory-only entry keeps the landscape
+                # complete without scanning every object.
+                ds = Dataset(
+                    identifier=meta.identifier,
+                    object_type=meta.object_type,
+                    row_count=meta.row_count,
+                    byte_size=meta.byte_size,
+                )
         ds.rank_score = scores.get(meta.identifier)
         datasets.append(ds)
-    return datasets
+    return datasets, carried
 
 
 def _resolve_identifiers(adapter: Adapter, requested: list[str]) -> list[str]:

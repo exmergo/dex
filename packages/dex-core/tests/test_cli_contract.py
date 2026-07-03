@@ -53,9 +53,9 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
 
 
 def test_unbuilt_commands_report_not_implemented(capsys):
-    # The maintain group, the dormant OSI exporter, and the Viz preview are the
-    # remaining stubs; viz lands later as an integration with the Viz product.
-    for argv in (["maintain", "check"], ["emit", "osi"], ["viz", "preview"]):
+    # The maintain group and the Viz preview are the remaining stubs; viz lands
+    # later as an integration with the Viz product.
+    for argv in (["maintain", "check"], ["viz", "preview"]):
         assert main(argv) == 0
         assert json.loads(capsys.readouterr().out)["status"] == "not_implemented"
 

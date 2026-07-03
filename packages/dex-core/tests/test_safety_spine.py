@@ -221,6 +221,127 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
 
 
+def test_semantic_planning_writes_nothing_even_with_shadow_parse(
+    dbt_project_dir: Path, capsys, monkeypatch
+):
+    """The plan-time dbt parse runs against a throwaway copy: after a semantic
+    plan the project tree is byte-identical, so the only artifact is the plan."""
+
+    import hashlib
+    import importlib
+    import json as json_mod
+    import subprocess
+
+    from exmergo_dex_core.cli import main
+
+    # Give dbt a reason to parse (a time spine) and record what it saw.
+    (dbt_project_dir / "models" / "spine.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: metricflow_time_spine\n"
+        "    time_spine:\n"
+        "      standard_granularity_column: date_day\n"
+        "    columns:\n"
+        "      - name: date_day\n"
+        "        granularity: day\n",
+        encoding="utf-8",
+    )
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    seen_dirs: list[str] = []
+
+    def recorder(timeout: float, cwd):
+        def run(argv: list[str]):
+            seen_dirs.append(argv[argv.index("--project-dir") + 1])
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", recorder)
+
+    def tree(root: Path) -> dict[str, str]:
+        return {
+            str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*"))
+            if p.is_file()
+        }
+
+    before = tree(dbt_project_dir)
+    payload = dbt_project_dir.parent / "sem.json"
+    payload.write_text(
+        json_mod.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/semantic/things.yml",
+                        "content": "metrics:\n"
+                        "  - name: thing_count\n"
+                        "    type: simple\n"
+                        "    type_params:\n"
+                        "      measure: thing_count\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    # The measure does not exist, so the plan is refused by reference checks;
+    # the write-nothing property must hold on refusal paths too. Then a valid
+    # payload exercises the parse path itself.
+    main(
+        [
+            "--repo-root",
+            str(dbt_project_dir.parent),
+            "semantic",
+            "plan",
+            "x",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    capsys.readouterr()
+    payload.write_text(
+        json_mod.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/semantic/things.yml",
+                        "content": "semantic_models:\n"
+                        "  - name: things\n"
+                        "    model: ref('stg_customers')\n"
+                        "    entities:\n"
+                        "      - name: thing\n"
+                        "        type: primary\n"
+                        "        expr: id\n"
+                        "    measures:\n"
+                        "      - name: thing_count\n"
+                        "        agg: count\n"
+                        "        expr: id\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "--repo-root",
+            str(dbt_project_dir.parent),
+            "semantic",
+            "plan",
+            "x",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    capsys.readouterr()
+    assert rc == 0
+    assert seen_dirs, "the shadow parse ran"
+    assert all(d != str(dbt_project_dir) for d in seen_dirs)
+    assert tree(dbt_project_dir) == before
+
+
 # `transform init` sits across families 1 and 4: the profile it generates is
 # what the dev-target-only rule later reads, and bootstrap must stay strictly
 # additive with no silent connector default.

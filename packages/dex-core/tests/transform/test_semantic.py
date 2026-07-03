@@ -1,4 +1,4 @@
-"""Semantic authoring: define/update as plans, MetricFlow validation, emit dbt."""
+"""Semantic authoring: define/update as plans, MetricFlow validation, apply."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ semantic_models:
   - name: customers
     description: Customer grain over stg_customers.
     model: ref('stg_customers')
+    defaults:
+      agg_time_dimension: signup_date
     entities:
       - name: customer
         type: primary
@@ -19,6 +21,11 @@ semantic_models:
     dimensions:
       - name: email_domain
         type: categorical
+      - name: signup_date
+        type: time
+        expr: cast('2020-01-01' as date)
+        type_params:
+          time_granularity: day
     measures:
       - name: customer_count
         agg: count
@@ -30,6 +37,33 @@ metrics:
     type: simple
     type_params:
       measure: customer_count
+"""
+
+
+_RATIO_METRICS_YAML = """\
+semantic_models:
+  - name: pit_stops
+    description: Pit stop grain.
+    model: ref('stg_customers')
+    entities:
+      - name: stop
+        type: primary
+        expr: id
+    measures:
+      - name: clean_stop_seconds
+        agg: sum
+        expr: id
+      - name: total_stops
+        agg: count
+        expr: id
+
+metrics:
+  - name: avg_clean_pit_stop_seconds
+    label: Avg clean stop seconds
+    type: ratio
+    type_params:
+      numerator: clean_stop_seconds
+      denominator: total_stops
 """
 
 
@@ -70,7 +104,7 @@ def test_semantic_define_creates_a_plan_not_a_file(
     assert rc == 0, envelope
     assert envelope["status"] == "ok"
     assert envelope["diffs"] and envelope["diffs"][0]["op"] == "create"
-    assert "emit dbt" in envelope["data"]["next"]
+    assert "transform apply" in envelope["data"]["next"]
     assert not (dbt_project_dir / "models/semantic/customers.yml").exists()
 
 
@@ -118,7 +152,7 @@ def test_semantic_define_requires_semantic_content(
 def test_define_refuses_existing_name_update_requires_it(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
-    # Land the semantic model first: define + emit dbt.
+    # Land the semantic model first: define + transform apply.
     payload = _payload_file(tmp_path, _VALID_SEMANTIC_YAML)
     rc, envelope = _run(
         [
@@ -133,7 +167,7 @@ def test_define_refuses_existing_name_update_requires_it(
         capsys,
     )
     assert envelope["status"] == "ok"
-    rc, envelope = _run(["--repo-root", str(tmp_path), "emit", "dbt"], capsys)
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
     assert rc == 0, envelope
     assert envelope["status"] == "ok"
     assert envelope["data"]["written"] == ["models/semantic/customers.yml"]
@@ -194,6 +228,265 @@ def test_update_refuses_unknown_name(dbt_project_dir: Path, tmp_path: Path, caps
     assert "semantic define" in envelope["errors"][0]
 
 
+def test_ratio_metric_referencing_a_measure_names_the_fix(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _payload_file(tmp_path, _RATIO_METRICS_YAML)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "pit stop kpi",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert "create_metric: true" in envelope["errors"][0]
+    # Both unresolved inputs are reported in one round-trip.
+    assert "numerator 'clean_stop_seconds'" in envelope["errors"][0]
+    assert "denominator 'total_stops'" in envelope["errors"][0]
+
+
+def test_ratio_metric_over_create_metric_measures_passes(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    fixed = _RATIO_METRICS_YAML.replace(
+        "        agg: sum\n", "        agg: sum\n        create_metric: true\n"
+    ).replace(
+        "        agg: count\n",
+        "        agg: count\n        create_metric: true\n",
+    )
+    payload = _payload_file(tmp_path, fixed)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "pit stop kpi",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+
+
+def test_simple_metric_with_unknown_measure_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    bad = _VALID_SEMANTIC_YAML.replace(
+        "      measure: customer_count", "      measure: nonexistent_measure"
+    )
+    payload = _payload_file(tmp_path, bad)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "unknown measure 'nonexistent_measure'" in envelope["errors"][0]
+
+
+def test_derived_metric_with_unknown_input_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    derived = (
+        _VALID_SEMANTIC_YAML + "  - name: customer_count_doubled\n"
+        "    label: Doubled\n"
+        "    type: derived\n"
+        "    type_params:\n"
+        "      expr: missing_metric * 2\n"
+        "      metrics:\n"
+        "        - name: missing_metric\n"
+    )
+    payload = _payload_file(tmp_path, derived)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "unknown metric 'missing_metric'" in envelope["errors"][0]
+
+
+def test_references_resolve_across_edits_in_one_payload(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    measures_only = (
+        _RATIO_METRICS_YAML.split("metrics:")[0]
+        .replace(
+            "        agg: sum\n", "        agg: sum\n        create_metric: true\n"
+        )
+        .replace(
+            "        agg: count\n",
+            "        agg: count\n        create_metric: true\n",
+        )
+    )
+    ratio_only = "metrics:" + _RATIO_METRICS_YAML.split("metrics:")[1]
+    payload = tmp_path / "two-edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {"path": "models/semantic/pit_stops.yml", "content": measures_only},
+                    {"path": "models/semantic/pit_kpis.yml", "content": ratio_only},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+
+
+def test_define_clashes_with_an_implicit_create_metric_name(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # A hand-written measure with create_metric: true implicitly declares a
+    # metric; a define proposing that name must be refused as a collision.
+    (dbt_project_dir / "models" / "semantic").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "models" / "semantic" / "existing.yml").write_text(
+        "semantic_models:\n"
+        "  - name: laps\n"
+        "    model: ref('stg_customers')\n"
+        "    entities:\n"
+        "      - name: lap\n"
+        "        type: primary\n"
+        "        expr: id\n"
+        "    measures:\n"
+        "      - name: lap_count\n"
+        "        agg: count\n"
+        "        expr: id\n"
+        "        create_metric: true\n",
+        encoding="utf-8",
+    )
+    clash = (
+        "metrics:\n"
+        "  - name: lap_count\n"
+        "    label: Laps\n"
+        "    type: simple\n"
+        "    type_params:\n"
+        "      measure: lap_count\n"
+    )
+    payload = _payload_file(tmp_path, clash)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "x",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "already defined" in envelope["errors"][0]
+
+
+def test_semantic_plan_accepts_mixed_new_and_existing_names(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # Land the baseline, then evolve it and add a dependent helper in ONE call:
+    # the mixed intent define/update each refuse.
+    payload = _payload_file(tmp_path, _VALID_SEMANTIC_YAML)
+    _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "v1",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, envelope
+
+    mixed = (
+        _VALID_SEMANTIC_YAML.replace("Customer count", "Count of customers")
+        + "  - name: customer_count_doubled\n"
+        "    label: Doubled\n"
+        "    type: derived\n"
+        "    type_params:\n"
+        "      expr: customer_count * 2\n"
+        "      metrics:\n"
+        "        - name: customer_count\n"
+    )
+    mixed_payload = _payload_file(tmp_path, mixed, name="mixed.json")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "plan",
+            "evolve and extend",
+            "--edits-file",
+            str(mixed_payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["defined"] == ["customer_count_doubled"]
+    assert envelope["data"]["updated"] == ["customer_count", "customers"]
+
+
+def test_define_reports_classification(dbt_project_dir: Path, tmp_path: Path, capsys):
+    payload = _payload_file(tmp_path, _VALID_SEMANTIC_YAML)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "v1",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["defined"] == ["customer_count", "customers"]
+    assert envelope["data"]["updated"] == []
+
+
 def test_semantic_rejects_model_sql_edits(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
@@ -226,15 +519,6 @@ def test_semantic_rejects_model_sql_edits(
     )
     assert rc == 1
     assert envelope["status"] == "error"
-
-
-def test_emit_dbt_without_a_semantic_plan_is_a_clean_error(
-    dbt_project_dir: Path, tmp_path: Path, capsys
-):
-    rc, envelope = _run(["--repo-root", str(tmp_path), "emit", "dbt"], capsys)
-    assert rc == 1
-    assert envelope["status"] == "error"
-    assert "semantic define" in envelope["errors"][0]
 
 
 def test_define_warns_when_project_lacks_a_time_spine(

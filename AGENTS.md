@@ -48,10 +48,11 @@ release is connector-neutral.
 | `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled, PII-cleared columns; requires the `.dex/` cache (`explore map` first) |
 | `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required) |
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
-| `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite |
-| `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget; prod-looking targets refused outright |
-| `semantic define\|update ... --edits-file <f>` | dbt semantic model edits as diffs (MetricFlow-validated) |
-| `emit dbt [plan-id]` | write the semantic plan's YAML into the dbt project (latest unapplied plan by default) |
+| `transform apply [plan-id]` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite; no id applies the latest unapplied plan of any kind |
+| `transform plans` | list stored plans, pending and applied, newest first |
+| `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget; prod-looking targets refused outright; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
+| `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
+| `semantic define\|update\|plan ... --edits-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies per name; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
 | `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` |
 | `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only) |
 | `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed |
@@ -61,7 +62,7 @@ release is connector-neutral.
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
-fronts `transform`, `semantic`, `emit`, and `viz`; `maintain` fronts the whole
+fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, detection (`check`, `schema`, `grain`,
 `semantic`) is read-only; only `reconcile` emits diffs. The engine does not care
 which skill fronts a subcommand.
@@ -70,7 +71,7 @@ Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "content"}, ...]}` with
 `kind` one of `model_sql`, `schema_yml`, `semantic_yml`. The engine validates,
 diffs, and stores the plan under `.dex/plans/`; nothing touches the dbt project
-until `transform apply` / `emit dbt`. See `references/command-contract.md`.
+until `transform apply`. See `references/command-contract.md`.
 
 ### The envelope
 

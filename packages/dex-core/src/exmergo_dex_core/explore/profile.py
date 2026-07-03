@@ -11,9 +11,25 @@ source so the value never leaves the engine.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
+from datetime import UTC, datetime
 
 from ..adapters.base import Adapter, ColumnAggregate, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+
+# approx_count_distinct error observed in practice reaches ~14% in both
+# directions at tens of thousands of rows (27,044 approx on 26,599 unique;
+# 39,134 approx on 45,000 distinct), far beyond HLL's nominal ~2%. The
+# threshold is one-sided with margin: any overshoot is consistent with a truly
+# unique column (an exact count can never exceed the non-null count), and
+# undershoot is covered down to 75% of non-null. Shared with
+# relationships.data_quality_notes, which must not call a column non-unique
+# from an approximation inside this band.
+NEAR_UNIQUE_RATIO = 0.75
+
+# All near-unique columns of one table escalate in a single batched
+# COUNT(DISTINCT) statement; the cap bounds the width of that statement.
+_EXACT_DISTINCT_CAP = 8
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
@@ -172,6 +188,9 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
             a.name: a
             for a in adapter.column_aggregates(identifier, columns, safe_min_max=safe)
         }
+        aggregates = _escalate_near_unique(
+            adapter, identifier, meta.row_count, aggregates
+        )
 
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
@@ -188,6 +207,7 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                     nullable=col.nullable,
                     null_fraction=agg.null_fraction if agg else None,
                     distinct_count=agg.distinct_count if agg else None,
+                    distinct_count_exact=agg.distinct_count_exact if agg else False,
                     is_unique=agg.is_unique if agg else None,
                     min_value=json_safe(agg.min_value) if agg else None,
                     max_value=json_safe(agg.max_value) if agg else None,
@@ -203,9 +223,65 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                 byte_size=meta.byte_size,
                 columns=profiles,
                 data_quality=data_quality,
+                profiled_at=datetime.now(UTC).isoformat(),
             )
         )
     return datasets
+
+
+def _escalate_near_unique(
+    adapter: Adapter,
+    identifier: str,
+    row_count: int | None,
+    aggregates: dict[str, ColumnAggregate],
+) -> dict[str, ColumnAggregate]:
+    """Replace approximate distinct counts with exact ones on columns that look
+    unique within approximation noise, so uniqueness verdicts (and the grain and
+    data-quality notes derived from them) rest on proof, not on HLL error.
+
+    Bounded: at most ``_EXACT_DISTINCT_CAP`` columns per table (the smallest
+    approx-to-non-null gaps win), all in one batched adapter call. An adapter
+    without ``exact_distinct_counts`` degrades to the approximate signals.
+    """
+
+    if not row_count:
+        return aggregates
+    exact_counts = getattr(adapter, "exact_distinct_counts", None)
+    if exact_counts is None:
+        return aggregates
+
+    candidates: list[tuple[int, str, int]] = []
+    for agg in aggregates.values():
+        if agg.distinct_count is None or agg.distinct_count_exact:
+            continue
+        non_null = (
+            round((1 - agg.null_fraction) * row_count)
+            if agg.null_fraction is not None
+            else row_count
+        )
+        if non_null <= 0:
+            continue
+        if agg.distinct_count >= NEAR_UNIQUE_RATIO * non_null:
+            gap = abs(non_null - agg.distinct_count)
+            candidates.append((gap, agg.name, non_null))
+    if not candidates:
+        return aggregates
+
+    candidates.sort(key=lambda c: c[0])
+    chosen = candidates[:_EXACT_DISTINCT_CAP]
+    exact = exact_counts(identifier, [name for _gap, name, _nn in chosen])
+
+    escalated = dict(aggregates)
+    for _gap, name, non_null in chosen:
+        if name not in exact:
+            continue
+        escalated[name] = replace(
+            aggregates[name],
+            distinct_count=exact[name],
+            is_unique=(exact[name] == non_null == row_count),
+            distinct_count_exact=True,
+        )
+    return escalated
 
 
 def _refine_confidence(
