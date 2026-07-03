@@ -24,7 +24,7 @@ from . import envelope as env
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": ["inventory", "profile", "relationships", "map", "query"],
-    "transform": ["plan", "apply", "build"],
+    "transform": ["init", "plan", "apply", "build"],
     "semantic": ["define", "update"],
     "emit": ["dbt", "osi"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
@@ -92,8 +92,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
-                # transform plan takes the intent; apply takes the plan id.
-                if group == "transform" and name in {"plan", "apply"}:
+                # transform init takes the project name; plan the intent; apply
+                # the plan id.
+                if group == "transform" and name in {"init", "plan", "apply"}:
                     sp.add_argument("argument", nargs="?", default=None)
                 if group == "transform" and name == "plan":
                     # The agent-authored edits payload: a JSON file, or - for stdin.
@@ -156,6 +157,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
     # module serves them all. `emit osi` stays reserved for the dormant exporter,
     # and `viz preview` stays a stub until the Viz integration lands.
     transform_surface = {
+        ("transform", "init"),
         ("transform", "plan"),
         ("transform", "apply"),
         ("transform", "build"),
@@ -167,6 +169,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
         from .transform import commands as transform_cmds
 
         handlers = {
+            ("transform", "init"): transform_cmds.cmd_init,
             ("transform", "plan"): transform_cmds.cmd_plan,
             ("transform", "apply"): transform_cmds.cmd_apply,
             ("transform", "build"): transform_cmds.cmd_build,

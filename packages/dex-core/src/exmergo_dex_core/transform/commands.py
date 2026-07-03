@@ -26,6 +26,49 @@ from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit, PlanStore
 
 
+def cmd_init(args: argparse.Namespace) -> env.Envelope:
+    from ..config import load_config
+    from . import init as init_mod
+
+    repo_root = command_args.repo_root(args)
+
+    # Init bakes the connector into the generated profiles.yml, so the engine-wide
+    # DuckDB fall-through is deliberately not used here: an explicit --connector
+    # wins, a connector: committed in .dex/config.yml is accepted (and attributed),
+    # and bare init is an error. Misconfiguration that works is the worst kind.
+    connector = getattr(args, "connector", None)
+    connector_source = "flag"
+    if not connector:
+        config = load_config(repo_root)
+        if config is not None and "connector" in config.model_fields_set:
+            connector, connector_source = config.connector, "config"
+    if not connector:
+        return env.error(
+            "transform init needs an explicit connector and never defaults: pass "
+            "--connector <" + "|".join(init_mod.VALID_CONNECTORS) + "> or declare "
+            "connector: in .dex/config.yml"
+        )
+
+    result = init_mod.init_project(
+        getattr(args, "argument", None) or "",
+        connector,
+        path=getattr(args, "path", None),
+        repo_root=repo_root,
+    )
+    return env.ok(
+        {
+            "project_name": result.project_name,
+            "project_dir": result.project_dir,
+            "connector": result.connector,
+            "connector_source": connector_source,
+            "created": result.created,
+            "next": "run `explore map` if you have not yet, then propose staging "
+            "models with `transform plan --scaffold <table>`",
+        },
+        diffs=result.diffs,
+    )
+
+
 def cmd_plan(args: argparse.Namespace) -> env.Envelope:
     intent = getattr(args, "argument", None) or ""
     edits = _edits_from_payload(getattr(args, "edits_file", None))
