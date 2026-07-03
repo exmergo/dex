@@ -7,10 +7,9 @@ dbt project, which is the source of truth, plus the ``.dex/`` cache), so the age
 orchestrates multi-step flows.
 
 ``connect test``, the ``explore`` group, and the authoring surface (``transform``,
-``semantic``, ``emit dbt``) are live. The ``maintain`` group, ``emit osi``, and
-``viz preview`` return a valid envelope with status ``not_implemented`` so the
-contract, the wrappers, and the eval harness can be exercised before their engine
-logic exists.
+``semantic``) are live. The ``maintain`` group and ``viz preview`` return a valid
+envelope with status ``not_implemented`` so the contract, the wrappers, and the
+eval harness can be exercised before their engine logic exists.
 """
 
 from __future__ import annotations
@@ -24,9 +23,8 @@ from . import envelope as env
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": ["inventory", "profile", "relationships", "map", "query"],
-    "transform": ["init", "plan", "apply", "build"],
-    "semantic": ["define", "update"],
-    "emit": ["dbt", "osi"],
+    "transform": ["init", "plan", "apply", "build", "deps", "plans"],
+    "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
     # `schema`/`grain`/`semantic` are the per-axis deep detectors; `reconcile`
@@ -106,8 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "semantic":
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
-                if group == "emit" and name == "dbt":
-                    sp.add_argument("plan_id", nargs="?", default=None)
+                    sp.add_argument("--no-parse", action="store_true", default=False)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {"schema", "grain", "semantic"}:
@@ -152,18 +149,19 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
         }
         return handlers[args.subcommand](args)
 
-    # The transform skill fronts the authoring surface (transform, semantic,
-    # emit dbt); they share one plan store and one write path, so one command
-    # module serves them all. `emit osi` stays reserved for the dormant exporter,
-    # and `viz preview` stays a stub until the Viz integration lands.
+    # The transform skill fronts the authoring surface (transform, semantic);
+    # they share one plan store and one write path, so one command module serves
+    # them all. `viz preview` stays a stub until the Viz integration lands.
     transform_surface = {
         ("transform", "init"),
         ("transform", "plan"),
         ("transform", "apply"),
         ("transform", "build"),
+        ("transform", "deps"),
+        ("transform", "plans"),
         ("semantic", "define"),
         ("semantic", "update"),
-        ("emit", "dbt"),
+        ("semantic", "plan"),
     }
     if (args.group, args.subcommand) in transform_surface:
         from .transform import commands as transform_cmds
@@ -173,9 +171,11 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             ("transform", "plan"): transform_cmds.cmd_plan,
             ("transform", "apply"): transform_cmds.cmd_apply,
             ("transform", "build"): transform_cmds.cmd_build,
+            ("transform", "deps"): transform_cmds.cmd_deps,
+            ("transform", "plans"): transform_cmds.cmd_plans,
             ("semantic", "define"): transform_cmds.cmd_semantic_define,
             ("semantic", "update"): transform_cmds.cmd_semantic_update,
-            ("emit", "dbt"): transform_cmds.cmd_emit_dbt,
+            ("semantic", "plan"): transform_cmds.cmd_semantic_plan,
         }
         return handlers[(args.group, args.subcommand)](args)
 
