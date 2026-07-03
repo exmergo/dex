@@ -36,6 +36,8 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
 dex explore map                   -> write/update the .dex cache; print a summary
 dex explore query "<SELECT ...>"  -> run one agent-authored SELECT through the query firewall
+dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
+                                     --connector (never defaults); refuses if a project exists
 dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet)
 dex transform apply <plan-id>     -> write diffs into the dbt project (a reviewable git diff)
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget
@@ -70,6 +72,22 @@ must parse; semantic YAML must satisfy MetricFlow's schemas), pins it to the
 sha256 of the file it would change, computes the diffs, and stores the plan under
 `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
 
+- `transform init "<name>" --connector <duckdb|snowflake|bigquery|databricks|postgres>`
+  bootstraps a dbt project when none exists: `dbt_project.yml`, `models/staging/`
+  and `models/marts/`, and a project-local `profiles.yml` with a single `dev`
+  target wired to the warehouse dex already knows (`--path`, or `duckdb.path` in
+  `.dex/config.yml`). It is strictly additive (any existing dbt project is a
+  refusal, so nothing is ever overwritten), and everything created is reported
+  as `create` diffs. **Init never defaults the connector**: the engine-wide
+  fall-through to DuckDB is safe for read-only commands but wrong here, because
+  init bakes the connector into the generated profile. `--connector` wins, a
+  `connector:` already committed in `.dex/config.yml` is accepted (the envelope
+  names which source was used), and bare init is an error listing the valid
+  connectors. On success init writes `connector`, `dbt_project_dir`, and
+  `dbt_target: dev` back to `.dex/config.yml`, so the choice is made once and is
+  ambient for every later command. DuckDB is the supported connector today; the
+  cloud connectors are accepted by the contract but return an actionable
+  not-yet-supported error until their dbt adapters ship.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.

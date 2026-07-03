@@ -46,6 +46,7 @@ release is connector-neutral.
 | `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
 | `explore map [--verify]` | writes/updates the `.dex/` map; prints a summary |
 | `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled, PII-cleared columns; requires the `.dex/` cache (`explore map` first) |
+| `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required) |
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
 | `transform apply <plan-id>` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite |
 | `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget; prod-looking targets refused outright |

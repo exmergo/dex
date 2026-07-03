@@ -2,17 +2,19 @@
 and the semantic layer (dbt semantic models / MetricFlow YAML).
 
 ``commands`` holds the CLI orchestrators; the sibling modules are the engine they
-drive: ``plans`` (propose/apply as reviewable diffs), ``validate`` (per-kind edit
-checks), ``build`` (gated dev-target dbt builds), ``semantic`` (MetricFlow YAML),
-and ``scaffold`` (deterministic staging skeletons). The Viz preview is not part
-of this engine: it is a separate product surface and stays a stub here.
+drive: ``init`` (dbt project bootstrap), ``plans`` (propose/apply as reviewable
+diffs), ``validate`` (per-kind edit checks), ``build`` (gated dev-target dbt
+builds), ``semantic`` (MetricFlow YAML), and ``scaffold`` (deterministic staging
+skeletons). The Viz preview is not part of this engine: it is a separate product
+surface and stays a stub here.
 
 The engine entry points are re-exported here so callers address the capability,
 not its file layout: ``transform.plan(...)``, ``transform.apply(...)``,
-``transform.build(...)``.
+``transform.build(...)``, ``transform.init_project(...)``.
 """
 
 from .build import ProdTargetRefusedError, assert_dev_target, build
+from .init import InitError, InitResult, init_project
 from .plans import (
     EditKind,
     PlanEdit,
@@ -26,6 +28,8 @@ from .plans import (
 
 __all__ = [
     "EditKind",
+    "InitError",
+    "InitResult",
     "PlanEdit",
     "PlanError",
     "PlanNotFoundError",
@@ -35,5 +39,6 @@ __all__ = [
     "apply",
     "assert_dev_target",
     "build",
+    "init_project",
     "plan",
 ]

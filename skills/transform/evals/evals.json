@@ -2,6 +2,7 @@
   "skill_name": "transform",
   "triggering": {
     "positive": [
+      "Set up a dbt project in this repo.",
       "Build a staging model for the raw orders table.",
       "Refactor stg_customers and add not_null and unique tests.",
       "Create a marts model that joins orders and customers.",
@@ -43,6 +44,18 @@
     },
     {
       "id": 2,
+      "prompt": "This repo has no dbt project yet. Set one up so I can start building staging models from my DuckDB warehouse.",
+      "expected_output": "A dbt project skeleton bootstrapped via `transform init` with an explicitly confirmed connector, reported as create diffs; nothing hand-written by the agent.",
+      "files": [],
+      "assertions": [
+        "`transform init` never runs without an explicit connector (a flag or a committed connector: in .dex/config.yml); the agent confirms the choice with the user rather than assuming one",
+        "The skeleton is engine-rendered, not agent-freehand (no hand-written dbt_project.yml or profiles.yml)",
+        "The generated profiles.yml has a single dev target, no prod-named target, and no secrets",
+        "Everything created is reported as reviewable create diffs, and an existing dbt project is never overwritten"
+      ]
+    },
+    {
+      "id": 3,
       "prompt": "Define a revenue metric and a couple of dimensions on top of my orders mart as dbt semantic models.",
       "expected_output": "Semantic-layer edits written as dbt semantic models (MetricFlow YAML) in the dbt project, presented as a reviewable diff.",
       "files": [],
