@@ -96,6 +96,17 @@ class PlanStore:
             )
         return TransformPlan.model_validate_json(path.read_text(encoding="utf-8"))
 
+    def list_all(self) -> list[TransformPlan]:
+        """Every stored plan, newest first."""
+
+        if not self.plans_dir.is_dir():
+            return []
+        plans = [
+            TransformPlan.model_validate_json(path.read_text(encoding="utf-8"))
+            for path in self.plans_dir.glob("*.json")
+        ]
+        return sorted(plans, key=lambda p: p.created_at, reverse=True)
+
     def latest(self, kind: EditKind | None = None) -> TransformPlan | None:
         """The most recent unapplied plan, optionally only-of-``kind`` edits."""
 
