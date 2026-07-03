@@ -28,13 +28,21 @@ Subcommands, in the usual order:
 3. `explore profile <objects>` (space- or comma-separated) returns column
    profiles, PII flags recorded as (column, category, confidence) and never
    example values, plus candidate keys, the likely grain, and data-quality
-   warnings (e.g. a non-unique id that will fan out on joins).
+   warnings (e.g. a non-unique id that will fan out on joins). Distinct counts
+   are approximate for scale, but any column that looks unique within
+   approximation noise is escalated to an exact COUNT(DISTINCT)
+   (`distinct_count_exact: true`), so uniqueness and grain verdicts rest on
+   proof; a `~` prefix in a warning marks a count that is still approximate.
 4. `explore relationships` returns inferred and declared joins with confidences,
    plus notes explaining what the inference examined (so an empty list is
    meaningful). Add `--verify` to measure each inferred join with an aggregate
    overlap probe (orphan fraction, confidence adjusted).
 5. `explore map` writes or updates the `.dex/` cache and prints a summary
-   (`--verify` works here too).
+   (`--verify` works here too). Past 50 objects it profiles only the top 25 by
+   rank and says so in `notes` (with `skipped_count`); pass `--full` to profile
+   everything. On a re-map, objects skipped this run keep their prior profiles
+   (`carried_forward_count`), each stamped with its own `profiled_at` so
+   staleness is visible instead of column detail silently vanishing.
 6. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
    don't cover: you write the SQL, the engine's query firewall refuses or bounds
    it. Requires the `.dex/` cache (run `map` first). Results come back columnar
