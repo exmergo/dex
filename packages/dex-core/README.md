@@ -46,17 +46,27 @@ the full surface and the envelope spec.
 ## Status
 
 Early and under active development; expect pre-release versions. Today the engine
-runs the Explore stage on DuckDB end to end: it ranks what matters in an unfamiliar
-warehouse, profiles columns selectively, flags PII, surfaces grain and
-data-quality warnings, infers joins and verifies them with overlap probes
-(`--verify`), and executes agent-authored ad-hoc SELECTs behind a PII-aware query
-firewall (`explore query`), all read-only. Transform (dbt models and the semantic
-layer) and Maintain (drift and
-reconcile), and the cloud connectors (BigQuery, Snowflake, Databricks,
-PostgreSQL), are in progress and report `not_implemented` until they land. The
-foundations are in place: the command contract, the
-canonical model and `.dex/` layout, the OSI validator against a pinned schema,
-and the eval and safety spine.
+runs Explore and Transform on DuckDB end to end.
+
+Explore: ranks what matters in an unfamiliar warehouse, profiles columns
+selectively, flags PII, surfaces grain and data-quality warnings, infers joins
+and verifies them with overlap probes (`--verify`), and executes agent-authored
+ad-hoc SELECTs behind a PII-aware query firewall (`explore query`), all
+read-only.
+
+Transform: bootstraps a dbt project where none exists (`transform init`, with an
+explicit connector, never a default), turns agent-authored edits and
+deterministic staging scaffolds into reviewable, conflict-checked diffs
+(`transform plan` / `apply`, with human edits authoritative on conflict), runs
+gated dev-target-only builds with cost surfaced before any spend
+(`transform build`), and authors the semantic layer as MetricFlow-validated dbt
+semantic models (`semantic define|update`, `emit dbt`).
+
+Maintain (drift detection and reconcile), the cloud connectors (BigQuery,
+Snowflake, Databricks, PostgreSQL), the OSI exporter, and the Viz preview report
+`not_implemented` until they land. The foundations are in place: the command
+contract, the canonical model and `.dex/` layout, the OSI validator against a
+pinned schema, and the eval and safety spine.
 
 ## License
 

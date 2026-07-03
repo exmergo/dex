@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.0a6] - 2026-07-03
+
 ### Added
 
 - `transform init "<name>" --connector <c>`: engine-owned dbt project bootstrap,
