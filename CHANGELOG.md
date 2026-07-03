@@ -9,6 +9,32 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- `transform init "<name>" --connector <c>`: engine-owned dbt project bootstrap,
+  so an empty repo no longer hits a wall on step one. Renders a deterministic
+  skeleton (`dbt_project.yml`, `models/staging/` and `models/marts/`, a
+  project-local `profiles.yml` with a single duckdb `dev` target wired to the
+  known warehouse) and records `connector`, `dbt_project_dir`, and
+  `dbt_target: dev` in `.dex/config.yml`, all reported as create diffs. Strictly
+  additive: refuses wherever a dbt project already exists. Unlike the read-only
+  commands, init never falls back to a default connector (it bakes the connector
+  into the generated profile): `--connector` wins, a committed `connector:` in
+  `.dex/config.yml` is accepted and attributed in the envelope, and bare init is
+  an error listing the valid connectors. DuckDB is the supported connector
+  today; the cloud connectors return an actionable not-yet-supported error until
+  their dbt adapters ship.
+- Safety-spine coverage for init: refuses over an existing project, no connector
+  fall-through, the generated profile is dev-only with no prod-named target and
+  no secret-like keys, and the generated project round-trips through the loader
+  and a real gated `dbt build`.
+
+### Changed
+
+- `.dex/config.yml` writes now persist only fields that were explicitly loaded
+  or assigned, so the committed file records choices instead of every engine
+  default.
+
 ## [0.1.0a5] - 2026-07-03
 
 The authoring half of the loop goes live on DuckDB. `transform plan|apply|build`,
