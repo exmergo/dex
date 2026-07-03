@@ -223,6 +223,39 @@ def resolve_target(project_dir: Path | str, target: str | None = None) -> Target
     )
 
 
+def duckdb_target_path(
+    project_dir: Path | str, target: str | None = None
+) -> Path | None:
+    """The database file a duckdb target points at, or None.
+
+    Relative paths resolve against the project dir, matching the cwd dbt runs
+    with. None for non-duckdb outputs, in-memory databases, or an unresolvable
+    profile/target. Only the path crosses the boundary; the output's other
+    connection fields stay behind, per this module's contract (a local file
+    path is not a credential).
+    """
+
+    project = Path(project_dir)
+    try:
+        view_profile = load(project).profile_name
+        profiles = _load_profiles(project)
+    except DbtProjectError:
+        return None
+    profile = profiles.get(view_profile)
+    if not isinstance(profile, dict):
+        return None
+    outputs = profile.get("outputs") or {}
+    name = target or profile.get("target")
+    output = outputs.get(name)
+    if not isinstance(output, dict) or str(output.get("type")) != "duckdb":
+        return None
+    raw_path = output.get("path")
+    if not raw_path or str(raw_path) == ":memory:":
+        return None
+    path = Path(str(raw_path))
+    return path if path.is_absolute() else project / path
+
+
 def profiles_dir(project_dir: Path | str) -> Path:
     """The directory whose profiles.yml governs this project (dbt search order)."""
 
