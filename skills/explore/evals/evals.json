@@ -17,6 +17,7 @@
       "Run a quick query to check whether order dates have any gaps."
     ],
     "negative": [
+      "Set up a dbt project in this repo.",
       "Build a staging model for the orders table.",
       "Refactor this dbt model and add tests.",
       "Define a revenue metric on top of fct_orders.",

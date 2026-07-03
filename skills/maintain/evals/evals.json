@@ -13,6 +13,7 @@
     "negative": [
       "What's in this warehouse and which tables matter?",
       "Profile the events table and flag PII.",
+      "Set up a dbt project in this repo.",
       "Build a staging model for raw orders.",
       "Define a revenue metric on top of fct_orders."
     ]
