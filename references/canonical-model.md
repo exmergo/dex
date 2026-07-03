@@ -43,7 +43,10 @@ informs proposals, never the source of truth:
 .dex/
   config.yml      non-secret config: connector + dbt target, budgets, ranking hints
   cache.json      exploration artifacts (DexCache): profiles, PII flags, relationships,
-                  candidate keys, grain, rankings, data-quality observations
+                  candidate keys, grain, rankings, data-quality observations. A column
+                  profile records whether its distinct count is exact or approximate
+                  (distinct_count_exact); each dataset carries the time it was profiled
+                  (profiled_at) so carried-forward profiles stay attributable
   snapshot.json   the maintain baseline: a frozen fingerprint of the warehouse schema, the
                   dbt manifest state, and declared grain/semantic assumptions. Written by
                   `maintain snapshot`; the drift detectors diff current reality against it.
@@ -61,16 +64,11 @@ here. PII is recorded as `(column, category, confidence)` with no example values
 
 Supporting more model formats over time does not require a neutral internal model.
 It requires a thin `ProjectAdapter` protocol (`adapters/project.py`) with one
-implementation today, `DbtProject`, plus exporters that read a project view.
-Future sources (SQLMesh, Cube) become new adapter implementations; future targets
-(OSI and others) become exporters. The interface is thin and dbt is its only
-implementation in v1; dex does not build a rich neutral model behind it.
-
-## OSI and other outputs
-
-Not emitted in v1. OSI is a dormant exporter (`exporters/osi.py`): the pinned-schema
-validator is live and tested so the mechanism is ready, but the engine produces no
-OSI until the format matures. See `osi-map-schema.md`.
+implementation today, `DbtProject`. Future sources (SQLMesh, Cube) become new
+adapter implementations. The interface is thin and dbt is its only implementation
+in v1; dex does not build a rich neutral model behind it, and it does not project
+the dbt model back out into other formats. dex reasons over the dbt project and
+authors into it directly; there is no one-way exporter path.
 
 ## The round-trip rule (reconcile, simplified)
 

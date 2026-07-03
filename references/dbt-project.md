@@ -37,3 +37,20 @@ under `.dex/plans/`. Applying a plan re-hashes every file first:
 Human edits to dbt are authoritative by construction; dex holds no competing copy
 to overwrite them from. Writes are confined to the project's model paths; path
 escapes are refused. dex never builds to a non-dev target.
+
+## Running dbt (build, deps, parse)
+
+Every dbt subprocess runs with its working directory pinned to the project dir, so
+relative paths in `profiles.yml` and anywhere else resolve against the project, not
+the caller's shell cwd. When the project declares packages (`packages.yml`, or a
+`dependencies.yml` with a `packages:` key) and `dbt_packages/` is missing or empty,
+`transform build` runs `dbt deps` automatically before building; `transform deps`
+is the explicit install/refresh. Package installation writes only `dbt_packages/`
+and the lockfile inside the project and spends nothing against the warehouse, so it
+runs without the cost gate.
+
+Semantic plans are validated up to and including dbt's own parser before they are
+stored: dex copies the project (minus warehouse files, target, and logs) into a
+throwaway directory, overlays the proposed YAML, and runs `dbt parse` there, so
+nothing the parser writes touches the real project. When dbt is unavailable the
+parse degrades to a warning rather than a hard failure.
