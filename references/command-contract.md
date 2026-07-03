@@ -25,9 +25,9 @@ from profiled, PII-cleared columns, bounded and capped by the query firewall.
 ## The command surface
 
 Capabilities, not final spelling. Implemented incrementally: `connect test`, the
-`explore` group, and the authoring surface (`transform`, `semantic`, `emit dbt`)
-are live; the `maintain` group, `emit osi`, and `viz preview` return a valid
-`not_implemented` envelope until they land.
+`explore` group, and the authoring surface (`transform`, `semantic`) are live;
+the `maintain` group and `viz preview` return a valid `not_implemented` envelope
+until they land.
 
 ```
 dex connect test                  -> {capabilities, dialect, read_only: true}
@@ -39,10 +39,15 @@ dex explore query "<SELECT ...>"  -> run one agent-authored SELECT through the q
 dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists
 dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet)
-dex transform apply <plan-id>     -> write diffs into the dbt project (a reviewable git diff)
-dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget
-dex semantic define|update ...    -> dbt semantic model edits as diffs (fronted by transform)
-dex emit dbt                      -> write/refresh dbt semantic YAML from the semantic edits
+dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
+                                     no id means the latest unapplied plan of any kind
+dex transform plans               -> list stored plans, pending and applied, newest first
+dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
+                                     auto-runs dbt deps when packages are declared but not installed
+dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
+dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
+                                     validated up to and including dbt's own parser; applied with
+                                     transform apply like any other plan
 dex maintain snapshot             -> capture/refresh the known-good baseline in .dex/snapshot.json
 dex maintain check                -> sweep every drift axis vs the snapshot; ranked drift report (read-only)
 dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed; nullability
@@ -91,20 +96,40 @@ sha256 of the file it would change, computes the diffs, and stores the plan unde
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.
-- `transform apply <plan-id>` re-hashes every file first. A file edited by a
+- `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
-  `--confirm` overrides it. A clean apply is all-or-nothing.
+  `--confirm` overrides it. A clean apply is all-or-nothing. With no plan id it
+  applies the latest unapplied plan of any kind (semantic plans included; `emit
+  dbt` remains the semantic-scoped spelling). `transform plans` lists what is
+  stored, pending and applied.
 - `transform build` accepts `--target` and `--select`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
-  the refusal.
+  the refusal. dbt runs with cwd pinned to the project dir (relative
+  `profiles.yml` paths resolve there, never against the caller's shell). When
+  `packages.yml` (or a `dependencies.yml` with packages) is declared and
+  `dbt_packages/` is missing, `dbt deps` runs automatically first; `transform
+  deps` is the explicit install/refresh. A missing dev DuckDB database is an
+  actionable refusal when the project reads from sources (seed it first), and a
+  warning otherwise. On failure the envelope's `errors[0]` carries the first
+  real dbt message; the rest land in `warnings`, per-entry capped, deduplicated,
+  with a pointer to the full log when anything was trimmed.
 - `semantic define` refuses names that already exist in the project (use
-  `update`); `update` refuses names that do not (use `define`). `emit dbt`
-  applies a semantic plan (the latest unapplied one, or an explicit plan id).
+  `update`); `update` refuses names that do not (use `define`); `semantic plan`
+  accepts a mix and classifies per name, reporting `defined` and `updated` in
+  the envelope. Names implicitly created by `create_metric: true` measures count
+  as existing metrics everywhere. Beyond MetricFlow's schemas, the engine
+  resolves every metric input (ratio and derived inputs must reference metrics,
+  not measures) and then runs the emitted YAML through dbt's own parser against
+  a throwaway copy of the project; a plan that fails parse is never stored.
+  When dbt is unavailable (or the project has no time spine yet) the parse
+  degrades to a warning; `--no-parse` skips it. A stored semantic plan is applied
+  with `transform apply` like any other plan (no id applies the latest unapplied
+  one).
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
-fronts `transform`, `semantic`, `emit`, and `viz`; `maintain` fronts the whole
+fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, `snapshot` manages the baseline, `check`
 plus `schema`/`grain`/`semantic` detect drift (read-only), and `reconcile` is the
 only verb that emits diffs.
@@ -113,6 +138,12 @@ only verb that emits diffs.
 inferred join with one aggregate overlap probe (non-null foreign keys, orphan
 count) and adjusts its confidence; the result carries `verified` and
 `orphan_fraction`.
+
+`explore map` never caps silently: past 50 objects it profiles the top
+`profile_top_n` (default 25) by rank and announces the cutoff in `notes`
+alongside `skipped_count` (`--full` profiles everything). Objects skipped on a
+re-map carry their prior profiles forward (`carried_forward_count`), each
+stamped with its own `profiled_at`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--repo-root`, `--confirm`, `--budget`.
