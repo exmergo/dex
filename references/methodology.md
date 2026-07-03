@@ -41,8 +41,17 @@ Profiling builds a column-level picture from SQL aggregates only. For each objec
 it issues one batched aggregate query (a non-null count, an approximate distinct
 count, and conditionally a min and max), batching wide tables so a single
 statement never balloons. From those it derives null fraction, distinct count, and
-a uniqueness signal. The distinct count is approximate for scale, so uniqueness is
-treated as a candidate signal, never a proven key.
+a uniqueness signal. The distinct count is approximate for scale, so uniqueness
+starts as a candidate signal, never a proven key.
+
+Because an approximate count can overshoot a genuinely unique column and turn a
+real key into a false "grain unknown", profiling then escalates: any column whose
+approximate distinct count sits near its non-null count (within a bounded band) is
+re-counted with an exact `COUNT(DISTINCT)` in one batched, read-only statement,
+capped to the few closest candidates per table so the escalation stays cheap. An
+escalated count is marked exact, and only an exact count is allowed to confirm a
+key or a table's grain; downstream consumers (relationship fan-out notes included)
+never draw a hard conclusion from an approximation.
 
 Two safety rules are enforced at the source, in the SQL that is generated:
 
@@ -82,11 +91,15 @@ simply empty, which is expected because explore is designed to work without one.
 truth; see `canonical-model.md`). It ranks first on cheap signals, profiles a
 selective top set by default (with a `--full` option to profile everything, and an
 automatic profile-all on small warehouses), infers relationships among the
-profiled set, then re-ranks with connectivity for the final scores. The cache is
-re-derived and replaced on each run so dropped objects disappear, while the
-original creation timestamp is preserved. What is printed back is a counts-level
-summary, never the cache contents, keeping the output sense-making rather than a
-dump.
+profiled set, then re-ranks with connectivity for the final scores. The selective
+pass never caps silently: the summary states how many objects were profiled versus
+skipped and the rule that drew the line. On a re-map, an object that falls outside
+this run's top set keeps its prior profile (carried forward, each dataset stamped
+with its own `profiled_at`) rather than dropping to inventory-only, so coverage
+accumulates across runs. The cache is re-derived and replaced on each run so
+dropped objects disappear, while the original creation timestamp is preserved. What
+is printed back is a counts-level summary, never the cache contents, keeping the
+output sense-making rather than a dump.
 
 ## What the agent sees
 
