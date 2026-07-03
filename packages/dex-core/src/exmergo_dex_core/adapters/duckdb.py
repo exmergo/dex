@@ -220,6 +220,32 @@ class DuckDBAdapter:
             )
         return aggregates
 
+    def exact_distinct_counts(
+        self, identifier: str, columns: list[str]
+    ) -> dict[str, int]:
+        """Exact COUNT(DISTINCT) per named column, batched into one statement
+        per _COLUMN_BATCH group (roughly one scan each)."""
+
+        results: dict[str, int] = {}
+        for start in range(0, len(columns), _COLUMN_BATCH):
+            batch = columns[start : start + _COLUMN_BATCH]
+            select_parts = [
+                f"COUNT(DISTINCT {_quote_ident(name)}) AS d_{i}"
+                for i, name in enumerate(batch)
+            ]
+            # Interpolated parts are quoted+escaped identifiers only; the result
+            # is guarded as a read-only SELECT.
+            sql = (
+                f"SELECT {', '.join(select_parts)} "  # noqa: S608
+                f"FROM {self._quote(identifier)}"
+            )
+            row = self._run_select(assert_select_only(sql, dialect=self.dialect))[0]
+            labels = [d[0] for d in self._conn.description]
+            values = dict(zip(labels, row, strict=True))
+            for i, name in enumerate(batch):
+                results[name] = int(values[f"d_{i}"])
+        return results
+
     def _build_aggregate_sql(
         self, identifier: str, columns: list[ColumnMeta], safe: set[str]
     ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool]]]:
