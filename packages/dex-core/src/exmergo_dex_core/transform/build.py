@@ -18,11 +18,21 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..dbt_project import profiles_dir
+import yaml
+
+from ..dbt_project import (
+    DbtProjectError,
+    Edit,
+    contained_path,
+    duckdb_target_path,
+    profiles_dir,
+)
+from ..dbt_project import load as load_project
 from ..envelope import Cost, Paradigm, redact
 from ..guards.cost_guard import preflight
 
@@ -32,6 +42,13 @@ from ..guards.cost_guard import preflight
 _PROD_TARGET_NAMES = {"prod", "production", "prd", "live", "release", "main"}
 
 _DBT_TIMEOUT_SECONDS = 600.0
+_DEPS_TIMEOUT_SECONDS = 300.0
+_PARSE_TIMEOUT_SECONDS = 120.0
+
+# Envelope hygiene for dbt output: enough of each message to act on, never a
+# multi-KB traceback, never the same message twice.
+_MESSAGE_MAX_CHARS = 400
+_MESSAGE_CAP = 20
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
@@ -92,6 +109,26 @@ def build(
         raise DbtRunError("no dbt project directory resolved for the build")
     project = Path(project_dir)
 
+    seeding_warning = _check_dev_database(project, target)
+
+    # Most real projects carry a packages.yml, and dbt refuses to compile until
+    # its packages are installed; running deps here (post-gate) means the first
+    # build never fails on a missing `dbt deps` step the agent has no verb for.
+    deps_ran = False
+    if needs_deps(project):
+        deps_summary = deps(project, runner=runner)
+        deps_ran = True
+        if not deps_summary["success"]:
+            return {
+                "target": target,
+                "success": False,
+                "returncode": deps_summary["returncode"],
+                "nodes": [],
+                "counts": {},
+                "messages": deps_summary["messages"],
+                "deps": {"ran": True, "success": False},
+            }, cost
+
     argv = [
         _dbt_executable(),
         "build",
@@ -107,11 +144,200 @@ def build(
     if select:
         argv += ["--select", select]
 
-    run = runner or _default_runner(timeout)
+    # cwd is pinned to the project dir so relative paths in profiles.yml (for
+    # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
+    # against whatever directory the caller happened to launch from.
+    run = runner or _default_runner(timeout, project)
     completed = run(argv)
 
     summary = _summarize(project, target, completed)
+    if deps_ran:
+        summary["deps"] = {"ran": True, "success": True}
+    if seeding_warning:
+        # A note, not a failure cause: kept out of `messages`, whose first entry
+        # is promoted to the envelope's error line on failure.
+        summary["notes"] = [seeding_warning]
     return summary, cost
+
+
+def _check_dev_database(project: Path, target: str) -> str | None:
+    """Catch the missing-dev-database failure mode before dbt does.
+
+    A duckdb target whose file does not exist yet is legitimate when the project
+    builds everything from models, but a project reading from ``sources:`` would
+    get a fresh empty database and then fail every source relation with a
+    confusing catalog error. That case is refused with the seeding step spelled
+    out; the source-less case only warns.
+    """
+
+    db_path = duckdb_target_path(project, target)
+    if db_path is None or db_path.exists():
+        return None
+    if _declares_sources(project):
+        raise DbtRunError(
+            f"the dev target database {db_path} does not exist and the project "
+            "reads from sources; seed it before building (for example copy the "
+            f"source warehouse: cp <source>.duckdb {db_path}), or point the dev "
+            "target at an existing database file"
+        )
+    return f"dev target database {db_path} does not exist; dbt will create an empty one"
+
+
+def _declares_sources(project: Path) -> bool:
+    view = load_project(project)
+    for source in view.files.values():
+        if not source.path.endswith((".yml", ".yaml")):
+            continue
+        try:
+            parsed = yaml.safe_load(source.content)
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("sources"):
+            return True
+    return False
+
+
+def shadow_parse(
+    project_dir: Path | str,
+    edits: list[Edit],
+    *,
+    target: str | None = None,
+    runner: Runner | None = None,
+    timeout: float = _PARSE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Validate proposed edits with dbt's own parser, without touching the project.
+
+    The project is copied to a throwaway directory (warehouse files and build
+    artifacts excluded), the edits are overlaid there, and ``dbt parse`` runs
+    against the copy with cwd pinned to it, so everything dbt writes (target/,
+    logs/, any stray database a relative profile path would create) lives and
+    dies with the copy.
+
+    Returns ``{"available", "reason", "messages"}``: unavailable means the
+    caller degrades to a warning (dbt or profiles missing, mirroring the
+    schema-validation fallback); available with empty messages means the parse
+    passed; non-empty messages are the parse errors.
+    """
+
+    project = Path(project_dir)
+    try:
+        executable = _dbt_executable()
+    except DbtRunError:
+        return {
+            "available": False,
+            "reason": "dbt is not installed; plan validated by schema checks only",
+            "messages": [],
+        }
+    try:
+        profiles = profiles_dir(project)
+    except DbtProjectError:
+        return {
+            "available": False,
+            "reason": "no profiles.yml found; dbt parse skipped",
+            "messages": [],
+        }
+
+    view = load_project(project)
+    with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
+        shadow = Path(tmp) / (project.resolve().name or "project")
+        # dbt_packages/ is deliberately copied (parse needs installed macros);
+        # warehouse files are deliberately not (parse never reads them, and
+        # they can be huge). `.dex` matters when the project is the repo root.
+        shutil.copytree(
+            project,
+            shadow,
+            ignore=shutil.ignore_patterns(
+                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
+            ),
+        )
+        for edit in edits:
+            edit_path = contained_path(shadow, edit.path, view.model_paths)
+            edit_path.parent.mkdir(parents=True, exist_ok=True)
+            edit_path.write_text(edit.new_content, encoding="utf-8")
+
+        argv = [
+            executable,
+            "parse",
+            "--project-dir",
+            str(shadow),
+            "--profiles-dir",
+            str(profiles),
+            "--log-format",
+            "json",
+        ]
+        if target:
+            argv += ["--target", target]
+        run = runner or _default_runner(timeout, shadow)
+        completed = run(argv)
+        messages: list[str] = []
+        if completed.returncode != 0:
+            messages = _collect_messages(completed) or ["dbt parse failed"]
+    return {"available": True, "reason": None, "messages": messages}
+
+
+def has_package_spec(project_dir: Path | str) -> bool:
+    """True when the project declares dbt packages (packages.yml, or a
+    dependencies.yml with a ``packages:`` key)."""
+
+    project = Path(project_dir)
+    if (project / "packages.yml").is_file():
+        return True
+    dependencies = project / "dependencies.yml"
+    if dependencies.is_file():
+        try:
+            parsed = yaml.safe_load(dependencies.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            return False
+        return isinstance(parsed, dict) and bool(parsed.get("packages"))
+    return False
+
+
+def needs_deps(project_dir: Path | str) -> bool:
+    """True when declared packages are not installed yet (dbt_packages/ missing
+    or empty). Lockfile staleness is not tracked; `transform deps` is the
+    explicit refresh."""
+
+    project = Path(project_dir)
+    if not has_package_spec(project):
+        return False
+    packages_dir = project / "dbt_packages"
+    return not packages_dir.is_dir() or not any(packages_dir.iterdir())
+
+
+def deps(
+    project_dir: Path | str,
+    *,
+    runner: Runner | None = None,
+    timeout: float = _DEPS_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Run ``dbt deps``. Returns a sanitized summary dict.
+
+    Not confirmation-gated: deps never connects to a warehouse and writes only
+    ``dbt_packages/`` plus the lockfile under the project dir. Inside ``build()``
+    it runs after the target check and the cost gate anyway.
+    """
+
+    project = Path(project_dir)
+    argv = [
+        _dbt_executable(),
+        "deps",
+        "--project-dir",
+        str(project),
+        "--log-format",
+        "json",
+    ]
+    run = runner or _default_runner(timeout, project)
+    completed = run(argv)
+    messages: list[str] = []
+    if completed.returncode != 0:
+        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+    packages_dir = project / "dbt_packages"
+    return {
+        "success": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "packages_dir_exists": packages_dir.is_dir() and any(packages_dir.iterdir()),
+        "messages": messages,
+    }
 
 
 # --- helpers -----------------------------------------------------------------
@@ -132,15 +358,63 @@ def _dbt_executable() -> str:
     )
 
 
-def _default_runner(timeout: float) -> Runner:
+def _default_runner(timeout: float, cwd: Path) -> Runner:
     def run(argv: list[str]) -> subprocess.CompletedProcess:
         # The argv is engine-built (dbt executable + validated target/paths),
         # never raw user input, and shell=False.
         return subprocess.run(  # noqa: S603
-            argv, capture_output=True, text=True, timeout=timeout, check=False
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            cwd=str(cwd),
         )
 
     return run
+
+
+def _collect_messages(
+    completed: subprocess.CompletedProcess, log_hint: Path | None = None
+) -> list[str]:
+    """Reduce dbt's output to actionable one-liners for the envelope.
+
+    Keeps the first line of each error/warn message (redacted, length-capped,
+    deduplicated); when anything was cut, the last entry points at the full log
+    instead of letting a raw traceback cross the envelope boundary.
+    """
+
+    messages: list[str] = []
+    seen: set[str] = set()
+    trimmed = False
+    for line in (completed.stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        info = event.get("info", {})
+        if info.get("level") not in {"error", "warn"} or not info.get("msg"):
+            continue
+        msg = redact(str(info["msg"]))
+        first_line = msg.splitlines()[0] if msg else msg
+        if len(first_line) > _MESSAGE_MAX_CHARS:
+            first_line = first_line[:_MESSAGE_MAX_CHARS] + "..."
+            trimmed = True
+        if first_line != msg:
+            trimmed = True
+        if first_line in seen:
+            trimmed = True
+            continue
+        seen.add(first_line)
+        messages.append(first_line)
+    if not messages and completed.stderr:
+        messages.append(redact(completed.stderr.strip().splitlines()[-1]))
+    if len(messages) > _MESSAGE_CAP:
+        messages = messages[:_MESSAGE_CAP]
+        trimmed = True
+    if trimmed and log_hint is not None:
+        messages.append(f"full output: {log_hint}")
+    return messages
 
 
 def _summarize(
@@ -166,18 +440,7 @@ def _summarize(
 
     messages: list[str] = []
     if completed.returncode != 0:
-        # Surface dbt's own human-readable messages (redacted), never raw log text
-        # wholesale: enough to act on, nothing to leak.
-        for line in (completed.stdout or "").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            info = event.get("info", {})
-            if info.get("level") in {"error", "warn"} and info.get("msg"):
-                messages.append(redact(str(info["msg"])))
-        if not messages and completed.stderr:
-            messages.append(redact(completed.stderr.strip().splitlines()[-1]))
+        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
 
     return {
         "target": target,
@@ -185,5 +448,5 @@ def _summarize(
         "returncode": completed.returncode,
         "nodes": nodes,
         "counts": counts,
-        "messages": messages[:20],
+        "messages": messages,
     }
