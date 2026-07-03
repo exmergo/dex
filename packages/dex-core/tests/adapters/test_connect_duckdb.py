@@ -48,6 +48,18 @@ def test_open_adapter_resolves_path_argument(duckdb_file: Path):
         adapter.close()
 
 
+def test_exact_distinct_counts_is_exact_and_batched(duckdb_file: Path):
+    adapter = DuckDBAdapter(duckdb_file)
+    try:
+        counts = adapter.exact_distinct_counts(
+            "warehouse.main.orders", ["id", "customer_id"]
+        )
+        assert counts == {"id": 3, "customer_id": 2}
+        assert adapter.exact_distinct_counts("warehouse.main.orders", []) == {}
+    finally:
+        adapter.close()
+
+
 def test_open_adapter_requires_a_path():
     with pytest.raises(ValueError):
         open_adapter(connector="duckdb", path=None, repo_root="/nonexistent-root")

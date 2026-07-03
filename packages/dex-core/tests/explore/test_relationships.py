@@ -156,10 +156,37 @@ def test_own_key_duplicates_produce_fan_out_warning():
     )
     notes = data_quality_notes(hosts)
     warning = next(n for n in notes if "not unique" in n)
-    assert "ID is not unique: 9590 distinct over 14111 rows" in warning
+    assert "ID is not unique: ~9590 distinct over 14111 rows" in warning
     assert "4521 duplicate rows" in warning
     assert "fan out" in warning
     assert any("grain unknown" in n for n in notes)
+
+
+def test_fan_out_note_gated_on_exactness():
+    """Within the approximation noise band, only an exact count may call a
+    column non-unique; a shortfall too large for noise still warns unescalated."""
+
+    in_band_approx = _ds("db.main.things", [_col("id", distinct=1100)], rows=1125)
+    assert not any("not unique" in n for n in data_quality_notes(in_band_approx))
+
+    in_band_exact = _ds(
+        "db.main.things",
+        [
+            ColumnProfile(
+                name="id",
+                data_type="INTEGER",
+                null_fraction=0.0,
+                distinct_count=1100,
+                distinct_count_exact=True,
+                is_unique=False,
+            )
+        ],
+        rows=1125,
+    )
+    assert any("not unique" in n for n in data_quality_notes(in_band_exact))
+
+    far_below_band = _ds("db.main.things", [_col("id", distinct=500)], rows=1125)
+    assert any("not unique" in n for n in data_quality_notes(far_below_band))
 
 
 def test_repeated_foreign_key_is_not_a_grain_defect():
