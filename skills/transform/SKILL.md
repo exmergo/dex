@@ -1,6 +1,6 @@
 ---
 name: transform
-description: Use this to author and change a dbt project: write or refactor dbt model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Trigger it for requests like "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Every change is a reviewable diff to the dbt project; any warehouse build is dev-target only, gated, and cost-surfaced first. Do not use it to explore or profile a warehouse (use explore) or to detect drift and reconcile a project that has fallen out of sync (use maintain).
+description: Use this to author and change a dbt project: bootstrap a new dbt project in a repo that has none (`transform init`), write or refactor dbt model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Every change is a reviewable diff to the dbt project; any warehouse build is dev-target only, gated, and cost-surfaced first. Do not use it to explore or profile a warehouse (use explore) or to detect drift and reconcile a project that has fallen out of sync (use maintain).
 ---
 
 # Transform
@@ -32,6 +32,26 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 `semantic define|update`, which imply it). Model SQL must be a single read-only
 SELECT once its jinja is stripped; semantic YAML is validated against
 MetricFlow's schemas.
+
+### Bootstrapping a project
+
+If no dbt project exists in the repo, offer `transform init` before anything
+else: `transform plan` needs a project to edit. Ask the user for the project
+name and **confirm the connector with them**, then run:
+
+```bash
+uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
+```
+
+The engine renders the whole skeleton (`dbt_project.yml`, `models/staging/` and
+`models/marts/`, a `profiles.yml` with a single `dev` target and no secrets) and
+records `connector`, `dbt_project_dir`, and `dbt_target: dev` in
+`.dex/config.yml`; do not hand-write these files yourself. Init never assumes a
+connector: it errors rather than defaulting, so always pass the user's confirmed
+choice (a `connector:` already committed in `.dex/config.yml` also counts).
+DuckDB needs a warehouse path (`--path`, or the `duckdb.path` config); it is the
+supported connector today, and the cloud connectors return an actionable
+not-yet-supported error. Init refuses if any dbt project already exists.
 
 ### dbt SQL models
 
