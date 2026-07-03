@@ -105,6 +105,19 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def discover_projects(repo_root: Path | str = ".") -> list[Path]:
+    """Every dbt project the search surface can see: the repo root itself, or
+    its immediate children. Shared by ``find_project`` and ``transform init``'s
+    already-exists refusal, so the two can never disagree."""
+
+    root = Path(repo_root)
+    if (root / PROJECT_FILE).is_file():
+        return [root]
+    if not root.is_dir():
+        return []
+    return sorted(child for child in root.iterdir() if (child / PROJECT_FILE).is_file())
+
+
 def find_project(repo_root: Path | str = ".") -> Path:
     """Locate the dbt project: the repo root itself, or a unique child directory.
 
@@ -113,13 +126,7 @@ def find_project(repo_root: Path | str = ".") -> Path:
     """
 
     root = Path(repo_root)
-    if (root / PROJECT_FILE).is_file():
-        return root
-    candidates = (
-        sorted(child for child in root.iterdir() if (child / PROJECT_FILE).is_file())
-        if root.is_dir()
-        else []
-    )
+    candidates = discover_projects(root)
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:

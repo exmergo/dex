@@ -76,9 +76,12 @@ def save_config(config: DexConfig, repo_root: Path | str = ".") -> Path:
     dex_dir = Path(repo_root) / DEX_DIR
     dex_dir.mkdir(parents=True, exist_ok=True)
     path = dex_dir / CONFIG_FILE
+    # Only fields that were loaded or assigned are written: the committed file
+    # stays a record of explicit choices, not a dump of every engine default.
     path.write_text(
         yaml.safe_dump(
-            config.model_dump(mode="json", exclude_none=True), sort_keys=False
+            config.model_dump(mode="json", exclude_unset=True, exclude_none=True),
+            sort_keys=False,
         ),
         encoding="utf-8",
     )
