@@ -60,13 +60,12 @@ deterministic staging scaffolds into reviewable, conflict-checked diffs
 (`transform plan` / `apply`, with human edits authoritative on conflict), runs
 gated dev-target-only builds with cost surfaced before any spend
 (`transform build`), and authors the semantic layer as MetricFlow-validated dbt
-semantic models (`semantic define|update`, `emit dbt`).
+semantic models (`semantic define|update|plan`, applied with `transform apply`).
 
 Maintain (drift detection and reconcile), the cloud connectors (BigQuery,
-Snowflake, Databricks, PostgreSQL), the OSI exporter, and the Viz preview report
-`not_implemented` until they land. The foundations are in place: the command
-contract, the canonical model and `.dex/` layout, the OSI validator against a
-pinned schema, and the eval and safety spine.
+Snowflake, Databricks, PostgreSQL), and the Viz preview report `not_implemented`
+until they land. The foundations are in place: the command contract, the
+canonical model and `.dex/` layout, and the eval and safety spine.
 
 ## License
 
