@@ -221,6 +221,71 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
 
 
+# `transform init` sits across families 1 and 4: the profile it generates is
+# what the dev-target-only rule later reads, and bootstrap must stay strictly
+# additive with no silent connector default.
+
+
+def test_init_refuses_where_a_project_already_exists(dbt_project_dir: Path):
+    # Bootstrap is strictly additive: anywhere find_project would discover a
+    # project, init refuses, so it can never clobber hand-written work.
+    from exmergo_dex_core import transform
+
+    repo = dbt_project_dir.parent
+    with pytest.raises(transform.InitError):
+        transform.init_project(
+            "fresh", "duckdb", path=str(repo / "warehouse.duckdb"), repo_root=repo
+        )
+
+
+def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys):
+    # Init bakes the connector into a durable artifact (the generated
+    # profiles.yml), so the engine-wide DuckDB default does not apply: bare init
+    # errors and creates nothing.
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    rc = main(["--repo-root", str(tmp_path), "transform", "init", "analytics"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "--connector" in payload["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
+def test_init_profile_is_dev_only_with_no_secrets(tmp_path: Path):
+    # The generated profiles.yml is why bootstrap is engine-owned: a single dev
+    # default target, nothing prod-named, and no secret-like keys anywhere.
+    import yaml
+
+    from exmergo_dex_core import transform
+
+    transform.init_project(
+        "analytics", "duckdb", path=str(tmp_path / "w.duckdb"), repo_root=tmp_path
+    )
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    profile = profiles["analytics"]
+    assert profile["target"] == "dev"
+    assert set(profile["outputs"]) == {"dev"}
+    # The envelope sanitizer doubles as the secret-key scanner here.
+    env.sanitize(env.ok(profiles))
+
+
+def test_init_project_round_trips_through_the_loader(tmp_path: Path):
+    from exmergo_dex_core import dbt_project, transform
+
+    transform.init_project(
+        "analytics", "duckdb", path=str(tmp_path / "w.duckdb"), repo_root=tmp_path
+    )
+    view = dbt_project.load(dbt_project.find_project(tmp_path))
+    assert view.project_name == "analytics"
+    assert view.profile_name == "analytics"
+    assert dbt_project.resolve_target(tmp_path / "analytics").name == "dev"
+
+
 # --- Family 5: credentials and raw rows never enter stdout data ---------------
 
 
