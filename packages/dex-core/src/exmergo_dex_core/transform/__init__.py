@@ -13,7 +13,15 @@ not its file layout: ``transform.plan(...)``, ``transform.apply(...)``,
 ``transform.build(...)``, ``transform.init_project(...)``.
 """
 
-from .build import ProdTargetRefusedError, assert_dev_target, build
+from .build import (
+    ProdTargetRefusedError,
+    assert_dev_target,
+    build,
+    deps,
+    has_package_spec,
+    needs_deps,
+    shadow_parse,
+)
 from .init import InitError, InitResult, init_project
 from .plans import (
     EditKind,
@@ -39,6 +47,10 @@ __all__ = [
     "apply",
     "assert_dev_target",
     "build",
+    "deps",
+    "has_package_spec",
     "init_project",
+    "needs_deps",
     "plan",
+    "shadow_parse",
 ]

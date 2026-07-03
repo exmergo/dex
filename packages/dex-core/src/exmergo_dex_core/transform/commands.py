@@ -2,8 +2,8 @@
 
 Each ``cmd_*`` resolves the dbt project, drives the plan/apply/build engine, and
 shapes the result into the sanitized envelope. The transform skill fronts the
-authoring CLI groups (``transform``, ``semantic``, ``emit dbt``); they share one
-plan store and one write path, which is why they live in one package.
+authoring CLI groups (``transform``, ``semantic``); they share one plan store and
+one write path, which is why they live in one package.
 
 The agent is the author: model SQL and semantic YAML arrive via ``--edits-file``
 (a JSON payload; ``-`` reads stdin). The engine validates, diffs, and stores;
@@ -93,8 +93,40 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
 def cmd_apply(args: argparse.Namespace) -> env.Envelope:
     plan_id = getattr(args, "argument", None)
     if not plan_id:
-        return env.error("transform apply needs a plan id (from `transform plan`)")
+        # No id means the latest unapplied plan of any kind: apply does not
+        # dispatch on kind, a plan is a plan (a semantic plan applies the same
+        # way a model plan does).
+        latest = PlanStore(command_args.repo_root(args)).latest(None)
+        if latest is None:
+            return env.error(
+                "no unapplied plan found; run `transform plan` or `semantic "
+                "define|update|plan` first, or pass a plan id"
+            )
+        plan_id = latest.plan_id
     return _apply_plan(args, plan_id)
+
+
+def cmd_plans(args: argparse.Namespace) -> env.Envelope:
+    """List stored plans (pending and applied), newest first."""
+
+    plans = PlanStore(command_args.repo_root(args)).list_all()
+    return env.ok(
+        {
+            "plans": [
+                {
+                    "plan_id": p.plan_id,
+                    "intent": p.intent,
+                    "kinds": sorted({e.kind.value for e in p.edits}),
+                    "paths": [e.path for e in p.edits],
+                    "created_at": p.created_at,
+                    "applied_at": p.applied_at,
+                    "pending": p.applied_at is None,
+                }
+                for p in plans
+            ],
+            "count": len(plans),
+        }
+    )
 
 
 def cmd_build(args: argparse.Namespace) -> env.Envelope:
@@ -133,9 +165,49 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         )
 
     messages = summary.pop("messages", [])
+    notes = summary.pop("notes", [])
     if summary["success"]:
-        return env.ok(summary, cost=cost, warnings=messages)
-    return env.error("dbt build failed", data=summary, cost=cost, warnings=messages)
+        return env.ok(summary, cost=cost, warnings=[*notes, *messages])
+    # Agents triage from `errors` first, so the first real dbt message rides
+    # there; the rest stay in warnings.
+    deps_info = summary.get("deps")
+    prefix = (
+        "dbt deps failed"
+        if deps_info and not deps_info.get("success", True)
+        else "dbt build failed"
+    )
+    return env.error(
+        _failure_message(prefix, messages),
+        data=summary,
+        cost=cost,
+        warnings=[*notes, *(messages[1:] if messages else [])],
+    )
+
+
+def cmd_deps(args: argparse.Namespace) -> env.Envelope:
+    from .build import deps as run_deps
+    from .build import has_package_spec
+
+    project = command_args.project_dir(args)
+    if not has_package_spec(project):
+        return env.ok(
+            {
+                "ran": False,
+                "reason": "no packages.yml (or dependencies.yml with packages) "
+                "in the project",
+            }
+        )
+    # An explicit invocation is a refresh: run even when dbt_packages/ exists.
+    summary = run_deps(project)
+    messages = summary.pop("messages", [])
+    data = {"ran": True, **summary}
+    if summary["success"]:
+        return env.ok(data, warnings=messages)
+    return env.error(
+        _failure_message("dbt deps failed", messages),
+        data=data,
+        warnings=messages[1:] if messages else [],
+    )
 
 
 def cmd_semantic_define(args: argparse.Namespace) -> env.Envelope:
@@ -146,22 +218,19 @@ def cmd_semantic_update(args: argparse.Namespace) -> env.Envelope:
     return _semantic_plan(args, mode="update")
 
 
-def cmd_emit_dbt(args: argparse.Namespace) -> env.Envelope:
-    """Apply a semantic plan's YAML into the dbt project (the semantic `apply`)."""
+def cmd_semantic_plan(args: argparse.Namespace) -> env.Envelope:
+    """Mixed-intent semantic authoring: one payload may evolve existing
+    definitions and add the new ones they depend on; each name is classified
+    as defined or updated instead of the whole payload being refused."""
 
-    plan_id = getattr(args, "plan_id", None)
-    if not plan_id:
-        latest = PlanStore(command_args.repo_root(args)).latest(EditKind.SEMANTIC_YML)
-        if latest is None:
-            return env.error(
-                "no unapplied semantic plan found; run `semantic define` or "
-                "`semantic update` first, or pass a plan id"
-            )
-        plan_id = latest.plan_id
-    return _apply_plan(args, plan_id)
+    return _semantic_plan(args, mode="plan")
 
 
 # --- helpers -----------------------------------------------------------------
+
+
+def _failure_message(prefix: str, messages: list[str]) -> str:
+    return f"{prefix}: {messages[0]}" if messages else prefix
 
 
 def _make_plan(
@@ -231,16 +300,46 @@ def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
 
     from ..dbt_project import load as load_project
 
-    view = load_project(command_args.project_dir(args))
+    project = command_args.project_dir(args)
+    view = load_project(project)
     parsed_edits = [yaml.safe_load(e.new_content) for e in edits]
-    semantic_mod.check_mode(mode, parsed_edits, view)
+    classification = semantic_mod.check_mode(mode, parsed_edits, view)
+    semantic_mod.check_references(parsed_edits, view)
+    spine_warning = semantic_mod.time_spine_warning(view, parsed_edits)
+
+    # The authoritative gate: a plan that dbt cannot parse is never stored.
+    # Skipped when the time-spine warning fires (dbt would refuse to parse for
+    # that already-surfaced reason, and authoring the spine comes next), or
+    # with --no-parse.
+    parse_warning: str | None = None
+    if getattr(args, "no_parse", False):
+        pass
+    elif spine_warning:
+        parse_warning = "dbt parse skipped until the project has a time spine"
+    else:
+        from ..config import DexConfig, load_config
+        from .build import shadow_parse
+
+        config = load_config(command_args.repo_root(args)) or DexConfig()
+        parse_result = shadow_parse(project, edits, target=config.dbt_target)
+        if not parse_result["available"]:
+            parse_warning = parse_result["reason"]
+        elif parse_result["messages"]:
+            return env.error(
+                _failure_message("dbt parse failed", parse_result["messages"]),
+                warnings=parse_result["messages"][1:],
+            )
+
     envelope = _make_plan(args, intent, edits)
     if envelope.status is env.Status.OK:
         plan_id = envelope.data["plan_id"]
-        envelope.data["next"] = f"review the diffs, then `emit dbt {plan_id}`"
-        spine_warning = semantic_mod.time_spine_warning(view, parsed_edits)
+        envelope.data["next"] = f"review the diffs, then `transform apply {plan_id}`"
+        envelope.data["defined"] = classification["defined"]
+        envelope.data["updated"] = classification["updated"]
         if spine_warning:
             envelope.warnings.append(spine_warning)
+        if parse_warning:
+            envelope.warnings.append(parse_warning)
     return envelope
 
 
