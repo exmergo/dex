@@ -61,6 +61,7 @@ class ColumnProfile(BaseModel):
     nullable: bool = True
     null_fraction: float | None = None
     distinct_count: int | None = None
+    distinct_count_exact: bool = False
     is_unique: bool | None = None
     min_value: object | None = None
     max_value: object | None = None
@@ -85,6 +86,7 @@ class Dataset(BaseModel):
     grain: list[str] | None = None
     rank_score: float | None = None
     data_quality: list[str] = Field(default_factory=list)
+    profiled_at: str | None = None
 
 
 class RelationshipKind(str, Enum):
