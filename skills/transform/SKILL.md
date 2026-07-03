@@ -29,9 +29,10 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 ```
 
 `kind` is `model_sql`, `schema_yml`, or `semantic_yml` (optional on
-`semantic define|update`, which imply it). Model SQL must be a single read-only
-SELECT once its jinja is stripped; semantic YAML is validated against
-MetricFlow's schemas.
+`semantic define|update|plan`, which imply it). Model SQL must be a single
+read-only SELECT once its jinja is stripped; semantic YAML is validated against
+MetricFlow's schemas, cross-reference-checked, and (when dbt is available)
+parsed by dbt itself before the plan is accepted.
 
 ### Bootstrapping a project
 
@@ -60,33 +61,61 @@ not-yet-supported error. Init refuses if any dbt project already exists.
   `--scaffold <table>` (repeatable) to generate a staging skeleton
   (`stg_<table>.sql` plus per-model YAML with key tests and PII meta) from the
   `.dex/` cache instead of, or on top of, hand-authored edits.
-- `transform apply <plan-id>` writes the plan into the dbt project. The result is
-  still a reviewable git diff for the user. If a human edited a file after the
-  plan was made, nothing is written: the divergence comes back as diffs with
-  `needs_confirmation`, and you should re-plan against current state (or, only
-  when the user says so, re-run with `--confirm`).
+- `transform apply [plan-id]` writes the plan into the dbt project (the latest
+  unapplied plan when no id is given; any plan kind, semantic included). The
+  result is still a reviewable git diff for the user. If a human edited a file
+  after the plan was made, nothing is written: the divergence comes back as
+  diffs with `needs_confirmation`, and you should re-plan against current state
+  (or, only when the user says so, re-run with `--confirm`).
+- `transform plans` lists stored plans (pending and applied, newest first), so
+  you never need to browse `.dex/plans/` by hand.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
   `--budget` on billed connectors). Production-looking targets are refused
-  outright; `--confirm` cannot override that.
+  outright; `--confirm` cannot override that. dbt runs with its working
+  directory pinned to the project dir, so relative paths in `profiles.yml`
+  resolve against the project. When the project declares packages
+  (`packages.yml`) and `dbt_packages/` is missing, the engine runs `dbt deps`
+  automatically before the build.
+- `transform deps` installs dbt packages explicitly (also the refresh path when
+  `dbt_packages/` exists but is stale). No confirmation needed: deps writes only
+  inside the project and never touches the warehouse.
+
+### Seeding the dev warehouse
+
+A DuckDB dev target points at a database file, and dbt happily creates an empty
+one if it does not exist, which then fails every `source()` relation with a
+confusing catalog error. The engine refuses that build up front and names the
+fix. The convention: copy the shared source warehouse to the dev target path
+(for example `cp shared/f1.duckdb <project>/dev.duckdb`), or point the dev
+target at an existing database file. Projects without sources just get a
+warning and an empty database, which is fine for model-only builds.
 
 ### The semantic layer
 
 - `semantic define ... --edits-file <path|->` and `semantic update ...` author
   and evolve the dbt semantic models (entities, dimensions, measures, metrics)
   as plans. `define` refuses names that already exist (use `update`); `update`
-  refuses names that do not (use `define`).
-- `emit dbt [plan-id]` writes the semantic plan's YAML into the dbt project (the
-  latest unapplied semantic plan when no id is given).
+  refuses names that do not (use `define`). For one logical change that mixes
+  both (evolve existing metrics and add the helpers they depend on), use
+  `semantic plan ...`: it accepts mixed intent and classifies each name, and the
+  envelope reports the split as `defined` and `updated`.
+- Plan-time validation is layered so a plan that validates will build:
+  MetricFlow's schemas check the shape; the engine resolves every metric input
+  (ratio and derived metrics reference **metrics**, not measures; a measure only
+  becomes a metric via `create_metric: true`, and the error names that fix); and
+  finally the emitted YAML is run through **dbt's own parser** against a
+  throwaway copy of the project. A plan that fails parse is refused, not stored.
+  If dbt is not installed the parse degrades to a warning; `--no-parse` skips it
+  explicitly.
+- A semantic plan is applied like any other: `transform apply [plan-id]` writes
+  its YAML into the dbt project (no id applies the latest unapplied plan).
 - dbt cannot parse semantic models in a project without a MetricFlow **time
-  spine**; the engine warns when one is missing. Author it like any other model
-  (a day-grain date model plus YAML with a `time_spine:` config) in the same or
-  a separate plan.
+  spine**; the engine warns when one is missing and defers the parse gate until
+  one exists. Author it like any other model (a day-grain date model plus YAML
+  with a `time_spine:` config) in the same or a separate plan.
 - `viz preview` is not yet implemented (it returns `not_implemented`); the Viz
   integration arrives later.
-
-Export to other formats (OSI and others) is a future capability and is not emitted
-in v1.
 
 ## Guardrails (enforced in the engine, not here)
 
