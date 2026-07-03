@@ -55,8 +55,7 @@ cost paradigms arrive. Published benchmark scores (ADE-bench uplift and
 cost/turn efficiency, Spider2.0-DBT) land with v0.3.
 
 This repository is currently at the foundation stage: the command contract, the
-dbt-project-as-source-of-truth model with a non-canonical `.dex/` cache, a dormant
-OSI exporter (validator against a pinned schema, not emitted in v1), and the
+dbt-project-as-source-of-truth model with a non-canonical `.dex/` cache, and the
 three-tier eval and safety spine.
 
 ## Beyond Claude Code
