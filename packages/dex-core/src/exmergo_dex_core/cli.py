@@ -6,10 +6,10 @@ envelope to stdout and nothing else. Subcommands are stateless (state lives in t
 dbt project, which is the source of truth, plus the ``.dex/`` cache), so the agent
 orchestrates multi-step flows.
 
-``connect test``, the ``explore`` group, and the authoring surface (``transform``,
-``semantic``) are live. The ``maintain`` group and ``viz preview`` return a valid
-envelope with status ``not_implemented`` so the contract, the wrappers, and the
-eval harness can be exercised before their engine logic exists.
+``connect test``, the ``explore`` group, the authoring surface (``transform``,
+``semantic``), and the ``maintain`` group are live. ``viz preview`` returns a
+valid envelope with status ``not_implemented`` until the Viz integration lands,
+so the contract, the wrappers, and the eval harness stay exercisable.
 """
 
 from __future__ import annotations
@@ -27,9 +27,18 @@ COMMAND_SURFACE: dict[str, list[str]] = {
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
-    # `schema`/`grain`/`semantic` are the per-axis deep detectors; `reconcile`
-    # proposes the fixing diffs. Detection is read-only; only reconcile emits diffs.
-    "maintain": ["snapshot", "check", "schema", "grain", "semantic", "reconcile"],
+    # `schema`/`volume`/`grain`/`semantic` are the per-axis deep detectors;
+    # `reconcile` proposes the fixing diffs. Detection is read-only; only
+    # reconcile emits diffs.
+    "maintain": [
+        "snapshot",
+        "check",
+        "schema",
+        "volume",
+        "grain",
+        "semantic",
+        "reconcile",
+    ],
     "viz": ["preview"],
 }
 
@@ -107,13 +116,18 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument("--no-parse", action="store_true", default=False)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
-                if group == "maintain" and name in {"schema", "grain", "semantic"}:
+                if group == "maintain" and name in {
+                    "schema",
+                    "volume",
+                    "grain",
+                    "semantic",
+                }:
                     sp.add_argument("objects", nargs="*")
                 if group == "maintain" and name == "reconcile":
                     sp.add_argument(
                         "drift_class",
                         nargs="?",
-                        choices=["schema", "grain", "semantic"],
+                        choices=["schema", "volume", "grain", "semantic"],
                         default=None,
                     )
     return parser
@@ -167,6 +181,22 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
         ("semantic", "update"),
         ("semantic", "plan"),
     }
+    if args.group == "maintain":
+        from .maintain import commands as maintain_cmds
+
+        handlers = {
+            "snapshot": maintain_cmds.cmd_snapshot,
+            "check": maintain_cmds.cmd_check,
+            "schema": maintain_cmds.cmd_schema,
+            "volume": maintain_cmds.cmd_volume,
+            "grain": maintain_cmds.cmd_grain,
+            "semantic": maintain_cmds.cmd_semantic,
+            "reconcile": maintain_cmds.cmd_reconcile,
+        }
+        handler = handlers.get(args.subcommand)
+        if handler is not None:
+            return handler(args)
+
     if (args.group, args.subcommand) in transform_surface:
         from .transform import commands as transform_cmds
 
