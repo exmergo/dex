@@ -57,6 +57,28 @@ measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
 (MIN, ANY_VALUE, STRING_AGG). Never fall back to raw Python or a database CLI to
 run SQL; the firewall path is the only sanctioned one.
 
+## Cloud targets (BigQuery)
+
+A cloud warehouse replaces `--path` with connector config. Start with
+`connect test --connector bigquery` (or set `connector: bigquery` plus a
+`bigquery:` block with `project` and a `datasets` allowlist in
+`.dex/config.yml`). Credentials are discovered, never asked for: if the
+envelope reports missing or expired credentials, tell the user to run
+`gcloud auth application-default login` and never ask them to paste a key or
+token.
+
+On a billed connector, scanning commands (`profile`, `map`, `relationships`,
+`query`) run a two-step handshake. The first call returns
+`needs_confirmation` with a dry-run byte estimate in `cost.estimate` (and a
+per-table breakdown where relevant). Surface the estimate to the user in
+human units (for example "about 6 MB, well under a cent"), get an explicit
+budget from them, and re-issue the same command with `--confirm` and
+`--budget <bytes>`. Never invent a budget the user did not agree to, and never
+retry
+with a raised budget on an over-ceiling refusal without asking. Metadata is
+free (`connect test`, `inventory` run immediately), and OK envelopes report
+actual spend under `data.spend`.
+
 ## Guardrails (enforced in the engine, not here)
 
 - Read-only against data. The connection is opened read-only and generated SQL is
