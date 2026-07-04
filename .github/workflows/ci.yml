@@ -26,14 +26,17 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Sync (duckdb + dev extras)
-        run: uv sync --extra duckdb --extra dev --python ${{ matrix.python-version }}
+      # bigquery is included so the BigQuery unit tests and safety families run
+      # here (they are offline against a fake client, but they importorskip on
+      # the client library; without the extra they would silently skip).
+      - name: Sync (duckdb + bigquery + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra dev --python ${{ matrix.python-version }}
       - name: Tier-1 unit tests
         run: uv run pytest -q
 
   # The safety spine is broken out as its own gate so a regression on a
   # safety-critical assertion is unmistakable in the checks list. Strict: an
-  # unexpected pass (a Phase 1+ placeholder going green early) is fine; a real
+  # unexpected pass (a placeholder going green early) is fine; a real
   # failure blocks the merge regardless of any benchmark score.
   safety:
     runs-on: ubuntu-latest
@@ -45,8 +48,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Sync (duckdb + dev extras)
-        run: uv sync --extra duckdb --extra dev
+      - name: Sync (duckdb + bigquery + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra dev
       - name: Safety-critical assertions
         run: uv run pytest -q tests/test_safety_spine.py
 
