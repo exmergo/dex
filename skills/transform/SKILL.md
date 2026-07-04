@@ -50,9 +50,14 @@ records `connector`, `dbt_project_dir`, and `dbt_target: dev` in
 `.dex/config.yml`; do not hand-write these files yourself. Init never assumes a
 connector: it errors rather than defaulting, so always pass the user's confirmed
 choice (a `connector:` already committed in `.dex/config.yml` also counts).
-DuckDB needs a warehouse path (`--path`, or the `duckdb.path` config); it is the
-supported connector today, and the cloud connectors return an actionable
-not-yet-supported error. Init refuses if any dbt project already exists.
+DuckDB and BigQuery are the supported connectors today; the remaining cloud
+connectors return an actionable not-yet-supported error. DuckDB needs a
+warehouse path (`--path`, or the `duckdb.path` config). BigQuery needs a GCP
+project (usually `bigquery.project` in `.dex/config.yml`; confirm it with the
+user) and writes builds to a dedicated dev dataset (`bigquery.dev_dataset`,
+default `dbt_dev`); auth is Application Default Credentials, so if credentials
+are missing tell the user to run `gcloud auth application-default login`,
+never ask for a key. Init refuses if any dbt project already exists.
 
 ### dbt SQL models
 
@@ -71,7 +76,11 @@ not-yet-supported error. Init refuses if any dbt project already exists.
   you never need to browse `.dex/plans/` by hand.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
-  `--budget` on billed connectors). Production-looking targets are refused
+  `--budget` on billed connectors). On BigQuery there is no upfront estimate
+  (dbt has no dry-run), so always get an explicit byte budget from the user and
+  pass it as `--budget <bytes>`; never invent one. Each statement dbt runs is
+  capped server-side by the profile's `maximum_bytes_billed`, and the envelope
+  reports billed bytes afterward. Production-looking targets are refused
   outright; `--confirm` cannot override that. dbt runs with its working
   directory pinned to the project dir, so relative paths in `profiles.yml`
   resolve against the project. When the project declares packages
