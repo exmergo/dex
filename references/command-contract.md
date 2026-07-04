@@ -25,9 +25,9 @@ from profiled, PII-cleared columns, bounded and capped by the query firewall.
 ## The command surface
 
 Capabilities, not final spelling. Implemented incrementally: `connect test`, the
-`explore` group, and the authoring surface (`transform`, `semantic`) are live;
-the `maintain` group and `viz preview` return a valid `not_implemented` envelope
-until they land.
+`explore` group, the authoring surface (`transform`, `semantic`), and the
+`maintain` group are live; `viz preview` returns a valid `not_implemented`
+envelope until the Viz integration lands.
 
 ```
 dex connect test                  -> {capabilities, dialect, read_only: true}
@@ -49,11 +49,17 @@ dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted 
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
 dex maintain snapshot             -> capture/refresh the known-good baseline in .dex/snapshot.json
-dex maintain check                -> sweep every drift axis vs the snapshot; ranked drift report (read-only)
-dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed; nullability
-dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join fanout
-dex maintain semantic [<objects>] -> definition drift: metric/measure/dimension/entity defs, new values, dangling refs
-dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as diffs (never applied)
+dex maintain check                -> sweep every drift axis vs the snapshot; ranked report (read-only;
+                                     two-phase on billed connectors: free axes now, one estimate for scans)
+dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed;
+                                     nullability; dangling sources (metadata, free everywhere)
+dex maintain volume [<objects>]   -> freshness drift: row counts that collapsed, emptied, or spiked (free)
+dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join
+                                     fanout (aggregates; gated by --confirm --budget on billed connectors)
+dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + categorical dimension
+                                     cardinality change (a scan; gated on billed connectors)
+dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as a stored plan
+                                     of diffs tagged mechanical/advisory (applied with transform apply)
 dex viz preview                   -> emit the dbt semantic model to the Viz preview (not yet implemented;
                                      the Viz integration arrives later)
 ```
@@ -132,8 +138,14 @@ sha256 of the file it would change, computes the diffs, and stores the plan unde
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
 fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, `snapshot` manages the baseline, `check`
-plus `schema`/`grain`/`semantic` detect drift (read-only), and `reconcile` is the
-only verb that emits diffs.
+plus `schema`/`volume`/`grain`/`semantic` detect drift (read-only), and
+`reconcile` is the only verb that emits diffs (applied through `transform
+apply`). Detection is read-only on every connector, but read-only is not free:
+`schema`, `volume`, and the reference half of `semantic` read metadata and run
+immediately, while `grain` and the dimension-cardinality half of `semantic` scan
+the warehouse and take the `--confirm --budget` handshake on billed connectors;
+`check` runs the free axes first and returns one combined estimate for the
+scanning axes.
 
 `explore relationships` and `explore map` accept `--verify`, which measures each
 inferred join with one aggregate overlap probe (non-null foreign keys, orphan
@@ -219,5 +231,5 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
 
 Because every skill, test, and benchmark depends on it, the contract was locked
 before the engine logic was built, and the subcommands fill in against this
-fixed boundary. Exploration and authoring are live today; maintain is the next
-group to land.
+fixed boundary. Exploration, authoring, and maintenance are live today; the Viz
+preview is the last stub, pending the Viz integration.

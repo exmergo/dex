@@ -16,8 +16,8 @@ engine, not here.
    dimensions, measures, metrics) as dbt semantic models (MetricFlow YAML). Both
    are the same job, reviewable diffs to the dbt project.
 3. **Maintain** the project as the world changes: diff the current warehouse and
-   dbt against the last `.dex/` snapshot, surface schema and definition drift, and
-   propose the reconciling edits.
+   dbt against the last `.dex/` snapshot, surface schema, volume, grain, and
+   definition drift, and propose the reconciling edits.
 
 ## The command contract
 
@@ -53,19 +53,24 @@ release is connector-neutral.
 | `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget; prod-looking targets refused outright; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
 | `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
 | `semantic define\|update\|plan ... --edits-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies per name; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
-| `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` |
-| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only) |
-| `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed |
-| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, fanout |
-| `maintain semantic [<objects>]` | definition drift: metric/measure/dimension/entity defs, new values, dangling refs |
-| `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as diffs (never applied) |
+| `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` (pins the `.dex/` map + per-layer definition fingerprints) |
+| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors (free axes now, one estimate for the scanning axes) |
+| `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources (free) |
+| `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata) |
+| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout (scans; gated on billed connectors) |
+| `maintain semantic [<objects>]` | definition drift and dangling refs (free) plus categorical dimension cardinality change (scans; gated on billed connectors) |
+| `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
 fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
-`maintain` group. Within `maintain`, detection (`check`, `schema`, `grain`,
-`semantic`) is read-only; only `reconcile` emits diffs. The engine does not care
-which skill fronts a subcommand.
+`maintain` group. Within `maintain`, detection (`check`, `schema`, `volume`,
+`grain`, `semantic`) is read-only; only `reconcile` emits diffs, and applying
+them is `transform apply`. Detection is read-only on every connector, but read-only
+is not free: `schema`, `volume`, and the reference half of `semantic` are metadata
+(free everywhere), while `grain` and the dimension-cardinality half of `semantic`
+scan and go through the `--confirm --budget` handshake on billed connectors. The
+engine does not care which skill fronts a subcommand.
 
 Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "content"}, ...]}` with
