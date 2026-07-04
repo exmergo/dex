@@ -46,22 +46,30 @@ def scaffold_edits(tables: list[str], repo_root: Path | str = ".") -> list[PlanE
 
     edits = [_sources_edit(datasets)]
     for dataset in datasets:
-        table = _table_name(dataset.identifier)
-        edits.append(
-            PlanEdit(
-                path=f"models/staging/stg_{table}.sql",
-                kind=EditKind.MODEL_SQL,
-                new_content=_model_sql(dataset),
-            )
-        )
-        edits.append(
-            PlanEdit(
-                path=f"models/staging/stg_{table}.yml",
-                kind=EditKind.SCHEMA_YML,
-                new_content=_model_yaml(dataset),
-            )
-        )
+        edits.extend(model_edits(dataset))
     return edits
+
+
+def model_edits(dataset: Dataset) -> list[PlanEdit]:
+    """The scaffold pair (model SQL + per-model YAML) for one profiled dataset.
+
+    Shared with maintain's reconcile, which regenerates a staging model from a
+    drift-patched dataset without touching the shared sources file.
+    """
+
+    table = _table_name(dataset.identifier)
+    return [
+        PlanEdit(
+            path=f"models/staging/stg_{table}.sql",
+            kind=EditKind.MODEL_SQL,
+            new_content=_model_sql(dataset),
+        ),
+        PlanEdit(
+            path=f"models/staging/stg_{table}.yml",
+            kind=EditKind.SCHEMA_YML,
+            new_content=_model_yaml(dataset),
+        ),
+    ]
 
 
 # --- helpers -----------------------------------------------------------------
