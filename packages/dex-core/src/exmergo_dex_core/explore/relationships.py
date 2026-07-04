@@ -222,6 +222,18 @@ def verify_relationships(
         rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
 
 
+def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
+    """The exact SQL :func:`verify_relationships` will run, one statement per
+    inferred join, in the adapter's dialect. Exists so a billed caller can
+    dry-run the probes for a cost estimate before confirming the spend."""
+
+    return [
+        _transpile_probe(_overlap_probe_sql(rel), dialect)
+        for rel in relationships
+        if rel.kind is RelationshipKind.INFERRED
+    ]
+
+
 def _overlap_probe_sql(rel: Relationship) -> str:
     child = _quote_identifier(rel.from_dataset)
     parent = _quote_identifier(rel.to_dataset)

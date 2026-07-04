@@ -1,10 +1,11 @@
-"""Argument-to-engine bridges shared by the command orchestrators.
+"""Argument-to-engine bridges and plumbing shared by the command orchestrators.
 
-These adapt an ``argparse.Namespace`` into the inputs the engine speaks: an open
-adapter and a repo root. They live at the command layer, deliberately not in the
-engine core, so ``inventory``/``profile``/``rank``/``relationships`` never depend
-on argparse. Every ``cmd_*`` module shares them (explore today; transform,
-semantic, and maintain as they land).
+These adapt an ``argparse.Namespace`` into the inputs the engine speaks (an open
+adapter, a repo root, a project directory) and carry the cost-before-spend
+handshake every billed command goes through. They live at the command layer,
+deliberately not in the engine core, so the engines never depend on argparse,
+and every ``cmd_*`` module (explore, transform, maintain) shares one handshake
+instead of re-deriving it.
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from . import envelope as env
 from .adapters.base import Adapter
 from .connect import open_adapter
+from .guards.cost_guard import ConfirmationRequiredError, CostGate
 
 
 def repo_root(args: argparse.Namespace) -> str:
@@ -32,6 +35,65 @@ def open_from_args(args: argparse.Namespace) -> Adapter:
         confirmed=getattr(args, "confirm", False),
         command=command,
     )
+
+
+def cost_gate(adapter: Adapter) -> CostGate | None:
+    """The adapter's cost gate when it is a billed connector; free adapters
+    (DuckDB) have none, and their commands stay confirmation-free."""
+
+    return getattr(adapter, "cost_gate", None)
+
+
+def billed_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    per_table: dict[str, float] | None = None,
+    notes: list[str] | None = None,
+) -> env.Envelope | None:
+    """The cost-before-spend handshake on billed connectors.
+
+    The estimate comes from free dry-runs, so the unconfirmed pass spends
+    nothing: it either passes the gate (confirmed, within budget) or returns
+    the ``needs_confirmation`` envelope for the agent to surface and re-issue
+    with ``--confirm --budget``. Over-ceiling and no-ceiling refusals propagate
+    as errors (confirmation cannot override them).
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None:
+        return None
+    try:
+        gate.preflight_command(estimate)
+    except ConfirmationRequiredError as exc:
+        data: dict = {
+            "command": command,
+            "estimated_bytes": estimate,
+            "hint": (
+                "review the estimate, then re-run with --confirm --budget "
+                "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
+                "$0.06 on-demand)"
+            ),
+        }
+        if per_table:
+            data["per_table_bytes"] = per_table
+        if notes:
+            data["notes"] = notes
+        return env.needs_confirmation(data, cost=exc.cost)
+    return None
+
+
+def stamp_spend(envelope: env.Envelope, adapter: Adapter) -> env.Envelope:
+    """Stamp the preflight cost and the actual spend onto an OK envelope. The
+    ``cost`` field stays a preflight estimate by contract; actual billed bytes
+    live in ``data.spend``."""
+
+    gate = cost_gate(adapter)
+    if gate is not None:
+        envelope.cost = gate.cost()
+        envelope.data["spend"] = gate.spend_summary()
+    return envelope
 
 
 def project_dir(args: argparse.Namespace) -> Path:

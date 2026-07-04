@@ -19,7 +19,6 @@ from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
 from ..cache import Dataset, DexCache, DexStore, match_identifier
 from ..config import DexConfig, QueryLimits, load_config
-from ..guards.cost_guard import ConfirmationRequiredError, CostGate
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
@@ -33,65 +32,6 @@ from . import relationships as rel_mod
 # Below this many objects, profile everything: enumeration is cheap and complete.
 # Above it, profile only the top-ranked unless --full is passed.
 _AUTO_PROFILE_ALL = 50
-
-
-def _cost_gate(adapter: Adapter) -> CostGate | None:
-    """The adapter's cost gate when it is a billed connector; free adapters
-    (DuckDB) have none, and their explore commands stay confirmation-free."""
-
-    return getattr(adapter, "cost_gate", None)
-
-
-def _billed_handshake(
-    command: str,
-    adapter: Adapter,
-    estimate: float,
-    *,
-    per_table: dict[str, float] | None = None,
-    notes: list[str] | None = None,
-) -> env.Envelope | None:
-    """The cost-before-spend handshake on billed connectors.
-
-    The estimate comes from free dry-runs, so the unconfirmed pass spends
-    nothing: it either passes the gate (confirmed, within budget) or returns
-    the ``needs_confirmation`` envelope for the agent to surface and re-issue
-    with ``--confirm --budget``. Over-ceiling and no-ceiling refusals propagate
-    as errors (confirmation cannot override them).
-    """
-
-    gate = _cost_gate(adapter)
-    if gate is None:
-        return None
-    try:
-        gate.preflight_command(estimate)
-    except ConfirmationRequiredError as exc:
-        data: dict = {
-            "command": command,
-            "estimated_bytes": estimate,
-            "hint": (
-                "review the estimate, then re-run with --confirm --budget "
-                "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
-                "$0.06 on-demand)"
-            ),
-        }
-        if per_table:
-            data["per_table_bytes"] = per_table
-        if notes:
-            data["notes"] = notes
-        return env.needs_confirmation(data, cost=exc.cost)
-    return None
-
-
-def _stamp_spend(envelope: env.Envelope, adapter: Adapter) -> env.Envelope:
-    """Stamp the preflight cost and the actual spend onto an OK envelope. The
-    ``cost`` field stays a preflight estimate by contract; actual billed bytes
-    live in ``data.spend``."""
-
-    gate = _cost_gate(adapter)
-    if gate is not None:
-        envelope.cost = gate.cost()
-        envelope.data["spend"] = gate.spend_summary()
-    return envelope
 
 
 def _profile_estimate(
@@ -109,7 +49,7 @@ def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
         # Inventory is metadata-only on every connector (free API calls on
         # BigQuery), so it never needs the confirm handshake.
         metas = inventory_mod.inventory(adapter)
-        gate = _cost_gate(adapter)
+        gate = command_args.cost_gate(adapter)
         cost = gate.cost() if gate is not None else env.Cost()
     finally:
         adapter.close()
@@ -147,14 +87,14 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
         estimate, per_table = _profile_estimate(adapter, identifiers)
-        unconfirmed = _billed_handshake(
+        unconfirmed = command_args.billed_handshake(
             "explore profile", adapter, estimate, per_table=per_table
         )
         if unconfirmed is not None:
             return unconfirmed
         datasets = profile_mod.profile(adapter, identifiers)
         envelope = env.ok({})
-        _stamp_spend(envelope, adapter)
+        command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     _annotate_grain(datasets)
@@ -184,7 +124,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
                 "they are billed within the confirmed budget, not in this "
                 "upfront estimate"
             )
-        unconfirmed = _billed_handshake(
+        unconfirmed = command_args.billed_handshake(
             "explore relationships",
             adapter,
             estimate,
@@ -200,7 +140,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
                 adapter, inferred, timeout_seconds=config.query.timeout_seconds
             )
         envelope = env.ok({})
-        _stamp_spend(envelope, adapter)
+        command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
 
@@ -257,7 +197,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
     try:
         query_estimate = getattr(adapter, "query_estimate", None)
         estimate = query_estimate(inspected.sql) if query_estimate else 0.0
-        unconfirmed = _billed_handshake("explore query", adapter, estimate)
+        unconfirmed = command_args.billed_handshake("explore query", adapter, estimate)
         if unconfirmed is not None:
             store.append_query_log(
                 {
@@ -274,7 +214,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
             timeout_seconds=limits.timeout_seconds,
         )
         envelope = env.ok({})
-        _stamp_spend(envelope, adapter)
+        command_args.stamp_spend(envelope, adapter)
     except Exception as exc:
         store.append_query_log(
             {
@@ -327,7 +267,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
                 "they are billed within the confirmed budget, not in this "
                 "upfront estimate"
             ]
-        unconfirmed = _billed_handshake(
+        unconfirmed = command_args.billed_handshake(
             "explore map", adapter, estimate, per_table=per_table, notes=handshake_notes
         )
         if unconfirmed is not None:
@@ -340,7 +280,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
                 adapter, inferred, timeout_seconds=config.query.timeout_seconds
             )
         envelope = env.ok({})
-        _stamp_spend(envelope, adapter)
+        command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     declared = rel_mod.declared_relationships(repo_root)

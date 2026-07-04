@@ -71,10 +71,18 @@ capped server-side by `maximum_bytes_billed` and recorded in a local
 dbt-bigquery, which the `[bigquery]` extra carries. See
 [`references/bigquery.md`](../../references/bigquery.md).
 
-Maintain (drift detection and reconcile), the remaining cloud connectors
-(Snowflake, Databricks, PostgreSQL), and the Viz preview report
-`not_implemented` until they land. The foundations are in place: the command
-contract, the canonical model and `.dex/` layout, and the eval and safety spine.
+Maintain detects drift against the `.dex/` snapshot on four axes and proposes
+the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
+and semantic (definitions, dangling references, and dimension cardinality).
+`maintain check` sweeps all of them, ranked by blast radius; `reconcile`
+proposes reviewable diffs tagged mechanical or advisory, applied through
+`transform apply`. Detection is read-only on every connector; on billed
+connectors the metadata axes (schema, volume, references) stay free while the
+scanning axes (grain, dimension cardinality) take the `--confirm --budget`
+handshake, so `check` is two-phase.
+
+The remaining cloud connectors (Snowflake, Databricks, PostgreSQL) and the Viz
+preview report `not_implemented` until they land.
 
 ## License
 

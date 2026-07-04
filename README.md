@@ -26,7 +26,8 @@ time. dex owns exactly that loop.
   metrics) as dbt semantic models (MetricFlow YAML), with a free Viz preview.
   Validated against a dev target, cost-guarded.
 - **Maintain** the project as it drifts: diff the warehouse and dbt against the
-  last snapshot, surface schema and definition drift, and propose edits.
+  last snapshot, surface schema, volume, grain, and definition drift ranked by
+  blast radius, and propose edits.
 
 ## Install (Claude Code)
 
@@ -56,13 +57,14 @@ local spend ledger.
 
 ## Status
 
-**v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required.
-**Explore and transform now also run on BigQuery**, the first cloud connector:
-credential discovery via ADC, bytes-scanned cost guards with a
-confirm-before-spend handshake, and dev-dataset-only dbt builds via
-dbt-bigquery. Snowflake, Databricks, and PostgreSQL land next as v0.2
-completes; published benchmark scores (ADE-bench uplift and cost/turn
-efficiency, Spider2.0-DBT) land with v0.3.
+**v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required:
+explore, transform, and now **maintain** (drift detection and reconcile across
+schema, volume, grain, and semantic axes). **Explore, transform, and maintain
+also run on BigQuery**, the first cloud connector: credential discovery via ADC,
+bytes-scanned cost guards with a confirm-before-spend handshake, and
+dev-dataset-only dbt builds via dbt-bigquery. Snowflake, Databricks, and
+PostgreSQL land next as v0.2 completes; published benchmark scores (ADE-bench
+uplift and cost/turn efficiency, Spider2.0-DBT) land with v0.3.
 
 ## Beyond Claude Code
 

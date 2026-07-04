@@ -17,8 +17,13 @@ import json
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from .maintain.drift import DriftReport
+    from .maintain.snapshot import Snapshot
 
 # Bump when the on-disk cache shape changes in a way old readers cannot handle.
 CACHE_SCHEMA_VERSION = 2
@@ -171,11 +176,13 @@ class DexCache(BaseModel):
 # Layout (all non-secret, committed to the user's repo):
 #   .dex/config.yml     non-secret config (see config.py)
 #   .dex/cache.json     the current DexCache (exploration artifacts)
-#   .dex/snapshot.json  the last reconcile snapshot (a frozen fingerprint)
+#   .dex/snapshot.json  the maintain baseline (see maintain/snapshot.py)
+#   .dex/drift.json     the last drift-detection report (see maintain/drift.py)
 
 DEX_DIR = ".dex"
 CACHE_FILE = "cache.json"
 SNAPSHOT_FILE = "snapshot.json"
+DRIFT_FILE = "drift.json"
 QUERIES_FILE = "queries.jsonl"
 SPEND_FILE = "spend.jsonl"
 
@@ -209,16 +216,32 @@ class DexStore:
         path.write_text(cache.model_dump_json(indent=2) + "\n", encoding="utf-8")
         return path
 
-    def load_snapshot(self) -> DexCache | None:
+    def load_snapshot(self) -> Snapshot | None:
+        from .maintain.snapshot import Snapshot
+
         path = self.dex_dir / SNAPSHOT_FILE
         if not path.is_file():
             return None
-        return DexCache.model_validate_json(path.read_text(encoding="utf-8"))
+        return Snapshot.model_validate_json(path.read_text(encoding="utf-8"))
 
-    def save_snapshot(self, cache: DexCache) -> Path:
+    def save_snapshot(self, snapshot: Snapshot) -> Path:
         self.dex_dir.mkdir(parents=True, exist_ok=True)
         path = self.dex_dir / SNAPSHOT_FILE
-        path.write_text(cache.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        path.write_text(snapshot.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def load_drift(self) -> DriftReport | None:
+        from .maintain.drift import DriftReport
+
+        path = self.dex_dir / DRIFT_FILE
+        if not path.is_file():
+            return None
+        return DriftReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def save_drift(self, report: DriftReport) -> Path:
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        path = self.dex_dir / DRIFT_FILE
+        path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
         return path
 
     def append_query_log(self, entry: dict) -> Path:

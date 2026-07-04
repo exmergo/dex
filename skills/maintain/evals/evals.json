@@ -8,7 +8,8 @@
       "My stg_customers primary key has duplicates now, what broke?",
       "The business changed the revenue metric definition; does my semantic model still match?",
       "Reconcile my models with the current source schema.",
-      "Which of my models are stale after the upstream change?"
+      "Which of my models are stale after the upstream change?",
+      "The row count on orders dropped overnight; did a load half-fail?"
     ],
     "negative": [
       "What's in this warehouse and which tables matter?",
@@ -40,6 +41,7 @@
       "assertions": [
         "Grain drift is established from SQL aggregates (uniqueness, cardinality), never raw rows",
         "The finding names the key that lost uniqueness or the changed row-per-entity cardinality",
+        "On a billed connector, surfaces the dry-run cost estimate and re-issues with --confirm and a user-agreed budget rather than inventing one; on DuckDB it runs directly",
         "Any proposed fix is a reviewable diff; nothing is applied silently"
       ]
     },
