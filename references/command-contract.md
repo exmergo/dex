@@ -90,9 +90,10 @@ sha256 of the file it would change, computes the diffs, and stores the plan unde
   names which source was used), and bare init is an error listing the valid
   connectors. On success init writes `connector`, `dbt_project_dir`, and
   `dbt_target: dev` back to `.dex/config.yml`, so the choice is made once and is
-  ambient for every later command. DuckDB is the supported connector today; the
-  cloud connectors are accepted by the contract but return an actionable
-  not-yet-supported error until their dbt adapters ship.
+  ambient for every later command. DuckDB and BigQuery are the supported
+  connectors today; the remaining cloud connectors are accepted by the contract
+  but return an actionable not-yet-supported error until their dbt adapters
+  ship.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.
@@ -200,7 +201,11 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   spend returns `needs_confirmation` unless given `--confirm` (and a `--budget`
   on billed connectors; DuckDB is free, so the confirm handshake alone gates it).
   An estimate over the ceiling is refused outright; confirmation cannot override
-  it.
+  it. On billed connectors the estimate comes from free dry-runs, the confirmed
+  run re-checks every statement against the budget with a server-side cap as
+  backstop, actual spend is reported under `data.spend`, and every billed byte
+  is appended to the `.dex/spend.jsonl` ledger, against which the optional
+  `budget.session_ceiling` binds cumulatively per UTC day.
 - **Diffs, not silent writes.** Proposed changes appear in `diffs`; being there
   does not apply them. The user applies through their normal review and PR flow.
 - **No secrets, no uncleared values.** `data` is scanned before printing
