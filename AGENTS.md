@@ -81,10 +81,16 @@ Every command prints exactly one JSON object and nothing else:
 { "status", "data", "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
 ```
 
-Cost is a preflight estimate surfaced **before** any spend. Any command that would
-spend requires an explicit `--confirm` and a session budget. Credentials never
-appear in `data`, and result values appear only in `explore query`'s columnar
-payload after the query firewall has cleared them.
+Cost is a preflight estimate surfaced **before** any spend. Any command that
+would spend requires an explicit `--confirm` and a session budget: on a billed
+connector (BigQuery today) the first call returns `needs_confirmation` with a
+free dry-run byte estimate, and the same command is re-issued with
+`--confirm --budget <bytes>` once the user has agreed to the spend. Actual
+billed bytes come back under `data.spend` and accumulate in the
+`.dex/spend.jsonl` ledger. Credentials never appear in `data` (BigQuery
+authenticates via discovered Application Default Credentials, never a pasted
+key), and result values appear only in `explore query`'s columnar payload
+after the query firewall has cleared them.
 
 ## Guardrails (non-negotiable, enforced in the engine)
 
