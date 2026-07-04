@@ -639,3 +639,186 @@ def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_cl
     assert "SELECT" not in json.dumps(entry)
     assert entry["billed_bytes"] == 5_000
     assert entry["statement_sha256"]
+
+
+# --- Maintain: drift detection and reconcile exercise every family -------------
+#
+# Detection is read-only against data and writes only to `.dex/`; only reconcile
+# emits diffs, and those apply through the transform conflict handshake. These
+# assertions guard those invariants on the DuckDB loop, where they are free.
+
+
+def _maintain_setup(tmp_path: Path, capsys) -> tuple[Path, Path]:
+    """A DuckDB warehouse (with a PII column and a key) plus a dbt project,
+    mapped and snapshotted: the baseline the maintain families detect against."""
+
+    import duckdb
+
+    from exmergo_dex_core.cli import main
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    db_path = root / "warehouse.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE customers (id INTEGER, email VARCHAR, status VARCHAR)")
+    conn.execute(
+        "INSERT INTO customers SELECT i, 'user' || i || '@example.com', "
+        "(['active','churned'])[(i % 2) + 1] FROM range(1, 31) t(i)"
+    )
+    conn.close()
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {db_path}\n", encoding="utf-8"
+    )
+    (root / "models" / "staging").mkdir(parents=True)
+    (root / "dbt_project.yml").write_text(
+        'name: spine_test\nversion: "1.0.0"\nprofile: spine_test\n'
+        'model-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (root / "profiles.yml").write_text(
+        "spine_test:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (root / "models" / "staging" / "_dex_sources.yml").write_text(
+        "version: 2\nsources:\n  - name: main\n    schema: main\n    tables:\n"
+        "      - name: customers\n        columns:\n"
+        "          - name: id\n          - name: email\n          - name: status\n",
+        encoding="utf-8",
+    )
+    assert main(["--repo-root", str(root), "explore", "map"]) == 0
+    assert main(["--repo-root", str(root), "maintain", "snapshot"]) == 0
+    capsys.readouterr()  # drain the setup commands' stdout
+    return root, db_path
+
+
+def _run(argv: list[str], capsys) -> dict:
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    rc = main(argv)
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, "exactly one line on stdout"
+    payload = json.loads(out)
+    assert rc in (0, 1)
+    return payload
+
+
+def test_maintain_detection_leaves_the_warehouse_read_only(tmp_path: Path, capsys):
+    # Family 1: detection never mutates the warehouse. The DuckDB file is
+    # byte-identical after a full check that scans it (grain runs aggregates).
+    import hashlib
+
+    root, db_path = _maintain_setup(tmp_path, capsys)
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    _run(["--repo-root", str(root), "maintain", "check"], capsys)
+    _run(["--repo-root", str(root), "maintain", "grain"], capsys)
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+
+
+def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys):
+    # Family 3: grain drift is established from aggregates; the finding reports
+    # counts, never the duplicated key values or any PII.
+    import duckdb
+
+    from exmergo_dex_core.maintain.drift import DriftFinding
+
+    # Structural: a finding has no field that could hold a row value.
+    assert "value" not in DriftFinding.model_fields
+    assert "values" not in DriftFinding.model_fields
+
+    root, db_path = _maintain_setup(tmp_path, capsys)
+    conn = duckdb.connect(str(db_path))
+    conn.execute("INSERT INTO customers SELECT id, email, status FROM customers")
+    conn.close()
+    payload = _run(["--repo-root", str(root), "maintain", "check"], capsys)
+    dumped = __import__("json").dumps(payload)
+    assert "@example.com" not in dumped  # no PII value ever
+    grain = [f for f in payload["data"]["findings"] if f["axis"] == "grain"]
+    assert grain and all(
+        set(f["data"]) <= {"distinct_count", "row_count", "was_grain"}
+        or f["code"] != "key_lost_uniqueness"
+        for f in grain
+    )
+
+
+def test_maintain_cardinality_reports_counts_not_the_new_value(tmp_path: Path, capsys):
+    # Family 3: a widened categorical dimension is a count delta; the new value
+    # itself never crosses the envelope.
+    import duckdb
+    import yaml
+
+    root, db_path = _maintain_setup(tmp_path, capsys)
+    (root / "models" / "staging" / "customers_semantic.yml").write_text(
+        yaml.safe_dump(
+            {
+                "semantic_models": [
+                    {
+                        "name": "customers",
+                        "model": "ref('customers')",
+                        "entities": [{"name": "id", "type": "primary"}],
+                        "dimensions": [{"name": "status", "type": "categorical"}],
+                        "measures": [
+                            {"name": "customer_count", "agg": "count", "expr": "id"}
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run(["--repo-root", str(root), "explore", "map"], capsys)
+    _run(["--repo-root", str(root), "maintain", "snapshot"], capsys)
+    conn = duckdb.connect(str(db_path))
+    conn.execute("INSERT INTO customers VALUES (999, 'x@example.com', 'refunded')")
+    conn.close()
+    payload = _run(["--repo-root", str(root), "maintain", "semantic"], capsys)
+    assert "refunded" not in __import__("json").dumps(payload)
+    card = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "dimension_cardinality_changed"
+    ]
+    assert card and card[0]["data"]["distinct_after"] == 3
+
+
+def test_maintain_reconcile_writes_nothing_to_the_project(tmp_path: Path, capsys):
+    # Family 4: reconcile proposes a plan of diffs and touches no project file;
+    # applying is a separate, hash-checked step.
+    import hashlib
+
+    import duckdb
+
+    def tree(root: Path) -> dict[str, str]:
+        return {
+            str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted((root / "models").rglob("*"))
+            if p.is_file()
+        }
+
+    root, db_path = _maintain_setup(tmp_path, capsys)
+    before = tree(root)
+    conn = duckdb.connect(str(db_path))
+    conn.execute("ALTER TABLE customers ADD COLUMN phone VARCHAR")
+    conn.close()
+    _run(["--repo-root", str(root), "maintain", "check"], capsys)
+    payload = _run(["--repo-root", str(root), "maintain", "reconcile"], capsys)
+    assert payload["status"] == "ok"
+    # Proposals and diffs exist as proposals only; the model tree is unchanged.
+    assert tree(root) == before
+
+
+def test_maintain_envelopes_pass_the_sanitizer(tmp_path: Path, capsys):
+    # Family 5: every maintain command's payload survives env.emit's sanitizer
+    # (it runs inside main), so no secret-like key or raw-row shape leaks.
+    root, _db_path = _maintain_setup(tmp_path, capsys)
+    for argv in (
+        ["maintain", "snapshot"],
+        ["maintain", "check"],
+        ["maintain", "schema"],
+        ["maintain", "reconcile"],
+    ):
+        payload = _run(["--repo-root", str(root), *argv], capsys)
+        assert payload["status"] in {"ok", "needs_confirmation"}
