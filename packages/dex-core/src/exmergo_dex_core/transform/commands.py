@@ -131,6 +131,7 @@ def cmd_plans(args: argparse.Namespace) -> env.Envelope:
 
 def cmd_build(args: argparse.Namespace) -> env.Envelope:
     from ..config import DexConfig, load_config
+    from ..envelope import Paradigm
     from ..guards.cost_guard import ConfirmationRequiredError
 
     # `from .build import ...` rather than `from . import build`: the package
@@ -143,6 +144,10 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     target = getattr(args, "target", None) or config.dbt_target or "dev"
     budget = getattr(args, "budget", None)
     ceiling = budget if budget is not None else config.budget.ceiling
+    connector = getattr(args, "connector", None) or config.connector
+    paradigm = (
+        Paradigm.BYTES_SCANNED if connector == "bigquery" else Paradigm.FREE_LOCAL
+    )
 
     try:
         summary, cost = run_build(
@@ -152,6 +157,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
             select=getattr(args, "select", None),
             ceiling=ceiling,
             confirmed=bool(getattr(args, "confirm", False)),
+            paradigm=paradigm,
         )
     except ConfirmationRequiredError as exc:
         return env.needs_confirmation(
@@ -166,6 +172,16 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
 
     messages = summary.pop("messages", [])
     notes = summary.pop("notes", [])
+    if paradigm is not Paradigm.FREE_LOCAL:
+        notes = [
+            "dbt has no dry-run, so this build's scan size could not be "
+            "estimated upfront; each statement was capped server-side by the "
+            "profile's maximum_bytes_billed (a per-statement cap, not per run)",
+            *notes,
+        ]
+        billed = summary.get("bytes_billed")
+        if billed:
+            _record_build_spend(repo_root, connector, billed)
     if summary["success"]:
         return env.ok(summary, cost=cost, warnings=[*notes, *messages])
     # Agents triage from `errors` first, so the first real dbt message rides
@@ -227,6 +243,26 @@ def cmd_semantic_plan(args: argparse.Namespace) -> env.Envelope:
 
 
 # --- helpers -----------------------------------------------------------------
+
+
+def _record_build_spend(repo_root, connector: str, billed: float) -> None:
+    """Account a billed dbt build in the `.dex/spend.jsonl` ledger, so builds
+    draw against the same session budget as explore scans."""
+
+    from datetime import UTC, datetime
+
+    from ..cache import DexStore
+
+    DexStore(repo_root).append_spend_log(
+        {
+            "at": datetime.now(UTC).isoformat(),
+            "connector": connector,
+            "command": "transform build",
+            "billed_bytes": float(billed),
+            "job_id": None,
+            "statement_sha256": None,
+        }
+    )
 
 
 def _failure_message(prefix: str, messages: list[str]) -> str:
