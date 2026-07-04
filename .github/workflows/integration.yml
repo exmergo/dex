@@ -1,0 +1,71 @@
+name: Integration
+
+# Live BigQuery, authenticated via Workload Identity Federation (OIDC, no
+# stored keys, matching the release workflow's Trusted Publishing stance).
+# Deliberately NOT a merge or release gate: ci.yml stays deterministic and
+# fork-runnable; this workflow answers "does the connector still work against
+# the real service" on main and on a schedule. The suite reads public datasets,
+# writes only to the TTL'd scratch dataset, and caps every query at
+# DEX_TEST_BQ_MAX_BYTES, so a worst-case run costs cents.
+#
+# One-time GCP setup (documented in CONTRIBUTING.md): a Workload Identity Pool
+# with a GitHub OIDC provider whose attribute condition restricts it to this
+# repository, and a service account holding roles/bigquery.jobUser on the
+# project plus roles/bigquery.dataEditor on the scratch dataset only.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/dex-core/**"
+      - ".github/workflows/integration.yml"
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time: the scratch dataset is shared, and serializing runs caps
+# worst-case concurrent spend.
+concurrency:
+  group: bigquery-integration
+  cancel-in-progress: false
+
+jobs:
+  bigquery:
+    # Forks have a different repository name, so they skip here; a fork can run
+    # the same suite against its own GCP project via the DEX_TEST_BQ_* env.
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The environment carries the GCP variables and, via its deployment branch
+    # policy (main only), refuses this job to a workflow modified on a branch
+    # before the auth step can run. Same posture as the release workflow's
+    # pypi/pypi-stub environments.
+    environment: gcp-integration
+    permissions:
+      contents: read
+      id-token: write # OIDC for Workload Identity Federation; no stored keys.
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_BQ_PROJECT: ${{ vars.DEX_TEST_BQ_PROJECT }}
+      DEX_TEST_BQ_DATASET: dex_ci
+      DEX_TEST_BQ_MAX_BYTES: "104857600" # 100 MB per query
+    steps:
+      - uses: actions/checkout@v4
+      # Exports Application Default Credentials (credential file plus
+      # GOOGLE_APPLICATION_CREDENTIALS/GOOGLE_CLOUD_PROJECT), which is exactly
+      # the discovery path the engine uses: no CI special-casing anywhere.
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_INTEGRATION_SA }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (bigquery + duckdb + dev extras)
+        run: uv sync --extra bigquery --extra duckdb --extra dev
+      - name: Live BigQuery integration suite
+        run: uv run pytest tests/integration -q
