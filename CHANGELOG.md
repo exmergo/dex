@@ -9,6 +9,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-04
+
+### Added
+
+- Maintain: the drift-detection and reconcile engine, closing the ETM loop. It
+  compares current reality against the `.dex/snapshot.json` baseline on four
+  axes and proposes the fix.
+  - `maintain snapshot` captures the baseline: it pins the `.dex/` map (so the
+    grain baseline is the exact-distinct verdicts `explore map` computed) plus
+    per-layer fingerprints of the dbt project's definitions (file hashes,
+    source declarations, semantic models and metrics with their referenced
+    columns). Fingerprinting the definitions, not the compiled manifest, keeps
+    the baseline stable across dbt versions. Without a cache it captures a
+    metadata-only baseline and says the grain and cardinality axes have nothing
+    to diff against.
+  - `maintain schema` (structural: columns and tables added, dropped, retyped,
+    renamed; nullability; dangling sources) and `maintain volume` (freshness:
+    row counts that collapsed, emptied, or spiked) read metadata and are free
+    on every connector.
+  - `maintain grain` (lost key uniqueness and increased join fanout, from exact
+    distinct counts and the verified overlap probes) and the categorical
+    dimension-cardinality half of `maintain semantic` scan the warehouse, so on
+    a billed connector they run the same `--confirm --budget` handshake as
+    `explore profile`. `maintain semantic` also does the free half: definition
+    changes against the baseline, dangling references, and impact analysis
+    tracing warehouse drift through to the affected models and metrics.
+  - `maintain check` sweeps every axis, ranked by blast radius (severity plus
+    the count of impacted models and metrics). On a billed connector it is
+    two-phase: the free axes complete immediately and their findings ride along
+    in the `needs_confirmation` envelope with one combined estimate for the
+    scanning axes.
+  - `maintain reconcile` proposes the fixing edits as a stored plan of
+    reviewable diffs, each tagged `mechanical` (a schema re-scaffold of a
+    dex-generated staging model) or `advisory` (a decision surfaced, at most
+    backed by a visibility test). Applied with `transform apply <plan-id>`, so
+    the human-edit conflict handshake is inherited; reconcile itself writes
+    nothing.
+  - New-categorical-value detection is a cardinality delta only: no dimension
+    value is ever stored in `.dex/` or surfaced in the envelope (naming a new
+    value is left to a firewalled `explore query`).
+- `.dex/drift.json`: a non-canonical cache of the last detection report, so
+  `reconcile` reads what `check` found instead of re-scanning; axes merge across
+  focused runs but are dropped when the baseline changes.
+
 ## [0.1.1] - 2026-07-04
 
 The first cloud connector: the full explore and transform loop runs on BigQuery
