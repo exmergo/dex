@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Tier-3 harness lands in Phase 5
+      - name: Tier-3 harness lands with v0.3
         run: |
           echo "ADE-bench plugin-set runner (vs none / vs all-dbt-skills),"
           echo "Spider2.0-DBT (lead) + Lite/Snow, and the SemBench seed are added"
-          echo "in Phase 5 under a cost ceiling. See benchmarks/ for the runbooks."
+          echo "with v0.3 under a cost ceiling. See benchmarks/ for the runbooks."
