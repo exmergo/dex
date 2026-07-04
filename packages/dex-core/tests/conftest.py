@@ -34,6 +34,60 @@ def duckdb_file(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def fake_bq_client():
+    """The standard populated fake BigQuery client (see tests/fakes/bigquery.py).
+
+    Requires the real google-cloud-bigquery library (the [bigquery] extra) for
+    its SchemaField and exception types; skipped when absent so the rest of the
+    suite still runs, but note that CI and the release gate install the extra,
+    so the BigQuery safety families do run everywhere that matters.
+    """
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    tables = [
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="customers",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("email", "STRING"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="events",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER"),
+                bigquery.SchemaField(
+                    "payload",
+                    "RECORD",
+                    fields=[bigquery.SchemaField("tags", "STRING", mode="REPEATED")],
+                ),
+                bigquery.SchemaField("labels", "STRING", mode="REPEATED"),
+            ],
+            num_rows=1_000,
+            num_bytes=50_000,
+        ),
+        FakeTable(
+            project="test-proj",
+            dataset_id="logs",
+            table_id="requests",
+            schema=[bigquery.SchemaField("day", "DATE")],
+            num_rows=10_000,
+            num_bytes=1_000_000,
+            require_partition_filter=True,
+        ),
+    ]
+    return FakeBigQueryClient(project="test-proj", tables=tables)
+
+
+@pytest.fixture
 def dbt_project_dir(tmp_path: Path) -> Path:
     """A minimal dbt project with a project-local profiles.yml.
 

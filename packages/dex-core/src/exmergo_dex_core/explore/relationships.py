@@ -197,7 +197,7 @@ def verify_relationships(
     for rel in relationships:
         if rel.kind is not RelationshipKind.INFERRED:
             continue
-        sql = _overlap_probe_sql(rel)
+        sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
         result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
         values = dict(zip(result.columns, result.cells[0], strict=True))
         nonnull = int(values["nonnull_fk"] or 0)
@@ -229,13 +229,33 @@ def _overlap_probe_sql(rel: Relationship) -> str:
     key = _quote_part(rel.to_columns[0])
     # Aggregate-only by construction: two counts, no value in the projection.
     # NOT EXISTS keeps the orphan count correct even when the parent key is not
-    # unique (a join would fan out and inflate it).
+    # unique (a join would fan out and inflate it). Deliberately portable SQL:
+    # CASE inside COUNT rather than FILTER (which BigQuery lacks and sqlglot
+    # does not rewrite), with the EXISTS in a subselect so every dialect plans
+    # it as an anti-join.
     return (
-        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
-        f"COUNT(*) FILTER (WHERE c.{fk} IS NOT NULL AND NOT EXISTS ("
-        f"SELECT 1 FROM {parent} p WHERE p.{key} = c.{fk})) AS orphans "
-        f"FROM {child} c"
+        f"SELECT COUNT(probe.fk) AS nonnull_fk, "  # noqa: S608
+        f"COUNT(CASE WHEN probe.orphan THEN 1 END) AS orphans FROM ("
+        f"SELECT c.{fk} AS fk, "
+        f"c.{fk} IS NOT NULL AND NOT EXISTS ("
+        f"SELECT 1 FROM {parent} p WHERE p.{key} = c.{fk}) AS orphan "
+        f"FROM {child} c) probe"
     )
+
+
+def _transpile_probe(sql: str, dialect: str) -> str:
+    """Render the DuckDB-flavored probe in the active connector's dialect.
+
+    The probe is authored once in DuckDB SQL (double-quoted identifiers,
+    ``COUNT(*) FILTER``); sqlglot rewrites it per connector (BigQuery gets
+    backticks and COUNTIF). Identity on DuckDB itself.
+    """
+
+    if dialect == "duckdb":
+        return sql
+    import sqlglot
+
+    return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
 
 
 def _quote_identifier(identifier: str) -> str:

@@ -7,11 +7,12 @@ pull request must pass.
 
 The engine lives in `packages/dex-core/` and is managed with
 [uv](https://docs.astral.sh/uv/). From that directory, sync the runtime plus the
-DuckDB on-ramp and the dev tools:
+DuckDB on-ramp, the BigQuery client (its unit tests run offline against a fake
+but need the library's types), and the dev tools:
 
 ```
 cd packages/dex-core
-uv sync --extra duckdb --extra dev
+uv sync --extra duckdb --extra bigquery --extra dev
 ```
 
 Run the test suite with:
@@ -19,6 +20,54 @@ Run the test suite with:
 ```
 uv run pytest
 ```
+
+Everything is deterministic and free: no cloud account is needed. The live
+BigQuery integration tests under `tests/integration/` collect as skipped with
+the enabling variables named in the skip reason.
+
+## Live BigQuery integration tests
+
+`tests/integration/` runs the real loop against BigQuery: ADC discovery, the
+confirm-before-spend handshake with genuine dry-run estimates, a firewalled
+query, and a dbt build into a scratch dataset. It reads public data
+(`bigquery-public-data`), bills to your test project, and caps every query at
+`DEX_TEST_BQ_MAX_BYTES` (default 100 MB), so a worst-case run costs cents.
+
+One-time setup in your GCP project (`scripts/setup_bigquery_ci.sh` automates
+all of this plus the CI wiring below; the manual steps follow for reference):
+
+```
+# Scratch dataset dbt builds into; the 24h table TTL makes crashed runs self-clean.
+bq mk --dataset --location=US --default_table_expiration=86400 <project>:dex_ci
+
+# The principal running the tests needs, at minimum:
+#   roles/bigquery.jobUser on the project (run query jobs; billing lands there)
+#   roles/bigquery.dataEditor on dex_ci ONLY (never project-wide: this is the
+#   IAM enforcement of "dex never writes outside the dev dataset")
+```
+
+Then authenticate with ADC and run the suite:
+
+```
+gcloud auth application-default login
+DEX_TEST_BQ_PROJECT=<project> DEX_TEST_BQ_DATASET=dex_ci uv run pytest tests/integration -q
+```
+
+In CI the same suite runs from `.github/workflows/integration.yml`,
+authenticated via Workload Identity Federation (OIDC, no stored keys): a
+Workload Identity Pool with a GitHub OIDC provider whose attribute condition
+pins it to this repository (`attribute.repository == "exmergo/dex"`; without
+that condition any repo could mint tokens against the pool), and a service
+account holding the two roles above plus `roles/iam.workloadIdentityUser` for
+the repository's principalSet. The job runs in the `gcp-integration` GitHub
+environment, whose deployment branch policy restricts it to `main` (so a
+workflow modified on a branch cannot claim it), and reads the pool path,
+service account, and project from that environment's variables
+`GCP_WIF_PROVIDER`, `GCP_INTEGRATION_SA`, and `DEX_TEST_BQ_PROJECT`. They are
+variables, not secrets, on purpose: with WIF there is no credential to hide,
+the values are identifiers, and unmasked values make auth failures debuggable.
+The workflow is deliberately not a merge or release gate; forks skip it and
+can point the suite at their own project with the same environment variables.
 
 ## Agent evals (`evals/`)
 

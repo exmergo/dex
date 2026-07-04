@@ -91,6 +91,7 @@ def build(
     select: str | None = None,
     ceiling: float | None = None,
     confirmed: bool = False,
+    paradigm: Paradigm = Paradigm.FREE_LOCAL,
     runner: Runner | None = None,
     timeout: float = _DBT_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], Cost]:
@@ -100,10 +101,16 @@ def build(
     prod target is refused outright rather than merely unconfirmed. DuckDB spend
     is zero (``FREE_LOCAL``) but the preflight still runs, so the confirmation
     path is exercised on the free connector exactly as it will be on billed ones.
+
+    On a billed paradigm the estimate is honestly ``None``: dbt has no dry-run,
+    so the engine cannot preflight the bytes a build will scan. The ceiling and
+    confirmation gates still bind, and the generated profile's per-statement
+    ``maximum_bytes_billed`` is the server-side backstop.
     """
 
     assert_dev_target(target, configured_target)
-    cost = preflight(0.0, ceiling, paradigm=Paradigm.FREE_LOCAL, confirmed=confirmed)
+    estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else None
+    cost = preflight(estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
 
     if project_dir is None:
         raise DbtRunError("no dbt project directory resolved for the build")
@@ -424,6 +431,8 @@ def _summarize(
 
     nodes: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
+    bytes_billed = 0.0
+    saw_billing = False
     run_results = project / "target" / "run_results.json"
     if run_results.is_file():
         results = json.loads(run_results.read_text(encoding="utf-8")).get("results", [])
@@ -437,12 +446,18 @@ def _summarize(
                 }
             )
             counts[status] = counts.get(status, 0) + 1
+            # dbt-bigquery stamps per-node billing into adapter_response; free
+            # adapters do not, so the key's absence means nothing to report.
+            response = result.get("adapter_response") or {}
+            if "bytes_billed" in response:
+                saw_billing = True
+                bytes_billed += float(response.get("bytes_billed") or 0)
 
     messages: list[str] = []
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
 
-    return {
+    summary = {
         "target": target,
         "success": completed.returncode == 0,
         "returncode": completed.returncode,
@@ -450,3 +465,6 @@ def _summarize(
         "counts": counts,
         "messages": messages,
     }
+    if saw_billing:
+        summary["bytes_billed"] = bytes_billed
+    return summary

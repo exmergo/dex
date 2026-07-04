@@ -197,6 +197,14 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
         if meta.row_count == 0:
             data_quality.append("empty table (no rows)")
 
+        # Adapters that degrade a profile (partition-filter tables, block
+        # sampling, skipped escalations) explain themselves through this
+        # duck-typed hook, so the limitation reads as a data-quality note
+        # instead of silently thinner numbers.
+        notes_for = getattr(adapter, "table_notes", None)
+        if notes_for is not None:
+            data_quality.extend(notes_for(identifier))
+
         for col in columns:
             agg = aggregates.get(col.name)
             pii = _refine_confidence(prelim_pii[col.name], agg)

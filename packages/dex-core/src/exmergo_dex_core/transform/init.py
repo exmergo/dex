@@ -14,12 +14,13 @@ warehouse shop would produce a project that parses and builds locally yet is
 wrong. The caller must resolve the connector explicitly before calling in.
 
 Per-connector profile rendering sits behind a small dispatch so cloud renderers
-can slot in alongside their dbt adapters without touching the command; today
-only DuckDB renders, and the others raise an actionable error.
+can slot in alongside their dbt adapters without touching the command; DuckDB
+and BigQuery render today, and the others raise an actionable error.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -29,7 +30,14 @@ import yaml
 from pydantic import BaseModel, Field
 
 from ..cache import DEX_DIR
-from ..config import CONFIG_FILE, DexConfig, DuckDBTarget, load_config, save_config
+from ..config import (
+    CONFIG_FILE,
+    BigQueryTarget,
+    DexConfig,
+    DuckDBTarget,
+    load_config,
+    save_config,
+)
 from ..dbt_project import PROFILES_FILE, PROJECT_FILE, discover_projects
 from ..diffs import file_diff
 
@@ -89,8 +97,9 @@ def init_project(
     render_profile = _PROFILE_RENDERERS.get(connector)
     if render_profile is None:
         raise InitError(
-            f"connector '{connector}' is not yet supported for init; DuckDB is "
-            "the supported path today (`transform init <name> --connector duckdb`)"
+            f"connector '{connector}' is not yet supported for init; DuckDB and "
+            "BigQuery are the supported paths today (`transform init <name> "
+            "--connector duckdb|bigquery`)"
         )
 
     project_name = sanitize_project_name(name)
@@ -183,8 +192,78 @@ def _duckdb_profile(
     )
 
 
+_DEFAULT_BQ_DEV_DATASET = "dbt_dev"
+
+
+def _bigquery_profile(
+    project_name: str, path: str | None, config: DexConfig, root: Path
+) -> str:
+    """A single dbt-bigquery ``dev`` target authenticated by ADC (method:
+    oauth), so no secret is ever rendered. Writes go to a dedicated dev
+    dataset, never to the source datasets dex reads from."""
+
+    target = config.bigquery or BigQueryTarget()
+    gcp_project = _resolve_init_project(target, root)
+    if not gcp_project:
+        raise InitError(
+            "no GCP project to wire the dev target to: set bigquery.project in "
+            ".dex/config.yml, or run `gcloud config set project <id>` (dex "
+            "discovers Application Default Credentials; it never asks for keys)"
+        )
+    dev_dataset = target.dev_dataset or _DEFAULT_BQ_DEV_DATASET
+    source_datasets = {entry.split(".")[-1] for entry in target.datasets}
+    if dev_dataset in source_datasets:
+        raise InitError(
+            f"dev_dataset '{dev_dataset}' is also a source dataset in "
+            "bigquery.datasets; dbt builds must write to a dataset dex does "
+            "not read from (set bigquery.dev_dataset to a dedicated one)"
+        )
+
+    target.project = gcp_project
+    target.dev_dataset = dev_dataset
+    config.bigquery = target
+
+    output: dict[str, Any] = {
+        "type": "bigquery",
+        "method": "oauth",
+        "project": gcp_project,
+        "dataset": dev_dataset,
+        "threads": 4,
+        "priority": "interactive",
+    }
+    if target.location:
+        output["location"] = target.location
+    if config.budget.ceiling is not None:
+        # Server-side cap per statement dbt runs; the engine cannot dry-run a
+        # dbt build, so this is the binding cost control for `transform build`.
+        output["maximum_bytes_billed"] = int(config.budget.ceiling)
+    return yaml.safe_dump(
+        {project_name: {"target": "dev", "outputs": {"dev": output}}},
+        sort_keys=False,
+    )
+
+
+def _resolve_init_project(target: BigQueryTarget, root: Path) -> str | None:
+    """The connect-time resolution chain, minus the hard ADC requirement: init
+    only renders config, so absent credentials degrade to "not found" rather
+    than an auth error."""
+
+    from ..connect import (
+        CredentialDiscoveryError,
+        _default_credentials,
+        resolve_bigquery_project,
+    )
+
+    try:
+        _credentials, adc_project, _principal = _default_credentials()
+    except CredentialDiscoveryError:
+        adc_project = None
+    return resolve_bigquery_project(target, os.environ, adc_project, repo_root=root)
+
+
 _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]] = {
     "duckdb": _duckdb_profile,
+    "bigquery": _bigquery_profile,
 }
 
 

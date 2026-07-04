@@ -9,6 +9,61 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+The first cloud connector: the full explore and transform loop runs on BigQuery
+with hard cost guards, alongside the existing DuckDB path.
+
+### Added
+
+- BigQuery adapter (`--connector bigquery`, behind the `[bigquery]` extra):
+  free API-metadata inventory (never `INFORMATION_SCHEMA`), batched aggregate
+  profiling with nested-type (`STRUCT`/`ARRAY`/`JSON`) handling, metadata-only
+  degradation for partition-filter-required tables, and opt-in `TABLESAMPLE`
+  block sampling for very large tables (`bigquery.max_full_profile_bytes`).
+- Credential discovery for BigQuery: Application Default Credentials only
+  (user, service account, impersonated, or federated), never a prompted or
+  pasted key; the project resolves from `.dex/config.yml`, the environment,
+  the ADC default, or a dbt profile, and every failure names the fix.
+- Bytes-scanned cost guards: every billed command is estimated with free
+  dry-runs and returns `needs_confirmation` until re-issued with
+  `--confirm --budget <bytes>`; every job carries a server-side
+  `maximum_bytes_billed` cap; billed bytes land in a `.dex/spend.jsonl` ledger
+  (byte counts and statement hashes, never SQL text); and
+  `budget.session_ceiling` bounds cumulative spend per UTC day against that
+  ledger. Over-ceiling estimates are refused outright and confirmation cannot
+  override them.
+- `bigquery:` config block (`project`, `datasets` allowlist supporting
+  qualified `project.dataset` entries such as public datasets, `location`,
+  `dev_dataset`, `max_full_profile_bytes`).
+- `transform init --connector bigquery`: renders a dev-only dbt profile with
+  `method: oauth` (ADC, no secrets), pointed at a dedicated dev dataset that
+  is refused when it collides with a source dataset; `transform build` on
+  BigQuery requires `--confirm` with a `--budget`, inherits the profile's
+  per-statement `maximum_bytes_billed` cap, and records billed bytes from
+  dbt's run results into the spend ledger. The `[bigquery]` extra now carries
+  `dbt-bigquery`.
+- Live BigQuery integration suite (`tests/integration/`), gated on
+  `DEX_TEST_BQ_*` environment variables and skipped otherwise, reading public
+  datasets with per-query byte ceilings; a scheduled `integration.yml`
+  workflow authenticates via Workload Identity Federation (no stored keys).
+- Safety-spine coverage for the billed paradigm: SELECT-only in the BigQuery
+  dialect (scripting, `MERGE`, `EXPORT DATA`, `CALL` refused), the
+  unconfirmed-never-executes and over-ceiling-cannot-confirm guarantees, the
+  server-side cap on every job, PII firewall checks for BigQuery
+  value-carrying aggregates (`ANY_VALUE`, `ARRAY_AGG`, `STRING_AGG`,
+  `TO_JSON_STRING`), secret-free generated profiles, and a sanitizer-checked
+  capabilities payload (principal type only, never an identity).
+
+### Changed
+
+- Explore envelopes on billed connectors now stamp the preflight `cost` and
+  report actual spend under `data.spend`; `connect test` reports the
+  connector's cost paradigm and performs a real API round-trip (a stale
+  credential no longer reports a healthy connection).
+- The query firewall and `explore query` now parse in the active connector's
+  SQL dialect instead of assuming DuckDB.
+- Relationship verification probes are authored in portable SQL and transpiled
+  per connector (BigQuery lacks `FILTER (WHERE ...)`).
+
 ## [0.1.0] - 2026-07-03
 
 

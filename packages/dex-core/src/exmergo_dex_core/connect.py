@@ -1,17 +1,32 @@
 """Connection handling and credential discovery.
 
 All connection handling lives here so credentials and raw rows stay inside the
-engine process and never reach the agent. In v0.1 only DuckDB is wired: a local
-file path, opened read-only, no credentials. Cloud credential discovery
-("discover, don't ask") is not yet implemented.
+engine process and never reach the agent. DuckDB is a local file path, opened
+read-only, no credentials. BigQuery discovers credentials ("discover, don't
+ask"): Application Default Credentials only, never a prompted or pasted key,
+with the project resolved from explicit config, the environment, the ADC
+default, or a dbt profile, in that order. Every discovery failure names the
+fix; nothing is ever prompted for.
 """
 
 from __future__ import annotations
 
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 
+import yaml
+
 from .adapters import get_adapter
-from .config import DexConfig, load_config
+from .cache import DexStore
+from .config import BigQueryTarget, DexConfig, load_config
+from .envelope import Paradigm
+from .guards.cost_guard import CostGate
+
+
+class CredentialDiscoveryError(Exception):
+    """Raised when a cloud connection cannot be discovered. The message always
+    names the command or config that fixes it, never a credential value."""
 
 
 def open_adapter(
@@ -19,12 +34,16 @@ def open_adapter(
     connector: str | None = None,
     path: str | None = None,
     repo_root: str | Path = ".",
+    budget: float | None = None,
+    confirmed: bool = False,
+    command: str | None = None,
 ):
     """Resolve the connection target and return an open, read-only adapter.
 
     Resolution order: explicit arguments win, then ``.dex/config.yml``. For
-    DuckDB the only input is a file path. Cloud connectors will resolve
-    credentials from their stores here; nothing is ever prompted for.
+    DuckDB the only input is a file path. ``budget``/``confirmed`` feed the
+    cost gate on billed connectors and are ignored by free ones; ``command``
+    labels ledger entries.
     """
 
     config = load_config(repo_root) or DexConfig()
@@ -38,5 +57,140 @@ def open_adapter(
             )
         return get_adapter("duckdb", path=resolved)
 
-    # Cloud connectors discover credentials from their own stores.
+    if connector == "bigquery":
+        return _open_bigquery(
+            config, repo_root, budget=budget, confirmed=confirmed, command=command
+        )
+
+    # The remaining cloud connectors are not yet implemented.
     return get_adapter(connector)
+
+
+def _open_bigquery(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+):
+    target = config.bigquery or BigQueryTarget()
+    credentials, adc_project, principal_type = _default_credentials()
+    project = resolve_bigquery_project(
+        target, os.environ, adc_project, repo_root=repo_root
+    )
+    if not project:
+        raise CredentialDiscoveryError(
+            "no GCP project resolved; set bigquery.project in .dex/config.yml "
+            "or run `gcloud config set project <id>` (then refresh ADC with "
+            "`gcloud auth application-default login`)"
+        )
+
+    store = DexStore(repo_root)
+    utc_midnight = (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+    gate = CostGate(
+        paradigm=Paradigm.BYTES_SCANNED,
+        ceiling=budget if budget is not None else config.budget.ceiling,
+        session_ceiling=config.budget.session_ceiling,
+        session_spent=store.spend_since(utc_midnight),
+        confirmed=confirmed,
+        connector="bigquery",
+        command=command,
+        record=store.append_spend_log,
+    )
+    return get_adapter(
+        "bigquery",
+        project=project,
+        target=target,
+        cost_gate=gate,
+        credentials=credentials,
+        principal_type=principal_type,
+    )
+
+
+def _default_credentials():
+    """Discover Application Default Credentials, never prompting.
+
+    Returns ``(credentials, adc_project, principal_type)``. ``principal_type``
+    is a coarse class of principal (user / service_account /
+    impersonated_service_account / external_account / metadata), safe to
+    surface; the principal's identity never is.
+    """
+
+    try:
+        import google.auth
+        from google.auth.exceptions import DefaultCredentialsError
+    except ImportError as exc:
+        raise CredentialDiscoveryError(
+            "the BigQuery client is not installed; install the connector "
+            "extra: exmergo-dex-core[bigquery]"
+        ) from exc
+
+    try:
+        credentials, adc_project = google.auth.default()
+    except DefaultCredentialsError as exc:
+        raise CredentialDiscoveryError(
+            "no Google Application Default Credentials found; run "
+            "`gcloud auth application-default login` (or point "
+            "GOOGLE_APPLICATION_CREDENTIALS at a service-account file) and retry"
+        ) from exc
+
+    module = type(credentials).__module__
+    if "impersonated" in module:
+        principal_type = "impersonated_service_account"
+    elif "external_account" in module:
+        principal_type = "external_account"
+    elif "service_account" in module:
+        principal_type = "service_account"
+    elif "compute_engine" in module:
+        principal_type = "metadata"
+    else:
+        principal_type = "user"
+    return credentials, adc_project, principal_type
+
+
+def resolve_bigquery_project(
+    target: BigQueryTarget,
+    env: dict | os._Environ,
+    adc_project: str | None,
+    *,
+    repo_root: str | Path = ".",
+) -> str | None:
+    """The project resolution chain: explicit config, then the environment,
+    then the ADC default, then a dbt profile's bigquery target. Pure given its
+    inputs (the environment is injected), so the order is directly testable."""
+
+    return (
+        target.project
+        or env.get("GOOGLE_CLOUD_PROJECT")
+        or env.get("GCLOUD_PROJECT")
+        or adc_project
+        or _project_from_dbt_profiles(repo_root)
+    )
+
+
+def _project_from_dbt_profiles(repo_root: str | Path) -> str | None:
+    """Best-effort: the ``project`` of a ``type: bigquery`` output in the
+    discovered dbt project's profiles. Any failure means "not found"."""
+
+    try:
+        from .dbt_project import PROFILES_FILE, find_project, profiles_dir
+
+        project_dir = find_project(repo_root)
+        profiles_path = profiles_dir(project_dir) / PROFILES_FILE
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if (
+                isinstance(output, dict)
+                and output.get("type") == "bigquery"
+                and output.get("project")
+            ):
+                return str(output["project"])
+    return None

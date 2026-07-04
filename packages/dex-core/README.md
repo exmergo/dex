@@ -46,7 +46,7 @@ the full surface and the envelope spec.
 ## Status
 
 Early and under active development; expect pre-release versions. Today the engine
-runs Explore and Transform on DuckDB end to end.
+runs Explore and Transform end to end on DuckDB and on BigQuery.
 
 Explore: ranks what matters in an unfamiliar warehouse, profiles columns
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins
@@ -62,10 +62,19 @@ gated dev-target-only builds with cost surfaced before any spend
 (`transform build`), and authors the semantic layer as MetricFlow-validated dbt
 semantic models (`semantic define|update|plan`, applied with `transform apply`).
 
-Maintain (drift detection and reconcile), the cloud connectors (BigQuery,
-Snowflake, Databricks, PostgreSQL), and the Viz preview report `not_implemented`
-until they land. The foundations are in place: the command contract, the
-canonical model and `.dex/` layout, and the eval and safety spine.
+BigQuery: connects through Application Default Credentials
+(`gcloud auth application-default login`; dex discovers credentials, it never
+asks for keys). Metadata is free; every scan is dry-run first, returned as a
+`needs_confirmation` estimate, and runs only with `--confirm --budget <bytes>`,
+capped server-side by `maximum_bytes_billed` and recorded in a local
+`.dex/spend.jsonl` ledger. dbt builds go to a dedicated dev dataset via
+dbt-bigquery, which the `[bigquery]` extra carries. See
+[`references/bigquery.md`](../../references/bigquery.md).
+
+Maintain (drift detection and reconcile), the remaining cloud connectors
+(Snowflake, Databricks, PostgreSQL), and the Viz preview report
+`not_implemented` until they land. The foundations are in place: the command
+contract, the canonical model and `.dex/` layout, and the eval and safety spine.
 
 ## License
 

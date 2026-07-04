@@ -20,17 +20,45 @@ CONFIG_FILE = "config.yml"
 
 
 class Budget(BaseModel):
-    """A per-session cost ceiling for a connector paradigm. Magnitude is
-    paradigm-relative (bytes, credits, DBUs, load score); DuckDB is unbounded by
-    cost and only resource-bounded."""
+    """Cost ceilings for a connector paradigm. Magnitudes are paradigm-relative
+    (bytes, credits, DBUs, load score); DuckDB is unbounded by cost and only
+    resource-bounded.
+
+    ``ceiling`` bounds one command; a ``--budget`` flag overrides it per call.
+    ``session_ceiling`` bounds cumulative spend across commands per UTC day,
+    settled against the ``.dex/spend.jsonl`` ledger, so a long agent session
+    (or a loop of confirmed commands) still has a hard stop.
+    """
 
     paradigm: Paradigm = Paradigm.FREE_LOCAL
     ceiling: float | None = None
+    session_ceiling: float | None = None
 
 
 class DuckDBTarget(BaseModel):
     # A local DuckDB file, or a directory of Parquet/CSV. Opened read-only.
     path: str
+
+
+class BigQueryTarget(BaseModel):
+    """Non-secret BigQuery connection target. Credentials are never here: auth
+    is Application Default Credentials, discovered at runtime by connect.py.
+
+    ``project`` is the billing/quota project jobs run in (also the default
+    project whose datasets are explored). ``datasets`` is a source allowlist
+    (entries ``dataset`` or ``project.dataset``); empty means every dataset in
+    the project. ``dev_dataset`` is where dbt dev builds write, and is refused
+    as a source so reads and writes can never share a dataset.
+    ``max_full_profile_bytes`` opts large tables into block-sampled profiling
+    (TABLESAMPLE) instead of a full scan; unset means profile fully, bounded
+    only by the budget.
+    """
+
+    project: str | None = None
+    location: str | None = None
+    datasets: list[str] = Field(default_factory=list)
+    dev_dataset: str | None = None
+    max_full_profile_bytes: int | None = None
 
 
 class QueryLimits(BaseModel):
@@ -47,11 +75,12 @@ class QueryLimits(BaseModel):
 
 
 class DexConfig(BaseModel):
-    """The shape of ``.dex/config.yml``. Only the DuckDB target is wired in v0.1;
-    cloud connector targets are not yet implemented."""
+    """The shape of ``.dex/config.yml``. DuckDB and BigQuery targets are wired;
+    the remaining cloud connector targets are not yet implemented."""
 
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
+    bigquery: BigQueryTarget | None = None
     dbt_target: str | None = None
     # Pins the dbt project directory (relative to the repo root) when discovery
     # would be ambiguous; by default the project is located automatically.

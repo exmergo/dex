@@ -177,6 +177,7 @@ DEX_DIR = ".dex"
 CACHE_FILE = "cache.json"
 SNAPSHOT_FILE = "snapshot.json"
 QUERIES_FILE = "queries.jsonl"
+SPEND_FILE = "spend.jsonl"
 
 
 class DexStore:
@@ -233,3 +234,44 @@ class DexStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
         return path
+
+    def append_spend_log(self, entry: dict) -> Path:
+        """Append one billed-command record to `.dex/spend.jsonl`.
+
+        The ledger is the audit trail for warehouse spend and the substrate for
+        the cumulative session budget: byte counts, job ids, and statement
+        hashes only, never SQL values or credentials.
+        """
+
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        path = self.dex_dir / SPEND_FILE
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
+        return path
+
+    def spend_since(self, cutoff_iso: str) -> float:
+        """Total `billed_bytes` recorded at or after ``cutoff_iso`` (ISO-8601).
+
+        String comparison is correct here because every `at` stamp is written
+        by dex in the same UTC ISO format. Malformed lines are skipped rather
+        than poisoning the budget check.
+        """
+
+        path = self.dex_dir / SPEND_FILE
+        if not path.is_file():
+            return 0.0
+        total = 0.0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            at = entry.get("at")
+            billed = entry.get("billed_bytes")
+            if (
+                isinstance(at, str)
+                and at >= cutoff_iso
+                and isinstance(billed, (int, float))
+            ):
+                total += float(billed)
+        return total

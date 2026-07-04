@@ -124,7 +124,11 @@ def _connect_test(args: argparse.Namespace) -> env.Envelope:
 
     adapter = open_from_args(args)
     try:
-        return env.ok(adapter.capabilities())
+        # A free probe on every connector, but the envelope's cost paradigm
+        # reflects the connector so the agent knows what later commands bill in.
+        gate = getattr(adapter, "cost_gate", None)
+        cost = gate.cost() if gate is not None else env.Cost()
+        return env.ok(adapter.capabilities(), cost=cost)
     finally:
         adapter.close()
 

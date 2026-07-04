@@ -1,6 +1,6 @@
 # Connector: Snowflake (stub)
 
-Implemented in Phase 4. The dominant dbt and AE warehouse. Cost paradigm: credits
+Not yet implemented. The dominant dbt and AE warehouse. Cost paradigm: credits
 (warehouse size times time), so minimize warehouse runtime, not bytes. Auth
 discovered (never asked) from `connections.toml`, key-pair (RSA), SSO
 (externalbrowser), the dbt `profiles.yml` Snowflake target, and `SNOWFLAKE_*` env.

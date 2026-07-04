@@ -21,10 +21,16 @@ def repo_root(args: argparse.Namespace) -> str:
 
 
 def open_from_args(args: argparse.Namespace) -> Adapter:
+    group = getattr(args, "group", None)
+    subcommand = getattr(args, "subcommand", None)
+    command = " ".join(part for part in (group, subcommand) if part) or None
     return open_adapter(
         connector=getattr(args, "connector", None),
         path=getattr(args, "path", None),
         repo_root=repo_root(args),
+        budget=getattr(args, "budget", None),
+        confirmed=getattr(args, "confirm", False),
+        command=command,
     )
 
 

@@ -155,9 +155,7 @@ def test_init_refuses_when_a_project_exists_in_a_child_dir(
     assert not (tmp_path / "fresh").exists()
 
 
-@pytest.mark.parametrize(
-    "connector", ["snowflake", "bigquery", "databricks", "postgres"]
-)
+@pytest.mark.parametrize("connector", ["snowflake", "databricks", "postgres"])
 def test_cloud_connectors_error_actionably(tmp_path: Path, capsys, connector: str):
     rc, envelope = _run(_init_argv(tmp_path, "--connector", connector), capsys)
     assert rc == 1
@@ -165,6 +163,71 @@ def test_cloud_connectors_error_actionably(tmp_path: Path, capsys, connector: st
     assert connector in message
     assert "not yet supported" in message
     assert "duckdb" in message.lower()
+
+
+def _seed_bigquery_config(repo: Path, **target) -> None:
+    (repo / ".dex").mkdir(parents=True, exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        yaml.safe_dump({"bigquery": target}), encoding="utf-8"
+    )
+
+
+def test_init_bigquery_bootstraps_a_project(tmp_path: Path, capsys):
+    _seed_bigquery_config(tmp_path, project="test-proj")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "bigquery"), capsys)
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "bigquery"
+
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    profile = profiles["analytics"]
+    assert profile["target"] == "dev"
+    assert set(profile["outputs"]) == {"dev"}
+    dev = profile["outputs"]["dev"]
+    assert dev["type"] == "bigquery"
+    assert dev["method"] == "oauth"  # ADC: no secret is ever rendered
+    assert dev["project"] == "test-proj"
+    assert dev["dataset"] == "dbt_dev"
+
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["connector"] == "bigquery"
+    assert config["bigquery"]["project"] == "test-proj"
+    assert config["bigquery"]["dev_dataset"] == "dbt_dev"
+
+
+def test_init_bigquery_without_a_project_errors_actionably(
+    tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core import connect
+
+    # No config project, no env, no ADC: deterministic regardless of the
+    # developer machine's gcloud state.
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GCLOUD_PROJECT", raising=False)
+
+    def no_adc():
+        raise connect.CredentialDiscoveryError("no ADC")
+
+    monkeypatch.setattr(connect, "_default_credentials", no_adc)
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "bigquery"), capsys)
+    assert rc == 1
+    message = envelope["errors"][0]
+    assert "bigquery.project" in message
+    assert "gcloud" in message
+    assert not (tmp_path / "analytics").exists()
+
+
+def test_init_bigquery_refuses_a_dev_dataset_that_is_a_source(tmp_path: Path, capsys):
+    _seed_bigquery_config(
+        tmp_path, project="test-proj", datasets=["shop"], dev_dataset="shop"
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "bigquery"), capsys)
+    assert rc == 1
+    assert "dev_dataset" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
 
 
 def test_unknown_connector_lists_the_valid_ones(tmp_path: Path, capsys):

@@ -41,22 +41,28 @@ intent.
 
 ## Connectors
 
-Cloud warehouse: **BigQuery**, **Snowflake**, **Databricks**. Operational
+Cloud warehouse: **BigQuery** (live), **Snowflake**, **Databricks**. Operational
 database: **PostgreSQL**. Embedded analytical: **DuckDB** (the zero-credential
 on-ramp, and the engine behind the eval and benchmark suites). Each client library
 is behind an optional extra, so the DuckDB on-ramp installs only `duckdb` and
-`sqlglot`. To pull every connector at once, install `exmergo-dex-core[all]`.
+`sqlglot`; BigQuery installs with `exmergo-dex-core[bigquery]`. To pull every
+connector at once, install `exmergo-dex-core[all]`.
+
+BigQuery authenticates through Application Default Credentials (run
+`gcloud auth application-default login`); dex discovers credentials, it never
+asks for keys. Every scan is estimated with a free dry-run and confirmed before
+it spends, capped server-side with `maximum_bytes_billed`, and recorded in a
+local spend ledger.
 
 ## Status
 
-**v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required. The
-warehouse-first, positioned launch lands at v0.2 when the cloud connectors and
-cost paradigms arrive. Published benchmark scores (ADE-bench uplift and
-cost/turn efficiency, Spider2.0-DBT) land with v0.3.
-
-This repository is currently at the foundation stage: the command contract, the
-dbt-project-as-source-of-truth model with a non-canonical `.dex/` cache, and the
-three-tier eval and safety spine.
+**v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required.
+**Explore and transform now also run on BigQuery**, the first cloud connector:
+credential discovery via ADC, bytes-scanned cost guards with a
+confirm-before-spend handshake, and dev-dataset-only dbt builds via
+dbt-bigquery. Snowflake, Databricks, and PostgreSQL land next as v0.2
+completes; published benchmark scores (ADE-bench uplift and cost/turn
+efficiency, Spider2.0-DBT) land with v0.3.
 
 ## Beyond Claude Code
 
@@ -81,7 +87,7 @@ pass the Lint workflow and CI before it can merge.
 
 ## Maintainers: post-scaffold runbook
 
-A few Phase 0 steps need accounts or network. Run them with the appropriate
+A few post-scaffold steps need accounts or network. Run them with the appropriate
 credentials:
 
 - **GitHub repo metadata:** set the repo **description** to the keyword sentence
@@ -107,6 +113,11 @@ credentials:
   `benchmarks/ade_bench/README.md`).
 - **Marketplace entry:** at v0.1 ship time, add the `dex` entry to the
   `exmergo/exmergo-agent-plugins` catalog with a pinned `ref`.
+- **BigQuery integration CI:** one-time GCP and GitHub setup (Workload
+  Identity Federation, a scoped service account, the `dex_ci` scratch dataset,
+  and the `gcp-integration` environment with its variables), automated by
+  `scripts/setup_bigquery_ci.sh`; background in `CONTRIBUTING.md` under "Live
+  BigQuery integration tests".
 
 ## License
 

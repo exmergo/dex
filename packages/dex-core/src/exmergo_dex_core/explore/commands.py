@@ -15,9 +15,11 @@ from datetime import UTC, datetime
 
 from .. import command_args
 from .. import envelope as env
+from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
 from ..cache import Dataset, DexCache, DexStore, match_identifier
 from ..config import DexConfig, QueryLimits, load_config
+from ..guards.cost_guard import ConfirmationRequiredError, CostGate
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
@@ -33,10 +35,82 @@ from . import relationships as rel_mod
 _AUTO_PROFILE_ALL = 50
 
 
+def _cost_gate(adapter: Adapter) -> CostGate | None:
+    """The adapter's cost gate when it is a billed connector; free adapters
+    (DuckDB) have none, and their explore commands stay confirmation-free."""
+
+    return getattr(adapter, "cost_gate", None)
+
+
+def _billed_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    per_table: dict[str, float] | None = None,
+    notes: list[str] | None = None,
+) -> env.Envelope | None:
+    """The cost-before-spend handshake on billed connectors.
+
+    The estimate comes from free dry-runs, so the unconfirmed pass spends
+    nothing: it either passes the gate (confirmed, within budget) or returns
+    the ``needs_confirmation`` envelope for the agent to surface and re-issue
+    with ``--confirm --budget``. Over-ceiling and no-ceiling refusals propagate
+    as errors (confirmation cannot override them).
+    """
+
+    gate = _cost_gate(adapter)
+    if gate is None:
+        return None
+    try:
+        gate.preflight_command(estimate)
+    except ConfirmationRequiredError as exc:
+        data: dict = {
+            "command": command,
+            "estimated_bytes": estimate,
+            "hint": (
+                "review the estimate, then re-run with --confirm --budget "
+                "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
+                "$0.06 on-demand)"
+            ),
+        }
+        if per_table:
+            data["per_table_bytes"] = per_table
+        if notes:
+            data["notes"] = notes
+        return env.needs_confirmation(data, cost=exc.cost)
+    return None
+
+
+def _stamp_spend(envelope: env.Envelope, adapter: Adapter) -> env.Envelope:
+    """Stamp the preflight cost and the actual spend onto an OK envelope. The
+    ``cost`` field stays a preflight estimate by contract; actual billed bytes
+    live in ``data.spend``."""
+
+    gate = _cost_gate(adapter)
+    if gate is not None:
+        envelope.cost = gate.cost()
+        envelope.data["spend"] = gate.spend_summary()
+    return envelope
+
+
+def _profile_estimate(
+    adapter: Adapter, identifiers: list[str]
+) -> tuple[float, dict[str, float]]:
+    estimate = getattr(adapter, "profile_estimate", None)
+    if estimate is None:
+        return 0.0, {}
+    return estimate(identifiers)
+
+
 def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
     adapter = command_args.open_from_args(args)
     try:
+        # Inventory is metadata-only on every connector (free API calls on
+        # BigQuery), so it never needs the confirm handshake.
         metas = inventory_mod.inventory(adapter)
+        gate = _cost_gate(adapter)
+        cost = gate.cost() if gate is not None else env.Cost()
     finally:
         adapter.close()
 
@@ -62,18 +136,30 @@ def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
         }
         for m in metas
     ]
-    return env.ok({"object_count": len(objects), "objects": objects, "ranked": ranked})
+    return env.ok(
+        {"object_count": len(objects), "objects": objects, "ranked": ranked},
+        cost=cost,
+    )
 
 
 def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     adapter = command_args.open_from_args(args)
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
+        estimate, per_table = _profile_estimate(adapter, identifiers)
+        unconfirmed = _billed_handshake(
+            "explore profile", adapter, estimate, per_table=per_table
+        )
+        if unconfirmed is not None:
+            return unconfirmed
         datasets = profile_mod.profile(adapter, identifiers)
+        envelope = env.ok({})
+        _stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     _annotate_grain(datasets)
-    return env.ok({"datasets": [d.model_dump(mode="json") for d in datasets]})
+    envelope.data["datasets"] = [d.model_dump(mode="json") for d in datasets]
+    return envelope
 
 
 def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
@@ -85,12 +171,36 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         # Relationship inference needs uniqueness signals, so profile every object
         # first (free and local on DuckDB), then infer across the full set.
         metas = inventory_mod.inventory(adapter)
-        datasets = profile_mod.profile(adapter, [m.identifier for m in metas])
+        identifiers = [m.identifier for m in metas]
+        estimate, per_table = _profile_estimate(adapter, identifiers)
+        handshake_notes = [
+            "relationship inference profiles every object; on a metered "
+            "connector `explore map` (top-ranked objects only) is usually the "
+            "cheaper way in"
+        ]
+        if verify:
+            handshake_notes.append(
+                "--verify overlap probes depend on what inference finds, so "
+                "they are billed within the confirmed budget, not in this "
+                "upfront estimate"
+            )
+        unconfirmed = _billed_handshake(
+            "explore relationships",
+            adapter,
+            estimate,
+            per_table=per_table,
+            notes=handshake_notes,
+        )
+        if unconfirmed is not None:
+            return unconfirmed
+        datasets = profile_mod.profile(adapter, identifiers)
         inferred = rel_mod.infer_relationships(datasets)
         if verify:
             rel_mod.verify_relationships(
                 adapter, inferred, timeout_seconds=config.query.timeout_seconds
             )
+        envelope = env.ok({})
+        _stamp_spend(envelope, adapter)
     finally:
         adapter.close()
 
@@ -101,7 +211,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
-    return env.ok(
+    envelope.data.update(
         {
             "relationships": [r.model_dump(mode="json") for r in rels],
             "declared_count": len(declared),
@@ -109,6 +219,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "notes": notes,
         }
     )
+    return envelope
 
 
 def cmd_query(args: argparse.Namespace) -> env.Envelope:
@@ -131,8 +242,11 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
 
     config = load_config(repo_root) or DexConfig()
     limits = config.query
+    # The firewall parses in the active connector's dialect, so BigQuery SQL
+    # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
+    dialect = get_dialect(getattr(args, "connector", None) or config.connector)
     try:
-        inspected = inspect_query(args.sql, cache, limits)
+        inspected = inspect_query(args.sql, cache, limits, dialect=dialect)
     except QueryRefusedError as exc:
         store.append_query_log(
             {"at": at, "sql": args.sql, "decision": "refused", "reason": str(exc)}
@@ -141,11 +255,26 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
 
     adapter = command_args.open_from_args(args)
     try:
+        query_estimate = getattr(adapter, "query_estimate", None)
+        estimate = query_estimate(inspected.sql) if query_estimate else 0.0
+        unconfirmed = _billed_handshake("explore query", adapter, estimate)
+        if unconfirmed is not None:
+            store.append_query_log(
+                {
+                    "at": at,
+                    "sql": inspected.sql,
+                    "decision": "needs_confirmation",
+                    "estimated_bytes": estimate,
+                }
+            )
+            return unconfirmed
         result = adapter.run_query(
             inspected.sql,
             max_rows=inspected.row_cap,
             timeout_seconds=limits.timeout_seconds,
         )
+        envelope = env.ok({})
+        _stamp_spend(envelope, adapter)
     except Exception as exc:
         store.append_query_log(
             {
@@ -160,6 +289,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
         adapter.close()
 
     data = _shape_query_payload(result, inspected, limits)
+    envelope.data.update(data)
     store.append_query_log(
         {
             "at": at,
@@ -170,7 +300,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
             "truncated": data["truncated"],
         }
     )
-    return env.ok(data)
+    return envelope
 
 
 def cmd_map(args: argparse.Namespace) -> env.Envelope:
@@ -185,6 +315,23 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         # profile; re-ranked with connectivity once relationships are known.
         first_pass = rank_mod.rank(metas, None, config.ranking_hints)
         selected = _select_for_profiling(metas, first_pass, config, full)
+        # Inventory and ranking are free, so an unconfirmed billed run repeats
+        # them on re-issue; only the profiling scans below need the handshake.
+        estimate, per_table = _profile_estimate(
+            adapter, [m.identifier for m in selected]
+        )
+        handshake_notes = None
+        if getattr(args, "verify", False):
+            handshake_notes = [
+                "--verify overlap probes depend on what inference finds, so "
+                "they are billed within the confirmed budget, not in this "
+                "upfront estimate"
+            ]
+        unconfirmed = _billed_handshake(
+            "explore map", adapter, estimate, per_table=per_table, notes=handshake_notes
+        )
+        if unconfirmed is not None:
+            return unconfirmed
         profiled = profile_mod.profile(adapter, [m.identifier for m in selected])
         _annotate_grain(profiled)
         inferred = rel_mod.infer_relationships(profiled)
@@ -192,6 +339,8 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             rel_mod.verify_relationships(
                 adapter, inferred, timeout_seconds=config.query.timeout_seconds
             )
+        envelope = env.ok({})
+        _stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     declared = rel_mod.declared_relationships(repo_root)
@@ -232,7 +381,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
     quality_notes = sum(len(d.data_quality) for d in profiled)
     top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
-    return env.ok(
+    envelope.data.update(
         {
             "cache_path": str(path),
             "object_count": len(metas),
@@ -249,6 +398,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             "updated_at": now.isoformat(),
         }
     )
+    return envelope
 
 
 # --- helpers -----------------------------------------------------------------

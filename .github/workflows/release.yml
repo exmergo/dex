@@ -21,8 +21,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - name: Sync (duckdb + dev extras)
-        run: uv sync --extra duckdb --extra dev
+      # bigquery stays in the gate: the BigQuery safety families importorskip
+      # on the client library, and a release gate that silently skips
+      # safety-critical assertions is a hole, not a speedup.
+      - name: Sync (duckdb + bigquery + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra dev
       - name: Tier-1 + safety-critical gate
         run: uv run pytest -q
       # A safety-assertion regression blocks the release regardless of pass-rate;

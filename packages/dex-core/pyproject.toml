@@ -42,7 +42,9 @@ dex = "exmergo_dex_core.cli:main"
 # split out later if that tradeoff matters.)
 duckdb = ["duckdb>=1", "sqlglot>=25", "dbt-duckdb>=1.9"]
 snowflake = ["snowflake-connector-python>=3", "sqlglot>=25"]
-bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25"]
+# Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
+# transform can build against a BigQuery dev target with one install.
+bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25", "dbt-bigquery>=1.9"]
 databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=25"]
 postgres = ["psycopg[binary]>=3", "sqlglot>=25"]
 # One command for users who want every connector at once (e.g. driving multiple
@@ -78,3 +80,10 @@ testpaths = ["tests"]
 # manipulation, so the package-mirroring test tree can reuse basenames (e.g. a
 # test_commands.py per capability) without import-file-mismatch collisions.
 addopts = "--import-mode=importlib"
+# importlib mode does not put the rootdir on sys.path, so the shared test
+# doubles under tests/fakes/ need an explicit path entry to be importable.
+pythonpath = ["tests"]
+markers = [
+  "integration: hits a live warehouse; gated on DEX_TEST_BQ_* environment variables",
+  "bigquery: BigQuery-specific integration tests",
+]

@@ -298,3 +298,108 @@ def test_relative_profile_path_resolves_against_project(
     assert rc == 0, envelope
     assert (dbt_project_dir / "dev-rel.duckdb").exists()
     assert not (elsewhere / "dev-rel.duckdb").exists()
+
+
+# --- billed connectors (BigQuery): the ceiling binds, spend is ledgered --------
+
+
+def test_billed_build_unconfirmed_needs_confirmation_with_unknown_estimate(
+    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+):
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["cost"]["paradigm"] == "bytes_scanned"
+    # dbt has no dry-run: the estimate is honestly unknown, not a fake zero.
+    assert envelope["cost"]["estimate"] is None
+    assert envelope["cost"]["ceiling"] == 100000000
+
+
+def test_billed_build_without_a_budget_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+):
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert "--budget" in envelope["errors"][0]
+
+
+def test_billed_build_sums_bytes_billed_into_the_ledger(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    import json as json_mod
+
+    _fake_runner_factory(monkeypatch, returncode=0)
+    target_dir = dbt_project_dir / "target"
+    target_dir.mkdir(exist_ok=True)
+    (target_dir / "run_results.json").write_text(
+        json_mod.dumps(
+            {
+                "results": [
+                    {
+                        "unique_id": "model.dex_test.stg_customers",
+                        "status": "success",
+                        "execution_time": 1.0,
+                        "adapter_response": {"bytes_billed": 1000},
+                    },
+                    {
+                        "unique_id": "model.dex_test.mart_customers",
+                        "status": "success",
+                        "execution_time": 1.0,
+                        "adapter_response": {"bytes_billed": 2000},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["bytes_billed"] == 3000
+    assert any("maximum_bytes_billed" in w for w in envelope["warnings"])
+    ledger = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = json_mod.loads(ledger[-1])
+    assert entry["command"] == "transform build"
+    assert entry["billed_bytes"] == 3000

@@ -425,3 +425,217 @@ def test_query_results_are_columnar_and_pass_the_sanitizer(capsys):
     # above still guards every other command against accidental record dumps.
     env.emit(env.ok({"columns": ["id", "n"], "cells": [[1, 3], [2, 5]]}))
     assert capsys.readouterr().out
+
+
+# --- BigQuery: the billed connector exercises every family ---------------------
+#
+# These run against the fake client (tests/fakes/bigquery.py): deterministic,
+# offline, free. They importorskip on the [bigquery] extra, which CI and the
+# release gate install, so trimming that extra from a workflow would silently
+# skip release-blocking families; keep `--extra bigquery` in ci.yml and
+# release.yml.
+
+
+def _bq_adapter(fake_bq_client, *, ceiling=500 * 1024 * 1024, confirmed=True):
+    from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.BYTES_SCANNED,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="bigquery",
+    )
+    return BigQueryAdapter(
+        project="test-proj",
+        cost_gate=gate,
+        client=fake_bq_client,
+        principal_type="user",
+    )
+
+
+def test_bigquery_generated_sql_is_select_only(fake_bq_client):
+    # Family 1: every statement the adapter generates passes the SELECT-only
+    # guard in the bigquery dialect (asserted at build time, no client needed).
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _bq_adapter(fake_bq_client)
+    _meta, columns = adapter.table_metadata("test-proj.shop.customers")
+    sql, _plan = adapter._build_aggregate_sql(
+        "test-proj.shop.customers", columns, {"id"}
+    )
+    assert sql.lstrip().upper().startswith("SELECT")
+    assert assert_select_only(sql, dialect="bigquery") == sql
+
+
+def test_select_only_guard_rejects_bigquery_writes_and_scripts():
+    # Family 1: BigQuery scripting, DML/DDL, and multi-statement forms are all
+    # refused when parsed in the bigquery dialect.
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
+
+    for bad in (
+        "DECLARE x INT64; SELECT x",
+        "CREATE TEMP TABLE t AS SELECT 1",
+        "MERGE INTO d.t USING d.s ON FALSE WHEN NOT MATCHED THEN INSERT ROW",
+        "TRUNCATE TABLE d.t",
+        "SELECT 1; SELECT 2",
+        "DELETE FROM d.t WHERE TRUE",
+        "EXPORT DATA OPTIONS(uri='gs://x/*') AS SELECT 1",
+        "CALL d.proc()",
+    ):
+        with pytest.raises(NotSelectOnlyError):
+            assert_select_only(bad, dialect="bigquery")
+
+
+def test_bigquery_unconfirmed_scan_never_executes(fake_bq_client):
+    # Family 2: the strict handshake. Without --confirm only the free dry-run
+    # happens; the refusal carries the estimate for the agent to surface.
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _bq_adapter(fake_bq_client, confirmed=False)
+    with pytest.raises(ConfirmationRequiredError) as exc_info:
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert exc_info.value.cost.estimate == 5_000
+    assert [c.dry_run for c in fake_bq_client.query_calls] == [True]
+
+
+def test_bigquery_confirmed_run_without_a_ceiling_is_refused(fake_bq_client):
+    # Family 2: nothing executes unbudgeted, and confirmation cannot stand in
+    # for a ceiling on a billed paradigm.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _bq_adapter(fake_bq_client, ceiling=None, confirmed=True)
+    with pytest.raises(CostGuardError):
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_bigquery_over_ceiling_cannot_be_confirmed_through(fake_bq_client):
+    # Family 2: over-ceiling blocks first, even fully confirmed.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _bq_adapter(fake_bq_client, ceiling=1_000, confirmed=True)
+    with pytest.raises(OverCeilingError):
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_bigquery_every_executed_job_is_server_capped(fake_bq_client):
+    # Family 2: defense in depth past the client-side gate; a wrong estimate
+    # cannot overrun the budget because the service enforces the cap.
+    fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _bq_adapter(fake_bq_client)
+    adapter.run_query(
+        "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    executed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert executed
+    assert all(c.job_config.maximum_bytes_billed is not None for c in executed)
+
+
+def test_query_firewall_blocks_bigquery_value_carrying_shapes():
+    # Family 3: PII stays flagged-not-surfaced under the bigquery dialect,
+    # including BigQuery's own value-carrying aggregates and JSON casts.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "SELECT ANY_VALUE(email) FROM db.main.customers",
+        "SELECT ARRAY_AGG(email) FROM db.main.customers",
+        "SELECT STRING_AGG(email) FROM db.main.customers",
+        "SELECT TO_JSON_STRING(email) FROM db.main.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits(), dialect="bigquery")
+    # Measuring stays allowed in the bigquery dialect too.
+    inspect_query(
+        "SELECT COUNT(DISTINCT email) FROM db.main.customers",
+        cache,
+        QueryLimits(),
+        dialect="bigquery",
+    )
+
+
+def test_init_bigquery_profile_is_dev_only_with_no_secrets(tmp_path: Path):
+    # Family 4: the generated BigQuery profile has a single dev target, ADC
+    # auth (method: oauth), and no secret-shaped key anywhere.
+    import yaml
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.cache import DEX_DIR
+    from exmergo_dex_core.config import CONFIG_FILE
+
+    (tmp_path / DEX_DIR).mkdir()
+    (tmp_path / DEX_DIR / CONFIG_FILE).write_text(
+        "bigquery:\n  project: test-proj\n", encoding="utf-8"
+    )
+    transform.init_project("analytics", "bigquery", repo_root=tmp_path)
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    profile = profiles["analytics"]
+    assert profile["target"] == "dev"
+    assert set(profile["outputs"]) == {"dev"}
+    assert profile["outputs"]["dev"]["method"] == "oauth"
+    # The envelope sanitizer doubles as the secret-key scanner here.
+    env.sanitize(env.ok(profiles))
+
+
+def test_bigquery_capabilities_pass_the_sanitizer(fake_bq_client, capsys):
+    # Family 5: the capabilities payload carries the principal's TYPE, never
+    # an identity or key material, and survives the sanitizer end to end.
+    adapter = _bq_adapter(fake_bq_client)
+    caps = adapter.capabilities()
+    env.emit(env.ok(caps))
+    out = capsys.readouterr().out
+    assert out
+    assert "@" not in out  # no principal email
+    assert caps["principal_type"] in {
+        "user",
+        "service_account",
+        "external_account",
+        "metadata",
+        "unknown",
+    }
+
+
+def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_client):
+    # Family 5: the audit trail is byte counts and statement hashes only.
+    import json
+
+    from exmergo_dex_core.cache import DexStore
+
+    store = DexStore(tmp_path)
+    fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _bq_adapter(fake_bq_client)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = json.loads(lines[-1])
+    assert "SELECT" not in json.dumps(entry)
+    assert entry["billed_bytes"] == 5_000
+    assert entry["statement_sha256"]

@@ -34,7 +34,7 @@ benchmark score:
 
 The spine lives in `tests/test_safety_spine.py`. Families whose engine lands in a
 later phase are wired as explicit `xfail` placeholders so the spine is complete
-from Phase 0 and turns green as the logic arrives.
+from the start and turns green as the logic arrives.
 
 ## Tier 2: agent evals (skill-creator framework)
 
