@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-04
+
 The first cloud connector: the full explore and transform loop runs on BigQuery
 with hard cost guards, alongside the existing DuckDB path.
 
