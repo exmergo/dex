@@ -78,4 +78,11 @@ def validate_edit(edit: PlanEdit) -> list[str]:
             from .semantic import validate_semantic_yaml
 
             warnings.extend(validate_semantic_yaml(edit.path, parsed))
+        elif edit.kind is EditKind.PACKAGES_YML and not (
+            parsed.get("packages") or parsed.get("dependencies")
+        ):
+            raise EditValidationError(
+                f"{edit.path}: a packages manifest needs a 'packages:' (or "
+                "'dependencies:') list"
+            )
     return warnings

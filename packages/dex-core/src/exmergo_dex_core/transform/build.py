@@ -114,7 +114,10 @@ def build(
 
     if project_dir is None:
         raise DbtRunError("no dbt project directory resolved for the build")
-    project = Path(project_dir)
+    # Absolute so --project-dir/--profiles-dir cannot resolve a second time
+    # against the cwd we pin below: a relative project dir would otherwise
+    # double (dbt would look for project/project and fail).
+    project = Path(project_dir).resolve()
 
     seeding_warning = _check_dev_database(project, target)
 
@@ -144,7 +147,7 @@ def build(
         "--project-dir",
         str(project),
         "--profiles-dir",
-        str(profiles_dir(project)),
+        str(profiles_dir(project).resolve()),
         "--log-format",
         "json",
     ]
@@ -226,7 +229,9 @@ def shadow_parse(
     passed; non-empty messages are the parse errors.
     """
 
-    project = Path(project_dir)
+    # Absolute so --profiles-dir (pointing at the real project) does not
+    # resolve against the shadow tempdir we pin as cwd below.
+    project = Path(project_dir).resolve()
     try:
         executable = _dbt_executable()
     except DbtRunError:
@@ -268,7 +273,7 @@ def shadow_parse(
             "--project-dir",
             str(shadow),
             "--profiles-dir",
-            str(profiles),
+            str(profiles.resolve()),
             "--log-format",
             "json",
         ]
@@ -324,7 +329,8 @@ def deps(
     it runs after the target check and the cost gate anyway.
     """
 
-    project = Path(project_dir)
+    # Absolute so --project-dir does not double against the pinned cwd.
+    project = Path(project_dir).resolve()
     argv = [
         _dbt_executable(),
         "deps",

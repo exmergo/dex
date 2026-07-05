@@ -51,6 +51,9 @@ class EditKind(str, Enum):
     MODEL_SQL = "model_sql"
     SCHEMA_YML = "schema_yml"
     SEMANTIC_YML = "semantic_yml"
+    # A dbt project-root manifest, not a model-path file: authoring it brings
+    # dependency declaration inside the plan/apply guardrail like every other edit.
+    PACKAGES_YML = "packages_yml"
 
 
 class PlanEdit(Edit):
