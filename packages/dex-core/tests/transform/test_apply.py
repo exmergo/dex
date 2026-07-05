@@ -59,6 +59,50 @@ def test_apply_round_trip(dbt_project_dir: Path, tmp_path: Path, capsys):
     assert json.loads(plan_file.read_text())["applied_at"] is not None
 
 
+def test_apply_writes_packages_yml_at_project_root(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload_file = tmp_path / "packages-edit.json"
+    payload_file.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "packages.yml",
+                        "kind": "packages_yml",
+                        "content": "packages:\n  - package: dbt-labs/dbt_utils\n"
+                        "    version: 1.1.1\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "add dbt_utils",
+            "--edits-file",
+            str(payload_file),
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok"
+    plan_id = envelope["data"]["plan_id"]
+
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", plan_id], capsys
+    )
+    assert rc == 0 and envelope["status"] == "ok"
+    assert envelope["data"]["written"] == ["packages.yml"]
+    manifest = dbt_project_dir / "packages.yml"
+    assert manifest.is_file()
+    assert "dbt_utils" in manifest.read_text(encoding="utf-8")
+
+
 def test_apply_unknown_plan_is_a_clean_error(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

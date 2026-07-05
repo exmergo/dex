@@ -197,6 +197,31 @@ def test_write_edits_refuses_absolute_paths(dbt_project_dir: Path, tmp_path: Pat
         write_edits([edit], dbt_project_dir)
 
 
+@pytest.mark.parametrize("manifest", ["packages.yml", "dependencies.yml"])
+def test_write_edits_allows_dbt_package_manifests_at_root(
+    dbt_project_dir: Path, manifest: str
+):
+    edit = Edit(
+        path=manifest,
+        new_content="packages:\n  - package: dbt-labs/dbt_utils\n    version: 1.1.1\n",
+        old_content_hash=None,
+    )
+    result = write_edits([edit], dbt_project_dir)
+    assert result.written == [manifest]
+    assert (dbt_project_dir / manifest).is_file()
+
+
+@pytest.mark.parametrize("root_file", ["profiles.yml", "dbt_project.yml", "random.yml"])
+def test_write_edits_still_refuses_other_root_files(
+    dbt_project_dir: Path, root_file: str
+):
+    # The carve-out is exactly the two package manifests, not project-root files
+    # in general.
+    edit = Edit(path=root_file, new_content="x: 1\n", old_content_hash=None)
+    with pytest.raises(DbtProjectError):
+        write_edits([edit], dbt_project_dir)
+
+
 def test_profiles_dir_env_override(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
