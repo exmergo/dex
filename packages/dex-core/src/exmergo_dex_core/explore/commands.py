@@ -283,6 +283,18 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    # Fold same-lineage duplicates before they reach the cache: a dev/replica
+    # dataset mapped alongside its source otherwise inflates one real foreign key
+    # into source, replica, and cross-dataset lookalike edges.
+    dev_schemas = frozenset(
+        name
+        for name in [config.bigquery.dev_dataset if config.bigquery else None]
+        if name
+    )
+    inferred, folded_edges, mirrored_objects = rel_mod.fold_replica_relationships(
+        profiled, inferred, dev_schemas
+    )
+
     declared = rel_mod.declared_relationships(repo_root)
     relationships = declared + inferred
 
@@ -316,6 +328,12 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         notes.append(
             f"carried forward {carried} prior profile(s) for objects not "
             "re-profiled this run; per-dataset profiled_at marks their age"
+        )
+    if folded_edges > 0:
+        notes.append(
+            f"folded {folded_edges} same-lineage duplicate relationship(s); "
+            f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
+            "dataset mapped alongside its source)"
         )
 
     pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
