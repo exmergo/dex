@@ -99,8 +99,9 @@ def test_unconfirmed_profile_returns_needs_confirmation(
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    assert envelope.cost.estimate == 5_000
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 5_000}
+    # The single below-floor batch is priced at the per-query billing minimum.
+    assert envelope.cost.estimate == 10 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 10 * MB}
     assert "--confirm" in envelope.data["hint"]
     # Nothing executed: only free metadata and dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -123,7 +124,7 @@ def test_confirmed_profile_runs_and_stamps_spend(
     )
     assert envelope.status.value == "ok"
     assert envelope.data["datasets"][0]["identifier"] == "test-proj.shop.customers"
-    assert envelope.cost.estimate == 5_000
+    assert envelope.cost.estimate == 10 * MB  # floored preflight estimate
     assert envelope.cost.ceiling == 100 * MB
     # The aggregate batch plus the exact-distinct escalation (optional spend
     # inside the confirmed budget): both scans land in the ledger.
@@ -137,8 +138,9 @@ def test_unconfirmed_map_estimates_selected_objects(
     route_adapter(fake_bq_client)
     envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
     assert envelope.status.value == "needs_confirmation"
-    # logs.requests needs a partition filter, so it contributes zero.
-    assert envelope.cost.estimate == 55_000
+    # customers and events each floor to the per-query minimum; logs.requests
+    # needs a partition filter, so it contributes zero.
+    assert envelope.cost.estimate == 2 * 10 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -187,7 +189,8 @@ def test_unconfirmed_query_returns_estimate_and_logs(
         )
     )
     assert envelope.status.value == "needs_confirmation"
-    assert envelope.cost.estimate == 5_000
+    # Single-table query, floored to the per-query billing minimum.
+    assert envelope.cost.estimate == 10 * MB
     log_lines = (tmp_path / ".dex" / "queries.jsonl").read_text().splitlines()
     assert json.loads(log_lines[-1])["decision"] == "needs_confirmation"
 

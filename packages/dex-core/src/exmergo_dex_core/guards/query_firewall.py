@@ -24,6 +24,7 @@ trusted to agent frugality) and records which cache tables the query touches.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import sqlglot
@@ -103,6 +104,59 @@ _QUERY_ROOTS = tuple(
 _Outputs = dict[str, set[str]]
 _Source = Dataset | dict
 
+# Warehouse-layer prefixes stripped before entity matching, so stg_products and
+# products share the entity "product" when suggesting an unflagged twin column.
+_LAYER_PREFIX = re.compile(r"^(raw|stg|src|dim|fct|fact|mart|int)_", re.IGNORECASE)
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_STRING_TYPE_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
+
+
+def _normalize_name(name: str) -> str:
+    return _CAMEL_BOUNDARY.sub("_", name).lower()
+
+
+def _is_string_type(data_type: str) -> bool:
+    upper = data_type.upper()
+    return any(hint in upper for hint in _STRING_TYPE_HINTS)
+
+
+def _entity_of(table: str) -> str:
+    """The entity a table name denotes: layer prefix stripped, naively
+    singularized (products -> product), lowered."""
+
+    stripped = _LAYER_PREFIX.sub("", table).lower()
+    if stripped.endswith("s") and not stripped.endswith("ss"):
+        stripped = stripped[:-1]
+    return stripped
+
+
+def recovery_hints(offending: list[str], cache: DexCache) -> list[str]:
+    """Unflagged string columns that plausibly carry the same readable value as a
+    refused PII column, so a refusal points at a lawful alternative instead of a
+    dead end (for example ``inventory_items.product_name`` for a flagged
+    ``products.name``). Column names only; no value is ever read. The flag itself
+    is never weakened, only the guidance around it."""
+
+    suggestions: set[str] = set()
+    for entry in offending:
+        table_col = entry.split(" (", 1)[0]
+        table, _, column = table_col.rpartition(".")
+        entity = _entity_of(table)
+        base = _normalize_name(column)
+        if not entity or not base:
+            continue
+        target = f"{entity}_{base}"
+        for dataset in cache.datasets:
+            short = dataset.identifier.rsplit(".", 1)[-1]
+            for col in dataset.columns:
+                if col.pii is not None or not _is_string_type(col.data_type):
+                    continue
+                normalized = _normalize_name(col.name)
+                tokens = set(normalized.split("_"))
+                if normalized == target or {entity, base} <= tokens:
+                    suggestions.add(f"{short}.{col.name}")
+    return sorted(suggestions)
+
 
 def inspect_query(
     sql: str,
@@ -133,13 +187,21 @@ def inspect_query(
 
     offending = sorted({flag for taint in outputs.values() for flag in taint})
     if offending:
-        raise QueryRefusedError(
+        message = (
             "the projection would carry values from PII-flagged column(s): "
             + "; ".join(offending)
             + ". Use a measuring aggregate over them (COUNT, "
             "APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), or drop them from the "
             "output. PII values never cross the envelope."
         )
+        hints = recovery_hints(offending, cache)
+        if hints:
+            message += (
+                " An unflagged column may carry the same readable value: "
+                + ", ".join(hints)
+                + "."
+            )
+        raise QueryRefusedError(message)
 
     new_sql, row_cap, capped = _apply_limit(root, limits.max_rows, dialect)
     return InspectedQuery(

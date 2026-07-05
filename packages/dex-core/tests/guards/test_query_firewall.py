@@ -125,6 +125,49 @@ def test_refusal_names_column_category_and_fix(cache: DexCache):
     assert "COUNT" in message  # the fix
 
 
+@pytest.fixture
+def twin_cache() -> DexCache:
+    """A flagged entity-name column with an unflagged equivalent one table over,
+    the shape that made the firewall a dead end in the field."""
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.PRODUCTS",
+                columns=[
+                    ColumnProfile(name="ID", data_type="INTEGER"),
+                    ColumnProfile(
+                        name="NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                ],
+            ),
+            Dataset(
+                identifier="db.main.INVENTORY_ITEMS",
+                columns=[
+                    ColumnProfile(name="ID", data_type="INTEGER"),
+                    ColumnProfile(name="PRODUCT_NAME", data_type="VARCHAR"),
+                ],
+            ),
+        ]
+    )
+
+
+def test_pii_refusal_points_to_an_unflagged_equivalent_column(twin_cache: DexCache):
+    message = _refusal("SELECT NAME FROM PRODUCTS", twin_cache)
+    assert "PRODUCTS.NAME" in message  # still refused, flag intact
+    assert "INVENTORY_ITEMS.PRODUCT_NAME" in message  # the lawful alternative
+    assert "unflagged column may carry" in message
+
+
+def test_pii_refusal_without_a_twin_still_refuses_cleanly(cache: DexCache):
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", cache)
+    assert "RAW_HOSTS.NAME" in message
+    assert "COUNT" in message  # the fix is still named
+    assert "unflagged column may carry" not in message  # no false suggestion
+
+
 # --- refused: shape, resolution, and introspection -------------------------------
 
 

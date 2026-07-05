@@ -10,6 +10,8 @@ import pytest
 
 pytest.importorskip("google.cloud.bigquery")
 
+from google.cloud import bigquery
+
 from exmergo_dex_core.adapters import get_adapter, get_dialect
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.config import BigQueryTarget
@@ -140,13 +142,52 @@ def test_dry_run_precedes_every_execution(fake_bq_client):
     assert [c.dry_run for c in fake_bq_client.query_calls] == [True, False]
 
 
-def test_estimate_is_the_dry_run_figure(fake_bq_client):
+def test_estimate_floors_at_the_billing_minimum(fake_bq_client):
+    # customers is 5000 bytes, well under BigQuery's 10 MiB per-table minimum;
+    # the estimate reports what will be billed, not the raw scan, so the agent
+    # budgets against a truthful number instead of hitting a rejection ladder.
     adapter = make_adapter(fake_bq_client)
     estimate = adapter.query_estimate(
         "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
     )
-    assert estimate == 5_000  # the table's num_bytes, priced by the fake
+    assert estimate == 10 * MB
     assert [c.dry_run for c in fake_bq_client.query_calls] == [True]
+
+
+def test_estimate_is_the_raw_scan_when_it_exceeds_the_floor():
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    big = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="huge",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=1,
+        num_bytes=20 * MB,
+    )
+    client = FakeBigQueryClient(project="test-proj", tables=[big])
+    adapter = make_adapter(client)
+    estimate = adapter.query_estimate("SELECT COUNT(*) FROM `test-proj`.`shop`.`huge`")
+    assert estimate == 20 * MB  # above the floor, the raw dry-run figure wins
+
+
+def test_query_estimate_floors_per_referenced_table(fake_bq_client):
+    # A two-table join is billed at least the minimum per table, so the floor is
+    # twice a single scan even though the raw dry-run of both is a few KB.
+    adapter = make_adapter(fake_bq_client)
+    estimate = adapter.query_estimate(
+        "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers` c "
+        "JOIN `test-proj`.`shop`.`events` e ON c.id = e.id"
+    )
+    assert estimate == 2 * 10 * MB
+
+
+def test_profile_estimate_floors_each_batch_at_the_billing_minimum(fake_bq_client):
+    adapter = make_adapter(fake_bq_client)
+    total, per_table = adapter.profile_estimate(["test-proj.shop.customers"])
+    # One batch over one table: the raw 5000-byte scan floors to the minimum.
+    assert per_table["test-proj.shop.customers"] == 10 * MB
+    assert total == 10 * MB
 
 
 def test_every_executed_job_carries_maximum_bytes_billed(fake_bq_client):
@@ -342,10 +383,11 @@ def test_profile_estimate_sums_free_dry_runs(fake_bq_client):
     total, per_table = adapter.profile_estimate(
         ["test-proj.shop.customers", "test-proj.shop.events", "test-proj.logs.requests"]
     )
-    assert per_table["test-proj.shop.customers"] == 5_000
-    assert per_table["test-proj.shop.events"] == 50_000
+    # Each queryable table is one below-floor batch, so both floor to the minimum.
+    assert per_table["test-proj.shop.customers"] == 10 * MB
+    assert per_table["test-proj.shop.events"] == 10 * MB
     assert per_table["test-proj.logs.requests"] == 0.0  # unqueryable, skipped
-    assert total == 55_000
+    assert total == 20 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -459,3 +501,55 @@ def test_project_falls_back_to_dbt_profiles(dbt_project_dir: Path):
         BigQueryTarget(), {}, None, repo_root=dbt_project_dir.parent
     )
     assert resolved == "from-dbt"
+
+
+def test_connect_test_parses_project_and_dataset_flags():
+    # The first-attempt flags a user reaches for must not be rejected as
+    # unrecognized args (the discoverability defect).
+    from exmergo_dex_core.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "connect",
+            "test",
+            "--connector",
+            "bigquery",
+            "--project",
+            "p",
+            "--dataset",
+            "d1",
+            "--dataset",
+            "d2",
+        ]
+    )
+    assert args.project == "p"
+    assert args.dataset == ["d1", "d2"]
+
+
+def test_project_and_dataset_flags_override_the_config_target(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import exmergo_dex_core.connect as connect_mod
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        connect_mod, "_default_credentials", lambda: (None, None, "user")
+    )
+
+    def fake_get_adapter(name, **kwargs):
+        captured.update(kwargs)
+        captured["name"] = name
+        return SimpleNamespace(name=name, close=lambda: None)
+
+    monkeypatch.setattr(connect_mod, "get_adapter", fake_get_adapter)
+
+    connect_mod.open_adapter(
+        connector="bigquery",
+        project="cli-proj",
+        datasets=["ds_a", "ds_b"],
+        repo_root=tmp_path,  # no .dex/config.yml here
+    )
+    assert captured["name"] == "bigquery"
+    assert captured["project"] == "cli-proj"
+    assert captured["target"].project == "cli-proj"
+    assert captured["target"].datasets == ["ds_a", "ds_b"]

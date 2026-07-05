@@ -419,7 +419,12 @@ class BigQueryAdapter:
         """Dry-run every aggregate batch profiling would issue and sum the
         bytes, per table and in total. Free: metadata GETs and dry-run jobs
         bill nothing. Partition-filter tables contribute zero because they
-        will not be queried."""
+        will not be queried.
+
+        Each batch is one billed query over one table, so its cost is floored
+        to the per-query minimum: on small tables the raw scan is a fraction of
+        what BigQuery actually bills, and an unfloored estimate would send the
+        agent into a ladder of budget rejections."""
 
         per_table: dict[str, float] = {}
         for identifier in identifiers:
@@ -438,7 +443,7 @@ class BigQueryAdapter:
                     sample_percent=sample_percent,
                 )
                 try:
-                    total += self._dry_run(sql)
+                    total += max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
                 except self._api_exceptions.BadRequest:
                     self._note(
                         identifier,
@@ -449,9 +454,37 @@ class BigQueryAdapter:
         return sum(per_table.values()), per_table
 
     def query_estimate(self, sql: str) -> float:
-        """The dry-run byte estimate for one firewall-approved query."""
+        """The dry-run byte estimate for one firewall-approved query, floored to
+        what BigQuery will actually bill (the per-referenced-table minimum), so
+        the estimate the agent budgets against is not decorative on small data."""
 
-        return self._dry_run(assert_select_only(sql, dialect=self.dialect))
+        checked = assert_select_only(sql, dialect=self.dialect)
+        return max(self._dry_run(checked), self._min_billed_floor(checked))
+
+    def _min_billed_floor(self, sql: str) -> float:
+        """BigQuery bills at least ``_MIN_BILLED_BYTES`` per table a query
+        references. The floor for one query is that minimum times its distinct
+        table references, so a two-table join floors at twice a single scan."""
+
+        return float(self._referenced_table_count(sql) * _MIN_BILLED_BYTES)
+
+    def _referenced_table_count(self, sql: str) -> int:
+        """Distinct physical tables a query reads, for the billing floor. A parse
+        failure falls back to one table (the estimate only ever floors upward, so
+        under-counting is the safe direction to be wrong)."""
+
+        try:
+            import sqlglot
+            from sqlglot import expressions as sqlglot_exp
+
+            parsed = sqlglot.parse_one(sql, read=self.dialect)
+        except Exception:
+            return 1
+        tables = {
+            ".".join(part for part in (t.catalog, t.db, t.name) if part)
+            for t in parsed.find_all(sqlglot_exp.Table)
+        }
+        return max(len(tables), 1)
 
     # --- execution (the single billed door) -----------------------------------
 

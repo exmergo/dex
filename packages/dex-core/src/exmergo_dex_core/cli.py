@@ -57,6 +57,11 @@ def _sub_connection_options() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--connector", default=argparse.SUPPRESS)
     common.add_argument("--path", default=argparse.SUPPRESS)
+    # BigQuery's equivalent of --path: a convenience smoke-test override for the
+    # project and dataset allowlist, so `connect test` works before a
+    # .dex/config.yml bigquery block exists. Nothing is written to config.
+    common.add_argument("--project", default=argparse.SUPPRESS)
+    common.add_argument("--dataset", action="append", default=argparse.SUPPRESS)
     common.add_argument("--repo-root", default=argparse.SUPPRESS)
     common.add_argument("--confirm", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--budget", type=float, default=argparse.SUPPRESS)
@@ -71,6 +76,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Real defaults live on the top-level parser so every namespace has them.
     parser.add_argument("--connector", default=None)
     parser.add_argument("--path", default=None)
+    parser.add_argument("--project", default=None)
+    parser.add_argument("--dataset", action="append", default=None)
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--budget", type=float, default=None)

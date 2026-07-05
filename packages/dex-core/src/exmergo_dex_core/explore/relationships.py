@@ -127,6 +127,108 @@ def infer_relationships(datasets: list[Dataset]) -> list[Relationship]:
     return relationships
 
 
+def fold_replica_relationships(
+    datasets: list[Dataset],
+    relationships: list[Relationship],
+    dev_schemas: frozenset[str] = frozenset(),
+) -> tuple[list[Relationship], int, int]:
+    """Fold same-lineage duplicate joins that appear when a dev/replica dataset is
+    mapped alongside its source.
+
+    A replica's models mirror source entities and keys, so one real foreign key
+    inflates into the source edge, the replica edge, and cross-dataset lookalike
+    edges. Returns ``(kept, folded_count, mirrored_object_count)``.
+
+    A replica schema is one whose short name is in ``dev_schemas`` or one that
+    structurally mirrors another (the same layer-stripped entity and column set
+    living in a second schema). With no replica in scope nothing is folded, so a
+    single-dataset map is untouched. Within each lineage signature that a replica
+    edge participates in, the canonical (source-schema) edge is kept and the
+    duplicates are dropped.
+    """
+
+    def schema_of(identifier: str) -> str:
+        return identifier.rsplit(".", 1)[0]
+
+    def bare(identifier: str) -> str:
+        return identifier.rsplit(".", 1)[-1]
+
+    def is_dev(schema: str) -> bool:
+        return schema.rsplit(".", 1)[-1] in dev_schemas
+
+    # An entity+columns fingerprint held by more than one schema is a mirrored
+    # entity; a dev schema is a replica by declaration even without a structural
+    # twin in scope.
+    schemas_by_fingerprint: dict[tuple[str, frozenset[str]], set[str]] = {}
+    tables_per_schema: dict[str, int] = {}
+    present_schemas: set[str] = set()
+    for dataset in datasets:
+        schema = schema_of(dataset.identifier)
+        present_schemas.add(schema)
+        key = (
+            _entity(bare(dataset.identifier)),
+            frozenset(c.name.lower() for c in dataset.columns),
+        )
+        schemas_by_fingerprint.setdefault(key, set()).add(schema)
+        if dataset.object_type == "table":
+            tables_per_schema[schema] = tables_per_schema.get(schema, 0) + 1
+
+    mirrored_schemas: set[str] = {s for s in present_schemas if is_dev(s)}
+    for schemas in schemas_by_fingerprint.values():
+        if len(schemas) > 1:
+            mirrored_schemas |= schemas
+    if not mirrored_schemas:
+        return relationships, 0, 0
+
+    # Canonical schema: prefer a non-dev schema, then the one with the most base
+    # tables (a source has tables where a replica has staging views), then name.
+    canonical = min(
+        mirrored_schemas,
+        key=lambda s: (is_dev(s), -tables_per_schema.get(s, 0), s),
+    )
+    replica_schemas = mirrored_schemas - {canonical}
+    mirrored_object_count = sum(
+        1 for d in datasets if schema_of(d.identifier) in replica_schemas
+    )
+
+    def replica_endpoints(rel: Relationship) -> int:
+        return sum(
+            schema_of(endpoint) in replica_schemas
+            for endpoint in (rel.from_dataset, rel.to_dataset)
+        )
+
+    def signature(rel: Relationship) -> tuple:
+        return (
+            _entity(bare(rel.from_dataset)),
+            tuple(c.lower() for c in rel.from_columns),
+            _entity(bare(rel.to_dataset)),
+            tuple(c.lower() for c in rel.to_columns),
+        )
+
+    groups: dict[tuple, list[Relationship]] = {}
+    for rel in relationships:
+        groups.setdefault(signature(rel), []).append(rel)
+
+    kept: list[Relationship] = []
+    folded = 0
+    for members in groups.values():
+        if len(members) == 1 or not any(replica_endpoints(r) for r in members):
+            kept.extend(members)
+            continue
+        best = min(
+            members,
+            key=lambda r: (
+                replica_endpoints(r),
+                -(r.confidence or 0.0),
+                r.from_dataset,
+                r.to_dataset,
+            ),
+        )
+        kept.append(best)
+        folded += len(members) - 1
+    return kept, folded, mirrored_object_count
+
+
 def fk_candidate_count(datasets: list[Dataset]) -> int:
     """How many profiled columns look like foreign keys. Reported alongside the
     inference result so an empty relationships array is distinguishable from

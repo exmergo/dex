@@ -148,8 +148,9 @@ def test_unconfirmed_grain_returns_the_dry_run_estimate(
     envelope = maintain_cmds.cmd_grain(_args(tmp_path, "grain"))
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    assert envelope.cost.estimate == 5_000
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 5_000}
+    # The single-table distinct-count scan floors to the per-query minimum.
+    assert envelope.cost.estimate == 10 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 10 * MB}
     assert "--confirm" in envelope.data["hint"]
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
@@ -207,7 +208,7 @@ def test_unconfirmed_check_is_two_phase(fake_bq_client, route_adapter, tmp_path)
     # with the estimate for the scanning axes.
     codes = {f["code"] for f in envelope.data["findings"]}
     assert "column_dropped" in codes
-    assert envelope.data["estimated_bytes"] == 5_000
+    assert envelope.data["estimated_bytes"] == 10 * MB
     assert any("free" in note for note in envelope.data["notes"])
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
@@ -230,3 +231,70 @@ def test_confirmed_check_completes_the_scanning_axes(
     assert envelope.data["axes"]["grain"] == 0
     report = DexStore(tmp_path).load_drift()
     assert {"schema", "volume", "grain"} <= set(report.axes)
+
+
+def _seed_two_keyed_tables(tmp_path: Path) -> None:
+    now = datetime.now(UTC).isoformat()
+
+    def keyed(identifier: str, rows: int, byte_size: int) -> Dataset:
+        return Dataset(
+            identifier=identifier,
+            row_count=rows,
+            byte_size=byte_size,
+            columns=[
+                ColumnProfile(
+                    name="id",
+                    data_type="INTEGER",
+                    nullable=False,
+                    null_fraction=0.0,
+                    distinct_count=rows,
+                    distinct_count_exact=True,
+                    is_unique=True,
+                )
+            ],
+            candidate_keys=[["id"]],
+            grain=["id"],
+            profiled_at=now,
+        )
+
+    DexStore(tmp_path).save_snapshot(
+        Snapshot(
+            created_at=now,
+            connector="bigquery",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    keyed("test-proj.shop.customers", 100, 5_000),
+                    keyed("test-proj.shop.events", 1_000, 50_000),
+                ]
+            ),
+            warehouse_from="cache",
+        )
+    )
+
+
+def test_check_fanout_estimate_reflects_per_query_floor(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """A fan-out check over two tables estimates 2x the per-query floor, not the
+    few KB of raw scan; confirming with exactly that budget then runs without the
+    per-statement floor rejecting a statement (the reject-ladder the estimate
+    used to cause)."""
+
+    _seed_two_keyed_tables(tmp_path)
+    route_adapter(fake_bq_client)
+
+    unconfirmed = maintain_cmds.cmd_check(_args(tmp_path, "check"))
+    assert unconfirmed.status.value == "needs_confirmation"
+    assert unconfirmed.data["estimated_bytes"] == 2 * 10 * MB
+
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    route_adapter(fake_bq_client)
+    confirmed = maintain_cmds.cmd_check(
+        _args(
+            tmp_path,
+            "check",
+            confirm=True,
+            budget=float(unconfirmed.data["estimated_bytes"]),
+        )
+    )
+    assert confirmed.status.value == "ok"

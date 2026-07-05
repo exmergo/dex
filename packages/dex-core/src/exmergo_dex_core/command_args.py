@@ -30,6 +30,8 @@ def open_from_args(args: argparse.Namespace) -> Adapter:
     return open_adapter(
         connector=getattr(args, "connector", None),
         path=getattr(args, "path", None),
+        project=getattr(args, "project", None),
+        datasets=getattr(args, "dataset", None),
         repo_root=repo_root(args),
         budget=getattr(args, "budget", None),
         confirmed=getattr(args, "confirm", False),
@@ -104,6 +106,8 @@ def project_dir(args: argparse.Namespace) -> Path:
 
     root = repo_root(args)
     config = load_config(root)
+    # Absolute so downstream dbt subprocess calls (which pin cwd to this dir)
+    # never re-resolve a relative --project-dir against it and double the path.
     if config and config.dbt_project_dir:
-        return Path(root) / config.dbt_project_dir
-    return find_project(root)
+        return (Path(root) / config.dbt_project_dir).resolve()
+    return find_project(root).resolve()

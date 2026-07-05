@@ -33,6 +33,8 @@ def open_adapter(
     *,
     connector: str | None = None,
     path: str | None = None,
+    project: str | None = None,
+    datasets: list[str] | None = None,
     repo_root: str | Path = ".",
     budget: float | None = None,
     confirmed: bool = False,
@@ -41,9 +43,10 @@ def open_adapter(
     """Resolve the connection target and return an open, read-only adapter.
 
     Resolution order: explicit arguments win, then ``.dex/config.yml``. For
-    DuckDB the only input is a file path. ``budget``/``confirmed`` feed the
-    cost gate on billed connectors and are ignored by free ones; ``command``
-    labels ledger entries.
+    DuckDB the only input is a file path; for BigQuery ``project``/``datasets``
+    are convenience overrides of the config target (never written back).
+    ``budget``/``confirmed`` feed the cost gate on billed connectors and are
+    ignored by free ones; ``command`` labels ledger entries.
     """
 
     config = load_config(repo_root) or DexConfig()
@@ -59,7 +62,13 @@ def open_adapter(
 
     if connector == "bigquery":
         return _open_bigquery(
-            config, repo_root, budget=budget, confirmed=confirmed, command=command
+            config,
+            repo_root,
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            project_override=project,
+            dataset_override=datasets,
         )
 
     # The remaining cloud connectors are not yet implemented.
@@ -73,8 +82,19 @@ def _open_bigquery(
     budget: float | None,
     confirmed: bool,
     command: str | None,
+    project_override: str | None = None,
+    dataset_override: list[str] | None = None,
 ):
     target = config.bigquery or BigQueryTarget()
+    if project_override or dataset_override:
+        # A command-line override of the committed target, applied in memory
+        # only: a smoke test should not silently rewrite .dex/config.yml.
+        updates: dict = {}
+        if project_override:
+            updates["project"] = project_override
+        if dataset_override:
+            updates["datasets"] = dataset_override
+        target = target.model_copy(update=updates)
     credentials, adc_project, principal_type = _default_credentials()
     project = resolve_bigquery_project(
         target, os.environ, adc_project, repo_root=repo_root

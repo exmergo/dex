@@ -63,6 +63,62 @@ def test_plan_from_edits_file(dbt_project_dir: Path, tmp_path: Path, capsys):
     assert not (dbt_project_dir / "models/staging/stg_orders.yml").exists()
 
 
+def test_plan_packages_yml_at_project_root(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "packages.yml",
+                "kind": "packages_yml",
+                "content": "packages:\n  - package: dbt-labs/dbt_utils\n"
+                "    version: 1.1.1\n",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "add dbt_utils",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok"
+    assert envelope["data"]["paths"] == ["packages.yml"]
+    assert envelope["diffs"][0]["op"] == "create"
+    # Propose-don't-impose: still nothing written until apply.
+    assert not (dbt_project_dir / "packages.yml").exists()
+
+
+def test_plan_packages_yml_requires_a_packages_key(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _write_payload(
+        tmp_path,
+        [{"path": "packages.yml", "kind": "packages_yml", "content": "nope: true\n"}],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "bad packages",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    assert "packages" in envelope["errors"][0]
+
+
 def test_plan_reads_stdin(dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch):
     payload = json.dumps(
         {

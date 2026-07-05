@@ -35,6 +35,11 @@ PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
 MANIFEST_PATH = Path("target") / "manifest.json"
 
+# dbt project-root manifests dex may author outside the model paths. They declare
+# package dependencies (not model content), so the editing surface widens by
+# exactly these two known files, never to arbitrary root files.
+_ALLOWED_ROOT_FILES = frozenset({"packages.yml", "dependencies.yml"})
+
 
 class DbtProjectError(Exception):
     pass
@@ -346,6 +351,10 @@ def contained_path(root: Path, rel_path: str, model_paths: list[str]) -> Path:
         raise DbtProjectError(f"edit path must be project-relative: '{rel_path}'")
     resolved = (root / candidate).resolve()
     root_resolved = root.resolve()
+    # The dbt package manifests live at the project root, so they are allowed by
+    # name (still inside the project, still not an arbitrary escape).
+    if resolved.parent == root_resolved and resolved.name in _ALLOWED_ROOT_FILES:
+        return root / candidate
     for model_path in model_paths:
         base = (root_resolved / model_path).resolve()
         if resolved == base or base in resolved.parents:

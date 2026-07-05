@@ -300,6 +300,94 @@ def test_relative_profile_path_resolves_against_project(
     assert not (elsewhere / "dev-rel.duckdb").exists()
 
 
+def test_build_paths_are_absolute_from_a_relative_project_dir(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A relative project dir must not double against the cwd we pin. dbt resolves
+    --project-dir against the process cwd, and the runner pins that cwd to the
+    project; a relative --project-dir would resolve to project/project and fail."""
+
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    captured: dict = {}
+
+    def runner(argv: list[str]):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.chdir(tmp_path)
+    summary, _cost = build_module.build(
+        "analytics",  # relative to the pinned cwd (tmp_path)
+        target="dev",
+        confirmed=True,
+        runner=runner,
+    )
+    assert summary["success"] is True
+
+    argv = captured["argv"]
+    project_arg = Path(argv[argv.index("--project-dir") + 1])
+    profiles_arg = Path(argv[argv.index("--profiles-dir") + 1])
+    assert project_arg.is_absolute()
+    assert profiles_arg.is_absolute()
+    assert project_arg == dbt_project_dir.resolve()
+    # The doubling bug would have produced .../analytics/analytics.
+    assert project_arg.parent.name != "analytics"
+
+
+def test_shadow_parse_profiles_dir_is_absolute_from_a_relative_project(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The define-time parse gate had the same doubling on --profiles-dir: its cwd
+    is an absolute shadow tempdir, so a relative --profiles-dir pointing at the
+    real project would resolve against the shadow and fail."""
+
+    pytest.importorskip("dbt.cli.main")
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    captured: dict = {}
+
+    def runner(argv: list[str]):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.chdir(tmp_path)
+    result = build_module.shadow_parse("analytics", [], target="dev", runner=runner)
+    assert result["available"] is True
+
+    argv = captured["argv"]
+    assert Path(argv[argv.index("--project-dir") + 1]).is_absolute()
+    assert Path(argv[argv.index("--profiles-dir") + 1]).is_absolute()
+
+
+def test_relative_project_dir_builds_without_path_doubling(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """End-to-end proof of the blocking defect: a config-pinned relative
+    dbt_project_dir and a relative repo-root build green, no 'Path ... does not
+    exist' from a doubled --project-dir."""
+
+    pytest.importorskip("dbt.cli.main")
+    dex_dir = tmp_path / ".dex"
+    dex_dir.mkdir()
+    (dex_dir / "config.yml").write_text(
+        "dbt_project_dir: analytics\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    rc, envelope = _run(
+        ["--repo-root", ".", "transform", "build", "--target", "dev", "--confirm"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["success"] is True
+
+
 # --- billed connectors (BigQuery): the ceiling binds, spend is ledgered --------
 
 
@@ -403,3 +491,37 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     entry = json_mod.loads(ledger[-1])
     assert entry["command"] == "transform build"
     assert entry["billed_bytes"] == 3000
+
+
+def test_billed_build_failure_names_the_real_error_in_errors(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The failure-path envelope on the billed connector: the real dbt message
+    rides in errors, not buried in warnings (guards the sanitized-failure fix on
+    the bytes_scanned paradigm)."""
+
+    msg = "Database Error in model x: Access Denied on dataset dbt_dev"
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=1,
+        stdout=json.dumps({"info": {"level": "error", "msg": msg}}),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert envelope["errors"][0] == f"dbt build failed: {msg}"

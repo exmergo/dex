@@ -40,7 +40,7 @@ release is connector-neutral.
 
 | Subcommand | Returns |
 |---|---|
-| `connect test` | capabilities, dialect, `read_only: true` |
+| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, BigQuery takes `--project`/`--dataset` convenience overrides (never written to config) |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings |
 | `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
@@ -74,9 +74,11 @@ engine does not care which skill fronts a subcommand.
 
 Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "content"}, ...]}` with
-`kind` one of `model_sql`, `schema_yml`, `semantic_yml`. The engine validates,
-diffs, and stores the plan under `.dex/plans/`; nothing touches the dbt project
-until `transform apply`. See `references/command-contract.md`.
+`kind` one of `model_sql`, `schema_yml`, `semantic_yml`, or `packages_yml` (the
+guarded way to author the project-root `packages.yml`/`dependencies.yml`, so
+declaring a dbt package is a reviewable diff too). The engine validates, diffs,
+and stores the plan under `.dex/plans/`; nothing touches the dbt project until
+`transform apply`. See `references/command-contract.md`.
 
 ### The envelope
 

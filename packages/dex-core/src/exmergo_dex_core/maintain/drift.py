@@ -43,6 +43,14 @@ _VOLUME_HIGH_DROP = 0.50
 
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
+# A dimension-cardinality baseline is often an approximate (HyperLogLog) count:
+# explore escalates only near-unique columns to an exact COUNT(DISTINCT), so a
+# low-cardinality categorical dimension keeps its sketch estimate in the
+# snapshot. A delta within the sketch's error band is noise, not drift, and must
+# not fire a finding against an exact current count. Retroactively re-measuring
+# the historical baseline is impossible, so deltas inside this band are gated.
+_APPROX_CARDINALITY_TOLERANCE = 0.02
+
 
 class DriftFinding(BaseModel):
     """One detected drift.
@@ -707,6 +715,19 @@ def cardinality_drift(
             after = counts.get(check.column)
             if after is None or after == check.baseline_distinct:
                 continue
+            # An approximate baseline wobbling within its sketch error is noise:
+            # the current count is exact, but the historical one was not, so a
+            # small delta is indistinguishable from HLL variance and would be a
+            # phantom finding. A delta beyond the band still fires (its direction
+            # and rough size are real), keeping the ~ marker and exact: false.
+            if not check.baseline_exact:
+                # The band scales with the baseline (the sketch's error is
+                # relative), with no floor: at a handful of distinct values it is
+                # zero, so a genuine new category still fires; at thousands it is
+                # tens, absorbing HLL wobble.
+                band = round(_APPROX_CARDINALITY_TOLERANCE * check.baseline_distinct)
+                if abs(after - check.baseline_distinct) <= band:
+                    continue
             marker = "" if check.baseline_exact else "~"
             direction = "widened" if after > check.baseline_distinct else "narrowed"
             sm = models_by_name.get(check.semantic_model)
