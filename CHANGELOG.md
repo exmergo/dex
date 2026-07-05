@@ -9,6 +9,59 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-05
+
+Hardening pass from the first billed-connector dogfooding sessions (BigQuery):
+the full explore, transform, and maintain loop on a real warehouse.
+
+### Added
+
+- `packages_yml` edit kind: author the project-root `packages.yml` (or
+  `dependencies.yml`) through the normal `transform plan`/`apply` contract, so
+  declaring a dbt package dependency is a reviewable, hash-pinned diff like every
+  other edit instead of a hand-written file outside the guardrail. The edit must
+  carry a `packages:` or `dependencies:` list; writes stay confined to the dbt
+  project (arbitrary project-root files are still refused).
+- `connect test --project` and `--dataset` (repeatable) for BigQuery: convenience
+  overrides of the config target, applied in memory only (never written to
+  `.dex/config.yml`), so a first smoke test works before a `bigquery:` block
+  exists. They mirror DuckDB's `--path`.
+
+### Changed
+
+- `explore map` folds same-lineage duplicate relationships when a dev/replica
+  dataset is mapped alongside its source. A replica's models mirror source
+  entities and keys, which otherwise inflated one real foreign key into source,
+  replica, and cross-dataset lookalike edges; the canonical (source-schema) edge
+  is kept, the duplicates are dropped, and the summary notes how many objects
+  mirror source lineage. The replica schema is recognized from
+  `bigquery.dev_dataset` or structurally (a matching entity and column set in a
+  second schema).
+- The query firewall's PII refusal now points at an unflagged column that
+  plausibly carries the same readable value (for example `inventory_items.product_name`
+  when `products.name` is flagged), computed from the cache. The flag itself is
+  never weakened and no value is ever surfaced; only the guidance improves.
+
+### Fixed
+
+- dbt subprocess path doubling: with a relative `dbt_project_dir`, `--project-dir`
+  and `--profiles-dir` resolved a second time against the already-pinned cwd
+  (`project/project`), which broke `transform build` and the `semantic define`
+  parse gate on a clean project. The engine now passes absolute dbt CLI paths, so
+  a relative project dir no longer needs a hand-edit to an absolute path.
+- BigQuery cost estimates now fold in the per-query billing floor (10 MiB per
+  referenced table). The dry-run estimate summed raw scanned bytes and ignored
+  the floor, so on small data (and fan-out commands like `maintain check`) it read
+  far below what must be approved and produced a ladder of budget rejections. The
+  surfaced estimate now reflects what BigQuery will bill, so the budget the agent
+  proposes clears in one step.
+- `maintain` no longer reports phantom dimension-cardinality drift from an
+  approximate baseline. It compares an exact current count against the snapshot's
+  distinct count, which for a low-cardinality categorical dimension is a
+  HyperLogLog estimate; a delta within the sketch's error band is now suppressed
+  as noise (the band scales with cardinality, so a genuine new category at low
+  cardinality still fires, and an exact baseline still fires on any change).
+
 ## [0.1.2] - 2026-07-04
 
 ### Added
