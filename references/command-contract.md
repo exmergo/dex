@@ -77,11 +77,16 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
-`semantic define|update`, which imply `semantic_yml`). The engine validates each
-edit (model SQL must be a single read-only SELECT once jinja is stripped; YAML
-must parse; semantic YAML must satisfy MetricFlow's schemas), pins it to the
-sha256 of the file it would change, computes the diffs, and stores the plan under
-`.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
+`semantic define|update`, which imply `semantic_yml`), or `packages_yml`. The
+engine validates each edit (model SQL must be a single read-only SELECT once
+jinja is stripped; YAML must parse; semantic YAML must satisfy MetricFlow's
+schemas; a `packages_yml` edit must carry a `packages:` or `dependencies:` list
+and targets the project-root `packages.yml` or `dependencies.yml`), pins it to
+the sha256 of the file it would change, computes the diffs, and stores the plan
+under `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an
+apply. `packages_yml` is the guarded way to declare dbt package dependencies: a
+reviewable diff like any other edit, then `transform deps` (or the automatic
+deps step in `transform build`) installs them.
 
 - `transform init "<name>" --connector <duckdb|snowflake|bigquery|databricks|postgres>`
   bootstraps a dbt project when none exists: `dbt_project.yml`, `models/staging/`
@@ -159,7 +164,9 @@ re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
-`--repo-root`, `--confirm`, `--budget`.
+`--project` and `--dataset` (BigQuery convenience overrides of the config
+target, repeatable `--dataset`; never written back to config, so `connect test`
+works before a `bigquery:` block exists), `--repo-root`, `--confirm`, `--budget`.
 
 ## The query firewall
 
