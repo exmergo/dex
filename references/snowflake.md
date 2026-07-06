@@ -25,6 +25,12 @@ credentials all work; only the coarse method (for example
 `named_connection:key_pair`) is ever surfaced. Identities, passwords, and key
 material never cross the envelope. Every discovery failure names the fix.
 
+One caveat: workload identity covers the engine (explore, maintain, query)
+but not dbt builds, because stable dbt-snowflake does not support it yet.
+`transform init` refuses a workload-identity connection and names the
+alternatives (key-pair or SSO); the refusal lifts once dbt-snowflake ships
+support.
+
 ## Config
 
 ```yaml

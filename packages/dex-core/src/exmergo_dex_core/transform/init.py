@@ -330,6 +330,20 @@ def _snowflake_profile(
         output["private_key_path"] = str(private_key)
     elif authenticator == "EXTERNALBROWSER":
         output["authenticator"] = "externalbrowser"
+    elif authenticator == "WORKLOAD_IDENTITY" or (
+        params.get("token") and not params.get("password")
+    ):
+        # Stable dbt-snowflake cannot authenticate via workload identity or a
+        # raw OIDC token (support is upstream but unreleased), so a rendered
+        # profile would fail every build with an opaque auth error. Refuse
+        # with the working alternatives instead.
+        raise InitError(
+            "the discovered Snowflake connection authenticates via workload "
+            "identity, which dbt-snowflake does not support yet; for dbt "
+            "builds use a key-pair or SSO connection (snow connection add "
+            "with --private-key-file or --authenticator externalbrowser) and "
+            "pin it via snowflake.connection_name in .dex/config.yml"
+        )
     else:
         # Never persist a password or token: the profile reads it from the
         # environment at dbt runtime instead (a Jinja reference, not a value).

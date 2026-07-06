@@ -107,6 +107,19 @@ the full explore, transform, and maintain loop on a real warehouse.
   as noise (the band scales with cardinality, so a genuine new category at low
   cardinality still fires, and an exact baseline still fires on any change).
 
+- `transform init --connector snowflake` on a workload-identity connection
+  now refuses with the working alternatives named (key-pair or SSO via
+  `snowflake.connection_name`) instead of rendering a profile that references
+  a `SNOWFLAKE_PASSWORD` that cannot exist. Stable dbt-snowflake does not
+  support workload identity yet; the engine paths (explore, maintain, query)
+  are unaffected. Surfaced by the first scheduled Snowflake integration run,
+  where the whole suite authenticates keylessly.
+- The live `connect test` assertion that no identity crosses the envelope now
+  checks identity-shaped keys and credential values instead of a raw username
+  substring, which false-positived when the CI username (`DEX_CI`) was a
+  substring of the scratch database and warehouse names the envelope
+  legitimately reports.
+
 ## [0.1.2] - 2026-07-04
 
 ### Added
