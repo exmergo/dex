@@ -9,6 +9,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-06
+
+Release to the public
+
 ## [0.1.4] - 2026-07-06
 
 ### Added
@@ -495,8 +499,3 @@ the rest of the loop is scaffolded and reports `not_implemented` until it lands.
 - The Transform, Model, and Reconcile stages of the loop.
 - The cloud and operational connectors (BigQuery, Snowflake, Databricks,
   PostgreSQL) and their cost paradigms.
-
-[Unreleased]: https://github.com/exmergo/dex/compare/v0.1.0a3...HEAD
-[0.1.0a3]: https://github.com/exmergo/dex/compare/v0.1.0a2...v0.1.0a3
-[0.1.0a2]: https://github.com/exmergo/dex/compare/v0.1.0a1...v0.1.0a2
-[0.1.0a1]: https://github.com/exmergo/dex/releases/tag/v0.1.0a1
