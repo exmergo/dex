@@ -9,6 +9,19 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-06
+
+### Fixed
+
+- The `description` field in each skill's `SKILL.md` frontmatter
+  (`explore`, `transform`, `maintain`) was an unquoted YAML plain scalar that
+  itself contained a `: ` partway through the text (for example "DuckDB
+  file: inventory..."), which a strict YAML parser reads as an ambiguous
+  nested mapping and rejects. `npx skills install` uses such a parser, so it
+  silently found zero valid skills and reported "No skills found" even though
+  the repo installed and `/plugin install` worked. Quoted the field so the
+  embedded colons are plain text.
+
 ## [1.0.0] - 2026-07-06
 
 Release to the public
