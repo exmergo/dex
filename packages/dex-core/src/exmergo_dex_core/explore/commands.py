@@ -288,7 +288,11 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     # into source, replica, and cross-dataset lookalike edges.
     dev_schemas = frozenset(
         name
-        for name in [config.bigquery.dev_dataset if config.bigquery else None]
+        for name in [
+            config.bigquery.dev_dataset if config.bigquery else None,
+            config.snowflake.dev_schema if config.snowflake else None,
+            config.postgres.dev_schema if config.postgres else None,
+        ]
         if name
     )
     inferred, folded_edges, mirrored_objects = rel_mod.fold_replica_relationships(

@@ -113,9 +113,9 @@ def _fake_runner_factory(
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
     calls: list[dict] = []
 
-    def fake(timeout: float, cwd):
+    def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
-            calls.append({"argv": argv, "cwd": cwd})
+            calls.append({"argv": argv, "cwd": cwd, "env": env})
             return subprocess.CompletedProcess(
                 args=argv, returncode=returncode, stdout=stdout, stderr=stderr
             )
@@ -525,3 +525,25 @@ def test_billed_build_failure_names_the_real_error_in_errors(
     assert rc == 1
     assert envelope["status"] == "error"
     assert envelope["errors"][0] == f"dbt build failed: {msg}"
+
+
+def test_build_env_caps_postgres_statements_via_pgoptions(monkeypatch):
+    """On db-load gating the ceiling becomes a server-side statement_timeout
+    injected through PGOPTIONS (the maximum_bytes_billed analogue: dbt has no
+    dry-run, so the per-statement cap is the binding cost control)."""
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.build import _build_env
+
+    monkeypatch.delenv("PGOPTIONS", raising=False)
+    env = _build_env(Paradigm.DB_LOAD, 120.0)
+    assert env is not None
+    assert env["PGOPTIONS"] == "-c statement_timeout=120s"
+
+    monkeypatch.setenv("PGOPTIONS", "-c search_path=app")
+    env = _build_env(Paradigm.DB_LOAD, 120.0)
+    assert env["PGOPTIONS"] == "-c search_path=app -c statement_timeout=120s"
+
+    assert _build_env(Paradigm.DB_LOAD, None) is None
+    assert _build_env(Paradigm.FREE_LOCAL, 120.0) is None
+    assert _build_env(Paradigm.BYTES_SCANNED, 120.0) is None

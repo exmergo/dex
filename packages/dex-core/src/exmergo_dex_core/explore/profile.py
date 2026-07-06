@@ -188,6 +188,12 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
             a.name: a
             for a in adapter.column_aggregates(identifier, columns, safe_min_max=safe)
         }
+        # Re-read the metadata after the aggregate scan: adapters whose
+        # inventory row counts are planner estimates (Postgres reltuples)
+        # upgrade to the exact COUNT(*) the scan just paid for, so uniqueness
+        # proofs and the dataset row count are exact. Free everywhere (cached
+        # or trivially cheap on the other adapters).
+        meta, _ = adapter.table_metadata(identifier)
         aggregates = _escalate_near_unique(
             adapter, identifier, meta.row_count, aggregates
         )

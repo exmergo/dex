@@ -295,3 +295,64 @@ def test_adapter_without_exact_counts_degrades_gracefully():
     assert col.distinct_count_exact is False
     # In the noise band and unproven: no non-uniqueness verdict.
     assert not any("not unique" in n for n in datasets[0].data_quality)
+
+
+def test_row_count_refreshes_after_the_aggregate_scan():
+    """Adapters whose free row counts are planner estimates (Postgres
+    reltuples) upgrade to the exact COUNT(*) the aggregate scan paid for; the
+    profile engine must re-read the metadata so uniqueness proofs and the
+    dataset row count compare against real rows, not the estimate."""
+
+    from exmergo_dex_core.adapters.base import (
+        ColumnAggregate,
+        ColumnMeta,
+        ObjectMeta,
+    )
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class EstimatingAdapter:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.scanned = False
+
+        def table_metadata(self, identifier):
+            rows = 1000 if self.scanned else 1200  # estimate is stale-high
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=rows,
+                byte_size=None,
+                column_count=1,
+            )
+            return meta, [
+                ColumnMeta(name="id", data_type="INTEGER", nullable=False, ordinal=0)
+            ]
+
+        def column_aggregates(self, identifier, columns, *, safe_min_max=None):
+            self.scanned = True
+            return [
+                ColumnAggregate(
+                    name="id",
+                    null_fraction=0.0,
+                    distinct_count=990,  # near-unique against the REAL count
+                    is_unique=None,
+                    min_value=None,
+                    max_value=None,
+                )
+            ]
+
+        def exact_distinct_counts(self, identifier, columns):
+            return dict.fromkeys(columns, 1000)
+
+    datasets = profile_mod.profile(EstimatingAdapter(), ["db.s.t"])
+    assert datasets[0].row_count == 1000  # the exact count, not the estimate
+    id_col = datasets[0].columns[0]
+    # 990 approx over 1000 real rows is in the escalation band; the exact scan
+    # returns 1000 == 1000, a proof that would be missed against 1200.
+    assert id_col.distinct_count == 1000
+    assert id_col.distinct_count_exact is True
+    assert id_col.is_unique is True

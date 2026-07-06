@@ -106,6 +106,31 @@ mints the token itself and hands it to the connector through the ordinary
 `DEX_TEST_SNOWFLAKE_USER` are environment variables, not secrets, for the
 same debuggability reason as the BigQuery job.
 
+## Live PostgreSQL integration tests
+
+The same `tests/integration/` directory carries the Postgres suite:
+connection discovery, the database-seconds handshake, the over-ceiling
+refusal, PII flag-not-surface, relationship inference on a deliberately
+undeclared foreign key, a firewalled query, and a dbt build into the
+dedicated dev schema. Unlike the cloud suites it bills nothing and needs no
+cloud account: the target is a local Docker container seeded from
+`scripts/postgres_seed.sql`, with a read-only `dex_ro` role for the engine
+and a `dbt_dev` role that can write only the dev schema.
+
+Stand the container up and run the suite locally:
+
+```
+scripts/setup_postgres_dev.sh
+DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:5433/dex_dogfood \
+    DEX_TEST_PG_DEV_PASSWORD=dbt_dev uv run pytest tests/integration -q -m postgres
+```
+
+In CI the same suite runs from `.github/workflows/integration.yml` against a
+`postgres:16` service container seeded from the same SQL: free, keyless, and
+fork-runnable, kept in the integration workflow for pattern parity with the
+cloud connectors rather than as a cost decision. There is no
+`setup_postgres_ci.sh`; there is nothing to provision.
+
 ## Agent evals (`evals/`)
 
 The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from

@@ -57,27 +57,33 @@ measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
 (MIN, ANY_VALUE, STRING_AGG). Never fall back to raw Python or a database CLI to
 run SQL; the firewall path is the only sanctioned one.
 
-## Cloud targets (BigQuery)
+## Cloud and database targets (BigQuery, Snowflake, Postgres)
 
-A cloud warehouse replaces `--path` with connector config. Start with
-`connect test --connector bigquery` (or set `connector: bigquery` plus a
-`bigquery:` block with `project` and a `datasets` allowlist in
-`.dex/config.yml`). Credentials are discovered, never asked for: if the
-envelope reports missing or expired credentials, tell the user to run
-`gcloud auth application-default login` and never ask them to paste a key or
-token.
+A remote warehouse or database replaces `--path` with connector config. Start
+with `connect test --connector <name>` (or set `connector:` plus the matching
+block in `.dex/config.yml`: `bigquery:` with `project` and a `datasets`
+allowlist, `snowflake:` with the pinned `warehouse` and a `databases`
+allowlist, `postgres:` with a `schemas` allowlist). Credentials are
+discovered, never asked for: if the envelope reports missing or expired
+credentials, relay the fix it names (for BigQuery
+`gcloud auth application-default login`; for Snowflake a `connections.toml`
+entry or `SNOWFLAKE_*` env; for Postgres `DATABASE_URL`, `PG*` env, or a
+`pg_service.conf` entry) and never ask the user to paste a key, token, or
+password.
 
-On a billed connector, scanning commands (`profile`, `map`, `relationships`,
+On a metered connector, scanning commands (`profile`, `map`, `relationships`,
 `query`) run a two-step handshake. The first call returns
-`needs_confirmation` with a dry-run byte estimate in `cost.estimate` (and a
-per-table breakdown where relevant). Surface the estimate to the user in
-human units (for example "about 6 MB, well under a cent"), get an explicit
-budget from them, and re-issue the same command with `--confirm` and
-`--budget <bytes>`. Never invent a budget the user did not agree to, and never
-retry
-with a raised budget on an over-ceiling refusal without asking. Metadata is
-free (`connect test`, `inventory` run immediately), and OK envelopes report
-actual spend under `data.spend`.
+`needs_confirmation` with an estimate in `cost.estimate` (and a per-table
+breakdown where relevant): an exact dry-run byte figure on BigQuery, a
+heuristic labeled `estimate_quality: "heuristic"` in warehouse-seconds on
+Snowflake (credits alongside) and database-seconds on Postgres (no dollars;
+the guarded quantity is load on the operational database). Surface the
+estimate to the user in human units, get an explicit budget from them, and
+re-issue the same command with `--confirm` and `--budget <magnitude>` in the
+paradigm's unit. Never invent a budget the user did not agree to, and never
+retry with a raised budget on an over-ceiling refusal without asking.
+Metadata is free (`connect test`, `inventory` run immediately), and OK
+envelopes report actual spend under `data.spend`.
 
 ## Guardrails (enforced in the engine, not here)
 

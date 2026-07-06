@@ -446,7 +446,7 @@ def test_get_adapter_wires_bigquery(fake_bq_client):
 
 
 def test_remaining_cloud_connectors_still_stub():
-    for connector in ("databricks", "postgres"):
+    for connector in ("databricks",):
         with pytest.raises(NotImplementedError):
             get_adapter(connector)
 

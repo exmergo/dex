@@ -14,8 +14,9 @@ warehouse shop would produce a project that parses and builds locally yet is
 wrong. The caller must resolve the connector explicitly before calling in.
 
 Per-connector profile rendering sits behind a small dispatch so cloud renderers
-can slot in alongside their dbt adapters without touching the command; DuckDB
-and BigQuery render today, and the others raise an actionable error.
+can slot in alongside their dbt adapters without touching the command; DuckDB,
+BigQuery, Snowflake, and Postgres render today, and the others raise an
+actionable error.
 """
 
 from __future__ import annotations
@@ -99,8 +100,9 @@ def init_project(
     if render_profile is None:
         raise InitError(
             f"connector '{connector}' is not yet supported for init; DuckDB, "
-            "BigQuery, and Snowflake are the supported paths today "
-            "(`transform init <name> --connector duckdb|bigquery|snowflake`)"
+            "BigQuery, Snowflake, and Postgres are the supported paths today "
+            "(`transform init <name> --connector "
+            "duckdb|bigquery|snowflake|postgres`)"
         )
 
     project_name = sanitize_project_name(name)
@@ -354,10 +356,126 @@ def _snowflake_profile(
     )
 
 
+_DEFAULT_PG_DEV_SCHEMA = "dbt_dev"
+
+
+def _postgres_profile(
+    project_name: str, path: str | None, config: DexConfig, root: Path
+) -> str:
+    """A single dbt-postgres ``dev`` target from the discovered connection,
+    with no secret ever rendered: the password is an ``env_var`` reference
+    (``PGPASSWORD``, empty default so ``~/.pgpass`` and peer auth still apply
+    at dbt runtime). Writes go to a dedicated dev schema, never to a source
+    schema dex reads from."""
+
+    from ..config import PostgresTarget
+    from ..connect import CredentialDiscoveryError, resolve_postgres_connection
+
+    target = config.postgres or PostgresTarget()
+    try:
+        _params, method = resolve_postgres_connection(target, os.environ, root)
+    except CredentialDiscoveryError as exc:
+        raise InitError(str(exc)) from exc
+
+    fields = _pg_connection_fields(target, method)
+    host = fields.get("host")
+    dbname = fields.get("dbname")
+    user = fields.get("user")
+    if not host or not dbname or not user:
+        missing = ", ".join(
+            name
+            for name, value in (("host", host), ("dbname", dbname), ("user", user))
+            if not value
+        )
+        raise InitError(
+            f"the discovered Postgres connection does not name {missing}, "
+            "which dbt-postgres requires; export DATABASE_URL with them (or "
+            "PGHOST/PGDATABASE/PGUSER), or complete the pg_service.conf entry"
+        )
+
+    dev_schema = target.dev_schema or _DEFAULT_PG_DEV_SCHEMA
+    if dev_schema in set(target.schemas):
+        raise InitError(
+            f"dev_schema '{dev_schema}' is also a source schema in "
+            "postgres.schemas; dbt builds must write where dex does not read "
+            "(set postgres.dev_schema to a dedicated schema)"
+        )
+
+    target.dev_schema = dev_schema
+    config.postgres = target
+
+    output: dict[str, Any] = {
+        "type": "postgres",
+        "host": str(host),
+        "port": int(fields.get("port") or 5432),
+        "user": str(user),
+        # Never persist a password: the profile reads it from the environment
+        # at dbt runtime (a Jinja reference, not a value); the empty default
+        # keeps ~/.pgpass and peer auth working when no variable is set.
+        "password": "{{ env_var('PGPASSWORD', '') }}",
+        "dbname": str(dbname),
+        "schema": dev_schema,
+        # One thread keeps the operational database from parallel bursts; the
+        # per-statement load is the guarded quantity on db-load gating.
+        "threads": 1,
+        "connect_timeout": 10,
+    }
+    if fields.get("sslmode"):
+        output["sslmode"] = str(fields["sslmode"])
+    return yaml.safe_dump(
+        {project_name: {"target": "dev", "outputs": {"dev": output}}},
+        sort_keys=False,
+    )
+
+
+def _pg_connection_fields(target: Any, method: str) -> dict:
+    """The non-secret connection fields of the source that won discovery, for
+    rendering into the profile. Values stay inside the engine except the ones
+    deliberately rendered (host/port/user/dbname/sslmode)."""
+
+    from ..connect import _pg_service_params, _pg_url_params
+
+    env = os.environ
+    source = method.split(":", 1)[0]
+    if source == "config_service" and target.service:
+        return _pg_service_params(target.service, env) or {}
+    if source == "database_url":
+        return _pg_url_params(env.get("DATABASE_URL", ""))
+    if source == "environment":
+        if env.get("PGSERVICE"):
+            return _pg_service_params(env["PGSERVICE"], env) or {}
+        return {
+            key: env[var]
+            for var, key in (
+                ("PGHOST", "host"),
+                ("PGPORT", "port"),
+                ("PGDATABASE", "dbname"),
+                ("PGUSER", "user"),
+                ("PGSSLMODE", "sslmode"),
+            )
+            if env.get(var)
+        }
+    if source == "config_target":
+        return {
+            key: value
+            for key, value in (
+                ("host", target.host),
+                ("port", target.port),
+                ("dbname", target.dbname),
+                ("user", target.user),
+            )
+            if value is not None
+        }
+    from ..connect import _postgres_from_dbt_profiles
+
+    return _postgres_from_dbt_profiles(".") or {}
+
+
 _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]] = {
     "duckdb": _duckdb_profile,
     "bigquery": _bigquery_profile,
     "snowflake": _snowflake_profile,
+    "postgres": _postgres_profile,
 }
 
 

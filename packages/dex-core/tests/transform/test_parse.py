@@ -124,7 +124,7 @@ def test_parse_failure_blocks_the_plan_and_stores_nothing(
         }
     )
 
-    def fake(timeout: float, cwd):
+    def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
             return subprocess.CompletedProcess(
                 args=argv, returncode=1, stdout=line, stderr=""
@@ -149,7 +149,7 @@ def test_shadow_parse_never_touches_the_real_project(
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
     calls: list[dict] = []
 
-    def fake(timeout: float, cwd):
+    def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
             calls.append({"argv": argv, "cwd": Path(cwd)})
             return subprocess.CompletedProcess(

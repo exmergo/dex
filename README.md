@@ -58,34 +58,37 @@ time. `dex` owns exactly that loop.
 
 - Cloud warehouse: **Snowflake**, **BigQuery**.
 - Embedded analytical: **DuckDB**.
+- Operational database: **Postgres**.
 
-Cloud credentials are discovered, never asked for: BigQuery through
-Application Default Credentials (`gcloud auth application-default login`),
-Snowflake through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile.
-Every scan is estimated and confirmed before it spends, capped server-side
-(`maximum_bytes_billed` on BigQuery; a per-statement statement timeout on
-Snowflake, where budgets are warehouse-seconds with credits shown alongside),
-and recorded in a local spend ledger.
+Credentials are discovered, never asked for: BigQuery through Application
+Default Credentials (`gcloud auth application-default login`), Snowflake
+through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Postgres
+through `pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt
+profile. Every scan is estimated and confirmed before it spends, capped
+server-side (`maximum_bytes_billed` on BigQuery; a per-statement statement
+timeout on Snowflake and Postgres, whose budgets are warehouse-seconds with
+credits alongside and database-seconds respectively), and recorded in a local
+spend ledger.
 
 ### Upcoming Connectors
 
 - Cloud warehouse: **Databricks**, **AWS Redshift**
-- Operational database: **PostgreSQL**
 
 ## The `exmergo-dex-core` package
 
 `dex` also bundles the `exmergo-dex-core` Python package.  
-This is the reusable and agent friendly package through which `dex` runs
-its commands.
+This is the reusable and agent-friendly package that contains all the core
+explore, transform, and maintain logic. This also holds connectors and the
+write logic for .dex/ which stores cache, snapshots, and query billing logs. 
 
-You can install it yourself in your projects
+You can install it yourself in your projects:
 
-1. pip
 ```
 pip install exmergo-dex-core
 ```
 
-2. uv
+or
+
 ```
 uv add exmergo-dex-core
 ```
@@ -94,7 +97,6 @@ More info in the package's [`README.md`](packages/dex-core/README.md)
 
 ## Agent References
 
-- Engine: `packages/dex-core/` (PyPI: `exmergo-dex-core`, Apache-2.0).
 - Cross-agent contract: [`AGENTS.md`](AGENTS.md).
 - References (connectors, the contract, the canonical model, evaluation):
   [`references/`](references/).

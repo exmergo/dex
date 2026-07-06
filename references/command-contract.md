@@ -101,10 +101,10 @@ deps step in `transform build`) installs them.
   names which source was used), and bare init is an error listing the valid
   connectors. On success init writes `connector`, `dbt_project_dir`, and
   `dbt_target: dev` back to `.dex/config.yml`, so the choice is made once and is
-  ambient for every later command. DuckDB and BigQuery are the supported
-  connectors today; the remaining cloud connectors are accepted by the contract
-  but return an actionable not-yet-supported error until their dbt adapters
-  ship.
+  ambient for every later command. DuckDB, BigQuery, Snowflake, and Postgres
+  are the supported connectors today; Databricks is accepted by the contract
+  but returns an actionable not-yet-supported error until its dbt adapter
+  ships.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.

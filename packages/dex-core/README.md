@@ -84,6 +84,21 @@ warehouse the config pins. dbt builds go to a dedicated dev database.schema
 via dbt-snowflake, which the `[snowflake]` extra carries. See
 [`references/snowflake.md`](../../references/snowflake.md).
 
+PostgreSQL: the operational-database connector. Connects through discovered
+credentials (`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a
+dbt profile; dex never asks for or persists a password). Nothing is billed in
+dollars; the guarded quantity is load on what is often a production primary,
+so budgets are **database-seconds** through the same confirm handshake. Query
+estimates come from the genuinely free planner preflight (`EXPLAIN`), profile
+estimates from relation sizes, both labeled heuristic; the budget is
+hard-enforced anyway by a per-statement server-side `statement_timeout`, and
+actual seconds land in the same ledger. The session is read-only at the
+server (`default_transaction_read_only = on`), profiling leans on the
+planner's own statistics instead of scanning distincts, and dbt builds go to
+a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
+carries, with the ceiling injected as a statement timeout through
+`PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
+
 Maintain detects drift against the `.dex/` snapshot on four axes and proposes
 the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
 and semantic (definitions, dangling references, and dimension cardinality).
@@ -94,8 +109,8 @@ connectors the metadata axes (schema, volume, references) stay free while the
 scanning axes (grain, dimension cardinality) take the `--confirm --budget`
 handshake, so `check` is two-phase.
 
-The remaining cloud connectors (Databricks, PostgreSQL) and the Viz preview
-report `not_implemented` until they land.
+The remaining cloud connector (Databricks) and the Viz preview report
+`not_implemented` until they land.
 
 ## License
 

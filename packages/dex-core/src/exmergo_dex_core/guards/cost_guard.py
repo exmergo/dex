@@ -203,7 +203,7 @@ class CostGate:
 
         return (
             "billed_seconds"
-            if self.paradigm is Paradigm.COMPUTE_TIME
+            if self.paradigm in (Paradigm.COMPUTE_TIME, Paradigm.DB_LOAD)
             else "billed_bytes"
         )
 
@@ -254,7 +254,7 @@ class CostGate:
 
         key = (
             "seconds_billed"
-            if self.paradigm is Paradigm.COMPUTE_TIME
+            if self.paradigm in (Paradigm.COMPUTE_TIME, Paradigm.DB_LOAD)
             else "bytes_billed"
         )
         return {

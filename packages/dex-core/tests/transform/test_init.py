@@ -155,7 +155,7 @@ def test_init_refuses_when_a_project_exists_in_a_child_dir(
     assert not (tmp_path / "fresh").exists()
 
 
-@pytest.mark.parametrize("connector", ["databricks", "postgres"])
+@pytest.mark.parametrize("connector", ["databricks"])
 def test_cloud_connectors_error_actionably(tmp_path: Path, capsys, connector: str):
     rc, envelope = _run(_init_argv(tmp_path, "--connector", connector), capsys)
     assert rc == 1
@@ -276,6 +276,79 @@ def test_init_snowflake_never_persists_a_password(tmp_path: Path, capsys, monkey
     rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
     assert "hunter2" not in rendered
     assert "env_var" in rendered and "SNOWFLAKE_PASSWORD" in rendered
+
+
+def _seed_postgres_config(repo: Path, **target) -> None:
+    (repo / ".dex").mkdir(parents=True, exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        yaml.safe_dump({"postgres": target}), encoding="utf-8"
+    )
+
+
+def test_init_postgres_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch):
+    # Postgres discovery is environment-based and pure, so the real chain runs
+    # under test: no patching, just a DATABASE_URL.
+    pytest.importorskip("psycopg")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://dbt:hunter2-never-rendered@db.example.com:5439/shop",
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "postgres"), capsys)
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "postgres"
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    profile = yaml.safe_load(rendered)
+    output = profile["analytics"]["outputs"]["dev"]
+    assert output["type"] == "postgres"
+    assert output["host"] == "db.example.com"
+    assert output["port"] == 5439
+    assert output["user"] == "dbt"
+    assert output["dbname"] == "shop"
+    assert output["schema"] == "dbt_dev"
+    assert output["threads"] == 1
+    # Never a password value: an env_var reference with an empty default so
+    # ~/.pgpass and peer auth still work at dbt runtime.
+    assert "hunter2" not in rendered
+    assert "env_var" in output["password"] and "PGPASSWORD" in output["password"]
+    # The dev schema choice is persisted for cmd_map's replica folding.
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["postgres"]["dev_schema"] == "dbt_dev"
+
+
+def test_init_postgres_refuses_dev_schema_source_collision(
+    tmp_path: Path, capsys, monkeypatch
+):
+    pytest.importorskip("psycopg")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://dbt:x@db.example.com/shop")
+    _seed_postgres_config(tmp_path, schemas=["app", "dbt_dev"], dev_schema="dbt_dev")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "postgres"), capsys)
+    assert rc == 1
+    assert "source schema" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
+def test_init_postgres_refuses_incomplete_connection(
+    tmp_path: Path, capsys, monkeypatch
+):
+    pytest.importorskip("psycopg")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://db.example.com/")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "postgres"), capsys)
+    assert rc == 1
+    message = envelope["errors"][0]
+    assert "dbt-postgres requires" in message
+    assert not (tmp_path / "analytics").exists()
+
+
+def test_init_postgres_without_a_connection_names_the_fixes(
+    tmp_path: Path, capsys, monkeypatch
+):
+    for var in ("DATABASE_URL", "PGHOST", "PGDATABASE", "PGSERVICE", "PGSERVICEFILE"):
+        monkeypatch.delenv(var, raising=False)
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "postgres"), capsys)
+    assert rc == 1
+    assert "DATABASE_URL" in envelope["errors"][0]
 
 
 def _seed_bigquery_config(repo: Path, **target) -> None:

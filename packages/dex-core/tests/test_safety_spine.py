@@ -852,6 +852,13 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
             "billed_seconds": 42.0,
         }
     )
+    store.append_spend_log(
+        {
+            "at": "2026-07-05T00:00:03+00:00",
+            "connector": "postgres",
+            "billed_seconds": 7.0,
+        }
+    )
     assert store.spend_since("2026-07-05T00:00:00+00:00", connector="bigquery") == 5000
     assert (
         store.spend_since(
@@ -859,6 +866,231 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
         )
         == 42.0
     )
+    assert (
+        store.spend_since(
+            "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="postgres"
+        )
+        == 7.0
+    )
+
+
+# --- Postgres: the db-load connector exercises every family ---------------------
+#
+# These run against the fake connection (tests/fakes/postgres.py):
+# deterministic, offline, free. They importorskip on the [postgres] extra,
+# which CI and the release gate install, so trimming that extra from a
+# workflow would silently skip release-blocking families; keep
+# `--extra postgres` in ci.yml and release.yml.
+
+
+def _pg_adapter(fake_pg_connection, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.postgres import PostgresAdapter
+    from exmergo_dex_core.config import PostgresTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.DB_LOAD,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="postgres",
+    )
+    return PostgresAdapter(
+        connection=fake_pg_connection,
+        cost_gate=gate,
+        target=PostgresTarget(),
+        auth_method="database_url:password",
+        clock=fake_pg_connection.clock,
+    )
+
+
+def test_postgres_generated_sql_is_select_only(fake_pg_connection):
+    # Family 1: every data statement the adapter generates passes the
+    # SELECT-only guard in the postgres dialect (asserted at build time).
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _pg_adapter(fake_pg_connection)
+    _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    sql, _plan = adapter._build_aggregate_sql("dexdb.shop.customers", columns, {"id"})
+    assert sql.lstrip().upper().startswith("SELECT")
+    assert assert_select_only(sql, dialect="postgres") == sql
+
+
+def test_postgres_session_is_read_only_by_construction(fake_pg_connection):
+    # Family 1: default_transaction_read_only is set before any statement, so
+    # even a statement that slipped every guard would be refused server-side.
+    adapter = _pg_adapter(fake_pg_connection)
+    adapter.capabilities()
+    first = fake_pg_connection.statements[0].sql.lower()
+    assert "set default_transaction_read_only = on" in first
+
+
+def test_select_only_guard_rejects_postgres_writes_ddl_and_copy():
+    # Family 1: Postgres DML/DDL, COPY, and multi-statement forms are all
+    # refused when parsed in the postgres dialect.
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
+
+    for bad in (
+        "CREATE TABLE t AS SELECT 1",
+        "TRUNCATE TABLE app.t",
+        "SELECT 1; SELECT 2",
+        "DELETE FROM app.t WHERE TRUE",
+        "UPDATE app.t SET x = 1",
+        "COPY app.t TO '/tmp/exfil.csv'",
+        "ALTER TABLE app.t ADD COLUMN y text",
+        "DROP TABLE app.t",
+    ):
+        with pytest.raises(NotSelectOnlyError):
+            assert_select_only(bad, dialect="postgres")
+
+
+def test_postgres_unconfirmed_scan_never_executes(fake_pg_connection):
+    # Family 2: the strict handshake. Without --confirm nothing scans (the
+    # estimate comes from the free planner, so there is nothing to load).
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _pg_adapter(fake_pg_connection, confirmed=False)
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "dexdb"."shop"."customers"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_pg_connection.data_statements == []
+
+
+def test_postgres_confirmed_run_without_a_ceiling_is_refused(fake_pg_connection):
+    # Family 2: nothing executes unbudgeted; confirmation cannot stand in for
+    # a ceiling on a metered paradigm.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _pg_adapter(fake_pg_connection, ceiling=None, confirmed=True)
+    with pytest.raises(CostGuardError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "dexdb"."shop"."customers"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_pg_connection.data_statements == []
+
+
+def test_postgres_over_ceiling_cannot_be_confirmed_through(fake_pg_connection):
+    # Family 2: over-ceiling blocks first, even fully confirmed.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _pg_adapter(fake_pg_connection, ceiling=2.0, confirmed=True)
+    with pytest.raises(OverCeilingError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "dexdb"."shop"."events"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_pg_connection.data_statements == []
+
+
+def test_postgres_every_executed_statement_is_server_capped(fake_pg_connection):
+    # Family 2: defense in depth past the client-side gate; a wrong heuristic
+    # cannot overrun the budget because statement_timeout kills the statement.
+    fake_pg_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _pg_adapter(fake_pg_connection)
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "dexdb"."shop"."customers"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    executed = fake_pg_connection.data_statements
+    assert executed
+    assert all(s.session_timeout_ms is not None for s in executed)
+
+
+def test_query_firewall_blocks_postgres_value_carrying_shapes():
+    # Family 3: PII stays flagged-not-surfaced under the postgres dialect,
+    # including Postgres's own value-carrying aggregates and casts.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "SELECT STRING_AGG(email, ',') FROM db.main.customers",
+        "SELECT ARRAY_AGG(email) FROM db.main.customers",
+        "SELECT JSONB_AGG(email) FROM db.main.customers",
+        "SELECT TO_JSON(email) FROM db.main.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits(), dialect="postgres")
+    # Measuring stays allowed in the postgres dialect too.
+    inspect_query(
+        "SELECT COUNT(DISTINCT email) FROM db.main.customers",
+        cache,
+        QueryLimits(),
+        dialect="postgres",
+    )
+
+
+def test_postgres_stats_reads_never_select_value_columns(fake_pg_connection):
+    # Family 3: pg_stats is the planner's own statistics view and its
+    # most_common_vals / histogram_bounds columns hold raw row values; the
+    # adapter's stats reads must never touch them.
+    fake_pg_connection.row_resolver = lambda sql: [
+        {"n_total": 100, "nn_0": 100, "nn_1": 90, "nn_2": 80, "nn_3": 70}
+    ]
+    adapter = _pg_adapter(fake_pg_connection)
+    _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    adapter.column_aggregates("dexdb.shop.customers", columns)
+    stats_reads = [s.sql for s in fake_pg_connection.statements if "pg_stats" in s.sql]
+    assert stats_reads
+    for sql in stats_reads:
+        assert "most_common_vals" not in sql
+        assert "histogram_bounds" not in sql
+        assert "most_common_elems" not in sql
+
+
+def test_postgres_capabilities_pass_the_sanitizer(fake_pg_connection, capsys):
+    # Family 5: the capabilities payload carries a coarse auth method, never
+    # an identity, password, or DSN, and survives the sanitizer end to end.
+    adapter = _pg_adapter(fake_pg_connection)
+    caps = adapter.capabilities()
+    env.emit(env.ok(caps))
+    out = capsys.readouterr().out
+    assert out
+    assert "@" not in out  # no user identity or DSN
+    assert caps["auth_method"].split(":")[0] in {
+        "config_service",
+        "database_url",
+        "environment",
+        "config_target",
+        "dbt_profile",
+        "unknown",
+    }
+    assert caps["auth_method"].split(":")[1] in {"password", "external", "service_file"}
+
+
+def test_postgres_spend_ledger_holds_no_sql_or_values(
+    tmp_path: Path, fake_pg_connection
+):
+    # Family 5: the audit trail is second counts and statement hashes only.
+    import json
+
+    from exmergo_dex_core.cache import DexStore
+
+    store = DexStore(tmp_path)
+    fake_pg_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _pg_adapter(fake_pg_connection)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "dexdb"."shop"."customers"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = json.loads(lines[-1])
+    assert "SELECT" not in json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
 
 
 # --- Maintain: drift detection and reconcile exercise every family -------------

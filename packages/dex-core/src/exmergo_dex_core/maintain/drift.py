@@ -414,6 +414,14 @@ def grain_drift(
     findings: list[DriftFinding] = []
     for dataset, keys, row_count in plan.key_checks:
         distinct = adapter.exact_distinct_counts(dataset.identifier, keys)
+        # Re-read the metadata after the distinct scan: adapters whose
+        # inventory row counts are planner estimates (Postgres reltuples)
+        # upgrade to the exact COUNT(*) that scan carried, so an over-estimate
+        # can never fabricate duplicates on a genuinely unique key. Free
+        # everywhere (cached or trivially cheap on the other adapters).
+        live_meta, _ = adapter.table_metadata(dataset.identifier)
+        if live_meta.row_count is not None:
+            row_count = live_meta.row_count
         for key in keys:
             count = distinct.get(key)
             if count is None or count >= row_count:

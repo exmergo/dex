@@ -13,6 +13,66 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 Release to the public
 
+### Added
+
+- **PostgreSQL connector**, the operational-database connector and the first
+  on the db-load paradigm. Explore, transform, and maintain run against
+  Postgres with the same guardrails as the billed connectors, adapted to what
+  the paradigm actually protects (no dollars are billed; the guarded quantity
+  is load on a production primary, in database-seconds):
+  - Connection discovery, never prompting: a `pg_service.conf` entry pinned by
+    `postgres.service`, `DATABASE_URL`, the `PG*` environment (resolved
+    natively by libpq, including `~/.pgpass`), the committed non-secret
+    `postgres.host`/`dbname` config target, or a dbt profile. Only a coarse
+    auth method is surfaced; DSNs and passwords never cross the envelope.
+  - Database-seconds budgets (`--budget`, `budget.ceiling`,
+    `budget.session_ceiling`) through the same strict confirm handshake as the
+    billed connectors. Query estimates come from the genuinely free planner
+    preflight (`EXPLAIN (FORMAT JSON)`, so index-served queries are not quoted
+    as full scans) and profile estimates from relation sizes, both honestly
+    labeled `estimate_quality: "heuristic"`; the budget is hard-enforced
+    regardless by a per-statement server-side `statement_timeout`. Actual
+    wall-clock seconds land in the `.dex/spend.jsonl` ledger as
+    `billed_seconds`. Sessions connect as `application_name = 'dex'`.
+  - Read-only in depth: `default_transaction_read_only = on` on every session
+    (autocommit, so no idle-in-transaction holds back vacuum), the SELECT-only
+    guard in the postgres dialect through one execution door, an adapter that
+    issues only catalog SELECTs / EXPLAIN / session SETs, and a documented
+    least-privilege role shape.
+  - Profiling that is deliberately light on the primary: one cheap single-pass
+    aggregate batch (counts, nulls, safe min/max); distinct counts come free
+    from `pg_stats.n_distinct` (never the value-carrying statistics columns),
+    and near-unique keys escalate to exact `COUNT(DISTINCT)` inside the
+    confirmed budget. The escalation scan also upgrades `reltuples` estimates
+    to exact row counts, so uniqueness proofs and `maintain grain` verdicts
+    never fabricate duplicates from a stale planner estimate. `json`/`jsonb`,
+    arrays, `bytea`, and geometric types degrade to non-null counts; tables
+    above `postgres.max_full_profile_bytes` profile from `TABLESAMPLE SYSTEM`.
+  - `transform init --connector postgres`: a dbt-postgres dev profile from the
+    discovered connection (password only as an `env_var('PGPASSWORD')`
+    reference, never a value), writing to a dedicated `dev_schema` refused as
+    a source, one thread. `transform build` injects the ceiling as
+    `PGOPTIONS="-c statement_timeout=<ceiling>s"` (dbt has no dry-run; the
+    per-statement cap is the binding cost control) and accounts per-node
+    execution time into the ledger.
+  - The `[postgres]` extra now carries `dbt-postgres`.
+  - Testing per the established connector template: a stateful fake connection
+    (catalog + pg_stats registry, size-derived EXPLAIN costs, simulated timing,
+    psycopg's real `QueryCanceled` on timeout), safety-spine extensions across
+    all five families for the db-load paradigm, and an env-gated live
+    integration suite (`DEX_TEST_PG_DSN`) against the seeded database from
+    `scripts/postgres_seed.sql`. No cloud setup script: CI runs the suite
+    against a free, keyless `postgres:16` service container, and
+    `scripts/setup_postgres_dev.sh` stands up the same seeded database locally
+    in Docker.
+
+### Fixed
+
+- `explore map` replica folding now recognizes the Snowflake and Postgres dev
+  schemas (`snowflake.dev_schema`, `postgres.dev_schema`); previously only
+  BigQuery's `dev_dataset` fed the fold, so a mapped Snowflake dev schema
+  could inflate one real foreign key into duplicate edges.
+
 ## [0.1.4] - 2026-07-06
 
 ### Added
