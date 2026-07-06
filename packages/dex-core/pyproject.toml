@@ -41,7 +41,10 @@ dex = "exmergo_dex_core.cli:main"
 # pure explore-only install would need; a separate lighter explore extra can be
 # split out later if that tradeoff matters.)
 duckdb = ["duckdb>=1", "sqlglot>=25", "dbt-duckdb>=1.9"]
-snowflake = ["snowflake-connector-python>=3", "sqlglot>=25"]
+# 3.17 is the floor for workload-identity auth (the keyless CI path). Like
+# [duckdb], the extra carries the dbt adapter so transform can build against a
+# Snowflake dev target with one install.
+snowflake = ["snowflake-connector-python>=3.17", "sqlglot>=25", "dbt-snowflake>=1.9"]
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a BigQuery dev target with one install.
 bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25", "dbt-bigquery>=1.9"]
@@ -84,6 +87,7 @@ addopts = "--import-mode=importlib"
 # doubles under tests/fakes/ need an explicit path entry to be importable.
 pythonpath = ["tests"]
 markers = [
-  "integration: hits a live warehouse; gated on DEX_TEST_BQ_* environment variables",
+  "integration: hits a live warehouse; gated on DEX_TEST_* environment variables",
   "bigquery: BigQuery-specific integration tests",
+  "snowflake: Snowflake-specific integration tests",
 ]
