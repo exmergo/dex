@@ -13,7 +13,7 @@ every change is a reviewable diff.
 ## Install
 
 ```
-pip install "exmergo-dex-core[duckdb]"
+pip install "exmergo-dex-core"
 ```
 
 Connector client libraries live behind extras, so the zero-credential DuckDB
@@ -71,6 +71,19 @@ capped server-side by `maximum_bytes_billed` and recorded in a local
 dbt-bigquery, which the `[bigquery]` extra carries. See
 [`references/bigquery.md`](../../references/bigquery.md).
 
+Snowflake: connects through discovered credentials (`connections.toml`,
+`SNOWFLAKE_*` env, or a dbt profile; dex never asks for or persists a
+password). The cost inversion from BigQuery: metadata is free (SHOW commands,
+no warehouse), while scans bill warehouse time, so budgets are
+**warehouse-seconds** with credits shown alongside. Estimates are an honestly
+labeled heuristic (Snowflake has no dry-run), floored by the 60-second resume
+minimum on a cold warehouse; the budget is hard-enforced anyway by a
+per-statement server-side `STATEMENT_TIMEOUT_IN_SECONDS`, and actual seconds
+land in the same `.dex/spend.jsonl` ledger. Billed work runs only on the
+warehouse the config pins. dbt builds go to a dedicated dev database.schema
+via dbt-snowflake, which the `[snowflake]` extra carries. See
+[`references/snowflake.md`](../../references/snowflake.md).
+
 Maintain detects drift against the `.dex/` snapshot on four axes and proposes
 the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
 and semantic (definitions, dangling references, and dimension cardinality).
@@ -81,8 +94,8 @@ connectors the metadata axes (schema, volume, references) stay free while the
 scanning axes (grain, dimension cardinality) take the `--confirm --budget`
 handshake, so `check` is two-phase.
 
-The remaining cloud connectors (Snowflake, Databricks, PostgreSQL) and the Viz
-preview report `not_implemented` until they land.
+The remaining cloud connectors (Databricks, PostgreSQL) and the Viz preview
+report `not_implemented` until they land.
 
 ## License
 
