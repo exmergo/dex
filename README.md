@@ -1,5 +1,3 @@
-# `dex`: the agent-native analytics engineering toolkit
-
 <img width="1280" height="563" alt="exmergo-dex-showcase" src="https://github.com/user-attachments/assets/9dd574c2-8598-47bc-ae90-7d5a3a4d2e18" />
 
 *Developed by Exmergo*
@@ -25,7 +23,7 @@ Run this command in your terminal
 npx skills install exmergo/dex
 ```
 
-## Intro
+## `dex`: the agent-native analytics engineering toolkit
 
 **`dex` is analytics engineering** for Claude Code and **any agent**: **data warehouse
 exploration**, **dbt transformation** and **semantic modeling**, and **schema-drift
@@ -58,7 +56,7 @@ time. `dex` owns exactly that loop.
 
 ## Connectors
 
-- Cloud warehouse:  **Snowflake**, **BigQuery**.
+- Cloud warehouse: **Snowflake**, **BigQuery**.
 - Embedded analytical: **DuckDB**.
 
 Cloud credentials are discovered, never asked for: BigQuery through
