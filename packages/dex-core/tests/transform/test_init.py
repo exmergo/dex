@@ -242,6 +242,29 @@ def test_init_snowflake_refuses_unpinned_warehouse_and_source_collision(
     assert "source" in envelope["errors"][0]
 
 
+def test_init_snowflake_refuses_workload_identity_with_the_fix(
+    tmp_path: Path, capsys, monkeypatch
+):
+    # dbt-snowflake cannot authenticate via workload identity yet, so a
+    # rendered profile would fail every build; init must refuse actionably.
+    _patch_snowflake_discovery(
+        monkeypatch,
+        {
+            "account": "A",
+            "user": "U",
+            "authenticator": "WORKLOAD_IDENTITY",
+            "token": "not-a-real-token",
+        },
+    )
+    _seed_snowflake_config(tmp_path, warehouse="DEX_WH", dev_database="SCRATCH")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+    assert rc == 1
+    message = envelope["errors"][0]
+    assert "workload identity" in message
+    assert "connection_name" in message
+    assert not (tmp_path / "analytics").exists()
+
+
 def test_init_snowflake_never_persists_a_password(tmp_path: Path, capsys, monkeypatch):
     _patch_snowflake_discovery(
         monkeypatch,

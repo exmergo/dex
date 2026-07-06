@@ -25,6 +25,12 @@ def test_init_plan_apply_build_into_the_scratch_database(
     tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
 ):
     pytest.importorskip("dbt.adapters.snowflake")
+    if os.environ.get("SNOWFLAKE_AUTHENTICATOR", "").upper() == "WORKLOAD_IDENTITY":
+        # Stable dbt-snowflake cannot authenticate via workload identity, so
+        # `transform init` deliberately refuses such a connection. The build
+        # path is exercised by the local key-pair run; unskip once
+        # dbt-snowflake ships workload-identity support and init renders it.
+        pytest.skip("dbt builds need a durable credential; WIF not yet in dbt")
     root = str(tmp_path)
     seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
 

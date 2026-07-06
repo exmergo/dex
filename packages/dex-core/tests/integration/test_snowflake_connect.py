@@ -62,13 +62,36 @@ def test_connect_test_discovers_connection_and_reports_read_only(
     assert data["budget"]["warehouse"]["name"].upper() == sf_warehouse.upper()
     assert data["budget"]["warehouse"]["credits_per_hour"] is not None
     assert envelope["cost"]["paradigm"] == "compute_time"
-    # The auth method is coarse; no identity, password, or key crosses.
-    payload = json.dumps(envelope)
+    # The auth method is coarse; no identity, password, or key crosses. A raw
+    # substring check on the username would false-positive whenever the user
+    # is a substring of a legitimate identifier (in CI the DEX_CI user matches
+    # the DEX_CI database and DEX_CI_WH warehouse), so assert on the actual
+    # invariants: no identity-shaped key anywhere, and no credential value.
     assert data["auth_method"].split(":")[0] in {
         "named_connection",
         "default_connection",
         "environment",
         "dbt_profile",
     }
-    user = os.environ.get("SNOWFLAKE_USER", "\x00never")
-    assert user not in payload
+    assert not _identity_keys(data)
+    payload = json.dumps(envelope)
+    for secret in (
+        os.environ.get("SNOWFLAKE_TOKEN"),
+        os.environ.get("SNOWFLAKE_PASSWORD"),
+    ):
+        assert not secret or secret not in payload
+
+
+def _identity_keys(value, path="data") -> list[str]:
+    """Every key in the payload that names an identity or credential."""
+
+    hits: list[str] = []
+    if isinstance(value, dict):
+        for key, sub in value.items():
+            if str(key).lower() in {"user", "username", "login", "login_name"}:
+                hits.append(f"{path}.{key}")
+            hits.extend(_identity_keys(sub, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for i, sub in enumerate(value):
+            hits.extend(_identity_keys(sub, f"{path}[{i}]"))
+    return hits
