@@ -272,8 +272,18 @@ class DexStore:
             handle.write(json.dumps(entry) + "\n")
         return path
 
-    def spend_since(self, cutoff_iso: str) -> float:
-        """Total `billed_bytes` recorded at or after ``cutoff_iso`` (ISO-8601).
+    def spend_since(
+        self,
+        cutoff_iso: str,
+        *,
+        field: str = "billed_bytes",
+        connector: str | None = None,
+    ) -> float:
+        """Total ``field`` recorded at or after ``cutoff_iso`` (ISO-8601).
+
+        ``field`` and ``connector`` keep paradigms separate: a session budget in
+        bytes must never absorb a seconds entry from another connector sharing
+        the ledger, so callers sum their own connector's own unit.
 
         String comparison is correct here because every `at` stamp is written
         by dex in the same UTC ISO format. Malformed lines are skipped rather
@@ -289,8 +299,10 @@ class DexStore:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if connector is not None and entry.get("connector") != connector:
+                continue
             at = entry.get("at")
-            billed = entry.get("billed_bytes")
+            billed = entry.get(field)
             if (
                 isinstance(at, str)
                 and at >= cutoff_iso

@@ -69,19 +69,28 @@ def billed_handshake(
     try:
         gate.preflight_command(estimate)
     except ConfirmationRequiredError as exc:
-        data: dict = {
-            "command": command,
-            "estimated_bytes": estimate,
-            "hint": (
-                "review the estimate, then re-run with --confirm --budget "
-                "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
-                "$0.06 on-demand)"
-            ),
-        }
-        if per_table:
-            data["per_table_bytes"] = per_table
+        # The payload speaks the connector's unit. An adapter that knows more
+        # than the raw magnitude (Snowflake's credit translation, its
+        # estimate-quality caveat) describes its own estimate; the bytes shape
+        # is the default the bytes-scanned connectors settled on.
+        describe = getattr(adapter, "describe_estimate", None)
+        if describe is not None:
+            data = {"command": command, **describe(estimate, per_table)}
+        else:
+            data = {
+                "command": command,
+                "estimated_bytes": estimate,
+                "hint": (
+                    "review the estimate, then re-run with --confirm --budget "
+                    "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
+                    "$0.06 on-demand)"
+                ),
+            }
+            if per_table:
+                data["per_table_bytes"] = per_table
         if notes:
-            data["notes"] = notes
+            data.setdefault("notes", [])
+            data["notes"] = [*data["notes"], *notes]
         return env.needs_confirmation(data, cost=exc.cost)
     return None
 
@@ -94,7 +103,11 @@ def stamp_spend(envelope: env.Envelope, adapter: Adapter) -> env.Envelope:
     gate = cost_gate(adapter)
     if gate is not None:
         envelope.cost = gate.cost()
-        envelope.data["spend"] = gate.spend_summary()
+        spend = gate.spend_summary()
+        display = getattr(adapter, "spend_display", None)
+        if display is not None:
+            spend.update(display())
+        envelope.data["spend"] = spend
     return envelope
 
 
