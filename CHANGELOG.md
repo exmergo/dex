@@ -9,6 +9,51 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-06
+
+### Added
+
+- **Snowflake connector**, the second billed cloud connector and the first on
+  the compute-time paradigm. Explore, transform, and maintain run against
+  Snowflake with the same guardrails as BigQuery, adapted to the cost
+  inversion (metadata is free via SHOW commands; scans bill warehouse time):
+  - Connection discovery, never prompting: a `connections.toml` entry pinned
+    by `snowflake.connection_name`, the default connection, `SNOWFLAKE_*`
+    environment variables (including workload-identity tokens, the keyless CI
+    path), or a dbt profile. Only a coarse auth method is surfaced.
+  - Warehouse-seconds budgets (`--budget`, `budget.ceiling`,
+    `budget.session_ceiling`) with the credit translation shown on every cost
+    surface, and dollars when `snowflake.credit_price_usd` is configured.
+    Estimates are an honestly labeled heuristic (`estimate_quality:
+    "heuristic"`; Snowflake has no dry-run) floored by the 60-second resume
+    minimum on a suspended warehouse; the budget is hard-enforced regardless
+    by a per-statement server-side `STATEMENT_TIMEOUT_IN_SECONDS`. Actual
+    wall-clock seconds land in the `.dex/spend.jsonl` ledger as
+    `billed_seconds`, kept separate from byte entries so paradigms never sum
+    together.
+  - Strict warehouse pinning: billed statements run only on
+    `snowflake.warehouse`; a connection-default warehouse is never spent on.
+    Every session is tagged `QUERY_TAG = 'dex'`.
+  - Free-path inventory and profiling estimation from SHOW metadata; batched
+    aggregate profiling with semi-structured degradation (VARIANT, OBJECT,
+    ARRAY, GEOGRAPHY) and opt-in `SAMPLE SYSTEM` above
+    `snowflake.max_full_profile_bytes`.
+  - `transform init --connector snowflake`: a dbt-snowflake dev profile from
+    the discovered connection (key-pair as a path, SSO as externalbrowser, a
+    password only as an `env_var` reference, never a value), writing to a
+    dedicated `dev_database.dev_schema` refused as a source, one thread, on
+    the pinned warehouse. `transform build` accounts per-node execution time
+    into the ledger.
+  - The `[snowflake]` extra now carries `dbt-snowflake` and requires
+    `snowflake-connector-python>=3.17` (workload-identity support).
+  - Testing per the established billed-connector template: a stateful fake
+    connection with simulated timing and real connector error types,
+    safety-spine extensions across all five families for the compute-time
+    paradigm, an env-gated live integration suite (`DEX_TEST_SNOWFLAKE_*`)
+    against `SNOWFLAKE_SAMPLE_DATA`, and a scheduled keyless CI job
+    (Snowflake workload identity federation, GitHub OIDC). One-time
+    provisioning automated by `scripts/setup_snowflake_ci.sh`.
+
 ## [0.1.3] - 2026-07-05
 
 Hardening pass from the first billed-connector dogfooding sessions (BigQuery):
