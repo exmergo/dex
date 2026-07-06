@@ -21,6 +21,15 @@ both):
 
     DEX_TEST_SNOWFLAKE_CONNECTION=dex-ci DEX_TEST_SNOWFLAKE_DATABASE=DEX_CI \
         uv run pytest tests/integration -q
+
+Postgres (bills nothing: a local container; db-load gating is exercised for
+real, statement timeouts and all). The DSN should be the read-only role from
+scripts/postgres_seed.sql; transform additionally needs the dbt_dev role's
+password in DEX_TEST_PG_DEV_PASSWORD (scripts/setup_postgres_dev.sh stands
+the whole thing up):
+
+    DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:5433/dex_dogfood \
+        DEX_TEST_PG_DEV_PASSWORD=dbt_dev uv run pytest tests/integration -q
 """
 
 from __future__ import annotations
@@ -58,6 +67,14 @@ def _require_cloud_env(request):
             )
         pytest.importorskip("snowflake.connector")
         return
+    if request.node.get_closest_marker("postgres"):
+        if not os.environ.get("DEX_TEST_PG_DSN"):
+            pytest.skip(
+                "Postgres integration disabled: set DEX_TEST_PG_DSN (run "
+                "scripts/setup_postgres_dev.sh for a seeded local container)"
+            )
+        pytest.importorskip("psycopg")
+        return
     missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
     if missing:
         pytest.skip(f"BigQuery integration disabled: set {', '.join(missing)}")
@@ -87,3 +104,13 @@ def sf_connection_name() -> str | None:
 @pytest.fixture
 def sf_warehouse() -> str:
     return os.environ.get("DEX_TEST_SNOWFLAKE_WAREHOUSE", "DEX_CI_WH")
+
+
+@pytest.fixture
+def pg_dsn() -> str:
+    return os.environ["DEX_TEST_PG_DSN"]
+
+
+@pytest.fixture
+def pg_dev_password() -> str | None:
+    return os.environ.get("DEX_TEST_PG_DEV_PASSWORD")

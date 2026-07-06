@@ -61,19 +61,21 @@ depth, then `reconcile` to get the proposed fix.
 
 ## Per-axis cost: what is free and what scans
 
-Detection is read-only, but read-only is not the same as free on a billed
-connector (BigQuery). The axes split:
+Detection is read-only, but read-only is not the same as free on a metered
+connector (BigQuery, Snowflake, Postgres). The axes split:
 
 - **Schema, volume, and the reference/definition half of semantic are free**
   everywhere: they read metadata and the snapshot, and run immediately.
 - **Grain and the dimension-cardinality half of semantic scan the warehouse**, so
-  on a billed connector they run the two-step handshake. The first call returns
-  `needs_confirmation` with a dry-run estimate in `cost.estimate` (and a per-table
+  on a metered connector they run the two-step handshake. The first call returns
+  `needs_confirmation` with an estimate in `cost.estimate` (and a per-table
   breakdown). Surface it to the user in human units, get an explicit budget, and
-  re-issue the same command with `--confirm --budget <bytes>`. Never invent a
-  budget the user did not agree to, and never retry with a raised budget on an
-  over-ceiling refusal without asking.
-- **`check` is two-phase on a billed connector**: the free axes complete
+  re-issue the same command with `--confirm --budget <magnitude>` in the
+  paradigm's unit (bytes on BigQuery, warehouse-seconds on Snowflake,
+  database-seconds on Postgres). Never invent a budget the user did not agree
+  to, and never retry with a raised budget on an over-ceiling refusal without
+  asking.
+- **`check` is two-phase on a metered connector**: the free axes complete
   immediately and their findings ride along in the `needs_confirmation` envelope,
   with one combined estimate for the scanning axes. Confirm to complete the sweep.
 

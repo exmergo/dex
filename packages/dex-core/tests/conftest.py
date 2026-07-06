@@ -135,6 +135,47 @@ def fake_sf_connection():
 
 
 @pytest.fixture
+def fake_pg_connection():
+    """The standard populated fake Postgres connection (see
+    tests/fakes/postgres.py).
+
+    Requires the real psycopg library (the [postgres] extra) for its error
+    types; skipped when absent, but CI and the release gate install the extra,
+    so the Postgres safety families run everywhere that matters. ``customers``
+    carries fresh planner statistics; ``events`` has never been analyzed
+    (reltuples -1, no pg_stats rows) so the missing-stats degradations are on
+    by default.
+    """
+
+    pytest.importorskip("psycopg")
+    from fakes.postgres import FakePostgresConnection, FakePostgresTable
+
+    tables = [
+        FakePostgresTable(
+            schema="shop",
+            name="customers",
+            columns=[
+                ("id", "bigint", False),
+                ("email", "text", True),
+                ("payload", "jsonb", True),
+                ("tags", "text[]", True),
+            ],
+            reltuples=100.0,
+            total_bytes=5_000_000_000,  # 5 GB -> a non-trivial seconds estimate
+            stats={"id": -1.0, "email": 90.0},
+        ),
+        FakePostgresTable(
+            schema="shop",
+            name="events",
+            columns=[("id", "bigint", True), ("payload", "jsonb", True)],
+            reltuples=-1.0,
+            total_bytes=50_000_000_000,  # 50 GB
+        ),
+    ]
+    return FakePostgresConnection(tables=tables, database="dexdb")
+
+
+@pytest.fixture
 def dbt_project_dir(tmp_path: Path) -> Path:
     """A minimal dbt project with a project-local profiles.yml.
 

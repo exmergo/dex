@@ -30,13 +30,13 @@ body:
     id: connector
     attributes:
       label: Connector
-      description: Which connector were you using? DuckDB and BigQuery are implemented today.
+      description: Which connector were you using? DuckDB, BigQuery, Snowflake, and PostgreSQL are implemented today.
       options:
         - DuckDB
         - BigQuery
-        - Snowflake (not yet implemented)
+        - Snowflake
+        - PostgreSQL
         - Databricks (not yet implemented)
-        - PostgreSQL (not yet implemented)
         - Not connector-specific
     validations:
       required: true

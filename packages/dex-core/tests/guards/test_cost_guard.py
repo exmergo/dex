@@ -148,3 +148,22 @@ def test_gate_cost_prefers_the_command_estimate():
     gate.preflight_command(500.0)
     gate.charge(200.0)
     assert gate.cost().estimate == 500.0
+
+
+def test_db_load_ledger_records_seconds():
+    # DB_LOAD is a time paradigm: its ledger unit and spend key are seconds,
+    # never bytes, so a Postgres entry can never sum into a bytes budget.
+    entries: list[dict] = []
+    gate = _gate(
+        paradigm=Paradigm.DB_LOAD,
+        connector="postgres",
+        record=entries.append,
+    )
+    assert gate.ledger_field() == "billed_seconds"
+    gate.charge(10.0)
+    gate.record_billed(3.5, statement="SELECT 1")
+    assert entries[0]["billed_seconds"] == 3.5
+    assert "billed_bytes" not in entries[0]
+    summary = gate.spend_summary()
+    assert summary["seconds_billed"] == 3.5
+    assert "bytes_billed" not in summary

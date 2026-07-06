@@ -96,3 +96,47 @@ def test_metadata_only_baseline_warns_grain_has_nothing(dex, tmp_path):
     assert rc == 0 and payload["status"] == "ok"
     assert payload["data"]["finding_count"] == 0
     assert any("metadata-only" in w for w in payload["warnings"])
+
+
+def test_estimated_row_counts_cannot_fabricate_duplicates():
+    """An adapter whose free row counts are planner estimates (Postgres
+    reltuples) must not produce key_lost_uniqueness findings from the estimate
+    alone: grain_drift re-reads the metadata after the distinct scan, and the
+    adapter serves the exact count that scan paid for."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.drift import GrainPlan, grain_drift
+
+    class EstimatingAdapter:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.scanned = False
+
+        def table_metadata(self, identifier):
+            # 1200 is the stale planner estimate; 1000 is the exact count the
+            # distinct scan carried (COUNT(*) rides along on Postgres).
+            rows = 1000 if self.scanned else 1200
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=rows,
+                byte_size=None,
+                column_count=1,
+            )
+            return meta, [
+                ColumnMeta(name="id", data_type="INTEGER", nullable=False, ordinal=0)
+            ]
+
+        def exact_distinct_counts(self, identifier, columns):
+            self.scanned = True
+            return dict.fromkeys(columns, 1000)
+
+    dataset = Dataset(identifier="db.s.t", candidate_keys=[["id"]], grain=["id"])
+    plan = GrainPlan(key_checks=[(dataset, ["id"], 1200)], fanout_pairs=[])
+    findings = grain_drift(EstimatingAdapter(), plan)
+    assert findings == []

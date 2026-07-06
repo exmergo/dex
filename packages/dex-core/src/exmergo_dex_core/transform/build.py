@@ -15,6 +15,7 @@ only a sanitized summary crosses the boundary. Node results come from dbt's own
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -157,7 +158,7 @@ def build(
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
     # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
     # against whatever directory the caller happened to launch from.
-    run = runner or _default_runner(timeout, project)
+    run = runner or _default_runner(timeout, project, env=_build_env(paradigm, ceiling))
     completed = run(argv)
 
     summary = _summarize(project, target, completed)
@@ -371,7 +372,26 @@ def _dbt_executable() -> str:
     )
 
 
-def _default_runner(timeout: float, cwd: Path) -> Runner:
+def _build_env(paradigm: Paradigm, ceiling: float | None) -> dict[str, str] | None:
+    """Environment overrides for the dbt subprocess, or ``None`` to inherit.
+
+    On db-load gating (Postgres) the profile has no statement-timeout key, but
+    libpq honors ``PGOPTIONS``, so the ceiling becomes a per-statement
+    server-side ``statement_timeout`` — the ``maximum_bytes_billed`` analogue:
+    a build statement cannot load the database past the budget even though dbt
+    has no dry-run.
+    """
+
+    if paradigm is not Paradigm.DB_LOAD or ceiling is None:
+        return None
+    cap = f"-c statement_timeout={max(int(ceiling), 1)}s"
+    existing = os.environ.get("PGOPTIONS", "")
+    return {**os.environ, "PGOPTIONS": f"{existing} {cap}".strip()}
+
+
+def _default_runner(
+    timeout: float, cwd: Path, env: dict[str, str] | None = None
+) -> Runner:
     def run(argv: list[str]) -> subprocess.CompletedProcess:
         # The argv is engine-built (dbt executable + validated target/paths),
         # never raw user input, and shell=False.
@@ -382,6 +402,7 @@ def _default_runner(timeout: float, cwd: Path) -> Runner:
             timeout=timeout,
             check=False,
             cwd=str(cwd),
+            env=env,
         )
 
     return run

@@ -90,6 +90,34 @@ class SnowflakeTarget(BaseModel):
     credit_price_usd: float | None = None
 
 
+class PostgresTarget(BaseModel):
+    """Non-secret PostgreSQL connection target. Credentials are never here:
+    auth is discovered at runtime by connect.py (a pg_service.conf entry,
+    DATABASE_URL, PG* environment variables, or a dbt profile), and passwords
+    are supplied by PGPASSWORD, ``~/.pgpass``, or the service file, never by
+    this config.
+
+    ``service`` pins a ``pg_service.conf`` entry (the ``connection_name``
+    analogue); unset means DATABASE_URL, then the PG* environment, then a dbt
+    profile. ``host``/``port``/``dbname``/``user`` are an optional committed
+    non-secret target used only when no other source resolves. ``schemas`` is
+    a source allowlist of schema names inside the connected database; empty
+    means every non-system schema the role can see. ``dev_schema`` is where
+    dbt dev builds write, and is refused as a source so reads and writes never
+    share a schema. ``max_full_profile_bytes`` opts large tables into sampled
+    profiling (TABLESAMPLE SYSTEM) instead of a full scan.
+    """
+
+    service: str | None = None
+    host: str | None = None
+    port: int | None = None
+    dbname: str | None = None
+    user: str | None = None
+    schemas: list[str] = Field(default_factory=list)
+    dev_schema: str | None = None
+    max_full_profile_bytes: int | None = None
+
+
 class QueryLimits(BaseModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
@@ -104,14 +132,15 @@ class QueryLimits(BaseModel):
 
 
 class DexConfig(BaseModel):
-    """The shape of ``.dex/config.yml``. DuckDB, BigQuery, and Snowflake
-    targets are wired; the remaining cloud connector targets are not yet
+    """The shape of ``.dex/config.yml``. DuckDB, BigQuery, Snowflake, and
+    Postgres targets are wired; the Databricks target is not yet
     implemented."""
 
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
     bigquery: BigQueryTarget | None = None
     snowflake: SnowflakeTarget | None = None
+    postgres: PostgresTarget | None = None
     dbt_target: str | None = None
     # Pins the dbt project directory (relative to the repo root) when discovery
     # would be ambiguous; by default the project is located automatically.

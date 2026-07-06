@@ -26,7 +26,7 @@ def _fake_runner(monkeypatch, *, returncode: int, stdout: str = ""):
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
     calls: list[dict] = []
 
-    def fake(timeout: float, cwd):
+    def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
             calls.append({"argv": argv, "cwd": cwd})
             return subprocess.CompletedProcess(

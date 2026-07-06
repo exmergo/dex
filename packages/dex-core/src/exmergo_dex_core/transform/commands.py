@@ -148,6 +148,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     paradigm = {
         "bigquery": Paradigm.BYTES_SCANNED,
         "snowflake": Paradigm.COMPUTE_TIME,
+        "postgres": Paradigm.DB_LOAD,
     }.get(connector, Paradigm.FREE_LOCAL)
 
     try:
@@ -192,6 +193,21 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         ]
         # dbt-snowflake reports no billing figure; per-node execution time is
         # the honest warehouse-seconds actual.
+        seconds = sum(
+            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
+        )
+        if seconds:
+            summary["seconds_billed"] = seconds
+            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
+    elif paradigm is Paradigm.DB_LOAD:
+        notes = [
+            "dbt has no dry-run, so this build's database time could not be "
+            "estimated upfront; each statement was capped server-side by a "
+            "statement_timeout set to the ceiling (injected via PGOPTIONS)",
+            *notes,
+        ]
+        # dbt-postgres reports no billing figure; per-node execution time is
+        # the honest database-seconds actual.
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )

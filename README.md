@@ -43,30 +43,32 @@ intent.
 ## Connectors
 
 Cloud warehouse: **BigQuery** (live), **Snowflake** (live), **Databricks**.
-Operational database: **PostgreSQL**. Embedded analytical: **DuckDB** (the
-zero-credential on-ramp, and the engine behind the eval and benchmark suites).
-Each client library is behind an optional extra, so the DuckDB on-ramp installs
-only `duckdb` and `sqlglot`; the cloud connectors install with
-`exmergo-dex-core[bigquery]` or `exmergo-dex-core[snowflake]`. To pull every
-connector at once, install `exmergo-dex-core[all]`.
+Operational database: **PostgreSQL** (live). Embedded analytical: **DuckDB**
+(the zero-credential on-ramp, and the engine behind the eval and benchmark
+suites). Each client library is behind an optional extra, so the DuckDB
+on-ramp installs only `duckdb` and `sqlglot`; the other connectors install
+with `exmergo-dex-core[bigquery]`, `[snowflake]`, or `[postgres]`. To pull
+every connector at once, install `exmergo-dex-core[all]`.
 
-Cloud credentials are discovered, never asked for: BigQuery through
-Application Default Credentials (`gcloud auth application-default login`),
-Snowflake through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile.
-Every scan is estimated and confirmed before it spends, capped server-side
-(`maximum_bytes_billed` on BigQuery; a per-statement statement timeout on
-Snowflake, where budgets are warehouse-seconds with credits shown alongside),
-and recorded in a local spend ledger.
+Credentials are discovered, never asked for: BigQuery through Application
+Default Credentials (`gcloud auth application-default login`), Snowflake
+through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Postgres
+through `pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt
+profile. Every scan is estimated and confirmed before it spends, capped
+server-side (`maximum_bytes_billed` on BigQuery; a per-statement statement
+timeout on Snowflake and Postgres, whose budgets are warehouse-seconds with
+credits alongside and database-seconds respectively), and recorded in a local
+spend ledger.
 
 ## Status
 
 **v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required:
 explore, transform, and now **maintain** (drift detection and reconcile across
 schema, volume, grain, and semantic axes). **Explore, transform, and maintain
-also run on BigQuery and Snowflake**, the first two cloud connectors, each with
-credential discovery, cost guards with a confirm-before-spend handshake
-(bytes-scanned on BigQuery, warehouse-seconds on Snowflake), and dev-target-only
-dbt builds. Databricks and PostgreSQL land next as v0.2 completes; published
+also run on BigQuery, Snowflake, and PostgreSQL**, each with credential
+discovery, cost guards with a confirm-before-spend handshake (bytes-scanned on
+BigQuery, warehouse-seconds on Snowflake, database-seconds on Postgres), and
+dev-target-only dbt builds. Databricks lands next as v0.2 completes; published
 benchmark scores (ADE-bench uplift and cost/turn efficiency, Spider2.0-DBT)
 land with v0.3.
 

@@ -24,8 +24,8 @@ jobs:
       # The cloud extras stay in the gate: their safety families importorskip
       # on the client libraries, and a release gate that silently skips
       # safety-critical assertions is a hole, not a speedup.
-      - name: Sync (duckdb + bigquery + snowflake + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra dev
+      - name: Sync (duckdb + bigquery + snowflake + postgres + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra postgres --extra dev
       - name: Tier-1 + safety-critical gate
         run: uv run pytest -q
       # A safety-assertion regression blocks the release regardless of pass-rate;

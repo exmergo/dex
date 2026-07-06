@@ -8,8 +8,10 @@ with the project resolved from explicit config, the environment, the ADC
 default, or a dbt profile, in that order. Snowflake discovers a connection the
 same way: a named ``connections.toml`` entry, the default connection, the
 ``SNOWFLAKE_*`` environment (which is also how CI's workload-identity token
-arrives), or a dbt profile. Every discovery failure names the fix; nothing is
-ever prompted for.
+arrives), or a dbt profile. Postgres follows suit: a config-pinned
+``pg_service.conf`` entry, ``DATABASE_URL``, the ``PG*`` environment (resolved
+natively by libpq, including ``~/.pgpass``), or a dbt profile. Every discovery
+failure names the fix; nothing is ever prompted for.
 """
 
 from __future__ import annotations
@@ -23,7 +25,13 @@ import yaml
 
 from .adapters import get_adapter
 from .cache import DexStore
-from .config import BigQueryTarget, DexConfig, SnowflakeTarget, load_config
+from .config import (
+    BigQueryTarget,
+    DexConfig,
+    PostgresTarget,
+    SnowflakeTarget,
+    load_config,
+)
 from .envelope import Paradigm
 from .guards.cost_guard import CostGate
 
@@ -77,6 +85,11 @@ def open_adapter(
 
     if connector == "snowflake":
         return _open_snowflake(
+            config, repo_root, budget=budget, confirmed=confirmed, command=command
+        )
+
+    if connector == "postgres":
+        return _open_postgres(
             config, repo_root, budget=budget, confirmed=confirmed, command=command
         )
 
@@ -386,6 +399,208 @@ def _snowflake_from_dbt_profiles(repo_root: str | Path) -> dict | None:
                 }
                 if output.get("private_key_path"):
                     params["private_key_file"] = output["private_key_path"]
+                return params
+    return None
+
+
+def _open_postgres(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+):
+    target = config.postgres or PostgresTarget()
+    params, method = resolve_postgres_connection(target, os.environ, repo_root)
+
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise CredentialDiscoveryError(
+            "the Postgres client is not installed; install the connector "
+            "extra: exmergo-dex-core[postgres]"
+        ) from exc
+
+    # autocommit keeps the session out of idle-in-transaction (which blocks
+    # vacuum on a production primary); application_name is the attribution
+    # tag, the QUERY_TAG analogue. The adapter additionally sets the session
+    # read-only before any statement runs.
+    connection = psycopg.connect(**params, autocommit=True, application_name="dex")
+
+    store = DexStore(repo_root)
+    utc_midnight = (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+    gate = CostGate(
+        paradigm=Paradigm.DB_LOAD,
+        ceiling=budget if budget is not None else config.budget.ceiling,
+        session_ceiling=config.budget.session_ceiling,
+        session_spent=store.spend_since(
+            utc_midnight, field="billed_seconds", connector="postgres"
+        ),
+        confirmed=confirmed,
+        connector="postgres",
+        command=command,
+        record=store.append_spend_log,
+    )
+    return get_adapter(
+        "postgres",
+        connection=connection,
+        cost_gate=gate,
+        target=target,
+        auth_method=method,
+    )
+
+
+def resolve_postgres_connection(
+    target: PostgresTarget,
+    env: dict | os._Environ,
+    repo_root: str | Path = ".",
+) -> tuple[dict, str]:
+    """Discover Postgres connection parameters, never prompting.
+
+    Returns ``(params, auth_method)`` where ``params`` feeds
+    ``psycopg.connect`` and ``auth_method`` is a coarse class safe to surface
+    (config_service / database_url / environment / config_target /
+    dbt_profile, suffixed with the credential kind); parameter values,
+    including any password a store legitimately holds, never leave the engine
+    process. Order: the config-pinned ``pg_service.conf`` entry,
+    ``DATABASE_URL``, the ``PG*`` environment (resolved natively by libpq,
+    including ``~/.pgpass`` and ``PGSERVICE``), the committed non-secret
+    config target, then a dbt profile's postgres target. Every failure names
+    the fix.
+    """
+
+    if target.service:
+        service_params = _pg_service_params(target.service, env)
+        if service_params is None:
+            raise CredentialDiscoveryError(
+                f"postgres.service '{target.service}' not found in "
+                "pg_service.conf; add the entry (PGSERVICEFILE or "
+                "~/.pg_service.conf) or fix the name in .dex/config.yml"
+            )
+        # libpq resolves the service entry itself; the parsed fields above
+        # only validated existence and stay inside the engine.
+        return {"service": target.service}, (
+            f"config_service:{_pg_credential_kind(service_params)}"
+        )
+
+    url = env.get("DATABASE_URL")
+    if url:
+        params = _pg_url_params(url)
+        return {"conninfo": url}, f"database_url:{_pg_credential_kind(params)}"
+
+    if env.get("PGSERVICE"):
+        return {}, "environment:service_file"
+    if env.get("PGHOST") or env.get("PGDATABASE"):
+        # libpq reads the PG* variables (and ~/.pgpass) natively; passing no
+        # explicit params lets its own resolution rules apply.
+        kind = "password" if env.get("PGPASSWORD") else "external"
+        return {}, f"environment:{kind}"
+
+    if target.host or target.dbname:
+        params = {
+            key: value
+            for key, value in (
+                ("host", target.host),
+                ("port", target.port),
+                ("dbname", target.dbname),
+                ("user", target.user),
+            )
+            if value is not None
+        }
+        kind = "password" if env.get("PGPASSWORD") else "external"
+        return params, f"config_target:{kind}"
+
+    profile_params = _postgres_from_dbt_profiles(repo_root)
+    if profile_params:
+        return profile_params, f"dbt_profile:{_pg_credential_kind(profile_params)}"
+
+    raise CredentialDiscoveryError(
+        "no Postgres connection discovered; export DATABASE_URL (or PGHOST/"
+        "PGDATABASE and friends), or add a pg_service.conf entry and set "
+        "postgres.service in .dex/config.yml, or set postgres.host/dbname "
+        "there, or keep a postgres target in your dbt profiles.yml"
+    )
+
+
+def _pg_credential_kind(params: dict) -> str:
+    """The coarse credential class for the envelope; never a value. Anything
+    that is not an inline password is ``external`` (``~/.pgpass``, peer/trust
+    auth, SSL client certificates), deliberately coarse."""
+
+    return "password" if params.get("password") else "external"
+
+
+def _pg_url_params(url: str) -> dict:
+    """Parse a Postgres URL into libpq keywords, for classification only (the
+    URL itself is what gets passed to the driver). Failures mean "no fields",
+    never an error that could echo the URL."""
+
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+
+        return {k: v for k, v in conninfo_to_dict(url).items() if v is not None}
+    except Exception:
+        return {}
+
+
+def _pg_service_params(service: str, env: dict | os._Environ) -> dict | None:
+    """The named entry of the pg_service.conf file, or ``None`` when the file
+    or entry is missing. Search order matches libpq: ``PGSERVICEFILE``, then
+    ``~/.pg_service.conf``. Parsed fields are used for existence validation
+    and credential classification only; they never leave the engine."""
+
+    import configparser
+
+    candidates: list[Path] = []
+    service_file = env.get("PGSERVICEFILE")
+    if service_file:
+        candidates.append(Path(service_file))
+    candidates.append(Path.home() / ".pg_service.conf")
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read_string(candidate.read_text(encoding="utf-8"))
+        except (OSError, configparser.Error):
+            continue
+        if parser.has_section(service):
+            return dict(parser.items(service))
+    return None
+
+
+def _postgres_from_dbt_profiles(repo_root: str | Path) -> dict | None:
+    """Best-effort: the connection fields of a ``type: postgres`` output in
+    the discovered dbt project's profiles. Any failure means "not found"."""
+
+    try:
+        from .dbt_project import PROFILES_FILE, find_project, profiles_dir
+
+        project_dir = find_project(repo_root)
+        profiles_path = profiles_dir(project_dir) / PROFILES_FILE
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if (
+                isinstance(output, dict)
+                and output.get("type") == "postgres"
+                and output.get("host")
+            ):
+                params = {
+                    key: output[key]
+                    for key in ("host", "port", "user", "password", "sslmode")
+                    if output.get(key)
+                }
+                dbname = output.get("dbname") or output.get("database")
+                if dbname:
+                    params["dbname"] = dbname
                 return params
     return None
 

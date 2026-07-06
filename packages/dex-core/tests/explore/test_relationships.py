@@ -399,3 +399,31 @@ def test_empty_result_is_explained_not_silent(tmp_path: Path, capsys):
     data = payload["data"]
     assert data["relationships"] == []
     assert any("nothing to infer" in n for n in data["notes"])
+
+
+def test_overlap_probe_transpiles_to_postgres_and_stays_select_only():
+    """The probe is authored once in DuckDB SQL; on Postgres it must transpile
+    to a statement that re-parses in the postgres dialect and passes the
+    SELECT-only guard (the dialect risk a new connector carries)."""
+
+    import sqlglot
+
+    from exmergo_dex_core.cache import Relationship
+    from exmergo_dex_core.explore.relationships import probe_statements
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    rel = Relationship(
+        from_dataset="dexdb.app.order_items",
+        from_columns=["product_id"],
+        to_dataset="dexdb.app.products",
+        to_columns=["id"],
+    )
+    statements = probe_statements([rel], "postgres")
+    assert len(statements) == 1
+    sql = statements[0]
+    assert_select_only(sql, dialect="postgres")
+    parsed = sqlglot.parse_one(sql, read="postgres")
+    assert parsed is not None
+    # Portable shapes survive the rewrite; DuckDB-only FILTER syntax does not
+    # appear (BigQuery lacks it and Postgres parses it differently).
+    assert "order_items" in sql and "products" in sql

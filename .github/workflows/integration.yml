@@ -6,7 +6,8 @@ name: Integration
 # fork-runnable; this workflow answers "does the connector still work against
 # the real service" on main and on a schedule. Each suite reads shared/public
 # sample data, writes only to its scratch scope, and caps every statement
-# (bytes on BigQuery, seconds on Snowflake), so a worst-case run costs cents.
+# (bytes on BigQuery, seconds on Snowflake and Postgres), so a worst-case run
+# costs cents.
 #
 # One-time setup (documented in CONTRIBUTING.md):
 #   BigQuery: scripts/setup_bigquery_ci.sh (Workload Identity Pool provider
@@ -17,6 +18,11 @@ name: Integration
 #   snowflake-integration environment; a least-privilege role on the pinned
 #   X-Small warehouse and the transient scratch database; a resource monitor
 #   as the hard monthly cost backstop).
+#   Postgres: no setup at all. The operational-database connector runs against
+#   a service container seeded from scripts/postgres_seed.sql (the same seed
+#   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
+#   fork-runnable by construction, kept here for pattern parity with the other
+#   connectors rather than as a cost decision.
 on:
   push:
     branches: [main]
@@ -119,3 +125,47 @@ jobs:
         run: uv sync --extra snowflake --extra duckdb --extra dev
       - name: Live Snowflake integration suite
         run: uv run pytest tests/integration -q -m snowflake
+
+  postgres:
+    # No repository gate and no environment: the target is a job-local service
+    # container, so there is nothing to authenticate against and nothing a
+    # fork could spend.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DEX_TEST_PG_DSN: postgresql://dex_ro:dex_ro@localhost:5432/dex_dogfood
+      DEX_TEST_PG_DEV_PASSWORD: dbt_dev
+    steps:
+      - uses: actions/checkout@v4
+      # The same seed the local dogfood container uses; psql ships on
+      # ubuntu-latest runners.
+      - name: Seed the service container
+        working-directory: .
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS dex_dogfood WITH (FORCE)" \
+            -c "CREATE DATABASE dex_dogfood"
+          PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
+            -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (postgres + duckdb + dev extras)
+        run: uv sync --extra postgres --extra duckdb --extra dev
+      - name: Live Postgres integration suite
+        run: uv run pytest tests/integration -q -m postgres
