@@ -155,7 +155,7 @@ def test_init_refuses_when_a_project_exists_in_a_child_dir(
     assert not (tmp_path / "fresh").exists()
 
 
-@pytest.mark.parametrize("connector", ["snowflake", "databricks", "postgres"])
+@pytest.mark.parametrize("connector", ["databricks", "postgres"])
 def test_cloud_connectors_error_actionably(tmp_path: Path, capsys, connector: str):
     rc, envelope = _run(_init_argv(tmp_path, "--connector", connector), capsys)
     assert rc == 1
@@ -163,6 +163,96 @@ def test_cloud_connectors_error_actionably(tmp_path: Path, capsys, connector: st
     assert connector in message
     assert "not yet supported" in message
     assert "duckdb" in message.lower()
+
+
+def _seed_snowflake_config(repo: Path, **target) -> None:
+    (repo / ".dex").mkdir(parents=True, exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        yaml.safe_dump({"snowflake": target}), encoding="utf-8"
+    )
+
+
+def _patch_snowflake_discovery(monkeypatch, params: dict):
+    # The renderer resolves the connection at call time from connect.py, so
+    # patching there keeps the real rendering logic under test.
+    import exmergo_dex_core.connect as connect_mod
+
+    monkeypatch.setattr(
+        connect_mod,
+        "resolve_snowflake_connection",
+        lambda target, env, root: (params, "named_connection:key_pair"),
+    )
+
+
+def test_init_snowflake_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch):
+    _seed_snowflake_config(
+        tmp_path,
+        warehouse="DEX_WH",
+        dev_database="SCRATCH",
+        databases=["SHOP"],
+    )
+    _patch_snowflake_discovery(
+        monkeypatch,
+        {
+            "account": "TESTORG-TESTACCT",
+            "user": "DEX_DEV",
+            "private_key_file": "/keys/k.p8",
+            "role": "DEX_ROLE",
+        },
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "snowflake"
+    profile = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    output = profile["analytics"]["outputs"]["dev"]
+    assert output["type"] == "snowflake"
+    assert output["account"] == "TESTORG-TESTACCT"
+    assert output["warehouse"] == "DEX_WH"
+    assert output["database"] == "SCRATCH"
+    assert output["schema"] == "DBT_DEV"
+    assert output["threads"] == 1
+    assert output["query_tag"] == "dex"
+    # Key-pair auth renders as a path, never a key or password value.
+    assert output["private_key_path"] == "/keys/k.p8"
+    assert "password" not in output
+
+
+def test_init_snowflake_refuses_unpinned_warehouse_and_source_collision(
+    tmp_path: Path, capsys, monkeypatch
+):
+    _patch_snowflake_discovery(
+        monkeypatch, {"account": "A", "user": "U", "password": "x"}
+    )
+    _seed_snowflake_config(tmp_path, dev_database="SCRATCH")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+    assert rc == 1
+    assert "snowflake.warehouse" in envelope["errors"][0]
+
+    _seed_snowflake_config(
+        tmp_path,
+        warehouse="DEX_WH",
+        dev_database="SHOP",
+        dev_schema="PUBLIC",
+        databases=["SHOP.PUBLIC"],
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+    assert rc == 1
+    assert "source" in envelope["errors"][0]
+
+
+def test_init_snowflake_never_persists_a_password(tmp_path: Path, capsys, monkeypatch):
+    _patch_snowflake_discovery(
+        monkeypatch,
+        {"account": "A", "user": "U", "password": "hunter2-never-rendered"},
+    )
+    _seed_snowflake_config(tmp_path, warehouse="DEX_WH", dev_database="SCRATCH")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+    assert rc == 0, envelope
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    assert "hunter2" not in rendered
+    assert "env_var" in rendered and "SNOWFLAKE_PASSWORD" in rendered
 
 
 def _seed_bigquery_config(repo: Path, **target) -> None:
