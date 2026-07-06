@@ -1,17 +1,22 @@
 name: Integration
 
-# Live BigQuery, authenticated via Workload Identity Federation (OIDC, no
-# stored keys, matching the release workflow's Trusted Publishing stance).
+# Live cloud connectors, authenticated via workload identity federation (OIDC,
+# no stored keys, matching the release workflow's Trusted Publishing stance).
 # Deliberately NOT a merge or release gate: ci.yml stays deterministic and
 # fork-runnable; this workflow answers "does the connector still work against
-# the real service" on main and on a schedule. The suite reads public datasets,
-# writes only to the TTL'd scratch dataset, and caps every query at
-# DEX_TEST_BQ_MAX_BYTES, so a worst-case run costs cents.
+# the real service" on main and on a schedule. Each suite reads shared/public
+# sample data, writes only to its scratch scope, and caps every statement
+# (bytes on BigQuery, seconds on Snowflake), so a worst-case run costs cents.
 #
-# One-time GCP setup (documented in CONTRIBUTING.md): a Workload Identity Pool
-# with a GitHub OIDC provider whose attribute condition restricts it to this
-# repository, and a service account holding roles/bigquery.jobUser on the
-# project plus roles/bigquery.dataEditor on the scratch dataset only.
+# One-time setup (documented in CONTRIBUTING.md):
+#   BigQuery: scripts/setup_bigquery_ci.sh (Workload Identity Pool provider
+#   pinned to this repo + environment; service account with jobUser on the
+#   project and dataEditor on the scratch dataset only).
+#   Snowflake: scripts/setup_snowflake_ci.sh (a SERVICE user whose
+#   WORKLOAD_IDENTITY accepts only GitHub OIDC tokens minted for this repo's
+#   snowflake-integration environment; a least-privilege role on the pinned
+#   X-Small warehouse and the transient scratch database; a resource monitor
+#   as the hard monthly cost backstop).
 on:
   push:
     branches: [main]
@@ -25,10 +30,10 @@ on:
 permissions:
   contents: read
 
-# One run at a time: the scratch dataset is shared, and serializing runs caps
+# One run at a time: the scratch scopes are shared, and serializing runs caps
 # worst-case concurrent spend.
 concurrency:
-  group: bigquery-integration
+  group: cloud-integration
   cancel-in-progress: false
 
 jobs:
@@ -68,4 +73,49 @@ jobs:
       - name: Sync (bigquery + duckdb + dev extras)
         run: uv sync --extra bigquery --extra duckdb --extra dev
       - name: Live BigQuery integration suite
-        run: uv run pytest tests/integration -q
+        run: uv run pytest tests/integration -q -m bigquery
+
+  snowflake:
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The environment carries the Snowflake variables and, via its deployment
+    # branch policy (main only), refuses this job to a workflow modified on a
+    # branch before the token is minted. The Snowflake-side pin mirrors it:
+    # the DEX_CI service user accepts only tokens whose subject names this
+    # repo + environment.
+    environment: snowflake-integration
+    permissions:
+      contents: read
+      id-token: write # OIDC for Snowflake workload identity; no stored keys.
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_SNOWFLAKE_DATABASE: DEX_CI
+      DEX_TEST_SNOWFLAKE_WAREHOUSE: DEX_CI_WH
+      DEX_TEST_SNOWFLAKE_MAX_SECONDS: "60"
+      SNOWFLAKE_ACCOUNT: ${{ vars.DEX_TEST_SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ vars.DEX_TEST_SNOWFLAKE_USER }}
+      SNOWFLAKE_AUTHENTICATOR: WORKLOAD_IDENTITY
+      SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER: OIDC
+    steps:
+      - uses: actions/checkout@v4
+      # Mint the GitHub OIDC token Snowflake validates (audience pinned to
+      # what the service user's OIDC_AUDIENCE_LIST expects) and hand it to the
+      # connector through the same SNOWFLAKE_* discovery path the engine uses
+      # everywhere: no CI special-casing.
+      - name: Mint GitHub OIDC token for Snowflake
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('snowflakecomputing.com')
+            core.setSecret(token)
+            core.exportVariable('SNOWFLAKE_TOKEN', token)
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (snowflake + duckdb + dev extras)
+        run: uv sync --extra snowflake --extra duckdb --extra dev
+      - name: Live Snowflake integration suite
+        run: uv run pytest tests/integration -q -m snowflake
