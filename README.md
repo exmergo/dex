@@ -2,6 +2,9 @@
 
 **Explore. Transform. Maintain. (ETM)**
 
+<img width="1280" height="563" alt="exmergo-dex-showcase" src="https://github.com/user-attachments/assets/9dd574c2-8598-47bc-ae90-7d5a3a4d2e18" />
+
+
 *Developed by Exmergo*
 
 ## Install (Claude Code)
