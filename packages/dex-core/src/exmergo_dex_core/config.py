@@ -61,6 +61,35 @@ class BigQueryTarget(BaseModel):
     max_full_profile_bytes: int | None = None
 
 
+class SnowflakeTarget(BaseModel):
+    """Non-secret Snowflake connection target. Credentials are never here: auth
+    is discovered at runtime by connect.py (connections.toml, SNOWFLAKE_* env,
+    or a dbt profile), and passwords or keys are never written or logged.
+
+    ``connection_name`` pins a ``connections.toml`` entry; unset means the
+    default connection, then the environment, then a dbt profile. ``warehouse``
+    is the pinned compute for every billed statement: dex refuses to spend on a
+    warehouse the config does not name, so a connection-level default can never
+    silently land work on oversized compute. ``databases`` is a source
+    allowlist (entries ``db`` or ``db.schema``); empty means every database the
+    role can see. ``dev_database``/``dev_schema`` are where dbt dev builds
+    write; the pair is refused as a source so reads and writes never share a
+    schema. ``max_full_profile_bytes`` opts large tables into sampled profiling
+    (SAMPLE SYSTEM) instead of a full scan. ``credit_price_usd`` is the
+    contract-specific dollar price of one credit; set it to see dollar figures
+    next to the credit translation (no API exposes it, so dex never guesses).
+    """
+
+    account: str | None = None
+    connection_name: str | None = None
+    warehouse: str | None = None
+    databases: list[str] = Field(default_factory=list)
+    dev_database: str | None = None
+    dev_schema: str | None = None
+    max_full_profile_bytes: int | None = None
+    credit_price_usd: float | None = None
+
+
 class QueryLimits(BaseModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
@@ -75,12 +104,14 @@ class QueryLimits(BaseModel):
 
 
 class DexConfig(BaseModel):
-    """The shape of ``.dex/config.yml``. DuckDB and BigQuery targets are wired;
-    the remaining cloud connector targets are not yet implemented."""
+    """The shape of ``.dex/config.yml``. DuckDB, BigQuery, and Snowflake
+    targets are wired; the remaining cloud connector targets are not yet
+    implemented."""
 
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
     bigquery: BigQueryTarget | None = None
+    snowflake: SnowflakeTarget | None = None
     dbt_target: str | None = None
     # Pins the dbt project directory (relative to the repo root) when discovery
     # would be ambiguous; by default the project is located automatically.

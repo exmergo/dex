@@ -117,9 +117,9 @@ def test_gate_session_remainder_binds_when_tighter():
 
 def test_gate_max_bytes_tracks_actual_billing():
     gate = _gate(ceiling=1_000.0)
-    assert gate.max_bytes_for_statement() == 1_000
+    assert gate.remaining_for_statement() == 1_000
     gate.record_billed(400.0, statement="SELECT 1")
-    assert gate.max_bytes_for_statement() == 600
+    assert gate.remaining_for_statement() == 600
 
 
 def test_gate_ledger_entries_carry_hashes_never_sql():

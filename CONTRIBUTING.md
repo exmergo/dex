@@ -22,7 +22,7 @@ uv run pytest
 ```
 
 Everything is deterministic and free: no cloud account is needed. The live
-BigQuery integration tests under `tests/integration/` collect as skipped with
+cloud integration tests under `tests/integration/` collect as skipped with
 the enabling variables named in the skip reason.
 
 ## Live BigQuery integration tests
@@ -68,6 +68,43 @@ variables, not secrets, on purpose: with WIF there is no credential to hide,
 the values are identifiers, and unmasked values make auth failures debuggable.
 The workflow is deliberately not a merge or release gate; forks skip it and
 can point the suite at their own project with the same environment variables.
+
+## Live Snowflake integration tests
+
+The same `tests/integration/` directory carries the Snowflake suite:
+connection discovery, the warehouse-seconds handshake with its credit
+translation, the over-ceiling refusal, a firewalled query, and a dbt build
+into the scratch database. It reads `SNOWFLAKE_SAMPLE_DATA` (shared data,
+free storage), bills warehouse time to the pinned X-Small only, and caps
+every statement at `DEX_TEST_SNOWFLAKE_MAX_SECONDS` (default 60), so a
+worst-case run costs cents; the account's resource monitor is the hard
+monthly backstop no bug can outspend.
+
+One-time setup is automated by `scripts/setup_snowflake_ci.sh` (run by a
+maintainer with an ACCOUNTADMIN `snow` connection): the `DEX_CI_WH` X-Small
+warehouse (60s auto-suspend, statement timeout, resource monitor), the
+transient zero-retention `DEX_CI` database, the least-privilege `DEX_CI_ROLE`
+(read samples, write scratch only: the grant-level enforcement of "dex never
+writes outside the dev target"), a workload-identity CI user, a key-pair dev
+user with a local `dex-ci` connection, and the GitHub environment with its
+variables.
+
+Run the suite locally against the `dex-ci` connection:
+
+```
+DEX_TEST_SNOWFLAKE_CONNECTION=dex-ci DEX_TEST_SNOWFLAKE_DATABASE=DEX_CI \
+    uv run pytest tests/integration -q -m snowflake
+```
+
+In CI the same suite runs from `.github/workflows/integration.yml`,
+authenticated via Snowflake workload identity federation (OIDC, no stored
+keys): the `DEX_CI` service user's `WORKLOAD_IDENTITY` accepts only GitHub
+OIDC tokens whose subject names this repository's `snowflake-integration`
+environment, whose deployment branch policy restricts it to `main`. The job
+mints the token itself and hands it to the connector through the ordinary
+`SNOWFLAKE_*` discovery path; `DEX_TEST_SNOWFLAKE_ACCOUNT` and
+`DEX_TEST_SNOWFLAKE_USER` are environment variables, not secrets, for the
+same debuggability reason as the BigQuery job.
 
 ## Agent evals (`evals/`)
 

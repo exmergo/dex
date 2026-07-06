@@ -186,14 +186,26 @@ class CostGate:
             return False
         return True
 
-    def max_bytes_for_statement(self) -> int | None:
-        """The server-side cap for the next statement: what remains of the
-        effective ceiling after everything already charged."""
+    def remaining_for_statement(self) -> int | None:
+        """The server-side cap for the next statement, in the paradigm's unit
+        (bytes for ``maximum_bytes_billed``, seconds for a statement timeout):
+        what remains of the effective ceiling after everything already charged.
+        """
 
         ceiling = self.effective_ceiling()
         if ceiling is None:
             return None
         return max(int(ceiling - self._billed), 0)
+
+    def ledger_field(self) -> str:
+        """The ledger key actual spend is recorded under. Paradigm-specific so
+        a bytes total and a seconds total can never silently sum together."""
+
+        return (
+            "billed_seconds"
+            if self.paradigm is Paradigm.COMPUTE_TIME
+            else "billed_bytes"
+        )
 
     def record_billed(
         self, billed: float, *, job_id: str | None = None, statement: str = ""
@@ -209,7 +221,7 @@ class CostGate:
                     "at": datetime.now(UTC).isoformat(),
                     "connector": self.connector,
                     "command": self.command,
-                    "billed_bytes": billed,
+                    self.ledger_field(): billed,
                     "job_id": job_id,
                     "statement_sha256": hashlib.sha256(
                         statement.encode("utf-8")
@@ -238,9 +250,14 @@ class CostGate:
     def spend_summary(self) -> dict:
         """Actual spend for the envelope's ``data`` (the ``cost`` field stays a
         preflight estimate by contract). Key names deliberately avoid every
-        envelope-sanitizer pattern."""
+        envelope-sanitizer pattern and carry the paradigm's unit."""
 
+        key = (
+            "seconds_billed"
+            if self.paradigm is Paradigm.COMPUTE_TIME
+            else "bytes_billed"
+        )
         return {
-            "bytes_billed": self._billed,
+            key: self._billed,
             "session_spent_today": self.session_spent + self._billed,
         }

@@ -641,6 +641,226 @@ def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_cl
     assert entry["statement_sha256"]
 
 
+# --- Snowflake: the compute-time connector exercises every family ---------------
+#
+# These run against the fake connection (tests/fakes/snowflake.py):
+# deterministic, offline, free. They importorskip on the [snowflake] extra,
+# which CI and the release gate install, so trimming that extra from a
+# workflow would silently skip release-blocking families; keep
+# `--extra snowflake` in ci.yml and release.yml.
+
+
+def _sf_adapter(fake_sf_connection, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+    from exmergo_dex_core.config import SnowflakeTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.COMPUTE_TIME,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="snowflake",
+    )
+    return SnowflakeAdapter(
+        connection=fake_sf_connection,
+        cost_gate=gate,
+        target=SnowflakeTarget(warehouse="DEX_WH"),
+        account="TESTORG-TESTACCT",
+        auth_method="named_connection:key_pair",
+        clock=fake_sf_connection.clock,
+    )
+
+
+def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
+    # Family 1: every data statement the adapter generates passes the
+    # SELECT-only guard in the snowflake dialect (asserted at build time).
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _sf_adapter(fake_sf_connection)
+    _meta, columns = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
+    sql, _plan = adapter._build_aggregate_sql("SHOP.PUBLIC.CUSTOMERS", columns, {"ID"})
+    assert sql.lstrip().upper().startswith("SELECT")
+    assert assert_select_only(sql, dialect="snowflake") == sql
+
+
+def test_select_only_guard_rejects_snowflake_writes_and_ddl():
+    # Family 1: Snowflake DML/DDL, stage/data movement, and multi-statement
+    # forms are all refused when parsed in the snowflake dialect.
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
+
+    for bad in (
+        "CREATE TABLE t AS SELECT 1",
+        "MERGE INTO d.t USING d.s ON FALSE WHEN NOT MATCHED THEN INSERT VALUES (1)",
+        "TRUNCATE TABLE d.t",
+        "SELECT 1; SELECT 2",
+        "DELETE FROM d.t WHERE TRUE",
+        "COPY INTO @mystage/x FROM (SELECT 1)",
+        "CALL d.proc()",
+        "ALTER WAREHOUSE wh SET WAREHOUSE_SIZE = 'X-Large'",
+    ):
+        with pytest.raises(NotSelectOnlyError):
+            assert_select_only(bad, dialect="snowflake")
+
+
+def test_snowflake_unconfirmed_scan_never_executes(fake_sf_connection):
+    # Family 2: the strict handshake. Without --confirm nothing runs on the
+    # warehouse (estimation is free SHOW metadata, so there is nothing to bill).
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _sf_adapter(fake_sf_connection, confirmed=False)
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_sf_connection.data_statements == []
+
+
+def test_snowflake_confirmed_run_without_a_ceiling_is_refused(fake_sf_connection):
+    # Family 2: nothing executes unbudgeted; confirmation cannot stand in for
+    # a ceiling on a billed paradigm.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _sf_adapter(fake_sf_connection, ceiling=None, confirmed=True)
+    with pytest.raises(CostGuardError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_sf_connection.data_statements == []
+
+
+def test_snowflake_over_ceiling_cannot_be_confirmed_through(fake_sf_connection):
+    # Family 2: over-ceiling blocks first, even fully confirmed.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _sf_adapter(fake_sf_connection, ceiling=2.0, confirmed=True)
+    with pytest.raises(OverCeilingError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "SHOP"."PUBLIC"."EVENTS"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_sf_connection.data_statements == []
+
+
+def test_snowflake_every_executed_statement_is_server_capped(fake_sf_connection):
+    # Family 2: defense in depth past the client-side gate; a wrong heuristic
+    # cannot overrun the budget because the statement timeout kills it.
+    fake_sf_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _sf_adapter(fake_sf_connection)
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    executed = fake_sf_connection.data_statements
+    assert executed
+    assert all(s.session_timeout is not None for s in executed)
+
+
+def test_query_firewall_blocks_snowflake_value_carrying_shapes():
+    # Family 3: PII stays flagged-not-surfaced under the snowflake dialect,
+    # including Snowflake's own value-carrying aggregates and casts.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "SELECT ANY_VALUE(email) FROM db.main.customers",
+        "SELECT ARRAY_AGG(email) FROM db.main.customers",
+        "SELECT LISTAGG(email, ',') FROM db.main.customers",
+        "SELECT TO_JSON(email) FROM db.main.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits(), dialect="snowflake")
+    # Measuring stays allowed in the snowflake dialect too.
+    inspect_query(
+        "SELECT COUNT(DISTINCT email) FROM db.main.customers",
+        cache,
+        QueryLimits(),
+        dialect="snowflake",
+    )
+
+
+def test_snowflake_capabilities_pass_the_sanitizer(fake_sf_connection, capsys):
+    # Family 5: the capabilities payload carries a coarse auth method, never
+    # an identity, password, or key, and survives the sanitizer end to end.
+    adapter = _sf_adapter(fake_sf_connection)
+    caps = adapter.capabilities()
+    env.emit(env.ok(caps))
+    out = capsys.readouterr().out
+    assert out
+    assert "@" not in out  # no user identity
+    assert caps["auth_method"].split(":")[0] in {
+        "named_connection",
+        "default_connection",
+        "environment",
+        "dbt_profile",
+        "unknown",
+    }
+
+
+def test_snowflake_spend_ledger_holds_no_sql_or_values(
+    tmp_path: Path, fake_sf_connection
+):
+    # Family 5: the audit trail is second counts and statement hashes only.
+    import json
+
+    from exmergo_dex_core.cache import DexStore
+
+    store = DexStore(tmp_path)
+    fake_sf_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _sf_adapter(fake_sf_connection)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = json.loads(lines[-1])
+    assert "SELECT" not in json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
+
+
+def test_ledgers_never_mix_paradigms(tmp_path: Path):
+    # Family 2 (cross-connector): a bytes session budget must not absorb a
+    # seconds entry and vice versa; each connector sums only its own unit.
+    from exmergo_dex_core.cache import DexStore
+
+    store = DexStore(tmp_path)
+    store.append_spend_log(
+        {
+            "at": "2026-07-05T00:00:01+00:00",
+            "connector": "bigquery",
+            "billed_bytes": 5000,
+        }
+    )
+    store.append_spend_log(
+        {
+            "at": "2026-07-05T00:00:02+00:00",
+            "connector": "snowflake",
+            "billed_seconds": 42.0,
+        }
+    )
+    assert store.spend_since("2026-07-05T00:00:00+00:00", connector="bigquery") == 5000
+    assert (
+        store.spend_since(
+            "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="snowflake"
+        )
+        == 42.0
+    )
+
+
 # --- Maintain: drift detection and reconcile exercise every family -------------
 #
 # Detection is read-only against data and writes only to `.dex/`; only reconcile

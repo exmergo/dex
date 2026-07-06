@@ -88,6 +88,53 @@ def fake_bq_client():
 
 
 @pytest.fixture
+def fake_sf_connection():
+    """The standard populated fake Snowflake connection (see
+    tests/fakes/snowflake.py).
+
+    Requires the real snowflake-connector-python library (the [snowflake]
+    extra) for its error types; skipped when absent, but CI and the release
+    gate install the extra, so the Snowflake safety families run everywhere
+    that matters. The DEX_WH warehouse starts SUSPENDED so resume-minimum
+    behavior is on by default; tests that want a warm warehouse flip its state.
+    """
+
+    pytest.importorskip("snowflake.connector")
+    from fakes.snowflake import (
+        FakeSnowflakeConnection,
+        FakeSnowflakeTable,
+        FakeWarehouse,
+    )
+
+    tables = [
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="PUBLIC",
+            name="CUSTOMERS",
+            columns=[("ID", "FIXED", False), ("EMAIL", "TEXT", True)],
+            rows=100,
+            bytes=5_000_000_000,  # 5 GB -> a non-trivial seconds estimate
+        ),
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="PUBLIC",
+            name="EVENTS",
+            columns=[
+                ("ID", "FIXED", True),
+                ("PAYLOAD", "VARIANT", True),
+                ("LABELS", "ARRAY", True),
+            ],
+            rows=1_000,
+            bytes=50_000_000_000,  # 50 GB
+        ),
+    ]
+    return FakeSnowflakeConnection(
+        tables=tables,
+        warehouses=[FakeWarehouse(name="DEX_WH", size="X-Small", state="SUSPENDED")],
+    )
+
+
+@pytest.fixture
 def dbt_project_dir(tmp_path: Path) -> Path:
     """A minimal dbt project with a project-local profiles.yml.
 

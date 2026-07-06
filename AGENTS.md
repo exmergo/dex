@@ -40,7 +40,7 @@ release is connector-neutral.
 
 | Subcommand | Returns |
 |---|---|
-| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, BigQuery takes `--project`/`--dataset` convenience overrides (never written to config) |
+| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, BigQuery takes `--project`/`--dataset` convenience overrides (never written to config); Snowflake reports the pinned warehouse and its credit rate |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings |
 | `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
@@ -90,14 +90,19 @@ Every command prints exactly one JSON object and nothing else:
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that
 would spend requires an explicit `--confirm` and a session budget: on a billed
-connector (BigQuery today) the first call returns `needs_confirmation` with a
-free dry-run byte estimate, and the same command is re-issued with
-`--confirm --budget <bytes>` once the user has agreed to the spend. Actual
-billed bytes come back under `data.spend` and accumulate in the
-`.dex/spend.jsonl` ledger. Credentials never appear in `data` (BigQuery
-authenticates via discovered Application Default Credentials, never a pasted
-key), and result values appear only in `explore query`'s columnar payload
-after the query firewall has cleared them.
+connector (BigQuery and Snowflake today) the first call returns
+`needs_confirmation` with a free estimate, and the same command is re-issued
+with `--confirm --budget <magnitude>` once the user has agreed to the spend.
+The magnitude is paradigm-relative: **bytes** on BigQuery (an exact free
+dry-run figure), **warehouse-seconds** on Snowflake (a heuristic labeled
+`estimate_quality: "heuristic"`, with a credit translation alongside; the
+budget still binds exactly via a server-side statement timeout). Actual spend
+comes back under `data.spend` (`bytes_billed` or `seconds_billed`) and
+accumulates in the `.dex/spend.jsonl` ledger per connector. Credentials never
+appear in `data` (BigQuery authenticates via discovered Application Default
+Credentials, Snowflake via a discovered `connections.toml` entry, environment,
+or dbt profile; never a pasted key), and result values appear only in
+`explore query`'s columnar payload after the query firewall has cleared them.
 
 ## Guardrails (non-negotiable, enforced in the engine)
 

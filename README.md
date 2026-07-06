@@ -42,29 +42,33 @@ intent.
 
 ## Connectors
 
-Cloud warehouse: **BigQuery** (live), **Snowflake**, **Databricks**. Operational
-database: **PostgreSQL**. Embedded analytical: **DuckDB** (the zero-credential
-on-ramp, and the engine behind the eval and benchmark suites). Each client library
-is behind an optional extra, so the DuckDB on-ramp installs only `duckdb` and
-`sqlglot`; BigQuery installs with `exmergo-dex-core[bigquery]`. To pull every
+Cloud warehouse: **BigQuery** (live), **Snowflake** (live), **Databricks**.
+Operational database: **PostgreSQL**. Embedded analytical: **DuckDB** (the
+zero-credential on-ramp, and the engine behind the eval and benchmark suites).
+Each client library is behind an optional extra, so the DuckDB on-ramp installs
+only `duckdb` and `sqlglot`; the cloud connectors install with
+`exmergo-dex-core[bigquery]` or `exmergo-dex-core[snowflake]`. To pull every
 connector at once, install `exmergo-dex-core[all]`.
 
-BigQuery authenticates through Application Default Credentials (run
-`gcloud auth application-default login`); dex discovers credentials, it never
-asks for keys. Every scan is estimated with a free dry-run and confirmed before
-it spends, capped server-side with `maximum_bytes_billed`, and recorded in a
-local spend ledger.
+Cloud credentials are discovered, never asked for: BigQuery through
+Application Default Credentials (`gcloud auth application-default login`),
+Snowflake through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile.
+Every scan is estimated and confirmed before it spends, capped server-side
+(`maximum_bytes_billed` on BigQuery; a per-statement statement timeout on
+Snowflake, where budgets are warehouse-seconds with credits shown alongside),
+and recorded in a local spend ledger.
 
 ## Status
 
 **v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required:
 explore, transform, and now **maintain** (drift detection and reconcile across
 schema, volume, grain, and semantic axes). **Explore, transform, and maintain
-also run on BigQuery**, the first cloud connector: credential discovery via ADC,
-bytes-scanned cost guards with a confirm-before-spend handshake, and
-dev-dataset-only dbt builds via dbt-bigquery. Snowflake, Databricks, and
-PostgreSQL land next as v0.2 completes; published benchmark scores (ADE-bench
-uplift and cost/turn efficiency, Spider2.0-DBT) land with v0.3.
+also run on BigQuery and Snowflake**, the first two cloud connectors, each with
+credential discovery, cost guards with a confirm-before-spend handshake
+(bytes-scanned on BigQuery, warehouse-seconds on Snowflake), and dev-target-only
+dbt builds. Databricks and PostgreSQL land next as v0.2 completes; published
+benchmark scores (ADE-bench uplift and cost/turn efficiency, Spider2.0-DBT)
+land with v0.3.
 
 ## Beyond Claude Code
 
@@ -120,6 +124,13 @@ credentials:
   and the `gcp-integration` environment with its variables), automated by
   `scripts/setup_bigquery_ci.sh`; background in `CONTRIBUTING.md` under "Live
   BigQuery integration tests".
+- **Snowflake integration CI:** one-time Snowflake and GitHub setup (a
+  workload-identity service user pinned to this repo's
+  `snowflake-integration` environment, a least-privilege role, the pinned
+  X-Small `DEX_CI_WH` warehouse with a resource-monitor backstop, the
+  transient `DEX_CI` scratch database, and a key-pair dev user with a local
+  `dex-ci` connection for running the live suite while developing), automated
+  by `scripts/setup_snowflake_ci.sh`.
 
 ## License
 

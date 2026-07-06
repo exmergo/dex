@@ -534,7 +534,7 @@ class BigQueryAdapter:
         cap, wait for completion (bounded when a timeout is given), account the
         actual billed bytes, and return (job, row iterator)."""
 
-        cap = self.cost_gate.max_bytes_for_statement()
+        cap = self.cost_gate.remaining_for_statement()
         if cap is not None and cap < _MIN_BILLED_BYTES:
             raise OverCeilingError(
                 f"the remaining budget ({cap} bytes) is below BigQuery's "

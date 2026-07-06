@@ -145,9 +145,10 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     budget = getattr(args, "budget", None)
     ceiling = budget if budget is not None else config.budget.ceiling
     connector = getattr(args, "connector", None) or config.connector
-    paradigm = (
-        Paradigm.BYTES_SCANNED if connector == "bigquery" else Paradigm.FREE_LOCAL
-    )
+    paradigm = {
+        "bigquery": Paradigm.BYTES_SCANNED,
+        "snowflake": Paradigm.COMPUTE_TIME,
+    }.get(connector, Paradigm.FREE_LOCAL)
 
     try:
         summary, cost = run_build(
@@ -172,7 +173,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
 
     messages = summary.pop("messages", [])
     notes = summary.pop("notes", [])
-    if paradigm is not Paradigm.FREE_LOCAL:
+    if paradigm is Paradigm.BYTES_SCANNED:
         notes = [
             "dbt has no dry-run, so this build's scan size could not be "
             "estimated upfront; each statement was capped server-side by the "
@@ -181,7 +182,22 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         ]
         billed = summary.get("bytes_billed")
         if billed:
-            _record_build_spend(repo_root, connector, billed)
+            _record_build_spend(repo_root, connector, billed, "billed_bytes")
+    elif paradigm is Paradigm.COMPUTE_TIME:
+        notes = [
+            "dbt has no dry-run, so this build's warehouse time could not be "
+            "estimated upfront; the warehouse-level statement timeout and "
+            "auto-suspend are the server-side caps",
+            *notes,
+        ]
+        # dbt-snowflake reports no billing figure; per-node execution time is
+        # the honest warehouse-seconds actual.
+        seconds = sum(
+            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
+        )
+        if seconds:
+            summary["seconds_billed"] = seconds
+            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
     if summary["success"]:
         return env.ok(summary, cost=cost, warnings=[*notes, *messages])
     # Agents triage from `errors` first, so the first real dbt message rides
@@ -245,9 +261,11 @@ def cmd_semantic_plan(args: argparse.Namespace) -> env.Envelope:
 # --- helpers -----------------------------------------------------------------
 
 
-def _record_build_spend(repo_root, connector: str, billed: float) -> None:
+def _record_build_spend(repo_root, connector: str, billed: float, field: str) -> None:
     """Account a billed dbt build in the `.dex/spend.jsonl` ledger, so builds
-    draw against the same session budget as explore scans."""
+    draw against the same session budget as explore scans. ``field`` carries
+    the connector's unit (bytes or seconds), matching what its cost gate
+    records."""
 
     from datetime import UTC, datetime
 
@@ -258,7 +276,7 @@ def _record_build_spend(repo_root, connector: str, billed: float) -> None:
             "at": datetime.now(UTC).isoformat(),
             "connector": connector,
             "command": "transform build",
-            "billed_bytes": float(billed),
+            field: float(billed),
             "job_id": None,
             "statement_sha256": None,
         }
