@@ -35,6 +35,7 @@ from ..config import (
     BigQueryTarget,
     DexConfig,
     DuckDBTarget,
+    SnowflakeTarget,
     load_config,
     save_config,
 )
@@ -97,9 +98,9 @@ def init_project(
     render_profile = _PROFILE_RENDERERS.get(connector)
     if render_profile is None:
         raise InitError(
-            f"connector '{connector}' is not yet supported for init; DuckDB and "
-            "BigQuery are the supported paths today (`transform init <name> "
-            "--connector duckdb|bigquery`)"
+            f"connector '{connector}' is not yet supported for init; DuckDB, "
+            "BigQuery, and Snowflake are the supported paths today "
+            "(`transform init <name> --connector duckdb|bigquery|snowflake`)"
         )
 
     project_name = sanitize_project_name(name)
@@ -261,9 +262,88 @@ def _resolve_init_project(target: BigQueryTarget, root: Path) -> str | None:
     return resolve_bigquery_project(target, os.environ, adc_project, repo_root=root)
 
 
+_DEFAULT_SF_DEV_SCHEMA = "DBT_DEV"
+
+
+def _snowflake_profile(
+    project_name: str, path: str | None, config: DexConfig, root: Path
+) -> str:
+    """A single dbt-snowflake ``dev`` target from the discovered connection,
+    with no secret ever rendered: key-pair auth becomes a ``private_key_path``
+    (a path, not a key), SSO stays ``externalbrowser``, and a password-based
+    connection renders an ``env_var`` reference. Writes go to a dedicated dev
+    database.schema, never to a source scope, on the pinned warehouse only."""
+
+    from ..connect import CredentialDiscoveryError, resolve_snowflake_connection
+
+    target = config.snowflake or SnowflakeTarget()
+    try:
+        params, _method = resolve_snowflake_connection(target, os.environ, root)
+    except CredentialDiscoveryError as exc:
+        raise InitError(str(exc)) from exc
+
+    if not target.warehouse:
+        raise InitError(
+            "no warehouse pinned: set snowflake.warehouse in .dex/config.yml "
+            "(dbt builds run only on the pinned warehouse, never a "
+            "connection default)"
+        )
+    dev_database = target.dev_database or params.get("database")
+    if not dev_database:
+        raise InitError(
+            "no dev database to write to: set snowflake.dev_database in "
+            ".dex/config.yml (a scratch database the role can write; source "
+            "databases stay read-only)"
+        )
+    dev_schema = target.dev_schema or _DEFAULT_SF_DEV_SCHEMA
+    dev_scope = f"{dev_database}.{dev_schema}".upper()
+    source_scopes = {entry.upper() for entry in target.databases}
+    if dev_scope in source_scopes:
+        raise InitError(
+            f"dev target '{dev_scope}' is also a source scope in "
+            "snowflake.databases; dbt builds must write where dex does not "
+            "read (set snowflake.dev_database/dev_schema to a dedicated pair)"
+        )
+
+    target.dev_database = str(dev_database)
+    target.dev_schema = dev_schema
+    config.snowflake = target
+
+    output: dict[str, Any] = {
+        "type": "snowflake",
+        "account": str(params["account"]),
+        "user": str(params.get("user", "")),
+        "role": str(params["role"]) if params.get("role") else None,
+        "warehouse": target.warehouse,
+        "database": str(dev_database),
+        "schema": dev_schema,
+        # One thread keeps the smallest warehouse from parallel bursts; the
+        # per-model runtime is the guarded quantity on compute-time billing.
+        "threads": 1,
+        "query_tag": "dex",
+    }
+    output = {k: v for k, v in output.items() if v is not None}
+
+    private_key = params.get("private_key_file") or params.get("private_key_path")
+    authenticator = str(params.get("authenticator", "")).upper()
+    if private_key:
+        output["private_key_path"] = str(private_key)
+    elif authenticator == "EXTERNALBROWSER":
+        output["authenticator"] = "externalbrowser"
+    else:
+        # Never persist a password or token: the profile reads it from the
+        # environment at dbt runtime instead (a Jinja reference, not a value).
+        output["password"] = "{{ env_var('SNOWFLAKE_PASSWORD') }}"  # noqa: S105
+    return yaml.safe_dump(
+        {project_name: {"target": "dev", "outputs": {"dev": output}}},
+        sort_keys=False,
+    )
+
+
 _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]] = {
     "duckdb": _duckdb_profile,
     "bigquery": _bigquery_profile,
+    "snowflake": _snowflake_profile,
 }
 
 
