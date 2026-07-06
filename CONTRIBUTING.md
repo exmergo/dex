@@ -180,3 +180,45 @@ bump it:
 - `.github/workflows/lint.yml` (the `uvx ruff@<version>` calls)
 - `.pre-commit-config.yaml` (the `rev:` tag)
 - `packages/dex-core/pyproject.toml` (the `ruff==<version>` pin in the `dev` extra)
+
+
+## Maintainers
+
+A few post-scaffold steps need accounts or network. Run them with the appropriate
+credentials:
+
+- **GitHub repo metadata:** set the repo **description** to the keyword sentence
+  at the top of this README, and add **Topics**: `analytics-engineering`, `dbt`,
+  `claude-code`, `text-to-sql`, `semantic-layer`, `duckdb`, `snowflake`,
+  `bigquery`, `databricks`, `data-engineering`, `agent`, `metricflow`,
+  `schema-drift`, `data-contracts`. This is where discovery lives, not the slug.
+- **TestPyPI dry-run:** `scripts/testpypi_dry_run.sh` proves the publish-and-pin
+  loop before automation.
+- **PyPI Trusted Publishing (both projects):** configure a pending publisher for
+  `exmergo-dex-core` (owner `exmergo`, repo `dex`, workflow `release.yml`,
+  environment `pypi`) and a second for `dex-core` with the **same values except
+  environment `pypi-stub`**. The environments must differ: PyPI rejects two
+  pending publishers that share an identical config. Create both environments in
+  the repo's GitHub settings. No API tokens are stored.
+- **Anti-squat `dex-core` stub:** published automatically by the
+  `reserve-dex-core` job in `release.yml` from `packages/dex-core-stub/`,
+  idempotently via `uv publish --check-url`. It claims the name on the first
+  tagged release and is a no-op after. For protection before that release, you
+  can publish the stub once by hand; the CI job then simply skips it.
+- **ADE-bench spike:** stand up ADE-bench locally on DuckDB against the no-plugin
+  baseline to confirm the runner before depending on it (the exact command is in
+  `benchmarks/ade_bench/README.md`).
+- **Marketplace entry:** at v0.1 ship time, add the `dex` entry to the
+  `exmergo/exmergo-agent-plugins` catalog with a pinned `ref`.
+- **BigQuery integration CI:** one-time GCP and GitHub setup (Workload
+  Identity Federation, a scoped service account, the `dex_ci` scratch dataset,
+  and the `gcp-integration` environment with its variables), automated by
+  `scripts/setup_bigquery_ci.sh`; background in `CONTRIBUTING.md` under "Live
+  BigQuery integration tests".
+- **Snowflake integration CI:** one-time Snowflake and GitHub setup (a
+  workload-identity service user pinned to this repo's
+  `snowflake-integration` environment, a least-privilege role, the pinned
+  X-Small `DEX_CI_WH` warehouse with a resource-monitor backstop, the
+  transient `DEX_CI` scratch database, and a key-pair dev user with a local
+  `dex-ci` connection for running the live suite while developing), automated
+  by `scripts/setup_snowflake_ci.sh`.
