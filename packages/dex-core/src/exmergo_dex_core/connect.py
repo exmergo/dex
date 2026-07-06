@@ -5,13 +5,17 @@ engine process and never reach the agent. DuckDB is a local file path, opened
 read-only, no credentials. BigQuery discovers credentials ("discover, don't
 ask"): Application Default Credentials only, never a prompted or pasted key,
 with the project resolved from explicit config, the environment, the ADC
-default, or a dbt profile, in that order. Every discovery failure names the
-fix; nothing is ever prompted for.
+default, or a dbt profile, in that order. Snowflake discovers a connection the
+same way: a named ``connections.toml`` entry, the default connection, the
+``SNOWFLAKE_*`` environment (which is also how CI's workload-identity token
+arrives), or a dbt profile. Every discovery failure names the fix; nothing is
+ever prompted for.
 """
 
 from __future__ import annotations
 
 import os
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,7 +23,7 @@ import yaml
 
 from .adapters import get_adapter
 from .cache import DexStore
-from .config import BigQueryTarget, DexConfig, load_config
+from .config import BigQueryTarget, DexConfig, SnowflakeTarget, load_config
 from .envelope import Paradigm
 from .guards.cost_guard import CostGate
 
@@ -71,6 +75,11 @@ def open_adapter(
             dataset_override=datasets,
         )
 
+    if connector == "snowflake":
+        return _open_snowflake(
+            config, repo_root, budget=budget, confirmed=confirmed, command=command
+        )
+
     # The remaining cloud connectors are not yet implemented.
     return get_adapter(connector)
 
@@ -114,7 +123,7 @@ def _open_bigquery(
         paradigm=Paradigm.BYTES_SCANNED,
         ceiling=budget if budget is not None else config.budget.ceiling,
         session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(utc_midnight),
+        session_spent=store.spend_since(utc_midnight, connector="bigquery"),
         confirmed=confirmed,
         connector="bigquery",
         command=command,
@@ -128,6 +137,257 @@ def _open_bigquery(
         credentials=credentials,
         principal_type=principal_type,
     )
+
+
+def _open_snowflake(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+):
+    target = config.snowflake or SnowflakeTarget()
+    params, method = resolve_snowflake_connection(target, os.environ, repo_root)
+
+    try:
+        import snowflake.connector
+    except ImportError as exc:
+        raise CredentialDiscoveryError(
+            "the Snowflake client is not installed; install the connector "
+            "extra: exmergo-dex-core[snowflake]"
+        ) from exc
+
+    # The pinned warehouse rides on the session so free paths and dbt agree,
+    # but the adapter re-asserts the pin before anything billed regardless.
+    if target.warehouse:
+        params.setdefault("warehouse", target.warehouse)
+    params.setdefault("client_session_keep_alive", False)
+    connection = snowflake.connector.connect(**params)
+
+    store = DexStore(repo_root)
+    utc_midnight = (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=budget if budget is not None else config.budget.ceiling,
+        session_ceiling=config.budget.session_ceiling,
+        session_spent=store.spend_since(
+            utc_midnight, field="billed_seconds", connector="snowflake"
+        ),
+        confirmed=confirmed,
+        connector="snowflake",
+        command=command,
+        record=store.append_spend_log,
+    )
+    return get_adapter(
+        "snowflake",
+        connection=connection,
+        cost_gate=gate,
+        target=target,
+        account=str(params.get("account") or "") or None,
+        auth_method=method,
+    )
+
+
+def resolve_snowflake_connection(
+    target: SnowflakeTarget,
+    env: dict | os._Environ,
+    repo_root: str | Path = ".",
+) -> tuple[dict, str]:
+    """Discover Snowflake connection parameters, never prompting.
+
+    Returns ``(params, auth_method)`` where ``params`` feeds
+    ``snowflake.connector.connect`` and ``auth_method`` is a coarse class safe
+    to surface (named_connection / default_connection / environment /
+    dbt_profile, suffixed with the credential kind); parameter values,
+    including any password or key a store legitimately holds, never leave the
+    engine process. Order: the config-pinned ``connections.toml`` entry, the
+    default connection, ``SNOWFLAKE_*`` environment variables (the CI path:
+    a workload-identity token arrives as SNOWFLAKE_TOKEN), then a dbt
+    profile's snowflake target. Every failure names the fix.
+    """
+
+    connections = _snowflake_connections(env)
+
+    if target.connection_name:
+        params = connections.get(target.connection_name)
+        if params is None:
+            raise CredentialDiscoveryError(
+                f"snowflake.connection_name '{target.connection_name}' not "
+                "found in connections.toml; run `snow connection add "
+                f"--connection-name {target.connection_name} ...` or fix the "
+                "name in .dex/config.yml"
+            )
+        return _normalize_connection(params, target), (
+            f"named_connection:{_credential_kind(params)}"
+        )
+
+    default_name = env.get("SNOWFLAKE_DEFAULT_CONNECTION_NAME") or connections.get(
+        "__default__"
+    )
+    if isinstance(default_name, str) and default_name in connections:
+        params = connections[default_name]
+        return _normalize_connection(params, target), (
+            f"default_connection:{_credential_kind(params)}"
+        )
+
+    if env.get("SNOWFLAKE_ACCOUNT") and env.get("SNOWFLAKE_USER"):
+        params = {
+            key: env[var]
+            for var, key in (
+                ("SNOWFLAKE_ACCOUNT", "account"),
+                ("SNOWFLAKE_USER", "user"),
+                ("SNOWFLAKE_PASSWORD", "password"),
+                ("SNOWFLAKE_AUTHENTICATOR", "authenticator"),
+                ("SNOWFLAKE_PRIVATE_KEY_FILE", "private_key_file"),
+                ("SNOWFLAKE_TOKEN", "token"),
+                ("SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER", "workload_identity_provider"),
+                ("SNOWFLAKE_ROLE", "role"),
+                ("SNOWFLAKE_WAREHOUSE", "warehouse"),
+                ("SNOWFLAKE_DATABASE", "database"),
+            )
+            if env.get(var)
+        }
+        return _normalize_connection(params, target), (
+            f"environment:{_credential_kind(params)}"
+        )
+
+    profile_params = _snowflake_from_dbt_profiles(repo_root)
+    if profile_params:
+        return _normalize_connection(profile_params, target), (
+            f"dbt_profile:{_credential_kind(profile_params)}"
+        )
+
+    raise CredentialDiscoveryError(
+        "no Snowflake connection discovered; add one with `snow connection "
+        "add` (then set snowflake.connection_name in .dex/config.yml), or "
+        "export SNOWFLAKE_ACCOUNT/SNOWFLAKE_USER plus a credential, or keep a "
+        "snowflake target in your dbt profiles.yml"
+    )
+
+
+def _normalize_connection(params: dict, target: SnowflakeTarget) -> dict:
+    normalized = dict(params)
+    if target.account:
+        normalized["account"] = target.account
+    if not normalized.get("account"):
+        raise CredentialDiscoveryError(
+            "the discovered Snowflake connection has no account identifier; "
+            "set snowflake.account in .dex/config.yml or fix the connection"
+        )
+    return normalized
+
+
+def _credential_kind(params: dict) -> str:
+    """The coarse credential class for the envelope; never a value."""
+
+    authenticator = str(params.get("authenticator", "")).upper()
+    if authenticator == "WORKLOAD_IDENTITY":
+        return "workload_identity"
+    if authenticator == "EXTERNALBROWSER":
+        return "sso_browser"
+    if (
+        params.get("private_key_file")
+        or params.get("private_key_path")
+        or params.get("private_key")
+    ):
+        return "key_pair"
+    if params.get("token"):
+        return "token"
+    if params.get("password"):
+        return "password"
+    return "unknown"
+
+
+def _snowflake_connections(env: dict | os._Environ) -> dict:
+    """Parse the Snowflake config stores the ``snow`` CLI and the Python
+    connector share. Returns name -> params, plus ``__default__`` naming the
+    configured default connection when one is declared.
+
+    Search order matches the connector: ``$SNOWFLAKE_HOME``, ``~/.snowflake``,
+    then the platform config dir. ``connections.toml`` holds top-level
+    connection tables; ``config.toml`` holds ``[connections.<name>]`` tables
+    and ``default_connection_name``.
+    """
+
+    candidates: list[Path] = []
+    snowflake_home = env.get("SNOWFLAKE_HOME")
+    if snowflake_home:
+        candidates.append(Path(snowflake_home))
+    candidates.append(Path.home() / ".snowflake")
+    candidates.append(_platform_config_dir())
+
+    connections: dict = {}
+    for directory in candidates:
+        connections_file = directory / "connections.toml"
+        config_file = directory / "config.toml"
+        try:
+            if connections_file.is_file():
+                parsed = tomllib.loads(connections_file.read_text(encoding="utf-8"))
+                for name, params in parsed.items():
+                    if isinstance(params, dict):
+                        connections.setdefault(name, params)
+            if config_file.is_file():
+                parsed = tomllib.loads(config_file.read_text(encoding="utf-8"))
+                for name, params in (parsed.get("connections") or {}).items():
+                    if isinstance(params, dict):
+                        connections.setdefault(name, params)
+                default = parsed.get("default_connection_name")
+                if isinstance(default, str):
+                    connections.setdefault("__default__", default)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+    return connections
+
+
+def _platform_config_dir() -> Path:
+    import sys
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "snowflake"
+    return Path.home() / ".config" / "snowflake"
+
+
+def _snowflake_from_dbt_profiles(repo_root: str | Path) -> dict | None:
+    """Best-effort: the connection fields of a ``type: snowflake`` output in
+    the discovered dbt project's profiles. Any failure means "not found"."""
+
+    try:
+        from .dbt_project import PROFILES_FILE, find_project, profiles_dir
+
+        project_dir = find_project(repo_root)
+        profiles_path = profiles_dir(project_dir) / PROFILES_FILE
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if (
+                isinstance(output, dict)
+                and output.get("type") == "snowflake"
+                and output.get("account")
+            ):
+                params = {
+                    key: output[key]
+                    for key in (
+                        "account",
+                        "user",
+                        "password",
+                        "authenticator",
+                        "role",
+                        "warehouse",
+                        "database",
+                    )
+                    if output.get(key)
+                }
+                if output.get("private_key_path"):
+                    params["private_key_file"] = output["private_key_path"]
+                return params
+    return None
 
 
 def _default_credentials():
