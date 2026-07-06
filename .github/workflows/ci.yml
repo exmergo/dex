@@ -26,11 +26,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      # bigquery is included so the BigQuery unit tests and safety families run
-      # here (they are offline against a fake client, but they importorskip on
-      # the client library; without the extra they would silently skip).
-      - name: Sync (duckdb + bigquery + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra dev --python ${{ matrix.python-version }}
+      # The cloud extras are included so their unit tests and safety families
+      # run here (they are offline against fake clients, but they importorskip
+      # on the client libraries; without the extras they would silently skip).
+      - name: Sync (duckdb + bigquery + snowflake + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra dev --python ${{ matrix.python-version }}
       - name: Tier-1 unit tests
         run: uv run pytest -q
 
@@ -48,8 +48,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Sync (duckdb + bigquery + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra dev
+      - name: Sync (duckdb + bigquery + snowflake + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra dev
       - name: Safety-critical assertions
         run: uv run pytest -q tests/test_safety_spine.py
 
