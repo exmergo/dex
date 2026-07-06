@@ -2,7 +2,31 @@
 
 **Explore. Transform. Maintain. (ETM)**
 
-dex is analytics engineering for Claude Code and any agent: data warehouse
+*Developed by Exmergo*
+
+## Install (Claude Code)
+
+Run these commands one at a time
+```
+/plugin marketplace add exmergo/exmergo-agent-plugins
+```
+```
+/plugin install dex@exmergo
+```
+
+Update later with `/plugin marketplace update exmergo`. The skills appear as
+`/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
+intent.
+
+## Install (Any Agent)
+
+```
+npx skills install exmergo/dex
+```
+
+## Intro
+
+`dex` is analytics engineering for Claude Code and any agent: data warehouse
 exploration, dbt transformation and semantic modeling, and schema-drift
 maintenance on dbt. Point it at your warehouse (or a local DuckDB file) and your
 dbt project; it learns the landscape, writes and refactors your dbt transformations
@@ -14,7 +38,7 @@ It closes the gap a general coding agent still has: agents re-learn the schema
 each session, have no strategy for thousands of tables, are blind to warehouse
 cost, will pull sensitive data into context, do not treat a dbt project as a
 first-class object, and have no concept of a semantic model to keep coherent over
-time. dex owns exactly that loop.
+time. `dex` owns exactly that loop.
 
 ## The loop
 
@@ -29,22 +53,12 @@ time. dex owns exactly that loop.
   last snapshot, surface schema, volume, grain, and definition drift ranked by
   blast radius, and propose edits.
 
-## Install (Claude Code)
-
-```
-/plugin marketplace add exmergo/exmergo-agent-plugins
-/plugin install dex@exmergo
-```
-
-Update later with `/plugin marketplace update exmergo`. The skills appear as
-`/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
-intent.
-
 ## Connectors
 
-Cloud warehouse: **BigQuery** (live), **Snowflake** (live), **Databricks**.
-Operational database: **PostgreSQL**. Embedded analytical: **DuckDB** (the
-zero-credential on-ramp, and the engine behind the eval and benchmark suites).
+- Cloud warehouse:  **Snowflake**, **BigQuery**.
+- Embedded analytical: **DuckDB** (the zero-credential on-ramp, and the engine 
+behind the eval and benchmark suites).
+
 Each client library is behind an optional extra, so the DuckDB on-ramp installs
 only `duckdb` and `sqlglot`; the cloud connectors install with
 `exmergo-dex-core[bigquery]` or `exmergo-dex-core[snowflake]`. To pull every
@@ -58,6 +72,11 @@ Every scan is estimated and confirmed before it spends, capped server-side
 Snowflake, where budgets are warehouse-seconds with credits shown alongside),
 and recorded in a local spend ledger.
 
+### Upcoming Connectors
+
+- Cloud warehouse: **Databricks**, **AWS Redshift**
+- Operational database: **PostgreSQL**
+
 ## Status
 
 **v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required:
@@ -69,14 +88,6 @@ credential discovery, cost guards with a confirm-before-spend handshake
 dbt builds. Databricks and PostgreSQL land next as v0.2 completes; published
 benchmark scores (ADE-bench uplift and cost/turn efficiency, Spider2.0-DBT)
 land with v0.3.
-
-## Beyond Claude Code
-
-The engine is portable. `AGENTS.md` documents how any coding agent (Codex, Gemini
-CLI, Cursor, and others) drives the same `exmergo-dex-core` engine through its
-command contract, with identical guardrails. Claude Code is the first-class,
-evaluated path; other agents are supported and become eval-gated as the benchmarks
-land.
 
 ## Cross-agent and engine
 
