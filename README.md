@@ -1,15 +1,12 @@
-# dex: the agent-native analytics engineering toolkit
-
-**Explore. Transform. Maintain. (ETM)**
+# `dex`: the agent-native analytics engineering toolkit
 
 <img width="1280" height="563" alt="exmergo-dex-showcase" src="https://github.com/user-attachments/assets/9dd574c2-8598-47bc-ae90-7d5a3a4d2e18" />
-
 
 *Developed by Exmergo*
 
 ## Install (Claude Code)
 
-Run these commands one at a time
+Run these commands **inside Claude Code** one at a time
 ```
 /plugin marketplace add exmergo/exmergo-agent-plugins
 ```
@@ -23,27 +20,30 @@ intent.
 
 ## Install (Any Agent)
 
+Run this command in your terminal
 ```
 npx skills install exmergo/dex
 ```
 
 ## Intro
 
-`dex` is analytics engineering for Claude Code and any agent: data warehouse
-exploration, dbt transformation and semantic modeling, and schema-drift
-maintenance on dbt. Point it at your warehouse (or a local DuckDB file) and your
+**`dex` is analytics engineering** for Claude Code and **any agent**: **data warehouse
+exploration**, **dbt transformation** and **semantic modeling**, and **schema-drift
+maintenance** on dbt. Point it at your warehouse (or a local DuckDB file) and your
 dbt project; it learns the landscape, writes and refactors your dbt transformations
 and semantic models, and tells you what to fix when anything drifts. The dbt
 project is the source of truth; every change is a reviewable diff. Read-only
 against your data.
 
-It closes the gap a general coding agent still has: agents re-learn the schema
+**It closes the gap a general coding agent still has**: agents re-learn the schema
 each session, have no strategy for thousands of tables, are blind to warehouse
 cost, will pull sensitive data into context, do not treat a dbt project as a
 first-class object, and have no concept of a semantic model to keep coherent over
 time. `dex` owns exactly that loop.
 
 ## The loop
+
+**Explore. Transform. Maintain. (ETM)**
 
 - **Explore** an unfamiliar warehouse: rank what matters, profile selectively,
   infer and verify joins, answer ad-hoc questions with guarded SQL probes behind
@@ -59,13 +59,7 @@ time. `dex` owns exactly that loop.
 ## Connectors
 
 - Cloud warehouse:  **Snowflake**, **BigQuery**.
-- Embedded analytical: **DuckDB** (the zero-credential on-ramp, and the engine 
-behind the eval and benchmark suites).
-
-Each client library is behind an optional extra, so the DuckDB on-ramp installs
-only `duckdb` and `sqlglot`; the cloud connectors install with
-`exmergo-dex-core[bigquery]` or `exmergo-dex-core[snowflake]`. To pull every
-connector at once, install `exmergo-dex-core[all]`.
+- Embedded analytical: **DuckDB**.
 
 Cloud credentials are discovered, never asked for: BigQuery through
 Application Default Credentials (`gcloud auth application-default login`),
@@ -80,19 +74,27 @@ and recorded in a local spend ledger.
 - Cloud warehouse: **Databricks**, **AWS Redshift**
 - Operational database: **PostgreSQL**
 
-## Status
+## The `exmergo-dex-core` package
 
-**v0.1 is the full ETM loop on DuckDB**, with no cloud credentials required:
-explore, transform, and now **maintain** (drift detection and reconcile across
-schema, volume, grain, and semantic axes). **Explore, transform, and maintain
-also run on BigQuery and Snowflake**, the first two cloud connectors, each with
-credential discovery, cost guards with a confirm-before-spend handshake
-(bytes-scanned on BigQuery, warehouse-seconds on Snowflake), and dev-target-only
-dbt builds. Databricks and PostgreSQL land next as v0.2 completes; published
-benchmark scores (ADE-bench uplift and cost/turn efficiency, Spider2.0-DBT)
-land with v0.3.
+`dex` also bundles the `exmergo-dex-core` Python package.  
+This is the reusable and agent friendly package through which `dex` runs
+its commands.
 
-## Cross-agent and engine
+You can install it yourself in your projects
+
+1. pip
+```
+pip install exmergo-dex-core
+```
+
+2. uv
+```
+uv add exmergo-dex-core
+```
+
+More info in the package's [`README.md`](packages/dex-core/README.md)
+
+## Agent References
 
 - Engine: `packages/dex-core/` (PyPI: `exmergo-dex-core`, Apache-2.0).
 - Cross-agent contract: [`AGENTS.md`](AGENTS.md).
@@ -105,46 +107,15 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, the Ruff lint and
 format workflow, and the pre-commit hook. Every pull request into `main` must
 pass the Lint workflow and CI before it can merge.
 
-## Maintainers: post-scaffold runbook
+## Community
 
-A few post-scaffold steps need accounts or network. Run them with the appropriate
-credentials:
+Connect with the Analytics Engineering Community (Data Engineers welcome as well!) 
+and discover how Exmergo brings AI Agents to Your Data Stack.
 
-- **GitHub repo metadata:** set the repo **description** to the keyword sentence
-  at the top of this README, and add **Topics**: `analytics-engineering`, `dbt`,
-  `claude-code`, `text-to-sql`, `semantic-layer`, `duckdb`, `snowflake`,
-  `bigquery`, `databricks`, `data-engineering`, `agent`, `metricflow`,
-  `schema-drift`, `data-contracts`. This is where discovery lives, not the slug.
-- **TestPyPI dry-run:** `scripts/testpypi_dry_run.sh` proves the publish-and-pin
-  loop before automation.
-- **PyPI Trusted Publishing (both projects):** configure a pending publisher for
-  `exmergo-dex-core` (owner `exmergo`, repo `dex`, workflow `release.yml`,
-  environment `pypi`) and a second for `dex-core` with the **same values except
-  environment `pypi-stub`**. The environments must differ: PyPI rejects two
-  pending publishers that share an identical config. Create both environments in
-  the repo's GitHub settings. No API tokens are stored.
-- **Anti-squat `dex-core` stub:** published automatically by the
-  `reserve-dex-core` job in `release.yml` from `packages/dex-core-stub/`,
-  idempotently via `uv publish --check-url`. It claims the name on the first
-  tagged release and is a no-op after. For protection before that release, you
-  can publish the stub once by hand; the CI job then simply skips it.
-- **ADE-bench spike:** stand up ADE-bench locally on DuckDB against the no-plugin
-  baseline to confirm the runner before depending on it (the exact command is in
-  `benchmarks/ade_bench/README.md`).
-- **Marketplace entry:** at v0.1 ship time, add the `dex` entry to the
-  `exmergo/exmergo-agent-plugins` catalog with a pinned `ref`.
-- **BigQuery integration CI:** one-time GCP and GitHub setup (Workload
-  Identity Federation, a scoped service account, the `dex_ci` scratch dataset,
-  and the `gcp-integration` environment with its variables), automated by
-  `scripts/setup_bigquery_ci.sh`; background in `CONTRIBUTING.md` under "Live
-  BigQuery integration tests".
-- **Snowflake integration CI:** one-time Snowflake and GitHub setup (a
-  workload-identity service user pinned to this repo's
-  `snowflake-integration` environment, a least-privilege role, the pinned
-  X-Small `DEX_CI_WH` warehouse with a resource-monitor backstop, the
-  transient `DEX_CI` scratch database, and a key-pair dev user with a local
-  `dex-ci` connection for running the live suite while developing), automated
-  by `scripts/setup_snowflake_ci.sh`.
+- 🌟 [Star Us on GitHub](https://github.com/exmergo/dex/)
+- 🔗 [Follow Us on LinkedIn](https://www.linkedin.com/company/exmergo/)
+- 🐦 [Follow Us on Twitter](https://x.com/exmergo)
+- 🔨 [Follow Us on GitHub](https://github.com/exmergo/)
 
 ## License
 
