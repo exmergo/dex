@@ -54,6 +54,26 @@ time. `dex` owns exactly that loop.
   last snapshot, surface schema, volume, grain, and definition drift ranked by
   blast radius, and propose edits.
 
+## Benchmark
+
+On ADE-bench (75 analytics-engineering tasks: fix, build, and extend dbt
+projects on DuckDB), `dex` reaches **76% task resolution with Claude Sonnet 5**,
+at **2.5x lower cost than Claude Fable 5**.
+
+With `dex`, accuracy clusters tightly across models (72-76%) while cost does not,
+so you can run an inexpensive model and still get top-tier results. Full
+methodology, per-model cost, and the raw `results.json` for every run are in the
+[benchmark README](benchmarks/ade_bench/README.md).
+
+### On benchmarks
+
+We publish these to be transparent, not to overclaim. A task-resolution score
+measures whether tests pass; it does not measure what matters most in practice:
+the experience of the human engineer working with the agent. Trust in a diff,
+clarity of the proposed change, cost surfaced before spend, and sensitive data
+kept out of context never show up in a pass rate. We optimize for that
+experience first and treat the benchmark as a floor, not the goal.
+
 ## Connectors
 
 - Cloud warehouse: **Snowflake**, **BigQuery**.
@@ -72,7 +92,7 @@ spend ledger.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Databricks**, **AWS Redshift**
+- Cloud warehouse: **Databricks**, **AWS Redshift**, **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 
