@@ -1,0 +1,8 @@
+# Publish only the per-run summaries. The per-task artifacts (session
+# recordings, agent logs, diffs, panes) are ~850MB and stay out of git.
+*
+!.gitignore
+!*/
+!*/results.json
+!*/run_metadata.json
+!*/results.tsv
