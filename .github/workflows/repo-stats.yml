@@ -1,0 +1,31 @@
+name: repo-stats
+
+# Snapshots GitHub traffic (clones and views) into a dedicated
+# `github-repo-stats` branch. GitHub's traffic API only retains this data for
+# 14 days, so a nightly job is the only way to keep a permanent history.
+#
+# One-time setup: create a fine-grained PAT scoped to this repo with
+#   Administration: read   (the traffic API requires admin-level read)
+#   Contents: read/write   (the action commits its data branch)
+# and store it as the repository secret GHRS_TOKEN. When the PAT expires the
+# job fails silently until the secret is rotated, so set an expiry reminder.
+
+on:
+  schedule:
+    # Nightly at 04:25 UTC (off the hour to avoid GitHub's cron congestion).
+    - cron: "25 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  repo-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: run github-repo-stats
+        # Pinned to the v1.4.2 commit SHA rather than the tag so a moved tag
+        # cannot change what executes.
+        uses: jgehrcke/github-repo-stats@306db38ad131cab2aa5f2cd3062bf6f8aa78c1aa
+        with:
+          ghtoken: ${{ secrets.GHRS_TOKEN }}
