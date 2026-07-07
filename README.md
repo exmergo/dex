@@ -1,6 +1,14 @@
 <img width="1280" height="563" alt="exmergo-dex-showcase" src="https://github.com/user-attachments/assets/9dd574c2-8598-47bc-ae90-7d5a3a4d2e18" />
 
-*Developed by Exmergo*
+**Built by [Exmergo](https://exmergo.com)** · AI Agents for Your Data Stack.
+
+[![PyPI](https://img.shields.io/pypi/v/exmergo-dex-core?logo=pypi&logoColor=white&color=165dfc)](https://pypi.org/project/exmergo-dex-core/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-165dfc)](LICENSE)
+[![ADE-bench](https://img.shields.io/badge/ADE--bench-76%25-33cf56)](benchmarks/ade_bench/README.md)
+[![CI](https://github.com/exmergo/dex/actions/workflows/ci.yml/badge.svg)](https://github.com/exmergo/dex/actions/workflows/ci.yml)
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Exmergo-165dfc?logo=linkedin&logoColor=white)](https://www.linkedin.com/company/exmergo/)
+[![X](https://img.shields.io/badge/Follow-%40exmergo-165dfc?logo=x&logoColor=white)](https://x.com/exmergo)
 
 ## Install (Claude Code)
 
@@ -54,6 +62,26 @@ time. `dex` owns exactly that loop.
   last snapshot, surface schema, volume, grain, and definition drift ranked by
   blast radius, and propose edits.
 
+## Benchmark
+
+On ADE-bench (75 analytics-engineering tasks: fix, build, and extend dbt
+projects on DuckDB), `dex` reaches **76% task resolution with Claude Sonnet 5**,
+at **2.5x lower cost than Claude Fable 5**.
+
+With `dex`, accuracy clusters tightly across models (72-76%) while cost does not,
+so you can run an inexpensive model and still get top-tier results. Full
+methodology, per-model cost, and the raw `results.json` for every run are in the
+[benchmark README](benchmarks/ade_bench/README.md).
+
+### On benchmarks
+
+We publish these to be transparent, not to overclaim. A task-resolution score
+measures whether tests pass; it does not measure what matters most in practice:
+the experience of the human engineer working with the agent. Trust in a diff,
+clarity of the proposed change, cost surfaced before spend, and sensitive data
+kept out of context never show up in a pass rate. We optimize for that
+experience first and treat the benchmark as a floor, not the goal.
+
 ## Connectors
 
 - Cloud warehouse: **Snowflake**, **BigQuery**.
@@ -72,7 +100,7 @@ spend ledger.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Databricks**, **AWS Redshift**
+- Cloud warehouse: **Databricks**, **AWS Redshift**, **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 

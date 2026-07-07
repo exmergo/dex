@@ -235,6 +235,11 @@ credentials:
   `benchmarks/ade_bench/README.md`).
 - **Marketplace entry:** at v0.1 ship time, add the `dex` entry to the
   `exmergo/exmergo-agent-plugins` catalog with a pinned `ref`.
+- **Repo traffic history:** the `repo-stats.yml` workflow snapshots clone and
+  view counts nightly into a `github-repo-stats` branch (GitHub's traffic API
+  only retains 14 days). It needs a fine-grained PAT scoped to this repo with
+  Administration: read and Contents: read/write, stored as the `GHRS_TOKEN`
+  secret; the job fails silently when the PAT expires, so rotate it on schedule.
 - **BigQuery integration CI:** one-time GCP and GitHub setup (Workload
   Identity Federation, a scoped service account, the `dex_ci` scratch dataset,
   and the `gcp-integration` environment with its variables), automated by

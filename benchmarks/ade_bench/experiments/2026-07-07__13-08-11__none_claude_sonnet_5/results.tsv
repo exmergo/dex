@@ -1,0 +1,76 @@
+experiment_id	task_id	result	result_num	failure_type	tests	passed	passed_percentage	time_seconds	cost	input_tokens	output_tokens	cache_tokens	turns	tools	agent	model_name	db_type	project_type	plugin_set	prompt_suffix
+2026-07-07__13-08-11__none	airbnb001	pass	1		11	11	100.0	53.22	0.17223845000000002	16960	3033	209484	15		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb002	pass	1		12	12	100.0	54.396	0.1731709	12346	3297	255273	18		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb003	pass	1		8	8	100.0	44.152	0.10361	6816	1073	204560	7		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb004	pass	1		3	3	100.0	115.892	0.32522549999999995	13466	4174	705035	20		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb005	pass	1		5	5	100.0	187.37	0.55251335	31471	14659	713072	24		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb006	pass	1		8	8	100.0	30.703	0.16284955	18667	2772	170111	17		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb007	pass	1		12	12	100.0	293.958	0.9305373000000001	36322	18529	1719516	38		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb008	pass	1		5	5	100.0	125.587	0.220695	13256	1938	471195	13		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb009	pass	1		2	2	100.0	111.323	0.27492395	11953	4152	557309	15		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb010	pass	1		5	5	100.0	405.785	0.9735903000000001	34111	18933	1870901	48		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb011	pass	1		5	5	100.0	219.683	0.5851573	27676	14907	856916	25		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb011.hint	pass	1		5	5	100.0	308.76	0.8217889499999997	39899	19157	1280389	36		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb012	fail	0	eval_error	3	1	33.33333333333333	227.559	0.6285879999999999	31342	15732	914895	23		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	airbnb013	pass	1		2	2	100.0	328.191	0.9533485999999999	35976	14649	1993777	41		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering001			setup_timeout	0	0	0	0	0.0	0	0	0	0		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering002	pass	1		3	3	100.0	25.268	0.0760679	4900	472	166628	5		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering002.medium	pass	1		3	3	100.0	61.745	0.12225325	9595	694	250925	7		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering003	fail	0	eval_error	3	1	33.33333333333333	65.079	0.21026104999999998	8533	3316	426391	12		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering004	fail	0	eval_error	3	2	66.66666666666666	64.09	0.1589217	11494	1822	292974	13		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering005	pass	1		4	4	100.0	84.928	0.27121559999999995	13614	2221	620802	17		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering006	fail	0	eval_error	8	5	62.5	135.868	0.4622773	21752	9018	816276	31		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering007	pass	1		11	11	100.0	157.507	0.5226759000000001	24722	6850	1088778	26		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering007.medium	fail	0	eval_error	11	10	90.9090909090909	215.387	0.5576236500000001	26665	7420	1152638	27		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	analytics_engineering008	pass	1		2	2	100.0	88.71	0.25453984999999996	13041	3022	532037	14		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	asana001	pass	1		3	3	100.0	407.755	1.0315766	50996	19622	1818092	34		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	asana002			setup_timeout	0	0	0	0	0.0	0	0	0	0		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	asana003	pass	1		18	18	100.0	100.188	0.33866624999999995	23503	3370	664485	15		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	asana004	fail	0	eval_error	7	6	85.71428571428571	146.391	0.39292735	18517	6589	746507	19		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	asana005	fail	0	eval_error	9	8	88.88888888888889	369.751	1.2988301500000001	52617	16557	2841673	51		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	asana005.hard	fail	0	eval_error	9	3	33.33333333333333	148.272	0.3774595000000001	18716	5749	734455	19		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1001	pass	1		7	7	100.0	218.914	0.63217395	54739	8779	982039	38		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1002	fail	0	eval_error	11	10	90.9090909090909	167.011	0.38674375000000005	18343	4903	812745	20		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1003	pass	1		5	5	100.0	247.617	0.67813195	23963	10030	1456769	34		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1003.hard	pass	1		5	5	100.0	196.51	0.5936911500000002	24673	10871	1124353	31		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1004	pass	1		3	3	100.0	110.722	0.43142424999999995	28203	5405	813235	21	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1005	fail	0	eval_error	5	4	80.0	102.658	0.3434094500000001	18479	4059	708719	19	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1005.medium	pass	1		5	5	100.0	110.637	0.41635845	27379	4779	804654	20	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1006	pass	1		5	5	100.0	110.247	0.38839559999999995	23372	5020	749457	26	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1006.hard	fail	0	eval_error	5	4	80.0	117.149	0.50229705	41582	6503	828151	24	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1007	pass	1		7	7	100.0	110.012	0.36925939999999996	22774	4743	707268	21	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1007.hard	pass	1		7	7	100.0	123.001	0.43495639999999997	27268	6450	784528	18		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1007.medium	pass	1		7	7	100.0	118.326	0.33918345	15193	4648	706284	19		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1009	fail	0	eval_error	2	1	50.0	82.596	0.20908329999999997	14164	3556	339966	12		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1010	pass	1		3	3	100.0	61.365	0.17507625000000002	13598	1673	332725	14		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1010.medium	pass	1		3	3	100.0	227.371	0.84717495	25992	8550	1221961	28	Agent	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	f1011	fail	0	eval_error	7	6	85.71428571428571	287.439	0.6715753499999999	25209	16411	1100262	26		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas001	pass	1		3	3	100.0	29.148	0.10653844999999998	6255	738	238059	7		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas002	pass	1		3	3	100.0	101.103	0.28706335	12071	2683	669907	18		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas003	pass	1		3	3	100.0	163.889	0.32809579999999994	15785	4726	659366	21		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas004	pass	1		3	3	100.0	76.671	0.2985157	20674	2448	612219	17	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas004.no_hint	pass	1		3	3	100.0	77.865	0.28256835	20728	2916	535157	18	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas005	pass	1		3	3	100.0	71.332	0.19569065000000002	8659	1651	459653	13		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas006	pass	1		4	4	100.0	89.467	0.23995999999999998	11510	2714	518245	14		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas007	pass	1		8	8	100.0	160.508	0.35755235	16435	4279	770402	21		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas007.no_location_hint	fail	0	eval_error	8	7	87.5	73.522	0.2965339	22362	2501	581873	18	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas008	pass	1		11	11	100.0	120.547	0.34516859999999994	13022	3016	835027	22		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas009	pass	1		5	5	100.0	197.87	0.36466224999999997	13135	5209	788845	21		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas010	fail	0	eval_error	11	8	72.72727272727273	191.991	0.5422580999999999	20944	7580	1164857	28		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas011	pass	1		3	3	100.0	117.569	0.4261621499999999	23673	4813	882038	23	ToolSearch	claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas011.hard	pass	1		3	3	100.0	169.639	0.4910203500000001	21153	7994	972922	30		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas012	pass	1		4	4	100.0	50.844	0.15227815	7593	1938	313763	11		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas012.hard	pass	1		4	4	100.0	52.643	0.16164955	8091	2385	316526	11		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas013			setup_timeout	0	0	0	0	0.0	0	0	0	0		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas015	fail	0	eval_error	4	3	75.0	55.058	0.18683545	11953	3615	290984	12		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas015.low	pass	1		4	4	100.0	169.861	0.5190902000000001	19118	7723	1103024	27		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas016	pass	1		3	3	100.0	106.914	0.28086025000000003	13521	4737	528215	14		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas017	pass	1		4	4	100.0	100.367	0.33642045	11189	4155	771934	21		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	helixops_saas018	pass	1		4	4	100.0	63.324	0.2038307	10786	2269	429104	12		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	intercom001	pass	1		3	3	100.0	214.625	0.6623576000000001	38324	12636	1094697	21		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	intercom002			setup_timeout	0	0	0	0	0.0	0	0	0	0		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	intercom003	pass	1		3	3	100.0	337.582	1.1032760499999998	43231	22470	2011221	39		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	quickbooks001	pass	1		13	13	100.0	176.036	0.5785820499999998	43875	6801	1038206	22		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	quickbooks002	pass	1		9	9	100.0	252.69	0.8934843499999997	34077	10094	2045712	41		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	quickbooks003	fail	0	eval_error	15	6	40.0	210.5	0.7427037499999999	25300	10531	1634525	43		claude	claude-sonnet-5	duckdb	dbt	none	
+2026-07-07__13-08-11__none	quickbooks004			agent_timeout	0	0	0	0	0.0	0	0	0	0		claude	claude-sonnet-5	duckdb	dbt	none	
