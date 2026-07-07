@@ -54,19 +54,33 @@ time. `dex` owns exactly that loop.
 - **Explore** an unfamiliar warehouse: rank what matters, profile selectively,
   infer and verify joins, answer ad-hoc questions with guarded SQL probes behind
   a PII-aware query firewall, persist a draft map. Fully read-only.
+
+<img width="522" height="343" alt="image" src="https://github.com/user-attachments/assets/7f16b370-66ed-4596-ae01-041cf3db3525" />
+
+  
 - **Transform** the dbt project: author dbt models (staging to marts) with tests
   and docs, and the semantic layer on top (entities, dimensions, measures,
   metrics) as dbt semantic models (MetricFlow YAML), with a free Viz preview.
   Validated against a dev target, cost-guarded.
+
+<img width="504" height="271" alt="image" src="https://github.com/user-attachments/assets/fda40e48-b481-424c-adc7-d79c0ede346b" />
+
+  
 - **Maintain** the project as it drifts: diff the warehouse and dbt against the
   last snapshot, surface schema, volume, grain, and definition drift ranked by
   blast radius, and propose edits.
+
+<img width="484" height="344" alt="image" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
+
 
 ## Benchmark
 
 On ADE-bench (75 analytics-engineering tasks: fix, build, and extend dbt
 projects on DuckDB), `dex` reaches **76% task resolution with Claude Sonnet 5**,
 at **2.5x lower cost than Claude Fable 5**.
+
+<img width="719" height="283" alt="image" src="https://github.com/user-attachments/assets/9f8bca64-6508-4590-9fa7-bb1ac077263d" />
+
 
 With `dex`, accuracy clusters tightly across models (72-76%) while cost does not,
 so you can run an inexpensive model and still get top-tier results. Full
@@ -87,6 +101,9 @@ experience first and treat the benchmark as a floor, not the goal.
 - Cloud warehouse: **Snowflake**, **BigQuery**.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
+
+<img width="840" height="153" alt="image" src="https://github.com/user-attachments/assets/82962530-4551-4d5b-b3b5-ae5ad1026f4d" />
+
 
 Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake
