@@ -1,8 +1,8 @@
 {
     "run_id": "2026-07-07__13-08-11__none",
     "uuid": "58eaf9f7-702c-4c5a-912c-b71cc4c31dd0",
-    "dataset_path": "/Users/marcociavarella/Projects/not-foundational/benchmarking-dex/ade-bench/tasks",
-    "output_path": "/Users/marcociavarella/Projects/not-foundational/benchmarking-dex/ade-bench/experiments",
+    "dataset_path": "ade-bench/tasks",
+    "output_path": "ade-bench/experiments",
     "agent_name": "claude",
     "no_rebuild": false,
     "cleanup": false,
