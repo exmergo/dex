@@ -48,7 +48,11 @@ snowflake = ["snowflake-connector-python>=3.17", "sqlglot>=25", "dbt-snowflake>=
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a BigQuery dev target with one install.
 bigquery = ["google-cloud-bigquery>=3", "sqlglot>=25", "dbt-bigquery>=1.9"]
-databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=25"]
+# Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
+# transform can build against a Databricks dev target with one install. The SDK
+# rides alongside the SQL driver: free Unity Catalog metadata and warehouse facts
+# come from the REST API, so nothing billable is touched until a statement runs.
+databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=25", "dbt-databricks>=1.9"]
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a Postgres dev schema with one install.
 postgres = ["psycopg[binary]>=3", "sqlglot>=25", "dbt-postgres>=1.9"]
@@ -92,5 +96,6 @@ markers = [
   "integration: hits a live warehouse; gated on DEX_TEST_* environment variables",
   "bigquery: BigQuery-specific integration tests",
   "snowflake: Snowflake-specific integration tests",
+  "databricks: Databricks-specific integration tests",
   "postgres: PostgreSQL-specific integration tests",
 ]

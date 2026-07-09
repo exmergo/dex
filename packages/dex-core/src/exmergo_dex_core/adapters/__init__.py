@@ -1,5 +1,4 @@
-"""Connector adapters. DuckDB, BigQuery, Snowflake, and Postgres are real;
-Databricks is a stub.
+"""Connector adapters: DuckDB, BigQuery, Snowflake, Databricks, and Postgres.
 
 ``get_adapter`` is the single entry point so callers never import a connector
 client directly; the client libraries stay behind their extras and are imported
@@ -43,7 +42,9 @@ def get_adapter(connector: str, **kwargs: Any):
 
         return PostgresAdapter(**kwargs)
     if connector == "databricks":
-        raise NotImplementedError(f"the '{connector}' adapter is not yet implemented")
+        from .databricks import DatabricksAdapter
+
+        return DatabricksAdapter(**kwargs)
     raise ValueError(f"unknown connector '{connector}'")
 
 

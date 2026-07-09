@@ -90,6 +90,39 @@ class SnowflakeTarget(BaseModel):
     credit_price_usd: float | None = None
 
 
+class DatabricksTarget(BaseModel):
+    """Non-secret Databricks connection target. Credentials are never here: auth
+    is discovered at runtime by connect.py through the SDK's unified chain (a
+    ``~/.databrickscfg`` profile, ``DATABRICKS_*`` environment variables, or a
+    dbt profile), and tokens are never written or logged.
+
+    ``profile`` pins a ``~/.databrickscfg`` entry; unset means the environment,
+    then the default profile, then a dbt profile. ``host`` overrides the
+    workspace URL when the discovered source carries none. ``warehouse`` is the
+    pinned SQL warehouse (an ID or its ``/sql/1.0/warehouses/...`` HTTP path)
+    for every billed statement: dex refuses to spend on a warehouse the config
+    does not name. ``catalogs`` is a source allowlist (entries ``catalog`` or
+    ``catalog.schema``); empty means every Unity Catalog catalog the principal
+    can see except ``system``. ``dev_catalog``/``dev_schema`` are where dbt dev
+    builds write; the pair is refused as a source so reads and writes never
+    share a schema. ``max_full_profile_bytes`` opts large tables into sampled
+    profiling (TABLESAMPLE) instead of a full scan; table sizes are not free on
+    Databricks, so the threshold binds once a size is learned in-budget.
+    ``dbu_price_usd`` is the contract-specific dollar price of one DBU; set it
+    to see dollar figures next to the DBU translation (it varies by cloud and
+    tier, so dex never guesses).
+    """
+
+    profile: str | None = None
+    host: str | None = None
+    warehouse: str | None = None
+    catalogs: list[str] = Field(default_factory=list)
+    dev_catalog: str | None = None
+    dev_schema: str | None = None
+    max_full_profile_bytes: int | None = None
+    dbu_price_usd: float | None = None
+
+
 class PostgresTarget(BaseModel):
     """Non-secret PostgreSQL connection target. Credentials are never here:
     auth is discovered at runtime by connect.py (a pg_service.conf entry,
@@ -132,14 +165,14 @@ class QueryLimits(BaseModel):
 
 
 class DexConfig(BaseModel):
-    """The shape of ``.dex/config.yml``. DuckDB, BigQuery, Snowflake, and
-    Postgres targets are wired; the Databricks target is not yet
-    implemented."""
+    """The shape of ``.dex/config.yml``: one optional target per connector plus
+    the connector selection, budgets, and engine limits."""
 
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
     bigquery: BigQueryTarget | None = None
     snowflake: SnowflakeTarget | None = None
+    databricks: DatabricksTarget | None = None
     postgres: PostgresTarget | None = None
     dbt_target: str | None = None
     # Pins the dbt project directory (relative to the repo root) when discovery

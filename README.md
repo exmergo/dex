@@ -98,26 +98,27 @@ experience first and treat the benchmark as a floor, not the goal.
 
 ## Connectors
 
-- Cloud warehouse: **Snowflake**, **BigQuery**.
+- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
-<img width="840" height="153" alt="image" src="https://github.com/user-attachments/assets/82962530-4551-4d5b-b3b5-ae5ad1026f4d" />
+<img width="927" height="149" alt="image" src="https://github.com/user-attachments/assets/66060b8d-f56c-4de8-9c79-cc00252eb1b4" />
 
 
 Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake
-through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Postgres
-through `pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt
-profile. Every scan is estimated and confirmed before it spends, capped
-server-side (`maximum_bytes_billed` on BigQuery; a per-statement statement
-timeout on Snowflake and Postgres, whose budgets are warehouse-seconds with
-credits alongside and database-seconds respectively), and recorded in a local
-spend ledger.
+through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Databricks
+through the SDK's unified chain (`databricks auth login`, `DATABRICKS_*` env,
+or a dbt profile), Postgres through `pg_service.conf`, `DATABASE_URL`, the
+`PG*` environment, or a dbt profile. Every scan is estimated and confirmed
+before it spends, capped server-side (`maximum_bytes_billed` on BigQuery; a
+per-statement statement timeout on Snowflake, Databricks, and Postgres, whose
+budgets are warehouse-seconds with credits or DBUs alongside and
+database-seconds respectively), and recorded in a local spend ledger.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Databricks**, **AWS Redshift**, **Microsoft Fabric**
+- Cloud warehouse: **AWS Redshift**, **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 

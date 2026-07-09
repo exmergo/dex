@@ -29,8 +29,8 @@ jobs:
       # The cloud extras are included so their unit tests and safety families
       # run here (they are offline against fake clients, but they importorskip
       # on the client libraries; without the extras they would silently skip).
-      - name: Sync (duckdb + bigquery + snowflake + postgres + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra postgres --extra dev --python ${{ matrix.python-version }}
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra dev --python ${{ matrix.python-version }}
       - name: Tier-1 unit tests
         run: uv run pytest -q
 
@@ -48,8 +48,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Sync (duckdb + bigquery + snowflake + postgres + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra postgres --extra dev
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra dev
       - name: Safety-critical assertions
         run: uv run pytest -q tests/test_safety_spine.py
 

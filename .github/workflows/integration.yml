@@ -6,8 +6,8 @@ name: Integration
 # fork-runnable; this workflow answers "does the connector still work against
 # the real service" on main and on a schedule. Each suite reads shared/public
 # sample data, writes only to its scratch scope, and caps every statement
-# (bytes on BigQuery, seconds on Snowflake and Postgres), so a worst-case run
-# costs cents.
+# (bytes on BigQuery, seconds on Snowflake, Databricks, and Postgres), so a
+# worst-case run costs cents.
 #
 # One-time setup (documented in CONTRIBUTING.md):
 #   BigQuery: scripts/setup_bigquery_ci.sh (Workload Identity Pool provider
@@ -18,6 +18,13 @@ name: Integration
 #   snowflake-integration environment; a least-privilege role on the pinned
 #   X-Small warehouse and the transient scratch database; a resource monitor
 #   as the hard monthly cost backstop).
+#   Databricks: scripts/setup_databricks_ci.sh (a service principal whose
+#   account-level federation policy accepts only GitHub OIDC tokens minted for
+#   this repo's databricks-integration environment; CAN USE on a dedicated
+#   2X-Small serverless warehouse with minimum auto-stop; read on samples,
+#   write only in the scratch catalog. No resource-monitor analogue exists, so
+#   the backstop is the smallest warehouse, auto-stop, per-statement
+#   STATEMENT_TIMEOUT, and a workspace budget alert).
 #   Postgres: no setup at all. The operational-database connector runs against
 #   a service container seeded from scripts/postgres_seed.sql (the same seed
 #   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
@@ -125,6 +132,64 @@ jobs:
         run: uv sync --extra snowflake --extra duckdb --extra dev
       - name: Live Snowflake integration suite
         run: uv run pytest tests/integration -q -m snowflake
+
+  databricks:
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The environment carries the Databricks variables and, via its deployment
+    # branch policy (main only), refuses this job to a workflow modified on a
+    # branch before the token is minted. The Databricks-side pin mirrors it:
+    # the service principal's federation policy accepts only tokens whose
+    # subject names this repo + environment.
+    environment: databricks-integration
+    permissions:
+      contents: read
+      id-token: write # OIDC for the federation-policy token exchange; no stored keys.
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DATABRICKS_HOST: ${{ vars.DEX_TEST_DATABRICKS_HOST }}
+      DEX_TEST_DATABRICKS_WAREHOUSE: ${{ vars.DEX_TEST_DATABRICKS_WAREHOUSE }}
+      DEX_TEST_DATABRICKS_CATALOG: ${{ vars.DEX_TEST_DATABRICKS_CATALOG }}
+      DEX_TEST_DATABRICKS_MAX_SECONDS: "60"
+    steps:
+      - uses: actions/checkout@v4
+      # Exchange the GitHub OIDC token for a Databricks OAuth token through
+      # the service principal's federation policy, then hand it to the engine
+      # and dbt through the same DATABRICKS_TOKEN discovery path a PAT would
+      # use: no CI special-casing anywhere downstream.
+      - name: Exchange GitHub OIDC token for a Databricks token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const githubToken = await core.getIDToken(process.env.DATABRICKS_HOST)
+            const response = await fetch(`${process.env.DATABRICKS_HOST}/oidc/v1/token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({
+                client_id: '${{ vars.DEX_TEST_DATABRICKS_CLIENT_ID }}',
+                grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+                scope: 'all-apis',
+                subject_token_type: 'urn:ietf:params:oauth:token-type:jwt',
+                subject_token: githubToken,
+              }),
+            })
+            if (!response.ok) {
+              core.setFailed(`token exchange failed: ${response.status} ${await response.text()}`)
+              return
+            }
+            const token = (await response.json()).access_token
+            core.setSecret(token)
+            core.exportVariable('DATABRICKS_TOKEN', token)
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (databricks + duckdb + dev extras)
+        run: uv sync --extra databricks --extra duckdb --extra dev
+      - name: Live Databricks integration suite
+        run: uv run pytest tests/integration -q -m databricks
 
   postgres:
     # No repository gate and no environment: the target is a job-local service

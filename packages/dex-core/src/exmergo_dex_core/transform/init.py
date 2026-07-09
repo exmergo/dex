@@ -14,9 +14,8 @@ warehouse shop would produce a project that parses and builds locally yet is
 wrong. The caller must resolve the connector explicitly before calling in.
 
 Per-connector profile rendering sits behind a small dispatch so cloud renderers
-can slot in alongside their dbt adapters without touching the command; DuckDB,
-BigQuery, Snowflake, and Postgres render today, and the others raise an
-actionable error.
+can slot in alongside their dbt adapters without touching the command; every
+shipped connector renders.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ from ..cache import DEX_DIR
 from ..config import (
     CONFIG_FILE,
     BigQueryTarget,
+    DatabricksTarget,
     DexConfig,
     DuckDBTarget,
     SnowflakeTarget,
@@ -99,10 +99,9 @@ def init_project(
     render_profile = _PROFILE_RENDERERS.get(connector)
     if render_profile is None:
         raise InitError(
-            f"connector '{connector}' is not yet supported for init; DuckDB, "
-            "BigQuery, Snowflake, and Postgres are the supported paths today "
-            "(`transform init <name> --connector "
-            "duckdb|bigquery|snowflake|postgres`)"
+            f"connector '{connector}' is not yet supported for init; run "
+            "`transform init <name> --connector "
+            "duckdb|bigquery|snowflake|databricks|postgres`"
         )
 
     project_name = sanitize_project_name(name)
@@ -356,6 +355,102 @@ def _snowflake_profile(
     )
 
 
+_DEFAULT_DBX_DEV_SCHEMA = "dbt_dev"
+
+
+def _databricks_profile(
+    project_name: str, path: str | None, config: DexConfig, root: Path
+) -> str:
+    """A single dbt-databricks ``dev`` target from the discovered connection,
+    with no secret ever rendered: a user OAuth connection stays
+    ``auth_type: oauth`` (dbt runs its own browser flow against the same
+    workspace), OAuth M2M renders the client ID with the secret as an
+    ``env_var`` reference, and a token-based connection (a PAT, or CI's
+    exchanged OIDC token) reads ``DATABRICKS_TOKEN`` at runtime. Writes go to
+    a dedicated dev catalog.schema, never to a source scope, on the pinned
+    warehouse only."""
+
+    from ..connect import (
+        CredentialDiscoveryError,
+        _databricks_hostname,
+        resolve_databricks_connection,
+    )
+
+    target = config.databricks or DatabricksTarget()
+    try:
+        sdk_config, method = resolve_databricks_connection(target, os.environ, root)
+    except CredentialDiscoveryError as exc:
+        raise InitError(str(exc)) from exc
+
+    if not target.warehouse:
+        raise InitError(
+            "no warehouse pinned: set databricks.warehouse in .dex/config.yml "
+            "(dbt builds run only on the pinned SQL warehouse)"
+        )
+    if not target.dev_catalog:
+        raise InitError(
+            "no dev catalog to write to: set databricks.dev_catalog in "
+            ".dex/config.yml (a catalog the principal can write; source "
+            "catalogs stay read-only)"
+        )
+    dev_schema = target.dev_schema or _DEFAULT_DBX_DEV_SCHEMA
+    dev_catalog = str(target.dev_catalog).lower()
+    dev_scope = f"{dev_catalog}.{dev_schema.lower()}"
+    source_scopes = {entry.lower() for entry in target.catalogs}
+    if dev_scope in source_scopes or dev_catalog in source_scopes:
+        raise InitError(
+            f"dev target '{dev_scope}' overlaps a source scope in "
+            "databricks.catalogs; dbt builds must write where dex does not "
+            "read (set databricks.dev_catalog/dev_schema to a dedicated pair)"
+        )
+
+    target.dev_catalog = dev_catalog
+    target.dev_schema = dev_schema
+    config.databricks = target
+
+    from ..adapters.databricks import warehouse_http_path
+
+    output: dict[str, Any] = {
+        "type": "databricks",
+        "host": _databricks_hostname(sdk_config.host),
+        "http_path": warehouse_http_path(str(target.warehouse)),
+        "catalog": dev_catalog,
+        "schema": dev_schema,
+        # One thread keeps the pinned warehouse from parallel bursts; the
+        # per-model runtime is the guarded quantity on compute-time billing.
+        "threads": 1,
+        # dbt-databricks parses this as a JSON object of tag key-values.
+        "query_tags": '{"application": "dex"}',
+    }
+    if config.budget.ceiling is not None:
+        # Server-side cap per statement dbt runs; the engine cannot dry-run a
+        # dbt build, so this is the binding cost control for `transform build`
+        # (the maximum_bytes_billed analogue, in warehouse-seconds).
+        output["session_properties"] = {
+            "STATEMENT_TIMEOUT": max(int(config.budget.ceiling), 1)
+        }
+
+    kind = method.rsplit(":", 1)[-1]
+    if kind == "oauth_user":
+        output["auth_type"] = "oauth"
+    elif kind == "oauth_m2m":
+        # The client ID is an identifier; the secret stays an env reference,
+        # read at dbt runtime, never a rendered value.
+        output["auth_type"] = "oauth"
+        client_id = getattr(sdk_config, "client_id", None)
+        if client_id:
+            output["client_id"] = str(client_id)
+        output["client_secret"] = "{{ env_var('DATABRICKS_CLIENT_SECRET') }}"  # noqa: S105
+    else:
+        # PATs and CI's exchanged OIDC token both arrive as DATABRICKS_TOKEN:
+        # a Jinja reference, not a value.
+        output["token"] = "{{ env_var('DATABRICKS_TOKEN') }}"  # noqa: S105
+    return yaml.safe_dump(
+        {project_name: {"target": "dev", "outputs": {"dev": output}}},
+        sort_keys=False,
+    )
+
+
 _DEFAULT_PG_DEV_SCHEMA = "dbt_dev"
 
 
@@ -475,6 +570,7 @@ _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]]
     "duckdb": _duckdb_profile,
     "bigquery": _bigquery_profile,
     "snowflake": _snowflake_profile,
+    "databricks": _databricks_profile,
     "postgres": _postgres_profile,
 }
 

@@ -106,6 +106,45 @@ mints the token itself and hands it to the connector through the ordinary
 `DEX_TEST_SNOWFLAKE_USER` are environment variables, not secrets, for the
 same debuggability reason as the BigQuery job.
 
+## Live Databricks integration tests
+
+The same `tests/integration/` directory carries the Databricks suite:
+connection discovery, the warehouse-seconds handshake with its DBU
+translation, the over-ceiling refusal, a firewalled query, and a dbt build
+into the scratch catalog. It reads the `samples` catalog (shared data, free
+storage), bills warehouse time to the pinned warehouse only, and caps every
+statement at `DEX_TEST_DATABRICKS_MAX_SECONDS` (default 60) via a server-side
+`STATEMENT_TIMEOUT`, so a worst-case run costs cents. Databricks has no
+resource-monitor analogue that hard-suspends compute, so the backstops are
+the smallest warehouse size, the minimum auto-stop, the per-statement
+timeout, and a budget alert in the account console.
+
+One-time setup is automated by `scripts/setup_databricks_ci.sh` (run by a
+maintainer who is a workspace admin and logged into the account console): the
+`dex-ci` service principal, its account-level GitHub OIDC federation policy,
+the dedicated 2X-Small serverless `DEX_CI` warehouse (minimum auto-stop, CAN
+USE for the principal only), the `dex_ci` scratch catalog (write grants to
+the principal only: the grant-level enforcement of "dex never writes outside
+the dev target"; `samples` needs no grant, sample datasets are implicitly
+readable), and the GitHub environment with its variables.
+
+Run the suite locally against your own `databricks auth login` session:
+
+```
+DEX_TEST_DATABRICKS_WAREHOUSE=<warehouse-id> \
+    DEX_TEST_DATABRICKS_CATALOG=dex_ci uv run pytest tests/integration -q -m databricks
+```
+
+In CI the same suite runs from `.github/workflows/integration.yml`,
+authenticated via the federation policy (OIDC, no stored keys): the policy
+accepts only GitHub OIDC tokens whose subject names this repository's
+`databricks-integration` environment, whose deployment branch policy
+restricts it to `main`. The job exchanges the GitHub token for a Databricks
+OAuth token at `/oidc/v1/token` and hands it to the engine and dbt through
+the ordinary `DATABRICKS_TOKEN` discovery path; the host, client id,
+warehouse, and catalog are environment variables, not secrets, for the same
+debuggability reason as the BigQuery job.
+
 ## Live PostgreSQL integration tests
 
 The same `tests/integration/` directory carries the Postgres suite:
@@ -252,3 +291,11 @@ credentials:
   transient `DEX_CI` scratch database, and a key-pair dev user with a local
   `dex-ci` connection for running the live suite while developing), automated
   by `scripts/setup_snowflake_ci.sh`.
+- **Databricks integration CI:** one-time Databricks and GitHub setup (the
+  `dex-ci` service principal with an account-level GitHub OIDC federation
+  policy pinned to this repo's `databricks-integration` environment, the
+  dedicated 2X-Small serverless `DEX_CI` warehouse, the `dex_ci` scratch
+  catalog, and the environment with its variables), automated by
+  `scripts/setup_databricks_ci.sh`; background in `CONTRIBUTING.md` under
+  "Live Databricks integration tests". The budget-alert backstop is manual
+  (account console, Usage > Budgets).

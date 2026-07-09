@@ -8,7 +8,10 @@ with the project resolved from explicit config, the environment, the ADC
 default, or a dbt profile, in that order. Snowflake discovers a connection the
 same way: a named ``connections.toml`` entry, the default connection, the
 ``SNOWFLAKE_*`` environment (which is also how CI's workload-identity token
-arrives), or a dbt profile. Postgres follows suit: a config-pinned
+arrives), or a dbt profile. Databricks delegates to the SDK's unified auth
+chain: a config-pinned ``~/.databrickscfg`` profile, the ``DATABRICKS_*``
+environment (which is also how CI's OIDC federation arrives), the default
+profile, or a dbt profile. Postgres follows suit: a config-pinned
 ``pg_service.conf`` entry, ``DATABASE_URL``, the ``PG*`` environment (resolved
 natively by libpq, including ``~/.pgpass``), or a dbt profile. Every discovery
 failure names the fix; nothing is ever prompted for.
@@ -27,6 +30,7 @@ from .adapters import get_adapter
 from .cache import DexStore
 from .config import (
     BigQueryTarget,
+    DatabricksTarget,
     DexConfig,
     PostgresTarget,
     SnowflakeTarget,
@@ -88,12 +92,16 @@ def open_adapter(
             config, repo_root, budget=budget, confirmed=confirmed, command=command
         )
 
+    if connector == "databricks":
+        return _open_databricks(
+            config, repo_root, budget=budget, confirmed=confirmed, command=command
+        )
+
     if connector == "postgres":
         return _open_postgres(
             config, repo_root, budget=budget, confirmed=confirmed, command=command
         )
 
-    # The remaining cloud connectors are not yet implemented.
     return get_adapter(connector)
 
 
@@ -400,6 +408,233 @@ def _snowflake_from_dbt_profiles(repo_root: str | Path) -> dict | None:
                 if output.get("private_key_path"):
                     params["private_key_file"] = output["private_key_path"]
                 return params
+    return None
+
+
+def _open_databricks(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+):
+    target = config.databricks or DatabricksTarget()
+
+    try:
+        from databricks.sdk import WorkspaceClient
+    except ImportError as exc:
+        raise CredentialDiscoveryError(
+            "the Databricks client is not installed; install the connector "
+            "extra: exmergo-dex-core[databricks]"
+        ) from exc
+
+    sdk_config, method = resolve_databricks_connection(target, os.environ, repo_root)
+    workspace = WorkspaceClient(config=sdk_config)
+
+    def sql_connect():
+        # Built lazily by the adapter on the first billed statement only:
+        # opening a SQL session lands on the warehouse and can wake it, so the
+        # free metadata paths must never construct this connection.
+        from databricks import sql as dbsql
+
+        from .adapters.databricks import warehouse_http_path
+
+        return dbsql.connect(
+            server_hostname=_databricks_hostname(sdk_config.host),
+            http_path=warehouse_http_path(str(target.warehouse)),
+            credentials_provider=lambda: sdk_config.authenticate,
+            user_agent_entry="dex",
+        )
+
+    store = DexStore(repo_root)
+    utc_midnight = (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=budget if budget is not None else config.budget.ceiling,
+        session_ceiling=config.budget.session_ceiling,
+        session_spent=store.spend_since(
+            utc_midnight, field="billed_seconds", connector="databricks"
+        ),
+        confirmed=confirmed,
+        connector="databricks",
+        command=command,
+        record=store.append_spend_log,
+    )
+    return get_adapter(
+        "databricks",
+        workspace=workspace,
+        sql_connect=sql_connect,
+        cost_gate=gate,
+        target=target,
+        host=_databricks_hostname(sdk_config.host),
+        auth_method=method,
+    )
+
+
+def resolve_databricks_connection(
+    target: DatabricksTarget,
+    env: dict | os._Environ,
+    repo_root: str | Path = ".",
+):
+    """Discover a Databricks workspace connection, never prompting.
+
+    Returns ``(sdk_config, auth_method)`` where ``sdk_config`` is a
+    ``databricks.sdk.core.Config`` carrying the resolved host and credential
+    strategy, and ``auth_method`` is a coarse class safe to surface
+    (named_profile / environment / default_profile / dbt_profile, suffixed
+    with the credential kind); token values never leave the engine process.
+    Credential mechanics are the SDK's unified chain, so the CLI's OAuth
+    cache, PATs, OAuth M2M, and CI's OIDC federation all arrive through the
+    same door. Order: the config-pinned ``~/.databrickscfg`` profile, the
+    ``DATABRICKS_*`` environment, the default profile, then a dbt profile's
+    databricks target. Every failure names the fix.
+    """
+
+    from databricks.sdk.core import Config
+
+    overrides: dict = {}
+    if target.host:
+        overrides["host"] = target.host
+
+    if target.profile:
+        try:
+            cfg = Config(profile=target.profile, **overrides)
+        except ValueError as exc:
+            raise CredentialDiscoveryError(
+                f"databricks.profile '{target.profile}' did not resolve: check "
+                "~/.databrickscfg or run `databricks auth login --host "
+                f"<workspace-url> --profile {target.profile}`"
+            ) from exc
+        return cfg, f"named_profile:{_databricks_credential_kind(cfg)}"
+
+    if env.get("DATABRICKS_HOST") or env.get("DATABRICKS_CONFIG_PROFILE"):
+        try:
+            cfg = Config(**overrides)
+        except ValueError as exc:
+            raise CredentialDiscoveryError(
+                "DATABRICKS_* environment variables are set but no credential "
+                "resolved; export DATABRICKS_TOKEN or the OAuth client "
+                "variables, or run `databricks auth login`"
+            ) from exc
+        return cfg, f"environment:{_databricks_credential_kind(cfg)}"
+
+    if _databrickscfg_default_exists(env):
+        try:
+            cfg = Config(**overrides)
+        except ValueError as exc:
+            raise CredentialDiscoveryError(
+                "the DEFAULT profile in ~/.databrickscfg did not resolve; "
+                "re-run `databricks auth login --host <workspace-url>` or pin "
+                "databricks.profile in .dex/config.yml"
+            ) from exc
+        return cfg, f"default_profile:{_databricks_credential_kind(cfg)}"
+
+    profile_params = _databricks_from_dbt_profiles(repo_root)
+    if profile_params:
+        kwargs: dict = {"host": target.host or profile_params.get("host")}
+        if profile_params.get("token"):
+            kwargs["token"] = profile_params["token"]
+        try:
+            cfg = Config(**kwargs)
+        except ValueError as exc:
+            raise CredentialDiscoveryError(
+                "the databricks target in dbt profiles.yml did not resolve to "
+                "a usable credential; run `databricks auth login --host "
+                "<workspace-url>` instead"
+            ) from exc
+        return cfg, f"dbt_profile:{_databricks_credential_kind(cfg)}"
+
+    raise CredentialDiscoveryError(
+        "no Databricks connection discovered; run `databricks auth login "
+        "--host <workspace-url>` (then optionally pin databricks.profile in "
+        ".dex/config.yml), or export DATABRICKS_HOST plus a credential, or "
+        "keep a databricks target in your dbt profiles.yml"
+    )
+
+
+def _databricks_credential_kind(cfg) -> str:
+    """The coarse credential class for the envelope; never a value. The SDK's
+    ``auth_type`` names the strategy that won its unified chain."""
+
+    auth_type = str(getattr(cfg, "auth_type", "") or "").lower()
+    if auth_type == "pat":
+        return "token"
+    if auth_type in ("databricks-cli", "external-browser"):
+        return "oauth_user"
+    if auth_type == "oauth-m2m":
+        return "oauth_m2m"
+    if "oidc" in auth_type:
+        return "workload_identity"
+    if auth_type.startswith(("azure", "google")):
+        return "cloud_native"
+    return "unknown"
+
+
+def _databricks_hostname(host: object) -> str:
+    """The bare workspace hostname (an identifier, not a secret): what the SQL
+    driver wants, and what capabilities surface."""
+
+    return str(host or "").removeprefix("https://").removeprefix("http://").rstrip("/")
+
+
+def _databrickscfg_default_exists(env: dict | os._Environ) -> bool:
+    """Whether ``~/.databrickscfg`` (or ``DATABRICKS_CONFIG_FILE``) declares a
+    default profile the SDK would resolve without any other signal: either a
+    classic ``[DEFAULT]`` section with a host, or the newer CLI's
+    ``[__settings__] default_profile`` pointer at a profile with a host."""
+
+    import configparser
+
+    path = Path(env.get("DATABRICKS_CONFIG_FILE") or Path.home() / ".databrickscfg")
+    if not path.is_file():
+        return False
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(path.read_text(encoding="utf-8"))
+    except (OSError, configparser.Error):
+        return False
+    if parser.defaults().get("host"):
+        return True
+    if parser.has_section("__settings__"):
+        pointed = parser.get("__settings__", "default_profile", fallback=None)
+        if (
+            pointed
+            and parser.has_section(pointed)
+            and parser.get(pointed, "host", fallback=None)
+        ):
+            return True
+    return False
+
+
+def _databricks_from_dbt_profiles(repo_root: str | Path) -> dict | None:
+    """Best-effort: the connection fields of a ``type: databricks`` output in
+    the discovered dbt project's profiles. Any failure means "not found"."""
+
+    try:
+        from .dbt_project import PROFILES_FILE, find_project, profiles_dir
+
+        project_dir = find_project(repo_root)
+        profiles_path = profiles_dir(project_dir) / PROFILES_FILE
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if (
+                isinstance(output, dict)
+                and output.get("type") == "databricks"
+                and output.get("host")
+            ):
+                return {
+                    key: output[key]
+                    for key in ("host", "token", "http_path")
+                    if output.get(key)
+                }
     return None
 
 

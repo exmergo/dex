@@ -135,6 +135,58 @@ def fake_sf_connection():
 
 
 @pytest.fixture
+def fake_databricks():
+    """The standard populated fake Databricks pair (see
+    tests/fakes/databricks.py): a Unity Catalog workspace client and a DBAPI
+    connection behind a counting connect factory.
+
+    Requires the real databricks-sql-connector library (the [databricks]
+    extra) for its error types; skipped when absent, but CI and the release
+    gate install the extra, so the Databricks safety families run everywhere
+    that matters. The warehouse starts STOPPED so startup-floor behavior is on
+    by default; tests that want a running warehouse flip its state (and the
+    connection's ``startup_pending``).
+    """
+
+    pytest.importorskip("databricks.sql")
+    from fakes.databricks import (
+        FakeDatabricks,
+        FakeDatabricksConnection,
+        FakeDatabricksTable,
+        FakeWarehouse,
+        FakeWorkspaceClient,
+    )
+
+    tables = [
+        FakeDatabricksTable(
+            catalog="shop",
+            schema="core",
+            name="customers",
+            columns=[("id", "bigint", False), ("email", "string", True)],
+            rows=100,
+            bytes=5_000_000_000,  # 5 GB -> a non-trivial refined estimate
+        ),
+        FakeDatabricksTable(
+            catalog="shop",
+            schema="core",
+            name="events",
+            columns=[
+                ("id", "bigint", True),
+                ("payload", "struct<a:int,b:string>", True),
+                ("labels", "array<string>", True),
+            ],
+            rows=1_000,
+            bytes=50_000_000_000,  # 50 GB
+        ),
+    ]
+    workspace = FakeWorkspaceClient(
+        tables=tables, warehouse=FakeWarehouse(id="fake-wh", state="STOPPED")
+    )
+    connection = FakeDatabricksConnection(tables=tables)
+    return FakeDatabricks(workspace=workspace, connection=connection, tables=tables)
+
+
+@pytest.fixture
 def fake_pg_connection():
     """The standard populated fake Postgres connection (see
     tests/fakes/postgres.py).
