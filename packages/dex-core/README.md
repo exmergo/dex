@@ -84,6 +84,20 @@ warehouse the config pins. dbt builds go to a dedicated dev database.schema
 via dbt-snowflake, which the `[snowflake]` extra carries. See
 [`references/snowflake.md`](../../references/snowflake.md).
 
+Databricks: the lakehouse connector. Connects through the Databricks SDK's
+unified auth chain (`databricks auth login`, `DATABRICKS_*` env, or a dbt
+profile; dex never asks for or persists a token). Metadata is free through
+the Unity Catalog REST API, and the SQL session opens lazily on the first
+billed statement, so free commands never touch (or wake) the warehouse.
+Budgets are **warehouse-seconds** with DBUs shown alongside. Estimates start
+as an honestly labeled floor (no dry-run, no free table sizes) and refine
+in-budget via `DESCRIBE DETAIL`; the budget is hard-enforced anyway by a
+per-statement server-side `STATEMENT_TIMEOUT`, and actual seconds land in the
+same `.dex/spend.jsonl` ledger. Billed work runs only on the SQL warehouse
+the config pins. dbt builds go to a dedicated dev catalog.schema via
+dbt-databricks, which the `[databricks]` extra carries. See
+[`references/databricks.md`](../../references/databricks.md).
+
 PostgreSQL: the operational-database connector. Connects through discovered
 credentials (`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a
 dbt profile; dex never asks for or persists a password). Nothing is billed in
@@ -109,8 +123,7 @@ connectors the metadata axes (schema, volume, references) stay free while the
 scanning axes (grain, dimension cardinality) take the `--confirm --budget`
 handshake, so `check` is two-phase.
 
-The remaining cloud connector (Databricks) and the Viz preview report
-`not_implemented` until they land.
+The Viz preview reports `not_implemented` until it lands.
 
 ## License
 
