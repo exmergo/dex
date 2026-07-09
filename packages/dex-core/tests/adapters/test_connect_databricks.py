@@ -572,8 +572,15 @@ def test_warehouse_pin_accepts_id_or_http_path():
 
 def _isolate_databricks_env(monkeypatch, tmp_path: Path) -> None:
     """Point every Databricks discovery source at empty test-local state so a
-    developer's real ~/.databrickscfg or env can never leak into a test."""
+    developer's real ~/.databrickscfg or env can never leak into a test, and
+    keep the SDK offline: ``Config.__init__`` unconditionally fetches
+    ``/.well-known/databricks-config`` from the configured host, and the fake
+    test host resolves (wildcard DNS), so without this no-op each discovery
+    test burns the SDK's multi-minute retry budget against a live endpoint."""
 
+    from databricks.sdk.core import Config
+
+    monkeypatch.setattr(Config, "_resolve_host_metadata", lambda self: None)
     for var in (
         "DATABRICKS_HOST",
         "DATABRICKS_TOKEN",
