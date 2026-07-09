@@ -146,6 +146,111 @@ def test_ambiguous_all_caps_id_suffix_is_not_a_fk():
     assert fk_candidate_count([ds]) == 2
 
 
+def test_underscore_key_suffix_matches_like_id():
+    """Dimensional models commonly use `<entity>_key` surrogate keys instead of
+    `<entity>_id`; the same matching rules must apply (issue #45)."""
+
+    customers = _ds(
+        "db.main.customers", [_col("customer_key", distinct=2, unique=True)], rows=2
+    )
+    orders = _ds("db.main.orders", [_col("customer_key", distinct=2)], rows=5)
+    rels = infer_relationships([customers, orders])
+    assert len(rels) == 1
+    assert rels[0].from_columns == ["customer_key"]
+    assert rels[0].to_dataset == "db.main.customers"
+    assert rels[0].confidence >= 0.85
+
+
+def test_camelcase_key_suffix_matches():
+    parts = _ds("db.main.parts", [_col("partKey", distinct=3, unique=True)], rows=3)
+    lines = _ds("db.main.lines", [_col("partKey", distinct=2)], rows=6)
+    rels = infer_relationships([parts, lines])
+    assert len(rels) == 1
+    assert rels[0].to_dataset == "db.main.parts"
+
+
+def test_bare_key_is_a_key_not_a_foreign_key():
+    """A column literally named `key` (like bare `id`) has no entity stem."""
+
+    ds = _ds("db.main.t", [_col("key", unique=True), _col("id")], rows=1)
+    assert fk_candidate_count([ds]) == 0
+
+
+def test_tpch_alias_prefixed_keys_are_inferred():
+    """TPC-H names every FK after the child table's own alias, not the parent's
+    entity name (`L_ORDERKEY` on LINEITEM, not `ORDERS_KEY`), and concatenates the
+    suffix with no separator at all (`CUSTKEY`, not `CUST_KEY`). Neither the
+    entity-name branch nor a bare `_id`-only stem detector can see these joins;
+    covers the exact chain reported in issue #45."""
+
+    region = _ds(
+        "db.tpch.region", [_col("R_REGIONKEY", distinct=5, unique=True)], rows=5
+    )
+    nation = _ds(
+        "db.tpch.nation",
+        [
+            _col("N_NATIONKEY", distinct=25, unique=True),
+            _col("N_REGIONKEY", distinct=5),
+        ],
+        rows=25,
+    )
+    supplier = _ds(
+        "db.tpch.supplier",
+        [
+            _col("S_SUPPKEY", distinct=100, unique=True),
+            _col("S_NATIONKEY", distinct=25),
+        ],
+        rows=100,
+    )
+    customer = _ds(
+        "db.tpch.customer",
+        [
+            _col("C_CUSTKEY", distinct=150, unique=True),
+            _col("C_NATIONKEY", distinct=25),
+        ],
+        rows=150,
+    )
+    part = _ds("db.tpch.part", [_col("P_PARTKEY", distinct=200, unique=True)], rows=200)
+    orders = _ds(
+        "db.tpch.orders",
+        [
+            _col("O_ORDERKEY", distinct=1500, unique=True),
+            _col("O_CUSTKEY", distinct=150),
+        ],
+        rows=1500,
+    )
+    lineitem = _ds(
+        "db.tpch.lineitem",
+        [
+            _col("L_ORDERKEY", distinct=1500),
+            _col("L_PARTKEY", distinct=200),
+            _col("L_SUPPKEY", distinct=100),
+        ],
+        rows=6000,
+    )
+    datasets = [region, nation, supplier, customer, part, orders, lineitem]
+    rels = infer_relationships(datasets)
+
+    found = {(r.from_dataset, r.from_columns[0], r.to_dataset) for r in rels}
+    assert ("db.tpch.orders", "O_CUSTKEY", "db.tpch.customer") in found
+    assert ("db.tpch.lineitem", "L_ORDERKEY", "db.tpch.orders") in found
+    assert ("db.tpch.lineitem", "L_PARTKEY", "db.tpch.part") in found
+    assert ("db.tpch.lineitem", "L_SUPPKEY", "db.tpch.supplier") in found
+    assert ("db.tpch.supplier", "S_NATIONKEY", "db.tpch.nation") in found
+    assert ("db.tpch.customer", "C_NATIONKEY", "db.tpch.nation") in found
+    assert ("db.tpch.nation", "N_REGIONKEY", "db.tpch.region") in found
+
+
+def test_dealiased_match_skips_when_stripped_to_a_bare_suffix():
+    """`x_key` / `y_key` collapse to the bare suffix `key` once dealiased; that's
+    too generic to trust, so two unrelated single-letter-prefixed keys must not
+    be matched to each other."""
+
+    a = _ds("db.main.alpha", [_col("a_key", distinct=2, unique=True)], rows=2)
+    b = _ds("db.main.beta", [_col("b_key", distinct=2)], rows=2)
+    assert infer_relationships([a, b]) == []
+
+
 # --- same-lineage / replica folding --------------------------------------------
 
 
