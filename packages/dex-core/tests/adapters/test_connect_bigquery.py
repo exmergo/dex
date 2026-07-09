@@ -445,12 +445,6 @@ def test_get_adapter_wires_bigquery(fake_bq_client):
     assert fake_bq_client.closed is True
 
 
-def test_remaining_cloud_connectors_still_stub():
-    for connector in ("databricks",):
-        with pytest.raises(NotImplementedError):
-            get_adapter(connector)
-
-
 def test_get_dialect_resolves_without_clients():
     assert get_dialect("bigquery") == "bigquery"
     assert get_dialect("duckdb") == "duckdb"

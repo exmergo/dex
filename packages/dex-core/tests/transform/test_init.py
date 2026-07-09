@@ -155,16 +155,6 @@ def test_init_refuses_when_a_project_exists_in_a_child_dir(
     assert not (tmp_path / "fresh").exists()
 
 
-@pytest.mark.parametrize("connector", ["databricks"])
-def test_cloud_connectors_error_actionably(tmp_path: Path, capsys, connector: str):
-    rc, envelope = _run(_init_argv(tmp_path, "--connector", connector), capsys)
-    assert rc == 1
-    message = envelope["errors"][0]
-    assert connector in message
-    assert "not yet supported" in message
-    assert "duckdb" in message.lower()
-
-
 def _seed_snowflake_config(repo: Path, **target) -> None:
     (repo / ".dex").mkdir(parents=True, exist_ok=True)
     (repo / ".dex" / "config.yml").write_text(
@@ -238,6 +228,92 @@ def test_init_snowflake_refuses_unpinned_warehouse_and_source_collision(
         databases=["SHOP.PUBLIC"],
     )
     rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+    assert rc == 1
+    assert "source" in envelope["errors"][0]
+
+
+def _seed_databricks_config(repo: Path, **target) -> None:
+    (repo / ".dex").mkdir(parents=True, exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        yaml.safe_dump({"databricks": target}), encoding="utf-8"
+    )
+
+
+def _patch_databricks_discovery(monkeypatch, method: str, **config_attrs):
+    # The renderer resolves the connection at call time from connect.py, so
+    # patching there keeps the real rendering logic under test.
+    from types import SimpleNamespace
+
+    import exmergo_dex_core.connect as connect_mod
+
+    cfg = SimpleNamespace(
+        host="https://test.cloud.databricks.com", client_id=None, **config_attrs
+    )
+    monkeypatch.setattr(
+        connect_mod,
+        "resolve_databricks_connection",
+        lambda target, env, root: (cfg, method),
+    )
+
+
+def test_init_databricks_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch):
+    _seed_databricks_config(
+        tmp_path,
+        warehouse="abc123",
+        dev_catalog="scratch",
+        catalogs=["samples.tpch"],
+    )
+    _patch_databricks_discovery(monkeypatch, "default_profile:oauth_user")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "databricks"), capsys)
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "databricks"
+    profile = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    output = profile["analytics"]["outputs"]["dev"]
+    assert output["type"] == "databricks"
+    assert output["host"] == "test.cloud.databricks.com"
+    assert output["http_path"] == "/sql/1.0/warehouses/abc123"
+    assert output["catalog"] == "scratch"
+    assert output["schema"] == "dbt_dev"
+    assert output["threads"] == 1
+    # A user OAuth connection renders dbt's own browser flow, never a token.
+    assert output["auth_type"] == "oauth"
+    assert "token" not in output
+
+
+def test_init_databricks_token_auth_renders_an_env_reference(
+    tmp_path: Path, capsys, monkeypatch
+):
+    _seed_databricks_config(tmp_path, warehouse="abc123", dev_catalog="scratch")
+    _patch_databricks_discovery(monkeypatch, "environment:token")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "databricks"), capsys)
+    assert rc == 0, envelope
+    profile = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    output = profile["analytics"]["outputs"]["dev"]
+    # The token is a Jinja env reference, never a value.
+    assert output["token"] == "{{ env_var('DATABRICKS_TOKEN') }}"  # noqa: S105
+
+
+def test_init_databricks_refuses_unpinned_warehouse_and_source_collision(
+    tmp_path: Path, capsys, monkeypatch
+):
+    _patch_databricks_discovery(monkeypatch, "default_profile:oauth_user")
+    _seed_databricks_config(tmp_path, dev_catalog="scratch")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "databricks"), capsys)
+    assert rc == 1
+    assert "databricks.warehouse" in envelope["errors"][0]
+
+    _seed_databricks_config(
+        tmp_path,
+        warehouse="abc123",
+        dev_catalog="samples",
+        dev_schema="tpch",
+        catalogs=["samples.tpch"],
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "databricks"), capsys)
     assert rc == 1
     assert "source" in envelope["errors"][0]
 
