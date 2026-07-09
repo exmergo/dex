@@ -28,21 +28,51 @@ from .profile import NEAR_UNIQUE_RATIO
 # RAW_HOSTS, stg_races, and dim_customers all match FKs named after the bare entity.
 _LAYER_PREFIX = re.compile(r"^(raw|stg|src|dim|fct|fact|mart|int)_", re.IGNORECASE)
 
+# Suffixes that make a column id-shaped. `id` is the common convention; `key` is
+# just as common in dimensional models (`customer_key` surrogate keys) and is the
+# *only* FK convention in some warehouses (TPC-H: `o_custkey`, `l_orderkey`, ...).
+# A new convention (e.g. a shop that suffixes `_pk`/`_fk`) is a one-line addition
+# here, not a rewrite of the three shapes below.
+_ID_SUFFIXES = ("id", "key")
+
+# A short table-alias prefix on a key column, stripped before comparing FK and
+# parent-key names so an alias convention (TPC-H: `o_custkey` vs `c_custkey`)
+# doesn't hide a shared suffix. Bounded to 3 chars so a genuine entity name
+# (`customer_id`) is never mistaken for an alias.
+_COLUMN_ALIAS_PREFIX = re.compile(r"^[a-z]{1,3}_", re.IGNORECASE)
+
 
 def _fk_stem(column_name: str) -> str | None:
     """The entity stem of an id-shaped column, or None if not id-shaped.
 
-    Recognizes the three naming shapes seen in real warehouses: `customer_id` /
-    `HOST_ID` (underscore, any case), camelCase `raceId`, and a trailing upper `ID`
-    only when a separator precedes it (`HOSTID` stays ambiguous and is skipped).
-    A bare `id` is a key, not a foreign key, so it has no stem.
+    Recognizes each suffix in :data:`_ID_SUFFIXES` in the three naming shapes
+    seen in real warehouses: underscore-separated, any case (`customer_id`,
+    `HOST_ID`, `nation_key`), camelCase (`raceId`, `customerKey`), and a
+    trailing suffix with no separator at all. The no-separator shape is only
+    accepted for `key`: TPC-H's own FK convention is exactly that (`CUSTKEY`,
+    `NATIONKEY`), and unlike `id` it isn't the tail of ordinary English words
+    (`PAID`, `VALID`, `GRID`), so `HOSTID` stays ambiguous and skipped while
+    `CUSTKEY` doesn't. A bare `id` or `key` is a key, not a foreign key, so it
+    has no stem.
     """
 
-    if re.search(r"(?<=.)_id$", column_name, re.IGNORECASE):
+    if column_name.lower() in _ID_SUFFIXES:
+        return None
+    for suffix in _ID_SUFFIXES:
+        if re.search(rf"(?<=.)_{suffix}$", column_name, re.IGNORECASE):
+            return column_name[: -(len(suffix) + 1)]
+        camel_suffix = suffix[0].upper() + suffix[1:]
+        if re.search(rf"(?<=[a-z0-9]){camel_suffix}$", column_name):
+            return column_name[: -len(suffix)]
+    if re.search(r"(?<=[A-Za-z0-9])KEY$", column_name, re.IGNORECASE):
         return column_name[:-3]
-    if re.search(r"(?<=[a-z0-9])Id$", column_name):
-        return column_name[:-2]
     return None
+
+
+def _dealias(column_name: str) -> str:
+    """Lowercased column name with a short table-alias prefix stripped."""
+
+    return _COLUMN_ALIAS_PREFIX.sub("", column_name.lower())
 
 
 def _entity(table_name: str) -> str:
@@ -52,7 +82,7 @@ def _entity(table_name: str) -> str:
 
 
 def _is_id_shaped(column_name: str) -> bool:
-    return column_name.lower() == "id" or _fk_stem(column_name) is not None
+    return column_name.lower() in _ID_SUFFIXES or _fk_stem(column_name) is not None
 
 
 def candidate_keys(dataset: Dataset) -> list[list[str]]:
@@ -414,10 +444,15 @@ def _match_parent(
     fk = col.name.lower()
     stem_l = stem.lower()
 
-    # Strongest: <entity>_id / <entity>Id pointing at the parent named <entity>,
-    # joining to the parent's id-shaped key (`id`, `<entity>_id`, or `<entity>Id`).
+    # Strongest: <entity>_id / <entity>Id (or the _key equivalents) pointing at
+    # the parent named <entity>, joining to the parent's id-shaped key (bare
+    # `id`/`key`, `<entity>_id`, or `<entity>id`, for each suffix in
+    # `_ID_SUFFIXES`).
     if stem_l in parent_entities or _singularize(stem).lower() in parent_entities:
-        for target in ("id", f"{stem_l}_id", f"{stem_l}id"):
+        targets = list(_ID_SUFFIXES)
+        targets += [f"{stem_l}_{suffix}" for suffix in _ID_SUFFIXES]
+        targets += [f"{stem_l}{suffix}" for suffix in _ID_SUFFIXES]
+        for target in targets:
             pcol = parent_cols.get(target)
             if pcol is not None and _type_compatible(col.data_type, pcol.data_type):
                 base = 0.85 if target in parent_key_names else 0.5
@@ -429,6 +464,22 @@ def _match_parent(
         pcol = parent_cols[fk]
         if _type_compatible(col.data_type, pcol.data_type):
             return [pcol.name], _score(0.6, col, pcol)
+
+    # Same key suffix once each side's table-alias prefix is stripped: TPC-H
+    # names a foreign key after the *child's* alias, not the parent's entity
+    # (LINEITEM.l_orderkey -> ORDERS.o_orderkey), which the entity-name branch
+    # above can't see since "l" and "o" aren't ORDERS's entity name. Skipped
+    # when stripping collapses the name to a bare suffix (e.g. "x_key" -> "key"),
+    # which is too generic to trust as a match.
+    fk_bare = _dealias(fk)
+    if fk_bare != fk and fk_bare not in _ID_SUFFIXES:
+        for pname, pcol in parent_cols.items():
+            if (
+                pname in parent_key_names
+                and _dealias(pname) == fk_bare
+                and _type_compatible(col.data_type, pcol.data_type)
+            ):
+                return [pcol.name], _score(0.55, col, pcol)
 
     return None
 
