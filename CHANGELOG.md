@@ -9,6 +9,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- `explore relationships` only recognized `_id`-style foreign key columns, so
+  warehouses using a `_key` convention (dimensional surrogate keys, and
+  TPC-H's own FK structure: `O_CUSTKEY`, `L_ORDERKEY`, `N_REGIONKEY`, ...)
+  inferred zero joins. `_fk_stem` now recognizes `key` alongside `id`, and a
+  new alias-stripping match handles TPC-H's convention of naming a foreign
+  key after the child table's own alias rather than the parent's entity name
+  (`L_ORDERKEY` on `LINEITEM` referring to `O_ORDERKEY` on `ORDERS`). (#45)
+
 ## [1.0.1] - 2026-07-06
 
 ### Fixed
