@@ -22,6 +22,16 @@ both):
     DEX_TEST_SNOWFLAKE_CONNECTION=dex-ci DEX_TEST_SNOWFLAKE_DATABASE=DEX_CI \
         uv run pytest tests/integration -q
 
+Databricks (bills warehouse time on the pinned SQL warehouse; every statement
+capped at DEX_TEST_DATABRICKS_MAX_SECONDS, default 60, enforced server-side by
+STATEMENT_TIMEOUT; reads the samples catalog, writes only to the scratch
+catalog). Auth is the SDK's unified chain: `databricks auth login` locally, or
+DATABRICKS_HOST plus a credential in CI (scripts/setup_databricks_ci.sh
+provisions the service principal and the OIDC federation policy):
+
+    DEX_TEST_DATABRICKS_WAREHOUSE=<warehouse-id> \
+        DEX_TEST_DATABRICKS_CATALOG=dex_ci uv run pytest tests/integration -q
+
 Postgres (bills nothing: a local container; db-load gating is exercised for
 real, statement timeouts and all). The DSN should be the read-only role from
 scripts/postgres_seed.sql; transform additionally needs the dbt_dev role's
@@ -43,6 +53,8 @@ REQUIRED_ENV = ("DEX_TEST_BQ_PROJECT", "DEX_TEST_BQ_DATASET")
 MAX_BYTES = int(os.environ.get("DEX_TEST_BQ_MAX_BYTES", str(100 * 1024 * 1024)))
 
 SF_MAX_SECONDS = float(os.environ.get("DEX_TEST_SNOWFLAKE_MAX_SECONDS", "60"))
+
+DBX_MAX_SECONDS = float(os.environ.get("DEX_TEST_DATABRICKS_MAX_SECONDS", "60"))
 
 
 def _snowflake_enabled() -> bool:
@@ -66,6 +78,15 @@ def _require_cloud_env(request):
                 "plus DEX_TEST_SNOWFLAKE_CONNECTION (or SNOWFLAKE_ACCOUNT/USER)"
             )
         pytest.importorskip("snowflake.connector")
+        return
+    if request.node.get_closest_marker("databricks"):
+        if not os.environ.get("DEX_TEST_DATABRICKS_WAREHOUSE"):
+            pytest.skip(
+                "Databricks integration disabled: set "
+                "DEX_TEST_DATABRICKS_WAREHOUSE (and authenticate via "
+                "`databricks auth login` or DATABRICKS_HOST plus a credential)"
+            )
+        pytest.importorskip("databricks.sql")
         return
     if request.node.get_closest_marker("postgres"):
         if not os.environ.get("DEX_TEST_PG_DSN"):
@@ -104,6 +125,17 @@ def sf_connection_name() -> str | None:
 @pytest.fixture
 def sf_warehouse() -> str:
     return os.environ.get("DEX_TEST_SNOWFLAKE_WAREHOUSE", "DEX_CI_WH")
+
+
+@pytest.fixture
+def dbx_warehouse() -> str:
+    return os.environ["DEX_TEST_DATABRICKS_WAREHOUSE"]
+
+
+@pytest.fixture
+def dbx_scratch_catalog() -> str | None:
+    # Needed by transform only; explore reads samples and writes nothing.
+    return os.environ.get("DEX_TEST_DATABRICKS_CATALOG")
 
 
 @pytest.fixture
