@@ -859,6 +859,13 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
             "billed_seconds": 7.0,
         }
     )
+    store.append_spend_log(
+        {
+            "at": "2026-07-05T00:00:04+00:00",
+            "connector": "databricks",
+            "billed_seconds": 11.0,
+        }
+    )
     assert store.spend_since("2026-07-05T00:00:00+00:00", connector="bigquery") == 5000
     assert (
         store.spend_since(
@@ -872,6 +879,208 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
         )
         == 7.0
     )
+    assert (
+        store.spend_since(
+            "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="databricks"
+        )
+        == 11.0
+    )
+
+
+# --- Databricks: the lakehouse compute-time connector exercises every family -----
+#
+# These run against the fake pair (tests/fakes/databricks.py): deterministic,
+# offline, free. They importorskip on the [databricks] extra (via the
+# fake_databricks fixture), which CI and the release gate install, so trimming
+# that extra from a workflow would silently skip release-blocking families;
+# keep `--extra databricks` in ci.yml and release.yml.
+
+
+def _dbx_adapter(fake_databricks, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.databricks import DatabricksAdapter
+    from exmergo_dex_core.config import DatabricksTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.COMPUTE_TIME,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="databricks",
+    )
+    return DatabricksAdapter(
+        workspace=fake_databricks.workspace,
+        sql_connect=fake_databricks.sql_connect,
+        cost_gate=gate,
+        target=DatabricksTarget(warehouse="fake-wh"),
+        host="test.cloud.databricks.com",
+        auth_method="default_profile:oauth_user",
+        clock=fake_databricks.clock,
+    )
+
+
+def test_databricks_generated_sql_is_select_only(fake_databricks):
+    # Family 1: every data statement the adapter generates passes the
+    # SELECT-only guard in the databricks dialect (asserted at build time).
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _dbx_adapter(fake_databricks)
+    _meta, columns = adapter.table_metadata("shop.core.customers")
+    sql, _plan = adapter._build_aggregate_sql("shop.core.customers", columns, {"id"})
+    assert sql.lstrip().upper().startswith("SELECT")
+    assert assert_select_only(sql, dialect="databricks") == sql
+
+
+def test_select_only_guard_rejects_databricks_writes_and_ddl():
+    # Family 1: Databricks DML/DDL, Delta maintenance, and multi-statement
+    # forms are all refused when parsed in the databricks dialect.
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
+
+    for bad in (
+        "CREATE TABLE t AS SELECT 1",
+        "MERGE INTO d.t USING d.s ON FALSE WHEN NOT MATCHED THEN INSERT VALUES (1)",
+        "TRUNCATE TABLE d.t",
+        "SELECT 1; SELECT 2",
+        "DELETE FROM d.t WHERE TRUE",
+        "INSERT INTO d.t VALUES (1)",
+        "OPTIMIZE d.t",
+        "VACUUM d.t",
+        "COPY INTO d.t FROM '/mnt/x'",
+    ):
+        with pytest.raises(NotSelectOnlyError):
+            assert_select_only(bad, dialect="databricks")
+
+
+def test_databricks_unconfirmed_scan_never_executes(fake_databricks):
+    # Family 2: the strict handshake. Without --confirm nothing runs on the
+    # warehouse; estimation is free REST metadata, and the SQL session that
+    # could wake the warehouse is never even opened.
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _dbx_adapter(fake_databricks, confirmed=False)
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `shop`.`core`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_databricks.connect_count == 0
+    assert fake_databricks.connection.data_statements == []
+
+
+def test_databricks_confirmed_run_without_a_ceiling_is_refused(fake_databricks):
+    # Family 2: nothing executes unbudgeted; confirmation cannot stand in for
+    # a ceiling on a billed paradigm.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _dbx_adapter(fake_databricks, ceiling=None, confirmed=True)
+    with pytest.raises(CostGuardError):
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `shop`.`core`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_databricks.connect_count == 0
+
+
+def test_databricks_over_ceiling_cannot_be_confirmed_through(fake_databricks):
+    # Family 2: over-ceiling blocks first, even fully confirmed (the floor
+    # plus the wake charge exceeds a 2-second ceiling).
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _dbx_adapter(fake_databricks, ceiling=2.0, confirmed=True)
+    with pytest.raises(OverCeilingError):
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `shop`.`core`.`events`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_databricks.connect_count == 0
+
+
+def test_databricks_every_executed_statement_is_server_capped(fake_databricks):
+    # Family 2: defense in depth past the client-side gate; a wrong floor
+    # cannot overrun the budget because STATEMENT_TIMEOUT kills the statement.
+    fake_databricks.connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _dbx_adapter(fake_databricks)
+    adapter.run_query(
+        "SELECT COUNT(*) AS n FROM `shop`.`core`.`customers`",
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    executed = fake_databricks.connection.data_statements
+    assert executed
+    assert all(s.session_timeout is not None for s in executed)
+
+
+def test_query_firewall_blocks_databricks_value_carrying_shapes():
+    # Family 3: PII stays flagged-not-surfaced under the databricks dialect,
+    # including its own value-carrying aggregates and JSON casts.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "SELECT ANY_VALUE(email) FROM db.main.customers",
+        "SELECT ARRAY_AGG(email) FROM db.main.customers",
+        "SELECT COLLECT_LIST(email) FROM db.main.customers",
+        "SELECT TO_JSON(struct(email)) FROM db.main.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits(), dialect="databricks")
+    # Measuring stays allowed in the databricks dialect too.
+    inspect_query(
+        "SELECT COUNT(DISTINCT email) FROM db.main.customers",
+        cache,
+        QueryLimits(),
+        dialect="databricks",
+    )
+
+
+def test_databricks_capabilities_pass_the_sanitizer(fake_databricks, capsys):
+    # Family 5: the capabilities payload carries a coarse auth method, never
+    # an identity or token, and survives the sanitizer end to end.
+    adapter = _dbx_adapter(fake_databricks)
+    caps = adapter.capabilities()
+    env.emit(env.ok(caps))
+    out = capsys.readouterr().out
+    assert out
+    assert "@" not in out  # no user identity
+    assert caps["auth_method"].split(":")[0] in {
+        "named_profile",
+        "environment",
+        "default_profile",
+        "dbt_profile",
+        "unknown",
+    }
+
+
+def test_databricks_spend_ledger_holds_no_sql_or_values(
+    tmp_path: Path, fake_databricks
+):
+    # Family 5: the audit trail is second counts and statement hashes only.
+    import json
+
+    from exmergo_dex_core.cache import DexStore
+
+    store = DexStore(tmp_path)
+    fake_databricks.connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _dbx_adapter(fake_databricks)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        "SELECT COUNT(*) AS n FROM `shop`.`core`.`customers`",
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = json.loads(lines[-1])
+    assert "SELECT" not in json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
 
 
 # --- Postgres: the db-load connector exercises every family ---------------------
