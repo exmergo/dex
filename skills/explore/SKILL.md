@@ -57,17 +57,19 @@ measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
 (MIN, ANY_VALUE, STRING_AGG). Never fall back to raw Python or a database CLI to
 run SQL; the firewall path is the only sanctioned one.
 
-## Cloud and database targets (BigQuery, Snowflake, Postgres)
+## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres)
 
 A remote warehouse or database replaces `--path` with connector config. Start
 with `connect test --connector <name>` (or set `connector:` plus the matching
 block in `.dex/config.yml`: `bigquery:` with `project` and a `datasets`
 allowlist, `snowflake:` with the pinned `warehouse` and a `databases`
+allowlist, `databricks:` with the pinned SQL `warehouse` and a `catalogs`
 allowlist, `postgres:` with a `schemas` allowlist). Credentials are
 discovered, never asked for: if the envelope reports missing or expired
 credentials, relay the fix it names (for BigQuery
 `gcloud auth application-default login`; for Snowflake a `connections.toml`
-entry or `SNOWFLAKE_*` env; for Postgres `DATABASE_URL`, `PG*` env, or a
+entry or `SNOWFLAKE_*` env; for Databricks `databricks auth login` or
+`DATABRICKS_*` env; for Postgres `DATABASE_URL`, `PG*` env, or a
 `pg_service.conf` entry) and never ask the user to paste a key, token, or
 password.
 
@@ -76,7 +78,9 @@ On a metered connector, scanning commands (`profile`, `map`, `relationships`,
 `needs_confirmation` with an estimate in `cost.estimate` (and a per-table
 breakdown where relevant): an exact dry-run byte figure on BigQuery, a
 heuristic labeled `estimate_quality: "heuristic"` in warehouse-seconds on
-Snowflake (credits alongside) and database-seconds on Postgres (no dollars;
+Snowflake (credits alongside), a floor labeled `estimate_quality: "low"` in
+warehouse-seconds on Databricks (DBUs alongside; it sharpens itself inside
+the confirmed budget), and database-seconds on Postgres (no dollars;
 the guarded quantity is load on the operational database). Surface the
 estimate to the user in human units, get an explicit budget from them, and
 re-issue the same command with `--confirm` and `--budget <magnitude>` in the
