@@ -9,6 +9,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-09
+
+### Added
+
+- **Databricks connector**, completing the planned cloud-warehouse set:
+  explore, maintain, ad-hoc query, and dbt builds against Unity Catalog
+  (`catalog.schema.table`), behind the `[databricks]` extra (which now
+  carries dbt-databricks). Connections are discovered through the SDK's
+  unified auth chain (`databricks auth login`, `DATABRICKS_*` env, or a dbt
+  profile); only a coarse auth method is ever surfaced.
+- The connector guards **warehouse-seconds** (DBUs and dollars alongside)
+  with a deliberate client split: all metadata comes free from the Unity
+  Catalog REST API, and the SQL session opens lazily on the first billed
+  statement, so free commands never touch, or wake, the warehouse. Estimates
+  start as an honestly labeled floor (Databricks has no dry-run and no free
+  table sizes) and refine inside the confirmed budget via `DESCRIBE DETAIL`;
+  every billed statement is capped server-side by `STATEMENT_TIMEOUT` wound
+  down to the remaining budget, and actual seconds land in the
+  `.dex/spend.jsonl` ledger.
+- `transform init --connector databricks` renders a dbt-databricks `dev`
+  profile: dev catalog.schema (refused when it overlaps a source scope), the
+  pinned warehouse's HTTP path, one thread, and auth without a persisted
+  secret (dbt's own OAuth flow for user connections, a `DATABRICKS_TOKEN`
+  env reference otherwise).
+- The Databricks safety-spine block (all five assertion families against a
+  stateful fake Unity Catalog + DBAPI pair, including the lazy-open
+  invariant), a live env-gated integration suite (`DEX_TEST_DATABRICKS_*`)
+  reading the samples catalog, a scheduled `integration.yml` job
+  authenticated by an OIDC federation policy (no stored keys), and
+  `scripts/setup_databricks_ci.sh` automating the one-time provisioning
+  (service principal, federation policy, dedicated 2X-Small serverless
+  warehouse, scratch catalog, GitHub environment).
+
 ## [1.0.1] - 2026-07-06
 
 ### Fixed
