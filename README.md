@@ -102,7 +102,7 @@ experience first and treat the benchmark as a floor, not the goal.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
-<img width="840" height="153" alt="image" src="https://github.com/user-attachments/assets/82962530-4551-4d5b-b3b5-ae5ad1026f4d" />
+<img width="927" height="149" alt="image" src="https://github.com/user-attachments/assets/66060b8d-f56c-4de8-9c79-cc00252eb1b4" />
 
 
 Credentials are discovered, never asked for: BigQuery through Application
