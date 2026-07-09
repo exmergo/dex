@@ -291,6 +291,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         for name in [
             config.bigquery.dev_dataset if config.bigquery else None,
             config.snowflake.dev_schema if config.snowflake else None,
+            config.databricks.dev_schema if config.databricks else None,
             config.postgres.dev_schema if config.postgres else None,
         ]
         if name

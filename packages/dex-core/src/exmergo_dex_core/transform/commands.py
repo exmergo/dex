@@ -148,6 +148,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     paradigm = {
         "bigquery": Paradigm.BYTES_SCANNED,
         "snowflake": Paradigm.COMPUTE_TIME,
+        "databricks": Paradigm.COMPUTE_TIME,
         "postgres": Paradigm.DB_LOAD,
     }.get(connector, Paradigm.FREE_LOCAL)
 
@@ -191,8 +192,8 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
             "auto-suspend are the server-side caps",
             *notes,
         ]
-        # dbt-snowflake reports no billing figure; per-node execution time is
-        # the honest warehouse-seconds actual.
+        # dbt-snowflake and dbt-databricks report no billing figure; per-node
+        # execution time is the honest warehouse-seconds actual.
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )
