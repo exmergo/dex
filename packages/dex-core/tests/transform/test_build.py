@@ -182,6 +182,60 @@ def test_build_failure_error_names_the_first_dbt_message(
     assert any("logs" in w and "dbt.log" in w for w in envelope["warnings"])
 
 
+def test_build_failure_error_skips_deprecation_warnings_for_the_real_cause(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Regression for #50: a dbt 1.11 deprecation notice logs before the real
+    failure on every normally-authored project, and must not win errors[0]."""
+
+    real_error = (
+        'Database error while listing schemas in database "NOPE_MISSING_DB"\n'
+        "  Database Error\n"
+        "    002043 (02000): SQL compilation error:\n"
+        "    Object does not exist, or operation cannot be performed."
+    )
+    lines = [
+        json.dumps(
+            {
+                "info": {
+                    "level": "warn",
+                    "name": "PropertyMovedToConfigDeprecation",
+                    "msg": "[WARNING][PropertyMovedToConfigDeprecation]: "
+                    "Deprecated functionality",
+                }
+            }
+        ),
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "MainEncounteredError",
+                    "msg": real_error,
+                }
+            }
+        ),
+    ]
+    _fake_runner_factory(monkeypatch, returncode=2, stdout="\n".join(lines))
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt build failed: Database error while listing schemas in database "
+        '"NOPE_MISSING_DB"'
+    )
+    assert any("PropertyMovedToConfigDeprecation" in w for w in envelope["warnings"])
+
+
 def test_missing_dev_db_with_sources_is_an_actionable_error(
     dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
 ):
