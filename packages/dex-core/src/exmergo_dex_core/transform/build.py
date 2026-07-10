@@ -224,10 +224,14 @@ def shadow_parse(
     logs/, any stray database a relative profile path would create) lives and
     dies with the copy.
 
-    Returns ``{"available", "reason", "messages"}``: unavailable means the
-    caller degrades to a warning (dbt or profiles missing, mirroring the
-    schema-validation fallback); available with empty messages means the parse
-    passed; non-empty messages are the parse errors.
+    Returns ``{"available", "reason", "success", "messages"}``: unavailable
+    means the caller degrades to a warning (dbt or profiles missing, mirroring
+    the schema-validation fallback). When available, ``success`` says whether
+    the parse itself passed; ``messages`` is populated either way, since dbt
+    logs deprecation notices on a project that parses cleanly, and a plan that
+    validates today should not go on to warn about them for the first time at
+    `transform build` (#55). On failure, ``messages`` are the parse errors
+    (dbt's own summary event leads if present; see :func:`_collect_messages`).
     """
 
     # Absolute so --profiles-dir (pointing at the real project) does not
@@ -239,6 +243,7 @@ def shadow_parse(
         return {
             "available": False,
             "reason": "dbt is not installed; plan validated by schema checks only",
+            "success": None,
             "messages": [],
         }
     try:
@@ -247,6 +252,7 @@ def shadow_parse(
         return {
             "available": False,
             "reason": "no profiles.yml found; dbt parse skipped",
+            "success": None,
             "messages": [],
         }
 
@@ -282,10 +288,15 @@ def shadow_parse(
             argv += ["--target", target]
         run = runner or _default_runner(timeout, shadow)
         completed = run(argv)
-        messages: list[str] = []
-        if completed.returncode != 0:
-            messages = _collect_messages(completed) or ["dbt parse failed"]
-    return {"available": True, "reason": None, "messages": messages}
+        success = completed.returncode == 0
+        # Collected unconditionally: a passing parse can still have logged
+        # deprecation notices, which the caller surfaces as plan-time warnings
+        # rather than letting the author discover them for the first time at
+        # `transform build`.
+        messages = _collect_messages(completed)
+        if not success and not messages:
+            messages = ["dbt parse failed"]
+    return {"available": True, "reason": None, "success": success, "messages": messages}
 
 
 def has_package_spec(project_dir: Path | str) -> bool:

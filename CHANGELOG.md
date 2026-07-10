@@ -9,6 +9,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- `semantic define`/`update`/`plan` reported `warnings: []` for a plan that
+  parsed cleanly but whose YAML would go on to log dbt deprecation notices
+  (e.g. `PropertyMovedToConfigDeprecation`) at `transform build`. `shadow_parse`
+  only collected messages on a failed parse; it now collects them on a clean
+  parse too, and the caller surfaces them as plan-time warnings instead of
+  letting the author discover them for the first time at build (where they
+  also poisoned the failure-error channel, #50). (#55)
+
 ## [1.1.0] - 2026-07-09
 
 ### Added

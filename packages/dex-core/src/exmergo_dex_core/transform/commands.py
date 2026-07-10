@@ -383,6 +383,7 @@ def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
     # that already-surfaced reason, and authoring the spine comes next), or
     # with --no-parse.
     parse_warning: str | None = None
+    parse_deprecations: list[str] = []
     if getattr(args, "no_parse", False):
         pass
     elif spine_warning:
@@ -395,11 +396,17 @@ def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
         parse_result = shadow_parse(project, edits, target=config.dbt_target)
         if not parse_result["available"]:
             parse_warning = parse_result["reason"]
-        elif parse_result["messages"]:
+        elif not parse_result["success"]:
             return env.error(
                 _failure_message("dbt parse failed", parse_result["messages"]),
                 warnings=parse_result["messages"][1:],
             )
+        elif parse_result["messages"]:
+            # The parse passed, but dbt logged deprecation notices against this
+            # exact YAML (#55): surface them now, at plan time, rather than
+            # let the author discover them for the first time at `transform
+            # build` (where they also poison the failure-error channel, #50).
+            parse_deprecations = [f"dbt: {m}" for m in parse_result["messages"]]
 
     envelope = _make_plan(args, intent, edits)
     if envelope.status is env.Status.OK:
@@ -411,6 +418,7 @@ def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
             envelope.warnings.append(spine_warning)
         if parse_warning:
             envelope.warnings.append(parse_warning)
+        envelope.warnings.extend(parse_deprecations)
     return envelope
 
 

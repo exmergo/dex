@@ -227,6 +227,42 @@ def test_parse_skipped_while_the_project_lacks_a_time_spine(
     assert any("dbt parse skipped" in w for w in envelope["warnings"])
 
 
+def test_parse_success_still_surfaces_deprecation_warnings(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Regression for #55: a clean parse (returncode 0) with a deprecation
+    notice on stdout must not report warnings: [] just because nothing failed
+    -- the same YAML would go on to warn at `transform build` (#50)."""
+
+    _add_time_spine(dbt_project_dir)
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    line = json.dumps(
+        {
+            "info": {
+                "level": "warn",
+                "name": "PropertyMovedToConfigDeprecation",
+                "msg": "[WARNING][PropertyMovedToConfigDeprecation]: Deprecated "
+                "functionality",
+            }
+        }
+    )
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout=line, stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+    rc, envelope = _define(tmp_path, _payload_file(tmp_path, _SEMANTIC_YAML), capsys)
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert len(_plans_on_disk(tmp_path)) == 1
+    assert any("PropertyMovedToConfigDeprecation" in w for w in envelope["warnings"])
+
+
 def test_real_dbt_parse_catches_a_dangling_model_ref(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
