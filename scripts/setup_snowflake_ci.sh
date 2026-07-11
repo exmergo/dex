@@ -19,15 +19,26 @@
 #     Federation (GitHub OIDC), pinned to this repository and to the
 #     snowflake-integration environment; no key or password is ever created
 #     or stored for CI
+#   - DEX_CI_DBT user: a SERVICE user with an RSA key pair, used by the one
+#     part of CI that cannot be keyless. dbt-snowflake authenticates by
+#     password, key pair, SSO, or OAuth token only: its profile carries no
+#     workload-identity provider field, so `transform init` refuses to render
+#     a WIF profile and the dbt tests need a durable credential. The private
+#     key goes straight into the GitHub environment as a secret and is never
+#     written to this machine; each run of this script rotates it, so the two
+#     halves cannot drift apart. Keeping this identity separate leaves DEX_CI
+#     itself keyless.
 #   - DEX_DEV user: a SERVICE user with a locally generated RSA key pair plus
 #     a `dex-ci` entry in ~/.snowflake/connections.toml, for running the live
 #     integration suite while developing
 #   - the GitHub environment (deployments restricted to main) carrying the
-#     two variables the workflow reads
+#     variables the workflow reads and the dbt key-pair secret
 #
 # Everything account-specific is a parameter, so nothing private lives in this
 # script. Idempotent: safe to re-run; existing resources are left in place and
-# the WIF pinning is refreshed.
+# the WIF pinning is refreshed. The one exception is the DEX_CI_DBT key pair,
+# which is rotated on every run (see below): both halves are replaced together,
+# so a re-run mid-CI can fail an in-flight dbt job. Re-run when CI is idle.
 #
 # Usage:
 #   scripts/setup_snowflake_ci.sh <account-identifier> [snow-connection-name]
@@ -58,6 +69,7 @@ MONITOR="DEX_CI_MONITOR"
 DATABASE="DEX_CI"
 ROLE="DEX_CI_ROLE"
 CI_USER="DEX_CI"
+CI_DBT_USER="DEX_CI_DBT"
 DEV_USER="DEX_DEV"
 GH_ENV="snowflake-integration"
 DEV_CONN_NAME="dex-ci"
@@ -78,6 +90,7 @@ echo "   monitor:     ${MONITOR} (${CREDIT_QUOTA} credits/month, suspends)"
 echo "   database:    ${DATABASE} (transient, retention 0)"
 echo "   role:        ${ROLE}"
 echo "   ci user:     ${CI_USER} (WIF: GitHub OIDC, env ${GH_ENV})"
+echo "   ci dbt user: ${CI_DBT_USER} (key pair, rotated into ${GH_ENV} on every run)"
 echo "   dev user:    ${DEV_USER} (key pair, connection '${DEV_CONN_NAME}')"
 echo
 
@@ -136,6 +149,18 @@ sql "CREATE USER IF NOT EXISTS ${CI_USER}
      );
      GRANT ROLE ${ROLE} TO USER ${CI_USER};"
 
+echo "-- CI dbt service user (key pair; dbt-snowflake cannot use workload identity)"
+# Same role, so the same blast radius as the WIF user: read the samples, write
+# the transient scratch database, nothing else. The key itself is minted below,
+# once the GitHub environment that carries it exists.
+sql "CREATE USER IF NOT EXISTS ${CI_DBT_USER}
+       TYPE = SERVICE
+       DEFAULT_ROLE = ${ROLE}
+       DEFAULT_WAREHOUSE = ${WAREHOUSE}
+       DEFAULT_NAMESPACE = ${DATABASE}
+       COMMENT = 'dex integration CI, dbt only (key pair; dbt cannot do WIF)';
+     GRANT ROLE ${ROLE} TO USER ${CI_DBT_USER};"
+
 echo "-- Local dev service user (key pair; the key never leaves this machine)"
 sql "CREATE USER IF NOT EXISTS ${DEV_USER}
        TYPE = SERVICE
@@ -158,7 +183,12 @@ PUBLIC_KEY=$(openssl rsa -in "$KEY_FILE" -pubout 2>/dev/null | grep -v '^-----' 
 sql "ALTER USER ${DEV_USER} SET RSA_PUBLIC_KEY = '${PUBLIC_KEY}';"
 
 echo "-- Local snow connection '${DEV_CONN_NAME}' (used by the integration suite)"
-if snow connection list 2>/dev/null | grep -q "$DEV_CONN_NAME"; then
+# Read the list into a variable and match in-shell rather than piping into
+# `grep -q`: grep exits at the first match, `snow` dies of SIGPIPE writing the
+# rest, and under `pipefail` that failure becomes the pipeline's, so an
+# existing connection reads as missing and the add below aborts the whole run.
+EXISTING_CONNECTIONS=$(snow connection list --format json 2>/dev/null || true)
+if [[ "$EXISTING_CONNECTIONS" == *"\"connection_name\": \"${DEV_CONN_NAME}\""* ]]; then
   echo "   connection ${DEV_CONN_NAME} already exists"
 else
   snow connection add --connection-name "$DEV_CONN_NAME" \
@@ -178,6 +208,26 @@ gh api -X POST "repos/${REPO}/environments/${GH_ENV}/deployment-branch-policies"
 echo "-- GitHub environment variables (identifiers, not secrets: WIF stores no credential)"
 gh variable set DEX_TEST_SNOWFLAKE_ACCOUNT --repo "$REPO" --env "$GH_ENV" --body "$ACCOUNT"
 gh variable set DEX_TEST_SNOWFLAKE_USER --repo "$REPO" --env "$GH_ENV" --body "$CI_USER"
+gh variable set DEX_TEST_SNOWFLAKE_DBT_USER --repo "$REPO" --env "$GH_ENV" --body "$CI_DBT_USER"
+
+echo "-- CI dbt key pair (minted here, pushed to ${GH_ENV}, never kept on disk)"
+# The one credential CI stores, because dbt-snowflake has no keyless option.
+# It is minted into a temp dir the trap wipes, so the private half exists only
+# in this process and in the GitHub environment: nothing to leak from this
+# machine, and no third copy to go stale. Re-running rotates both halves
+# together, which is why this is not guarded by an "if exists" like the dev
+# key: a key we deliberately do not keep cannot be reused.
+CI_KEY_DIR=$(mktemp -d)
+trap 'rm -rf "$CI_KEY_DIR"' EXIT
+CI_KEY_FILE="${CI_KEY_DIR}/dex_ci_dbt_rsa_key.p8"
+(umask 077 && openssl genrsa 2048 2>/dev/null \
+  | openssl pkcs8 -topk8 -inform PEM -nocrypt -out "$CI_KEY_FILE")
+CI_PUBLIC_KEY=$(openssl rsa -in "$CI_KEY_FILE" -pubout 2>/dev/null \
+  | grep -v '^-----' | tr -d '\n')
+sql "ALTER USER ${CI_DBT_USER} SET RSA_PUBLIC_KEY = '${CI_PUBLIC_KEY}';"
+gh secret set DEX_TEST_SNOWFLAKE_PRIVATE_KEY \
+  --repo "$REPO" --env "$GH_ENV" < "$CI_KEY_FILE"
+echo "   rotated ${CI_DBT_USER}'s key pair and DEX_TEST_SNOWFLAKE_PRIVATE_KEY"
 
 echo
 echo "== Done. Verify with:"

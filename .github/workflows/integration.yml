@@ -130,8 +130,43 @@ jobs:
           enable-cache: true
       - name: Sync (snowflake + duckdb + dev extras)
         run: uv sync --extra snowflake --extra duckdb --extra dev
+      # Keyless: connect, explore, and the transform tests' own skip guard all
+      # run on the workload identity above. The transform tests skip themselves
+      # here (dbt cannot authenticate that way) and run in the next step.
       - name: Live Snowflake integration suite
         run: uv run pytest tests/integration -q -m snowflake
+      # The one step that cannot be keyless. dbt-snowflake's profile has no
+      # workload-identity provider field, so `transform init` refuses to render
+      # a WIF profile and these tests need a durable credential: a key pair on
+      # a separate service user holding the same least-privilege role, so the
+      # blast radius is unchanged (read the samples, write the transient
+      # scratch database) and DEX_CI itself stays keyless. The secret is
+      # readable only by this environment, whose deployments are pinned to
+      # main, so a pull request cannot reach it. Emptying SNOWFLAKE_TOKEN and
+      # the WIF provider is what makes discovery pick the key pair rather than
+      # the token the job already minted.
+      - name: Live Snowflake transform suite (dbt, key pair)
+        env:
+          SNOWFLAKE_USER: ${{ vars.DEX_TEST_SNOWFLAKE_DBT_USER }}
+          SNOWFLAKE_AUTHENTICATOR: SNOWFLAKE_JWT
+          SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER: ""
+          SNOWFLAKE_TOKEN: ""
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.DEX_TEST_SNOWFLAKE_PRIVATE_KEY }}
+        run: |
+          # Without these the suite reads Snowflake as "not configured" and
+          # skips itself green, which is the one failure mode this step exists
+          # to prevent. Refuse instead: the credential comes from the setup
+          # script, so a missing one means it has not been re-run.
+          if [ -z "$SNOWFLAKE_USER" ] || [ -z "$SNOWFLAKE_PRIVATE_KEY" ]; then
+            echo "::error::DEX_TEST_SNOWFLAKE_DBT_USER or DEX_TEST_SNOWFLAKE_PRIVATE_KEY is missing from the snowflake-integration environment; re-run scripts/setup_snowflake_ci.sh"
+            exit 1
+          fi
+          key="${RUNNER_TEMP}/snowflake_ci_dbt_key.p8"
+          install -m 600 /dev/null "$key"
+          printf '%s' "$SNOWFLAKE_PRIVATE_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+          SNOWFLAKE_PRIVATE_KEY_FILE="$key" \
+            uv run pytest tests/integration/test_snowflake_transform.py -q -m snowflake
 
   databricks:
     if: github.repository == 'exmergo/dex'
