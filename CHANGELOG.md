@@ -9,6 +9,55 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`--scope`**, a portable, repeatable source-scope override that every
+  warehouse connector reads in its own namespace vocabulary: a `dataset` on
+  BigQuery, a `schema`, `database`, or `database.schema` on Snowflake, a
+  `catalog`/`catalog.schema` on Databricks, a `schema` on Postgres. Nothing is
+  written back to `.dex/config.yml`. A committed source allowlist is a cost
+  boundary, so `--scope` may only narrow it, never widen it, and a scope that
+  reaches outside is refused.
+- **Snowflake scope resolution and validation.** Scopes now resolve against the
+  account through free SHOW metadata before anything is estimated. A bare schema
+  is qualified against the databases in scope; an ambiguous one asks for
+  `database.schema`; one that names nothing is refused with the schemas that do
+  exist listed. `connect test --scope <bad>` therefore fails for free.
+- **A dev-target preflight before `transform build`.** It runs after the prod
+  refusal and before the cost gate, and it is free, so a build that cannot
+  succeed is refused before anyone is asked to weigh a budget. On Snowflake it
+  refuses a missing `dev_database` and names the `CREATE DATABASE` statement that
+  fixes it; dbt creates schemas but never databases, so the first build otherwise
+  failed inside dbt's `list_schemas` macro with an opaque
+  `002043: Object does not exist`. DuckDB's existing missing-file refusal moved
+  into the same preflight unchanged.
+
+### Fixed
+
+- **`explore map --dataset <schema>` was accepted and silently ignored on
+  Snowflake** (and, identically, on Databricks and Postgres). Scoping was
+  governed solely by the config allowlist, so a nonexistent schema was accepted
+  without error and the estimate spanned every table the allowlist permitted. A
+  user could confirm a budget believing it bounded an eight-table schema while it
+  in fact covered billion-row tables elsewhere. Scoping flags are now honored or
+  named in an error, never dropped.
+- **A `.dex/config.yml` edit to the dev target was inert after `transform
+  init`.** `profiles.yml` was the sole source of truth thereafter, so retargeting
+  `snowflake.dev_database` produced a green build against the old database.
+  `transform build` now refuses when the two disagree, naming both values and
+  both files. It never rewrites `profiles.yml`, which may legitimately be
+  hand-edited.
+
+### Changed
+
+- **`--project` and `--dataset` now error on every connector except BigQuery**,
+  where they remain as aliases of `--scope`. They were previously accepted and
+  discarded, which is strictly worse than a refusal. `--scope` on DuckDB errors
+  too: a DuckDB target is one file, selected with `--path`.
+- **`--dataset` on BigQuery now narrows a committed `bigquery.datasets`
+  allowlist rather than replacing it.** With no allowlist committed it still sets
+  one, so the `connect test --project X --dataset Y` smoke test is unchanged.
+
 ## [1.1.0] - 2026-07-09
 
 ### Added
