@@ -13,6 +13,7 @@ ordering, session state, ledger effects), not call signatures.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,21 @@ from snowflake.connector import errors as sf_errors
 
 # Statements with no registered duration run this long on the fake clock.
 DEFAULT_STATEMENT_SECONDS = 0.5
+
+
+def _object_does_not_exist() -> sf_errors.ProgrammingError:
+    """What the service actually says when a SHOW names a database or schema that
+    is not there. Verbatim, because the whole point of dex's scope resolver is
+    that this message names neither the object nor the fix, and a fake that
+    quietly returned no rows here would hide the bug being guarded against."""
+
+    return sf_errors.ProgrammingError(
+        msg=(
+            "002043 (02000): SQL compilation error: Object does not exist, or "
+            "operation cannot be performed."
+        ),
+        errno=2043,
+    )
 
 
 class FakeClock:
@@ -171,8 +187,25 @@ class FakeCursor:
     def _serve_show(self, sql: str) -> None:
         upper = sql.strip().upper()
         if upper.startswith("SHOW DATABASES"):
-            names = sorted({t.database for t in self._conn.tables})
+            like = self._like_pattern(sql)
+            names = sorted(
+                name
+                for name in self._conn.databases
+                if like is None or name.upper() == like.upper()
+            )
             self._emit([{"name": name} for name in names])
+        elif upper.startswith("SHOW SCHEMAS"):
+            like = self._like_pattern(sql)
+            names = sorted(
+                {t.schema for t in self._scoped(sql)} | {"INFORMATION_SCHEMA"}
+            )
+            self._emit(
+                [
+                    {"name": name}
+                    for name in names
+                    if like is None or name.upper() == like.upper()
+                ]
+            )
         elif upper.startswith("SHOW WAREHOUSES"):
             like = self._like_pattern(sql)
             rows = [
@@ -226,6 +259,12 @@ class FakeCursor:
         if " IN SCHEMA " in upper:
             scope = sql[upper.index(" IN SCHEMA ") + len(" IN SCHEMA ") :].strip()
             db, schema = (part.strip('"') for part in scope.split(".", 1))
+            if db.upper() not in {d.upper() for d in self._conn.databases}:
+                raise _object_does_not_exist()
+            if schema.upper() not in {
+                t.schema.upper() for t in tables if t.database.upper() == db.upper()
+            }:
+                raise _object_does_not_exist()
             return [
                 t
                 for t in tables
@@ -235,6 +274,8 @@ class FakeCursor:
         if " IN DATABASE " in upper:
             scope = sql[upper.index(" IN DATABASE ") + len(" IN DATABASE ") :].strip()
             db = scope.strip('"')
+            if db.upper() not in {d.upper() for d in self._conn.databases}:
+                raise _object_does_not_exist()
             return [t for t in tables if t.database.upper() == db.upper()]
         if " IN TABLE " in upper:
             scope = sql[upper.index(" IN TABLE ") + len(" IN TABLE ") :].strip()
@@ -244,10 +285,10 @@ class FakeCursor:
 
     @staticmethod
     def _like_pattern(sql: str) -> str | None:
-        upper = sql.upper()
-        if "LIKE" not in upper:
-            return None
-        return sql[upper.index("LIKE") + 4 :].strip().strip("'")
+        # Only the quoted literal, so a trailing `IN DATABASE x` never leaks into
+        # the pattern the way a naive split on LIKE would let it.
+        match = re.search(r"\bLIKE\s+'([^']*)'", sql, re.IGNORECASE)
+        return match.group(1) if match else None
 
     def _emit(self, rows: list[dict]) -> None:
         keys = list(rows[0].keys()) if rows else ["name"]
@@ -268,8 +309,15 @@ class FakeSnowflakeConnection:
         clock: FakeClock | None = None,
         row_resolver: Callable[[str], FakeResult | list[dict]] | None = None,
         resume_seconds: float = 60.0,
+        empty_databases: list[str] | None = None,
     ):
         self.tables = tables or []
+        # Databases exist independently of their contents. `empty_databases` is
+        # how a scratch database that holds nothing yet gets modeled, which is
+        # exactly the state a dbt dev target is in before its first build.
+        self.databases = sorted(
+            {t.database for t in self.tables} | set(empty_databases or [])
+        )
         self.warehouses = warehouses or [FakeWarehouse(name="DEX_WH")]
         self.clock = clock or FakeClock()
         self.row_resolver = row_resolver
