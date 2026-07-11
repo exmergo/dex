@@ -9,17 +9,23 @@ config afterwards changes nothing, so a user who retargets their dev database
 gets a green build against the old one. dex asks you to author that config file,
 so it has to be live or say plainly that it is not.
 
-The second is absence. dbt creates schemas but never databases, so a dev database
-that does not exist yet fails somewhere inside dbt's ``list_schemas`` macro with
-``002043: Object does not exist``, a message that names neither the database nor
-the fix.
+The second is that the dev target cannot be built into. dbt creates schemas, and
+nothing above them, so the namespace the schema lives in has to be there already:
+a missing Snowflake database dies inside dbt's ``list_schemas`` macro with
+``002043: Object does not exist``, and a missing Databricks catalog dies inside
+the ``create schema`` it issues. Neither message names the object or the fix. The
+rule is therefore: what dbt cannot create for itself is refused here, and what it
+can create is not. That lands differently per connector, so each has its own free
+probe. BigQuery does create its dev dataset, so an absent one is a warning and
+only an unreachable project is fatal. Postgres creates its dev schema too, but
+only if the role may, so what gets checked there is the privilege, asked of the
+role in the rendered profile rather than the one dex reads with.
 
-Both are refusals, not warnings, and both are free: the drift check reads two
-files, and the existence check rides the connector's free metadata path. They run
-before the cost gate, so a build that cannot possibly succeed is refused before
-anyone is asked to weigh a budget. Neither ever rewrites ``profiles.yml``: a
-hand-edited profile is a legitimate thing to have, and dex proposes rather than
-imposes.
+The refusals are free: the drift check reads two files, and every existence check
+rides the connector's free metadata path. They run before the cost gate, so a
+build that cannot possibly succeed is refused before anyone is asked to weigh a
+budget. Neither ever rewrites ``profiles.yml``: a hand-edited profile is a
+legitimate thing to have, and dex proposes rather than imposes.
 """
 
 from __future__ import annotations
@@ -30,7 +36,12 @@ import yaml
 
 from ..cache import DEX_DIR
 from ..config import CONFIG_FILE, DexConfig
-from ..dbt_project import PROFILES_FILE, duckdb_target_path, target_identifiers
+from ..dbt_project import (
+    PROFILES_FILE,
+    duckdb_target_path,
+    target_identifiers,
+    target_role,
+)
 from ..dbt_project import load as load_project
 
 
@@ -138,14 +149,52 @@ def _assert_no_drift(
 def _assert_namespace_exists(
     project: Path, target: str, config: DexConfig, repo_root: Path | str
 ) -> list[str]:
+    """What dbt cannot create for itself is fatal; what it can create is not.
+
+    That rule is the whole shape of this dispatch, and it lands differently per
+    connector because their ``create_schema`` implementations differ. dbt creates
+    schemas everywhere, so no connector's dev *schema* is checked. Above the
+    schema it stops: it never creates a Snowflake database or a Databricks
+    catalog, so a missing one is refused. BigQuery is the exception, because
+    dbt-bigquery does create its dev dataset; only the project it cannot create,
+    so an absent dataset is a warning and an unreachable project a refusal.
+    Postgres inverts it again: dbt creates the schema, but only if the role may,
+    so the privilege is what gets checked.
+    """
+
     if config.connector == "duckdb":
         return _duckdb_namespace(project, target)
     if config.connector == "snowflake":
         return _snowflake_namespace(config, repo_root)
-    # BigQuery, Databricks, and Postgres have the same gap: nothing checks that
-    # the dev dataset/catalog/schema exists, or that the principal may write it.
-    # Each needs its own free probe; until then dbt's error is the only signal.
+    if config.connector == "databricks":
+        return _databricks_namespace(config, repo_root)
+    if config.connector == "bigquery":
+        return _bigquery_namespace(config, repo_root)
+    if config.connector == "postgres":
+        return _postgres_namespace(project, target, config, repo_root)
     return []
+
+
+def _open_for_preflight(connector: str, repo_root: Path | str):
+    """The adapter, or the note to degrade to.
+
+    dex discovers its own connection (a connections file, the environment) while
+    dbt reads ``profiles.yml``, and the two can legitimately differ, so a
+    connection dex cannot open is reported rather than raised: the preflight must
+    never be the thing that breaks a build dbt could have run. The exception class
+    rides along, because silently degrading is how a real defect in the preflight
+    would go unnoticed for a long time.
+    """
+
+    from ..connect import open_adapter
+
+    try:
+        return open_adapter(connector=connector, repo_root=repo_root), None
+    except Exception as exc:
+        return None, (
+            "could not preflight the dev database "
+            f"({type(exc).__name__}: {exc}); dbt will report any problem with it"
+        )
 
 
 def _duckdb_namespace(project: Path, target: str) -> list[str]:
@@ -171,29 +220,15 @@ def _duckdb_namespace(project: Path, target: str) -> list[str]:
 
 
 def _snowflake_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
-    """Free: SHOW only, no warehouse, so this costs nothing on a billed connector.
-
-    dex discovers its own connection (connections.toml, the environment) while dbt
-    reads ``profiles.yml``, and the two can legitimately differ, so a connection
-    dex cannot open is reported as a warning rather than raised: the preflight
-    must never be the thing that breaks a build dbt could have run.
-    """
+    """Free: SHOW only, no warehouse, so this costs nothing on a billed connector."""
 
     target = config.snowflake
     if target is None or not target.dev_database:
         return []
 
-    from ..connect import open_adapter
-
-    try:
-        adapter = open_adapter(connector="snowflake", repo_root=repo_root)
-    except Exception as exc:  # degrade to a note; never block a build dbt could run
-        # The exception class rides along: silently degrading is how a real defect
-        # in the preflight would go unnoticed for a long time.
-        return [
-            "could not preflight the dev database "
-            f"({type(exc).__name__}: {exc}); dbt will report any problem with it"
-        ]
+    adapter, note = _open_for_preflight("snowflake", repo_root)
+    if adapter is None:
+        return [note]
     try:
         missing = adapter.missing_dev_namespaces(target.dev_database)
     finally:
@@ -207,6 +242,146 @@ def _snowflake_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
         "(dbt creates schemas but never databases, so the first build cannot "
         "create it), or point snowflake.dev_database at a database the role "
         "can write"
+    )
+
+
+def _databricks_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
+    """Free: Unity Catalog REST only, so the billed SQL warehouse is never woken.
+
+    The closest analogue of the Snowflake case: dbt-databricks creates the dev
+    schema (``create schema if not exists <catalog>.<schema>``) but never the
+    catalog it lives in, so a missing catalog fails the first build from inside
+    that statement, naming neither the catalog nor the fix.
+    """
+
+    target = config.databricks
+    if target is None or not target.dev_catalog:
+        return []
+
+    from .init import _DEFAULT_DBX_DEV_SCHEMA
+
+    schema = target.dev_schema or _DEFAULT_DBX_DEV_SCHEMA
+    adapter, note = _open_for_preflight("databricks", repo_root)
+    if adapter is None:
+        return [note]
+    try:
+        missing = adapter.missing_dev_namespaces(target.dev_catalog)
+        ungranted = (
+            adapter.dev_write_grants(target.dev_catalog, schema) if not missing else []
+        )
+    finally:
+        adapter.close()
+
+    if missing:
+        raise DevTargetError(
+            f"databricks {missing[0]} does not exist; create it with:\n"
+            f"  CREATE CATALOG IF NOT EXISTS {target.dev_catalog};\n"
+            "(dbt creates schemas but never catalogs, so the first build cannot "
+            "create it), or point databricks.dev_catalog at a catalog the principal "
+            "can write"
+        )
+    if not ungranted:
+        return []
+    grants = "\n".join(f"  GRANT {grant} TO `<principal>`;" for grant in ungranted)
+    return [
+        f"the dev target {target.dev_catalog}.{schema} exists but Unity Catalog "
+        "reports no privilege on it for this principal, so the build may fail with "
+        "PERMISSION_DENIED after the warehouse has already woken. Grant it:\n"
+        f"{grants}\n"
+        "(ownership and metastore-admin rights are invisible to the grants API, so "
+        "this is a warning, not a refusal: the build may still succeed)"
+    ]
+
+
+def _bigquery_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
+    """Free: a metadata GET, no query, so nothing is billed on a bytes-billed
+    connector.
+
+    BigQuery is the connector where the missing dev namespace is *not* fatal:
+    dbt-bigquery's ``create_schema`` issues ``CREATE SCHEMA IF NOT EXISTS``, which
+    creates the dataset, so an absent one is the normal state before a first build
+    and gets a warning rather than a refusal. Refusing it would block a build that
+    would have succeeded. What dbt cannot create is the project, and an unreachable
+    one is raised by the adapter.
+    """
+
+    target = config.bigquery
+    if target is None or not target.dev_dataset:
+        return []
+
+    dataset = target.dev_dataset
+    adapter, note = _open_for_preflight("bigquery", repo_root)
+    if adapter is None:
+        return [note]
+    try:
+        missing = adapter.missing_dev_namespaces(dataset)
+        qualified = dataset if "." in dataset else f"{adapter.project}.{dataset}"
+    except Exception as exc:  # an unreachable dev project: dbt cannot create one
+        raise DevTargetError(str(exc)) from exc
+    finally:
+        adapter.close()
+
+    if not missing:
+        return []
+    location = target.location or "<location>"
+    return [
+        f"dev_dataset {qualified} does not exist; dbt will create it on the first "
+        "build, which needs bigquery.datasets.create on the project. Without that "
+        "permission the build fails there instead, so create it first: "
+        f"bq mk --dataset --location={location} {qualified}"
+    ]
+
+
+def _postgres_namespace(
+    project: Path, target: str, config: DexConfig, repo_root: Path | str
+) -> list[str]:
+    """Free: catalog lookups and privilege predicates, no scan.
+
+    Postgres inverts the question. dbt creates the dev schema, so its absence is
+    not the failure; the privilege to create it is. And the role that needs the
+    privilege is the one in the rendered profile, not the one dex connects as:
+    reading the warehouse read-only and building as a role that can write is a
+    perfectly ordinary split, and this preflight exists precisely to catch the
+    case where the writing role cannot, in fact, write.
+    """
+
+    pg = config.postgres
+    if pg is None or not pg.dev_schema:
+        return []
+    role = target_role(project, target)
+    if not role:
+        # No rendered profile to read a role from (or it names none): there is no
+        # role to ask a privilege question about, so there is nothing to check.
+        return []
+
+    adapter, note = _open_for_preflight("postgres", repo_root)
+    if adapter is None:
+        return [note]
+    try:
+        missing = adapter.missing_dev_namespaces(pg.dev_schema, role=role)
+    except Exception as exc:  # the profile's role does not exist in the database
+        raise DevTargetError(str(exc)) from exc
+    finally:
+        adapter.close()
+
+    if not missing:
+        return []
+    problem = missing[0]
+    if problem.startswith("dev_schema"):
+        raise DevTargetError(
+            f"postgres {problem} does not exist and role {role} may not create "
+            "it; create it with:\n"
+            f"  CREATE SCHEMA IF NOT EXISTS {pg.dev_schema} AUTHORIZATION "
+            f"{role};\n"
+            "(dbt creates its dev schema, but only if the role may, so the first "
+            "build otherwise dies on a bare permission error), or point "
+            "postgres.dev_schema at a schema the role can write"
+        )
+    raise DevTargetError(
+        f"postgres role {role} is missing {problem}; grant it with:\n"
+        f"  GRANT USAGE, CREATE ON SCHEMA {pg.dev_schema} TO {role};\n"
+        "(dbt builds every model in that schema), or point postgres.dev_schema "
+        "at a schema the role can write"
     )
 
 

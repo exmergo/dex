@@ -270,6 +270,38 @@ def target_identifiers(
     }
 
 
+def target_role(project_dir: Path | str, target: str | None = None) -> str | None:
+    """The role a profiles.yml target authenticates as, for a privilege preflight.
+
+    Deliberately not part of :func:`target_identifiers`, whose result is
+    envelope-safe by contract and therefore carries namespace identifiers only.
+    A role name is an identity, so it gets its own door and one narrow caller:
+    asking the warehouse whether *that* role may write the dev namespace.
+
+    It has to be the profile's role rather than the one dex connects as, because
+    reading a warehouse with a read-only role while dbt builds with a writing one
+    is an ordinary split, and asking the wrong role would refuse a build dbt could
+    have run. Callers may name it in the refusal (the GRANT that fixes the problem
+    is useless without it) and nowhere else.
+    """
+
+    project = Path(project_dir)
+    try:
+        view_profile = load(project).profile_name
+        profiles = _load_profiles(project)
+    except (DbtProjectError, yaml.YAMLError):
+        return None
+    profile = profiles.get(view_profile)
+    if not isinstance(profile, dict):
+        return None
+    outputs = profile.get("outputs") or {}
+    output = outputs.get(target or profile.get("target"))
+    if not isinstance(output, dict):
+        return None
+    role = output.get("user")
+    return str(role) if role else None
+
+
 def duckdb_target_path(
     project_dir: Path | str, target: str | None = None
 ) -> Path | None:
