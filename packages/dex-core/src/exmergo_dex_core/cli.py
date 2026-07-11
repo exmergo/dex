@@ -57,9 +57,13 @@ def _sub_connection_options() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--connector", default=argparse.SUPPRESS)
     common.add_argument("--path", default=argparse.SUPPRESS)
-    # BigQuery's equivalent of --path: a convenience smoke-test override for the
-    # project and dataset allowlist, so `connect test` works before a
-    # .dex/config.yml bigquery block exists. Nothing is written to config.
+    # The portable source-scope override, repeatable: each connector reads it in
+    # its own namespace vocabulary. Nothing is written to config, and a scope may
+    # only narrow a committed allowlist, never widen it.
+    common.add_argument("--scope", action="append", default=argparse.SUPPRESS)
+    # BigQuery's older spelling of --scope, kept because `connect test --project X
+    # --dataset Y` is how a BigQuery connection is smoke-tested before a
+    # .dex/config.yml bigquery block exists. Both error on other connectors.
     common.add_argument("--project", default=argparse.SUPPRESS)
     common.add_argument("--dataset", action="append", default=argparse.SUPPRESS)
     common.add_argument("--repo-root", default=argparse.SUPPRESS)
@@ -76,6 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # Real defaults live on the top-level parser so every namespace has them.
     parser.add_argument("--connector", default=None)
     parser.add_argument("--path", default=None)
+    parser.add_argument("--scope", action="append", default=None)
     parser.add_argument("--project", default=None)
     parser.add_argument("--dataset", action="append", default=None)
     parser.add_argument("--repo-root", default=".")

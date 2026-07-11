@@ -98,15 +98,29 @@ already exists.
   `dbt_packages/` exists but is stale). No confirmation needed: deps writes only
   inside the project and never touches the warehouse.
 
-### Seeding the dev warehouse
+### Preparing the dev target
 
-A DuckDB dev target points at a database file, and dbt happily creates an empty
-one if it does not exist, which then fails every `source()` relation with a
-confusing catalog error. The engine refuses that build up front and names the
-fix. The convention: copy the shared source warehouse to the dev target path
-(for example `cp shared/f1.duckdb <project>/dev.duckdb`), or point the dev
-target at an existing database file. Projects without sources just get a
-warning and an empty database, which is fine for model-only builds.
+Before the cost gate, and for free, `transform build` refuses two things and
+names the fix for each. Neither costs anything to check, so both surface on the
+unconfirmed call rather than after a budget has been agreed.
+
+**Config that has drifted from the profile.** `transform init` renders
+`.dex/config.yml` into the project's `profiles.yml`, and dbt reads only the
+profile from then on. If a later config edit never reached it (a retargeted
+`dev_database`, a different warehouse), the build refuses and names both values
+and both files. Edit one to match the other. The engine never rewrites
+`profiles.yml`, which you may legitimately have hand-edited.
+
+**A dev target that does not exist.** On Snowflake, dbt creates schemas but never
+databases, so a missing `dev_database` is refused with the `CREATE DATABASE`
+statement to run; dex will not create it for you, because its only writes are
+reviewable diffs inside the repo. On DuckDB the dev target is a database file,
+and dbt would happily create an empty one, then fail every `source()` relation
+with a confusing catalog error. The convention there: copy the shared source
+warehouse to the dev target path (for example
+`cp shared/f1.duckdb <project>/dev.duckdb`), or point the dev target at an
+existing file. Projects without sources just get a warning and an empty
+database, which is fine for model-only builds.
 
 ### The semantic layer
 

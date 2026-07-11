@@ -27,6 +27,7 @@ from pathlib import Path
 import yaml
 
 from .adapters import get_adapter
+from .adapters.base import scope_within
 from .cache import DexStore
 from .config import (
     BigQueryTarget,
@@ -45,12 +46,36 @@ class CredentialDiscoveryError(Exception):
     names the command or config that fixes it, never a credential value."""
 
 
+class ScopeError(Exception):
+    """Raised when a source scope is not one this connector can honor: a flag it
+    does not speak, or an entry outside the committed allowlist. The message
+    always names the offending entry and the vocabulary that would work."""
+
+
+# Where each connector keeps its committed source allowlist, and how a `--scope`
+# entry reads in that connector's namespace vocabulary. DuckDB is absent because
+# it has no namespace to scope: the target is one file.
+_SCOPE_FIELDS = {
+    "bigquery": "datasets",
+    "snowflake": "databases",
+    "databricks": "catalogs",
+    "postgres": "schemas",
+}
+_SCOPE_GRAMMAR = {
+    "bigquery": "--scope <dataset> (or <project>.<dataset>)",
+    "snowflake": "--scope <schema>, <database>, or <database>.<schema>",
+    "databricks": "--scope <catalog> (or <catalog>.<schema>)",
+    "postgres": "--scope <schema>",
+}
+
+
 def open_adapter(
     *,
     connector: str | None = None,
     path: str | None = None,
     project: str | None = None,
     datasets: list[str] | None = None,
+    scopes: list[str] | None = None,
     repo_root: str | Path = ".",
     budget: float | None = None,
     confirmed: bool = False,
@@ -59,14 +84,19 @@ def open_adapter(
     """Resolve the connection target and return an open, read-only adapter.
 
     Resolution order: explicit arguments win, then ``.dex/config.yml``. For
-    DuckDB the only input is a file path; for BigQuery ``project``/``datasets``
-    are convenience overrides of the config target (never written back).
+    DuckDB the only input is a file path. ``scopes`` narrows the source
+    allowlist for this one command in every warehouse connector's own
+    vocabulary; ``project``/``datasets`` are BigQuery's older spelling of the
+    same idea. None of them are written back to config.
     ``budget``/``confirmed`` feed the cost gate on billed connectors and are
     ignored by free ones; ``command`` labels ledger entries.
     """
 
     config = load_config(repo_root) or DexConfig()
     connector = connector or config.connector
+    assert_scope_vocabulary(
+        connector, project=project, datasets=datasets, scopes=scopes
+    )
 
     if connector == "duckdb":
         resolved = path or (config.duckdb.path if config.duckdb else None)
@@ -84,25 +114,114 @@ def open_adapter(
             confirmed=confirmed,
             command=command,
             project_override=project,
-            dataset_override=datasets,
+            dataset_override=datasets or scopes,
         )
 
     if connector == "snowflake":
         return _open_snowflake(
-            config, repo_root, budget=budget, confirmed=confirmed, command=command
+            config,
+            repo_root,
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            scope_override=scopes,
         )
 
     if connector == "databricks":
         return _open_databricks(
-            config, repo_root, budget=budget, confirmed=confirmed, command=command
+            config,
+            repo_root,
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            scope_override=scopes,
         )
 
     if connector == "postgres":
         return _open_postgres(
-            config, repo_root, budget=budget, confirmed=confirmed, command=command
+            config,
+            repo_root,
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            scope_override=scopes,
         )
 
     return get_adapter(connector)
+
+
+def assert_scope_vocabulary(
+    connector: str,
+    *,
+    project: str | None,
+    datasets: list[str] | None,
+    scopes: list[str] | None,
+) -> None:
+    """Refuse a scoping flag the connector cannot honor.
+
+    Accepted-and-ignored is strictly worse than rejected. A ``--dataset`` silently
+    dropped on Snowflake let a user confirm a budget believing it bounded an
+    eight-table schema, when the estimate in fact spanned billion-row tables
+    elsewhere in the allowlist. So the only two outcomes a scoping flag may have
+    are "honored" and "named in an error".
+    """
+
+    if connector == "duckdb":
+        for flag, value in (
+            ("--project", project),
+            ("--dataset", datasets),
+            ("--scope", scopes),
+        ):
+            if value:
+                raise ScopeError(
+                    f"{flag} does not apply to the duckdb connector: a DuckDB "
+                    "target is a single file, selected with --path"
+                )
+        return
+    if connector not in _SCOPE_FIELDS:
+        return
+    if connector != "bigquery":
+        for flag, value in (("--project", project), ("--dataset", datasets)):
+            if value:
+                raise ScopeError(
+                    f"{flag} is BigQuery vocabulary and has no meaning for the "
+                    f"{connector} connector; scope this command with "
+                    f"{_SCOPE_GRAMMAR[connector]}"
+                )
+        return
+    if datasets and scopes:
+        raise ScopeError(
+            "--dataset and --scope both scope a BigQuery command; pass one "
+            "(--scope is the spelling every connector understands)"
+        )
+
+
+def narrow_target(target, connector: str, scope_override: list[str] | None):
+    """Apply a ``--scope`` override to a connector target, in memory only.
+
+    A per-command scope must never rewrite the committed ``.dex/config.yml``, and
+    it may only narrow: a committed allowlist is a cost boundary, so a flag cannot
+    reach outside it. When nothing is committed, the override sets the allowlist,
+    which is what makes ``connect test --scope X`` work before a config block
+    exists.
+
+    Entries are matched textually here. Snowflake resolves bare schema names
+    against the account before it can test containment, so it narrows inside the
+    adapter and never reaches this function.
+    """
+
+    if not scope_override:
+        return target
+    field = _SCOPE_FIELDS[connector]
+    committed = [str(entry) for entry in getattr(target, field)]
+    outside = [s for s in scope_override if not scope_within(s, committed)]
+    if committed and outside:
+        raise ScopeError(
+            f"scope {', '.join(repr(s) for s in outside)} is outside the committed "
+            f"allowlist ({connector}.{field}: {', '.join(committed)}); --scope "
+            "narrows the configured scope, it never widens it"
+        )
+    return target.model_copy(update={field: list(scope_override)})
 
 
 def _open_bigquery(
@@ -116,15 +235,11 @@ def _open_bigquery(
     dataset_override: list[str] | None = None,
 ):
     target = config.bigquery or BigQueryTarget()
-    if project_override or dataset_override:
+    target = narrow_target(target, "bigquery", dataset_override)
+    if project_override:
         # A command-line override of the committed target, applied in memory
         # only: a smoke test should not silently rewrite .dex/config.yml.
-        updates: dict = {}
-        if project_override:
-            updates["project"] = project_override
-        if dataset_override:
-            updates["datasets"] = dataset_override
-        target = target.model_copy(update=updates)
+        target = target.model_copy(update={"project": project_override})
     credentials, adc_project, principal_type = _default_credentials()
     project = resolve_bigquery_project(
         target, os.environ, adc_project, repo_root=repo_root
@@ -167,6 +282,7 @@ def _open_snowflake(
     budget: float | None,
     confirmed: bool,
     command: str | None,
+    scope_override: list[str] | None = None,
 ):
     target = config.snowflake or SnowflakeTarget()
     params, method = resolve_snowflake_connection(target, os.environ, repo_root)
@@ -209,6 +325,10 @@ def _open_snowflake(
         target=target,
         account=str(params.get("account") or "") or None,
         auth_method=method,
+        # Not folded into the target: a bare `--scope TPCH_SF1` is a schema name
+        # that only the account can resolve to a database, so the adapter has to
+        # see the override and the committed allowlist as two separate things.
+        scope_override=scope_override,
     )
 
 
@@ -418,8 +538,10 @@ def _open_databricks(
     budget: float | None,
     confirmed: bool,
     command: str | None,
+    scope_override: list[str] | None = None,
 ):
     target = config.databricks or DatabricksTarget()
+    target = narrow_target(target, "databricks", scope_override)
 
     try:
         from databricks.sdk import WorkspaceClient
@@ -645,8 +767,10 @@ def _open_postgres(
     budget: float | None,
     confirmed: bool,
     command: str | None,
+    scope_override: list[str] | None = None,
 ):
     target = config.postgres or PostgresTarget()
+    target = narrow_target(target, "postgres", scope_override)
     params, method = resolve_postgres_connection(target, os.environ, repo_root)
 
     try:

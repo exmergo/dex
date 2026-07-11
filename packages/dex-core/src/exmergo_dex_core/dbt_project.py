@@ -228,6 +228,48 @@ def resolve_target(project_dir: Path | str, target: str | None = None) -> Target
     )
 
 
+# The only keys of a profile output that may leave this module. Every one is a
+# namespace identifier, not a credential: no user, account, host, password, token,
+# or key path is ever surfaced, so what comes back is always safe to put in an
+# envelope and show to the agent.
+_TARGET_IDENTIFIER_KEYS = frozenset(
+    {"type", "database", "schema", "warehouse", "dataset", "project", "catalog", "path"}
+)
+
+
+def target_identifiers(
+    project_dir: Path | str, target: str | None = None
+) -> dict[str, str]:
+    """The namespace a profiles.yml target writes to, and nothing else.
+
+    Where ``resolve_target`` answers "which adapter", this answers "which
+    database, schema, warehouse". It exists so the engine can compare the
+    rendered profile against ``.dex/config.yml`` and refuse a build whose config
+    has silently drifted out of the profile that actually governs it. Missing
+    profile or target yields ``{}``: the caller degrades to no check rather than
+    erroring on a project it cannot read.
+    """
+
+    project = Path(project_dir)
+    try:
+        view_profile = load(project).profile_name
+        profiles = _load_profiles(project)
+    except (DbtProjectError, yaml.YAMLError):
+        return {}
+    profile = profiles.get(view_profile)
+    if not isinstance(profile, dict):
+        return {}
+    outputs = profile.get("outputs") or {}
+    output = outputs.get(target or profile.get("target"))
+    if not isinstance(output, dict):
+        return {}
+    return {
+        key: str(value)
+        for key, value in output.items()
+        if key in _TARGET_IDENTIFIER_KEYS and value is not None
+    }
+
+
 def duckdb_target_path(
     project_dir: Path | str, target: str | None = None
 ) -> Path | None:

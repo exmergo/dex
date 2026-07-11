@@ -162,9 +162,24 @@ re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
-`--project` and `--dataset` (BigQuery convenience overrides of the config
-target, repeatable `--dataset`; never written back to config, so `connect test`
-works before a `bigquery:` block exists), `--repo-root`, `--confirm`, `--budget`.
+`--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,
+`--confirm`, `--budget`.
+
+`--scope` is repeatable and narrows the source allowlist for one command. Each
+connector reads it in its own namespace vocabulary: a `dataset` on BigQuery, a
+`schema`, `database`, or `database.schema` on Snowflake, a `catalog` or
+`catalog.schema` on Databricks, a `schema` on Postgres. It is never written back
+to config, so `connect test --scope X` works before a connector block exists.
+
+Two rules make it a cost control rather than a hint:
+
+- **Scope narrows, never widens.** When `.dex/config.yml` commits a source
+  allowlist, that allowlist is a cost boundary and every `--scope` entry must
+  resolve inside it. A scope that reaches outside is refused.
+- **A scope is honored or named in an error, never dropped.** An entry that
+  names nothing refuses and lists what exists. `--project` and `--dataset` are
+  BigQuery vocabulary and error on any other connector; DuckDB has no namespace
+  to scope and refuses all three (its target is `--path`).
 
 ## The query firewall
 

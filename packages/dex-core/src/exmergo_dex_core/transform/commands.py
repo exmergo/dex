@@ -137,6 +137,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     # `from .build import ...` rather than `from . import build`: the package
     # re-exports the build *function* under the same name as the module, and the
     # submodule-path form resolves the module unambiguously.
+    from . import dev_target
     from .build import build as run_build
 
     repo_root = command_args.repo_root(args)
@@ -152,15 +153,23 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         "postgres": Paradigm.DB_LOAD,
     }.get(connector, Paradigm.FREE_LOCAL)
 
+    project = command_args.project_dir(args)
+    # A --connector flag governs this build, so the drift check must compare the
+    # profile against that connector's config block, not the committed default.
+    effective = config.model_copy(update={"connector": connector})
+
     try:
         summary, cost = run_build(
-            command_args.project_dir(args),
+            project,
             target=target,
             configured_target=config.dbt_target,
             select=getattr(args, "select", None),
             ceiling=ceiling,
             confirmed=bool(getattr(args, "confirm", False)),
             paradigm=paradigm,
+            dev_target_check=lambda: dev_target.check(
+                project, target, effective, repo_root
+            ),
         )
     except ConfirmationRequiredError as exc:
         return env.needs_confirmation(

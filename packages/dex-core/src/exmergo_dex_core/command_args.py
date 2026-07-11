@@ -32,6 +32,7 @@ def open_from_args(args: argparse.Namespace) -> Adapter:
         path=getattr(args, "path", None),
         project=getattr(args, "project", None),
         datasets=getattr(args, "dataset", None),
+        scopes=getattr(args, "scope", None),
         repo_root=repo_root(args),
         budget=getattr(args, "budget", None),
         confirmed=getattr(args, "confirm", False),

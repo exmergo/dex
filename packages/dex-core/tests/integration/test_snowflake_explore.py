@@ -152,3 +152,94 @@ def test_firewalled_query_round_trip(
     assert rc == 0, envelope
     assert envelope["data"]["cells"] == [[5]]
     assert envelope["data"]["spend"]["seconds_billed"] >= 0
+
+
+def test_scope_bounds_the_estimate_to_the_named_schema(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """A scope that is honored bounds the spend. The committed allowlist here is
+    the whole sample database, which spans four orders of magnitude in table size;
+    `--scope TPCH_SF1` must quote an estimate for those eight tables alone.
+    """
+
+    seed_repo(
+        tmp_path,
+        sf_scratch_database,
+        sf_warehouse,
+        sf_connection_name,
+        databases=["SNOWFLAKE_SAMPLE_DATA"],
+    )
+    root = str(tmp_path)
+    rc, scoped = run_cli(
+        ["--repo-root", root, "explore", "map", "--scope", "TPCH_SF1"], capsys
+    )
+    assert rc == 0, scoped
+    assert scoped["status"] == "needs_confirmation"
+    per_table = scoped["data"]["per_table_seconds"]
+    assert {ident.split(".")[1] for ident in per_table} == {"TPCH_SF1"}
+    assert len(per_table) == 8
+
+    rc, unscoped = run_cli(["--repo-root", root, "explore", "map"], capsys)
+    assert rc == 0, unscoped
+    # The whole point: scoping is worth orders of magnitude, and before this was
+    # honored both calls returned the same estimate.
+    assert scoped["cost"]["estimate"] < unscoped["cost"]["estimate"] / 1000
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_bogus_scope_is_refused_for_free(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    seed_repo(
+        tmp_path,
+        sf_scratch_database,
+        sf_warehouse,
+        sf_connection_name,
+        databases=["SNOWFLAKE_SAMPLE_DATA"],
+    )
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "map",
+            "--scope",
+            "__NONEXISTENT_SCHEMA__",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "__NONEXISTENT_SCHEMA__" in error
+    # The refusal names what does exist, which the raw 002043 never did.
+    assert "TPCH_SF1" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_scope_cannot_widen_the_committed_allowlist_live(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """The committed allowlist keeps the ~170 GB SF1000 schema out of reach; a
+    flag must not be able to pull it back in."""
+
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--scope", HUGE_SCOPE], capsys
+    )
+    assert rc == 1
+    assert "never widens" in envelope["errors"][0]
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_bigquery_flags_are_refused_on_snowflake(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--dataset", "TPCH_SF1"],
+        capsys,
+    )
+    assert rc == 1
+    assert "--dataset" in envelope["errors"][0]
+    assert "--scope" in envelope["errors"][0]
