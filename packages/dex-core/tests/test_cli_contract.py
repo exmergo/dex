@@ -90,3 +90,43 @@ def test_connect_test_without_path_is_clean_error(capsys, tmp_path):
     assert rc == 1
     assert payload["status"] == "error"
     assert payload["errors"]
+
+
+@pytest.mark.parametrize(
+    "argv_builder",
+    [
+        lambda: ["--scope", "raw", "explore", "inventory"],
+        lambda: ["explore", "inventory", "--scope", "raw"],
+        lambda: ["--scope", "raw", "--scope", "staging", "explore", "inventory"],
+    ],
+    ids=["before-subcommand", "after-subcommand", "repeatable"],
+)
+def test_scope_parses_in_either_position_and_repeats(argv_builder, tmp_path, capsys):
+    """`--scope` is a connection option like `--path`, so it has to work on both
+    sides of the subcommand and accumulate."""
+
+    rc = main(["--repo-root", str(tmp_path), *argv_builder()])
+    payload = json.loads(capsys.readouterr().out)
+    # DuckDB is the default connector and has no scope, so this is a clean refusal
+    # rather than a parse error: the point is that argparse accepted the flag.
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "--scope" in payload["errors"][0]
+
+
+def test_scope_is_accepted_on_every_subcommand():
+    """A scoping flag missing from one subcommand is how `--dataset` came to be
+    silently dropped in the first place."""
+
+    from exmergo_dex_core.cli import _build_parser
+
+    parser = _build_parser()
+    for group, subcommands in COMMAND_SURFACE.items():
+        for sub in subcommands:
+            argv = [group, sub, "--scope", "raw"]
+            if group == "explore" and sub == "profile":
+                argv.append("t")
+            elif group == "explore" and sub == "query":
+                argv.append("select 1")
+            args = parser.parse_args(argv)
+            assert args.scope == ["raw"], f"{group} {sub} dropped --scope"

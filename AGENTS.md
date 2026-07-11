@@ -40,7 +40,7 @@ release is connector-neutral.
 
 | Subcommand | Returns |
 |---|---|
-| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, BigQuery takes `--project`/`--dataset` convenience overrides (never written to config); Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
+| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings |
 | `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
@@ -50,7 +50,7 @@ release is connector-neutral.
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
 | `transform apply [plan-id]` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite; no id applies the latest unapplied plan of any kind |
 | `transform plans` | list stored plans, pending and applied, newest first |
-| `transform build --target dev` | cost preflight first; runs only with `--confirm` and a budget; prod-looking targets refused outright; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
+| `transform build --target dev` | prod-looking targets refused outright; then a free dev-target preflight (refuses when `.dex/config.yml` and the rendered `profiles.yml` disagree, or when the dev database does not exist, naming the fix); then the cost preflight; runs only with `--confirm` and a budget; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
 | `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
 | `semantic define\|update\|plan ... --edits-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies per name; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
 | `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` (pins the `.dex/` map + per-layer definition fingerprints) |
@@ -118,7 +118,10 @@ firewall has cleared them.
 3. Read-only against data; writes confined to the repo. DuckDB opens read-only;
    generated SQL is SELECT-only; agent-authored SQL runs only through the query
    firewall; builds run against a dev target only, never prod.
-4. Cost-aware by connector. Nothing runs without a ceiling.
+4. Cost-aware by connector. Nothing runs without a ceiling. The source allowlist
+   in `.dex/config.yml` is a committed cost boundary: `--scope` narrows it for one
+   command and can never widen it, and a scope that names nothing is refused
+   rather than dropped.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.

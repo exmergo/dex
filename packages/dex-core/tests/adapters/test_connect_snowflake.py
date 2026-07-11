@@ -37,6 +37,7 @@ def make_adapter(
     session_spent: float = 0.0,
     record=None,
     target: SnowflakeTarget | None = None,
+    scope_override: list[str] | None = None,
 ) -> SnowflakeAdapter:
     gate = CostGate(
         paradigm=Paradigm.COMPUTE_TIME,
@@ -54,6 +55,7 @@ def make_adapter(
         target=target or SnowflakeTarget(warehouse="DEX_WH"),
         account="TESTORG-TESTACCT",
         auth_method="named_connection:key_pair",
+        scope_override=scope_override,
         clock=connection.clock,
     )
 
@@ -588,3 +590,247 @@ def test_connections_toml_parsing(tmp_path: Path):
     assert connections["dex-ci"]["user"] == "DEX_DEV"
     assert connections["admin"]["user"] == "ADMIN"
     assert connections["__default__"] == "dex-ci"
+
+
+# --- scope resolution: honored or named in an error, never dropped -----------------
+
+
+@pytest.fixture
+def multi_db_connection():
+    """Two source databases that share a PUBLIC schema, plus an empty scratch
+    database. Enough to exercise qualification, ambiguity, and the dev-target
+    preflight, and modeled on the shape that made `--dataset` dangerous: one
+    database holding schemas of wildly different size."""
+
+    from fakes.snowflake import (
+        FakeSnowflakeConnection,
+        FakeSnowflakeTable,
+        FakeWarehouse,
+    )
+
+    def table(database, schema, name, size):
+        return FakeSnowflakeTable(
+            database=database,
+            schema=schema,
+            name=name,
+            columns=[("ID", "FIXED", False)],
+            rows=10,
+            bytes=size,
+        )
+
+    return FakeSnowflakeConnection(
+        tables=[
+            table("SAMPLE", "TPCH_SF1", "ORDERS", 1_000_000),
+            table("SAMPLE", "TPCH_SF1", "CUSTOMER", 1_000_000),
+            table("SAMPLE", "TPCDS_SF100TCL", "STORE_SALES", 900_000_000_000),
+            table("SAMPLE", "PUBLIC", "SHARED", 1_000),
+            table("RAW", "PUBLIC", "EVENTS", 1_000),
+            table("RAW", "STAGING", "SEEDS", 1_000),
+        ],
+        warehouses=[FakeWarehouse(name="DEX_WH", size="X-Small", state="SUSPENDED")],
+        empty_databases=["DBT_DEV"],
+    )
+
+
+def _scoped_identifiers(adapter) -> list[str]:
+    return [o.identifier for o in adapter.list_objects()]
+
+
+def test_qualified_scope_bounds_the_inventory(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["SAMPLE.TPCH_SF1"],
+    )
+    assert _scoped_identifiers(adapter) == [
+        "SAMPLE.TPCH_SF1.CUSTOMER",
+        "SAMPLE.TPCH_SF1.ORDERS",
+    ]
+
+
+def test_bare_schema_scope_qualifies_against_the_allowlist(multi_db_connection):
+    """The exact spelling the field report used: `--scope TPCH_SF1`, no database.
+
+    It must resolve to SAMPLE.TPCH_SF1 and bound the estimate to those two
+    tables, never silently span the 900 GB TPCDS schema next door.
+    """
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["TPCH_SF1"],
+    )
+    assert _scoped_identifiers(adapter) == [
+        "SAMPLE.TPCH_SF1.CUSTOMER",
+        "SAMPLE.TPCH_SF1.ORDERS",
+    ]
+
+
+def test_bare_database_scope_is_a_database_scope(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE", "RAW"]),
+        scope_override=["RAW"],
+    )
+    assert _scoped_identifiers(adapter) == [
+        "RAW.PUBLIC.EVENTS",
+        "RAW.STAGING.SEEDS",
+    ]
+
+
+def test_nonexistent_schema_scope_is_refused_and_names_what_exists(multi_db_connection):
+    """The bug from the field report: this used to be accepted and dropped, and
+    the estimate silently covered the whole allowlist."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["__NONEXISTENT_SCHEMA__"],
+    )
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "__NONEXISTENT_SCHEMA__" in message
+    assert "TPCH_SF1" in message and "TPCDS_SF100TCL" in message
+    assert "[from --scope]" in message
+    # Free: refusal never reaches a warehouse.
+    assert data_statements(multi_db_connection) == []
+
+
+def test_nonexistent_qualified_schema_names_the_database_and_its_schemas(
+    multi_db_connection,
+):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["SAMPLE.__NOPE__"],
+    )
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    assert "database SAMPLE has no schema __NOPE__" in str(exc.value)
+
+
+def test_nonexistent_database_scope_is_refused(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH"),
+        scope_override=["__NO_DB__.PUBLIC"],
+    )
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    assert "names no database this role can see" in str(exc.value)
+    assert "SAMPLE" in str(exc.value)
+
+
+def test_ambiguous_bare_schema_demands_qualification(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE", "RAW"]),
+        scope_override=["PUBLIC"],
+    )
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "ambiguous" in message
+    assert "qualify it as <database>.PUBLIC" in message
+
+
+def test_scope_cannot_widen_the_committed_allowlist(multi_db_connection):
+    """The cost boundary: `snowflake.databases` is committed to the repo, so a
+    per-command flag must not reach the 900 GB schema it deliberately excludes."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE.TPCH_SF1"]),
+        scope_override=["SAMPLE.TPCDS_SF100TCL"],
+    )
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "outside the committed allowlist" in message
+    assert "never widens" in message
+    assert data_statements(multi_db_connection) == []
+
+
+def test_committed_allowlist_entry_that_does_not_exist_is_blamed_on_config(
+    multi_db_connection,
+):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE.__GONE__"]),
+    )
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    assert "[from snowflake.databases in .dex/config.yml]" in str(exc.value)
+
+
+def test_connect_test_validates_the_scope_for_free(multi_db_connection):
+    """capabilities() resolves scopes, so `connect test --scope <bad>` fails
+    before any command that would spend."""
+
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["__NOPE__"],
+    )
+    with pytest.raises(SnowflakeConnectionError):
+        adapter.capabilities()
+    assert data_statements(multi_db_connection) == []
+
+
+def test_information_schema_is_never_a_scope(multi_db_connection):
+    adapter = make_adapter(
+        multi_db_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SAMPLE"]),
+        scope_override=["INFORMATION_SCHEMA"],
+    )
+    with pytest.raises(SnowflakeConnectionError):
+        adapter.list_objects()
+
+
+# --- the dev-target preflight (free) ----------------------------------------------
+
+
+def test_missing_dev_database_is_reported(multi_db_connection):
+    adapter = make_adapter(multi_db_connection)
+    assert adapter.missing_dev_namespaces("NOT_THERE") == ['dev_database "NOT_THERE"']
+    assert data_statements(multi_db_connection) == []
+
+
+def test_existing_but_empty_dev_database_is_fine(multi_db_connection):
+    """dbt creates the schema; only the database has to pre-exist. An empty
+    scratch database is exactly the state before a first build."""
+
+    adapter = make_adapter(multi_db_connection)
+    assert adapter.missing_dev_namespaces("DBT_DEV") == []
+    assert data_statements(multi_db_connection) == []
+
+
+def test_bare_schema_on_a_wide_open_account_asks_for_qualification(monkeypatch):
+    """Qualifying a bare schema costs one free SHOW SCHEMAS per candidate
+    database. On an account with hundreds, dex asks rather than round-trips."""
+
+    from fakes.snowflake import (
+        FakeSnowflakeConnection,
+        FakeSnowflakeTable,
+        FakeWarehouse,
+    )
+
+    connection = FakeSnowflakeConnection(
+        tables=[
+            FakeSnowflakeTable(
+                database=f"DB{i:03d}",
+                schema="RAW",
+                name="T",
+                columns=[("ID", "FIXED", True)],
+            )
+            for i in range(30)
+        ],
+        warehouses=[FakeWarehouse(name="DEX_WH")],
+    )
+    adapter = make_adapter(connection, scope_override=["RAW"])
+    with pytest.raises(SnowflakeConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "30 databases" in message
+    assert "qualify it as <database>.RAW" in message

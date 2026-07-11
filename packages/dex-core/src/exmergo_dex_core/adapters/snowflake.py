@@ -28,16 +28,39 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 from ..config import SnowflakeTarget
 from ..envelope import Paradigm
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
-from .base import ColumnAggregate, ColumnMeta, ObjectMeta, QueryResult, json_safe
+from .base import (
+    ColumnAggregate,
+    ColumnMeta,
+    ObjectMeta,
+    QueryResult,
+    json_safe,
+    scope_within,
+)
 
 PARADIGM = "compute_time"
 DIALECT = "snowflake"
+
+# Snowflake keeps a read-only INFORMATION_SCHEMA in every database and an
+# account-internal SNOWFLAKE database. Neither is ever a source, and neither may
+# be reached by a scope entry.
+_RESERVED_SCHEMA = "INFORMATION_SCHEMA"
+_RESERVED_DATABASE = "SNOWFLAKE"
+
+# How many sibling names an error message lists before it stops. Long enough to
+# spot a typo, short enough not to paste a thousand-schema account into stdout.
+_SUGGESTION_CAP = 12
+
+# How many databases a bare schema name may be searched across before dex asks
+# for a qualified <database>.<schema> instead. Each candidate costs one free SHOW
+# SCHEMAS round-trip, and an unscoped enterprise account has hundreds.
+_BARE_SCOPE_SEARCH_LIMIT = 20
 
 # Columns are profiled in batches so one statement against a very wide table
 # does not balloon (up to 4 expressions per column).
@@ -121,6 +144,7 @@ class SnowflakeAdapter:
         target: SnowflakeTarget | None = None,
         account: str | None = None,
         auth_method: str = "unknown",
+        scope_override: list[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._conn = connection
@@ -128,6 +152,10 @@ class SnowflakeAdapter:
         self.target = target or SnowflakeTarget()
         self.account = account
         self.auth_method = auth_method
+        # A per-command `--scope`, kept apart from the committed allowlist in the
+        # target: it may only narrow that allowlist, and deciding whether it does
+        # requires resolving bare schema names against the account first.
+        self._scope_override = list(scope_override or [])
         self._clock = clock
         # Imported lazily (the caller constructed the connection, so the
         # library is present); the error types drive refusal translation.
@@ -140,6 +168,9 @@ class SnowflakeAdapter:
         self._objects: dict[str, dict] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
         self._inventory_loaded = False
+        self._resolved_scopes: list[str] | None = None
+        self._visible_databases: set[str] | None = None
+        self._schemas_by_database: dict[str, set[str]] = {}
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
         # The 60s resume minimum is charged once per command, by whichever
@@ -317,26 +348,163 @@ class SnowflakeAdapter:
             return True
 
     def _scopes(self) -> list[str]:
-        """The allowlist entries in scope (``db`` or ``db.schema``), or every
-        database the role can see when no allowlist is configured. The
-        account-internal SNOWFLAKE database is never a source."""
+        """Every source scope this command reads, resolved and proven to exist.
 
-        if self.target.databases:
-            return sorted({entry.upper() for entry in self.target.databases})
-        return sorted(
-            str(row["name"]).upper()
-            for row in self._show("SHOW DATABASES")
-            if str(row["name"]).upper() != "SNOWFLAKE"
+        Resolution is free (SHOW only, no warehouse) and cached for the command.
+        It runs before anything is estimated, because an unresolvable scope that
+        silently falls back to the whole allowlist is a cost-safety bug: the
+        estimate the user confirms would cover tables they never named.
+        """
+
+        if self._resolved_scopes is None:
+            self._resolved_scopes = self._resolve_scopes()
+        return self._resolved_scopes
+
+    def _resolve_scopes(self) -> list[str]:
+        committed = self.target.databases
+        if committed:
+            with _blame("snowflake.databases in .dex/config.yml"):
+                configured = sorted(
+                    {
+                        self._resolve_scope(entry, sorted(self._databases()))
+                        for entry in committed
+                    }
+                )
+        else:
+            configured = sorted(self._databases())
+        if not self._scope_override:
+            return configured
+
+        # A --scope searches only the databases the config already allows, so a
+        # bare schema name can never resolve into a database outside the committed
+        # boundary; a qualified one that tries is refused below.
+        searchable = sorted({scope.split(".")[0] for scope in configured})
+        with _blame("--scope"):
+            requested = sorted(
+                {
+                    self._resolve_scope(entry, searchable)
+                    for entry in self._scope_override
+                }
+            )
+        outside = [scope for scope in requested if not scope_within(scope, configured)]
+        if outside:
+            raise SnowflakeConnectionError(
+                f"scope {_name_list(outside)} is outside the committed allowlist "
+                f"(snowflake.databases: {_name_list(configured)}); --scope narrows "
+                "the configured scope, it never widens it"
+            )
+        return requested
+
+    def _resolve_scope(self, entry: str, searchable: list[str]) -> str:
+        """One scope entry, resolved to ``DATABASE`` or ``DATABASE.SCHEMA`` and
+        proven to exist. ``searchable`` bounds where a bare schema may be found.
+
+        Every failure path here names the entry and lists the near misses, because
+        Snowflake's own answer to a bad scope is ``002043: Object does not exist``,
+        which names neither the object nor the fix.
+        """
+
+        token = entry.strip().upper()
+        if not token:
+            raise SnowflakeConnectionError("empty scope entry")
+
+        if "." in token:
+            database, _, schema = token.partition(".")
+            if "." in schema:
+                raise SnowflakeConnectionError(
+                    f"scope '{entry}' has too many parts; a source scope is "
+                    "<database> or <database>.<schema>, never a table"
+                )
+            if database not in self._databases():
+                reserved = (
+                    f" (the account-internal {_RESERVED_DATABASE} database is never "
+                    "a source)"
+                    if database == _RESERVED_DATABASE
+                    else ""
+                )
+                raise SnowflakeConnectionError(
+                    f"scope '{entry}' names no database this role can see{reserved}; "
+                    f"{self._visible_hint()}"
+                )
+            schemas = self._schemas(database)
+            if schema not in schemas:
+                raise SnowflakeConnectionError(
+                    f"scope '{entry}' does not exist: database {database} has no "
+                    f"schema {schema}; schemas there: {_name_list(sorted(schemas))}"
+                )
+            return f"{database}.{schema}"
+
+        if token in self._databases():
+            return token
+
+        # Qualifying a bare schema costs one SHOW SCHEMAS per candidate database.
+        # That is free but not instant, so a wide-open account is asked to qualify
+        # rather than made to wait through hundreds of round-trips.
+        if len(searchable) > _BARE_SCOPE_SEARCH_LIMIT:
+            raise SnowflakeConnectionError(
+                f"scope '{entry}' is a bare schema name and this role can see "
+                f"{len(searchable)} databases; qualify it as <database>.{token}, or "
+                "narrow snowflake.databases in .dex/config.yml first"
+            )
+
+        matches = sorted(db for db in searchable if token in self._schemas(db))
+        if len(matches) == 1:
+            return f"{matches[0]}.{token}"
+        if not matches:
+            schemas = sorted({s for db in searchable for s in self._schemas(db)})
+            raise SnowflakeConnectionError(
+                f"scope '{entry}' names no database and no schema in "
+                f"{_name_list(searchable)}; schemas there: {_name_list(schemas)}; "
+                f"{self._visible_hint()}"
+            )
+        raise SnowflakeConnectionError(
+            f"scope '{entry}' is ambiguous: it names a schema in "
+            f"{_name_list(matches)}; qualify it as <database>.{token}"
         )
 
-    def _database_scope(self) -> list[str]:
-        """Distinct databases in scope; also the live credential probe (SHOW
-        DATABASES round-trips even when an allowlist is configured)."""
+    def _visible_hint(self) -> str:
+        return f"visible databases: {_name_list(sorted(self._databases()))}"
 
-        visible = {str(row["name"]).upper() for row in self._show("SHOW DATABASES")}
-        if not self.target.databases:
-            return sorted(visible - {"SNOWFLAKE"})
-        return sorted({entry.split(".")[0].upper() for entry in self.target.databases})
+    def _databases(self) -> set[str]:
+        """Every database the role can see. Free, and doubles as the live
+        credential probe: SHOW DATABASES fails on a stale or underprivileged
+        credential."""
+
+        if self._visible_databases is None:
+            self._visible_databases = {
+                str(row["name"]).upper() for row in self._show("SHOW DATABASES")
+            } - {_RESERVED_DATABASE}
+        return self._visible_databases
+
+    def _schemas(self, database: str) -> set[str]:
+        """Every source schema of one database. Free, and cached: a bare scope
+        entry searches several databases and must not re-ask for each."""
+
+        if database not in self._schemas_by_database:
+            rows = self._show(f"SHOW SCHEMAS IN DATABASE {_quote_ident(database)}")
+            self._schemas_by_database[database] = {
+                str(row["name"]).upper() for row in rows
+            } - {_RESERVED_SCHEMA}
+        return self._schemas_by_database[database]
+
+    def _database_scope(self) -> list[str]:
+        """Distinct databases across the resolved scopes."""
+
+        return sorted({scope.split(".")[0] for scope in self._scopes()})
+
+    def missing_dev_namespaces(self, database: str) -> list[str]:
+        """Which parts of a dbt dev target do not exist yet. Free: SHOW only.
+
+        dbt creates schemas but never databases, so ``dev_schema`` is deliberately
+        not checked: its absence is normal on a first build. A missing database is
+        fatal, and left to dbt it surfaces from the ``list_schemas`` macro as
+        ``002043: Object does not exist``, naming neither the database nor the fix.
+        The list shape (rather than a bool) is what the catalog-plus-schema
+        connectors will want when they grow the same preflight.
+        """
+
+        rows = self._show(f"SHOW DATABASES LIKE '{_escape_literal(database.upper())}'")
+        return [] if rows else [f'dev_database "{database}"']
 
     def _scope_clause(self, scope: str) -> str:
         if "." in scope:
@@ -831,6 +999,31 @@ class SnowflakeAdapter:
         close = getattr(self._conn, "close", None)
         if close is not None:
             close()
+
+
+def _name_list(names: list[str]) -> str:
+    """Names for an error message, capped so a thousand-schema account cannot
+    turn a one-line refusal into a page of stdout."""
+
+    shown = list(names)[:_SUGGESTION_CAP]
+    suffix = (
+        f", and {len(names) - _SUGGESTION_CAP} more"
+        if len(names) > _SUGGESTION_CAP
+        else ""
+    )
+    return (", ".join(shown) + suffix) if shown else "(none)"
+
+
+@contextmanager
+def _blame(origin: str):
+    """Attribute a scope failure to the thing the user has to go edit. The
+    resolver does not know whether an entry came from the committed allowlist or
+    from a flag, and the fix differs entirely."""
+
+    try:
+        yield
+    except SnowflakeConnectionError as exc:
+        raise SnowflakeConnectionError(f"{exc} [from {origin}]") from exc
 
 
 def _quote_ident(name: str) -> str:

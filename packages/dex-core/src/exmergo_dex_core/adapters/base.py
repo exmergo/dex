@@ -94,6 +94,27 @@ class QueryResult:
     truncated: bool
 
 
+def scope_within(scope: str, committed: list[str]) -> bool:
+    """Whether one scope entry lies inside a committed source allowlist.
+
+    Every connector's scope entries are dotted namespace paths that grow coarse to
+    fine (``project.dataset``, ``database.schema``, ``catalog.schema``), so
+    containment is prefix containment on path segments: ``RAW.EVENTS`` is inside
+    ``RAW``, and ``RAW`` is not inside ``RAW.EVENTS``. Comparison is
+    case-insensitive because the connectors disagree about identifier case and a
+    case mismatch must never read as an escape attempt.
+
+    This is what makes ``--scope`` narrow-only. A committed allowlist is a cost
+    boundary, so a per-command flag has to stay inside it.
+    """
+
+    entry = scope.strip().lower()
+    return any(
+        entry == c.strip().lower() or entry.startswith(c.strip().lower() + ".")
+        for c in committed
+    )
+
+
 def json_safe(value: object | None) -> object | None:
     """Coerce a connector scalar to a JSON-serializable primitive for the envelope."""
 

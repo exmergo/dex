@@ -136,6 +136,25 @@ def test_cost_guard_blocks_over_ceiling():
         cost_guard.preflight(estimate=10_000, ceiling=10)
 
 
+def test_a_scope_flag_cannot_widen_the_committed_allowlist():
+    """The source allowlist in .dex/config.yml is a committed cost boundary. A
+    per-command flag scopes work inside it and can never reach outside it, on any
+    connector."""
+
+    from exmergo_dex_core import config as config_mod
+    from exmergo_dex_core.connect import ScopeError, narrow_target
+
+    for connector, field, target in (
+        ("bigquery", "datasets", config_mod.BigQueryTarget(datasets=["analytics"])),
+        ("databricks", "catalogs", config_mod.DatabricksTarget(catalogs=["raw"])),
+        ("postgres", "schemas", config_mod.PostgresTarget(schemas=["public"])),
+    ):
+        narrowed = narrow_target(target, connector, [getattr(target, field)[0]])
+        assert getattr(narrowed, field) == getattr(target, field)
+        with pytest.raises(ScopeError):
+            narrow_target(target, connector, ["somewhere_else"])
+
+
 # --- Family 3: PII flagged, never surfaced -----------------------------------
 
 
@@ -650,7 +669,14 @@ def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_cl
 # `--extra snowflake` in ci.yml and release.yml.
 
 
-def _sf_adapter(fake_sf_connection, *, ceiling=600.0, confirmed=True):
+def _sf_adapter(
+    fake_sf_connection,
+    *,
+    ceiling=600.0,
+    confirmed=True,
+    databases=None,
+    scope_override=None,
+):
     from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
     from exmergo_dex_core.config import SnowflakeTarget
     from exmergo_dex_core.guards.cost_guard import CostGate
@@ -666,11 +692,41 @@ def _sf_adapter(fake_sf_connection, *, ceiling=600.0, confirmed=True):
     return SnowflakeAdapter(
         connection=fake_sf_connection,
         cost_gate=gate,
-        target=SnowflakeTarget(warehouse="DEX_WH"),
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=databases or []),
         account="TESTORG-TESTACCT",
         auth_method="named_connection:key_pair",
+        scope_override=scope_override,
         clock=fake_sf_connection.clock,
     )
+
+
+def test_snowflake_scope_flag_cannot_widen_the_committed_allowlist(fake_sf_connection):
+    # Family 2: Snowflake resolves bare schema names against the account, so it
+    # enforces the committed cost boundary inside the adapter, after resolution
+    # and before anything is estimated or spent.
+    from exmergo_dex_core.adapters.snowflake import SnowflakeConnectionError
+
+    adapter = _sf_adapter(
+        fake_sf_connection, databases=["SHOP.PUBLIC"], scope_override=["SHOP"]
+    )
+    with pytest.raises(SnowflakeConnectionError, match="never widens"):
+        adapter.list_objects()
+    assert fake_sf_connection.data_statements == []
+
+
+def test_snowflake_unresolvable_scope_never_falls_back_to_the_whole_allowlist(
+    fake_sf_connection,
+):
+    # Family 2: the cost-safety bug this guards. A scope that names nothing must
+    # refuse, never silently widen to every table the allowlist permits.
+    from exmergo_dex_core.adapters.snowflake import SnowflakeConnectionError
+
+    adapter = _sf_adapter(
+        fake_sf_connection, databases=["SHOP"], scope_override=["__NOT_A_SCHEMA__"]
+    )
+    with pytest.raises(SnowflakeConnectionError):
+        adapter.profile_estimate(["SHOP.PUBLIC.EVENTS"])
+    assert fake_sf_connection.data_statements == []
 
 
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):

@@ -26,13 +26,7 @@ from typing import Any
 
 import yaml
 
-from ..dbt_project import (
-    DbtProjectError,
-    Edit,
-    contained_path,
-    duckdb_target_path,
-    profiles_dir,
-)
+from ..dbt_project import DbtProjectError, Edit, contained_path, profiles_dir
 from ..dbt_project import load as load_project
 from ..envelope import Cost, Paradigm, redact
 from ..guards.cost_guard import preflight
@@ -93,15 +87,19 @@ def build(
     ceiling: float | None = None,
     confirmed: bool = False,
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
+    dev_target_check: Callable[[], list[str]] | None = None,
     runner: Runner | None = None,
     timeout: float = _DBT_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
-    Refusal order is deliberate: the target check runs before the cost gate, so a
-    prod target is refused outright rather than merely unconfirmed. DuckDB spend
-    is zero (``FREE_LOCAL``) but the preflight still runs, so the confirmation
-    path is exercised on the free connector exactly as it will be on billed ones.
+    Refusal order is deliberate. The target check runs first, so a prod target is
+    refused outright rather than merely unconfirmed. ``dev_target_check`` runs
+    next, before the cost gate: it is free, and a dev target that has drifted or
+    does not exist makes the build impossible, so the user should learn that
+    instead of being asked to weigh a budget for a run that cannot succeed. It
+    returns warnings and raises to refuse; the callable is injected so the engine
+    stays independent of connection handling and testable without a warehouse.
 
     On a billed paradigm the estimate is honestly ``None``: dbt has no dry-run,
     so the engine cannot preflight the bytes a build will scan. The ceiling and
@@ -110,8 +108,6 @@ def build(
     """
 
     assert_dev_target(target, configured_target)
-    estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else None
-    cost = preflight(estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
 
     if project_dir is None:
         raise DbtRunError("no dbt project directory resolved for the build")
@@ -120,7 +116,10 @@ def build(
     # double (dbt would look for project/project and fail).
     project = Path(project_dir).resolve()
 
-    seeding_warning = _check_dev_database(project, target)
+    target_warnings = dev_target_check() if dev_target_check is not None else []
+
+    estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else None
+    cost = preflight(estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
 
     # Most real projects carry a packages.yml, and dbt refuses to compile until
     # its packages are installed; running deps here (post-gate) means the first
@@ -164,48 +163,11 @@ def build(
     summary = _summarize(project, target, completed)
     if deps_ran:
         summary["deps"] = {"ran": True, "success": True}
-    if seeding_warning:
-        # A note, not a failure cause: kept out of `messages`, whose first entry
+    if target_warnings:
+        # Notes, not failure causes: kept out of `messages`, whose first entry
         # is promoted to the envelope's error line on failure.
-        summary["notes"] = [seeding_warning]
+        summary["notes"] = list(target_warnings)
     return summary, cost
-
-
-def _check_dev_database(project: Path, target: str) -> str | None:
-    """Catch the missing-dev-database failure mode before dbt does.
-
-    A duckdb target whose file does not exist yet is legitimate when the project
-    builds everything from models, but a project reading from ``sources:`` would
-    get a fresh empty database and then fail every source relation with a
-    confusing catalog error. That case is refused with the seeding step spelled
-    out; the source-less case only warns.
-    """
-
-    db_path = duckdb_target_path(project, target)
-    if db_path is None or db_path.exists():
-        return None
-    if _declares_sources(project):
-        raise DbtRunError(
-            f"the dev target database {db_path} does not exist and the project "
-            "reads from sources; seed it before building (for example copy the "
-            f"source warehouse: cp <source>.duckdb {db_path}), or point the dev "
-            "target at an existing database file"
-        )
-    return f"dev target database {db_path} does not exist; dbt will create an empty one"
-
-
-def _declares_sources(project: Path) -> bool:
-    view = load_project(project)
-    for source in view.files.values():
-        if not source.path.endswith((".yml", ".yaml")):
-            continue
-        try:
-            parsed = yaml.safe_load(source.content)
-        except yaml.YAMLError:
-            continue
-        if isinstance(parsed, dict) and parsed.get("sources"):
-            return True
-    return False
 
 
 def shadow_parse(

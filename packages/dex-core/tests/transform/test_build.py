@@ -19,6 +19,35 @@ def _run(argv: list[str], capsys) -> tuple[int, dict]:
 
 
 @pytest.fixture
+def bigquery_project_dir(dbt_project_dir: Path) -> Path:
+    """The shared dbt project, retyped to a BigQuery dev target.
+
+    The billed-paradigm tests drive `--connector bigquery` for its cost gate, and
+    the dev-target preflight now (correctly) refuses a build whose profile names a
+    different adapter than the connector governing it. So the profile has to say
+    what the test claims it is.
+    """
+
+    (dbt_project_dir / "profiles.yml").write_text(
+        "dex_test:\n"
+        "  target: dev\n"
+        "  outputs:\n"
+        "    dev:\n"
+        "      type: bigquery\n"
+        "      method: oauth\n"
+        "      project: dex-test\n"
+        "      dataset: dbt_dev\n"
+        "    prod:\n"
+        "      type: bigquery\n"
+        "      method: oauth\n"
+        "      project: dex-test\n"
+        "      dataset: prod\n",
+        encoding="utf-8",
+    )
+    return dbt_project_dir
+
+
+@pytest.fixture
 def forbid_dbt(monkeypatch: pytest.MonkeyPatch):
     """Fail the test if the gate lets a dbt subprocess launch."""
 
@@ -446,7 +475,7 @@ def test_relative_project_dir_builds_without_path_doubling(
 
 
 def test_billed_build_unconfirmed_needs_confirmation_with_unknown_estimate(
-    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+    bigquery_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
 ):
     rc, envelope = _run(
         [
@@ -472,7 +501,7 @@ def test_billed_build_unconfirmed_needs_confirmation_with_unknown_estimate(
 
 
 def test_billed_build_without_a_budget_is_refused(
-    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+    bigquery_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
 ):
     rc, envelope = _run(
         [
@@ -494,12 +523,12 @@ def test_billed_build_without_a_budget_is_refused(
 
 
 def test_billed_build_sums_bytes_billed_into_the_ledger(
-    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
     import json as json_mod
 
     _fake_runner_factory(monkeypatch, returncode=0)
-    target_dir = dbt_project_dir / "target"
+    target_dir = bigquery_project_dir / "target"
     target_dir.mkdir(exist_ok=True)
     (target_dir / "run_results.json").write_text(
         json_mod.dumps(
@@ -548,7 +577,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(
-    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
     """The failure-path envelope on the billed connector: the real dbt message
     rides in errors, not buried in warnings (guards the sanitized-failure fix on
@@ -601,3 +630,42 @@ def test_build_env_caps_postgres_statements_via_pgoptions(monkeypatch):
     assert _build_env(Paradigm.DB_LOAD, None) is None
     assert _build_env(Paradigm.FREE_LOCAL, 120.0) is None
     assert _build_env(Paradigm.BYTES_SCANNED, 120.0) is None
+
+
+def test_dev_target_check_runs_before_the_cost_gate(
+    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+):
+    """A dev target that cannot work is refused before anyone is asked to weigh a
+    budget. The preflight is free, so surfacing `needs_confirmation` for a build
+    that is already doomed would be the wrong order.
+    """
+
+    (dbt_project_dir / "models" / "staging" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    tables:\n      - name: customers\n",
+        encoding="utf-8",
+    )
+    # No --confirm: the old ordering would have returned needs_confirmation here.
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"], capsys
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert "seed" in envelope["errors"][0]
+
+
+def test_prod_refusal_still_beats_the_dev_target_check(
+    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+):
+    """Ordering, continued: a prod target is refused outright, before dex goes
+    looking at whether that target happens to exist."""
+
+    (dbt_project_dir / "models" / "staging" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    tables:\n      - name: customers\n",
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--target", "prod"], capsys
+    )
+    assert rc == 1
+    assert "prod" in envelope["errors"][0].lower()
+    assert "seed" not in envelope["errors"][0]
