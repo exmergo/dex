@@ -21,16 +21,29 @@ pytestmark = [pytest.mark.integration, pytest.mark.snowflake]
 MODEL_NAME = "dex_probe"
 
 
+@pytest.fixture(autouse=True)
+def dbt_capable_connection():
+    """Every test here starts from `transform init`, which refuses a
+    workload-identity connection outright: dbt-snowflake authenticates by
+    password, key pair, SSO, or OAuth token only (its profile carries no
+    workload-identity provider field at all), so a rendered profile would fail
+    every build with an opaque auth error.
+
+    So this suite needs a durable credential and skips without one. CI runs it
+    on a dedicated key-pair service user rather than the workload identity the
+    rest of the Snowflake job uses; a local run discovers a key-pair or SSO
+    connection. Drop this once dbt-snowflake grows workload-identity support
+    and init renders it.
+    """
+
+    pytest.importorskip("dbt.adapters.snowflake")
+    if os.environ.get("SNOWFLAKE_AUTHENTICATOR", "").upper() == "WORKLOAD_IDENTITY":
+        pytest.skip("dbt needs a durable credential; workload identity not yet in dbt")
+
+
 def test_init_plan_apply_build_into_the_scratch_database(
     tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
 ):
-    pytest.importorskip("dbt.adapters.snowflake")
-    if os.environ.get("SNOWFLAKE_AUTHENTICATOR", "").upper() == "WORKLOAD_IDENTITY":
-        # Stable dbt-snowflake cannot authenticate via workload identity, so
-        # `transform init` deliberately refuses such a connection. The build
-        # path is exercised by the local key-pair run; unskip once
-        # dbt-snowflake ships workload-identity support and init renders it.
-        pytest.skip("dbt builds need a durable credential; WIF not yet in dbt")
     root = str(tmp_path)
     seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
 
@@ -47,8 +60,16 @@ def test_init_plan_apply_build_into_the_scratch_database(
     assert dev["database"] == sf_scratch_database
     assert dev["schema"] == "DBT_DEV"
     assert dev["threads"] == 1
-    # Discovery renders auth without persisting a secret value.
-    assert "password" not in dev or "env_var" in str(dev.get("password"))
+    # Discovery renders auth without ever persisting a credential value: a key
+    # pair renders as a path to the key, a password as an env_var reference the
+    # profile resolves at dbt runtime. Asserted against the rendered text, not
+    # just the parsed keys, so any future auth branch that inlines a secret
+    # trips this rather than quietly shipping one in a file dbt writes to disk.
+    profile_text = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    assert "PRIVATE KEY" not in profile_text, "key material inlined into the profile"
+    for secret_key in ("password", "token", "private_key"):
+        rendered = str(dev.get(secret_key, ""))
+        assert not rendered or "env_var" in rendered, f"{secret_key} inlined"
 
     edits_file = tmp_path / "edits.json"
     edits_file.write_text(
@@ -135,7 +156,6 @@ def test_missing_dev_database_is_refused_before_the_cost_gate(
     `002043: Object does not exist`. The preflight is free and runs before the
     confirm handshake, so this refuses without `--confirm` and without spend."""
 
-    pytest.importorskip("dbt.adapters.snowflake")
     root = str(tmp_path)
     seed_repo(tmp_path, "DEX_NO_SUCH_DEV_DATABASE", sf_warehouse, sf_connection_name)
 
@@ -162,7 +182,6 @@ def test_config_drift_from_the_rendered_profile_is_refused(
     A later config edit that never reached the profile must not build silently
     against the old target."""
 
-    pytest.importorskip("dbt.adapters.snowflake")
     root = str(tmp_path)
     seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
 

@@ -34,6 +34,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **The live Snowflake transform tests failed in CI rather than skipping.** Every
+  test in that suite starts from `transform init`, which refuses a
+  workload-identity connection because dbt-snowflake's profile carries no
+  workload-identity provider field and so cannot authenticate that way. CI
+  authenticates keylessly through GitHub OIDC, so two of the three tests asserted
+  a successful init against a connection the engine refuses by design. The guard
+  now covers the suite instead of a single test, and CI runs the dbt tests on a
+  dedicated key-pair service user holding the same least-privilege role, so the
+  coverage is restored rather than skipped. The refusal itself was correct and is
+  unchanged.
 - **`explore map --dataset <schema>` was accepted and silently ignored on
   Snowflake** (and, identically, on Databricks and Postgres). Scoping was
   governed solely by the config allowlist, so a nonexistent schema was accepted
