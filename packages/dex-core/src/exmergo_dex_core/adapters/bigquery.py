@@ -22,7 +22,15 @@ from ..config import BigQueryTarget
 from ..envelope import Paradigm
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
-from .base import ColumnAggregate, ColumnMeta, ObjectMeta, QueryResult, json_safe
+from .base import (
+    ColumnAggregate,
+    ColumnMeta,
+    ObjectMeta,
+    QueryResult,
+    blame,
+    json_safe,
+    name_list,
+)
 
 PARADIGM = "bytes_scanned"
 DIALECT = "bigquery"
@@ -40,6 +48,11 @@ _MIN_BILLED_BYTES = 10 * 1024 * 1024
 # min/max, and non-null counting via COUNTIF (COUNT DISTINCT is invalid on
 # them and plain COUNT is not supported for every one of these types).
 _NESTED_FIELD_TYPES = {"RECORD", "STRUCT", "JSON", "GEOGRAPHY", "RANGE", "INTERVAL"}
+
+
+class BigQueryConnectionError(Exception):
+    """Raised when a source scope (or the dev project) cannot be resolved. The
+    message always names the fix, never a credential."""
 
 
 class BigQueryAdapter:
@@ -63,12 +76,18 @@ class BigQueryAdapter:
         target: BigQueryTarget | None = None,
         credentials: Any | None = None,
         principal_type: str | None = None,
+        scope_origin: str | None = None,
         client: Any | None = None,
     ):
         self.project = project
         self.cost_gate = cost_gate
         self.target = target or BigQueryTarget()
         self.principal_type = principal_type or "unknown"
+        # What the scope entries in the target came from, so a refusal names the
+        # thing the user has to go edit: a per-command flag or the committed
+        # allowlist. `narrow_target` has already collapsed the two by the time
+        # the adapter sees them, and the fix differs entirely.
+        self._scope_origin = scope_origin or "bigquery.datasets in .dex/config.yml"
         # Imported lazily so the base package import does not require the
         # [bigquery] extra; only this adapter pulls it in.
         try:
@@ -88,18 +107,16 @@ class BigQueryAdapter:
         # confirmed profiling pass do not re-fetch (each fetch is a free API
         # call, but table facts also back the notes and sampling decisions).
         self._tables: dict[str, Any] = {}
+        self._resolved_datasets: list[str] | None = None
         self._notes: dict[str, list[str]] = {}
 
     # --- capabilities ---------------------------------------------------------
 
     def capabilities(self) -> dict[str, object]:
+        # Resolving the scopes is also the live probe `connect test` needs: every
+        # entry is proven with a metadata GET, so a stale ADC token cannot report
+        # a healthy connection, and neither can an allowlist that names nothing.
         datasets = self._dataset_ids()
-        # `connect test` must prove a live round-trip, not just credential
-        # discovery: with a dataset allowlist, _dataset_ids makes no API call,
-        # and a stale ADC token would otherwise report a healthy connection.
-        # One free metadata GET exercises the credential for real.
-        if self.target.datasets:
-            self._client.get_dataset(datasets[0])
         cost = self.cost_gate.cost()
         return {
             "connector": self.name,
@@ -179,26 +196,116 @@ class BigQueryAdapter:
         return str(base)
 
     def _dataset_ids(self) -> list[str]:
-        """The datasets in scope, fully qualified as ``project.dataset``.
+        """The datasets in scope, fully qualified as ``project.dataset``, resolved
+        and proven to exist.
 
         Allowlist entries may name another project (``project.dataset``), which
         is how public datasets (``bigquery-public-data.samples``) are explored:
         reads go there, jobs still run in and bill to ``self.project``. Bare
         entries qualify against ``self.project``; no allowlist means every
         dataset of the configured project.
+
+        Resolution is free (metadata GET, no query) and cached for the command.
+        It runs before anything is estimated, because a scope that resolves to
+        nothing and silently falls back to the whole allowlist is a cost-safety
+        bug: the estimate the user confirms would cover tables they never named.
         """
 
-        if self.target.datasets:
+        if self._resolved_datasets is None:
+            self._resolved_datasets = self._resolve_datasets()
+        return self._resolved_datasets
+
+    def _resolve_datasets(self) -> list[str]:
+        if not self.target.datasets:
             return sorted(
-                {
-                    entry if "." in entry else f"{self.project}.{entry}"
-                    for entry in self.target.datasets
-                }
+                f"{self.project}.{item.dataset_id}"
+                for item in self._client.list_datasets(self.project)
             )
-        return sorted(
-            f"{self.project}.{item.dataset_id}"
-            for item in self._client.list_datasets(self.project)
-        )
+        with blame(self._scope_origin, BigQueryConnectionError):
+            return sorted(
+                {self._resolve_dataset(entry) for entry in self.target.datasets}
+            )
+
+    def _resolve_dataset(self, entry: str) -> str:
+        """One scope entry, qualified and proven to exist.
+
+        The GET is the proof, rather than listing the project and testing
+        membership: a principal may legitimately be granted one dataset without
+        the project-wide ``bigquery.datasets.list``, and public projects are far
+        too large to enumerate for a containment check. The listing is only used
+        to name the near misses once something has already failed.
+        """
+
+        token = entry.strip()
+        if not token:
+            raise BigQueryConnectionError("empty scope entry")
+        if token.count(".") > 1:
+            raise BigQueryConnectionError(
+                f"scope '{entry}' has too many parts; a source scope is "
+                "<dataset> or <project>.<dataset>, never a table"
+            )
+        qualified = token if "." in token else f"{self.project}.{token}"
+        project, _, dataset = qualified.partition(".")
+        try:
+            self._client.get_dataset(qualified)
+        except self._api_exceptions.NotFound as exc:
+            raise BigQueryConnectionError(
+                f"scope '{entry}' does not exist: project {project} has no "
+                f"dataset {dataset}; {self._visible_hint(project)}"
+            ) from exc
+        except self._api_exceptions.Forbidden as exc:
+            raise BigQueryConnectionError(
+                f"scope '{entry}' is not readable by this principal; grant "
+                "roles/bigquery.dataViewer on it, or point bigquery.datasets at "
+                "a dataset the principal can read"
+            ) from exc
+        return qualified
+
+    def _visible_hint(self, project: str) -> str:
+        """The datasets that do exist, for a refusal message. Best effort: a
+        principal that may GET a dataset without listing the project still gets
+        the refusal, just without the near misses."""
+
+        try:
+            visible = sorted(
+                item.dataset_id for item in self._client.list_datasets(project)
+            )
+        except Exception:  # a hint is never worth failing the refusal for
+            return "and its datasets cannot be listed by this principal"
+        return f"datasets there: {name_list(visible)}"
+
+    def missing_dev_namespaces(self, dataset: str) -> list[str]:
+        """Which parts of a dbt dev target do not exist yet. Free: metadata GET,
+        no query, so this costs nothing on a bytes-billed connector.
+
+        Unlike Snowflake and Databricks, dbt-bigquery *does* create its dev
+        dataset (its ``create_schema`` issues ``CREATE SCHEMA IF NOT EXISTS``),
+        so an absent dataset is normal on a first build and is reported for the
+        caller to warn about, not to refuse. What dbt cannot create is the
+        project, so an unreachable one is raised here.
+        """
+
+        qualified = dataset if "." in dataset else f"{self.project}.{dataset}"
+        project = qualified.partition(".")[0]
+        try:
+            self._client.get_dataset(qualified)
+        except self._api_exceptions.NotFound:
+            # Distinguish "no such dataset" (dbt will create it) from "no such
+            # project" (dbt cannot), because BigQuery answers both with NotFound.
+            # list_datasets returns a lazy iterator, so it has to be drained for
+            # the request to actually go out; without that, an unreachable project
+            # reads as a reachable one.
+            try:
+                list(self._client.list_datasets(project, max_results=1))
+            except Exception as exc:  # any failure to reach the project is fatal
+                raise BigQueryConnectionError(
+                    f"the dev project {project} is not reachable by this "
+                    f"principal ({type(exc).__name__}); dbt creates datasets but "
+                    "never projects, so point bigquery.dev_dataset at a dataset "
+                    "in a project the principal can write"
+                ) from exc
+            return [f'dev_dataset "{qualified}"']
+        return []
 
     def _get_table(self, identifier: str) -> Any:
         cached = self._tables.get(identifier)

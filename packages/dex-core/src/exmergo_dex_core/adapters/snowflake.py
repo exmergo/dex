@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
 from typing import Any
 
 from ..config import SnowflakeTarget
@@ -40,7 +39,9 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    blame,
     json_safe,
+    name_list,
     scope_within,
 )
 
@@ -52,10 +53,6 @@ DIALECT = "snowflake"
 # be reached by a scope entry.
 _RESERVED_SCHEMA = "INFORMATION_SCHEMA"
 _RESERVED_DATABASE = "SNOWFLAKE"
-
-# How many sibling names an error message lists before it stops. Long enough to
-# spot a typo, short enough not to paste a thousand-schema account into stdout.
-_SUGGESTION_CAP = 12
 
 # How many databases a bare schema name may be searched across before dex asks
 # for a qualified <database>.<schema> instead. Each candidate costs one free SHOW
@@ -363,7 +360,8 @@ class SnowflakeAdapter:
     def _resolve_scopes(self) -> list[str]:
         committed = self.target.databases
         if committed:
-            with _blame("snowflake.databases in .dex/config.yml"):
+            origin = "snowflake.databases in .dex/config.yml"
+            with blame(origin, SnowflakeConnectionError):
                 configured = sorted(
                     {
                         self._resolve_scope(entry, sorted(self._databases()))
@@ -379,7 +377,7 @@ class SnowflakeAdapter:
         # bare schema name can never resolve into a database outside the committed
         # boundary; a qualified one that tries is refused below.
         searchable = sorted({scope.split(".")[0] for scope in configured})
-        with _blame("--scope"):
+        with blame("--scope", SnowflakeConnectionError):
             requested = sorted(
                 {
                     self._resolve_scope(entry, searchable)
@@ -389,8 +387,8 @@ class SnowflakeAdapter:
         outside = [scope for scope in requested if not scope_within(scope, configured)]
         if outside:
             raise SnowflakeConnectionError(
-                f"scope {_name_list(outside)} is outside the committed allowlist "
-                f"(snowflake.databases: {_name_list(configured)}); --scope narrows "
+                f"scope {name_list(outside)} is outside the committed allowlist "
+                f"(snowflake.databases: {name_list(configured)}); --scope narrows "
                 "the configured scope, it never widens it"
             )
         return requested
@@ -430,7 +428,7 @@ class SnowflakeAdapter:
             if schema not in schemas:
                 raise SnowflakeConnectionError(
                     f"scope '{entry}' does not exist: database {database} has no "
-                    f"schema {schema}; schemas there: {_name_list(sorted(schemas))}"
+                    f"schema {schema}; schemas there: {name_list(sorted(schemas))}"
                 )
             return f"{database}.{schema}"
 
@@ -454,16 +452,16 @@ class SnowflakeAdapter:
             schemas = sorted({s for db in searchable for s in self._schemas(db)})
             raise SnowflakeConnectionError(
                 f"scope '{entry}' names no database and no schema in "
-                f"{_name_list(searchable)}; schemas there: {_name_list(schemas)}; "
+                f"{name_list(searchable)}; schemas there: {name_list(schemas)}; "
                 f"{self._visible_hint()}"
             )
         raise SnowflakeConnectionError(
             f"scope '{entry}' is ambiguous: it names a schema in "
-            f"{_name_list(matches)}; qualify it as <database>.{token}"
+            f"{name_list(matches)}; qualify it as <database>.{token}"
         )
 
     def _visible_hint(self) -> str:
-        return f"visible databases: {_name_list(sorted(self._databases()))}"
+        return f"visible databases: {name_list(sorted(self._databases()))}"
 
     def _databases(self) -> set[str]:
         """Every database the role can see. Free, and doubles as the live
@@ -999,31 +997,6 @@ class SnowflakeAdapter:
         close = getattr(self._conn, "close", None)
         if close is not None:
             close()
-
-
-def _name_list(names: list[str]) -> str:
-    """Names for an error message, capped so a thousand-schema account cannot
-    turn a one-line refusal into a page of stdout."""
-
-    shown = list(names)[:_SUGGESTION_CAP]
-    suffix = (
-        f", and {len(names) - _SUGGESTION_CAP} more"
-        if len(names) > _SUGGESTION_CAP
-        else ""
-    )
-    return (", ".join(shown) + suffix) if shown else "(none)"
-
-
-@contextmanager
-def _blame(origin: str):
-    """Attribute a scope failure to the thing the user has to go edit. The
-    resolver does not know whether an entry came from the committed allowlist or
-    from a flag, and the fix differs entirely."""
-
-    try:
-        yield
-    except SnowflakeConnectionError as exc:
-        raise SnowflakeConnectionError(f"{exc} [from {origin}]") from exc
 
 
 def _quote_ident(name: str) -> str:

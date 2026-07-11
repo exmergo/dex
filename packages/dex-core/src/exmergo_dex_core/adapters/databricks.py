@@ -36,7 +36,15 @@ from ..config import DatabricksTarget
 from ..envelope import Paradigm
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
-from .base import ColumnAggregate, ColumnMeta, ObjectMeta, QueryResult, json_safe
+from .base import (
+    ColumnAggregate,
+    ColumnMeta,
+    ObjectMeta,
+    QueryResult,
+    blame,
+    json_safe,
+    name_list,
+)
 
 PARADIGM = "compute_time"
 DIALECT = "databricks"
@@ -149,6 +157,7 @@ class DatabricksAdapter:
         target: DatabricksTarget | None = None,
         host: str | None = None,
         auth_method: str = "unknown",
+        scope_origin: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._workspace = workspace
@@ -157,11 +166,19 @@ class DatabricksAdapter:
         self.target = target or DatabricksTarget()
         self.host = host
         self.auth_method = auth_method
+        # What the scope entries in the target came from, so a refusal names the
+        # thing the user has to go edit: a per-command flag or the committed
+        # allowlist. `narrow_target` has already collapsed the two by the time
+        # the adapter sees them, and the fix differs entirely.
+        self._scope_origin = scope_origin or "databricks.catalogs in .dex/config.yml"
         self._clock = clock
         self._conn: Any = None
         self._objects: dict[str, dict] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
         self._inventory_loaded = False
+        self._resolved_scopes: list[tuple[str, str | None]] | None = None
+        self._visible_catalogs: set[str] | None = None
+        self._schemas_by_catalog: dict[str, set[str]] = {}
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
         # The startup floor is charged once per command, by whichever billed
@@ -268,11 +285,7 @@ class DatabricksAdapter:
     def _schema_names(self, catalog: str, schema_filter: str | None) -> list[str]:
         if schema_filter is not None:
             return [schema_filter]
-        return [
-            str(schema.name)
-            for schema in self._workspace.schemas.list(catalog_name=catalog)
-            if str(schema.name) != "information_schema"
-        ]
+        return sorted(self._schemas(catalog))
 
     def _register(self, table: Any) -> None:
         identifier = str(table.full_name)
@@ -346,30 +359,182 @@ class DatabricksAdapter:
         )
 
     def _scopes(self) -> list[tuple[str, str | None]]:
-        """The allowlist entries in scope as ``(catalog, schema-or-None)``
-        pairs, or every catalog the principal can see when no allowlist is
-        configured. The ``system`` catalog is never a source."""
+        """Every source scope this command reads, as ``(catalog, schema-or-None)``
+        pairs, resolved and proven to exist.
 
-        if self.target.catalogs:
-            scopes = []
-            for entry in sorted({e.lower() for e in self.target.catalogs}):
-                catalog, _, schema = entry.partition(".")
-                scopes.append((catalog, schema or None))
-            return scopes
-        return [
-            (str(catalog.name), None)
-            for catalog in self._workspace.catalogs.list()
-            if str(catalog.name) != "system"
-        ]
+        Resolution is free (Unity Catalog REST, no warehouse) and cached for the
+        command. It runs before anything is estimated, because a scope that
+        resolves to nothing and silently falls back to the whole allowlist is a
+        cost-safety bug: the estimate the user confirms would cover tables they
+        never named.
+        """
+
+        if self._resolved_scopes is None:
+            self._resolved_scopes = self._resolve_scopes()
+        return self._resolved_scopes
+
+    def _resolve_scopes(self) -> list[tuple[str, str | None]]:
+        if not self.target.catalogs:
+            # Nothing committed: every catalog the principal can see is the
+            # allowlist by definition, so there is nothing to prove.
+            return [
+                (catalog, None)
+                for catalog in sorted(self._catalogs())
+                if catalog != "system"
+            ]
+        with blame(self._scope_origin, DatabricksConnectionError):
+            return [
+                self._resolve_scope(entry)
+                for entry in sorted({e.lower() for e in self.target.catalogs})
+            ]
+
+    def _resolve_scope(self, entry: str) -> tuple[str, str | None]:
+        """One scope entry, proven to exist. Unity Catalog names are always
+        rooted in a catalog, so unlike Snowflake there is no bare schema to
+        qualify and no ambiguity to resolve: an entry either names something or
+        it does not."""
+
+        token = entry.strip().lower()
+        if not token:
+            raise DatabricksConnectionError("empty scope entry")
+        catalog, _, schema = token.partition(".")
+        if "." in schema:
+            raise DatabricksConnectionError(
+                f"scope '{entry}' has too many parts; a source scope is "
+                "<catalog> or <catalog>.<schema>, never a table"
+            )
+        visible = self._catalogs()
+        if catalog not in {name.lower() for name in visible}:
+            raise DatabricksConnectionError(
+                f"scope '{entry}' names no catalog this principal can see; "
+                f"visible catalogs: {name_list(sorted(visible))}"
+            )
+        if not schema:
+            return (catalog, None)
+        schemas = self._schemas(catalog)
+        if schema not in {name.lower() for name in schemas}:
+            raise DatabricksConnectionError(
+                f"scope '{entry}' does not exist: catalog {catalog} has no "
+                f"schema {schema}; schemas there: {name_list(sorted(schemas))}"
+            )
+        return (catalog, schema)
+
+    def _catalogs(self) -> set[str]:
+        """Every catalog the principal can see, as Unity Catalog spells them. Free
+        (REST, no warehouse), cached, and the live credential probe: the listing
+        fails on a stale or underprivileged credential."""
+
+        if self._visible_catalogs is None:
+            self._visible_catalogs = {
+                str(catalog.name) for catalog in self._workspace.catalogs.list()
+            }
+        return self._visible_catalogs
+
+    def _schemas(self, catalog: str) -> set[str]:
+        """Every schema in one catalog, as Unity Catalog spells them. Free (REST),
+        cached per catalog. ``information_schema`` is never a source."""
+
+        if catalog not in self._schemas_by_catalog:
+            self._schemas_by_catalog[catalog] = {
+                str(schema.name)
+                for schema in self._workspace.schemas.list(catalog_name=catalog)
+                if str(schema.name) != "information_schema"
+            }
+        return self._schemas_by_catalog[catalog]
 
     def _catalog_scope(self) -> list[str]:
-        """Distinct catalogs in scope; also the live credential probe (the
-        catalogs list round-trips even when an allowlist is configured)."""
+        """Distinct catalogs across the resolved scopes."""
 
-        visible = {str(c.name) for c in self._workspace.catalogs.list()}
-        if not self.target.catalogs:
-            return sorted(visible - {"system"})
-        return sorted({entry.split(".")[0].lower() for entry in self.target.catalogs})
+        return sorted({catalog for catalog, _schema in self._scopes()})
+
+    def missing_dev_namespaces(self, catalog: str) -> list[str]:
+        """Which parts of a dbt dev target do not exist yet. Free: REST only, so
+        the billed SQL session is never opened.
+
+        dbt creates schemas but never catalogs, so ``dev_schema`` is deliberately
+        not checked: its absence is normal on a first build. A missing catalog is
+        fatal, and left to dbt it surfaces from deep inside the first build as a
+        ``CREATE SCHEMA`` failure naming neither the catalog nor the fix.
+        """
+
+        visible = {name.lower() for name in self._catalogs()}
+        return [] if catalog.lower() in visible else [f'dev_catalog "{catalog}"']
+
+    def dev_write_grants(self, catalog: str, schema: str) -> list[str]:
+        """The privileges the principal is missing to build into the dev namespace,
+        as far as Unity Catalog can prove. Free: REST only.
+
+        A dev catalog that exists but cannot be written is the other half of the
+        preflight, and the one dbt reports worst: the first model dies with
+        ``PERMISSION_DENIED: User does not have CREATE TABLE and USE SCHEMA``,
+        after the warehouse has already woken and the budget has already been
+        spent.
+
+        Reported, never raised, because Unity Catalog cannot prove the negative.
+        Ownership does not appear in the effective-privilege API (a catalog owner
+        reads back as holding nothing at all), and a metastore admin bypasses
+        grants entirely, so an empty answer is not evidence of no access. Refusing
+        on it would break builds dbt could run, which this preflight must never do.
+        Ownership is therefore checked first, and what is left is a warning.
+        """
+
+        principal = str(self._workspace.current_user.me().user_name)
+        owns_catalog = self._owns(self._workspace.catalogs.get(catalog), principal)
+        catalog_privileges = (
+            set()
+            if owns_catalog
+            else self._effective_privileges("CATALOG", catalog, principal)
+        )
+
+        qualified = f"{catalog}.{schema}"
+        if schema.lower() not in {name.lower() for name in self._schemas(catalog)}:
+            # The schema is not there yet, and dbt creates it: what that needs is
+            # the right to create inside the catalog, which its owner always has.
+            if owns_catalog:
+                return []
+            return [
+                f"{privilege} ON CATALOG {catalog}"
+                for privilege in ("USE CATALOG", "CREATE SCHEMA")
+                if privilege not in catalog_privileges
+            ]
+
+        # The schema exists, and owning the catalog is not enough to write inside a
+        # schema someone else owns: Unity Catalog answers that with the very
+        # PERMISSION_DENIED this check exists to predict.
+        if self._owns(self._workspace.schemas.get(qualified), principal):
+            return []
+        held = self._effective_privileges("SCHEMA", qualified, principal)
+        missing = [
+            f"{privilege} ON SCHEMA {qualified}"
+            for privilege in ("USE SCHEMA", "CREATE TABLE")
+            if privilege not in held
+        ]
+        if missing and not owns_catalog and "USE CATALOG" not in catalog_privileges:
+            missing.insert(0, f"USE CATALOG ON CATALOG {catalog}")
+        return missing
+
+    @staticmethod
+    def _owns(securable: Any, principal: str) -> bool:
+        return str(getattr(securable, "owner", "") or "").lower() == principal.lower()
+
+    def _effective_privileges(
+        self, securable_type: str, full_name: str, principal: str
+    ) -> set[str]:
+        """Everything ``principal`` effectively holds on one securable, including
+        what it inherits through its groups. Free (REST). An error here is not a
+        refusal: it degrades to "nothing proven", and the caller only warns."""
+
+        try:
+            effective = self._workspace.grants.get_effective(
+                securable_type=securable_type, full_name=full_name, principal=principal
+            )
+        except Exception:  # a grant we cannot read is not a grant we can deny on
+            return set()
+        return {
+            str(privilege.privilege)
+            for assignment in (effective.privilege_assignments or [])
+            for privilege in (assignment.privileges or [])
+        }
 
     # --- the warehouse and the DBU translation ----------------------------------
 
