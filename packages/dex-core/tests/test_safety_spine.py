@@ -729,6 +729,73 @@ def test_snowflake_unresolvable_scope_never_falls_back_to_the_whole_allowlist(
     assert fake_sf_connection.data_statements == []
 
 
+def test_an_unresolvable_scope_never_falls_back_on_any_connector(
+    fake_bq_client, fake_databricks, fake_pg_connection
+):
+    # Family 2: the same cost-safety bug, on every warehouse connector. A source
+    # scope that names nothing must refuse, and must do so on the free metadata
+    # path: never an empty inventory the user was not told about, and never a
+    # fallback to every table the allowlist permits. The estimate a user confirms
+    # has to cover what they actually named.
+    from exmergo_dex_core.adapters.bigquery import (
+        BigQueryAdapter,
+        BigQueryConnectionError,
+    )
+    from exmergo_dex_core.adapters.databricks import (
+        DatabricksAdapter,
+        DatabricksConnectionError,
+    )
+    from exmergo_dex_core.adapters.postgres import (
+        PostgresAdapter,
+        PostgresConnectionError,
+    )
+    from exmergo_dex_core.config import BigQueryTarget, DatabricksTarget, PostgresTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    def gate(paradigm, connector):
+        return CostGate(
+            paradigm=paradigm,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=True,
+            connector=connector,
+        )
+
+    bigquery = BigQueryAdapter(
+        project="test-proj",
+        cost_gate=gate(env.Paradigm.BYTES_SCANNED, "bigquery"),
+        target=BigQueryTarget(datasets=["__not_a_dataset__"]),
+        client=fake_bq_client,
+    )
+    databricks = DatabricksAdapter(
+        workspace=fake_databricks.workspace,
+        sql_connect=fake_databricks.sql_connect,
+        cost_gate=gate(env.Paradigm.COMPUTE_TIME, "databricks"),
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["__not_a_catalog__"]),
+        clock=fake_databricks.clock,
+    )
+    postgres = PostgresAdapter(
+        connection=fake_pg_connection,
+        cost_gate=gate(env.Paradigm.DB_LOAD, "postgres"),
+        target=PostgresTarget(schemas=["__not_a_schema__"]),
+        clock=fake_pg_connection.clock,
+    )
+
+    with pytest.raises(BigQueryConnectionError):
+        bigquery.list_objects()
+    with pytest.raises(DatabricksConnectionError):
+        databricks.list_objects()
+    with pytest.raises(PostgresConnectionError):
+        postgres.list_objects()
+
+    # Refused on the free path: nothing was queried, and no SQL session opened.
+    assert fake_bq_client.query_calls == []
+    assert fake_databricks.connection.data_statements == []
+    assert fake_databricks.connect_count == 0
+    assert fake_pg_connection.data_statements == []
+
+
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
