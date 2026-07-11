@@ -249,3 +249,381 @@ def test_an_unopenable_connection_degrades_to_a_note(
     assert len(warnings) == 1
     assert "could not preflight the dev database" in warnings[0]
     assert "RuntimeError" in warnings[0]
+
+
+# --- existence, through the fakes: what dbt cannot create for itself ------------------
+
+
+def _fake_open(monkeypatch, adapter):
+    monkeypatch.setattr(
+        "exmergo_dex_core.connect.open_adapter", lambda **_kwargs: adapter
+    )
+
+
+def _databricks(
+    dbt_project_dir: Path,
+    *,
+    empty_catalogs: list[str],
+    owners: dict[str, str] | None = None,
+    grants: dict[str, set[str]] | None = None,
+):
+    pytest.importorskip("databricks.sql")
+    from fakes.databricks import (
+        FakeDatabricks,
+        FakeDatabricksConnection,
+        FakeWorkspaceClient,
+    )
+
+    from exmergo_dex_core.adapters.databricks import DatabricksAdapter
+    from exmergo_dex_core.config import DatabricksTarget
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    workspace = FakeWorkspaceClient(
+        empty_catalogs=empty_catalogs,
+        # The healthy default: the principal owns the dev catalog, so it may
+        # create the dev schema inside it, which is the state a first build wants.
+        owners=owners if owners is not None else {"dex_dev": "dex@example.com"},
+        grants=grants,
+    )
+    fake = FakeDatabricks(workspace=workspace, connection=FakeDatabricksConnection())
+    adapter = DatabricksAdapter(
+        workspace=fake.workspace,
+        sql_connect=fake.sql_connect,
+        cost_gate=CostGate(
+            paradigm=Paradigm.COMPUTE_TIME,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="databricks",
+        ),
+        target=DatabricksTarget(warehouse="fake-wh"),
+        clock=fake.clock,
+    )
+    _write_profile(
+        dbt_project_dir,
+        "      type: databricks\n"
+        "      catalog: dex_dev\n"
+        "      schema: dbt_dev\n"
+        "      http_path: /sql/1.0/warehouses/fake-wh\n",
+    )
+    config = DexConfig(
+        connector="databricks",
+        databricks=DatabricksTarget(
+            warehouse="fake-wh", dev_catalog="dex_dev", dev_schema="dbt_dev"
+        ),
+    )
+    return fake, adapter, config
+
+
+def test_missing_databricks_dev_catalog_refuses_with_the_create_statement(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    fake, adapter, config = _databricks(
+        dbt_project_dir, empty_catalogs=["something_else"]
+    )
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert 'dev_catalog "dex_dev" does not exist' in message
+    assert "CREATE CATALOG IF NOT EXISTS dex_dev;" in message
+    assert "dbt creates schemas but never catalogs" in message
+    # Free: Unity Catalog REST only, so the billed SQL warehouse never woke.
+    assert fake.connect_count == 0
+
+
+def test_an_existing_databricks_dev_catalog_the_principal_owns_passes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    fake, adapter, config = _databricks(dbt_project_dir, empty_catalogs=["dex_dev"])
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert fake.connect_count == 0
+
+
+def test_a_databricks_dev_schema_the_principal_cannot_write_is_warned_about(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The failure this caught in the field: the dev catalog exists, so existence
+    alone said yes, but the dev schema inside it belonged to another principal.
+    dbt reported it as PERMISSION_DENIED on the first model, after the warehouse
+    had woken and the budget had been spent.
+
+    Owning the catalog is not enough to write inside a schema someone else owns,
+    which is exactly what Unity Catalog answered live.
+    """
+
+    from fakes.databricks import FakeDatabricksTable
+
+    fake, adapter, config = _databricks(
+        dbt_project_dir,
+        empty_catalogs=[],
+        owners={"dex_dev": "dex@example.com", "dex_dev.dbt_dev": "someone-else"},
+        grants={},
+    )
+    # A table puts the dbt_dev schema on the map, so the schema exists but is not
+    # owned by us and carries no grant.
+    fake.workspace._tables.append(
+        FakeDatabricksTable(
+            catalog="dex_dev",
+            schema="dbt_dev",
+            name="prior",
+            columns=[("id", "bigint", True)],
+        )
+    )
+    _fake_open(monkeypatch, adapter)
+
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "PERMISSION_DENIED" in warnings[0]
+    assert "GRANT USE SCHEMA ON SCHEMA dex_dev.dbt_dev" in warnings[0]
+    assert "GRANT CREATE TABLE ON SCHEMA dex_dev.dbt_dev" in warnings[0]
+    # A warning, not a refusal: ownership and metastore-admin rights are invisible
+    # to the grants API, so an empty answer cannot prove the build would fail.
+    assert fake.connect_count == 0
+
+
+def test_a_granted_databricks_dev_schema_passes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Grants, not just ownership: a principal explicitly granted what dbt needs
+    must not be warned at."""
+
+    from fakes.databricks import FakeDatabricksTable
+
+    fake, adapter, config = _databricks(
+        dbt_project_dir,
+        empty_catalogs=[],
+        owners={"dex_dev": "someone-else", "dex_dev.dbt_dev": "someone-else"},
+        grants={
+            "dex_dev": {"USE CATALOG"},
+            "dex_dev.dbt_dev": {"USE SCHEMA", "CREATE TABLE"},
+        },
+    )
+    fake.workspace._tables.append(
+        FakeDatabricksTable(
+            catalog="dex_dev",
+            schema="dbt_dev",
+            name="prior",
+            columns=[("id", "bigint", True)],
+        )
+    )
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+
+
+def _bigquery(
+    dbt_project_dir: Path, *, project: str = "test-proj", dev: str = "dbt_dev"
+):
+    pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient
+
+    from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+    from exmergo_dex_core.config import BigQueryTarget
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    client = FakeBigQueryClient(project="test-proj", empty_datasets=["shop"])
+    adapter = BigQueryAdapter(
+        project="test-proj",
+        cost_gate=CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="bigquery",
+        ),
+        target=BigQueryTarget(),
+        client=client,
+    )
+    _write_profile(
+        dbt_project_dir,
+        f"      type: bigquery\n      project: {project}\n      dataset: {dev}\n",
+    )
+    config = DexConfig(
+        connector="bigquery",
+        bigquery=BigQueryTarget(project=project, dev_dataset=dev, location="US"),
+    )
+    return client, adapter, config
+
+
+def test_a_missing_bigquery_dev_dataset_warns_rather_than_refusing(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The connector where the missing namespace is not fatal: dbt-bigquery's
+    create_schema issues CREATE SCHEMA IF NOT EXISTS, which creates the dataset.
+    Refusing would block a first build that would have succeeded."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _fake_open(monkeypatch, adapter)
+
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "test-proj.dbt_dev does not exist" in warnings[0]
+    assert "bigquery.datasets.create" in warnings[0]
+    assert "bq mk --dataset --location=US test-proj.dbt_dev" in warnings[0]
+    assert client.query_calls == []
+
+
+def test_an_existing_bigquery_dev_dataset_passes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    _client, adapter, config = _bigquery(dbt_project_dir, dev="shop")
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+
+
+def test_an_unreachable_bigquery_dev_project_refuses(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """What dbt cannot create for itself: it makes datasets, never projects."""
+
+    _client, adapter, config = _bigquery(dbt_project_dir, project="test-proj")
+    config.bigquery.dev_dataset = "no-such-project.dbt_dev"
+    _write_profile(
+        dbt_project_dir,
+        "      type: bigquery\n"
+        "      project: test-proj\n"
+        "      dataset: no-such-project.dbt_dev\n",
+    )
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert "dbt creates datasets but never projects" in str(exc.value)
+
+
+def _postgres(dbt_project_dir: Path, role, *, dev: str = "dbt_dev", profile_user=None):
+    pytest.importorskip("psycopg")
+    from fakes.postgres import FakePostgresConnection, FakePostgresTable
+
+    from exmergo_dex_core.adapters.postgres import PostgresAdapter
+    from exmergo_dex_core.config import PostgresTarget
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    connection = FakePostgresConnection(
+        tables=[
+            FakePostgresTable(
+                schema="app", name="orders", columns=[("id", "bigint", False)]
+            )
+        ],
+        roles=[role],
+        empty_schemas=["dbt_dev"],
+    )
+    adapter = PostgresAdapter(
+        connection=connection,
+        cost_gate=CostGate(
+            paradigm=Paradigm.DB_LOAD,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="postgres",
+        ),
+        target=PostgresTarget(),
+        clock=connection.clock,
+    )
+    _write_profile(
+        dbt_project_dir,
+        "      type: postgres\n"
+        f"      user: {profile_user or role.name}\n"
+        "      dbname: dexdb\n"
+        f"      schema: {dev}\n",
+    )
+    config = DexConfig(connector="postgres", postgres=PostgresTarget(dev_schema=dev))
+    return connection, adapter, config
+
+
+def test_a_writable_postgres_dev_schema_passes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    from fakes.postgres import FakeRole
+
+    role = FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE", "CREATE"}})
+    connection, adapter, config = _postgres(dbt_project_dir, role)
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert connection.data_statements == []
+
+
+def test_an_unwritable_postgres_dev_schema_refuses_with_the_grant(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    from fakes.postgres import FakeRole
+
+    role = FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
+    connection, adapter, config = _postgres(dbt_project_dir, role)
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert 'missing CREATE on dev_schema "dbt_dev"' in message
+    assert "GRANT USAGE, CREATE ON SCHEMA dbt_dev TO dbt_dev;" in message
+    assert connection.data_statements == []
+
+
+def test_an_absent_postgres_dev_schema_the_role_cannot_create_refuses(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """dbt creates the schema, but only if the role may, so the privilege is what
+    is checked. The first build otherwise dies on a bare permission error."""
+
+    from fakes.postgres import FakeRole
+
+    role = FakeRole(name="dbt_dev", may_create_in_database=False)
+    _connection, adapter, config = _postgres(dbt_project_dir, role, dev="not_there")
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert 'dev_schema "not_there" does not exist and role dbt_dev may not create it'
+    assert "CREATE SCHEMA IF NOT EXISTS not_there AUTHORIZATION dbt_dev;" in message
+
+
+def test_the_postgres_privilege_is_asked_of_the_profile_role(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """dex may read the warehouse as a read-only role while dbt builds as another,
+    so the question has to be asked of the role the profile names. The refusal
+    naming that role, and not the one dex connects as, is the proof it was."""
+
+    from fakes.postgres import FakeRole
+
+    builder = FakeRole(name="ci_builder", schema_privileges={"dbt_dev": {"USAGE"}})
+    _connection, adapter, config = _postgres(
+        dbt_project_dir, builder, profile_user="ci_builder"
+    )
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert "role ci_builder is missing" in message
+    assert "TO ci_builder;" in message
+
+
+def test_an_unopenable_connection_degrades_to_a_note_on_every_connector(
+    dbt_project_dir: Path, tmp_path: Path
+):
+    """The autouse no_warehouse fixture makes open_adapter raise. A preflight that
+    cannot reach the warehouse must never be the thing that breaks a build dbt
+    could have run."""
+
+    from exmergo_dex_core.config import DatabricksTarget
+
+    _write_profile(dbt_project_dir, "      type: databricks\n      catalog: dex_dev\n")
+    config = DexConfig(
+        connector="databricks",
+        databricks=DatabricksTarget(warehouse="wh", dev_catalog="dex_dev"),
+    )
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "could not preflight the dev database" in warnings[0]
+    assert "RuntimeError" in warnings[0]

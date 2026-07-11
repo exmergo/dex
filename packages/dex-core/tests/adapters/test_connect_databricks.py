@@ -42,6 +42,7 @@ def make_adapter(
     session_spent: float = 0.0,
     record=None,
     target: DatabricksTarget | None = None,
+    scope_origin: str | None = None,
 ) -> DatabricksAdapter:
     gate = CostGate(
         paradigm=Paradigm.COMPUTE_TIME,
@@ -60,6 +61,7 @@ def make_adapter(
         target=target or DatabricksTarget(warehouse="fake-wh"),
         host="test.cloud.databricks.com",
         auth_method="default_profile:oauth_user",
+        scope_origin=scope_origin,
         clock=fake.clock,
     )
 
@@ -698,3 +700,86 @@ def test_discovery_falls_back_to_dbt_profiles(
     )
     assert "from-dbt.cloud.databricks.com" in cfg.host
     assert method == "dbt_profile:token"
+
+
+# --- scope resolution: an entry that names nothing is refused, not dropped ------------
+
+
+def test_nonexistent_catalog_scope_is_refused_and_names_what_exists(fake_databricks):
+    """The cost-safety bug: a scope that resolves to nothing used to yield an
+    empty inventory, so the user scoped to nothing and was never told."""
+
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["no_such_catalog"]),
+    )
+    with pytest.raises(DatabricksConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "no_such_catalog" in message
+    assert "shop" in message  # the catalogs that do exist
+    assert "[from databricks.catalogs in .dex/config.yml]" in message
+    assert data_statements(fake_databricks) == []
+    assert fake_databricks.connect_count == 0  # never woke the warehouse
+
+
+def test_nonexistent_schema_scope_is_refused_and_names_what_exists(fake_databricks):
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.nope"]),
+        scope_origin="--scope",
+    )
+    with pytest.raises(DatabricksConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "shop.nope" in message
+    assert "catalog shop has no schema nope" in message
+    assert "core" in message  # the schemas that do exist there
+    # The blame names the flag the entry actually came from, not the config file
+    # it was copied over: the two have entirely different fixes.
+    assert "[from --scope]" in message
+    assert data_statements(fake_databricks) == []
+
+
+def test_a_table_shaped_scope_is_refused(fake_databricks):
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.core.customers"]),
+    )
+    with pytest.raises(DatabricksConnectionError, match="never a table"):
+        adapter.list_objects()
+
+
+def test_scope_resolution_is_free_and_cached(fake_databricks):
+    """Free (REST only) and one round-trip per command: the estimate pass and the
+    confirmed run share the resolution."""
+
+    adapter = make_adapter(
+        fake_databricks,
+        target=DatabricksTarget(warehouse="fake-wh", catalogs=["shop.core"]),
+    )
+    adapter.list_objects()
+    adapter.list_objects()
+    calls = fake_databricks.workspace.metadata_calls
+    assert calls.count("catalogs.list") == 1
+    assert data_statements(fake_databricks) == []
+
+
+# --- the dev-target preflight (free) --------------------------------------------------
+
+
+def test_missing_dev_catalog_is_reported(fake_databricks):
+    adapter = make_adapter(fake_databricks)
+    assert adapter.missing_dev_namespaces("not_there") == ['dev_catalog "not_there"']
+    assert data_statements(fake_databricks) == []
+    assert fake_databricks.connect_count == 0
+
+
+def test_existing_but_empty_dev_catalog_is_fine(fake_databricks):
+    """dbt creates the schema; only the catalog has to pre-exist. An empty scratch
+    catalog is exactly the state before a first build."""
+
+    fake_databricks.workspace._empty_catalogs.append("dex_dev")
+    adapter = make_adapter(fake_databricks)
+    assert adapter.missing_dev_namespaces("dex_dev") == []
+    assert data_statements(fake_databricks) == []

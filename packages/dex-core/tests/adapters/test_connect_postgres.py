@@ -42,6 +42,7 @@ def make_adapter(
     session_spent: float = 0.0,
     record=None,
     target: PostgresTarget | None = None,
+    scope_origin: str | None = None,
 ) -> PostgresAdapter:
     gate = CostGate(
         paradigm=Paradigm.DB_LOAD,
@@ -58,6 +59,7 @@ def make_adapter(
         cost_gate=gate,
         target=target or PostgresTarget(),
         auth_method="database_url:password",
+        scope_origin=scope_origin,
         clock=connection.clock,
     )
 
@@ -632,3 +634,140 @@ def test_discovery_never_surfaces_a_password(tmp_path: Path):
         tmp_path,
     )
     assert "supersecret" not in method
+
+
+# --- scope resolution: an entry that names nothing is refused, not dropped ------------
+
+
+def test_nonexistent_schema_scope_is_refused_and_names_what_exists(fake_pg_connection):
+    """Postgres was the worst of the connectors here: the allowlist was echoed
+    back without ever asking the server, and the inventory filter then dropped
+    the unmatched entry, so a typo simply returned nothing."""
+
+    adapter = make_adapter(
+        fake_pg_connection, target=PostgresTarget(schemas=["no_such_schema"])
+    )
+    with pytest.raises(PostgresConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "no_such_schema" in message
+    assert "shop" in message  # the schemas that do exist
+    assert "[from postgres.schemas in .dex/config.yml]" in message
+    assert fake_pg_connection.data_statements == []
+
+
+def test_scope_refusal_blames_the_flag_it_came_from(fake_pg_connection):
+    adapter = make_adapter(
+        fake_pg_connection,
+        target=PostgresTarget(schemas=["nope"]),
+        scope_origin="--scope",
+    )
+    with pytest.raises(PostgresConnectionError, match=r"\[from --scope\]"):
+        adapter.list_objects()
+
+
+def test_a_qualified_scope_is_refused_as_postgres_vocabulary(fake_pg_connection):
+    """dbt refuses cross-database references outright, so a Postgres scope is
+    always a bare schema in the connected database."""
+
+    adapter = make_adapter(
+        fake_pg_connection, target=PostgresTarget(schemas=["dexdb.shop"])
+    )
+    with pytest.raises(PostgresConnectionError, match="never a database or a table"):
+        adapter.list_objects()
+
+
+def test_a_valid_scope_still_bounds_the_inventory(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
+    assert {o.schema for o in adapter.list_objects()} == {"shop"}
+    assert fake_pg_connection.data_statements == []
+
+
+# --- the dev-target preflight (free): the privilege, not the object -------------------
+
+
+def _with_role(role):
+    from fakes.postgres import FakePostgresConnection, FakePostgresTable
+
+    return FakePostgresConnection(
+        tables=[
+            FakePostgresTable(
+                schema="shop", name="customers", columns=[("id", "bigint", False)]
+            )
+        ],
+        roles=[role],
+        empty_schemas=["dbt_dev"],
+    )
+
+
+def test_a_writable_dev_schema_is_fine(fake_pg_connection):
+    from fakes.postgres import FakeRole
+
+    connection = _with_role(
+        FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE", "CREATE"}})
+    )
+    adapter = make_adapter(connection)
+    assert adapter.missing_dev_namespaces("dbt_dev", role="dbt_dev") == []
+    assert connection.data_statements == []
+
+
+def test_a_dev_schema_the_role_cannot_write_is_reported(fake_pg_connection):
+    from fakes.postgres import FakeRole
+
+    connection = _with_role(
+        FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
+    )
+    adapter = make_adapter(connection)
+    assert adapter.missing_dev_namespaces("dbt_dev", role="dbt_dev") == [
+        'CREATE on dev_schema "dbt_dev"'
+    ]
+
+
+def test_an_absent_dev_schema_is_fine_when_the_role_may_create_it(fake_pg_connection):
+    """dbt creates the schema itself, so absence alone is not the failure."""
+
+    from fakes.postgres import FakeRole
+
+    connection = _with_role(FakeRole(name="dbt_dev", may_create_in_database=True))
+    adapter = make_adapter(connection)
+    assert adapter.missing_dev_namespaces("not_there", role="dbt_dev") == []
+
+
+def test_an_absent_dev_schema_the_role_cannot_create_is_reported(fake_pg_connection):
+    from fakes.postgres import FakeRole
+
+    connection = _with_role(FakeRole(name="dbt_dev", may_create_in_database=False))
+    adapter = make_adapter(connection)
+    assert adapter.missing_dev_namespaces("not_there", role="dbt_dev") == [
+        'dev_schema "not_there"'
+    ]
+
+
+def test_the_privilege_is_asked_of_the_profile_role_not_the_connected_user(
+    fake_pg_connection,
+):
+    """The whole reason the role is passed in: dex may read the warehouse as a
+    read-only role while dbt builds as another, so asking about the connected
+    user would refuse a build dbt could have run."""
+
+    from fakes.postgres import FakeRole
+
+    connection = _with_role(
+        FakeRole(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE", "CREATE"}})
+    )
+    adapter = make_adapter(connection)
+    # The writing role may build; the read-only role dex connects as may not, and
+    # that is not a reason to refuse.
+    assert adapter.missing_dev_namespaces("dbt_dev", role="dbt_dev") == []
+    with pytest.raises(PostgresConnectionError, match="dex_ro"):
+        adapter.missing_dev_namespaces("dbt_dev", role="dex_ro")
+
+
+def test_a_profile_role_the_database_does_not_know_is_refused(fake_pg_connection):
+    from fakes.postgres import FakeRole
+
+    connection = _with_role(FakeRole(name="dbt_dev"))
+    adapter = make_adapter(connection)
+    with pytest.raises(PostgresConnectionError) as exc:
+        adapter.missing_dev_namespaces("dbt_dev", role="ghost")
+    assert "ghost" in str(exc.value)

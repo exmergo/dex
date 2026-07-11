@@ -13,7 +13,7 @@ pytest.importorskip("google.cloud.bigquery")
 from google.cloud import bigquery
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
-from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+from exmergo_dex_core.adapters.bigquery import BigQueryAdapter, BigQueryConnectionError
 from exmergo_dex_core.config import BigQueryTarget
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import (
@@ -34,6 +34,7 @@ def make_adapter(
     session_spent: float = 0.0,
     record=None,
     target: BigQueryTarget | None = None,
+    scope_origin: str | None = None,
 ) -> BigQueryAdapter:
     gate = CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
@@ -51,6 +52,7 @@ def make_adapter(
         target=target or BigQueryTarget(),
         client=client,
         principal_type="user",
+        scope_origin=scope_origin,
     )
 
 
@@ -547,3 +549,91 @@ def test_project_and_dataset_flags_override_the_config_target(tmp_path, monkeypa
     assert captured["project"] == "cli-proj"
     assert captured["target"].project == "cli-proj"
     assert captured["target"].datasets == ["ds_a", "ds_b"]
+
+
+# --- scope resolution: an entry that names nothing is refused, not dropped ------------
+
+
+def test_nonexistent_dataset_scope_is_refused_and_names_what_exists(fake_bq_client):
+    """The cost-safety bug: a scope that resolves to nothing used to reach
+    list_tables and die on a raw google NotFound, naming neither the fix nor the
+    datasets that do exist."""
+
+    adapter = make_adapter(
+        fake_bq_client,
+        target=BigQueryTarget(datasets=["no_such_dataset"]),
+    )
+    with pytest.raises(BigQueryConnectionError) as exc:
+        adapter.list_objects()
+    message = str(exc.value)
+    assert "no_such_dataset" in message
+    assert "shop" in message and "logs" in message  # the datasets that do exist
+    assert "[from bigquery.datasets in .dex/config.yml]" in message
+    assert fake_bq_client.query_calls == []
+
+
+def test_scope_refusal_blames_the_flag_it_came_from(fake_bq_client):
+    """`--dataset` and `--scope` both scope BigQuery, and narrow_target copies
+    either one over the committed allowlist, so the adapter is told which."""
+
+    adapter = make_adapter(
+        fake_bq_client,
+        target=BigQueryTarget(datasets=["nope"]),
+        scope_origin="--dataset",
+    )
+    with pytest.raises(BigQueryConnectionError, match=r"\[from --dataset\]"):
+        adapter.list_objects()
+
+
+def test_a_table_shaped_scope_is_refused(fake_bq_client):
+    adapter = make_adapter(
+        fake_bq_client,
+        target=BigQueryTarget(datasets=["test-proj.shop.customers"]),
+    )
+    with pytest.raises(BigQueryConnectionError, match="never a table"):
+        adapter.list_objects()
+
+
+def test_a_valid_scope_still_bounds_the_inventory(fake_bq_client):
+    adapter = make_adapter(fake_bq_client, target=BigQueryTarget(datasets=["shop"]))
+    assert [o.identifier for o in adapter.list_objects()] == [
+        "test-proj.shop.customers",
+        "test-proj.shop.events",
+    ]
+    assert fake_bq_client.query_calls == []
+
+
+# --- the dev-target preflight (free) --------------------------------------------------
+
+
+def test_a_missing_dev_dataset_is_reported_not_raised(fake_bq_client):
+    """dbt-bigquery creates its dev dataset (CREATE SCHEMA IF NOT EXISTS), so an
+    absent one is the normal state before a first build: the caller warns rather
+    than refusing, unlike Snowflake and Databricks."""
+
+    adapter = make_adapter(fake_bq_client)
+    assert adapter.missing_dev_namespaces("dbt_dev") == [
+        'dev_dataset "test-proj.dbt_dev"'
+    ]
+    assert fake_bq_client.query_calls == []
+
+
+def test_an_existing_dev_dataset_is_fine(fake_bq_client):
+    fake_bq_client.empty_datasets.add("test-proj.dbt_dev")
+    adapter = make_adapter(fake_bq_client)
+    assert adapter.missing_dev_namespaces("dbt_dev") == []
+    assert fake_bq_client.query_calls == []
+
+
+def test_an_unreachable_dev_project_is_raised(fake_bq_client):
+    """What dbt cannot create for itself: it makes datasets, never projects. The
+    listing that distinguishes the two is lazy in the real client, so a project
+    that is merely never iterated would read as a healthy one."""
+
+    adapter = make_adapter(fake_bq_client)
+    with pytest.raises(BigQueryConnectionError) as exc:
+        adapter.missing_dev_namespaces("no-such-project.dbt_dev")
+    message = str(exc.value)
+    assert "no-such-project" in message
+    assert "dbt creates datasets but never projects" in message
+    assert fake_bq_client.query_calls == []
