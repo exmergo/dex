@@ -147,3 +147,54 @@ def test_firewalled_query_round_trip(
     assert rc == 0, envelope
     assert envelope["data"]["cells"] == [[5]]
     assert envelope["data"]["spend"]["seconds_billed"] >= 0
+
+
+# --- scope resolution against the live workspace (free: Unity Catalog REST) -----------
+
+
+def test_a_bogus_scope_is_refused_for_free(tmp_path: Path, capsys, dbx_warehouse):
+    """The cost-safety bug: a scope that resolves to nothing used to yield an
+    empty inventory, so the user scoped to nothing and was never told."""
+
+    seed_repo(tmp_path, dbx_warehouse, None, catalogs=["samples"])
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--scope", "samples.__nope__"],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "__nope__" in error
+    # The refusal names what does exist, and the flag it came from.
+    assert "nyctaxi" in error
+    assert "[from --scope]" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_a_bogus_committed_catalog_is_refused_for_free(
+    tmp_path: Path, capsys, dbx_warehouse
+):
+    seed_repo(tmp_path, dbx_warehouse, None, catalogs=["__no_such_catalog__"])
+    rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
+    assert rc == 1
+    error = envelope["errors"][0]
+    assert "__no_such_catalog__" in error
+    assert "[from databricks.catalogs in .dex/config.yml]" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_scope_cannot_widen_the_committed_allowlist_live(
+    tmp_path: Path, capsys, dbx_warehouse
+):
+    """The committed allowlist is a cost boundary: it holds this run to one
+    sample schema, and a flag must not be able to reach a different one (nyctaxi
+    exists, which is the point: the refusal is the boundary, not the typo)."""
+
+    seed_repo(tmp_path, dbx_warehouse, None, catalogs=[SAMPLE_SCOPE])
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--scope", "samples.nyctaxi"],
+        capsys,
+    )
+    assert rc == 1
+    assert "never widens" in envelope["errors"][0]
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()

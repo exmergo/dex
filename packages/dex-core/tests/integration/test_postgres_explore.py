@@ -135,3 +135,35 @@ def test_query_firewall_allows_measuring_and_refuses_pii_values(tmp_path: Path, 
     )
     assert rc == 1
     assert "PII" in envelope["errors"][0]
+
+
+# --- scope resolution against the live database (free: one pg_catalog SELECT) ---------
+
+
+def test_a_bogus_scope_is_refused_for_free(tmp_path: Path, capsys, pg_dsn):
+    """Postgres was the worst of the connectors here: the allowlist was echoed
+    back without ever asking the server, and the inventory filter then dropped the
+    unmatched entry, so a typo simply returned nothing at all."""
+
+    seed_repo(tmp_path, schemas=["__no_such_schema__"])
+    rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "__no_such_schema__" in error
+    # The refusal names what does exist, which the silent empty inventory never did.
+    assert "app" in error
+    assert "[from postgres.schemas in .dex/config.yml]" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_scope_cannot_widen_the_committed_allowlist_live(
+    tmp_path: Path, capsys, pg_dsn
+):
+    seed_repo(tmp_path, schemas=["app"])
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--scope", "public"], capsys
+    )
+    assert rc == 1
+    assert "never widens" in envelope["errors"][0]
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()

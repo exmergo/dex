@@ -152,3 +152,41 @@ def test_firewalled_query_round_trip(tmp_path: Path, capsys, bq_project: str):
         for line in (tmp_path / ".dex" / "queries.jsonl").read_text().splitlines()
     ]
     assert decisions == ["needs_confirmation", "allowed"]
+
+
+# --- scope resolution against the live project (free: metadata GET, no query) ---------
+
+
+def test_a_bogus_scope_is_refused_for_free(tmp_path: Path, capsys, bq_project):
+    """The cost-safety bug: a scope that resolves to nothing used to reach
+    list_tables and die on a raw google NotFound, naming neither the fix nor the
+    datasets that do exist."""
+
+    seed_repo(tmp_path, bq_project, datasets=["__no_such_dataset__"])
+    rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "__no_such_dataset__" in error
+    assert "[from bigquery.datasets in .dex/config.yml]" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_scope_cannot_widen_the_committed_allowlist_live(
+    tmp_path: Path, capsys, bq_project
+):
+    seed_repo(tmp_path, bq_project, datasets=["bigquery-public-data.samples"])
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "map",
+            "--scope",
+            "bigquery-public-data.austin_bikeshare",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "never widens" in envelope["errors"][0]
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
