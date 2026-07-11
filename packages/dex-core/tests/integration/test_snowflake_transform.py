@@ -125,3 +125,74 @@ def test_init_plan_apply_build_into_the_scratch_database(
         cursor.execute(f"DROP VIEW IF EXISTS {relation}")
     finally:
         conn.close()
+
+
+def test_missing_dev_database_is_refused_before_the_cost_gate(
+    tmp_path: Path, capsys, sf_warehouse, sf_connection_name
+):
+    """dbt creates schemas but never databases, so a `dev_database` that does not
+    exist used to die inside dbt's `list_schemas` macro with an opaque
+    `002043: Object does not exist`. The preflight is free and runs before the
+    confirm handshake, so this refuses without `--confirm` and without spend."""
+
+    pytest.importorskip("dbt.adapters.snowflake")
+    root = str(tmp_path)
+    seed_repo(tmp_path, "DEX_NO_SUCH_DEV_DATABASE", sf_warehouse, sf_connection_name)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "build", "--target", "dev"], capsys
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "DEX_NO_SUCH_DEV_DATABASE" in error
+    assert "CREATE DATABASE IF NOT EXISTS DEX_NO_SUCH_DEV_DATABASE" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_config_drift_from_the_rendered_profile_is_refused(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """`transform init` renders config into profiles.yml, which dbt then reads.
+    A later config edit that never reached the profile must not build silently
+    against the old target."""
+
+    pytest.importorskip("dbt.adapters.snowflake")
+    root = str(tmp_path)
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+
+    config_path = tmp_path / ".dex" / "config.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["snowflake"]["dev_database"] = "DEX_RETARGETED_ELSEWHERE"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            str(SF_MAX_SECONDS),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "DEX_RETARGETED_ELSEWHERE" in error
+    assert sf_scratch_database in error
+    assert "disagree about the dev target" in error
