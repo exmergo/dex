@@ -47,6 +47,13 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `transform build` now refuses when the two disagree, naming both values and
   both files. It never rewrites `profiles.yml`, which may legitimately be
   hand-edited.
+- `transform build` surfaced a dbt deprecation warning (`[WARNING]
+  PropertyMovedToConfigDeprecation`) as the failure cause instead of the real
+  error. dbt 1.11 logs these notices before the actual failure on every
+  normally-authored project, so the notice reliably won the `errors[0]` slot.
+  `_collect_messages` now promotes dbt's own `MainEncounteredError` event (the
+  structured summary of what actually failed) to the front and sinks
+  `[WARNING]`-tagged lines to `warnings` instead. (#50)
 
 ### Changed
 

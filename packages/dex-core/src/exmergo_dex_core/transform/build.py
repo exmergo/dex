@@ -370,17 +370,30 @@ def _default_runner(
     return run
 
 
+# dbt 1.11 emits deprecation notices (e.g. PropertyMovedToConfigDeprecation) on
+# every run of a normally-authored project, tagged `[WARNING]` in their own
+# message text regardless of `info.level`. Left undistinguished from a real
+# failure, one of these reliably wins the errors[0] slot merely by logging
+# before the actual cause does. `MainEncounteredError` is dbt's own summary of
+# what actually killed the run and always leads when present.
+_DEPRECATION_MARKER = "[WARNING]"
+_MAIN_ENCOUNTERED_ERROR = "MainEncounteredError"
+
+
 def _collect_messages(
     completed: subprocess.CompletedProcess, log_hint: Path | None = None
 ) -> list[str]:
     """Reduce dbt's output to actionable one-liners for the envelope.
 
     Keeps the first line of each error/warn message (redacted, length-capped,
-    deduplicated); when anything was cut, the last entry points at the full log
-    instead of letting a raw traceback cross the envelope boundary.
+    deduplicated); deprecation notices sink below real errors so they cannot
+    poison the errors[0] slot, and dbt's own MainEncounteredError event (the
+    structured summary of the actual failure) always leads when present. When
+    anything was cut, the last entry points at the full log instead of letting
+    a raw traceback cross the envelope boundary.
     """
 
-    messages: list[str] = []
+    entries: list[tuple[str, str]] = []
     seen: set[str] = set()
     trimmed = False
     for line in (completed.stdout or "").splitlines():
@@ -402,7 +415,17 @@ def _collect_messages(
             trimmed = True
             continue
         seen.add(first_line)
-        messages.append(first_line)
+        entries.append((str(info.get("name") or ""), first_line))
+
+    primary = [m for _, m in entries if _DEPRECATION_MARKER not in m]
+    deprecations = [m for _, m in entries if _DEPRECATION_MARKER in m]
+    main_error = next(
+        (m for name, m in entries if name == _MAIN_ENCOUNTERED_ERROR), None
+    )
+    if main_error is not None:
+        primary = [main_error] + [m for m in primary if m != main_error]
+    messages = primary + deprecations
+
     if not messages and completed.stderr:
         messages.append(redact(completed.stderr.strip().splitlines()[-1]))
     if len(messages) > _MESSAGE_CAP:
