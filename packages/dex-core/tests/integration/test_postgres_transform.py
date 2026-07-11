@@ -95,3 +95,47 @@ def test_init_and_build_write_only_the_dev_schema(
     assert entry["connector"] == "postgres"
     assert entry["command"] == "transform build"
     assert entry["billed_seconds"] > 0
+
+
+def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(
+    tmp_path: Path, capsys, dev_dsn
+):
+    """dbt creates its dev schema, but only if the role may. The seeded dbt_dev
+    role holds CREATE on the dbt_dev schema and nothing else, so a dev schema that
+    does not exist yet cannot be created: the first build would die on a bare
+    permission error naming neither the schema nor the grant. The preflight is
+    free (catalog lookups and privilege predicates) and runs before the confirm
+    handshake, so this refuses without `--confirm` and without load."""
+
+    pytest.importorskip("dbt.adapters.postgres")
+    root = str(tmp_path)
+    seed_repo(tmp_path, schemas=["app"], budget=300)
+    config_path = tmp_path / ".dex" / "config.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["postgres"]["dev_schema"] = "dex_absent_dev_schema"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "postgres",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "build", "--target", "dev"], capsys
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "dex_absent_dev_schema" in error
+    assert "may not create it" in error
+    assert "CREATE SCHEMA IF NOT EXISTS dex_absent_dev_schema AUTHORIZATION" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()

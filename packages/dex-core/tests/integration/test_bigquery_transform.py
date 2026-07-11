@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from .conftest import MAX_BYTES
-from .test_bigquery_connect import run_cli
+from .test_bigquery_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.bigquery]
 
@@ -118,3 +118,40 @@ def test_init_plan_apply_build_into_the_scratch_dataset(
         client.delete_table(table, not_found_ok=True)
     finally:
         client.close()
+
+
+def test_a_missing_dev_dataset_warns_rather_than_refusing(
+    tmp_path: Path, capsys, bq_project
+):
+    """BigQuery is the connector where the missing dev namespace is not fatal:
+    dbt-bigquery's create_schema issues CREATE SCHEMA IF NOT EXISTS, which creates
+    the dataset. Refusing would block a first build that would have succeeded, so
+    the preflight warns and names the permission that build needs."""
+
+    pytest.importorskip("dbt.adapters.bigquery")
+    root = str(tmp_path)
+    seed_repo(tmp_path, bq_project)
+    config_path = tmp_path / ".dex" / "config.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["bigquery"]["dev_dataset"] = "dex_absent_dev_dataset"
+    config["bigquery"]["location"] = "US"
+    config["budget"] = {"ceiling": 100 * 1024 * 1024}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+
+    # No model is authored, so the build creates nothing: the preflight's warning
+    # is what is under test, not dbt's dataset creation.
+    rc, built = run_cli(
+        ["--repo-root", root, "transform", "build", "--target", "dev", "--confirm"],
+        capsys,
+    )
+    assert rc == 0, built
+    warnings = [w for w in built["warnings"] if "dev_dataset" in w]
+    assert len(warnings) == 1
+    assert "dex_absent_dev_dataset does not exist" in warnings[0]
+    assert "bigquery.datasets.create" in warnings[0]
+    assert "bq mk --dataset --location=US" in warnings[0]
