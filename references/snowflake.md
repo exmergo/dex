@@ -57,6 +57,47 @@ smallest warehouse that works (X-Small with 60s auto-suspend is the intended
 shape; `scripts/setup_snowflake_ci.sh` provisions exactly that plus a resource
 monitor as the hard monthly backstop).
 
+## Scoping a command
+
+`snowflake.databases` is the committed source allowlist, and a single database
+can span four orders of magnitude in table size, so prefer `db.schema` entries
+over bare `db` when the difference matters for cost.
+
+`--scope` narrows that allowlist for one command, and is repeatable. It accepts
+a bare schema (`--scope TPCH_SF1`, qualified against the databases already in
+scope), a database, or a qualified `database.schema`. Resolution is free (SHOW
+metadata, no warehouse) and happens before anything is estimated:
+
+- A scope that names no database and no schema is **refused**, and the error
+  lists the schemas that do exist. It is never quietly dropped, because an
+  estimate that silently spans the whole allowlist is one a user could confirm
+  believing it bounded a handful of tables.
+- A bare schema that exists in more than one in-scope database is refused as
+  ambiguous, asking for `database.schema`.
+- A scope outside the committed allowlist is refused. `--scope` narrows; it
+  never widens.
+
+`--project` and `--dataset` are BigQuery vocabulary and error here.
+
+## Preflight before a dbt build
+
+`transform build` refuses, for free, before the cost gate:
+
+- when `.dex/config.yml` and the rendered `profiles.yml` disagree about the dev
+  database, schema, or warehouse (the profile is what dbt reads, so a config
+  edit that never reached it would otherwise build against the old target), and
+- when `snowflake.dev_database` does not exist. dbt creates schemas but never
+  databases, so the first build would fail inside dbt's `list_schemas` macro
+  with `002043: Object does not exist`. dex names the database and the
+  statement that fixes it:
+
+```sql
+CREATE DATABASE IF NOT EXISTS DBT_DEV;
+```
+
+dex never creates it for you, and never rewrites your `profiles.yml`: its only
+writes are reviewable diffs inside the repo.
+
 ## Cost model: the inversion from BigQuery
 
 On BigQuery, metadata is free and scans bill by bytes. On Snowflake the rule

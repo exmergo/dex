@@ -89,6 +89,15 @@ retry with a raised budget on an over-ceiling refusal without asking.
 Metadata is free (`connect test`, `inventory` run immediately), and OK
 envelopes report actual spend under `data.spend`.
 
+When an estimate is larger than the work deserves, narrow the scope rather than
+raise the budget. `--scope` (repeatable) bounds a command to part of the
+configured source allowlist, in the connector's own vocabulary: a dataset on
+BigQuery, a `schema` or `database.schema` on Snowflake, a `catalog.schema` on
+Databricks, a schema on Postgres. It is free to resolve, it can only narrow what
+`.dex/config.yml` already allows, and a scope that names nothing is refused with
+the schemas that do exist listed. So `explore map --scope <schema>` is the first
+thing to reach for on a warehouse whose full map would be expensive.
+
 ## Guardrails (enforced in the engine, not here)
 
 - Read-only against data. The connection is opened read-only and generated SQL is
