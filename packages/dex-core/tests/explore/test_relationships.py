@@ -15,6 +15,7 @@ import pytest
 from exmergo_dex_core.cache import ColumnProfile, Dataset
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.explore.relationships import (
+    candidate_keys,
     data_quality_notes,
     detect_grain,
     fk_candidate_count,
@@ -401,6 +402,67 @@ def test_repeated_foreign_key_is_not_a_grain_defect():
 def test_empty_table_produces_no_grain_notes():
     empty = _ds("db.main.empty_t", [_col("id")], rows=0)
     assert data_quality_notes(empty) == []
+
+
+# --- composite keys --------------------------------------------------------------
+
+
+def test_candidate_keys_list_singles_before_composites():
+    ds = _ds(
+        "db.main.line_items",
+        [
+            _col("id", distinct=2000, unique=True),
+            _col("order_key", distinct=500),
+            _col("line_number", distinct=4),
+        ],
+        rows=2000,
+    )
+    ds.composite_keys = [["order_key", "line_number"]]
+    assert candidate_keys(ds) == [["id"], ["order_key", "line_number"]]
+
+
+def test_grain_prefers_a_single_key_over_a_composite():
+    ds = _ds(
+        "db.main.line_items",
+        [
+            _col("id", distinct=2000, unique=True),
+            _col("order_key", distinct=500),
+            _col("line_number", distinct=4),
+        ],
+        rows=2000,
+    )
+    ds.composite_keys = [["order_key", "line_number"]]
+    assert detect_grain(ds) == ["id"]
+
+
+def test_grain_falls_back_to_the_best_ranked_composite():
+    ds = _ds(
+        "db.main.line_items",
+        [
+            _col("order_key", distinct=500),
+            _col("line_number", distinct=4),
+            _col("quantity", distinct=30),
+        ],
+        rows=2000,
+    )
+    ds.composite_keys = [["order_key", "line_number"], ["order_key", "quantity"]]
+    assert detect_grain(ds) == ["order_key", "line_number"]
+    assert not any("grain unknown" in n for n in data_quality_notes(ds))
+
+
+def test_composite_member_is_not_a_unique_parent_key():
+    """A same-named foreign key must not join to a composite member as if it
+    were the parent's unique key: order_key alone repeats in line_items, so an
+    edge onto it would fan out."""
+
+    line_items = _ds(
+        "db.main.line_items",
+        [_col("order_key", distinct=500), _col("line_number", distinct=4)],
+        rows=2000,
+    )
+    line_items.composite_keys = [["order_key", "line_number"]]
+    shipments = _ds("db.main.shipments", [_col("order_key", distinct=400)], rows=450)
+    assert infer_relationships([line_items, shipments]) == []
 
 
 # --- envelope: the two field sessions ------------------------------------------

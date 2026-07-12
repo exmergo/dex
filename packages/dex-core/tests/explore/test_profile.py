@@ -206,15 +206,27 @@ def test_true_duplicates_still_warn_with_exact_counts(near_unique_duckdb: Path, 
 
 
 class _StubAdapter:
-    """Metadata-only double: crafted approximate aggregates, recorded escalations."""
+    """Metadata-only double: crafted approximate aggregates, recorded escalations
+    and composite probes. ``combos`` maps a column tuple to its exact distinct
+    combination count; unlisted tuples come back just below the row count, so
+    they read as probed-but-not-unique."""
 
     name = "stub"
     dialect = "duckdb"
 
-    def __init__(self, rows: int, approx: dict[str, int]):
+    def __init__(
+        self,
+        rows: int,
+        approx: dict[str, int],
+        nulls: dict[str, float] | None = None,
+        combos: dict[tuple[str, ...], int] | None = None,
+    ):
         self.rows = rows
         self.approx = approx
+        self.nulls = nulls or {}
+        self.combos = combos or {}
         self.calls: list[list[str]] = []
+        self.combo_calls: list[list[list[str]]] = []
 
     def table_metadata(self, identifier):
         from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
@@ -240,7 +252,7 @@ class _StubAdapter:
         return [
             ColumnAggregate(
                 name=c.name,
-                null_fraction=0.0,
+                null_fraction=self.nulls.get(c.name, 0.0),
                 distinct_count=self.approx[c.name],
                 is_unique=False,
                 min_value=None,
@@ -252,6 +264,12 @@ class _StubAdapter:
     def exact_distinct_counts(self, identifier, columns):
         self.calls.append(list(columns))
         return {n: (self.rows if n == "overshoot" else self.rows - 10) for n in columns}
+
+    def distinct_combination_counts(self, identifier, combinations):
+        self.combo_calls.append([list(c) for c in combinations])
+        return {
+            tuple(c): self.combos.get(tuple(c), self.rows - 10) for c in combinations
+        }
 
 
 def test_escalation_policy_is_bounded_and_targeted():
@@ -295,6 +313,113 @@ def test_adapter_without_exact_counts_degrades_gracefully():
     assert col.distinct_count_exact is False
     # In the noise band and unproven: no non-uniqueness verdict.
     assert not any("not unique" in n for n in datasets[0].data_quality)
+
+
+# --- composite-key probing ------------------------------------------------------
+
+
+def test_composite_probe_is_bounded_and_targeted():
+    """Pairs are pruned on the distinct-product necessary condition, nullable
+    columns never enter a key, the id-shaped/smallest-product ranking picks the
+    grain-shaped pair first, and only the pair whose exact combination count
+    equals the row count is proven."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={
+            "order_key": 250,
+            "line_no": 4,
+            "qty": 30,
+            "filler": 2,
+            "commentId": 900,  # high-cardinality but nullable: never a key member
+        },
+        nulls={"commentId": 0.2},
+        combos={("order_key", "line_no"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.line_items"])
+
+    assert len(adapter.combo_calls) == 1, "all pairs batch into one adapter call"
+    probed = adapter.combo_calls[0]
+    # Survivors of the product test only (250*4 and 250*30 reach the row count
+    # within HLL slack; every filler pair falls short), best-ranked first,
+    # members ordered by descending cardinality.
+    assert probed == [["order_key", "line_no"], ["order_key", "qty"]]
+    assert not any("commentId" in pair for pair in probed)
+
+    ds = datasets[0]
+    assert ds.composite_keys == [["order_key", "line_no"]]
+    assert ["order_key", "line_no"] in rel_mod.candidate_keys(ds)
+    assert rel_mod.detect_grain(ds) == ["order_key", "line_no"]
+    assert not any("grain unknown" in n for n in rel_mod.data_quality_notes(ds))
+
+
+def test_composite_probe_caps_the_pair_count():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    # Five interchangeable mid-cardinality columns: every pair survives the
+    # product test, so only the cap keeps the probe bounded.
+    adapter = _StubAdapter(rows=1000, approx={f"c{i}_id": 100 + i for i in range(5)})
+    profile_mod.profile(adapter, ["db.s.t"])
+    assert len(adapter.combo_calls) == 1
+    assert len(adapter.combo_calls[0]) == 3
+
+
+def test_composite_probe_skipped_when_single_key_exists():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    # "overshoot" escalates to a proven unique single key, so the composite
+    # probe would be pure waste and must not fire.
+    adapter = _StubAdapter(
+        rows=1000, approx={"overshoot": 1010, "order_key": 250, "line_no": 4}
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.combo_calls == []
+    assert datasets[0].composite_keys == []
+
+
+def test_adapter_without_combination_counts_degrades_gracefully():
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(rows=1000, approx={"order_key": 250, "line_no": 4})
+    adapter.distinct_combination_counts = None  # shadow: adapter can't probe
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    ds = datasets[0]
+    assert ds.composite_keys == []
+    assert rel_mod.candidate_keys(ds) == []
+    assert any("grain unknown" in n for n in rel_mod.data_quality_notes(ds))
+
+
+def test_composite_grain_detected_end_to_end(composite_grain_duckdb: Path, capsys):
+    """The TPCH LINEITEM shape: no single column is unique, the true grain is
+    (order_key, line_number), and the profile proves it instead of reporting
+    an unknown grain."""
+
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "orders,line_items",
+            "--path",
+            str(composite_grain_duckdb),
+        ],
+        capsys,
+    )
+    ds = {d["identifier"].split(".")[-1]: d for d in payload["data"]["datasets"]}
+
+    line_items = ds["line_items"]
+    assert line_items["composite_keys"] == [["order_key", "line_number"]]
+    assert ["order_key", "line_number"] in line_items["candidate_keys"]
+    assert line_items["grain"] == ["order_key", "line_number"]
+    assert not any("grain unknown" in n for n in line_items["data_quality"])
+
+    # The sibling with a clean surrogate key keeps its single-column grain.
+    orders = ds["orders"]
+    assert orders["grain"] == ["order_key"]
+    assert orders["composite_keys"] == []
 
 
 def test_row_count_refreshes_after_the_aggregate_scan():
