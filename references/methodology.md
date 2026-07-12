@@ -53,6 +53,17 @@ escalated count is marked exact, and only an exact count is allowed to confirm a
 key or a table's grain; downstream consumers (relationship fan-out notes included)
 never draw a hard conclusion from an approximation.
 
+When no single column proves unique (the shape of a fact table, whose grain is
+exactly what a profile must answer), profiling probes 2-column composite keys. A
+pair can only be a key if the product of its members' distinct counts reaches the
+row count, so pairs are pruned on that necessary condition using the counts
+already in hand, then ranked (id-shaped members first, smallest product next) and
+capped to a few probes issued as one exact distinct-combination statement. A pair
+whose combination count equals the row count is a proven composite key: it enters
+the candidate keys and, absent any single-column key, becomes the reported grain.
+On metered connectors the probe spends only inside the already-confirmed budget
+and skips with an explanatory note when the remaining budget cannot cover it.
+
 Two safety rules are enforced at the source, in the SQL that is generated:
 
 - **min and max are surfaced only where the extreme value is not itself
@@ -80,8 +91,11 @@ verify referential integrity, so it stays free and read-only at the cost of
 certainty, which is why every inferred join carries a confidence. A join is
 proposed when a foreign-key-shaped column name matches a parent object whose
 corresponding column is a candidate key and the types are compatible; confidence
-reflects how strong the name and key signals are. Single-column candidate keys and
-the most likely grain are derived from the uniqueness signals. Declared joins come
+reflects how strong the name and key signals are. Candidate keys and the most
+likely grain come from the uniqueness signals: single columns proven unique, plus
+the composite keys proven at profile time; a single-column key is always
+preferred as the grain, and a member of a composite key is never treated as
+unique on its own. Declared joins come
 from the dbt project when one is present; absent a dbt project, declared joins are
 simply empty, which is expected because explore is designed to work without one.
 
