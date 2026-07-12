@@ -42,7 +42,15 @@ from ..config import PostgresTarget
 from ..envelope import Paradigm
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
-from .base import ColumnAggregate, ColumnMeta, ObjectMeta, QueryResult, json_safe
+from .base import (
+    ColumnAggregate,
+    ColumnMeta,
+    ObjectMeta,
+    QueryResult,
+    blame,
+    json_safe,
+    name_list,
+)
 
 PARADIGM = "db_load"
 DIALECT = "postgres"
@@ -120,12 +128,18 @@ class PostgresAdapter:
         cost_gate: CostGate,
         target: PostgresTarget | None = None,
         auth_method: str = "unknown",
+        scope_origin: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._conn = connection
         self.cost_gate = cost_gate
         self.target = target or PostgresTarget()
         self.auth_method = auth_method
+        # What the scope entries in the target came from, so a refusal names the
+        # thing the user has to go edit: a per-command flag or the committed
+        # allowlist. `narrow_target` has already collapsed the two by the time
+        # the adapter sees them, and the fix differs entirely.
+        self._scope_origin = scope_origin or "postgres.schemas in .dex/config.yml"
         self._clock = clock
         # Imported lazily (the caller constructed the connection, so the
         # library is present); the error types drive refusal translation.
@@ -140,6 +154,8 @@ class PostgresAdapter:
         self._stats: dict[str, dict[str, float]] = {}
         self._exact_rows: dict[str, int] = {}
         self._inventory_loaded = False
+        self._resolved_schemas: list[str] | None = None
+        self._visible_schemas: set[str] | None = None
         self._database: str | None = None
         self._notes: dict[str, list[str]] = {}
         self._session_prepared = False
@@ -211,7 +227,10 @@ class PostgresAdapter:
         if self._inventory_loaded:
             return
         database = self._current_database()
-        allowed = set(self.target.schemas)
+        # The resolved scopes, not the raw config: an entry that names nothing is
+        # refused before this filter drops it, which is the silent-empty-inventory
+        # bug this connector was most exposed to.
+        allowed = set(self._schema_scope()) if self.target.schemas else set()
         # relkind: r table, p partitioned table, f foreign table, m
         # materialized view, v view. reltuples is the planner's estimate (-1
         # means never analyzed); pg_total_relation_size is a catalog lookup,
@@ -296,17 +315,115 @@ class PostgresAdapter:
         return self._database
 
     def _schema_scope(self) -> list[str]:
-        """The allowlisted schemas, or every visible non-system schema when no
-        allowlist is configured."""
+        """Every source schema this command reads, proven to exist.
 
-        if self.target.schemas:
-            return sorted(set(self.target.schemas))
+        Resolution is free (one pg_catalog SELECT, no scan) and cached for the
+        command. It runs before anything is estimated, because a scope that
+        resolves to nothing and silently falls back to the whole allowlist is a
+        cost-safety bug: the estimate the user confirms would cover tables they
+        never named. Postgres was the worst of the connectors here, because an
+        allowlist entry was echoed back without ever asking the server, and the
+        inventory filter then dropped it silently: a typo simply returned nothing.
+        """
+
+        if self._resolved_schemas is None:
+            self._resolved_schemas = self._resolve_schemas()
+        return self._resolved_schemas
+
+    def _resolve_schemas(self) -> list[str]:
+        visible = self._schemas()
+        if not self.target.schemas:
+            return sorted(visible)
+        with blame(self._scope_origin, PostgresConnectionError):
+            return sorted(
+                {self._resolve_schema(entry, visible) for entry in self.target.schemas}
+            )
+
+    def _resolve_schema(self, entry: str, visible: set[str]) -> str:
+        """One scope entry, proven to exist. A Postgres scope is always a bare
+        schema in the connected database (dbt refuses cross-database references
+        outright), so there is nothing to qualify and nothing to disambiguate."""
+
+        token = entry.strip()
+        if not token:
+            raise PostgresConnectionError("empty scope entry")
+        if "." in token:
+            raise PostgresConnectionError(
+                f"scope '{entry}' has too many parts; a Postgres source scope is "
+                "a bare <schema> in the connected database "
+                f"({self._current_database()}), never a database or a table"
+            )
+        if token not in visible:
+            raise PostgresConnectionError(
+                f"scope '{entry}' names no schema in database "
+                f"{self._current_database()}; schemas there: "
+                f"{name_list(sorted(visible))}"
+            )
+        return token
+
+    def _schemas(self) -> set[str]:
+        """Every non-system schema in the connected database. Free (one catalog
+        SELECT, no scan), cached, and the live credential probe."""
+
+        if self._visible_schemas is None:
+            rows = self._catalog(
+                "SELECT nspname FROM pg_catalog.pg_namespace "
+                "WHERE nspname <> 'information_schema' "
+                "AND nspname NOT LIKE 'pg\\_%'"
+            )
+            self._visible_schemas = {str(row["nspname"]) for row in rows}
+        return self._visible_schemas
+
+    def missing_dev_namespaces(self, schema: str, *, role: str) -> list[str]:
+        """What stops ``role`` from building into the dev schema. Free: catalog
+        lookups and privilege predicates, no scan.
+
+        dbt creates the schema itself, so its absence is not fatal on its own:
+        what is fatal is the privilege to create it. Postgres therefore differs
+        from Snowflake and Databricks, where the missing *object* is the whole
+        problem. ``role`` is the one in the rendered profile rather than the
+        connected user, because dex may legitimately read as a read-only role
+        while dbt writes as another, and Postgres will answer a privilege
+        question about any role.
+        """
+
+        if not self._role_exists(role):
+            raise PostgresConnectionError(
+                f"the dbt role {role} does not exist in database "
+                f"{self._current_database()}; create it, or point the profile at "
+                "a role that exists"
+            )
+        who = f"'{_escape_literal(role)}'"
+        if schema not in self._schemas():
+            # dbt will issue CREATE SCHEMA IF NOT EXISTS on the first build, which
+            # needs CREATE on the database. Absent that, the build dies with a
+            # bare permission error naming neither the schema nor the grant.
+            row = self._catalog(
+                f"SELECT has_database_privilege({who}, current_database(), "
+                "'CREATE') AS may_create"
+            )[0]
+            return [] if bool(row["may_create"]) else [f'dev_schema "{schema}"']
+        where = f"{who}, '{_escape_literal(schema)}'"
+        row = self._catalog(
+            f"SELECT has_schema_privilege({where}, 'CREATE') AS may_create, "
+            f"has_schema_privilege({where}, 'USAGE') AS may_use"
+        )[0]
+        missing = [
+            privilege
+            for privilege, granted in (
+                ("USAGE", row["may_use"]),
+                ("CREATE", row["may_create"]),
+            )
+            if not bool(granted)
+        ]
+        return [f'{", ".join(missing)} on dev_schema "{schema}"'] if missing else []
+
+    def _role_exists(self, role: str) -> bool:
         rows = self._catalog(
-            "SELECT nspname FROM pg_catalog.pg_namespace "
-            "WHERE nspname <> 'information_schema' "
-            "AND nspname NOT LIKE 'pg\\_%'"
+            "SELECT 1 AS present FROM pg_catalog.pg_roles "  # noqa: S608
+            f"WHERE rolname = '{_escape_literal(role)}'"
         )
-        return sorted(str(row["nspname"]) for row in rows)
+        return bool(rows)
 
     def _table_stats(self, identifier: str) -> dict[str, float]:
         """Free per-table distinct estimates from the planner's statistics.

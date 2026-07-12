@@ -18,6 +18,8 @@ caps and truncates them before the envelope.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -113,6 +115,39 @@ def scope_within(scope: str, committed: list[str]) -> bool:
         entry == c.strip().lower() or entry.startswith(c.strip().lower() + ".")
         for c in committed
     )
+
+
+SUGGESTION_CAP = 12
+
+
+def name_list(names: Iterable[str]) -> str:
+    """Names for an error message, capped so a thousand-schema account cannot
+    turn a one-line refusal into a page of stdout."""
+
+    names = list(names)
+    shown = names[:SUGGESTION_CAP]
+    suffix = (
+        f", and {len(names) - SUGGESTION_CAP} more"
+        if len(names) > SUGGESTION_CAP
+        else ""
+    )
+    return (", ".join(shown) + suffix) if shown else "(none)"
+
+
+@contextmanager
+def blame(origin: str, error: type[Exception]):
+    """Attribute a scope failure to the thing the user has to go edit. A resolver
+    does not know whether an entry came from the committed allowlist or from a
+    flag, and the fix differs entirely.
+
+    ``error`` is the connector's own exception class, so the re-raise stays the
+    type that connector's callers already catch.
+    """
+
+    try:
+        yield
+    except error as exc:
+        raise error(f"{exc} [from {origin}]") from exc
 
 
 def json_safe(value: object | None) -> object | None:

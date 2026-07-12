@@ -16,6 +16,7 @@ effects), not call signatures.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -62,6 +63,23 @@ class FakePostgresTable:
 
 
 @dataclass
+class FakeRole:
+    """A role and what it may do, for the dev-target privilege preflight.
+
+    The preflight asks about the role in the rendered profile, which need not be
+    the role the connection authenticated as, so the fake answers privilege
+    questions per role rather than for one implicit current user.
+    """
+
+    name: str
+    # CREATE on the database: what dbt needs to create a dev schema that is not
+    # there yet.
+    may_create_in_database: bool = False
+    # schema name -> the privileges this role holds on it ({"USAGE", "CREATE"}).
+    schema_privileges: dict[str, set[str]] = field(default_factory=dict)
+
+
+@dataclass
 class FakeStatement:
     sql: str
     session_timeout_ms: int | None
@@ -95,7 +113,11 @@ class FakeCursor:
             cost = self._conn.plan_cost(inner)
             self._emit([{"QUERY PLAN": [{"Plan": {"Total Cost": cost}}]}])
             return self
-        if "pg_catalog." in sql or "current_database()" in sql:
+        if (
+            "pg_catalog." in sql
+            or "current_database()" in sql
+            or "has_schema_privilege" in sql
+        ):
             self._serve_catalog(stripped)
             return self
 
@@ -143,7 +165,20 @@ class FakeCursor:
             pass
 
     def _serve_catalog(self, sql: str) -> None:
-        if "current_database()" in sql and "server_version" in sql:
+        # The privilege predicates come first: has_database_privilege names
+        # current_database() too, and would otherwise be answered as the
+        # capabilities probe.
+        if "has_database_privilege" in sql:
+            role = self._conn.roles.get(_first_literal(sql))
+            self._emit([{"may_create": bool(role and role.may_create_in_database)}])
+        elif "has_schema_privilege" in sql:
+            # The adapter asks about both privileges in one round-trip, so the
+            # answer carries both: SELECT ... AS may_create, ... AS may_use.
+            literals = _literals(sql)
+            role = self._conn.roles.get(literals[0] if literals else "")
+            held = role.schema_privileges.get(literals[1], set()) if role else set()
+            self._emit([{"may_create": "CREATE" in held, "may_use": "USAGE" in held}])
+        elif "current_database()" in sql and "server_version" in sql:
             read_only = self._conn.session_parameters.get(
                 "default_transaction_read_only", "off"
             )
@@ -195,8 +230,13 @@ class FakeCursor:
                 for t in sorted(self._conn.tables, key=lambda t: (t.schema, t.name))
             ]
             self._emit(rows)
+        elif "pg_catalog.pg_roles" in sql:
+            known = [name for name in self._conn.roles if f"'{name}'" in sql]
+            self._emit([{"present": 1} for _ in known])
         elif "pg_catalog.pg_namespace" in sql:
-            names = sorted({t.schema for t in self._conn.tables})
+            names = sorted(
+                {t.schema for t in self._conn.tables} | self._conn.empty_schemas
+            )
             self._emit([{"nspname": name} for name in names])
         else:
             self._emit([])
@@ -213,6 +253,17 @@ class FakeCursor:
         self._rows = [tuple(row[key] for key in keys) for row in rows]
 
 
+def _literals(sql: str) -> list[str]:
+    """The single-quoted literals of an engine-built catalog query, in order."""
+
+    return re.findall(r"'([^']*)'", sql)
+
+
+def _first_literal(sql: str) -> str:
+    found = _literals(sql)
+    return found[0] if found else ""
+
+
 class FakePostgresConnection:
     """Simulates exactly the connection surface the adapter touches; anything
     else raises AttributeError, which is the point (the adapter must not grow
@@ -227,8 +278,16 @@ class FakePostgresConnection:
         clock: FakeClock | None = None,
         row_resolver: Callable[[str], FakeResult | list[dict]] | None = None,
         plan_costs: Callable[[str], float | None] | None = None,
+        roles: list[FakeRole] | None = None,
+        empty_schemas: list[str] | None = None,
     ):
         self.tables = tables or []
+        # Roles the database knows, and their privileges: what the dev-target
+        # preflight interrogates. Schemas holding no table (a scratch dev schema
+        # before a first build) cannot come from the table registry, so they are
+        # declared here.
+        self.roles = {role.name: role for role in (roles or [])}
+        self.empty_schemas = set(empty_schemas or [])
         self.database = database
         self.server_version = server_version
         self.clock = clock or FakeClock()
@@ -267,8 +326,10 @@ class FakePostgresConnection:
 
     @property
     def data_statements(self) -> list[FakeStatement]:
-        """Statements that scan data: SELECTs that are not catalog lookups,
-        the capabilities probe, or EXPLAIN plan requests."""
+        """Statements that scan data: SELECTs that are not catalog lookups, the
+        capabilities probe, the dev-target privilege predicates, or EXPLAIN plan
+        requests. The privilege predicates are catalog reads like the rest: they
+        answer from pg_authid, scanning nothing."""
 
         return [
             s
@@ -276,4 +337,5 @@ class FakePostgresConnection:
             if s.sql.strip().upper().startswith("SELECT")
             and "pg_catalog." not in s.sql
             and "current_database()" not in s.sql
+            and "has_schema_privilege" not in s.sql
         ]

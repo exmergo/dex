@@ -115,6 +115,9 @@ def open_adapter(
             command=command,
             project_override=project,
             dataset_override=datasets or scopes,
+            # Both flags scope BigQuery, and the refusal has to name the one the
+            # user actually typed.
+            scope_flag=("--dataset" if datasets else "--scope" if scopes else None),
         )
 
     if connector == "snowflake":
@@ -224,6 +227,18 @@ def narrow_target(target, connector: str, scope_override: list[str] | None):
     return target.model_copy(update={field: list(scope_override)})
 
 
+def scope_origin(connector: str, flag: str | None) -> str:
+    """What a scope refusal should tell the user to go edit.
+
+    ``narrow_target`` copies a per-command scope over the committed allowlist, so
+    by the time an adapter proves the entries exist it can no longer tell which
+    of the two it is holding, and the fix differs entirely: edit the flag, or
+    edit the file. The caller knows, so it says.
+    """
+
+    return flag or f"{connector}.{_SCOPE_FIELDS[connector]} in .dex/config.yml"
+
+
 def _open_bigquery(
     config: DexConfig,
     repo_root: str | Path,
@@ -233,6 +248,7 @@ def _open_bigquery(
     command: str | None,
     project_override: str | None = None,
     dataset_override: list[str] | None = None,
+    scope_flag: str | None = None,
 ):
     target = config.bigquery or BigQueryTarget()
     target = narrow_target(target, "bigquery", dataset_override)
@@ -272,6 +288,7 @@ def _open_bigquery(
         cost_gate=gate,
         credentials=credentials,
         principal_type=principal_type,
+        scope_origin=scope_origin("bigquery", scope_flag),
     )
 
 
@@ -593,6 +610,7 @@ def _open_databricks(
         target=target,
         host=_databricks_hostname(sdk_config.host),
         auth_method=method,
+        scope_origin=scope_origin("databricks", "--scope" if scope_override else None),
     )
 
 
@@ -809,6 +827,7 @@ def _open_postgres(
         cost_gate=gate,
         target=target,
         auth_method=method,
+        scope_origin=scope_origin("postgres", "--scope" if scope_override else None),
     )
 
 

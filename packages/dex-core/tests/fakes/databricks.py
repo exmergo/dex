@@ -95,19 +95,67 @@ class FakeWorkspaceClient:
         tables: list[FakeDatabricksTable] | None = None,
         warehouse: FakeWarehouse | None = None,
         omit_list_columns: bool = False,
+        empty_catalogs: list[str] | None = None,
+        principal: str = "dex@example.com",
+        owners: dict[str, str] | None = None,
+        grants: dict[str, set[str]] | None = None,
     ):
         self._tables = tables or []
+        # Catalogs that exist but hold no table: the state a scratch dev catalog
+        # is in before a first build, which a table-derived registry cannot
+        # otherwise express.
+        self._empty_catalogs = list(empty_catalogs or [])
+        # Who this client authenticates as, who owns each securable (by full name),
+        # and what the principal is granted on each. Ownership and grants are
+        # separate on purpose: Unity Catalog does not report ownership through the
+        # effective-privilege API, so an owner reads back as holding nothing, and
+        # the dev-target preflight has to consult both.
+        self.principal = principal
+        self._owners = dict(owners or {})
+        self._grants = {name: set(held) for name, held in (grants or {}).items()}
         self.warehouse = warehouse or FakeWarehouse()
         self.omit_list_columns = omit_list_columns
         self.metadata_calls: list[str] = []
-        self.catalogs = SimpleNamespace(list=self._list_catalogs)
-        self.schemas = SimpleNamespace(list=self._list_schemas)
+        self.catalogs = SimpleNamespace(list=self._list_catalogs, get=self._get_catalog)
+        self.schemas = SimpleNamespace(list=self._list_schemas, get=self._get_schema)
         self.tables = SimpleNamespace(list=self._list_tables, get=self._get_table)
         self.warehouses = SimpleNamespace(get=self._get_warehouse)
+        self.current_user = SimpleNamespace(me=self._me)
+        self.grants = SimpleNamespace(get_effective=self._get_effective)
+
+    def _me(self):
+        self.metadata_calls.append("current_user.me")
+        return SimpleNamespace(user_name=self.principal)
+
+    def _get_catalog(self, name: str):
+        self.metadata_calls.append(f"catalogs.get:{name}")
+        return SimpleNamespace(name=name, owner=self._owners.get(name))
+
+    def _get_schema(self, full_name: str):
+        self.metadata_calls.append(f"schemas.get:{full_name}")
+        return SimpleNamespace(full_name=full_name, owner=self._owners.get(full_name))
+
+    def _get_effective(self, securable_type: str, full_name: str, *, principal: str):
+        """Effective privileges, which in Unity Catalog do NOT include the ones an
+        owner holds implicitly: an owner reads back as holding nothing."""
+
+        self.metadata_calls.append(f"grants.get_effective:{full_name}")
+        held = (
+            self._grants.get(full_name, set()) if principal == self.principal else set()
+        )
+        return SimpleNamespace(
+            privilege_assignments=[
+                SimpleNamespace(
+                    privileges=[SimpleNamespace(privilege=p) for p in sorted(held)]
+                )
+            ]
+            if held
+            else []
+        )
 
     def _list_catalogs(self):
         self.metadata_calls.append("catalogs.list")
-        names = sorted({t.catalog for t in self._tables})
+        names = sorted({t.catalog for t in self._tables} | set(self._empty_catalogs))
         return [SimpleNamespace(name=name) for name in names]
 
     def _list_schemas(self, catalog_name: str):

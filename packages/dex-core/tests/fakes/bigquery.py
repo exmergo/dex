@@ -128,9 +128,17 @@ class FakeBigQueryClient:
         tables: list[FakeTable] | None = None,
         row_resolver: Callable[[str], FakeResult | list[dict]] | None = None,
         default_query_bytes: int = DEFAULT_QUERY_BYTES,
+        empty_datasets: list[str] | None = None,
     ):
         self.project = project
         self.tables: dict[str, FakeTable] = {t.identifier: t for t in (tables or [])}
+        # Datasets that exist but hold no table: the state a scratch dev dataset
+        # is in before a first build, which a table-derived registry cannot
+        # otherwise express. Bare names qualify against `project`.
+        self.empty_datasets = {
+            name if "." in name else f"{project}.{name}"
+            for name in (empty_datasets or [])
+        }
         self.row_resolver = row_resolver
         self.default_query_bytes = default_query_bytes
         self.query_calls: list[FakeQueryCall] = []
@@ -146,18 +154,46 @@ class FakeBigQueryClient:
 
     # --- metadata surface (free API calls) ------------------------------------
 
-    def list_datasets(self, project: str | None = None):
-        dataset_ids = sorted({t.dataset_id for t in self.tables.values()})
-        return [SimpleNamespace(dataset_id=d) for d in dataset_ids]
+    def list_datasets(self, project: str | None = None, max_results: int | None = None):
+        """Lazy, like the real client's HTTPIterator: the request goes out (and an
+        unreachable project raises NotFound) only when the result is iterated. A
+        caller that never drains it learns nothing, which is exactly how a
+        not-really-checked project once read as a healthy one."""
+
+        target = project or self.project
+
+        def _pages():
+            if target not in self._projects():
+                raise api_exceptions.NotFound(f"project not found: {target}")
+            dataset_ids = sorted(
+                {t.dataset_id for t in self.tables.values() if t.project == target}
+                | {
+                    name.split(".", 1)[1]
+                    for name in self.empty_datasets
+                    if name.startswith(f"{target}.")
+                }
+            )
+            for dataset_id in dataset_ids[:max_results] if max_results else dataset_ids:
+                yield SimpleNamespace(dataset_id=dataset_id)
+
+        return _pages()
 
     def get_dataset(self, dataset_ref: str):
         project, dataset_id = str(dataset_ref).rsplit(".", 1)
-        if not any(
+        known = any(
             t.project == project and t.dataset_id == dataset_id
             for t in self.tables.values()
-        ):
+        )
+        if not known and str(dataset_ref) not in self.empty_datasets:
             raise api_exceptions.NotFound(f"dataset not found: {dataset_ref}")
         return SimpleNamespace(dataset_id=dataset_id, project=project)
+
+    def _projects(self) -> set[str]:
+        return (
+            {self.project}
+            | {t.project for t in self.tables.values()}
+            | {name.split(".", 1)[0] for name in self.empty_datasets}
+        )
 
     def list_tables(self, dataset_ref: str):
         _project, dataset_id = str(dataset_ref).rsplit(".", 1)

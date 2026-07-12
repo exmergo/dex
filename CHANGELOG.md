@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-07-12
+
 ### Added
 
 - **`--scope`**, a portable, repeatable source-scope override that every
@@ -18,6 +20,24 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   written back to `.dex/config.yml`. A committed source allowlist is a cost
   boundary, so `--scope` may only narrow it, never widen it, and a scope that
   reaches outside is refused.
+- **Source-scope validation on every warehouse connector.** BigQuery, Databricks,
+  and Postgres now resolve each scope entry through their own free metadata path
+  before anything is estimated, matching what Snowflake already did: a dataset,
+  catalog, `catalog.schema`, or schema that names nothing is refused, and the
+  message lists what does exist and names where the entry came from (the `--scope`
+  or `--dataset` flag, or the allowlist in `.dex/config.yml`). `connect test`
+  therefore fails for free on a bad scope.
+- **A dev-target preflight on every warehouse connector.** The free check that
+  runs before the cost gate now covers BigQuery, Databricks, and Postgres. What
+  dbt cannot create for itself is refused; what it can create is not, and that
+  lands differently per connector: dbt never creates a Databricks catalog, so a
+  missing `dev_catalog` is refused with the `CREATE CATALOG` statement that fixes
+  it; dbt *does* create its BigQuery dev dataset, so an absent one warns (naming
+  the `bigquery.datasets.create` permission the build needs) while an unreachable
+  dev project is refused; and dbt creates its Postgres dev schema only if the role
+  may, so the privilege is what gets checked, asked of the role in the rendered
+  profile rather than the one dex reads with, and refused with the `GRANT` that
+  fixes it.
 - **Snowflake scope resolution and validation.** Scopes now resolve against the
   account through free SHOW metadata before anything is estimated. A bare schema
   is qualified against the databases in scope; an ambiguous one asks for

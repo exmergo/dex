@@ -21,6 +21,40 @@ pytestmark = [pytest.mark.integration, pytest.mark.databricks]
 MODEL_NAME = "dex_probe"
 
 
+@pytest.fixture(autouse=True)
+def non_interactive_credential():
+    """A dbt build here must never depend on a human at a browser.
+
+    `transform init` renders a user-OAuth connection as `auth_type: oauth`, and
+    dbt-databricks then runs its own browser flow. In CI that never happens (the
+    workflow exchanges the GitHub OIDC token and exports DATABRICKS_TOKEN, which
+    dbt reads through the same env_var reference a PAT would), but a local run
+    discovering a user-OAuth profile would sit for ten minutes waiting for a
+    browser that no test harness will ever open, and then fail on a timeout that
+    names none of this.
+
+    So the requirement is stated rather than stumbled into: skip unless the
+    discovered credential is one dbt can use unattended.
+    """
+
+    pytest.importorskip("databricks.sql")
+    from exmergo_dex_core.config import DatabricksTarget
+    from exmergo_dex_core.connect import resolve_databricks_connection
+
+    try:
+        _config, method = resolve_databricks_connection(
+            DatabricksTarget(), os.environ, "."
+        )
+    except Exception as exc:  # no connection at all: the suite's own gate reports it
+        pytest.skip(f"no Databricks connection discovered ({type(exc).__name__})")
+    if method.rsplit(":", 1)[-1] == "oauth_user":
+        pytest.skip(
+            "dbt needs a credential it can use unattended; the discovered "
+            "connection is user OAuth, which sends dbt to a browser. Export "
+            "DATABRICKS_TOKEN (for example: databricks auth token -p <profile>)"
+        )
+
+
 def test_init_plan_apply_build_into_the_scratch_catalog(
     tmp_path: Path, capsys, dbx_warehouse, dbx_scratch_catalog
 ):
@@ -130,3 +164,32 @@ def test_init_plan_apply_build_into_the_scratch_catalog(
         cursor.execute(f"DROP VIEW IF EXISTS {relation}")
     finally:
         conn.close()
+
+
+def test_missing_dev_catalog_is_refused_before_the_cost_gate(
+    tmp_path: Path, capsys, dbx_warehouse
+):
+    """dbt creates schemas but never catalogs, so a `dev_catalog` that does not
+    exist dies inside the `create schema` dbt issues, naming neither the catalog
+    nor the fix. The preflight is free (Unity Catalog REST, no SQL session) and
+    runs before the confirm handshake, so this refuses without `--confirm` and
+    without spend."""
+
+    pytest.importorskip("dbt.adapters.databricks")
+    root = str(tmp_path)
+    seed_repo(tmp_path, dbx_warehouse, "dex_no_such_dev_catalog")
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "build", "--target", "dev"], capsys
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    error = envelope["errors"][0]
+    assert "dex_no_such_dev_catalog" in error
+    assert "CREATE CATALOG IF NOT EXISTS dex_no_such_dev_catalog" in error
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
