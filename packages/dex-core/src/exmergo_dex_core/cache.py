@@ -89,6 +89,11 @@ class Dataset(BaseModel):
     columns: list[ColumnProfile] = Field(default_factory=list)
     candidate_keys: list[list[str]] = Field(default_factory=list)
     grain: list[str] | None = None
+    #: Column combinations proven unique by an exact profile-time probe, best
+    #: candidate first. Kept separate from ``candidate_keys`` (which the
+    #: annotation pass recomputes from column stats) so the proof survives
+    #: re-annotation and its provenance stays distinct from derived signals.
+    composite_keys: list[list[str]] = Field(default_factory=list)
     rank_score: float | None = None
     data_quality: list[str] = Field(default_factory=list)
     profiled_at: str | None = None
