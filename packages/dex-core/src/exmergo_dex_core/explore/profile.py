@@ -31,6 +31,11 @@ NEAR_UNIQUE_RATIO = 0.75
 # COUNT(DISTINCT) statement; the cap bounds the width of that statement.
 _EXACT_DISTINCT_CAP = 8
 
+# Composite-key probes are capped much tighter than single-column escalation:
+# each pair costs a full two-column DISTINCT scan (not one cheap aggregate),
+# and the ranking puts a real grain in the first slots when one exists.
+_COMPOSITE_PAIR_CAP = 3
+
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
 # the same as "first_name") with word-ish boundaries so "email" hits but
@@ -197,6 +202,9 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
         aggregates = _escalate_near_unique(
             adapter, identifier, meta.row_count, aggregates
         )
+        composite_keys = _probe_composite_keys(
+            adapter, identifier, meta.row_count, aggregates
+        )
 
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
@@ -236,6 +244,7 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                 row_count=meta.row_count,
                 byte_size=meta.byte_size,
                 columns=profiles,
+                composite_keys=composite_keys,
                 data_quality=data_quality,
                 profiled_at=datetime.now(UTC).isoformat(),
             )
@@ -296,6 +305,72 @@ def _escalate_near_unique(
             distinct_count_exact=True,
         )
     return escalated
+
+
+def _probe_composite_keys(
+    adapter: Adapter,
+    identifier: str,
+    row_count: int | None,
+    aggregates: dict[str, ColumnAggregate],
+) -> list[list[str]]:
+    """Prove 2-column keys on tables where no single column is one: the shape
+    of a fact table, whose grain is exactly what a profile must answer.
+
+    A pair can only be a key if the product of its members' distinct counts
+    reaches the row count, so pairs are pruned on that necessary condition
+    (relaxed per approximate member to absorb HLL undershoot) and ranked:
+    id-shaped members first (real grains are key-shaped), smallest product
+    next (a minimal grain sits just above the row count; a pair of two
+    near-unique columns lands near rows squared and is analytically useless
+    even when technically unique). Bounded to ``_COMPOSITE_PAIR_CAP`` pairs in
+    one batched adapter call; a pair is proven when its exact combination
+    count equals the row count. Adapters without
+    ``distinct_combination_counts`` degrade to no composite keys.
+    """
+
+    if not row_count:
+        return []
+    combo_counts = getattr(adapter, "distinct_combination_counts", None)
+    if combo_counts is None:
+        return []
+    for agg in aggregates.values():
+        if agg.is_unique and agg.null_fraction in (0.0, None):
+            return []  # a proven single-column key makes the probe waste
+
+    pool = [
+        agg
+        for agg in aggregates.values()
+        if agg.distinct_count and not agg.is_unique and agg.null_fraction in (0.0, None)
+    ]
+    if len(pool) < 2:
+        return []
+
+    # Imported here: relationships imports NEAR_UNIQUE_RATIO from this module,
+    # so a module-level import would be circular.
+    from .relationships import _is_id_shaped
+
+    ranked: list[tuple[int, int, tuple[str, str]]] = []
+    for i, a in enumerate(pool):
+        for b in pool[i + 1 :]:
+            product = a.distinct_count * b.distinct_count
+            n_approx = sum(1 for m in (a, b) if not m.distinct_count_exact)
+            if product < row_count * NEAR_UNIQUE_RATIO**n_approx:
+                continue
+            id_shaped = sum(1 for m in (a, b) if _is_id_shaped(m.name))
+            # Members ordered by descending cardinality so the key reads
+            # parent-then-line, e.g. (L_ORDERKEY, L_LINENUMBER).
+            members = sorted(
+                (a.name, b.name),
+                key=lambda n: (-(aggregates[n].distinct_count or 0), n),
+            )
+            ranked.append((-id_shaped, product, (members[0], members[1])))
+    if not ranked:
+        return []
+
+    ranked.sort()
+    chosen = [list(pair) for _ids, _product, pair in ranked[:_COMPOSITE_PAIR_CAP]]
+    exact = combo_counts(identifier, chosen)
+    return [combo for combo in chosen if exact.get(tuple(combo)) == row_count]
 
 
 def _refine_confidence(
