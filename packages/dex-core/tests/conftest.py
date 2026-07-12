@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -225,6 +227,112 @@ def fake_pg_connection():
         ),
     ]
     return FakePostgresConnection(tables=tables, database="dexdb")
+
+
+def write_manifest(
+    project: Path,
+    *,
+    models: dict[str, str | None],
+    sources: dict[str, str] | None = None,
+    relationship_tests: list[tuple[str, str, str, str]] = (),
+    unique_tests: list[tuple[str, str]] = (),
+    not_null_tests: list[tuple[str, str]] = (),
+    generated_at: str | None = None,
+) -> Path:
+    """Write a minimal compiled manifest.json shaped like dbt's.
+
+    ``models`` maps model name to its relation_name (None for ephemeral).
+    ``sources`` maps ``"source_name.table"`` to a relation_name.
+    ``relationship_tests`` entries are ``(model, column, to, field)`` with
+    ``to`` as the literal test argument (``"ref('x')"`` / ``"source('a','b')"``).
+    ``unique_tests`` / ``not_null_tests`` entries are ``(model, column)``.
+    """
+
+    uid_of = {name: f"model.dex_test.{name}" for name in models}
+    nodes: dict[str, dict] = {
+        uid_of[name]: {
+            "resource_type": "model",
+            "name": name,
+            "relation_name": relation,
+            "config": {"enabled": True},
+        }
+        for name, relation in models.items()
+    }
+    source_nodes: dict[str, dict] = {}
+    for key, relation in (sources or {}).items():
+        source_name, table = key.split(".", 1)
+        uid = f"source.dex_test.{source_name}.{table}"
+        uid_of[key] = uid
+        source_nodes[uid] = {
+            "resource_type": "source",
+            "source_name": source_name,
+            "name": table,
+            "relation_name": relation,
+        }
+
+    def test_node(name: str, kwargs: dict, attached: str) -> dict:
+        return {
+            "resource_type": "test",
+            "name": name,
+            "test_metadata": {"name": name.split("__")[0], "kwargs": kwargs},
+            "attached_node": uid_of[attached],
+            "depends_on": {"nodes": [uid_of[attached]]},
+        }
+
+    for i, (model, column, to, field) in enumerate(relationship_tests):
+        nodes[f"test.dex_test.relationships_{i}"] = test_node(
+            f"relationships__{i}",
+            {"column_name": column, "to": to, "field": field},
+            model,
+        )
+    for i, (model, column) in enumerate(unique_tests):
+        nodes[f"test.dex_test.unique_{i}"] = test_node(
+            f"unique__{i}", {"column_name": column}, model
+        )
+    for i, (model, column) in enumerate(not_null_tests):
+        nodes[f"test.dex_test.not_null_{i}"] = test_node(
+            f"not_null__{i}", {"column_name": column}, model
+        )
+
+    target = project / "target"
+    target.mkdir(exist_ok=True)
+    path = target / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "project_name": "dex_test",
+                    "generated_at": generated_at or datetime.now(UTC).isoformat(),
+                },
+                "nodes": nodes,
+                "sources": source_nodes,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_semantic_manifest(
+    project: Path, *, semantic_models: list[dict], metrics: list[dict]
+) -> Path:
+    """Write a minimal target/semantic_manifest.json (dbt's compiled semantic
+    layer artifact: pre-resolved node_relation and metric input_measures)."""
+
+    target = project / "target"
+    target.mkdir(exist_ok=True)
+    path = target / "semantic_manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "semantic_models": semantic_models,
+                "metrics": metrics,
+                "project_configuration": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.fixture

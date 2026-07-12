@@ -16,6 +16,7 @@ from exmergo_dex_core import envelope as env
 from exmergo_dex_core.cache import DexStore
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
+from exmergo_dex_core.explore.commands import _merged_hints
 
 
 def _run(argv: list[str], capsys) -> dict:
@@ -325,3 +326,224 @@ def test_empty_table_and_view_profile_without_error(edge_duckdb: Path, capsys):
     assert any("empty" in note for note in empty["data_quality"])
     assert empty["columns"][0]["null_fraction"] is None  # no rows -> undefined
     assert "people_v" in ds  # a view profiles fine
+
+
+# --- free priors from the dbt project ------------------------------------------
+
+
+def _semantic_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A warehouse plus a dbt project whose semantic layer declares a grain
+    (order_code, disagreeing with the id heuristic) and whose schema.yml
+    declares status unique (contradicted by the data)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE orders (id INTEGER, order_code INTEGER, status VARCHAR)")
+    conn.execute(
+        "INSERT INTO orders VALUES (1, 101, 'open'), (2, 102, 'open'), "
+        "(3, 103, 'closed')"
+    )
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "semantic.yml").write_text(
+        "semantic_models:\n"
+        "  - name: orders\n"
+        "    model: ref('orders')\n"
+        "    entities:\n"
+        "      - name: order\n"
+        "        type: primary\n"
+        "        expr: order_code\n",
+        encoding="utf-8",
+    )
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: status\n"
+        "        tests: [unique]\n",
+        encoding="utf-8",
+    )
+    return db, repo
+
+
+def test_map_declared_grain_overrides_heuristic(tmp_path: Path, capsys):
+    db, repo = _semantic_repo(tmp_path)
+    _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    cache = DexStore(repo).load_cache()
+    (orders,) = [d for d in cache.datasets if d.identifier.endswith(".orders")]
+    # The heuristic would pick the id-shaped key; the declared primary entity wins.
+    assert orders.grain == ["order_code"]
+    assert any("declared primary entity" in n for n in orders.data_quality)
+    assert any("heuristic suggested id" in n for n in orders.data_quality)
+
+
+def test_map_notes_declared_unique_contradiction(tmp_path: Path, capsys):
+    db, repo = _semantic_repo(tmp_path)
+    _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    cache = DexStore(repo).load_cache()
+    (orders,) = [d for d in cache.datasets if d.identifier.endswith(".orders")]
+    assert any(
+        "status is declared unique" in n and "duplicates" in n
+        for n in orders.data_quality
+    )
+    # Measurement-only: the contradicted declared key must not appear as a
+    # candidate key just because the project claims it.
+    assert ["status"] not in orders.candidate_keys
+
+
+def test_profile_gets_declared_grain_too(tmp_path: Path, capsys):
+    db, repo = _semantic_repo(tmp_path)
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "orders",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    (orders,) = payload["data"]["datasets"]
+    assert orders["grain"] == ["order_code"]
+
+
+def test_exploration_starts_bare_and_discovers_the_project(tmp_path: Path, capsys):
+    """Without --use-project the warehouse is explored as-is: heuristic grain,
+    no declared influence, and a discovery note pointing at the flag."""
+
+    db, repo = _semantic_repo(tmp_path)
+    payload = _run(
+        ["explore", "map", "--path", str(db), "--repo-root", str(repo)],
+        capsys,
+    )
+    notes = payload["data"]["notes"]
+    assert any("--use-project" in n for n in notes)
+    # The empty-declared note adapts: the project exists, it just was not used.
+    assert not any("no dbt project" in n for n in notes)
+    cache = DexStore(repo).load_cache()
+    (orders,) = [d for d in cache.datasets if d.identifier.endswith(".orders")]
+    assert orders.grain == ["id"]
+    assert not any("declared" in n for n in orders.data_quality)
+
+
+def _metric_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """Two structurally identical tables; only beta_events backs a metric."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    for name in ("alpha_events", "beta_events"):
+        conn.execute(f"CREATE TABLE {name} (id INTEGER, amount INTEGER)")
+        conn.execute(f"INSERT INTO {name} VALUES (1, 10), (2, 20)")  # noqa: S608
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "semantic.yml").write_text(
+        "semantic_models:\n"
+        "  - name: events\n"
+        "    model: ref('beta_events')\n"
+        "    entities:\n"
+        "      - name: id\n"
+        "        type: primary\n"
+        "    measures:\n"
+        "      - name: event_amount\n"
+        "        agg: sum\n"
+        "        expr: amount\n"
+        "metrics:\n"
+        "  - name: total_amount\n"
+        "    type: simple\n"
+        "    type_params:\n"
+        "      measure: event_amount\n",
+        encoding="utf-8",
+    )
+    return db, repo
+
+
+def test_map_metric_backed_table_outranks_equivalent(tmp_path: Path, capsys):
+    db, repo = _metric_repo(tmp_path)
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    top = {
+        o["identifier"].split(".")[-1]: o["rank_score"]
+        for o in payload["data"]["top_objects"]
+    }
+    assert top["beta_events"] > top["alpha_events"]
+    assert any("back metric definitions" in n for n in payload["data"]["notes"])
+
+
+def test_map_metric_hints_do_not_displace_user_hints(tmp_path: Path, capsys):
+    db, repo = _metric_repo(tmp_path)
+    save_config(DexConfig(ranking_hints=["alpha_events"]), repo)
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    top = {
+        o["identifier"].split(".")[-1]: o["rank_score"]
+        for o in payload["data"]["top_objects"]
+    }
+    # The user's hint keeps its full naming boost alongside the metric's.
+    assert top["alpha_events"] == top["beta_events"]
+
+
+def test_merged_hints_appends_without_displacing():
+    assert _merged_hints(["customer"], ["Customer", "orders"]) == [
+        "customer",
+        "orders",
+    ]
