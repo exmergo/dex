@@ -111,6 +111,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
+                # Exploration starts bare: warehouse truth, independent of
+                # whatever repo dex runs from. --use-project opts in to folding
+                # the project's declared definitions (joins, grain, metric
+                # lineage) into the result.
+                if group == "explore" and name in {"profile", "relationships", "map"}:
+                    sp.add_argument(
+                        "--use-project",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                    )
                 # transform init takes the project name; plan the intent; apply
                 # the plan id.
                 if group == "transform" and name in {"init", "plan", "apply"}:

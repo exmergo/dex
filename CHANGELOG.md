@@ -11,6 +11,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`--use-project`: explore can read the dbt project, on request.**
+  Exploration still starts bare (default behavior is unchanged; a dbt project
+  in the repo earns only a discovery note). With the flag, `explore
+  relationships` and `explore map` report joins the project itself declares:
+  every resolvable `relationships` test becomes a declared join at confidence
+  1.0, resolved against the connection's inventory (manifest-first for exact
+  physical names, with a name-based fallback when the project is not
+  compiled). A declared join that matches nothing, or more than one object,
+  is surfaced as a note instead of guessed. An inferred join that duplicates
+  a declared one is folded into it and noted as independently confirmed.
+- **Declared grain and declared-unique checks (under `--use-project`).**
+  A semantic model's primary entity overrides the heuristic grain on the
+  matching profiled dataset (disagreements are noted), and a profiled column
+  that contradicts its declared `unique` test gets a data-quality note.
+  Candidate keys stay measurement-only. `explore profile` takes the flag too.
+- **Metric-aware ranking (under `--use-project`).** Models reachable from
+  metric definitions feed the ranking hints alongside (never displacing) the
+  configured `ranking_hints`, so metric-backing tables surface first.
+  Declared joins also sharpen the existing connectivity signal.
+- A stale compiled manifest (older than the model sources) is noted rather
+  than trusted silently; a repo with no dbt project, several projects, or an
+  unreadable one degrades to heuristics exactly as before.
+
+#### AWS Redshift
+
 - **Amazon Redshift connector** (`[redshift]` extra), Serverless-first and
   provisioned-compatible: Postgres-catalog metadata (a `pg_class` census
   merged with `SVV_TABLE_INFO` size facts and `SVV_COLUMNS`, so empty tables
@@ -41,6 +66,12 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   both auth paths, including a keyless `method: iam` dbt build.
 
 ### Changed
+
+- One shared read view in the engine's dbt project reader now feeds explore's
+  declared joins, the semantic definitions, and `maintain snapshot`'s
+  fingerprints (previously a separate parser); snapshot output is unchanged.
+
+#### AWS Redshift
 
 - The relationship-verification overlap probe now measures orphans with a
   LEFT JOIN against the DISTINCT parent keys instead of a `NOT EXISTS`
