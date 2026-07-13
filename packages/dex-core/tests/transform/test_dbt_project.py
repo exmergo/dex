@@ -6,12 +6,15 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import write_manifest, write_semantic_manifest
+from maintain.conftest import SEMANTIC_YAML
 
 from exmergo_dex_core import dbt_project
 from exmergo_dex_core.dbt_project import (
     DbtProjectError,
     Edit,
     content_hash,
+    definitions,
     find_project,
     load,
     resolve_target,
@@ -233,3 +236,245 @@ def test_profiles_dir_env_override(
     )
     monkeypatch.setenv("DBT_PROFILES_DIR", str(override))
     assert dbt_project.profiles_dir(dbt_project_dir) == override
+
+
+# --- definitions(): the read view of declared and semantic definitions --------
+
+
+def test_definitions_reads_yaml_tests_without_manifest(dbt_project_dir: Path):
+    defs = definitions(dbt_project_dir)
+    assert defs.present is True
+    assert defs.relationship_source == "yaml"
+    assert defs.manifest_loaded is False
+    assert defs.foreign_keys == []
+    (key,) = defs.declared_keys
+    assert (key.model, key.column) == ("stg_customers", "id")
+    assert key.not_null is True and key.unique is False
+    assert key.source == "yaml"
+    # No semantic YAML in this project: the semantic half stays empty.
+    assert defs.semantic_source is None
+    assert defs.primary_entities == {}
+
+
+def test_definitions_yaml_relationships_test(dbt_project_dir: Path):
+    (dbt_project_dir / "models" / "staging" / "stg_orders.sql").write_text(
+        "select 1 as id, 1 as customer_id\n", encoding="utf-8"
+    )
+    (dbt_project_dir / "models" / "staging" / "orders_schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_orders\n"
+        "    columns:\n"
+        "      - name: customer_id\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('stg_customers')\n"
+        "              field: id\n",
+        encoding="utf-8",
+    )
+    defs = definitions(dbt_project_dir)
+    (fk,) = defs.foreign_keys
+    assert (fk.model, fk.column, fk.to_model, fk.to_column) == (
+        "stg_orders",
+        "customer_id",
+        "stg_customers",
+        "id",
+    )
+    assert fk.relation is None and fk.to_relation is None
+    assert fk.source == "yaml"
+    assert any("name-based" in note for note in defs.notes)
+
+
+def test_definitions_manifest_foreign_keys_and_key_merge(dbt_project_dir: Path):
+    write_manifest(
+        dbt_project_dir,
+        models={
+            "stg_customers": '"dev"."main"."stg_customers"',
+            "stg_orders": '"dev"."main"."stg_orders"',
+        },
+        relationship_tests=[
+            ("stg_orders", "customer_id", "ref('stg_customers')", "id")
+        ],
+        unique_tests=[("stg_customers", "id")],
+        not_null_tests=[("stg_customers", "id")],
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.relationship_source == "manifest"
+    assert defs.manifest_loaded is True
+    (fk,) = defs.foreign_keys
+    assert fk.relation == "dev.main.stg_orders"
+    assert fk.to_relation == "dev.main.stg_customers"
+    assert fk.source == "manifest"
+    # unique + not_null on the same column merge into one declared key. The
+    # YAML not_null on stg_customers.id is superseded by the manifest read.
+    (key,) = defs.declared_keys
+    assert (key.model, key.column) == ("stg_customers", "id")
+    assert key.unique is True and key.not_null is True
+    assert defs.model_relations["stg_orders"] == "dev.main.stg_orders"
+
+
+def test_definitions_manifest_source_parent_and_backtick_quoting(
+    dbt_project_dir: Path,
+):
+    write_manifest(
+        dbt_project_dir,
+        models={"stg_orders": "`proj.main.stg_orders`"},
+        sources={"raw.customers": '"dev"."raw"."customers"'},
+        relationship_tests=[
+            ("stg_orders", "customer_id", "source('raw', 'customers')", "id")
+        ],
+    )
+    defs = definitions(dbt_project_dir)
+    (fk,) = defs.foreign_keys
+    assert fk.relation == "proj.main.stg_orders"
+    assert fk.to_model == "raw.customers"
+    assert fk.to_relation == "dev.raw.customers"
+
+
+def test_definitions_ephemeral_model_has_no_relation(dbt_project_dir: Path):
+    write_manifest(
+        dbt_project_dir,
+        models={"stg_orders": '"dev"."main"."stg_orders"', "int_helper": None},
+        relationship_tests=[("stg_orders", "helper_id", "ref('int_helper')", "id")],
+    )
+    defs = definitions(dbt_project_dir)
+    assert "int_helper" not in defs.model_relations
+    (fk,) = defs.foreign_keys
+    assert fk.to_relation is None
+
+
+def test_definitions_stub_manifest_falls_back_to_yaml(dbt_project_dir: Path):
+    # The 2-key stub other tests use: metadata plus empty nodes must not be
+    # mistaken for a compiled project.
+    target = dbt_project_dir / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text(
+        json.dumps({"metadata": {"project_name": "dex_test"}, "nodes": {}}),
+        encoding="utf-8",
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.relationship_source == "yaml"
+    assert defs.manifest_loaded is False
+    assert len(defs.declared_keys) == 1
+
+
+def test_definitions_flags_stale_manifest(dbt_project_dir: Path):
+    write_manifest(
+        dbt_project_dir,
+        models={"stg_customers": '"dev"."main"."stg_customers"'},
+        generated_at="2020-01-01T00:00:00Z",
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.manifest_stale is True
+    assert any("older than the model sources" in note for note in defs.notes)
+
+
+def test_definitions_fresh_manifest_is_not_stale(dbt_project_dir: Path):
+    write_manifest(
+        dbt_project_dir,
+        models={"stg_customers": '"dev"."main"."stg_customers"'},
+        generated_at="2099-01-01T00:00:00Z",
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.manifest_stale is False
+
+
+def test_definitions_degrades_without_a_project(tmp_path: Path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    defs = definitions(empty)
+    assert defs.present is False
+    assert defs.foreign_keys == [] and defs.declared_keys == []
+    assert defs.notes == []
+
+
+def test_definitions_degrades_on_multiple_projects(tmp_path: Path):
+    for name in ("one", "two"):
+        child = tmp_path / name
+        child.mkdir()
+        (child / "dbt_project.yml").write_text(f"name: {name}\n", encoding="utf-8")
+    defs = definitions(tmp_path)
+    assert defs.present is False
+    assert any("dbt_project_dir" in note for note in defs.notes)
+
+
+def test_definitions_honors_project_dir_pin(dbt_project_dir: Path, tmp_path: Path):
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    (decoy / "dbt_project.yml").write_text("name: decoy\n", encoding="utf-8")
+    defs = definitions(tmp_path, project_dir=dbt_project_dir)
+    assert defs.present is True
+    assert defs.project_dir == str(dbt_project_dir)
+    assert len(defs.declared_keys) == 1
+
+
+def test_definitions_degrades_on_corrupt_manifest(dbt_project_dir: Path):
+    target = dbt_project_dir / "target"
+    target.mkdir()
+    (target / "manifest.json").write_text("{not json", encoding="utf-8")
+    defs = definitions(dbt_project_dir)
+    assert defs.present is False
+    assert any("could not be read" in note for note in defs.notes)
+
+
+def test_definitions_semantic_from_yaml(dbt_project_dir: Path):
+    (dbt_project_dir / "models" / "staging" / "semantic.yml").write_text(
+        SEMANTIC_YAML, encoding="utf-8"
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.semantic_source == "yaml"
+    assert defs.primary_entities == {"stg_orders": "order_id"}
+    assert defs.metric_models == ["stg_orders"]
+
+
+def test_definitions_prefers_semantic_manifest(dbt_project_dir: Path):
+    # YAML on disk says stg_orders; the compiled artifact says the model landed
+    # as a different alias/relation and must win.
+    (dbt_project_dir / "models" / "staging" / "semantic.yml").write_text(
+        SEMANTIC_YAML, encoding="utf-8"
+    )
+    write_semantic_manifest(
+        dbt_project_dir,
+        semantic_models=[
+            {
+                "name": "orders",
+                "node_relation": {
+                    "alias": "orders_mart",
+                    "relation_name": '"dev"."main"."orders_mart"',
+                },
+                "entities": [{"name": "order_id", "type": "primary"}],
+                "measures": [{"name": "order_amount"}],
+            }
+        ],
+        metrics=[
+            {
+                "name": "revenue",
+                "type": "simple",
+                "type_params": {"input_measures": [{"name": "order_amount"}]},
+            }
+        ],
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.semantic_source == "manifest"
+    assert defs.primary_entities == {"orders_mart": "order_id"}
+    assert defs.metric_models == ["orders_mart"]
+    assert defs.model_relations["orders_mart"] == "dev.main.orders_mart"
+
+
+def test_definitions_yaml_derived_metric_lineage(dbt_project_dir: Path):
+    # A derived metric grounds through its input metrics down to measures.
+    (dbt_project_dir / "models" / "staging" / "semantic.yml").write_text(
+        SEMANTIC_YAML
+        + (
+            "  - name: revenue_growth\n"
+            "    label: Revenue growth\n"
+            "    type: derived\n"
+            "    type_params:\n"
+            "      expr: revenue - revenue\n"
+            "      metrics:\n"
+            "        - revenue\n"
+        ),
+        encoding="utf-8",
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.metric_models == ["stg_orders"]

@@ -42,9 +42,9 @@ release is connector-neutral.
 |---|---|
 | `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
-| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings |
-| `explore relationships [--verify]` | inferred + declared joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe |
-| `explore map [--verify]` | writes/updates the `.dex/` map; prints a summary |
+| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
+| `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe; `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge) |
+| `explore map [--verify] [--use-project]` | writes/updates the `.dex/` map; prints a summary; `--use-project` additionally applies declared grain and ranks metric-backing models higher |
 | `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled, PII-cleared columns; requires the `.dex/` cache (`explore map` first) |
 | `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required) |
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
