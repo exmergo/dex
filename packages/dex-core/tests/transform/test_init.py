@@ -427,6 +427,79 @@ def test_init_postgres_without_a_connection_names_the_fixes(
     assert "DATABASE_URL" in envelope["errors"][0]
 
 
+def _seed_redshift_config(repo: Path, **target) -> None:
+    (repo / ".dex").mkdir(parents=True, exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        yaml.safe_dump({"redshift": target}), encoding="utf-8"
+    )
+
+
+def test_init_redshift_bootstraps_a_password_profile(
+    tmp_path: Path, capsys, monkeypatch
+):
+    # The committed non-secret config target wins discovery when no workgroup
+    # is pinned; the password stays an env_var reference at dbt runtime.
+    pytest.importorskip("redshift_connector")
+    monkeypatch.setenv("REDSHIFT_PASSWORD", "hunter2-never-rendered")
+    _seed_redshift_config(
+        tmp_path,
+        host="wg.example.redshift-serverless.amazonaws.com",
+        port=5439,
+        dbname="shop",
+        user="dbt",
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "redshift"), capsys)
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "redshift"
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    profile = yaml.safe_load(rendered)
+    output = profile["analytics"]["outputs"]["dev"]
+    assert output["type"] == "redshift"
+    assert output["host"] == "wg.example.redshift-serverless.amazonaws.com"
+    assert output["port"] == 5439
+    assert output["user"] == "dbt"
+    assert output["dbname"] == "shop"
+    assert output["schema"] == "dbt_dev"
+    assert output["threads"] == 1
+    # Never a password value: an env_var reference resolved at dbt runtime.
+    assert "hunter2" not in rendered
+    assert "env_var" in output["password"] and "REDSHIFT_PASSWORD" in output["password"]
+    # The dev schema choice is persisted for cmd_map's replica folding.
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["redshift"]["dev_schema"] == "dbt_dev"
+
+
+def test_init_redshift_refuses_dev_schema_source_collision(
+    tmp_path: Path, capsys, monkeypatch
+):
+    pytest.importorskip("redshift_connector")
+    _seed_redshift_config(
+        tmp_path,
+        host="h.example.com",
+        dbname="shop",
+        user="dbt",
+        schemas=["app", "dbt_dev"],
+        dev_schema="dbt_dev",
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "redshift"), capsys)
+    assert rc == 1
+    assert "source schema" in envelope["errors"][0]
+    assert not (tmp_path / "analytics").exists()
+
+
+def test_init_redshift_without_a_connection_names_the_fixes(
+    tmp_path: Path, capsys, monkeypatch
+):
+    pytest.importorskip("redshift_connector")
+    for var in ("REDSHIFT_HOST", "REDSHIFT_DATABASE", "REDSHIFT_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "redshift"), capsys)
+    assert rc == 1
+    assert "redshift.workgroup" in envelope["errors"][0]
+
+
 def _seed_bigquery_config(repo: Path, **target) -> None:
     (repo / ".dex").mkdir(parents=True, exist_ok=True)
     (repo / ".dex" / "config.yml").write_text(

@@ -6,8 +6,8 @@ name: Integration
 # fork-runnable; this workflow answers "does the connector still work against
 # the real service" on main and on a schedule. Each suite reads shared/public
 # sample data, writes only to its scratch scope, and caps every statement
-# (bytes on BigQuery, seconds on Snowflake, Databricks, and Postgres), so a
-# worst-case run costs cents.
+# (bytes on BigQuery, seconds on Snowflake, Databricks, Redshift, and
+# Postgres), so a worst-case run costs cents.
 #
 # One-time setup (documented in CONTRIBUTING.md):
 #   BigQuery: scripts/setup_bigquery_ci.sh (Workload Identity Pool provider
@@ -25,6 +25,13 @@ name: Integration
 #   write only in the scratch catalog. No resource-monitor analogue exists, so
 #   the backstop is the smallest warehouse, auto-stop, per-statement
 #   STATEMENT_TIMEOUT, and a workspace budget alert).
+#   Redshift: scripts/setup_redshift_ci.sh (an IAM role whose trust policy
+#   accepts only GitHub OIDC tokens minted for this repo's
+#   redshift-integration environment, holding GetWorkgroup/GetNamespace/
+#   GetCredentials on the smallest Serverless workgroup; a seeded app schema
+#   read by dex_ro; a dbt_dev user writable only in its dev schema with a
+#   durable statement_timeout; an RPU-hours-per-day usage limit as the hard
+#   cost backstop).
 #   Postgres: no setup at all. The operational-database connector runs against
 #   a service container seeded from scripts/postgres_seed.sql (the same seed
 #   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
@@ -225,6 +232,50 @@ jobs:
         run: uv sync --extra databricks --extra duckdb --extra dev
       - name: Live Databricks integration suite
         run: uv run pytest tests/integration -q -m databricks
+
+  redshift:
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The environment carries the AWS variables and, via its deployment branch
+    # policy (main only), refuses this job to a workflow modified on a branch
+    # before the role is assumed. The AWS-side pin mirrors it: the role's
+    # trust policy accepts only GitHub OIDC tokens whose subject names this
+    # repo + environment.
+    environment: redshift-integration
+    permissions:
+      contents: read
+      id-token: write # OIDC for AWS role assumption; no stored keys.
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_REDSHIFT_WORKGROUP: ${{ vars.DEX_TEST_REDSHIFT_WORKGROUP }}
+      DEX_TEST_REDSHIFT_DATABASE: ${{ vars.DEX_TEST_REDSHIFT_DATABASE }}
+      DEX_TEST_REDSHIFT_HOST: ${{ vars.DEX_TEST_REDSHIFT_HOST }}
+      DEX_TEST_REDSHIFT_MAX_SECONDS: "60"
+      # The transform suite's password path only; the engine itself stays
+      # keyless (IAM temporary credentials through the assumed role). The
+      # secret is readable only by this environment, whose deployments are
+      # pinned to main, so a pull request cannot reach it.
+      DEX_TEST_REDSHIFT_DEV_PASSWORD: ${{ secrets.DEX_TEST_REDSHIFT_DEV_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      # Assume the OIDC-trusted role, exporting AWS_* credentials into the
+      # default chain, which is exactly the discovery path the engine uses:
+      # no CI special-casing anywhere.
+      - name: Assume the Redshift integration role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEX_TEST_REDSHIFT_ROLE_ARN }}
+          aws-region: ${{ vars.DEX_TEST_REDSHIFT_REGION }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (redshift + duckdb + dev extras)
+        run: uv sync --extra redshift --extra duckdb --extra dev
+      - name: Live Redshift integration suite
+        run: uv run pytest tests/integration -q -m redshift
 
   postgres:
     # No repository gate and no environment: the target is a job-local service

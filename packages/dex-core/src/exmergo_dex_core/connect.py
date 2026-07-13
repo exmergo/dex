@@ -13,13 +13,19 @@ chain: a config-pinned ``~/.databrickscfg`` profile, the ``DATABRICKS_*``
 environment (which is also how CI's OIDC federation arrives), the default
 profile, or a dbt profile. Postgres follows suit: a config-pinned
 ``pg_service.conf`` entry, ``DATABASE_URL``, the ``PG*`` environment (resolved
-natively by libpq, including ``~/.pgpass``), or a dbt profile. Every discovery
-failure names the fix; nothing is ever prompted for.
+natively by libpq, including ``~/.pgpass``), or a dbt profile. Redshift
+discovers along both of its worlds: a config-pinned Serverless workgroup (or
+provisioned cluster) resolved through the AWS default credential chain into
+IAM temporary database credentials, the ``REDSHIFT_*`` environment, the
+committed non-secret config target (password via ``REDSHIFT_PASSWORD``), or a
+dbt profile. Every discovery failure names the fix; nothing is ever prompted
+for.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +40,7 @@ from .config import (
     DatabricksTarget,
     DexConfig,
     PostgresTarget,
+    RedshiftTarget,
     SnowflakeTarget,
     load_config,
 )
@@ -60,12 +67,14 @@ _SCOPE_FIELDS = {
     "snowflake": "databases",
     "databricks": "catalogs",
     "postgres": "schemas",
+    "redshift": "schemas",
 }
 _SCOPE_GRAMMAR = {
     "bigquery": "--scope <dataset> (or <project>.<dataset>)",
     "snowflake": "--scope <schema>, <database>, or <database>.<schema>",
     "databricks": "--scope <catalog> (or <catalog>.<schema>)",
     "postgres": "--scope <schema>",
+    "redshift": "--scope <schema>",
 }
 
 
@@ -142,6 +151,16 @@ def open_adapter(
 
     if connector == "postgres":
         return _open_postgres(
+            config,
+            repo_root,
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            scope_override=scopes,
+        )
+
+    if connector == "redshift":
+        return _open_redshift(
             config,
             repo_root,
             budget=budget,
@@ -980,6 +999,378 @@ def _postgres_from_dbt_profiles(repo_root: str | Path) -> dict | None:
                 if dbname:
                     params["dbname"] = dbname
                 return params
+    return None
+
+
+def _open_redshift(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+    scope_override: list[str] | None = None,
+):
+    target = config.redshift or RedshiftTarget()
+    target = narrow_target(target, "redshift", scope_override)
+    params, method, compute = resolve_redshift_connection(target, os.environ, repo_root)
+
+    try:
+        import redshift_connector
+    except ImportError as exc:
+        raise CredentialDiscoveryError(
+            "the Redshift client is not installed; install the connector "
+            "extra: exmergo-dex-core[redshift]"
+        ) from exc
+
+    # application_name is the attribution tag (SYS_CONNECTION_LOG); the
+    # adapter additionally sets query_group and a best-effort session
+    # read-only mode before any statement runs. autocommit keeps session SETs
+    # (statement_timeout) outside any transaction the driver would otherwise
+    # open.
+    connection = redshift_connector.connect(**params, application_name="dex")
+    connection.autocommit = True
+
+    store = DexStore(repo_root)
+    utc_midnight = (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=budget if budget is not None else config.budget.ceiling,
+        session_ceiling=config.budget.session_ceiling,
+        session_spent=store.spend_since(
+            utc_midnight, field="billed_seconds", connector="redshift"
+        ),
+        confirmed=confirmed,
+        connector="redshift",
+        command=command,
+        record=store.append_spend_log,
+    )
+    return get_adapter(
+        "redshift",
+        connection=connection,
+        cost_gate=gate,
+        target=target,
+        compute=compute,
+        auth_method=method,
+        scope_origin=scope_origin("redshift", "--scope" if scope_override else None),
+    )
+
+
+def resolve_redshift_connection(
+    target: RedshiftTarget,
+    env: dict | os._Environ,
+    repo_root: str | Path = ".",
+) -> tuple[dict, str, dict | None]:
+    """Discover Redshift connection parameters, never prompting.
+
+    Returns ``(params, auth_method, compute)`` where ``params`` feeds
+    ``redshift_connector.connect``, ``auth_method`` is a coarse class safe to
+    surface (iam_serverless / iam_cluster / environment / config_target /
+    dbt_profile, suffixed with the credential kind), and ``compute`` carries
+    the control-plane facts for the RPU translation (kind, workgroup, base
+    capacity) or ``None`` when they are unknowable. Parameter values,
+    including any password an environment legitimately holds, never leave the
+    engine process.
+
+    Order: the config-pinned Serverless ``workgroup`` (IAM temporary
+    credentials through the AWS default chain, endpoint and database
+    discovered from the control plane), the config-pinned provisioned
+    ``cluster_identifier`` (IAM, GetClusterCredentials), the ``REDSHIFT_*``
+    environment, the committed non-secret config target (password via
+    ``REDSHIFT_PASSWORD``), then a dbt profile's redshift target. Every
+    failure names the fix.
+    """
+
+    if target.workgroup:
+        return _redshift_serverless_iam(target, env)
+
+    if target.cluster_identifier:
+        if not target.dbname or not target.user:
+            raise CredentialDiscoveryError(
+                "IAM auth against a provisioned cluster needs the database "
+                "and user: set redshift.dbname and redshift.user in "
+                ".dex/config.yml alongside redshift.cluster_identifier"
+            )
+        params: dict = {
+            "iam": True,
+            "cluster_identifier": target.cluster_identifier,
+            "database": target.dbname,
+            "db_user": target.user,
+        }
+        if target.aws_profile:
+            params["profile"] = target.aws_profile
+        if target.region:
+            params["region"] = target.region
+        return (
+            params,
+            f"iam_cluster:{_aws_credential_kind(target, env)}",
+            _redshift_compute("provisioned"),
+        )
+
+    if env.get("REDSHIFT_HOST"):
+        params = {"host": env["REDSHIFT_HOST"]}
+        if env.get("REDSHIFT_PORT"):
+            params["port"] = int(env["REDSHIFT_PORT"])
+        if env.get("REDSHIFT_DATABASE"):
+            params["database"] = env["REDSHIFT_DATABASE"]
+        if env.get("REDSHIFT_USER"):
+            params["user"] = env["REDSHIFT_USER"]
+        if env.get("REDSHIFT_PASSWORD"):
+            params["password"] = env["REDSHIFT_PASSWORD"]
+        kind = "password" if env.get("REDSHIFT_PASSWORD") else "external"
+        return params, f"environment:{kind}", _redshift_host_compute(params["host"])
+
+    if target.host or target.dbname:
+        params = {
+            key: value
+            for key, value in (
+                ("host", target.host),
+                ("port", target.port),
+                ("database", target.dbname),
+                ("user", target.user),
+            )
+            if value is not None
+        }
+        if env.get("REDSHIFT_PASSWORD"):
+            params["password"] = env["REDSHIFT_PASSWORD"]
+            kind = "password"
+        else:
+            kind = "external"
+        return (
+            params,
+            f"config_target:{kind}",
+            _redshift_host_compute(target.host),
+        )
+
+    profile_params = _redshift_from_dbt_profiles(repo_root, env)
+    if profile_params:
+        kind = "password" if profile_params.get("password") else "external"
+        return (
+            profile_params,
+            f"dbt_profile:{kind}",
+            _redshift_host_compute(profile_params.get("host")),
+        )
+
+    raise CredentialDiscoveryError(
+        "no Redshift connection discovered; set redshift.workgroup in "
+        ".dex/config.yml (Serverless, IAM via the AWS credential chain), or "
+        "redshift.cluster_identifier plus dbname/user (provisioned, IAM), or "
+        "export REDSHIFT_HOST/REDSHIFT_DATABASE (password via "
+        "REDSHIFT_PASSWORD), or set redshift.host/dbname there, or keep a "
+        "redshift target in your dbt profiles.yml"
+    )
+
+
+def _redshift_serverless_iam(
+    target: RedshiftTarget, env: dict | os._Environ
+) -> tuple[dict, str, dict | None]:
+    """The Serverless IAM path: the workgroup pin plus the AWS default
+    credential chain resolve everything else (endpoint, port, database) from
+    the control plane, and GetCredentials mints temporary database
+    credentials inside the driver. Nothing is prompted; every failure names
+    the fix."""
+
+    try:
+        import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError as exc:
+        raise CredentialDiscoveryError(
+            "the Redshift client is not installed; install the connector "
+            "extra: exmergo-dex-core[redshift]"
+        ) from exc
+
+    session = boto3.Session(
+        profile_name=target.aws_profile or None,
+        region_name=target.region or None,
+    )
+    try:
+        client = session.client("redshift-serverless")
+        workgroup = client.get_workgroup(workgroupName=target.workgroup)["workgroup"]
+    except (BotoCoreError, ClientError, ValueError) as exc:
+        raise CredentialDiscoveryError(
+            f"could not resolve Redshift Serverless workgroup "
+            f"'{target.workgroup}': configure the AWS credential chain "
+            "(aws configure, AWS_* environment variables, or "
+            "redshift.aws_profile), set redshift.region when the default "
+            "region is wrong, and grant redshift-serverless:GetWorkgroup "
+            "and redshift-serverless:GetCredentials"
+        ) from exc
+
+    endpoint = workgroup.get("endpoint") or {}
+    host = endpoint.get("address")
+    if not host:
+        raise CredentialDiscoveryError(
+            f"workgroup '{target.workgroup}' has no reachable endpoint yet "
+            f"(status {workgroup.get('status', 'unknown')}); wait for it to "
+            "become AVAILABLE or check its network configuration"
+        )
+    database = target.dbname or _redshift_namespace_database(
+        client, workgroup.get("namespaceName")
+    )
+    if not database:
+        raise CredentialDiscoveryError(
+            "could not discover the database of workgroup "
+            f"'{target.workgroup}'; set redshift.dbname in .dex/config.yml "
+            "or grant redshift-serverless:GetNamespace"
+        )
+    params: dict = {
+        "iam": True,
+        "host": host,
+        "port": int(endpoint.get("port") or 5439),
+        "database": database,
+    }
+    if target.aws_profile:
+        params["profile"] = target.aws_profile
+    if target.region:
+        params["region"] = target.region
+    compute = _redshift_compute(
+        "serverless",
+        workgroup=str(workgroup.get("workgroupName", target.workgroup)),
+        base_capacity_rpus=(
+            float(workgroup["baseCapacity"])
+            if workgroup.get("baseCapacity") is not None
+            else None
+        ),
+    )
+    return params, f"iam_serverless:{_aws_credential_kind(target, env)}", compute
+
+
+def _redshift_namespace_database(client, namespace_name: str | None) -> str | None:
+    """The default database of a Serverless namespace, or ``None`` when it
+    cannot be read (the caller then requires ``redshift.dbname``). Takes the
+    already-built redshift-serverless client: constructing a second one per
+    connect would re-load the service model for nothing."""
+
+    if not namespace_name:
+        return None
+    try:
+        namespace = client.get_namespace(namespaceName=namespace_name)["namespace"]
+        return str(namespace["dbName"]) if namespace.get("dbName") else None
+    except Exception:
+        return None
+
+
+def _aws_credential_kind(target: RedshiftTarget, env: dict | os._Environ) -> str:
+    """The coarse AWS credential class for the envelope; never a value or an
+    identity. Deliberately coarse: a pinned profile, the environment, or
+    whatever else the default chain found (SSO, a role, instance metadata)."""
+
+    if target.aws_profile:
+        return "profile"
+    if env.get("AWS_ACCESS_KEY_ID"):
+        return "environment"
+    return "default_chain"
+
+
+def _redshift_compute(
+    kind: str,
+    *,
+    workgroup: str | None = None,
+    base_capacity_rpus: float | None = None,
+) -> dict:
+    """The compute-facts shape every discovery path returns. The adapter reads
+    exactly these three keys for the RPU translation, so one constructor keeps
+    the shape from drifting per path."""
+
+    return {
+        "kind": kind,
+        "workgroup": workgroup,
+        "base_capacity_rpus": base_capacity_rpus,
+    }
+
+
+def _redshift_host_compute(host: str | None) -> dict | None:
+    """Compute facts inferred from an endpoint host alone: a Serverless
+    endpoint is recognizable by its domain, but its workgroup and base
+    capacity are unknowable without the control plane, so the RPU translation
+    degrades and only the wake-minimum honesty remains."""
+
+    if not host:
+        return None
+    kind = "serverless" if ".redshift-serverless." in host else "provisioned"
+    return _redshift_compute(kind)
+
+
+_ENV_VAR_TEMPLATE = re.compile(r"\{\{\s*env_var\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}")
+
+
+def _profile_scalar(value, env: dict | os._Environ) -> str | None:
+    """A profiles.yml scalar with dbt's env_var indirection honored. dex's own
+    rendered profiles keep the password as ``{{ env_var('REDSHIFT_PASSWORD') }}``
+    (never a value), so a reference resolves from the environment the way dbt
+    would; any other unrendered template is unusable, never passed through as
+    a literal (the driver would misreport that as a wrong password)."""
+
+    if value is None:
+        return None
+    text = str(value)
+    if "{{" not in text:
+        return text
+    match = _ENV_VAR_TEMPLATE.fullmatch(text.strip())
+    if match:
+        return env.get(match.group(1)) or None
+    return None
+
+
+def _redshift_from_dbt_profiles(
+    repo_root: str | Path, env: dict | os._Environ
+) -> dict | None:
+    """Best-effort: the connection fields of a ``type: redshift`` output in
+    the discovered dbt project's profiles. Any failure means "not found"."""
+
+    try:
+        from .dbt_project import PROFILES_FILE, find_project, profiles_dir
+
+        project_dir = find_project(repo_root)
+        profiles_path = profiles_dir(project_dir) / PROFILES_FILE
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if not isinstance(output, dict) or output.get("type") != "redshift":
+                continue
+            if str(output.get("method") or "").lower() == "iam":
+                # An IAM output mints its credentials at dbt runtime; it
+                # carries nothing durable to connect with natively, and the
+                # workgroup/cluster config paths own that story.
+                continue
+            host = _profile_scalar(output.get("host"), env)
+            if not host:
+                continue
+            # A declared field the environment cannot render (dex's own
+            # profiles keep the password as {{ env_var(...) }}) makes the
+            # output unusable as discovered: skip it rather than connect
+            # with a hole where a credential should be, and let the terminal
+            # discovery error name the export that fixes it.
+            fields: dict = {}
+            unusable = False
+            for key in ("user", "password", "dbname", "database"):
+                raw = output.get(key)
+                if not raw:
+                    continue
+                value = _profile_scalar(raw, env)
+                if not value:
+                    unusable = True
+                    break
+                fields["database" if key == "database" else key] = value
+            if unusable:
+                continue
+            params: dict = {"host": host}
+            port = output.get("port")
+            if isinstance(port, int) or (isinstance(port, str) and port.isdigit()):
+                params["port"] = int(port)
+            for key in ("user", "password"):
+                if key in fields:
+                    params[key] = fields[key]
+            dbname = fields.get("dbname") or fields.get("database")
+            if dbname:
+                params["database"] = dbname
+            return params
     return None
 
 

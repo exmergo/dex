@@ -228,6 +228,52 @@ def fake_pg_connection():
 
 
 @pytest.fixture
+def fake_redshift_connection():
+    """The standard populated fake Redshift connection (see
+    tests/fakes/redshift.py).
+
+    Requires the real redshift_connector library (the [redshift] extra) for
+    its error types; skipped when absent, but CI and the release gate install
+    the extra, so the Redshift safety families run everywhere that matters.
+    ``customers`` carries SVV_TABLE_INFO facts; ``signups`` holds no data so
+    the view omits it (the census must still see it); ``events`` is the
+    50 GB table a non-trivial estimate comes from.
+    """
+
+    pytest.importorskip("redshift_connector")
+    from fakes.redshift import FakeRedshiftConnection, FakeRedshiftTable
+
+    tables = [
+        FakeRedshiftTable(
+            schema="shop",
+            name="customers",
+            columns=[
+                ("id", "bigint", False),
+                ("email", "character varying", True),
+                ("payload", "super", True),
+            ],
+            size_mb=5_000,  # 5 GB -> a non-trivial seconds estimate
+            tbl_rows=100.0,
+        ),
+        FakeRedshiftTable(
+            schema="shop",
+            name="signups",
+            columns=[("id", "bigint", True)],
+            # Holds no data: SVV_TABLE_INFO omits it, the pg_class census must not.
+            size_mb=None,
+        ),
+        FakeRedshiftTable(
+            schema="shop",
+            name="events",
+            columns=[("id", "bigint", True), ("payload", "super", True)],
+            size_mb=50_000,  # 50 GB
+            tbl_rows=1_000_000.0,
+        ),
+    ]
+    return FakeRedshiftConnection(tables=tables, database="dexdb")
+
+
+@pytest.fixture
 def dbt_project_dir(tmp_path: Path) -> Path:
     """A minimal dbt project with a project-local profiles.yml.
 

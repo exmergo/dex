@@ -40,6 +40,20 @@ the whole thing up):
 
     DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:5433/dex_dogfood \
         DEX_TEST_PG_DEV_PASSWORD=dbt_dev uv run pytest tests/integration -q
+
+Redshift (bills RPU time on the pinned Serverless workgroup; every confirmed
+budget derives from DEX_TEST_REDSHIFT_MAX_SECONDS, default 60 -- small fixed
+multiples covering the 60-second wake minimum plus the seeded scans -- and the
+budget-derived statement_timeout caps each statement server-side; the
+workgroup usage limit is the hard backstop). Auth is
+the AWS default credential chain (`aws configure` locally, an assumed OIDC
+role in CI; scripts/setup_redshift_ci.sh provisions the workgroup, the users,
+and the usage limit); transform additionally needs the dbt_dev user's
+password in DEX_TEST_REDSHIFT_DEV_PASSWORD unless the IAM profile path is in
+use:
+
+    DEX_TEST_REDSHIFT_WORKGROUP=dex-ci DEX_TEST_REDSHIFT_DATABASE=dev \
+        uv run pytest tests/integration -q
 """
 
 from __future__ import annotations
@@ -55,6 +69,8 @@ MAX_BYTES = int(os.environ.get("DEX_TEST_BQ_MAX_BYTES", str(100 * 1024 * 1024)))
 SF_MAX_SECONDS = float(os.environ.get("DEX_TEST_SNOWFLAKE_MAX_SECONDS", "60"))
 
 DBX_MAX_SECONDS = float(os.environ.get("DEX_TEST_DATABRICKS_MAX_SECONDS", "60"))
+
+RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
 
 
 def _snowflake_enabled() -> bool:
@@ -96,6 +112,18 @@ def _require_cloud_env(request):
             )
         pytest.importorskip("psycopg")
         return
+    if request.node.get_closest_marker("redshift"):
+        if not (
+            os.environ.get("DEX_TEST_REDSHIFT_WORKGROUP")
+            or os.environ.get("DEX_TEST_REDSHIFT_HOST")
+        ):
+            pytest.skip(
+                "Redshift integration disabled: set DEX_TEST_REDSHIFT_WORKGROUP "
+                "(IAM via the AWS credential chain) or DEX_TEST_REDSHIFT_HOST "
+                "plus REDSHIFT_* credentials"
+            )
+        pytest.importorskip("redshift_connector")
+        return
     missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
     if missing:
         pytest.skip(f"BigQuery integration disabled: set {', '.join(missing)}")
@@ -136,6 +164,27 @@ def dbx_warehouse() -> str:
 def dbx_scratch_catalog() -> str | None:
     # Needed by transform only; explore reads samples and writes nothing.
     return os.environ.get("DEX_TEST_DATABRICKS_CATALOG")
+
+
+@pytest.fixture
+def rs_workgroup() -> str | None:
+    return os.environ.get("DEX_TEST_REDSHIFT_WORKGROUP")
+
+
+@pytest.fixture
+def rs_host() -> str | None:
+    return os.environ.get("DEX_TEST_REDSHIFT_HOST")
+
+
+@pytest.fixture
+def rs_database() -> str | None:
+    return os.environ.get("DEX_TEST_REDSHIFT_DATABASE")
+
+
+@pytest.fixture
+def rs_dev_password() -> str | None:
+    # Needed by transform's password path only; IAM profiles need nothing.
+    return os.environ.get("DEX_TEST_REDSHIFT_DEV_PASSWORD")
 
 
 @pytest.fixture

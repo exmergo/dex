@@ -33,7 +33,7 @@ uv run scripts/run.py <subcommand> [flags]
 
 Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
-`[postgres]`, or `[all]` for every connector at once. The shipped wrapper pins
+`[postgres]`, `[redshift]`, or `[all]` for every connector at once. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
 connector (an explicit `--connector`, then `.dex/config.yml`, then DuckDB), so a
 release is connector-neutral.
@@ -90,26 +90,31 @@ Every command prints exactly one JSON object and nothing else:
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that
 would spend requires an explicit `--confirm` and a session budget: on a
-metered connector (BigQuery, Snowflake, Databricks, and Postgres) the first
-call returns `needs_confirmation` with a free estimate, and the same command
-is re-issued with `--confirm --budget <magnitude>` once the user has agreed
-to the spend. The magnitude is paradigm-relative: **bytes** on BigQuery (an
-exact free dry-run figure), **warehouse-seconds** on Snowflake (a heuristic
-labeled `estimate_quality: "heuristic"`, with a credit translation alongside)
-and on Databricks (a floor labeled `estimate_quality: "low"` that sharpens
-itself inside the confirmed budget, with a DBU translation alongside),
-**database-seconds** on Postgres (nothing is billed in dollars; the guarded
-quantity is load on the operational database, estimated free via EXPLAIN). On
-every time paradigm the budget still binds exactly via a server-side
-statement timeout. Actual spend comes back under `data.spend` (`bytes_billed`
-or `seconds_billed`) and accumulates in the `.dex/spend.jsonl` ledger per
-connector. Credentials never appear in `data` (BigQuery authenticates via
-discovered Application Default Credentials, Snowflake via a discovered
-`connections.toml` entry, environment, or dbt profile, Databricks via the
-SDK's unified chain, Postgres via `pg_service.conf`, `DATABASE_URL`, the
-`PG*` environment, or a dbt profile; never a pasted key or token), and result
-values appear only in `explore query`'s columnar payload after the query
-firewall has cleared them.
+metered connector (BigQuery, Snowflake, Databricks, Redshift, and Postgres)
+the first call returns `needs_confirmation` with a free estimate, and the
+same command is re-issued with `--confirm --budget <magnitude>` once the user
+has agreed to the spend. The magnitude is paradigm-relative: **bytes** on
+BigQuery (an exact free dry-run figure), **warehouse-seconds** on Snowflake
+(a heuristic labeled `estimate_quality: "heuristic"`, with a credit
+translation alongside) and on Databricks (a floor labeled
+`estimate_quality: "low"` that sharpens itself inside the confirmed budget,
+with a DBU translation alongside), **compute-seconds** on Redshift (a
+heuristic with an RPU-hour translation alongside; Serverless estimates carry
+the 60-second wake minimum once), **database-seconds** on Postgres (nothing
+is billed in dollars; the guarded quantity is load on the operational
+database, estimated free via EXPLAIN). On every time paradigm the budget
+still binds exactly via a server-side statement timeout. Actual spend comes
+back under `data.spend` (`bytes_billed` or `seconds_billed`) and accumulates
+in the `.dex/spend.jsonl` ledger per connector. Credentials never appear in
+`data` (BigQuery authenticates via discovered Application Default
+Credentials, Snowflake via a discovered `connections.toml` entry,
+environment, or dbt profile, Databricks via the SDK's unified chain, Redshift
+via the AWS credential chain (a pinned Serverless workgroup mints IAM
+temporary database credentials) or the `REDSHIFT_*` environment, Postgres via
+`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile;
+never a pasted key or token), and result values appear only in
+`explore query`'s columnar payload after the query firewall has cleared
+them.
 
 ## Guardrails (non-negotiable, enforced in the engine)
 

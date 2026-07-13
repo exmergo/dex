@@ -145,6 +145,38 @@ the ordinary `DATABRICKS_TOKEN` discovery path; the host, client id,
 warehouse, and catalog are environment variables, not secrets, for the same
 debuggability reason as the BigQuery job.
 
+## Live Redshift integration tests
+
+The same `tests/integration/` directory carries the Redshift suite:
+connection discovery (the AWS chain against a pinned Serverless workgroup,
+or the `REDSHIFT_*` environment), the compute-seconds handshake with the
+Serverless wake-minimum floor, the over-ceiling refusal, PII
+flag-not-surface, a firewalled query, and a dbt build into the dedicated dev
+schema as the `dbt_dev` user.
+
+One-time setup is automated by `scripts/setup_redshift_ci.sh` (run by a
+maintainer with AWS admin credentials, psql, and gh): the smallest Serverless
+namespace and workgroup (8 RPUs), a daily RPU-hours usage limit with a
+query-deactivating breach action as the hard cost backstop, the seeded `app`
+schema plus the `dex_ro` and `dbt_dev` users (the dbt user carries a durable
+`statement_timeout`, the per-statement cap dex cannot inject through
+dbt-redshift), an IAM role whose trust policy accepts only GitHub OIDC tokens
+minted for this repo's `redshift-integration` environment, and the
+environment with its variables and the rotated dbt password secret.
+
+Run the suite locally with your own AWS credentials:
+
+```
+DEX_TEST_REDSHIFT_WORKGROUP=dex-ci DEX_TEST_REDSHIFT_DATABASE=dev \
+    uv run pytest tests/integration -q -m redshift
+```
+
+The transform tests additionally need `DEX_TEST_REDSHIFT_HOST` and
+`DEX_TEST_REDSHIFT_DEV_PASSWORD` (they exercise the env-var password
+rendering; the engine itself stays keyless). In CI the suite runs from
+`.github/workflows/integration.yml` on an assumed OIDC role: keyless, never
+a merge gate.
+
 ## Live PostgreSQL integration tests
 
 The same `tests/integration/` directory carries the Postgres suite:
@@ -291,6 +323,13 @@ credentials:
   transient `DEX_CI` scratch database, and a key-pair dev user with a local
   `dex-ci` connection for running the live suite while developing), automated
   by `scripts/setup_snowflake_ci.sh`.
+- **Redshift integration CI:** one-time AWS and GitHub setup (the smallest
+  Serverless workgroup with a daily RPU-hours usage limit, the seeded `app`
+  schema with the `dex_ro`/`dbt_dev` users, an OIDC-trusted IAM role pinned
+  to this repo's `redshift-integration` environment, and the environment
+  with its variables and the rotated dbt password secret), automated by
+  `scripts/setup_redshift_ci.sh`; background in `CONTRIBUTING.md` under
+  "Live Redshift integration tests".
 - **Databricks integration CI:** one-time Databricks and GitHub setup (the
   `dex-ci` service principal with an account-level GitHub OIDC federation
   policy pinned to this repo's `databricks-integration` environment, the

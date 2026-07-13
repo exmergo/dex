@@ -609,6 +609,113 @@ def test_the_postgres_privilege_is_asked_of_the_profile_role(
     assert "TO ci_builder;" in message
 
 
+def _redshift(dbt_project_dir: Path, user, *, profile_extra: str = ""):
+    pytest.importorskip("redshift_connector")
+    from fakes.redshift import FakeRedshiftConnection, FakeRedshiftTable
+
+    from exmergo_dex_core.adapters.redshift import RedshiftAdapter
+    from exmergo_dex_core.config import RedshiftTarget
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    connection = FakeRedshiftConnection(
+        tables=[
+            FakeRedshiftTable(
+                schema="shop", name="orders", columns=[("id", "bigint", False)]
+            )
+        ],
+        users=[user],
+        empty_schemas=["dbt_dev"],
+    )
+    adapter = RedshiftAdapter(
+        connection=connection,
+        cost_gate=CostGate(
+            paradigm=Paradigm.COMPUTE_TIME,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="redshift",
+        ),
+        target=RedshiftTarget(),
+        clock=connection.clock,
+    )
+    _write_profile(
+        dbt_project_dir,
+        "      type: redshift\n"
+        f"      user: {user.name}\n"
+        "      dbname: dexdb\n"
+        "      schema: dbt_dev\n" + profile_extra,
+    )
+    config = DexConfig(
+        connector="redshift", redshift=RedshiftTarget(dev_schema="dbt_dev")
+    )
+    return connection, adapter, config
+
+
+def test_a_redshift_iam_profile_skips_the_preflight_whatever_its_user_says(
+    dbt_project_dir: Path, tmp_path: Path
+):
+    """A method: iam target mints its database user from the caller's identity
+    at dbt runtime, so the profile's user field (a configured name or the
+    rendered placeholder) is not a durable user to interrogate. The autouse
+    no_warehouse fixture makes any attempted open fail, so a clean pass is
+    proof the preflight never opened a connection."""
+
+    pytest.importorskip("redshift_connector")
+    from exmergo_dex_core.config import RedshiftTarget
+
+    _write_profile(
+        dbt_project_dir,
+        "      type: redshift\n"
+        "      method: iam\n"
+        "      user: analyst\n"
+        "      dbname: dexdb\n"
+        "      schema: dbt_dev\n",
+    )
+    config = DexConfig(
+        connector="redshift", redshift=RedshiftTarget(dev_schema="dbt_dev")
+    )
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+
+
+def test_a_redshift_password_user_literally_named_iam_still_gets_the_preflight(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The IAM skip keys on the profile's method, not on the user's name, so a
+    real database user that happens to be called iam keeps its privilege check."""
+
+    from fakes.redshift import FakeUser
+
+    user = FakeUser(name="iam", schema_privileges={"dbt_dev": {"USAGE"}})
+    connection, adapter, config = _redshift(dbt_project_dir, user)
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert "user iam is missing" in message
+    assert "GRANT USAGE, CREATE ON SCHEMA dbt_dev TO iam;" in message
+    assert connection.data_statements == []
+
+
+def test_an_unwritable_redshift_dev_schema_refuses_with_the_grant(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    from fakes.redshift import FakeUser
+
+    user = FakeUser(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
+    connection, adapter, config = _redshift(dbt_project_dir, user)
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert 'missing CREATE on dev_schema "dbt_dev"' in message
+    assert "GRANT USAGE, CREATE ON SCHEMA dbt_dev TO dbt_dev;" in message
+    assert connection.data_statements == []
+
+
 def test_an_unopenable_connection_degrades_to_a_note_on_every_connector(
     dbt_project_dir: Path, tmp_path: Path
 ):
