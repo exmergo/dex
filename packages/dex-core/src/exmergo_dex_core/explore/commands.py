@@ -4,7 +4,8 @@ Each ``cmd_*`` opens the adapter, drives the explore engine, and shapes the resu
 into the sanitized envelope. Keeping this here (not in ``cli.py``) keeps dispatch
 thin and keeps ``map``'s composition (it runs inventory, profile, and relationships
 together) out of the CLI layer. These are the only explore commands that hold an
-adapter; ``map`` is the only one that writes, and only to the ``.dex/`` cache.
+adapter; ``map``, ``profile``, and ``relationships`` all persist what they learned,
+and only to the ``.dex/`` cache, so a scan is never paid for twice.
 """
 
 from __future__ import annotations
@@ -84,7 +85,8 @@ def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
 
 
 def cmd_profile(args: argparse.Namespace) -> env.Envelope:
-    config = load_config(command_args.repo_root(args)) or DexConfig()
+    repo_root = command_args.repo_root(args)
+    config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
     adapter = command_args.open_from_args(args)
     try:
@@ -96,18 +98,37 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         if unconfirmed is not None:
             return unconfirmed
         datasets = profile_mod.profile(adapter, identifiers)
+        connector = adapter.name
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     _annotate_grain(datasets, defs)
-    envelope.data["datasets"] = [d.model_dump(mode="json") for d in datasets]
+
+    # Persist what the scan already paid for: after profiling a table, `explore
+    # query` on that table must work without a second warehouse scan (the query
+    # firewall's own refusal messages promise exactly this). Prior relationships
+    # are preserved because profile runs no inference pass.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    cache, stats = _merge_profiles(store.load_cache(), datasets, connector, now)
+    path = store.save_cache(cache, now=now)
+
+    envelope.data.update(
+        {
+            "datasets": [d.model_dump(mode="json") for d in datasets],
+            "cache_path": str(path),
+            "updated_at": now.isoformat(),
+            "notes": [_persist_note(stats, len(datasets), keeps_relationships=True)],
+        }
+    )
     return envelope
 
 
 def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     verify = getattr(args, "verify", False)
-    config = load_config(command_args.repo_root(args)) or DexConfig()
+    repo_root = command_args.repo_root(args)
+    config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
 
     adapter = command_args.open_from_args(args)
@@ -138,6 +159,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         if unconfirmed is not None:
             return unconfirmed
         datasets = profile_mod.profile(adapter, identifiers)
+        connector = adapter.name
         inferred = rel_mod.infer_relationships(datasets)
         if verify:
             rel_mod.verify_relationships(
@@ -147,6 +169,9 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    # Annotate before persisting so cached datasets carry candidate_keys and
+    # grain, the same shape a `map`-written cache has.
+    _annotate_grain(datasets, defs)
 
     declared, declared_notes = rel_mod.declared_relationships(
         defs, [d.identifier for d in datasets]
@@ -163,11 +188,25 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
+
+    # Persist the profiles this run already paid for. Because relationships
+    # inventories and profiles the full set and infers across all of it, its
+    # relationship set is authoritative for this run and replaces the prior one.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    cache, stats = _merge_profiles(
+        store.load_cache(), datasets, connector, now, relationships=rels
+    )
+    path = store.save_cache(cache, now=now)
+    notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
+
     envelope.data.update(
         {
             "relationships": [r.model_dump(mode="json") for r in rels],
             "declared_count": len(declared),
             "inferred_count": len(rels) - len(declared),
+            "cache_path": str(path),
+            "updated_at": now.isoformat(),
             "notes": notes,
         }
     )
@@ -675,6 +714,99 @@ def _compose_datasets(
         ds.rank_score = scores.get(meta.identifier)
         datasets.append(ds)
     return datasets, carried
+
+
+# Sentinel: preserve the prior cache's relationships (profile has no inference
+# pass, so it has no business touching them).
+_KEEP_RELATIONSHIPS = object()
+
+
+def _merge_profiles(
+    prior: DexCache | None,
+    profiled: list[Dataset],
+    connector: str,
+    now: datetime,
+    *,
+    relationships=_KEEP_RELATIONSHIPS,
+) -> tuple[DexCache, dict]:
+    """Fold freshly profiled datasets into a prior cache, keyed by identifier.
+
+    Unlike ``_compose_datasets`` (inventory-driven: it iterates metas and
+    manufactures inventory-only stubs), this merges over prior datasets plus
+    the freshly profiled set and never fabricates stubs or drops prior entries.
+
+    A same-connector prior is reusable; a mismatched-connector prior is dropped
+    wholesale (mirrors ``cmd_map``'s reuse gate: mixing connectors would poison
+    the PII policy and the maintain baseline, and `.dex/` is non-canonical
+    scratch that one `explore map` rebuilds). A refreshed dataset carries
+    forward the prior ``rank_score``, because profile and relationships do not
+    compute rank. Relationships are preserved by default (profile) or replaced
+    with the passed set (relationships, whose full-inventory inference is
+    authoritative for its run).
+    """
+
+    reusable = prior if prior and prior.provenance.connector == connector else None
+    by_id = {d.identifier: d for d in profiled}
+    datasets: list[Dataset] = []
+    consumed: set[str] = set()
+    if reusable is not None:
+        for old in reusable.datasets:
+            fresh = by_id.get(old.identifier)
+            if fresh is not None:
+                fresh.rank_score = old.rank_score  # keep map's connectivity ranking
+                datasets.append(fresh)
+                consumed.add(old.identifier)
+            else:
+                datasets.append(old)  # untouched; keeps its older profiled_at
+    # Anything left over is newly profiled and inserted; rank_score stays None.
+    datasets.extend(ds for ds in profiled if ds.identifier not in consumed)
+    if relationships is _KEEP_RELATIONSHIPS:
+        rels = list(reusable.relationships) if reusable else []
+    else:
+        rels = relationships
+    cache = DexCache(datasets=datasets, relationships=rels)
+    cache.provenance.connector = connector
+    cache.provenance.created_at = (
+        reusable.provenance.created_at
+        if reusable and reusable.provenance.created_at
+        else now.isoformat()
+    )
+    stats = {
+        "connector": connector,
+        "merged": reusable is not None,
+        "refreshed": len(consumed),
+        "added": len(profiled) - len(consumed),
+        "replaced_connector": (
+            prior.provenance.connector if prior and reusable is None else None
+        ),
+    }
+    return cache, stats
+
+
+def _persist_note(stats: dict, count: int, *, keeps_relationships: bool) -> str:
+    """One sentence saying what the cache write did, driven by merge stats."""
+
+    if stats["replaced_connector"]:
+        return (
+            f"prior cache was built for connector '{stats['replaced_connector']}'; "
+            f"profiling on '{stats['connector']}' replaced it with a fresh cache "
+            f"of the {count} profiled object(s); run `explore map` to rebuild "
+            "the full landscape"
+        )
+    if stats["merged"]:
+        preserved = (
+            "other datasets and relationships preserved"
+            if keeps_relationships
+            else "other datasets preserved"
+        )
+        return (
+            f"merged {count} profiled object(s) into the existing cache "
+            f"({stats['refreshed']} refreshed, {stats['added']} added); {preserved}"
+        )
+    return (
+        f"created .dex/cache.json with {count} profiled object(s); run "
+        "`explore map` to add the full inventory and relationships"
+    )
 
 
 def _resolve_identifiers(adapter: Adapter, requested: list[str]) -> list[str]:

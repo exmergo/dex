@@ -9,6 +9,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore profile` and `explore relationships` now persist their results
+  to `.dex/cache.json`**, merging into any existing cache instead of
+  discarding the scan they just paid for. Previously only `explore map` wrote
+  the cache, so `explore query` on an already-profiled table demanded a
+  second, redundant warehouse scan via `map`, and the query firewall's own
+  refusal messages ("run `explore profile <table>` first") promised a path
+  that did not work. The merge is keyed by identifier: refreshed datasets
+  carry forward `map`'s rank score, untouched prior datasets keep their older
+  `profiled_at` (and `profile` preserves prior relationships, while
+  `relationships` replaces them with its authoritative full-set inference),
+  `provenance.created_at` survives, and a prior cache built for a different
+  connector is replaced wholesale with a loud note rather than poisoned by
+  mixing. `relationships` also annotates candidate keys and grain before
+  persisting, so its cached datasets match `map`'s shape. Known asymmetry:
+  `relationships` does not fold same-lineage replica edges the way `map`
+  does, mirroring the two commands' existing envelope behavior.
+
 ### Added
 
 - **`--use-project`: explore can read the dbt project, on request.**
