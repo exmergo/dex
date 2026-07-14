@@ -373,18 +373,18 @@ def _overlap_probe_sql(rel: Relationship) -> str:
     fk = _quote_part(rel.from_columns[0])
     key = _quote_part(rel.to_columns[0])
     # Aggregate-only by construction: two counts, no value in the projection.
-    # NOT EXISTS keeps the orphan count correct even when the parent key is not
-    # unique (a join would fan out and inflate it). Deliberately portable SQL:
-    # CASE inside COUNT rather than FILTER (which BigQuery lacks and sqlglot
-    # does not rewrite), with the EXISTS in a subselect so every dialect plans
-    # it as an anti-join.
+    # A LEFT JOIN against the DISTINCT parent keys keeps the orphan count
+    # correct even when the parent key is not unique (a bare join would fan
+    # out and inflate it). Deliberately portable SQL: CASE inside COUNT
+    # rather than FILTER (which BigQuery lacks and sqlglot does not rewrite),
+    # and a join rather than a projected NOT EXISTS, which Redshift refuses
+    # outright (XX000: correlated subquery pattern not supported).
     return (
-        f"SELECT COUNT(probe.fk) AS nonnull_fk, "  # noqa: S608
-        f"COUNT(CASE WHEN probe.orphan THEN 1 END) AS orphans FROM ("
-        f"SELECT c.{fk} AS fk, "
-        f"c.{fk} IS NOT NULL AND NOT EXISTS ("
-        f"SELECT 1 FROM {parent} p WHERE p.{key} = c.{fk}) AS orphan "
-        f"FROM {child} c) probe"
+        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
+        f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d.pk IS NULL THEN 1 END) "
+        f"AS orphans "
+        f"FROM {child} c LEFT JOIN ("
+        f"SELECT DISTINCT {key} AS pk FROM {parent}) d ON d.pk = c.{fk}"
     )
 
 

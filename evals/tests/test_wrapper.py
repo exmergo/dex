@@ -88,7 +88,13 @@ def test_defaults_to_duckdb_when_nothing_set(wrapper, tmp_path):
 def test_unknown_connector_falls_back_to_duckdb(wrapper, tmp_path):
     # A bad guess must not produce a bogus extra; installing duckdb lets the engine
     # emit its canonical "unknown connector" error instead.
-    assert wrapper._resolve_connector(["--connector", "redshift"], tmp_path) == "duckdb"
+    assert wrapper._resolve_connector(["--connector", "oracle"], tmp_path) == "duckdb"
+
+
+def test_redshift_resolves_to_its_own_extra(wrapper, tmp_path):
+    assert (
+        wrapper._resolve_connector(["--connector", "redshift"], tmp_path) == "redshift"
+    )
 
 
 def test_resolution_does_not_consume_forwarded_args(wrapper, tmp_path):

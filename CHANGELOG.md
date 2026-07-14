@@ -34,11 +34,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   than trusted silently; a repo with no dbt project, several projects, or an
   unreadable one degrades to heuristics exactly as before.
 
+#### AWS Redshift
+
+- **Amazon Redshift connector** (`[redshift]` extra), Serverless-first and
+  provisioned-compatible: Postgres-catalog metadata (a `pg_class` census
+  merged with `SVV_TABLE_INFO` size facts and `SVV_COLUMNS`, so empty tables
+  the view omits still appear), the compute-time cost paradigm in seconds
+  with an RPU-hour translation from the workgroup's base capacity (dollars
+  when `redshift.rpu_price_usd` is set), the 60-second Serverless wake
+  minimum floored into every estimate exactly once per command, and a
+  per-statement server-side `statement_timeout` wound down to the remaining
+  budget so a wrong heuristic cannot overrun the ceiling. Credential
+  discovery spans both of Redshift's worlds: a pinned Serverless
+  `redshift.workgroup` (or provisioned `cluster_identifier`) resolved through
+  the AWS default credential chain into IAM temporary database credentials,
+  the `REDSHIFT_*` environment, the committed non-secret config target
+  (password via `REDSHIFT_PASSWORD`), or a dbt profile. `transform init`
+  renders IAM or env-var-password dev profiles; the dev-target preflight asks
+  the Postgres privilege question of the profile's user. Profiling uses
+  `HLL(...)` approximate distincts (Redshift caps `APPROXIMATE
+  COUNT(DISTINCT)` at three per statement, verified live) with exact
+  escalation inside the confirmed budget; there is deliberately no
+  sampled-profiling knob because Redshift has no TABLESAMPLE. Session
+  read-only is attempted and reported honestly rather than assumed (verified
+  live: Redshift accepts and enforces it), and inventory degrades with a
+  named grant fix when an IAM-minted user cannot read `svv_table_info`. The
+  five safety families are extended to the new connector against a stateful
+  fake (`tests/fakes/redshift.py`), and `references/redshift.md` documents
+  the cost story, including that Serverless bills metadata activity. The
+  whole loop was verified live against a Redshift Serverless workgroup on
+  both auth paths, including a keyless `method: iam` dbt build.
+
 ### Changed
 
 - One shared read view in the engine's dbt project reader now feeds explore's
   declared joins, the semantic definitions, and `maintain snapshot`'s
   fingerprints (previously a separate parser); snapshot output is unchanged.
+
+#### AWS Redshift
+
+- The relationship-verification overlap probe now measures orphans with a
+  LEFT JOIN against the DISTINCT parent keys instead of a `NOT EXISTS`
+  projected into the SELECT list, which Redshift refuses outright (XX000:
+  correlated subquery pattern not supported). Same aggregate-only result on
+  every connector, same fanout safety, one dialect fewer surprises.
 
 ## [1.1.1] - 2026-07-12
 

@@ -98,7 +98,7 @@ experience first and treat the benchmark as a floor, not the goal.
 
 ## Connectors
 
-- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**.
+- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first).
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
@@ -109,16 +109,19 @@ Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake
 through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Databricks
 through the SDK's unified chain (`databricks auth login`, `DATABRICKS_*` env,
-or a dbt profile), Postgres through `pg_service.conf`, `DATABASE_URL`, the
-`PG*` environment, or a dbt profile. Every scan is estimated and confirmed
+or a dbt profile), Redshift through the AWS credential chain (a pinned
+Serverless workgroup mints IAM temporary database credentials) or `REDSHIFT_*`
+env, Postgres through `pg_service.conf`, `DATABASE_URL`, the `PG*`
+environment, or a dbt profile. Every scan is estimated and confirmed
 before it spends, capped server-side (`maximum_bytes_billed` on BigQuery; a
-per-statement statement timeout on Snowflake, Databricks, and Postgres, whose
-budgets are warehouse-seconds with credits or DBUs alongside and
-database-seconds respectively), and recorded in a local spend ledger.
+per-statement statement timeout on Snowflake, Databricks, Redshift, and
+Postgres, whose budgets are warehouse-seconds with credits or DBUs alongside,
+compute-seconds with RPU-hours alongside, and database-seconds respectively),
+and recorded in a local spend ledger.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **AWS Redshift**, **Microsoft Fabric**
+- Cloud warehouse: **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 

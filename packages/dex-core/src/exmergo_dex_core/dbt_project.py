@@ -312,6 +312,36 @@ def target_role(project_dir: Path | str, target: str | None = None) -> str | Non
     return str(role) if role else None
 
 
+def target_auth_method(
+    project_dir: Path | str, target: str | None = None
+) -> str | None:
+    """The auth ``method`` a profiles.yml target declares, or None.
+
+    Exists for one question: is this target IAM-authenticated? dbt-redshift's
+    ``method: iam`` mints a database user from the caller's identity at run
+    time, so the profile's ``user`` field is not a durable identity a privilege
+    preflight can interrogate. Overloading the user field for that signal (a
+    sentinel value) would misfire on profiles that carry a real user alongside
+    IAM auth, so the method gets read directly.
+    """
+
+    project = Path(project_dir)
+    try:
+        view_profile = load(project).profile_name
+        profiles = _load_profiles(project)
+    except (DbtProjectError, yaml.YAMLError):
+        return None
+    profile = profiles.get(view_profile)
+    if not isinstance(profile, dict):
+        return None
+    outputs = profile.get("outputs") or {}
+    output = outputs.get(target or profile.get("target"))
+    if not isinstance(output, dict):
+        return None
+    method = output.get("method")
+    return str(method) if method else None
+
+
 def duckdb_target_path(
     project_dir: Path | str, target: str | None = None
 ) -> Path | None:

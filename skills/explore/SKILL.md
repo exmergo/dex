@@ -57,21 +57,23 @@ measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
 (MIN, ANY_VALUE, STRING_AGG). Never fall back to raw Python or a database CLI to
 run SQL; the firewall path is the only sanctioned one.
 
-## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres)
+## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift)
 
 A remote warehouse or database replaces `--path` with connector config. Start
 with `connect test --connector <name>` (or set `connector:` plus the matching
 block in `.dex/config.yml`: `bigquery:` with `project` and a `datasets`
 allowlist, `snowflake:` with the pinned `warehouse` and a `databases`
 allowlist, `databricks:` with the pinned SQL `warehouse` and a `catalogs`
-allowlist, `postgres:` with a `schemas` allowlist). Credentials are
+allowlist, `postgres:` with a `schemas` allowlist, `redshift:` with the
+Serverless `workgroup` and a `schemas` allowlist). Credentials are
 discovered, never asked for: if the envelope reports missing or expired
 credentials, relay the fix it names (for BigQuery
 `gcloud auth application-default login`; for Snowflake a `connections.toml`
 entry or `SNOWFLAKE_*` env; for Databricks `databricks auth login` or
 `DATABRICKS_*` env; for Postgres `DATABASE_URL`, `PG*` env, or a
-`pg_service.conf` entry) and never ask the user to paste a key, token, or
-password.
+`pg_service.conf` entry; for Redshift the AWS credential chain
+(`aws configure`, `AWS_*` env) or `REDSHIFT_*` env) and never ask the user to
+paste a key, token, or password.
 
 On a metered connector, scanning commands (`profile`, `map`, `relationships`,
 `query`) run a two-step handshake. The first call returns
@@ -80,8 +82,10 @@ breakdown where relevant): an exact dry-run byte figure on BigQuery, a
 heuristic labeled `estimate_quality: "heuristic"` in warehouse-seconds on
 Snowflake (credits alongside), a floor labeled `estimate_quality: "low"` in
 warehouse-seconds on Databricks (DBUs alongside; it sharpens itself inside
-the confirmed budget), and database-seconds on Postgres (no dollars;
-the guarded quantity is load on the operational database). Surface the
+the confirmed budget), a heuristic in compute-seconds on Redshift (RPU-hours
+alongside; Serverless estimates carry the 60-second wake minimum once), and
+database-seconds on Postgres (no dollars; the guarded quantity is load on
+the operational database). Surface the
 estimate to the user in human units, get an explicit budget from them, and
 re-issue the same command with `--confirm` and `--budget <magnitude>` in the
 paradigm's unit. Never invent a budget the user did not agree to, and never
@@ -93,7 +97,7 @@ When an estimate is larger than the work deserves, narrow the scope rather than
 raise the budget. `--scope` (repeatable) bounds a command to part of the
 configured source allowlist, in the connector's own vocabulary: a dataset on
 BigQuery, a `schema` or `database.schema` on Snowflake, a `catalog.schema` on
-Databricks, a schema on Postgres. It is free to resolve, it can only narrow what
+Databricks, a schema on Postgres or Redshift. It is free to resolve, it can only narrow what
 `.dex/config.yml` already allows, and a scope that names nothing is refused with
 the schemas that do exist listed. So `explore map --scope <schema>` is the first
 thing to reach for on a warehouse whose full map would be expensive.

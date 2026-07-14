@@ -50,22 +50,26 @@ records `connector`, `dbt_project_dir`, and `dbt_target: dev` in
 `.dex/config.yml`; do not hand-write these files yourself. Init never assumes a
 connector: it errors rather than defaulting, so always pass the user's confirmed
 choice (a `connector:` already committed in `.dex/config.yml` also counts).
-Every connector is supported: DuckDB, BigQuery, Snowflake, Databricks, and
-Postgres. DuckDB needs a warehouse path (`--path`, or the `duckdb.path`
-config). BigQuery needs a GCP project (usually `bigquery.project` in
-`.dex/config.yml`; confirm it with the user) and writes builds to a dedicated
-dev dataset (`bigquery.dev_dataset`, default `dbt_dev`); auth is Application
-Default Credentials, so if credentials are missing tell the user to run
-`gcloud auth application-default login`, never ask for a key. Snowflake
-writes builds to a dedicated `snowflake.dev_database`/`dev_schema` on the
-pinned warehouse; Databricks writes builds to a dedicated
-`databricks.dev_catalog`/`dev_schema` on the pinned SQL warehouse (if
-credentials are missing tell the user to run `databricks auth login`, never
-ask for a token); Postgres writes builds to a dedicated `postgres.dev_schema`
-(default `dbt_dev`), with the password reaching dbt only through the
-`PGPASSWORD` environment variable. All of them discover their connections and
-refuse with the fix named when none resolves. Init refuses if any dbt project
-already exists.
+Every connector is supported: DuckDB, BigQuery, Snowflake, Databricks,
+Postgres, and Redshift. DuckDB needs a warehouse path (`--path`, or the
+`duckdb.path` config). BigQuery needs a GCP project (usually
+`bigquery.project` in `.dex/config.yml`; confirm it with the user) and writes
+builds to a dedicated dev dataset (`bigquery.dev_dataset`, default
+`dbt_dev`); auth is Application Default Credentials, so if credentials are
+missing tell the user to run `gcloud auth application-default login`, never
+ask for a key. Snowflake writes builds to a dedicated
+`snowflake.dev_database`/`dev_schema` on the pinned warehouse; Databricks
+writes builds to a dedicated `databricks.dev_catalog`/`dev_schema` on the
+pinned SQL warehouse (if credentials are missing tell the user to run
+`databricks auth login`, never ask for a token); Postgres writes builds to a
+dedicated `postgres.dev_schema` (default `dbt_dev`), with the password
+reaching dbt only through the `PGPASSWORD` environment variable. Redshift
+writes builds to a dedicated `redshift.dev_schema` (default `dbt_dev`): with
+a `redshift.workgroup` pinned the profile renders IAM auth (temporary
+credentials from the AWS chain, nothing persisted), otherwise the password
+reaches dbt only through the `REDSHIFT_PASSWORD` environment variable. All
+of them discover their connections and refuse with the fix named when none
+resolves. Init refuses if any dbt project already exists.
 
 ### dbt SQL models
 
@@ -114,7 +118,9 @@ and both files. Edit one to match the other. The engine never rewrites
 **A dev target that does not exist.** On Snowflake, dbt creates schemas but never
 databases, so a missing `dev_database` is refused with the `CREATE DATABASE`
 statement to run; dex will not create it for you, because its only writes are
-reviewable diffs inside the repo. On DuckDB the dev target is a database file,
+reviewable diffs inside the repo. On Postgres and Redshift, dbt creates the dev
+schema but only if the profile's user may, so the missing privilege is what gets
+refused, with the `CREATE SCHEMA`/`GRANT` statement to run. On DuckDB the dev target is a database file,
 and dbt would happily create an empty one, then fail every `source()` relation
 with a confusing catalog error. The convention there: copy the shared source
 warehouse to the dev target path (for example

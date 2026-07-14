@@ -307,6 +307,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             config.snowflake.dev_schema if config.snowflake else None,
             config.databricks.dev_schema if config.databricks else None,
             config.postgres.dev_schema if config.postgres else None,
+            config.redshift.dev_schema if config.redshift else None,
         ]
         if name
     )

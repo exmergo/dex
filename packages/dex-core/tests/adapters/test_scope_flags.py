@@ -15,6 +15,7 @@ from exmergo_dex_core.config import (
     BigQueryTarget,
     DatabricksTarget,
     PostgresTarget,
+    RedshiftTarget,
 )
 from exmergo_dex_core.connect import ScopeError, assert_scope_vocabulary, narrow_target
 
@@ -28,7 +29,9 @@ def _assert(connector, *, project=None, datasets=None, scopes=None):
 # --- vocabulary --------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("connector", ["snowflake", "databricks", "postgres"])
+@pytest.mark.parametrize(
+    "connector", ["snowflake", "databricks", "postgres", "redshift"]
+)
 @pytest.mark.parametrize(
     ("flag", "kwargs"),
     [("--project", {"project": "p"}), ("--dataset", {"datasets": ["d"]})],
@@ -58,7 +61,7 @@ def test_bigquery_accepts_its_own_flags():
 
 
 @pytest.mark.parametrize(
-    "connector", ["bigquery", "snowflake", "databricks", "postgres"]
+    "connector", ["bigquery", "snowflake", "databricks", "postgres", "redshift"]
 )
 def test_scope_is_accepted_on_every_warehouse_connector(connector):
     _assert(connector, scopes=["analytics"])
@@ -71,7 +74,14 @@ def test_bigquery_refuses_dataset_and_scope_together():
 
 
 def test_no_flags_is_always_fine():
-    for connector in ("duckdb", "bigquery", "snowflake", "databricks", "postgres"):
+    for connector in (
+        "duckdb",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "postgres",
+        "redshift",
+    ):
         _assert(connector)
 
 
@@ -113,6 +123,15 @@ def test_containment_is_case_insensitive():
 def test_a_coarser_scope_cannot_escape_a_finer_allowlist():
     with pytest.raises(ScopeError):
         narrow_target(DatabricksTarget(catalogs=["raw.events"]), "databricks", ["raw"])
+
+
+def test_redshift_scope_narrows_and_never_widens():
+    target = narrow_target(
+        RedshiftTarget(schemas=["shop", "billing"]), "redshift", ["shop"]
+    )
+    assert target.schemas == ["shop"]
+    with pytest.raises(ScopeError, match="never widens"):
+        narrow_target(RedshiftTarget(schemas=["shop"]), "redshift", ["billing"])
 
 
 def test_no_override_leaves_the_target_untouched():
