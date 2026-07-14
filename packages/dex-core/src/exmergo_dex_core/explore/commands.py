@@ -45,6 +45,21 @@ def _profile_estimate(
     return estimate(identifiers)
 
 
+def _dev_schemas(config: DexConfig) -> frozenset[str]:
+    """Dev/replica namespaces declared per connector (where dbt dev builds write)."""
+    return frozenset(
+        name
+        for name in [
+            config.bigquery.dev_dataset if config.bigquery else None,
+            config.snowflake.dev_schema if config.snowflake else None,
+            config.databricks.dev_schema if config.databricks else None,
+            config.postgres.dev_schema if config.postgres else None,
+            config.redshift.dev_schema if config.redshift else None,
+        ]
+        if name
+    )
+
+
 def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
     adapter = command_args.open_from_args(args)
     try:
@@ -173,6 +188,14 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     # grain, the same shape a `map`-written cache has.
     _annotate_grain(datasets, defs)
 
+    # Fold same-lineage duplicates before the merge, as `map` does, so the folded
+    # set flows into both the cache and the envelope. Relationships profiles the
+    # full inventory, so it is even more likely than map to pull a dev/replica
+    # schema into scope alongside its source.
+    inferred, folded_edges, mirrored_objects = rel_mod.fold_replica_relationships(
+        datasets, inferred, _dev_schemas(config)
+    )
+
     declared, declared_notes = rel_mod.declared_relationships(
         defs, [d.identifier for d in datasets]
     )
@@ -187,6 +210,12 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     if verify and inferred:
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
+        )
+    if folded_edges > 0:
+        notes.append(
+            f"folded {folded_edges} same-lineage duplicate relationship(s); "
+            f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
+            "dataset mapped alongside its source)"
         )
 
     # Persist the profiles this run already paid for. Because relationships
@@ -339,19 +368,8 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
     # into source, replica, and cross-dataset lookalike edges.
-    dev_schemas = frozenset(
-        name
-        for name in [
-            config.bigquery.dev_dataset if config.bigquery else None,
-            config.snowflake.dev_schema if config.snowflake else None,
-            config.databricks.dev_schema if config.databricks else None,
-            config.postgres.dev_schema if config.postgres else None,
-            config.redshift.dev_schema if config.redshift else None,
-        ]
-        if name
-    )
     inferred, folded_edges, mirrored_objects = rel_mod.fold_replica_relationships(
-        profiled, inferred, dev_schemas
+        profiled, inferred, _dev_schemas(config)
     )
 
     declared, declared_notes = rel_mod.declared_relationships(
