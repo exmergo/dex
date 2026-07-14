@@ -102,8 +102,7 @@ experience first and treat the benchmark as a floor, not the goal.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
-<img width="927" height="149" alt="image" src="https://github.com/user-attachments/assets/66060b8d-f56c-4de8-9c79-cc00252eb1b4" />
-
+<img width="1162" height="225" alt="image" src="https://github.com/user-attachments/assets/32d2311b-b85e-41a5-8431-4edb1f928346" />
 
 Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake
