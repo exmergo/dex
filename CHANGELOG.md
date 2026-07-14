@@ -9,8 +9,49 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore profile` and `explore relationships` now persist their results
+  to `.dex/cache.json`**, merging into any existing cache instead of
+  discarding the scan they just paid for. Previously only `explore map` wrote
+  the cache, so `explore query` on an already-profiled table demanded a
+  second, redundant warehouse scan via `map`, and the query firewall's own
+  refusal messages ("run `explore profile <table>` first") promised a path
+  that did not work. The merge is keyed by identifier: refreshed datasets
+  carry forward `map`'s rank score, untouched prior datasets keep their older
+  `profiled_at` (and `profile` preserves prior relationships, while
+  `relationships` replaces them with its authoritative full-set inference),
+  `provenance.created_at` survives, and a prior cache built for a different
+  connector is replaced wholesale with a loud note rather than poisoned by
+  mixing. `relationships` also annotates candidate keys and grain before
+  persisting, so its cached datasets match `map`'s shape. Known asymmetry:
+  `relationships` does not fold same-lineage replica edges the way `map`
+  does, mirroring the two commands' existing envelope behavior.
+
 ### Added
 
+- **`--use-project`: explore can read the dbt project, on request.**
+  Exploration still starts bare (default behavior is unchanged; a dbt project
+  in the repo earns only a discovery note). With the flag, `explore
+  relationships` and `explore map` report joins the project itself declares:
+  every resolvable `relationships` test becomes a declared join at confidence
+  1.0, resolved against the connection's inventory (manifest-first for exact
+  physical names, with a name-based fallback when the project is not
+  compiled). A declared join that matches nothing, or more than one object,
+  is surfaced as a note instead of guessed. An inferred join that duplicates
+  a declared one is folded into it and noted as independently confirmed.
+- **Declared grain and declared-unique checks (under `--use-project`).**
+  A semantic model's primary entity overrides the heuristic grain on the
+  matching profiled dataset (disagreements are noted), and a profiled column
+  that contradicts its declared `unique` test gets a data-quality note.
+  Candidate keys stay measurement-only. `explore profile` takes the flag too.
+- **Metric-aware ranking (under `--use-project`).** Models reachable from
+  metric definitions feed the ranking hints alongside (never displacing) the
+  configured `ranking_hints`, so metric-backing tables surface first.
+  Declared joins also sharpen the existing connectivity signal.
+- A stale compiled manifest (older than the model sources) is noted rather
+  than trusted silently; a repo with no dbt project, several projects, or an
+  unreadable one degrades to heuristics exactly as before.
 - **Composite candidate-key detection in `explore profile`** ([#49]). When no
   single column proves unique, the profiler now tests a small ranked set of
   2-column combinations with exact distinct-combination counts, so fact tables
@@ -28,6 +69,51 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   and gated like every other grain scan) and reports a combination-level
   `key_lost_uniqueness` finding; composite members are no longer checked one
   at a time, which would have fabricated findings on every run.
+
+#### AWS Redshift
+
+- **Amazon Redshift connector** (`[redshift]` extra), Serverless-first and
+  provisioned-compatible: Postgres-catalog metadata (a `pg_class` census
+  merged with `SVV_TABLE_INFO` size facts and `SVV_COLUMNS`, so empty tables
+  the view omits still appear), the compute-time cost paradigm in seconds
+  with an RPU-hour translation from the workgroup's base capacity (dollars
+  when `redshift.rpu_price_usd` is set), the 60-second Serverless wake
+  minimum floored into every estimate exactly once per command, and a
+  per-statement server-side `statement_timeout` wound down to the remaining
+  budget so a wrong heuristic cannot overrun the ceiling. Credential
+  discovery spans both of Redshift's worlds: a pinned Serverless
+  `redshift.workgroup` (or provisioned `cluster_identifier`) resolved through
+  the AWS default credential chain into IAM temporary database credentials,
+  the `REDSHIFT_*` environment, the committed non-secret config target
+  (password via `REDSHIFT_PASSWORD`), or a dbt profile. `transform init`
+  renders IAM or env-var-password dev profiles; the dev-target preflight asks
+  the Postgres privilege question of the profile's user. Profiling uses
+  `HLL(...)` approximate distincts (Redshift caps `APPROXIMATE
+  COUNT(DISTINCT)` at three per statement, verified live) with exact
+  escalation inside the confirmed budget; there is deliberately no
+  sampled-profiling knob because Redshift has no TABLESAMPLE. Session
+  read-only is attempted and reported honestly rather than assumed (verified
+  live: Redshift accepts and enforces it), and inventory degrades with a
+  named grant fix when an IAM-minted user cannot read `svv_table_info`. The
+  five safety families are extended to the new connector against a stateful
+  fake (`tests/fakes/redshift.py`), and `references/redshift.md` documents
+  the cost story, including that Serverless bills metadata activity. The
+  whole loop was verified live against a Redshift Serverless workgroup on
+  both auth paths, including a keyless `method: iam` dbt build.
+
+### Changed
+
+- One shared read view in the engine's dbt project reader now feeds explore's
+  declared joins, the semantic definitions, and `maintain snapshot`'s
+  fingerprints (previously a separate parser); snapshot output is unchanged.
+
+#### AWS Redshift
+
+- The relationship-verification overlap probe now measures orphans with a
+  LEFT JOIN against the DISTINCT parent keys instead of a `NOT EXISTS`
+  projected into the SELECT list, which Redshift refuses outright (XX000:
+  correlated subquery pattern not supported). Same aggregate-only result on
+  every connector, same fanout safety, one dialect fewer surprises.
 
 ## [1.1.1] - 2026-07-12
 

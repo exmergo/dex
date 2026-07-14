@@ -9,6 +9,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolated_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`explore profile` and `explore relationships` persist to `.dex/` under the
+    repo root, which defaults to the CWD; tests that omit --repo-root must land
+    that write in tmp_path, never in the checkout."""
+
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture
 def airbnb_duckdb(tmp_path: Path) -> Path:
     """Three raw tables: person-name and free-text columns that must be flagged,

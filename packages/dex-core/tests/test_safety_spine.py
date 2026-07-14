@@ -749,7 +749,7 @@ def test_snowflake_unresolvable_scope_never_falls_back_to_the_whole_allowlist(
 
 
 def test_an_unresolvable_scope_never_falls_back_on_any_connector(
-    fake_bq_client, fake_databricks, fake_pg_connection
+    fake_bq_client, fake_databricks, fake_pg_connection, fake_redshift_connection
 ):
     # Family 2: the same cost-safety bug, on every warehouse connector. A source
     # scope that names nothing must refuse, and must do so on the free metadata
@@ -768,7 +768,16 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
         PostgresAdapter,
         PostgresConnectionError,
     )
-    from exmergo_dex_core.config import BigQueryTarget, DatabricksTarget, PostgresTarget
+    from exmergo_dex_core.adapters.redshift import (
+        RedshiftAdapter,
+        RedshiftConnectionError,
+    )
+    from exmergo_dex_core.config import (
+        BigQueryTarget,
+        DatabricksTarget,
+        PostgresTarget,
+        RedshiftTarget,
+    )
     from exmergo_dex_core.guards.cost_guard import CostGate
 
     def gate(paradigm, connector):
@@ -800,6 +809,12 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
         target=PostgresTarget(schemas=["__not_a_schema__"]),
         clock=fake_pg_connection.clock,
     )
+    redshift = RedshiftAdapter(
+        connection=fake_redshift_connection,
+        cost_gate=gate(env.Paradigm.COMPUTE_TIME, "redshift"),
+        target=RedshiftTarget(schemas=["__not_a_schema__"]),
+        clock=fake_redshift_connection.clock,
+    )
 
     with pytest.raises(BigQueryConnectionError):
         bigquery.list_objects()
@@ -807,12 +822,15 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
         databricks.list_objects()
     with pytest.raises(PostgresConnectionError):
         postgres.list_objects()
+    with pytest.raises(RedshiftConnectionError):
+        redshift.list_objects()
 
     # Refused on the free path: nothing was queried, and no SQL session opened.
     assert fake_bq_client.query_calls == []
     assert fake_databricks.connection.data_statements == []
     assert fake_databricks.connect_count == 0
     assert fake_pg_connection.data_statements == []
+    assert fake_redshift_connection.data_statements == []
 
 
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
@@ -1008,6 +1026,13 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
             "billed_seconds": 11.0,
         }
     )
+    store.append_spend_log(
+        {
+            "at": "2026-07-05T00:00:05+00:00",
+            "connector": "redshift",
+            "billed_seconds": 13.0,
+        }
+    )
     assert store.spend_since("2026-07-05T00:00:00+00:00", connector="bigquery") == 5000
     assert (
         store.spend_since(
@@ -1026,6 +1051,12 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
             "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="databricks"
         )
         == 11.0
+    )
+    assert (
+        store.spend_since(
+            "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="redshift"
+        )
+        == 13.0
     )
 
 
@@ -1431,6 +1462,284 @@ def test_postgres_spend_ledger_holds_no_sql_or_values(
     store = DexStore(tmp_path)
     fake_pg_connection.row_resolver = lambda sql: [{"n": 1}]
     adapter = _pg_adapter(fake_pg_connection)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "dexdb"."shop"."customers"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = json.loads(lines[-1])
+    assert "SELECT" not in json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
+
+
+# --- Redshift: the second compute-time connector exercises every family ---------
+#
+# These run against the fake connection (tests/fakes/redshift.py):
+# deterministic, offline, free. They importorskip on the [redshift] extra,
+# which CI and the release gate install, so trimming that extra from a
+# workflow would silently skip release-blocking families; keep
+# `--extra redshift` in ci.yml and release.yml.
+
+
+def _redshift_adapter(fake_redshift_connection, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.redshift import RedshiftAdapter
+    from exmergo_dex_core.config import RedshiftTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.COMPUTE_TIME,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="redshift",
+    )
+    return RedshiftAdapter(
+        connection=fake_redshift_connection,
+        cost_gate=gate,
+        target=RedshiftTarget(),
+        compute={
+            "kind": "serverless",
+            "workgroup": "dex-wg",
+            "base_capacity_rpus": 8.0,
+        },
+        auth_method="iam_serverless:default_chain",
+        clock=fake_redshift_connection.clock,
+    )
+
+
+def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
+    # Family 1: every data statement the adapter generates passes the
+    # SELECT-only guard in the redshift dialect (asserted at build time).
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _redshift_adapter(fake_redshift_connection)
+    _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    sql, _plan = adapter._build_aggregate_sql("dexdb.shop.customers", columns, {"id"})
+    assert sql.lstrip().upper().startswith("SELECT")
+    assert assert_select_only(sql, dialect="redshift") == sql
+
+
+def test_redshift_session_read_only_is_best_effort_and_honest(
+    fake_redshift_connection,
+):
+    # Family 1: the session read-only mode is attempted before any statement;
+    # when Redshift declines it, the adapter tolerates the refusal and
+    # capabilities reports the truth rather than a comforting fiction.
+    adapter = _redshift_adapter(fake_redshift_connection)
+    adapter.capabilities()
+    first = fake_redshift_connection.statements[0].sql.lower()
+    assert "set default_transaction_read_only = on" in first
+
+    from fakes.redshift import FakeRedshiftConnection
+
+    declining = FakeRedshiftConnection(
+        tables=fake_redshift_connection.tables, reject_read_only=True
+    )
+    declined = _redshift_adapter(declining)
+    assert declined.capabilities()["session_read_only"] is False
+
+
+def test_select_only_guard_rejects_redshift_writes_ddl_and_movement():
+    # Family 2 of the dialect surface: Redshift DML/DDL, data movement
+    # (COPY/UNLOAD), and multi-statement forms are all refused when parsed in
+    # the redshift dialect.
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
+
+    for bad in (
+        "CREATE TABLE t AS SELECT 1",
+        "TRUNCATE TABLE shop.t",
+        "SELECT 1; SELECT 2",
+        "DELETE FROM shop.t WHERE TRUE",
+        "UPDATE shop.t SET x = 1",
+        "COPY shop.t FROM 's3://bucket/exfil' IAM_ROLE 'arn:aws:iam::1:role/r'",
+        "UNLOAD ('SELECT * FROM shop.t') TO 's3://bucket/exfil'",
+        "ALTER TABLE shop.t ADD COLUMN y varchar",
+        "DROP TABLE shop.t",
+    ):
+        with pytest.raises(NotSelectOnlyError):
+            assert_select_only(bad, dialect="redshift")
+
+
+def test_redshift_unconfirmed_scan_never_executes(fake_redshift_connection):
+    # Family 2: the strict handshake. Without --confirm nothing scans.
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _redshift_adapter(fake_redshift_connection, confirmed=False)
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "dexdb"."shop"."customers"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_redshift_connection.data_statements == []
+
+
+def test_redshift_confirmed_run_without_a_ceiling_is_refused(fake_redshift_connection):
+    # Family 2: nothing executes unbudgeted; confirmation cannot stand in for
+    # a ceiling on a billed paradigm.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _redshift_adapter(fake_redshift_connection, ceiling=None, confirmed=True)
+    with pytest.raises(CostGuardError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "dexdb"."shop"."customers"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_redshift_connection.data_statements == []
+
+
+def test_redshift_over_ceiling_cannot_be_confirmed_through(fake_redshift_connection):
+    # Family 2: over-ceiling blocks first, even fully confirmed.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _redshift_adapter(fake_redshift_connection, ceiling=2.0, confirmed=True)
+    with pytest.raises(OverCeilingError):
+        adapter.run_query(
+            'SELECT COUNT(*) FROM "dexdb"."shop"."events"',
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert fake_redshift_connection.data_statements == []
+
+
+def test_redshift_every_executed_statement_is_server_capped(fake_redshift_connection):
+    # Family 2: defense in depth past the client-side gate; a wrong heuristic
+    # cannot overrun the budget because statement_timeout kills the statement.
+    fake_redshift_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _redshift_adapter(fake_redshift_connection)
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "dexdb"."shop"."customers"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    executed = fake_redshift_connection.data_statements
+    assert executed
+    assert all(s.session_timeout_ms is not None for s in executed)
+
+
+def test_query_firewall_blocks_redshift_value_carrying_shapes():
+    # Family 3: PII stays flagged-not-surfaced under the redshift dialect,
+    # including Redshift's own value-carrying aggregates.
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = _firewall_cache()
+    for bad in (
+        "SELECT LISTAGG(email, ',') FROM db.main.customers",
+        "SELECT MIN(email) FROM db.main.customers",
+        "SELECT ANY_VALUE(email) FROM db.main.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(bad, cache, QueryLimits(), dialect="redshift")
+    # Measuring stays allowed in the redshift dialect too.
+    inspect_query(
+        "SELECT COUNT(DISTINCT email) FROM db.main.customers",
+        cache,
+        QueryLimits(),
+        dialect="redshift",
+    )
+
+
+def test_init_redshift_profile_is_dev_only_with_no_secrets(tmp_path: Path, monkeypatch):
+    # Family 4: the generated Redshift profile has a single dev target and, on
+    # the IAM path, no secret-shaped key anywhere (temporary credentials are
+    # minted by the dbt adapter at runtime).
+    import yaml
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.cache import DEX_DIR
+    from exmergo_dex_core.config import CONFIG_FILE
+
+    class _Client:
+        def get_workgroup(self, workgroupName):  # noqa: N803 (boto3's spelling)
+            return {
+                "workgroup": {
+                    "workgroupName": workgroupName,
+                    "namespaceName": "ns",
+                    "status": "AVAILABLE",
+                    "baseCapacity": 8,
+                    "endpoint": {
+                        "address": "wg.1.eu.redshift-serverless.amazonaws.com",
+                        "port": 5439,
+                    },
+                }
+            }
+
+        def get_namespace(self, namespaceName):  # noqa: N803 (boto3's spelling)
+            return {"namespace": {"namespaceName": namespaceName, "dbName": "shop"}}
+
+    class _Session:
+        def __init__(self, **kwargs):
+            pass
+
+        def client(self, service):
+            return _Client()
+
+    import boto3
+
+    monkeypatch.setattr(boto3, "Session", _Session)
+    (tmp_path / DEX_DIR).mkdir()
+    (tmp_path / DEX_DIR / CONFIG_FILE).write_text(
+        "redshift:\n  workgroup: dex-wg\n", encoding="utf-8"
+    )
+    transform.init_project("analytics", "redshift", repo_root=tmp_path)
+    profiles = yaml.safe_load(
+        (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    )
+    profile = profiles["analytics"]
+    assert profile["target"] == "dev"
+    assert set(profile["outputs"]) == {"dev"}
+    assert profile["outputs"]["dev"]["method"] == "iam"
+    # The envelope sanitizer doubles as the secret-key scanner here.
+    env.sanitize(env.ok(profiles))
+
+
+def test_redshift_capabilities_pass_the_sanitizer(fake_redshift_connection, capsys):
+    # Family 5: the capabilities payload carries a coarse auth method, never
+    # an identity, key, or password, and survives the sanitizer end to end.
+    adapter = _redshift_adapter(fake_redshift_connection)
+    caps = adapter.capabilities()
+    env.emit(env.ok(caps))
+    out = capsys.readouterr().out
+    assert out
+    assert "@" not in out  # no user identity
+    assert caps["auth_method"].split(":")[0] in {
+        "iam_serverless",
+        "iam_cluster",
+        "environment",
+        "config_target",
+        "dbt_profile",
+        "unknown",
+    }
+    assert caps["auth_method"].split(":")[1] in {
+        "profile",
+        "environment",
+        "default_chain",
+        "password",
+        "external",
+        "unknown",
+    }
+
+
+def test_redshift_spend_ledger_holds_no_sql_or_values(
+    tmp_path: Path, fake_redshift_connection
+):
+    # Family 5: the audit trail is second counts and statement hashes only.
+    import json
+
+    from exmergo_dex_core.cache import DexStore
+
+    store = DexStore(tmp_path)
+    fake_redshift_connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = _redshift_adapter(fake_redshift_connection)
     adapter.cost_gate._record = store.append_spend_log
     adapter.run_query(
         'SELECT COUNT(*) AS n FROM "dexdb"."shop"."customers"',

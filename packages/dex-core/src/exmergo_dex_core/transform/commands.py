@@ -25,6 +25,20 @@ from . import plans as plans_mod
 from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit, PlanStore
 
+# What actually caps a dbt statement server-side, per compute-time connector:
+# a per-connector fact, kept out of the shared build arm so the next connector
+# adds an entry instead of nesting a conditional. dex cannot inject a per-build
+# cap through any of these dbt adapters.
+_COMPUTE_TIME_CAP_NOTES = {
+    "redshift": (
+        "a statement_timeout on the dbt dev user and a workgroup usage "
+        "limit are the server-side caps (dex cannot inject one per build)"
+    ),
+}
+_DEFAULT_COMPUTE_TIME_CAP_NOTE = (
+    "the warehouse-level statement timeout and auto-suspend are the server-side caps"
+)
+
 
 def cmd_init(args: argparse.Namespace) -> env.Envelope:
     from ..config import load_config
@@ -150,6 +164,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         "bigquery": Paradigm.BYTES_SCANNED,
         "snowflake": Paradigm.COMPUTE_TIME,
         "databricks": Paradigm.COMPUTE_TIME,
+        "redshift": Paradigm.COMPUTE_TIME,
         "postgres": Paradigm.DB_LOAD,
     }.get(connector, Paradigm.FREE_LOCAL)
 
@@ -195,14 +210,16 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         if billed:
             _record_build_spend(repo_root, connector, billed, "billed_bytes")
     elif paradigm is Paradigm.COMPUTE_TIME:
+        cap_note = _COMPUTE_TIME_CAP_NOTES.get(
+            connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
+        )
         notes = [
             "dbt has no dry-run, so this build's warehouse time could not be "
-            "estimated upfront; the warehouse-level statement timeout and "
-            "auto-suspend are the server-side caps",
+            f"estimated upfront; {cap_note}",
             *notes,
         ]
-        # dbt-snowflake and dbt-databricks report no billing figure; per-node
-        # execution time is the honest warehouse-seconds actual.
+        # dbt-snowflake, dbt-databricks, and dbt-redshift report no billing
+        # figure; per-node execution time is the honest compute-seconds actual.
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )

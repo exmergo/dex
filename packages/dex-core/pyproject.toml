@@ -56,11 +56,17 @@ databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "sqlglot>=2
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a Postgres dev schema with one install.
 postgres = ["psycopg[binary]>=3", "sqlglot>=25", "dbt-postgres>=1.9"]
+# Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
+# transform can build against a Redshift dev schema with one install. boto3
+# rides alongside the driver: Serverless workgroup facts (endpoint, base
+# capacity) come from the control plane, and the driver mints IAM temporary
+# database credentials through the same chain.
+redshift = ["redshift-connector>=2.1", "boto3>=1.34", "sqlglot>=25", "dbt-redshift>=1.9"]
 # One command for users who want every connector at once (e.g. driving multiple
 # warehouses). Self-references the connector extras so their client lists stay
 # defined in exactly one place. Excludes dev, which is contributor tooling, not a
 # connector. The light default and the [duckdb] on-ramp are unchanged.
-all = ["exmergo-dex-core[bigquery,databricks,duckdb,postgres,snowflake]"]
+all = ["exmergo-dex-core[bigquery,databricks,duckdb,postgres,redshift,snowflake]"]
 dev = ["pytest>=8", "ruff==0.15.19"]
 
 [project.urls]
@@ -98,4 +104,5 @@ markers = [
   "snowflake: Snowflake-specific integration tests",
   "databricks: Databricks-specific integration tests",
   "postgres: PostgreSQL-specific integration tests",
+  "redshift: Redshift-specific integration tests",
 ]

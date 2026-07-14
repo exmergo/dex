@@ -43,7 +43,14 @@ from ..config import (
 from ..dbt_project import PROFILES_FILE, PROJECT_FILE, discover_projects
 from ..diffs import file_diff
 
-VALID_CONNECTORS = ("duckdb", "snowflake", "bigquery", "databricks", "postgres")
+VALID_CONNECTORS = (
+    "duckdb",
+    "snowflake",
+    "bigquery",
+    "databricks",
+    "postgres",
+    "redshift",
+)
 
 
 class InitError(Exception):
@@ -101,7 +108,7 @@ def init_project(
         raise InitError(
             f"connector '{connector}' is not yet supported for init; run "
             "`transform init <name> --connector "
-            "duckdb|bigquery|snowflake|databricks|postgres`"
+            "duckdb|bigquery|snowflake|databricks|postgres|redshift`"
         )
 
     project_name = sanitize_project_name(name)
@@ -566,12 +573,127 @@ def _pg_connection_fields(target: Any, method: str) -> dict:
     return _postgres_from_dbt_profiles(".") or {}
 
 
+_DEFAULT_REDSHIFT_DEV_SCHEMA = "dbt_dev"
+
+
+def _redshift_profile(
+    project_name: str, path: str | None, config: DexConfig, root: Path
+) -> str:
+    """A single dbt-redshift ``dev`` target from the discovered connection,
+    with no secret ever rendered. IAM discovery renders ``method: iam`` (the
+    endpoint resolved from the workgroup, temporary credentials minted by the
+    dbt adapter at runtime); password discovery renders an ``env_var``
+    reference (``REDSHIFT_PASSWORD``), never a value. Writes go to a
+    dedicated dev schema, never to a source schema dex reads from."""
+
+    from ..config import RedshiftTarget
+    from ..connect import CredentialDiscoveryError, resolve_redshift_connection
+
+    target = config.redshift or RedshiftTarget()
+    try:
+        params, method, _compute = resolve_redshift_connection(target, os.environ, root)
+    except CredentialDiscoveryError as exc:
+        raise InitError(str(exc)) from exc
+
+    dev_schema = target.dev_schema or _DEFAULT_REDSHIFT_DEV_SCHEMA
+    if dev_schema in set(target.schemas):
+        raise InitError(
+            f"dev_schema '{dev_schema}' is also a source schema in "
+            "redshift.schemas; dbt builds must write where dex does not read "
+            "(set redshift.dev_schema to a dedicated schema)"
+        )
+
+    target.dev_schema = dev_schema
+    config.redshift = target
+
+    source = method.split(":", 1)[0]
+    output: dict[str, Any] = {"type": "redshift"}
+    if source == "iam_serverless":
+        output.update(
+            {
+                "method": "iam",
+                "host": str(params["host"]),
+                "port": int(params.get("port") or 5439),
+                # Serverless IAM derives the database user from the caller's
+                # identity; dbt-redshift still requires the field, and the
+                # sentinel keeps it honest about where identity comes from.
+                "user": str(target.user or "iam"),
+                "dbname": str(params["database"]),
+            }
+        )
+        if target.aws_profile:
+            output["iam_profile"] = str(target.aws_profile)
+        if target.region:
+            output["region"] = str(target.region)
+    elif source == "iam_cluster":
+        if not target.host:
+            raise InitError(
+                "dbt-redshift needs the cluster endpoint host alongside "
+                "cluster_identifier; set redshift.host in .dex/config.yml"
+            )
+        output.update(
+            {
+                "method": "iam",
+                "cluster_id": str(target.cluster_identifier),
+                "host": str(target.host),
+                "port": int(target.port or 5439),
+                "user": str(params["db_user"]),
+                "dbname": str(params["database"]),
+            }
+        )
+        if target.aws_profile:
+            output["iam_profile"] = str(target.aws_profile)
+        if target.region:
+            output["region"] = str(target.region)
+    else:
+        host = params.get("host")
+        dbname = params.get("database")
+        user = params.get("user")
+        if not host or not dbname or not user:
+            missing = ", ".join(
+                name
+                for name, value in (("host", host), ("dbname", dbname), ("user", user))
+                if not value
+            )
+            raise InitError(
+                f"the discovered Redshift connection does not name {missing}, "
+                "which dbt-redshift requires; export REDSHIFT_HOST/"
+                "REDSHIFT_DATABASE/REDSHIFT_USER, or complete redshift.host/"
+                "dbname/user in .dex/config.yml"
+            )
+        output.update(
+            {
+                "host": str(host),
+                "port": int(params.get("port") or 5439),
+                "user": str(user),
+                # Never persist a password: the profile reads it from the
+                # environment at dbt runtime (a Jinja reference, not a value).
+                "password": "{{ env_var('REDSHIFT_PASSWORD') }}",
+                "dbname": str(dbname),
+            }
+        )
+    output.update(
+        {
+            "schema": dev_schema,
+            # One thread keeps the workgroup from parallel bursts; compute
+            # seconds are the guarded quantity on compute-time gating.
+            "threads": 1,
+            "connect_timeout": 10,
+        }
+    )
+    return yaml.safe_dump(
+        {project_name: {"target": "dev", "outputs": {"dev": output}}},
+        sort_keys=False,
+    )
+
+
 _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]] = {
     "duckdb": _duckdb_profile,
     "bigquery": _bigquery_profile,
     "snowflake": _snowflake_profile,
     "databricks": _databricks_profile,
     "postgres": _postgres_profile,
+    "redshift": _redshift_profile,
 }
 
 

@@ -8,11 +8,19 @@ Airbnb-style raw export with bare `NAME`, `REVIEWER_NAME`, and free-text
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.cache import PIICategory
+from exmergo_dex_core.cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    DexStore,
+    PIICategory,
+    Relationship,
+)
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.explore.profile import detect_pii, is_min_max_safe
 
@@ -173,6 +181,229 @@ def test_profile_accepts_comma_separated_objects(airbnb_duckdb: Path, capsys):
     )
     names = {d["identifier"].split(".")[-1] for d in payload["data"]["datasets"]}
     assert names == {"RAW_HOSTS", "RAW_LISTINGS", "RAW_REVIEWS"}
+
+
+# --- persistence: profile writes through to the .dex/ cache ---------------------
+
+
+def _profile(objects: list[str], db: Path, repo: Path, capsys) -> dict:
+    return _run(
+        ["explore", "profile", *objects, "--path", str(db), "--repo-root", str(repo)],
+        capsys,
+    )
+
+
+def _map(db: Path, repo: Path, capsys) -> dict:
+    return _run(["explore", "map", "--path", str(db), "--repo-root", str(repo)], capsys)
+
+
+def _dataset(cache: DexCache, suffix: str) -> Dataset:
+    return next(d for d in cache.datasets if d.identifier.endswith(f".{suffix}"))
+
+
+def test_profile_writes_cache_when_none_exists(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+
+    assert (repo / ".dex" / "cache.json").is_file()
+    assert payload["data"]["cache_path"].endswith("cache.json")
+    assert payload["data"]["updated_at"]
+    assert any("created .dex/cache.json" in n for n in payload["data"]["notes"])
+    assert any("explore map" in n for n in payload["data"]["notes"])
+
+    cache = DexStore(repo).load_cache()
+    assert [d.identifier.split(".")[-1] for d in cache.datasets] == ["RAW_HOSTS"]
+    assert cache.datasets[0].columns, "the firewall needs columns to allow queries"
+    assert cache.relationships == []
+    assert cache.provenance.connector == "duckdb"
+    assert cache.provenance.created_at == cache.provenance.updated_at
+
+
+def test_profile_merges_into_existing_map_preserving_relationships_and_rank(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+    store = DexStore(repo)
+    before = store.load_cache()
+    rels_before = [r.model_dump() for r in before.relationships]
+    assert rels_before, "the airbnb fixture has inferable joins"
+    hosts_before = _dataset(before, "RAW_HOSTS")
+    assert hosts_before.rank_score is not None
+
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    after = store.load_cache()
+
+    assert [r.model_dump() for r in after.relationships] == rels_before
+    assert {d.identifier for d in after.datasets} == {
+        d.identifier for d in before.datasets
+    }
+    hosts_after = _dataset(after, "RAW_HOSTS")
+    assert hosts_after.rank_score == hosts_before.rank_score
+    assert after.provenance.created_at == before.provenance.created_at
+    assert after.provenance.updated_at >= before.provenance.updated_at
+    note = next(n for n in payload["data"]["notes"] if "merged" in n)
+    assert "1 refreshed, 0 added" in note
+    assert "relationships preserved" in note
+
+
+def test_profile_refreshes_stale_profile_updates_profiled_at(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+    store = DexStore(repo)
+    before = store.load_cache()
+    old = _dataset(before, "RAW_HOSTS")
+    reviews_stamp = _dataset(before, "RAW_REVIEWS").profiled_at
+    assert old.profiled_at is not None
+
+    _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    after = store.load_cache()
+    new = _dataset(after, "RAW_HOSTS")
+    assert new.profiled_at > old.profiled_at, "the fresh measurement wins"
+    assert new.rank_score == old.rank_score
+    # A table not re-profiled keeps its older stamp, which marks its age.
+    assert _dataset(after, "RAW_REVIEWS").profiled_at == reviews_stamp
+
+
+def test_profile_inserts_new_dataset(airbnb_duckdb: Path, tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    payload = _profile(["RAW_LISTINGS"], airbnb_duckdb, repo, capsys)
+
+    cache = DexStore(repo).load_cache()
+    names = {d.identifier.split(".")[-1] for d in cache.datasets}
+    assert names == {"RAW_HOSTS", "RAW_LISTINGS"}
+    assert _dataset(cache, "RAW_LISTINGS").rank_score is None
+    note = next(n for n in payload["data"]["notes"] if "merged" in n)
+    assert "0 refreshed, 1 added" in note
+
+
+def test_profile_connector_mismatch_replaces_cache(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    seeded = DexCache(
+        datasets=[
+            Dataset(
+                identifier="proj.ds.t",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+            )
+        ],
+        relationships=[
+            Relationship(
+                from_dataset="proj.ds.t",
+                from_columns=["id"],
+                to_dataset="proj.ds.u",
+                to_columns=["id"],
+            )
+        ],
+    )
+    seeded.provenance.connector = "bigquery"
+    seeded.provenance.created_at = "2020-01-01T00:00:00+00:00"
+    DexStore(repo).save_cache(seeded)
+
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    cache = DexStore(repo).load_cache()
+    assert cache.provenance.connector == "duckdb"
+    assert [d.identifier.split(".")[-1] for d in cache.datasets] == ["RAW_HOSTS"]
+    assert cache.relationships == []
+    assert cache.provenance.created_at != "2020-01-01T00:00:00+00:00"
+    note = next(n for n in payload["data"]["notes"] if "bigquery" in n)
+    assert "explore map" in note
+
+
+def test_merge_profiles_carries_rank_and_preserves_relationships():
+    from exmergo_dex_core.explore.commands import _merge_profiles
+
+    def _prior() -> DexCache:
+        prior = DexCache(
+            datasets=[
+                Dataset(
+                    identifier="db.s.a",
+                    rank_score=0.9,
+                    columns=[ColumnProfile(name="id", data_type="INTEGER")],
+                    profiled_at="2026-01-01T00:00:00+00:00",
+                ),
+                Dataset(
+                    identifier="db.s.b",
+                    rank_score=0.5,
+                    columns=[ColumnProfile(name="id", data_type="INTEGER")],
+                    profiled_at="2026-01-01T00:00:00+00:00",
+                ),
+            ],
+            relationships=[
+                Relationship(
+                    from_dataset="db.s.b",
+                    from_columns=["a_id"],
+                    to_dataset="db.s.a",
+                    to_columns=["id"],
+                )
+            ],
+        )
+        prior.provenance.connector = "duckdb"
+        prior.provenance.created_at = "2026-01-01T00:00:00+00:00"
+        return prior
+
+    now = datetime(2026, 7, 13, tzinfo=UTC)
+
+    def _fresh() -> list[Dataset]:
+        # A fresh list per scenario: the merge carries rank onto these objects.
+        return [
+            Dataset(
+                identifier="db.s.a",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+                profiled_at=now.isoformat(),
+            ),
+            Dataset(
+                identifier="db.s.c",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+                profiled_at=now.isoformat(),
+            ),
+        ]
+
+    cache, stats = _merge_profiles(_prior(), _fresh(), "duckdb", now)
+    by_id = {d.identifier: d for d in cache.datasets}
+    assert by_id["db.s.a"].rank_score == 0.9, "map's ranking is carried forward"
+    assert by_id["db.s.a"].profiled_at == now.isoformat()
+    assert by_id["db.s.b"].profiled_at == "2026-01-01T00:00:00+00:00", "untouched"
+    assert by_id["db.s.c"].rank_score is None, "never ranked"
+    assert len(cache.relationships) == 1, "preserved by default"
+    assert cache.provenance.created_at == "2026-01-01T00:00:00+00:00"
+    assert stats["merged"] is True
+    assert stats["refreshed"] == 1 and stats["added"] == 1
+    assert stats["replaced_connector"] is None
+
+    # Connector mismatch: the prior is dropped wholesale, created_at resets.
+    cache, stats = _merge_profiles(_prior(), [_fresh()[0]], "postgres", now)
+    assert [d.identifier for d in cache.datasets] == ["db.s.a"]
+    assert cache.datasets[0].rank_score is None
+    assert cache.relationships == []
+    assert cache.provenance.connector == "postgres"
+    assert cache.provenance.created_at == now.isoformat()
+    assert stats["replaced_connector"] == "duckdb"
+
+    # Passing relationships replaces the prior set (the relationships command).
+    replacement = [
+        Relationship(
+            from_dataset="db.s.c",
+            from_columns=["a_id"],
+            to_dataset="db.s.a",
+            to_columns=["id"],
+        )
+    ]
+    cache, _ = _merge_profiles(
+        _prior(), _fresh(), "duckdb", now, relationships=replacement
+    )
+    assert cache.relationships == replacement
 
 
 # --- exact-count escalation ----------------------------------------------------

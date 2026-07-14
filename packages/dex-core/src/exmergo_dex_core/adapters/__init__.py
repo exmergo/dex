@@ -1,4 +1,5 @@
-"""Connector adapters: DuckDB, BigQuery, Snowflake, Databricks, and Postgres.
+"""Connector adapters: DuckDB, BigQuery, Snowflake, Databricks, Postgres, and
+Redshift.
 
 ``get_adapter`` is the single entry point so callers never import a connector
 client directly; the client libraries stay behind their extras and are imported
@@ -19,6 +20,7 @@ _DIALECTS = {
     "snowflake": "snowflake",
     "databricks": "databricks",
     "postgres": "postgres",
+    "redshift": "redshift",
 }
 
 
@@ -45,6 +47,10 @@ def get_adapter(connector: str, **kwargs: Any):
         from .databricks import DatabricksAdapter
 
         return DatabricksAdapter(**kwargs)
+    if connector == "redshift":
+        from .redshift import RedshiftAdapter
+
+        return RedshiftAdapter(**kwargs)
     raise ValueError(f"unknown connector '{connector}'")
 
 

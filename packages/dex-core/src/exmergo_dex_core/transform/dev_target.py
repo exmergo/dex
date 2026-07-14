@@ -39,6 +39,7 @@ from ..config import CONFIG_FILE, DexConfig
 from ..dbt_project import (
     PROFILES_FILE,
     duckdb_target_path,
+    target_auth_method,
     target_identifiers,
     target_role,
 )
@@ -69,6 +70,7 @@ _DRIFT_FIELDS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("dev_schema", "databricks.dev_schema", "schema"),
     ),
     "postgres": (("dev_schema", "postgres.dev_schema", "schema"),),
+    "redshift": (("dev_schema", "redshift.dev_schema", "schema"),),
     "duckdb": (("path", "duckdb.path", "path"),),
 }
 
@@ -172,6 +174,8 @@ def _assert_namespace_exists(
         return _bigquery_namespace(config, repo_root)
     if config.connector == "postgres":
         return _postgres_namespace(project, target, config, repo_root)
+    if config.connector == "redshift":
+        return _redshift_namespace(project, target, config, repo_root)
     return []
 
 
@@ -382,6 +386,62 @@ def _postgres_namespace(
         f"  GRANT USAGE, CREATE ON SCHEMA {pg.dev_schema} TO {role};\n"
         "(dbt builds every model in that schema), or point postgres.dev_schema "
         "at a schema the role can write"
+    )
+
+
+def _redshift_namespace(
+    project: Path, target: str, config: DexConfig, repo_root: Path | str
+) -> list[str]:
+    """Cheap: catalog lookups and privilege predicates, no scan.
+
+    Redshift asks the Postgres question: dbt creates the dev schema, so its
+    absence is not the failure; the privilege to create it is. The user that
+    needs the privilege is the one in the rendered profile, not the one dex
+    connects as. A ``method: iam`` profile is the exception: its database user
+    is minted from the caller's identity at dbt runtime regardless of what the
+    profile's ``user`` field says, so there is no durable user to ask a
+    privilege question about and the check degrades to dbt's own error.
+    """
+
+    rs = config.redshift
+    if rs is None or not rs.dev_schema:
+        return []
+    role = target_role(project, target)
+    if not role or target_auth_method(project, target) == "iam":
+        # No rendered profile to read a user from, or IAM auth: an IAM target
+        # mints its database user from the caller's identity at dbt runtime,
+        # so whatever the user field says, there is no durable user to ask a
+        # privilege question about.
+        return []
+
+    adapter, note = _open_for_preflight("redshift", repo_root)
+    if adapter is None:
+        return [note]
+    try:
+        missing = adapter.missing_dev_namespaces(rs.dev_schema, role=role)
+    except Exception as exc:  # the profile's user does not exist in the database
+        raise DevTargetError(str(exc)) from exc
+    finally:
+        adapter.close()
+
+    if not missing:
+        return []
+    problem = missing[0]
+    if problem.startswith("dev_schema"):
+        raise DevTargetError(
+            f"redshift {problem} does not exist and user {role} may not create "
+            "it; create it with:\n"
+            f"  CREATE SCHEMA IF NOT EXISTS {rs.dev_schema} AUTHORIZATION "
+            f"{role};\n"
+            "(dbt creates its dev schema, but only if the user may, so the first "
+            "build otherwise dies on a bare permission error), or point "
+            "redshift.dev_schema at a schema the user can write"
+        )
+    raise DevTargetError(
+        f"redshift user {role} is missing {problem}; grant it with:\n"
+        f"  GRANT USAGE, CREATE ON SCHEMA {rs.dev_schema} TO {role};\n"
+        "(dbt builds every model in that schema), or point redshift.dev_schema "
+        "at a schema the user can write"
     )
 
 

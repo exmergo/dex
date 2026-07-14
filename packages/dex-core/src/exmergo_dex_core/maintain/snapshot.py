@@ -25,23 +25,24 @@ pass deemed safe to record.
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
-import yaml
 from pydantic import BaseModel, Field
 
 from ..adapters.base import Adapter
 from ..cache import ColumnProfile, Dataset, DexCache, Relationship, tool_version
-from ..dbt_project import DbtProjectView, content_hash
+from ..dbt_project import (
+    REF_PATTERN,
+    SOURCE_PATTERN,
+    DbtProjectView,
+    content_hash,
+    metric_inputs,
+    physical_column,
+    semantic_yaml_entries,
+    yaml_documents,
+)
 
 SNAPSHOT_SCHEMA_VERSION = 1
-
-_REF_PATTERN = re.compile(r"ref\(\s*['\"]([^'\"]+)['\"]")
-_SOURCE_PATTERN = re.compile(
-    r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]"
-)
-_BARE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class WarehouseBaseline(BaseModel):
@@ -205,17 +206,17 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
         source_calls = sorted(
             {
                 f"{name}.{table}"
-                for name, table in _SOURCE_PATTERN.findall(source.content)
+                for name, table in SOURCE_PATTERN.findall(source.content)
             }
         )
-        ref_calls = sorted(set(_REF_PATTERN.findall(source.content)) - {model})
+        ref_calls = sorted(set(REF_PATTERN.findall(source.content)) - {model})
         if source_calls:
             model_sources[model] = source_calls
         if ref_calls:
             model_refs[model] = ref_calls
     models.sort()
     sources: list[SourceTable] = []
-    for parsed, path in _yaml_documents(view):
+    for parsed, path in yaml_documents(view):
         for src in parsed.get("sources") or []:
             if not isinstance(src, dict) or not src.get("name"):
                 continue
@@ -249,64 +250,30 @@ def semantic_layer(view: DbtProjectView) -> SemanticLayer:
 
     semantic_models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
-    for parsed, path in _yaml_documents(view):
-        semantic_models.extend(
-            _semantic_model_def(entry, path)
-            for entry in parsed.get("semantic_models") or []
-            if isinstance(entry, dict) and entry.get("name")
-        )
-        metrics.extend(
-            _metric_def(entry, path)
-            for entry in parsed.get("metrics") or []
-            if isinstance(entry, dict) and entry.get("name")
-        )
+    for kind, entry, path in semantic_yaml_entries(view):
+        if kind == "semantic_model":
+            semantic_models.append(_semantic_model_def(entry, path))
+        else:
+            metrics.append(_metric_def(entry, path))
     return SemanticLayer(semantic_models=semantic_models, metrics=metrics)
 
 
 # --- helpers -----------------------------------------------------------------
 
 
-def _yaml_documents(view: DbtProjectView) -> list[tuple[dict[str, Any], str]]:
-    documents: list[tuple[dict[str, Any], str]] = []
-    for source in view.files.values():
-        if not source.path.endswith((".yml", ".yaml")):
-            continue
-        try:
-            parsed = yaml.safe_load(source.content)
-        except yaml.YAMLError:
-            continue  # a broken hand-written file is not this command's problem
-        if isinstance(parsed, dict):
-            documents.append((parsed, source.path))
-    return documents
-
-
 def _definition_hash(entry: dict[str, Any]) -> str:
     return content_hash(json.dumps(entry, sort_keys=True, default=str))
 
 
-def _physical_column(entry: Any) -> str | None:
-    """The single physical column a dimension/entity/measure references, if any."""
-
-    if not isinstance(entry, dict):
-        return None
-    expr = entry.get("expr")
-    if expr is None:
-        name = entry.get("name")
-        return name if isinstance(name, str) else None
-    if isinstance(expr, str) and _BARE_IDENTIFIER.fullmatch(expr.strip()):
-        return expr.strip()
-    return None
-
-
 def _semantic_model_def(entry: dict[str, Any], path: str) -> SemanticModelDef:
-    model_match = _REF_PATTERN.search(str(entry.get("model", "")))
+    model_match = REF_PATTERN.search(str(entry.get("model", "")))
     dimensions = [d for d in entry.get("dimensions") or [] if isinstance(d, dict)]
     measures = [m for m in entry.get("measures") or [] if isinstance(m, dict)]
     entities = [e for e in entry.get("entities") or [] if isinstance(e, dict)]
 
     def mapping_of(entries: list[dict[str, Any]]) -> dict[str, str | None]:
         return {
-            e["name"]: _physical_column(e)
+            e["name"]: physical_column(e)
             for e in entries
             if isinstance(e.get("name"), str)
         }
@@ -334,31 +301,7 @@ def _semantic_model_def(entry: dict[str, Any], path: str) -> SemanticModelDef:
 
 
 def _metric_def(entry: dict[str, Any], path: str) -> MetricDef:
-    metric_type = str(entry.get("type", "")).lower()
-    params = entry.get("type_params")
-    params = params if isinstance(params, dict) else {}
-    measures: list[str] = []
-    metrics: list[str] = []
-
-    def add(bucket: list[str], value: Any) -> None:
-        if isinstance(value, str):
-            bucket.append(value)
-        elif isinstance(value, dict) and isinstance(value.get("name"), str):
-            bucket.append(value["name"])
-
-    if metric_type in {"simple", "cumulative"}:
-        add(measures, params.get("measure"))
-    elif metric_type == "ratio":
-        add(metrics, params.get("numerator"))
-        add(metrics, params.get("denominator"))
-    elif metric_type == "derived":
-        for input_metric in params.get("metrics") or []:
-            add(metrics, input_metric)
-    elif metric_type == "conversion":
-        conversion = params.get("conversion_type_params")
-        if isinstance(conversion, dict):
-            add(measures, conversion.get("base_measure"))
-            add(measures, conversion.get("conversion_measure"))
+    measures, metrics = metric_inputs(entry)
     return MetricDef(
         name=entry["name"],
         path=path,

@@ -11,12 +11,22 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import write_manifest
 
-from exmergo_dex_core.cache import ColumnProfile, Dataset
+from exmergo_dex_core.cache import (
+    ColumnProfile,
+    Dataset,
+    DexStore,
+    Relationship,
+    RelationshipKind,
+)
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
+from exmergo_dex_core.explore.commands import _merge_relationships
 from exmergo_dex_core.explore.relationships import (
     candidate_keys,
     data_quality_notes,
+    declared_relationships,
     detect_grain,
     fk_candidate_count,
     fold_replica_relationships,
@@ -554,6 +564,66 @@ def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):
     assert rel["confidence"] < 0.5, "measured non-containment demotes the guess"
 
 
+def test_relationships_persists_datasets_and_relationships(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """The profiles and inference this run already paid for land in the cache,
+    in the same annotated shape a `map`-written cache has."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert payload["data"]["cache_path"].endswith("cache.json")
+    assert payload["data"]["updated_at"]
+
+    cache = DexStore(repo).load_cache()
+    names = {d.identifier.split(".")[-1] for d in cache.datasets}
+    assert names == {"RAW_HOSTS", "RAW_LISTINGS", "RAW_REVIEWS"}
+    assert all(d.columns for d in cache.datasets)
+    listings = next(d for d in cache.datasets if d.identifier.endswith(".RAW_LISTINGS"))
+    assert listings.grain == ["ID"], "grain-annotated before persisting, like map"
+    assert len(cache.relationships) == len(payload["data"]["relationships"]) == 2
+
+
+def test_relationships_then_query_succeeds(airbnb_duckdb: Path, tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run(
+        [
+            "explore",
+            "relationships",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    payload = _run(
+        [
+            "explore",
+            "query",
+            "SELECT COUNT(*) AS n FROM RAW_REVIEWS",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert payload["data"]["cells"] == [[2]]
+
+
 def test_empty_result_is_explained_not_silent(tmp_path: Path, capsys):
     duckdb = pytest.importorskip("duckdb")
     path = tmp_path / "flat.duckdb"
@@ -594,3 +664,262 @@ def test_overlap_probe_transpiles_to_postgres_and_stays_select_only():
     # Portable shapes survive the rewrite; DuckDB-only FILTER syntax does not
     # appear (BigQuery lacks it and Postgres parses it differently).
     assert "order_items" in sql and "products" in sql
+
+
+# --- declared joins from the dbt project -----------------------------------------
+
+
+def _defs(foreign_keys) -> ProjectDefinitions:
+    return ProjectDefinitions(present=True, foreign_keys=foreign_keys)
+
+
+def _fk(
+    model, column, to_model, to_column, relation=None, to_relation=None, source="yaml"
+):
+    return DeclaredForeignKey(
+        model=model,
+        relation=relation,
+        column=column,
+        to_model=to_model,
+        to_relation=to_relation,
+        to_column=to_column,
+        source=source,
+    )
+
+
+def test_declared_resolves_manifest_relation_across_database_alias():
+    # The manifest says database "analytics"; the adapter normalized the same
+    # objects under the DuckDB file stem "wh". The schema.table suffix pins them.
+    defs = _defs(
+        [
+            _fk(
+                "orders",
+                "customer_id",
+                "customers",
+                "id",
+                relation="analytics.main.orders",
+                to_relation="analytics.main.customers",
+                source="manifest",
+            )
+        ]
+    )
+    known = ["wh.main.orders", "wh.main.customers"]
+    rels, notes = declared_relationships(defs, known)
+    assert notes == []
+    (rel,) = rels
+    assert rel.from_dataset == "wh.main.orders"
+    assert rel.to_dataset == "wh.main.customers"
+    assert rel.from_columns == ["customer_id"] and rel.to_columns == ["id"]
+    assert rel.kind.value == "declared"
+    assert rel.confidence == 1.0
+
+
+def test_declared_yaml_fallback_resolves_by_model_name():
+    defs = _defs([_fk("orders", "customer_id", "customers", "id")])
+    rels, notes = declared_relationships(defs, ["wh.main.orders", "wh.main.customers"])
+    assert notes == []
+    (rel,) = rels
+    assert rel.from_dataset == "wh.main.orders"
+
+
+def test_declared_ambiguous_match_is_skipped_with_a_note():
+    defs = _defs([_fk("orders", "customer_id", "customers", "id")])
+    known = ["wh.a.orders", "wh.b.orders", "wh.main.customers"]
+    rels, notes = declared_relationships(defs, known)
+    assert rels == []
+    assert any("more than one object" in n for n in notes)
+
+
+def test_declared_missing_relation_is_a_note_not_an_edge():
+    defs = _defs([_fk("orders", "payment_id", "payments", "id")])
+    rels, notes = declared_relationships(defs, ["wh.main.orders"])
+    assert rels == []
+    (note,) = notes
+    assert "payments.id" in note and "not in this connection's inventory" in note
+
+
+def test_declared_duplicate_edges_are_deduped():
+    fk = _fk("orders", "customer_id", "customers", "id")
+    defs = _defs([fk, fk.model_copy()])
+    rels, _ = declared_relationships(defs, ["wh.main.orders", "wh.main.customers"])
+    assert len(rels) == 1
+
+
+def test_merge_keeps_declared_over_matching_inferred():
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    same_inferred = Relationship(
+        from_dataset="WH.MAIN.ORDERS",
+        from_columns=["CUSTOMER_ID"],
+        to_dataset="wh.main.customers",
+        to_columns=["ID"],
+        confidence=0.85,
+    )
+    other = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["host_id"],
+        to_dataset="wh.main.hosts",
+        to_columns=["id"],
+        confidence=0.6,
+    )
+    merged, confirmed = _merge_relationships([declared], [same_inferred, other])
+    assert confirmed == 1
+    assert merged == [declared, other]
+
+
+def _declared_join_repo(tmp_path: Path, *, with_manifest: bool) -> tuple[Path, Path]:
+    """A DuckDB warehouse plus a dbt project declaring orders -> customers."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1), (2, 2), (3, 1)")
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: customer_id\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('customers')\n"
+        "              field: id\n",
+        encoding="utf-8",
+    )
+    if with_manifest:
+        # The manifest's database component ("analytics") deliberately differs
+        # from the adapter-normalized file stem ("wh"): resolution must absorb it.
+        write_manifest(
+            repo,
+            models={
+                "orders": '"analytics"."main"."orders"',
+                "customers": '"analytics"."main"."customers"',
+            },
+            relationship_tests=[("orders", "customer_id", "ref('customers')", "id")],
+        )
+    return db, repo
+
+
+def test_relationships_envelope_reports_declared_join(tmp_path: Path, capsys):
+    db, repo = _declared_join_repo(tmp_path, with_manifest=True)
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["declared_count"] == 1
+    declared = [r for r in data["relationships"] if r["kind"] == "declared"]
+    (rel,) = declared
+    assert rel["from_dataset"] == "wh.main.orders"
+    assert rel["confidence"] == 1.0
+    # Inference finds the same edge; the merge keeps only the declared one.
+    assert not any(
+        r["kind"] == "inferred"
+        and r["from_columns"] == ["customer_id"]
+        and r["to_dataset"] == "wh.main.customers"
+        for r in data["relationships"]
+    )
+    assert any("match declared tests" in n for n in data["notes"])
+
+
+def test_relationships_envelope_yaml_fallback_and_note(tmp_path: Path, capsys):
+    db, repo = _declared_join_repo(tmp_path, with_manifest=False)
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["declared_count"] == 1
+    assert any("name-based" in n for n in data["notes"])
+
+
+def test_relationships_envelope_notes_stale_manifest(tmp_path: Path, capsys):
+    db, repo = _declared_join_repo(tmp_path, with_manifest=False)
+    write_manifest(
+        repo,
+        models={
+            "orders": '"analytics"."main"."orders"',
+            "customers": '"analytics"."main"."customers"',
+        },
+        relationship_tests=[("orders", "customer_id", "ref('customers')", "id")],
+        generated_at="2020-01-01T00:00:00Z",
+    )
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert any("older than the model sources" in n for n in payload["data"]["notes"])
+
+
+def test_relationships_envelope_unresolved_declared_is_a_signal(tmp_path: Path, capsys):
+    db, repo = _declared_join_repo(tmp_path, with_manifest=False)
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: payment_id\n"
+        "        tests:\n"
+        "          - relationships:\n"
+        "              to: ref('payments')\n"
+        "              field: id\n",
+        encoding="utf-8",
+    )
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["declared_count"] == 0
+    notes = data["notes"]
+    assert any("no declared relationships resolved" in n for n in notes)
+    assert any("not in this connection's inventory" in n for n in notes)

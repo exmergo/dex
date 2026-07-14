@@ -13,7 +13,6 @@ work without a dbt project).
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 from ..adapters.base import Adapter
 from ..cache import (
@@ -21,7 +20,9 @@ from ..cache import (
     Dataset,
     Relationship,
     RelationshipKind,
+    match_identifier,
 )
+from ..dbt_project import ProjectDefinitions
 from .profile import NEAR_UNIQUE_RATIO
 
 # Warehouse-layer prefixes stripped from a table name before entity matching, so
@@ -380,18 +381,18 @@ def _overlap_probe_sql(rel: Relationship) -> str:
     fk = _quote_part(rel.from_columns[0])
     key = _quote_part(rel.to_columns[0])
     # Aggregate-only by construction: two counts, no value in the projection.
-    # NOT EXISTS keeps the orphan count correct even when the parent key is not
-    # unique (a join would fan out and inflate it). Deliberately portable SQL:
-    # CASE inside COUNT rather than FILTER (which BigQuery lacks and sqlglot
-    # does not rewrite), with the EXISTS in a subselect so every dialect plans
-    # it as an anti-join.
+    # A LEFT JOIN against the DISTINCT parent keys keeps the orphan count
+    # correct even when the parent key is not unique (a bare join would fan
+    # out and inflate it). Deliberately portable SQL: CASE inside COUNT
+    # rather than FILTER (which BigQuery lacks and sqlglot does not rewrite),
+    # and a join rather than a projected NOT EXISTS, which Redshift refuses
+    # outright (XX000: correlated subquery pattern not supported).
     return (
-        f"SELECT COUNT(probe.fk) AS nonnull_fk, "  # noqa: S608
-        f"COUNT(CASE WHEN probe.orphan THEN 1 END) AS orphans FROM ("
-        f"SELECT c.{fk} AS fk, "
-        f"c.{fk} IS NOT NULL AND NOT EXISTS ("
-        f"SELECT 1 FROM {parent} p WHERE p.{key} = c.{fk}) AS orphan "
-        f"FROM {child} c) probe"
+        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
+        f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d.pk IS NULL THEN 1 END) "
+        f"AS orphans "
+        f"FROM {child} c LEFT JOIN ("
+        f"SELECT DISTINCT {key} AS pk FROM {parent}) d ON d.pk = c.{fk}"
     )
 
 
@@ -419,20 +420,82 @@ def _quote_part(name: str) -> str:
     return f'"{escaped}"'
 
 
-def declared_relationships(repo_root: Path | str = ".") -> list[Relationship]:
-    """Declared joins from the dbt project. Returns empty when there is no dbt
-    project (the common explore-without-dbt case), which is not an error."""
+def declared_relationships(
+    defs: ProjectDefinitions, known_identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """Declared joins from the dbt project, resolved against this connection's
+    identifiers.
 
-    root = Path(repo_root)
-    has_project = (root / "dbt_project.yml").is_file() or (
-        root / "target" / "manifest.json"
-    ).is_file()
-    if not has_project:
-        return []
-    # Parsing declared relationships from the manifest lands with the dbt_project
-    # reader (transform phase). Until then, a present-but-unparsed project yields
-    # no declared joins rather than guessing.
-    return []
+    A ``relationships`` test is the project's own statement of a foreign key, so
+    every resolvable one is emitted at confidence 1.0. Resolution never guesses:
+    an endpoint matching nothing or matching more than one object yields a note
+    instead of an edge (a declared relation missing from the connection is a
+    drift signal worth surfacing, not an error). Empty definitions (the common
+    explore-without-dbt case) yield nothing.
+    """
+
+    relationships: list[Relationship] = []
+    notes: list[str] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for fk in defs.foreign_keys:
+        child, child_ambiguous = resolve_declared(
+            fk.relation, fk.model, known_identifiers
+        )
+        parent, parent_ambiguous = resolve_declared(
+            fk.to_relation, fk.to_model, known_identifiers
+        )
+        label = f"declared join {fk.model}.{fk.column} -> {fk.to_model}.{fk.to_column}"
+        if child is None or parent is None:
+            if child_ambiguous or parent_ambiguous:
+                notes.append(
+                    f"{label} matches more than one object here; skipped rather "
+                    "than guessed"
+                )
+            else:
+                notes.append(
+                    f"{label} references a relation not in this connection's inventory"
+                )
+            continue
+        key = (child.lower(), fk.column.lower(), parent.lower(), fk.to_column.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append(
+            Relationship(
+                from_dataset=child,
+                from_columns=[fk.column],
+                to_dataset=parent,
+                to_columns=[fk.to_column],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+            )
+        )
+    return relationships, notes
+
+
+def resolve_declared(
+    relation: str | None, name: str, known: list[str]
+) -> tuple[str | None, bool]:
+    """One declared endpoint as a unique known identifier, or why not.
+
+    Tries the most specific form first (the manifest's quote-stripped
+    ``db.schema.table``, or the model / ``source.table`` name from YAML), then
+    progressively shorter dotted suffixes: the manifest's database component
+    routinely disagrees with the adapter-normalized identifier (a DuckDB file
+    stem, a profile database alias), while the suffix still pins the object.
+    Returns ``(identifier, False)`` on a unique match, ``(None, True)`` when a
+    suffix matched several objects (shorter suffixes only widen, so stop), and
+    ``(None, False)`` when nothing matched at all.
+    """
+
+    parts = (relation or name).split(".")
+    for start in range(len(parts)):
+        matches = match_identifier(".".join(parts[start:]), known)
+        if len(matches) == 1:
+            return matches[0], False
+        if len(matches) > 1:
+            return None, True
+    return None, False
 
 
 def _match_parent(

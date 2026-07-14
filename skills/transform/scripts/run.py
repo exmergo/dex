@@ -45,7 +45,14 @@ DEX_CORE_VERSION = "1.1.1"
 # extras share names, so this is the identity set today. An unknown or unset
 # connector falls back to the light DuckDB on-ramp and lets the installed engine
 # emit the canonical error rather than the wrapper guessing wrong.
-_KNOWN_CONNECTORS = ("duckdb", "snowflake", "bigquery", "databricks", "postgres")
+_KNOWN_CONNECTORS = (
+    "duckdb",
+    "snowflake",
+    "bigquery",
+    "databricks",
+    "postgres",
+    "redshift",
+)
 _DEFAULT_CONNECTOR = "duckdb"
 
 

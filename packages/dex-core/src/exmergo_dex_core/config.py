@@ -151,6 +151,44 @@ class PostgresTarget(BaseModel):
     max_full_profile_bytes: int | None = None
 
 
+class RedshiftTarget(BaseModel):
+    """Non-secret Amazon Redshift connection target. Credentials are never
+    here: auth is discovered at runtime by connect.py (the AWS default
+    credential chain for IAM temporary database credentials, REDSHIFT_*
+    environment variables, or a dbt profile), and passwords or keys are never
+    written or logged.
+
+    ``workgroup`` pins the Redshift Serverless workgroup: with it set, IAM
+    auth resolves the endpoint and temporary database credentials from the
+    AWS credential chain, and RPU translation reads the workgroup's base
+    capacity. ``cluster_identifier`` is the provisioned-cluster analogue for
+    IAM auth. ``aws_profile`` pins a named ``~/.aws`` profile; unset means
+    the chain's default. ``host``/``port``/``dbname``/``user`` are an
+    optional committed non-secret target for native password auth (password
+    supplied by REDSHIFT_PASSWORD, never by this config). ``schemas`` is a
+    source allowlist of schema names inside the connected database; empty
+    means every non-system schema the user can see. ``dev_schema`` is where
+    dbt dev builds write, and is refused as a source so reads and writes
+    never share a schema. ``rpu_price_usd`` is the region-specific dollar
+    price of one RPU-hour; set it to see dollar figures next to the RPU
+    translation (it varies by region and contract, so dex never guesses).
+    There is no sampled-profiling threshold: Redshift has no TABLESAMPLE, so
+    the budget is the only bound on profiling cost.
+    """
+
+    workgroup: str | None = None
+    cluster_identifier: str | None = None
+    aws_profile: str | None = None
+    region: str | None = None
+    host: str | None = None
+    port: int | None = None
+    dbname: str | None = None
+    user: str | None = None
+    schemas: list[str] = Field(default_factory=list)
+    dev_schema: str | None = None
+    rpu_price_usd: float | None = None
+
+
 class QueryLimits(BaseModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
@@ -174,6 +212,7 @@ class DexConfig(BaseModel):
     snowflake: SnowflakeTarget | None = None
     databricks: DatabricksTarget | None = None
     postgres: PostgresTarget | None = None
+    redshift: RedshiftTarget | None = None
     dbt_target: str | None = None
     # Pins the dbt project directory (relative to the repo root) when discovery
     # would be ambiguous; by default the project is located automatically.

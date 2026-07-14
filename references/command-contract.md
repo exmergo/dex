@@ -155,6 +155,20 @@ inferred join with one aggregate overlap probe (non-null foreign keys, orphan
 count) and adjusts its confidence; the result carries `verified` and
 `orphan_fraction`.
 
+Exploration starts bare: by default the warehouse is observed as-is, and a dbt
+project in the repo earns only a discovery note. `explore profile`,
+`explore relationships`, and `explore map` accept `--use-project`, which folds
+the project's declared definitions into the result: `relationships` tests
+become declared joins at confidence 1.0 (resolved against the connection's
+inventory; a declared join that matches nothing or more than one object is
+reported in `notes`, never guessed, and a declared edge wins over the same
+inferred one), a semantic model's primary entity overrides the heuristic grain
+(disagreements and contradicted `unique` tests land in `data_quality`), and
+models reachable from metric definitions rank higher alongside the configured
+`ranking_hints`. The compiled manifest resolves names exactly when present;
+an uncompiled project falls back to name-based resolution and says so. A
+stale manifest (older than the model sources) is noted, not trusted silently.
+
 `explore map` never caps silently: past 50 objects it profiles the top
 `profile_top_n` (default 25) by rank and announces the cutoff in `notes`
 alongside `skipped_count` (`--full` profiles everything). Objects skipped on a

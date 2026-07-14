@@ -4,7 +4,8 @@ Each ``cmd_*`` opens the adapter, drives the explore engine, and shapes the resu
 into the sanitized envelope. Keeping this here (not in ``cli.py``) keeps dispatch
 thin and keeps ``map``'s composition (it runs inventory, profile, and relationships
 together) out of the CLI layer. These are the only explore commands that hold an
-adapter; ``map`` is the only one that writes, and only to the ``.dex/`` cache.
+adapter; ``map``, ``profile``, and ``relationships`` all persist what they learned,
+and only to the ``.dex/`` cache, so a scan is never paid for twice.
 """
 
 from __future__ import annotations
@@ -12,12 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
-from .. import command_args
+from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
-from ..cache import Dataset, DexCache, DexStore, match_identifier
+from ..cache import Dataset, DexCache, DexStore, Relationship, match_identifier
 from ..config import DexConfig, QueryLimits, load_config
 from ..guards.query_firewall import (
     InspectedQuery,
@@ -83,6 +85,9 @@ def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
 
 
 def cmd_profile(args: argparse.Namespace) -> env.Envelope:
+    repo_root = command_args.repo_root(args)
+    config = load_config(repo_root) or DexConfig()
+    defs = _project_definitions(args, config)
     adapter = command_args.open_from_args(args)
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
@@ -93,18 +98,38 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         if unconfirmed is not None:
             return unconfirmed
         datasets = profile_mod.profile(adapter, identifiers)
+        connector = adapter.name
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
-    _annotate_grain(datasets)
-    envelope.data["datasets"] = [d.model_dump(mode="json") for d in datasets]
+    _annotate_grain(datasets, defs)
+
+    # Persist what the scan already paid for: after profiling a table, `explore
+    # query` on that table must work without a second warehouse scan (the query
+    # firewall's own refusal messages promise exactly this). Prior relationships
+    # are preserved because profile runs no inference pass.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    cache, stats = _merge_profiles(store.load_cache(), datasets, connector, now)
+    path = store.save_cache(cache, now=now)
+
+    envelope.data.update(
+        {
+            "datasets": [d.model_dump(mode="json") for d in datasets],
+            "cache_path": str(path),
+            "updated_at": now.isoformat(),
+            "notes": [_persist_note(stats, len(datasets), keeps_relationships=True)],
+        }
+    )
     return envelope
 
 
 def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     verify = getattr(args, "verify", False)
-    config = load_config(command_args.repo_root(args)) or DexConfig()
+    repo_root = command_args.repo_root(args)
+    config = load_config(repo_root) or DexConfig()
+    defs = _project_definitions(args, config)
 
     adapter = command_args.open_from_args(args)
     try:
@@ -134,6 +159,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         if unconfirmed is not None:
             return unconfirmed
         datasets = profile_mod.profile(adapter, identifiers)
+        connector = adapter.name
         inferred = rel_mod.infer_relationships(datasets)
         if verify:
             rel_mod.verify_relationships(
@@ -143,19 +169,44 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    # Annotate before persisting so cached datasets carry candidate_keys and
+    # grain, the same shape a `map`-written cache has.
+    _annotate_grain(datasets, defs)
 
-    declared = rel_mod.declared_relationships(command_args.repo_root(args))
-    rels = declared + inferred
-    notes = _relationship_notes(datasets, declared, inferred)
+    declared, declared_notes = rel_mod.declared_relationships(
+        defs, [d.identifier for d in datasets]
+    )
+    rels, confirmed = _merge_relationships(declared, inferred)
+    notes = _relationship_notes(datasets, declared, inferred, defs)
+    notes.extend(declared_notes)
+    notes.extend(defs.notes)
+    if confirmed:
+        notes.append(
+            f"{confirmed} inferred join(s) match declared tests; kept as declared"
+        )
     if verify and inferred:
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
+
+    # Persist the profiles this run already paid for. Because relationships
+    # inventories and profiles the full set and infers across all of it, its
+    # relationship set is authoritative for this run and replaces the prior one.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    cache, stats = _merge_profiles(
+        store.load_cache(), datasets, connector, now, relationships=rels
+    )
+    path = store.save_cache(cache, now=now)
+    notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
+
     envelope.data.update(
         {
             "relationships": [r.model_dump(mode="json") for r in rels],
             "declared_count": len(declared),
-            "inferred_count": len(inferred),
+            "inferred_count": len(rels) - len(declared),
+            "cache_path": str(path),
+            "updated_at": now.isoformat(),
             "notes": notes,
         }
     )
@@ -246,6 +297,8 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
 def cmd_map(args: argparse.Namespace) -> env.Envelope:
     repo_root = command_args.repo_root(args)
     config = load_config(repo_root) or DexConfig()
+    defs = _project_definitions(args, config)
+    hints = _merged_hints(config.ranking_hints, defs.metric_models)
     full = getattr(args, "full", False)
 
     adapter = command_args.open_from_args(args)
@@ -253,7 +306,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         metas = inventory_mod.inventory(adapter)
         # First-pass rank on cheap signals (no connectivity yet) to choose what to
         # profile; re-ranked with connectivity once relationships are known.
-        first_pass = rank_mod.rank(metas, None, config.ranking_hints)
+        first_pass = rank_mod.rank(metas, None, hints)
         selected = _select_for_profiling(metas, first_pass, config, full)
         # Inventory and ranking are free, so an unconfirmed billed run repeats
         # them on re-issue; only the profiling scans below need the handshake.
@@ -273,7 +326,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         if unconfirmed is not None:
             return unconfirmed
         profiled = profile_mod.profile(adapter, [m.identifier for m in selected])
-        _annotate_grain(profiled)
+        _annotate_grain(profiled, defs)
         inferred = rel_mod.infer_relationships(profiled)
         if getattr(args, "verify", False):
             rel_mod.verify_relationships(
@@ -293,6 +346,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             config.snowflake.dev_schema if config.snowflake else None,
             config.databricks.dev_schema if config.databricks else None,
             config.postgres.dev_schema if config.postgres else None,
+            config.redshift.dev_schema if config.redshift else None,
         ]
         if name
     )
@@ -300,15 +354,17 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         profiled, inferred, dev_schemas
     )
 
-    declared = rel_mod.declared_relationships(repo_root)
-    relationships = declared + inferred
+    declared, declared_notes = rel_mod.declared_relationships(
+        defs, [m.identifier for m in metas]
+    )
+    relationships, confirmed = _merge_relationships(declared, inferred)
 
     store = DexStore(repo_root)
     now = datetime.now(UTC)
     prior = store.load_cache()
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
-    final_scores = rank_mod.rank(metas, relationships, config.ranking_hints)
+    final_scores = rank_mod.rank(metas, relationships, hints)
     datasets, carried = _compose_datasets(metas, profiled, final_scores, reusable)
 
     cache = DexCache(datasets=datasets, relationships=relationships)
@@ -320,7 +376,19 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     )
     path = store.save_cache(cache, now=now)
 
-    notes = _relationship_notes(profiled, declared, inferred)
+    notes = _relationship_notes(profiled, declared, inferred, defs)
+    notes.extend(declared_notes)
+    notes.extend(defs.notes)
+    if confirmed:
+        notes.append(
+            f"{confirmed} inferred join(s) match declared tests; kept as declared"
+        )
+    metric_hint_count = len(hints) - len(config.ranking_hints)
+    if metric_hint_count > 0:
+        notes.append(
+            f"{metric_hint_count} model(s) back metric definitions; ranking "
+            "favors them alongside configured hints"
+        )
     skipped = len(metas) - len(profiled)
     if skipped > 0:
         notes.append(
@@ -420,22 +488,149 @@ def _shape_query_payload(
     }
 
 
-def _annotate_grain(datasets: list[Dataset]) -> None:
+def _project_definitions(
+    args: argparse.Namespace, config: DexConfig
+) -> dbt_project.ProjectDefinitions:
+    """The dbt project's declared definitions, honoring the config pin.
+
+    Exploration starts bare: warehouse observations stay independent of
+    whatever repo dex happens to run from, so the declared definitions fold in
+    only when ``--use-project`` asks for them. Without the flag, a present
+    project earns a discovery note instead of influence. With it, a repo
+    without a project (or with an ambiguous choice) degrades to the empty
+    view, so explore keeps working on raw warehouses.
+    """
+
+    repo_root = command_args.repo_root(args)
+    if not getattr(args, "use_project", False):
+        defs = dbt_project.ProjectDefinitions()
+        discovered = dbt_project.discover_projects(repo_root)
+        if discovered:
+            # project_dir marks "found but unused" so the empty-declared note
+            # can say so instead of claiming there is no project.
+            defs.project_dir = str(discovered[0])
+            defs.notes.append(
+                "a dbt project is present but unused; pass --use-project to "
+                "fold its declared joins, grain, and metric definitions into "
+                "exploration"
+            )
+        return defs
+    pin = Path(repo_root) / config.dbt_project_dir if config.dbt_project_dir else None
+    return dbt_project.definitions(repo_root, pin)
+
+
+def _merge_relationships(
+    declared: list[Relationship], inferred: list[Relationship]
+) -> tuple[list[Relationship], int]:
+    """Declared joins win over the same inferred edge.
+
+    Returns the merged list plus how many inferred edges the declared set
+    absorbed: inference independently agreeing with a declared test is worth a
+    note, and double-reporting the edge would inflate connectivity ranking.
+    """
+
+    def edge_key(rel: Relationship) -> tuple:
+        return (
+            rel.from_dataset.lower(),
+            tuple(c.lower() for c in rel.from_columns),
+            rel.to_dataset.lower(),
+            tuple(c.lower() for c in rel.to_columns),
+        )
+
+    declared_keys = {edge_key(rel) for rel in declared}
+    merged = list(declared)
+    confirmed = 0
+    for rel in inferred:
+        if edge_key(rel) in declared_keys:
+            confirmed += 1
+            continue
+        merged.append(rel)
+    return merged, confirmed
+
+
+def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
+    """User-configured ranking hints plus the models metric definitions ground
+    in. User hints come first and are never displaced; metric-backed models are
+    appended so the naming signal favors what the project measures."""
+
+    merged = list(user_hints)
+    seen = {h.strip().lower() for h in user_hints if isinstance(h, str)}
+    for model in metric_models:
+        if model.lower() not in seen:
+            merged.append(model)
+            seen.add(model.lower())
+    return merged
+
+
+def _annotate_grain(
+    datasets: list[Dataset], defs: dbt_project.ProjectDefinitions | None = None
+) -> None:
     """Attach the interpretation layer to raw profiles: candidate keys, the likely
     grain, and the data-quality warnings an analyst would write (non-unique own
     key, unknown grain). Shared by profile and map so a single-table profile
-    surfaces a broken grain without requiring a full map."""
+    surfaces a broken grain without requiring a full map.
+
+    With project definitions, the declared truth refines the heuristics: a
+    semantic model's primary entity overrides the detected grain (noting any
+    disagreement), and a profiled column contradicting its declared ``unique``
+    test gets a data-quality note. ``candidate_keys`` stays measurement-only:
+    an unmeasured declared key is a claim, and the cache is a drift baseline.
+    """
+
+    declared_grain: dict[str, str] = {}
+    declared_unique: dict[str, set[str]] = {}
+    if defs is not None and (defs.primary_entities or defs.declared_keys):
+        identifiers = [d.identifier for d in datasets]
+        for model, column in defs.primary_entities.items():
+            ident, _ambiguous = rel_mod.resolve_declared(
+                defs.model_relations.get(model), model, identifiers
+            )
+            if ident is not None:
+                declared_grain[ident.lower()] = column
+        for key in defs.declared_keys:
+            if not key.unique:
+                continue
+            ident, _ambiguous = rel_mod.resolve_declared(
+                key.relation, key.model, identifiers
+            )
+            if ident is not None:
+                declared_unique.setdefault(ident.lower(), set()).add(key.column.lower())
 
     for ds in datasets:
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
         ds.data_quality.extend(rel_mod.data_quality_notes(ds))
 
+        grain_column = declared_grain.get(ds.identifier.lower())
+        if grain_column is not None:
+            profiled = next(
+                (c for c in ds.columns if c.name.lower() == grain_column.lower()),
+                None,
+            )
+            if profiled is not None:
+                declared = [profiled.name]
+                if ds.grain and ds.grain != declared:
+                    ds.data_quality.append(
+                        f"grain {profiled.name} comes from the project's declared "
+                        f"primary entity (heuristic suggested {', '.join(ds.grain)})"
+                    )
+                ds.grain = declared
+        for col in ds.columns:
+            if (
+                col.name.lower() in declared_unique.get(ds.identifier.lower(), set())
+                and col.is_unique is False
+            ):
+                ds.data_quality.append(
+                    f"{col.name} is declared unique in the dbt project but "
+                    "profiling found duplicates"
+                )
+
 
 def _relationship_notes(
     datasets: list[Dataset],
     declared: list,
     inferred: list,
+    defs: dbt_project.ProjectDefinitions | None = None,
 ) -> list[str]:
     """Explain the inference result so an empty array is distinguishable from
     'no relationships exist': what was examined and why nothing survived."""
@@ -446,9 +641,16 @@ def _relationship_notes(
         f"across {len(datasets)} profiled object(s)"
     ]
     if not declared:
-        notes.append(
-            "no declared relationships (no dbt project or no declared foreign keys)"
-        )
+        if defs is not None and defs.present and defs.foreign_keys:
+            # The project declares foreign keys, but none resolved here; the
+            # per-join notes from resolution say which and why.
+            notes.append("no declared relationships resolved against this connection")
+        elif defs is not None and not defs.present and defs.project_dir:
+            notes.append("no declared relationships (dbt project present but unused)")
+        else:
+            notes.append(
+                "no declared relationships (no dbt project or no declared foreign keys)"
+            )
     if fk_columns and not inferred:
         notes.append(
             "no id-shaped column matched a parent table by name; joins may exist "
@@ -513,6 +715,99 @@ def _compose_datasets(
         ds.rank_score = scores.get(meta.identifier)
         datasets.append(ds)
     return datasets, carried
+
+
+# Sentinel: preserve the prior cache's relationships (profile has no inference
+# pass, so it has no business touching them).
+_KEEP_RELATIONSHIPS = object()
+
+
+def _merge_profiles(
+    prior: DexCache | None,
+    profiled: list[Dataset],
+    connector: str,
+    now: datetime,
+    *,
+    relationships=_KEEP_RELATIONSHIPS,
+) -> tuple[DexCache, dict]:
+    """Fold freshly profiled datasets into a prior cache, keyed by identifier.
+
+    Unlike ``_compose_datasets`` (inventory-driven: it iterates metas and
+    manufactures inventory-only stubs), this merges over prior datasets plus
+    the freshly profiled set and never fabricates stubs or drops prior entries.
+
+    A same-connector prior is reusable; a mismatched-connector prior is dropped
+    wholesale (mirrors ``cmd_map``'s reuse gate: mixing connectors would poison
+    the PII policy and the maintain baseline, and `.dex/` is non-canonical
+    scratch that one `explore map` rebuilds). A refreshed dataset carries
+    forward the prior ``rank_score``, because profile and relationships do not
+    compute rank. Relationships are preserved by default (profile) or replaced
+    with the passed set (relationships, whose full-inventory inference is
+    authoritative for its run).
+    """
+
+    reusable = prior if prior and prior.provenance.connector == connector else None
+    by_id = {d.identifier: d for d in profiled}
+    datasets: list[Dataset] = []
+    consumed: set[str] = set()
+    if reusable is not None:
+        for old in reusable.datasets:
+            fresh = by_id.get(old.identifier)
+            if fresh is not None:
+                fresh.rank_score = old.rank_score  # keep map's connectivity ranking
+                datasets.append(fresh)
+                consumed.add(old.identifier)
+            else:
+                datasets.append(old)  # untouched; keeps its older profiled_at
+    # Anything left over is newly profiled and inserted; rank_score stays None.
+    datasets.extend(ds for ds in profiled if ds.identifier not in consumed)
+    if relationships is _KEEP_RELATIONSHIPS:
+        rels = list(reusable.relationships) if reusable else []
+    else:
+        rels = relationships
+    cache = DexCache(datasets=datasets, relationships=rels)
+    cache.provenance.connector = connector
+    cache.provenance.created_at = (
+        reusable.provenance.created_at
+        if reusable and reusable.provenance.created_at
+        else now.isoformat()
+    )
+    stats = {
+        "connector": connector,
+        "merged": reusable is not None,
+        "refreshed": len(consumed),
+        "added": len(profiled) - len(consumed),
+        "replaced_connector": (
+            prior.provenance.connector if prior and reusable is None else None
+        ),
+    }
+    return cache, stats
+
+
+def _persist_note(stats: dict, count: int, *, keeps_relationships: bool) -> str:
+    """One sentence saying what the cache write did, driven by merge stats."""
+
+    if stats["replaced_connector"]:
+        return (
+            f"prior cache was built for connector '{stats['replaced_connector']}'; "
+            f"profiling on '{stats['connector']}' replaced it with a fresh cache "
+            f"of the {count} profiled object(s); run `explore map` to rebuild "
+            "the full landscape"
+        )
+    if stats["merged"]:
+        preserved = (
+            "other datasets and relationships preserved"
+            if keeps_relationships
+            else "other datasets preserved"
+        )
+        return (
+            f"merged {count} profiled object(s) into the existing cache "
+            f"({stats['refreshed']} refreshed, {stats['added']} added); {preserved}"
+        )
+    return (
+        f"created .dex/cache.json with {count} profiled object(s); run "
+        "`explore map` to add the full inventory and relationships"
+    )
 
 
 def _resolve_identifiers(adapter: Adapter, requested: list[str]) -> list[str]:
