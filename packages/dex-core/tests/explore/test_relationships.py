@@ -16,6 +16,7 @@ from conftest import write_manifest
 from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
+    DexStore,
     Relationship,
     RelationshipKind,
 )
@@ -499,6 +500,66 @@ def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):
     assert rel["verified"] is True
     assert rel["orphan_fraction"] == 0.6
     assert rel["confidence"] < 0.5, "measured non-containment demotes the guess"
+
+
+def test_relationships_persists_datasets_and_relationships(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """The profiles and inference this run already paid for land in the cache,
+    in the same annotated shape a `map`-written cache has."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        [
+            "explore",
+            "relationships",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert payload["data"]["cache_path"].endswith("cache.json")
+    assert payload["data"]["updated_at"]
+
+    cache = DexStore(repo).load_cache()
+    names = {d.identifier.split(".")[-1] for d in cache.datasets}
+    assert names == {"RAW_HOSTS", "RAW_LISTINGS", "RAW_REVIEWS"}
+    assert all(d.columns for d in cache.datasets)
+    listings = next(d for d in cache.datasets if d.identifier.endswith(".RAW_LISTINGS"))
+    assert listings.grain == ["ID"], "grain-annotated before persisting, like map"
+    assert len(cache.relationships) == len(payload["data"]["relationships"]) == 2
+
+
+def test_relationships_then_query_succeeds(airbnb_duckdb: Path, tmp_path: Path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run(
+        [
+            "explore",
+            "relationships",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    payload = _run(
+        [
+            "explore",
+            "query",
+            "SELECT COUNT(*) AS n FROM RAW_REVIEWS",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    assert payload["data"]["cells"] == [[2]]
 
 
 def test_empty_result_is_explained_not_silent(tmp_path: Path, capsys):

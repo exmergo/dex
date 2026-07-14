@@ -63,6 +63,77 @@ def test_query_without_cache_is_refused_with_the_fix(
     assert not (repo / ".dex").exists(), "a refused gate writes nothing"
 
 
+# --- a profile-built cache unblocks query -----------------------------------------
+
+
+def _profiled_repo(
+    objects: list[str], airbnb_duckdb: Path, tmp_path: Path, capsys
+) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run(
+        [
+            "explore",
+            "profile",
+            *objects,
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    return repo
+
+
+def test_profile_then_query_with_no_prior_map_succeeds(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """The scan `profile` paid for must be enough: no `explore map` ever ran."""
+
+    repo = _profiled_repo(["RAW_LISTINGS"], airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT HOST_ID, COUNT(*) AS n FROM RAW_LISTINGS GROUP BY 1 ORDER BY 1",
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+    assert payload["data"]["cells"] == [[1, 1], [2, 1]]
+
+
+def test_query_on_unprofiled_table_after_profile_is_refused(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """A partial cache scopes the firewall to exactly the profiled tables."""
+
+    repo = _profiled_repo(["RAW_LISTINGS"], airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT COUNT(*) FROM RAW_HOSTS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+    message = payload["errors"][0]
+    assert "not in the .dex cache" in message
+    assert "explore profile" in message
+
+
+def test_profile_built_cache_enforces_pii(airbnb_duckdb: Path, tmp_path: Path, capsys):
+    """PII flags must survive the profile -> cache -> firewall path."""
+
+    repo = _profiled_repo(["RAW_HOSTS"], airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT MIN(NAME) FROM RAW_HOSTS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+    message = payload["errors"][0]
+    assert "RAW_HOSTS.NAME" in message and "(name)" in message
+
+
 # --- allowed queries -------------------------------------------------------------
 
 
