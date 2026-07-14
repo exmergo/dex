@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-14
+
 ### Fixed
 
 - **`explore profile` and `explore relationships` now persist their results
