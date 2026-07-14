@@ -87,36 +87,44 @@ def _is_id_shaped(column_name: str) -> bool:
 
 
 def candidate_keys(dataset: Dataset) -> list[list[str]]:
-    """Single-column candidate keys: unique and non-null. Composite keys deferred.
+    """Candidate keys: single columns first, proven composites after.
 
-    Uniqueness on near-unique columns is escalated to an exact COUNT(DISTINCT)
-    at profile time (``distinct_count_exact``), so these are proven where it
-    matters; a column whose uniqueness still rests on the approximate count is
-    a signal, not a proof.
+    Single-column keys are unique and non-null columns; uniqueness on
+    near-unique columns is escalated to an exact COUNT(DISTINCT) at profile
+    time (``distinct_count_exact``), so these are proven where it matters,
+    while a column whose uniqueness still rests on the approximate count is a
+    signal, not a proof. Composite keys come from ``dataset.composite_keys``,
+    each one proven by an exact distinct-combination probe at profile time.
     """
 
-    return [
+    singles = [
         [col.name]
         for col in dataset.columns
         if col.is_unique and (col.null_fraction in (0.0, None))
     ]
+    return singles + [list(key) for key in dataset.composite_keys]
 
 
 def detect_grain(dataset: Dataset) -> list[str] | None:
-    """The most likely grain: prefer an ``id`` / ``<entity>_id`` candidate key,
-    else the unique column with the smallest cardinality. None if no key."""
+    """The most likely grain: prefer an ``id`` / ``<entity>_id`` single-column
+    candidate key, else the unique column with the smallest cardinality. A
+    composite key is the grain only when no single column is one (the fact
+    table shape); composites arrive best-ranked first from the profile probe.
+    None if no key at all."""
 
     keys = candidate_keys(dataset)
-    if not keys:
-        return None
+    singles = [key for key in keys if len(key) == 1]
+    if not singles:
+        composites = [key for key in keys if len(key) > 1]
+        return composites[0] if composites else None
     entity = _entity(dataset.identifier.rsplit(".", 1)[-1])
-    for key in keys:
+    for key in singles:
         name = key[0].lower()
         if name in ("id", f"{entity}_id", f"{entity}id") or _is_id_shaped(key[0]):
             return key
     # Fall back to the lowest-cardinality unique column.
     by_card = sorted(
-        keys,
+        singles,
         key=lambda k: _distinct_of(dataset, k[0]) or float("inf"),
     )
     return by_card[0]
@@ -503,7 +511,10 @@ def _match_parent(
     parent_entities = {stripped.lower(), _singularize(stripped).lower()}
 
     parent_cols = {c.name.lower(): c for c in parent.columns}
-    parent_key_names = {k[0].lower() for k in parent_keys}
+    # Single-column keys only: a composite member alone is not unique, so
+    # treating it as the parent's key would inflate join confidence and invent
+    # many-to-one edges toward fact tables.
+    parent_key_names = {k[0].lower() for k in parent_keys if len(k) == 1}
     fk = col.name.lower()
     stem_l = stem.lower()
 

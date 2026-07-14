@@ -25,7 +25,7 @@ from typing import NamedTuple
 
 from pydantic import BaseModel, Field
 
-from ..adapters.base import Adapter
+from ..adapters.base import Adapter, distinct_combination_sql
 from ..cache import Dataset, Relationship, match_identifier
 from ..explore import relationships as rel_mod
 from .snapshot import SemanticLayer, Snapshot, TransformLayer
@@ -338,6 +338,9 @@ class GrainPlan(NamedTuple):
 
     key_checks: list[tuple[Dataset, list[str], int]]
     fanout_pairs: list[tuple[Relationship, Relationship]]
+    # Proven multi-column keys re-verified as combinations: their members are
+    # not individually unique, so they never enter key_checks.
+    composite_checks: list[tuple[Dataset, list[list[str]], int]]
 
 
 def grain_plan(
@@ -353,21 +356,40 @@ def grain_plan(
         return described[identifier]
 
     key_checks: list[tuple[Dataset, list[str], int]] = []
+    composite_checks: list[tuple[Dataset, list[list[str]], int]] = []
     for dataset in snap.warehouse.datasets:
         if scope is not None and dataset.identifier not in scope:
             continue
         if dataset.identifier not in current:
             continue  # disappearance is the schema axis's story
+        # A composite grain contributes nothing to the single-column set: its
+        # members are not individually unique, and checking them one at a time
+        # would fabricate key_lost_uniqueness findings on every run.
         keys = sorted(
             {key[0] for key in dataset.candidate_keys if len(key) == 1}
-            | set(dataset.grain or [])
+            | (
+                set(dataset.grain)
+                if dataset.grain and len(dataset.grain) == 1
+                else set()
+            )
         )
-        if not keys:
+        composites: list[list[str]] = []
+        for combo in [k for k in dataset.candidate_keys if len(k) > 1] + (
+            [dataset.grain] if dataset.grain and len(dataset.grain) > 1 else []
+        ):
+            if list(combo) not in composites:
+                composites.append(list(combo))
+        if not keys and not composites:
             continue
         columns, row_count = describe(dataset.identifier)
         live_keys = [k for k in keys if k in columns]
+        # A combination with a vanished member is the schema axis's story,
+        # same as a vanished single key.
+        live_composites = [c for c in composites if set(c) <= columns]
         if live_keys and row_count:
             key_checks.append((dataset, live_keys, row_count))
+        if live_composites and row_count:
+            composite_checks.append((dataset, live_composites, row_count))
 
     fanout_pairs: list[tuple[Relationship, Relationship]] = []
     for rel in snap.warehouse.relationships:
@@ -381,7 +403,7 @@ def grain_plan(
         to_columns, _ = describe(rel.to_dataset)
         if rel.from_columns[0] in from_columns and rel.to_columns[0] in to_columns:
             fanout_pairs.append((rel, rel.model_copy(deep=True)))
-    return GrainPlan(key_checks, fanout_pairs)
+    return GrainPlan(key_checks, fanout_pairs, composite_checks)
 
 
 def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, float]]:
@@ -394,6 +416,12 @@ def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, 
     for dataset, keys, _row_count in plan.key_checks:
         per_table[dataset.identifier] = query_estimate(
             _distinct_count_sql(dataset.identifier, keys, adapter.dialect)
+        )
+    for dataset, combos, _row_count in plan.composite_checks:
+        per_table[dataset.identifier] = per_table.get(
+            dataset.identifier, 0.0
+        ) + query_estimate(
+            _distinct_combination_stand_in(dataset.identifier, combos, adapter.dialect)
         )
     probes = rel_mod.probe_statements(
         [live for _baseline, live in plan.fanout_pairs], adapter.dialect
@@ -443,6 +471,44 @@ def grain_drift(
                         "distinct_count": count,
                         "row_count": row_count,
                         "was_grain": bool(dataset.grain and key in dataset.grain),
+                    },
+                )
+            )
+
+    combo_counts = getattr(adapter, "distinct_combination_counts", None)
+    for dataset, combos, row_count in plan.composite_checks:
+        if combo_counts is None:
+            break  # an adapter without combination probes cannot re-verify
+        counts = combo_counts(dataset.identifier, combos)
+        live_meta, _ = adapter.table_metadata(dataset.identifier)
+        if live_meta.row_count is not None:
+            row_count = live_meta.row_count
+        for combo in combos:
+            count = counts.get(tuple(combo))
+            if count is None or count >= row_count:
+                continue
+            duplicates = row_count - count
+            members = ", ".join(combo)
+            findings.append(
+                DriftFinding(
+                    axis="grain",
+                    code="key_lost_uniqueness",
+                    identifier=dataset.identifier,
+                    column=members,
+                    severity="high",
+                    detail=(
+                        f"({members}) on {dataset.identifier} is no longer "
+                        f"unique: {count} distinct combinations over "
+                        f"{row_count} rows (~{duplicates} duplicate rows); "
+                        "joins on it will fan out"
+                    ),
+                    data={
+                        "columns": list(combo),
+                        "distinct_count": count,
+                        "row_count": row_count,
+                        "was_grain": bool(
+                            dataset.grain and list(combo) == list(dataset.grain)
+                        ),
                     },
                 )
             )
@@ -851,6 +917,25 @@ def _distinct_count_sql(identifier: str, columns: list[str], dialect: str) -> st
         f"COUNT(DISTINCT {quote(column)}) AS d_{i}" for i, column in enumerate(columns)
     )
     sql = f"SELECT {selects} FROM {table}"  # noqa: S608
+    if dialect == "duckdb":
+        return sql
+    import sqlglot
+
+    return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
+
+
+def _distinct_combination_stand_in(
+    identifier: str, combinations: list[list[str]], dialect: str
+) -> str:
+    """The estimation stand-in for ``adapter.distinct_combination_counts``:
+    the same combinations over the same table, so a dry-run prices what the
+    confirmed run scans. Never executed by dex; only dry-run."""
+
+    def quote(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    table = ".".join(quote(part) for part in identifier.split("."))
+    sql = distinct_combination_sql(table, combinations, quote)
     if dialect == "duckdb":
         return sql
     import sqlglot

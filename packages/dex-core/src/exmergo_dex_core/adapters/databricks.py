@@ -42,6 +42,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     blame,
+    distinct_combination_sql,
     json_safe,
     name_list,
 )
@@ -917,6 +918,39 @@ class DatabricksAdapter:
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
         return {name: int(values[f"d_{i}"]) for i, name in enumerate(columns)}
+
+    def distinct_combination_counts(
+        self, identifier: str, combinations: list[list[str]]
+    ) -> dict[tuple[str, ...], int]:
+        """Exact distinct count per column combination, spent only within the
+        already-confirmed budget: when the remaining budget cannot cover the
+        extra scans (one per combination), return nothing and let the grain
+        stay unknown. A metered adapter never self-escalates past its ceiling.
+        """
+
+        if not combinations:
+            return {}
+        self._ensure_detail(identifier)
+        meta, _ = self.table_metadata(identifier)
+        estimate = self._statement_seconds(meta.byte_size) * len(combinations)
+        if not self.cost_gate.try_charge(estimate):
+            self._note(
+                identifier,
+                "composite-key probe skipped: the remaining budget could not "
+                "cover the extra scan; grain stays unknown",
+            )
+            return {}
+        sql = assert_select_only(
+            distinct_combination_sql(
+                self._quote(identifier), combinations, _quote_ident
+            ),
+            dialect=self.dialect,
+        )
+        rows, labels = self._run(sql)
+        values = dict(zip(labels, rows[0], strict=True))
+        return {
+            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
+        }
 
     # --- execution (the single billed door) --------------------------------------
 

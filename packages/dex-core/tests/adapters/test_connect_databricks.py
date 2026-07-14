@@ -518,6 +518,42 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_databricks)
     assert data_statements(fake_databricks) == []
 
 
+def test_distinct_combination_counts_batch_into_one_guarded_statement(
+    fake_databricks,
+):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [{"d_0": 97, "d_1": 100}]
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    counts = adapter.distinct_combination_counts(
+        "shop.core.customers", [["id", "email"], ["email", "id"]]
+    )
+    assert counts == {("id", "email"): 97, ("email", "id"): 100}
+    stmts = data_statements(fake_databricks)
+    assert len(stmts) == 1
+    assert "SELECT DISTINCT" in stmts[0].sql
+    assert assert_select_only(stmts[0].sql, dialect="databricks") == stmts[0].sql
+    assert adapter.distinct_combination_counts("shop.core.customers", []) == {}
+
+
+def test_distinct_combination_counts_degrade_when_budget_cannot_cover(
+    fake_databricks,
+):
+    warm(fake_databricks)
+    adapter = make_adapter(fake_databricks, ceiling=100.0)
+    adapter.cost_gate.charge(99.5)
+    result = adapter.distinct_combination_counts(
+        "shop.core.customers", [["id", "email"]]
+    )
+    assert result == {}
+    assert any(
+        "composite-key probe skipped" in note
+        for note in adapter.table_notes("shop.core.customers")
+    )
+    assert data_statements(fake_databricks) == []
+
+
 # --- factory, dialect, and warehouse pin forms ----------------------------------------
 
 

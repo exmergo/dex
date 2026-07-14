@@ -28,6 +28,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     blame,
+    distinct_combination_sql,
     json_safe,
     name_list,
 )
@@ -517,6 +518,35 @@ class BigQueryAdapter:
         _job, iterator = self._run(sql)
         rows = list(iterator)
         return {name: int(rows[0][f"d_{i}"]) for i, name in enumerate(columns)}
+
+    def distinct_combination_counts(
+        self, identifier: str, combinations: list[list[str]]
+    ) -> dict[tuple[str, ...], int]:
+        """Exact distinct count per column combination, spent only within the
+        already-confirmed budget: when the remaining budget cannot cover the
+        extra scan, return nothing and let the grain stay unknown. A metered
+        adapter never self-escalates past its ceiling."""
+
+        if self._unqueryable(identifier) or not combinations:
+            return {}
+        sql = assert_select_only(
+            distinct_combination_sql(
+                self._quote(identifier), combinations, _quote_ident
+            ),
+            dialect=self.dialect,
+        )
+        if not self.cost_gate.try_charge(self._dry_run(sql)):
+            self._note(
+                identifier,
+                "composite-key probe skipped: the remaining budget could not "
+                "cover the extra scan; grain stays unknown",
+            )
+            return {}
+        _job, iterator = self._run(sql)
+        rows = list(iterator)
+        return {
+            tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(combinations)
+        }
 
     # --- estimation (free dry-runs; feeds the confirm handshake) --------------
 
