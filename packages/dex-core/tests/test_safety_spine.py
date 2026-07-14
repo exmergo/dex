@@ -67,7 +67,8 @@ def test_combination_probe_sql_is_select_only_in_every_dialect():
         quote,
     )
     assert sql.lstrip().upper().startswith("SELECT")
-    for dialect in ("duckdb", "bigquery", "snowflake", "databricks", "postgres"):
+    dialects = ("duckdb", "bigquery", "snowflake", "databricks", "postgres", "redshift")
+    for dialect in dialects:
         assert assert_select_only(sql, dialect=dialect) == sql
 
 

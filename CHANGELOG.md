@@ -59,7 +59,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   instead of "no candidate key detected; grain unknown". Pairs are pruned on a
   necessary condition (the product of the members' distinct counts must reach
   the row count), ranked id-shaped-first then smallest-product-first, and
-  capped at three probes issued as one statement. Works on all five connectors;
+  capped at three probes issued as one statement. Works on all connectors;
   on metered ones the probe spends only inside the already-confirmed budget and
   degrades to "grain unknown" with an explanatory note when the remaining
   budget cannot cover it. Proven composite keys flow into `candidate_keys`,
