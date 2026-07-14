@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # One-time provisioning for the Redshift connector: the local dev/test loop
 # and the live integration suite (.github/workflows/integration.yml). Run by a
-# maintainer whose AWS credentials can administer Redshift Serverless and IAM,
-# with psql on PATH (Redshift speaks the Postgres wire protocol) and gh
-# authenticated against the repository.
+# maintainer whose AWS credentials can administer Redshift Serverless, IAM, and
+# Secrets Manager (the seed connects as the namespace admin, whose password is
+# read from the managed secret; creating database users is superuser-only on
+# Redshift), with psql on PATH (Redshift speaks the Postgres wire protocol) and
+# gh authenticated against the repository.
 #
 # What it sets up, keyless wherever the platform allows it:
 #   - a Redshift Serverless namespace + workgroup at the smallest base
@@ -27,26 +29,32 @@
 #     GetWorkgroup/GetNamespace/GetCredentials on this workgroup only (the
 #     engine then authenticates exactly as a developer laptop does: the AWS
 #     default chain plus IAM temporary database credentials; no stored keys)
+#   - dex_ci_reader: a database role with the same read access as dex_ro,
+#     granted to the CI role's minted database user (IAMR:<role-name>), which
+#     is what GetCredentials mints when the job assumes the role. Without it
+#     the CI identity would connect with no privileges; dex_ro's grants do not
+#     reach it because Serverless names the user after the IAM identity.
 #   - the GitHub environment (deployments restricted to main) carrying the
 #     variables the workflow reads and the dbt password secret
 #
 # Everything account-specific is a parameter, so nothing private lives in this
 # script. Idempotent: safe to re-run; existing resources are left in place and
-# the trust pinning, the seed, and the grants are refreshed. The one exception
-# is the dbt_dev password, which is rotated on every run: both halves (the
-# database user and the GitHub secret) are replaced together, so they cannot
-# drift apart.
+# the trust pinning, the seed, and the grants are refreshed. The admin password
+# is managed in Secrets Manager (enabled on first run, rotating any manually
+# set one) and fetched with the operator's AWS credentials, never stored here.
+# The dbt_dev password is rotated on every run: both halves (the database user
+# and the GitHub secret) are replaced together, so they cannot drift apart.
 #
 # Usage:
 #   scripts/setup_redshift_ci.sh \
-#     --region eu-central-1 \
+#     --region us-east-1 \
 #     [--workgroup dex-ci] [--namespace dex-ci] [--database dev] \
 #     [--repo exmergo/dex] [--environment redshift-integration] \
 #     [--daily-rpu-hours 4] [--skip-github]
 
 set -euo pipefail
 
-REGION=""
+REGION="us-east-1"
 WORKGROUP="dex-ci"
 NAMESPACE="dex-ci"
 DATABASE="dev"
@@ -174,23 +182,91 @@ aws iam put-role-policy --role-name "$ROLE_NAME" \
   --policy-name dex-redshift-integration --policy-document "$POLICY"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
-echo "==> seeding the database as an IAM temporary credential"
-DBT_DEV_PASSWORD=$(python3 -c "import secrets, string; print('Aa1' + ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(29)))")
-CREDS=$(aws redshift-serverless get-credentials --workgroup-name "$WORKGROUP" \
-  --db-name "$DATABASE" --duration-seconds 900)
-DB_USER=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['dbUser'])" "$CREDS")
-DB_PASSWORD=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['dbPassword'])" "$CREDS")
+# The seed creates database users, which on Redshift is a superuser-only
+# operation, and the only superuser on a Serverless namespace is its admin
+# (an IAM-minted user cannot be one: Redshift forbids a superuser with the
+# disabled password IAM identities carry). So the seed connects as the admin.
+# It stays keyless for the operator: the admin password is managed in Secrets
+# Manager and fetched with the operator's own AWS credentials, never stored on
+# this machine. Enabling management here is idempotent and rotates any
+# manually-set admin password into the secret.
+echo "==> ensuring the namespace admin password is managed in Secrets Manager"
+SECRET_ARN=$(aws redshift-serverless get-namespace --namespace-name "$NAMESPACE" \
+  --query 'namespace.adminPasswordSecretArn' --output text)
+if [[ "$SECRET_ARN" == "None" || -z "$SECRET_ARN" ]]; then
+  aws redshift-serverless update-namespace --namespace-name "$NAMESPACE" \
+    --manage-admin-password >/dev/null
+  echo "    waiting for the managed secret to populate..."
+  for _ in $(seq 1 30); do
+    NS_STATUS=$(aws redshift-serverless get-namespace --namespace-name "$NAMESPACE" \
+      --query 'namespace.status' --output text)
+    SECRET_ARN=$(aws redshift-serverless get-namespace --namespace-name "$NAMESPACE" \
+      --query 'namespace.adminPasswordSecretArn' --output text)
+    [[ "$NS_STATUS" == "AVAILABLE" && "$SECRET_ARN" != "None" && -n "$SECRET_ARN" ]] && break
+    sleep 10
+  done
+  [[ "$SECRET_ARN" != "None" && -n "$SECRET_ARN" ]] || {
+    echo "managed admin secret never appeared" >&2; exit 1; }
+fi
 
-# Redshift has no CREATE USER IF NOT EXISTS, and users survive the schema
-# rebuild below, so creation is tolerated on its own: a re-run reaches the
-# strict block either way, which refreshes the grants and rotates the dbt
-# password (the header's idempotency contract).
-PGPASSWORD="$DB_PASSWORD" psql "host=$HOST port=5439 dbname=$DATABASE user=$DB_USER sslmode=require" \
-  -c "CREATE USER dex_ro PASSWORD DISABLE" \
-  || echo "    dex_ro already exists; grants are refreshed below"
-PGPASSWORD="$DB_PASSWORD" psql "host=$HOST port=5439 dbname=$DATABASE user=$DB_USER sslmode=require" \
-  -c "CREATE USER dbt_dev PASSWORD '${DBT_DEV_PASSWORD}'" \
-  || echo "    dbt_dev already exists; its password is rotated below"
+echo "==> seeding the database as the namespace admin (superuser)"
+DBT_DEV_PASSWORD=$(python3 -c "import secrets, string; print('Aa1' + ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(29)))")
+ADMIN_SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" \
+  --query SecretString --output text)
+DB_USER=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['username'])" "$ADMIN_SECRET")
+DB_PASSWORD=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['password'])" "$ADMIN_SECRET")
+
+# An idle Serverless workgroup drops the first connection while it resumes
+# from cold ("server closed the connection unexpectedly"), so wait for it to
+# accept a trivial query before seeding; raw psql, unlike redshift_connector,
+# does not retry the resume itself.
+echo "    waiting for the workgroup to accept connections (resume from cold)..."
+for _ in $(seq 1 18); do
+  if PGPASSWORD="$DB_PASSWORD" psql \
+      "host=$HOST port=5439 dbname=$DATABASE user=$DB_USER sslmode=require" \
+      -tAc "SELECT 1" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 10
+done
+PGPASSWORD="$DB_PASSWORD" psql \
+  "host=$HOST port=5439 dbname=$DATABASE user=$DB_USER sslmode=require" \
+  -tAc "SELECT 1" >/dev/null || {
+    echo "workgroup did not accept connections; check it is AVAILABLE and the" >&2
+    echo "security group allows 5439 from this host" >&2
+    exit 1
+  }
+
+# Redshift has no CREATE USER/ROLE IF NOT EXISTS, and users and roles survive
+# the schema rebuild below, so creation is tolerated on its own: a re-run
+# reaches the strict block either way, which refreshes the grants and rotates
+# the dbt password (the header's idempotency contract). Only an "already
+# exists" failure is forgiven; anything else (a connection timeout, a
+# permission error) still aborts, rather than being mislabeled as existing.
+run_tolerating_exists() {
+  local statement="$1" label="$2" err
+  if err=$(PGPASSWORD="$DB_PASSWORD" psql \
+      "host=$HOST port=5439 dbname=$DATABASE user=$DB_USER sslmode=require" \
+      -v ON_ERROR_STOP=1 -c "$statement" 2>&1); then
+    return 0
+  fi
+  if [[ "$err" == *"already exists"* ]]; then
+    echo "    $label already exists; refreshed below"
+    return 0
+  fi
+  echo "$err" >&2
+  return 1
+}
+run_tolerating_exists "CREATE USER dex_ro PASSWORD DISABLE" dex_ro
+run_tolerating_exists "CREATE USER dbt_dev PASSWORD '${DBT_DEV_PASSWORD}'" dbt_dev
+# The CI job authenticates by assuming the OIDC role, so GetCredentials mints
+# the database user IAMR:<role-name>, not dex_ro (Serverless derives the user
+# from the IAM identity and cannot mint a PASSWORD DISABLE user by name). Give
+# that identity the same read access through a database role, pre-creating the
+# user so the grant lands before its first login.
+CI_DB_USER="IAMR:${ROLE_NAME}"
+run_tolerating_exists "CREATE ROLE dex_ci_reader" "role dex_ci_reader"
+run_tolerating_exists "CREATE USER \"${CI_DB_USER}\" PASSWORD DISABLE" "CI role db user"
 
 PGPASSWORD="$DB_PASSWORD" psql "host=$HOST port=5439 dbname=$DATABASE user=$DB_USER sslmode=require" \
   -v ON_ERROR_STOP=1 <<SQL
@@ -283,6 +359,15 @@ CREATE TABLE app.events AS
 GRANT USAGE ON SCHEMA app TO dex_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA app TO dex_ro;
 GRANT SELECT ON svv_table_info TO dex_ro;
+
+-- The CI identity (IAMR:${ROLE_NAME}, created above) gets the same read access
+-- through the dex_ci_reader role. The table grants are re-applied here because
+-- DROP SCHEMA app CASCADE above dropped them with the old tables; the role
+-- grant to the user is cluster-level and survives, re-granted idempotently.
+GRANT USAGE ON SCHEMA app TO ROLE dex_ci_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA app TO ROLE dex_ci_reader;
+GRANT SELECT ON svv_table_info TO ROLE dex_ci_reader;
+GRANT ROLE dex_ci_reader TO "IAMR:${ROLE_NAME}";
 
 -- The dbt user (created above): reads app, writes only its dev schema, and
 -- carries the durable per-statement cap dex cannot inject through
