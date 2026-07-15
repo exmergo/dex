@@ -487,6 +487,43 @@ def test_escalation_skipped_when_budget_cannot_cover(fake_pg_connection):
     assert any("escalation skipped" in note for note in notes)
 
 
+def test_distinct_combination_counts_batch_into_one_guarded_statement(
+    fake_pg_connection,
+):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"d_0": 97, "d_1": 100}], seconds=0.5
+    )
+    adapter = make_adapter(fake_pg_connection)
+    counts = adapter.distinct_combination_counts(
+        "dexdb.shop.customers", [["id", "email"], ["email", "id"]]
+    )
+    assert counts == {("id", "email"): 97, ("email", "id"): 100}
+    stmts = fake_pg_connection.data_statements
+    assert len(stmts) == 1
+    sql = stmts[0].sql
+    assert "SELECT DISTINCT" in sql
+    # Postgres refuses an unaliased derived table; the portable shape carries
+    # the alias everywhere.
+    assert ") AS q_0" in sql
+    assert assert_select_only(sql, dialect="postgres") == sql
+    assert adapter.distinct_combination_counts("dexdb.shop.customers", []) == {}
+
+
+def test_composite_probe_skipped_when_budget_cannot_cover(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection, ceiling=1.0)
+    result = adapter.distinct_combination_counts(
+        "dexdb.shop.customers", [["id", "email"]]
+    )
+    assert result == {}
+    assert fake_pg_connection.data_statements == []
+    assert any(
+        "composite-key probe skipped" in note
+        for note in adapter.table_notes("dexdb.shop.customers")
+    )
+
+
 # --- run_query ----------------------------------------------------------------------
 
 

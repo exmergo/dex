@@ -53,6 +53,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     blame,
+    distinct_combination_sql,
     json_safe,
     name_list,
 )
@@ -828,6 +829,44 @@ class RedshiftAdapter:
         values = dict(zip(labels, rows[0], strict=True))
         self._exact_rows[identifier] = int(values["n_total"])
         return {name: int(values[f"d_{i}"]) for i, name in enumerate(columns)}
+
+    def distinct_combination_counts(
+        self, identifier: str, combinations: list[list[str]]
+    ) -> dict[tuple[str, ...], int]:
+        """Exact distinct count per column combination, spent only within the
+        already-confirmed budget: when the remaining budget cannot cover the
+        extra scans (one per combination), return nothing and let the grain
+        stay unknown. A metered adapter never self-escalates past its ceiling.
+        """
+
+        if not combinations:
+            return {}
+        meta, _ = self.table_metadata(identifier)
+        # Like the exact-distinct escalation, this can be a command's first
+        # billed statement, so the pending Serverless wake minimum rides the
+        # charge; on refusal it stays pending.
+        estimate = (
+            self._scan_seconds(meta.byte_size) * len(combinations) + self._wake_floor()
+        )
+        if not self.cost_gate.try_charge(estimate):
+            self._note(
+                identifier,
+                "composite-key probe skipped: the remaining budget could not "
+                "cover the extra scan; grain stays unknown",
+            )
+            return {}
+        self._consume_wake_floor()
+        sql = assert_select_only(
+            distinct_combination_sql(
+                self._quote(identifier), combinations, _quote_ident
+            ),
+            dialect=self.dialect,
+        )
+        rows, labels = self._run(sql)
+        values = dict(zip(labels, rows[0], strict=True))
+        return {
+            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
+        }
 
     # --- execution (the single billed door) --------------------------------------
 

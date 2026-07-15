@@ -142,7 +142,12 @@ for engine-cleared safe columns; never row values. Redshift keeps no usable
 planner distincts, so approximate distincts ride the billed batch, and an
 approximation is never a uniqueness verdict: near-unique keys escalate to an
 exact `COUNT(DISTINCT)` inside the confirmed budget, and that scan also
-upgrades the `SVV_TABLE_INFO` row estimate to an exact figure. `SUPER`,
+upgrades the `SVV_TABLE_INFO` row estimate to an exact figure. When no single
+column proves unique, the composite-key probe (a bounded batch of exact
+distinct-combination counts) spends inside the same confirmed budget, and
+like the escalation it carries the pending Serverless wake minimum when it
+bills first; when the remaining budget cannot cover it, the probe skips with
+a note and the grain stays unknown. `SUPER`,
 `VARBYTE`, `GEOMETRY`, `GEOGRAPHY`, and `HLLSKETCH` columns degrade to
 non-null counts. There is **no sampled-profiling threshold**: Redshift has
 no TABLESAMPLE, so a sampling knob would be a lie; the budget is the only

@@ -52,6 +52,26 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     assert assert_select_only(sql) == sql
 
 
+def test_combination_probe_sql_is_select_only_in_every_dialect():
+    # The composite-key probe shares one SQL builder across the adapters; the
+    # statement must parse as a single read-only SELECT in each dialect.
+    from exmergo_dex_core.adapters.base import distinct_combination_sql
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    def quote(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    sql = distinct_combination_sql(
+        '"db"."main"."line_items"',
+        [["order_key", "line_number"], ["order_key", "quantity"]],
+        quote,
+    )
+    assert sql.lstrip().upper().startswith("SELECT")
+    dialects = ("duckdb", "bigquery", "snowflake", "databricks", "postgres", "redshift")
+    for dialect in dialects:
+        assert assert_select_only(sql, dialect=dialect) == sql
+
+
 def test_select_only_guard_rejects_writes():
     from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
 

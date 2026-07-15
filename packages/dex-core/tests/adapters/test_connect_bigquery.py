@@ -407,6 +407,37 @@ def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_bq_client):
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
+def test_distinct_combination_counts_batch_into_one_guarded_statement(fake_bq_client):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 90, "d_1": 100}]
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.distinct_combination_counts(
+        "test-proj.shop.customers", [["id", "email"], ["email", "id"]]
+    )
+    assert counts == {("id", "email"): 90, ("email", "id"): 100}
+    billed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(billed) == 1
+    sql = billed[0].sql
+    assert "SELECT DISTINCT" in sql
+    assert assert_select_only(sql, dialect="bigquery") == sql
+    assert adapter.distinct_combination_counts("test-proj.shop.customers", []) == {}
+
+
+def test_distinct_combination_counts_degrade_when_budget_cannot_cover(fake_bq_client):
+    adapter = make_adapter(fake_bq_client, ceiling=100 * MB)
+    adapter.cost_gate.charge(100 * MB - 1_000)
+    result = adapter.distinct_combination_counts(
+        "test-proj.shop.customers", [["id", "email"]]
+    )
+    assert result == {}
+    assert any(
+        "composite-key probe skipped" in note
+        for note in adapter.table_notes("test-proj.shop.customers")
+    )
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
 def test_sampling_kicks_in_above_the_threshold_and_voids_uniqueness(fake_bq_client):
     fake_bq_client.row_resolver = _aggregate_resolver
     adapter = make_adapter(

@@ -161,7 +161,7 @@ def cmd_grain(args: argparse.Namespace) -> env.Envelope:
             }
             scope = drift_mod.resolve_scope(scope_names, identifiers)
         plan = drift_mod.grain_plan(adapter, snap, scope)
-        if plan.key_checks or plan.fanout_pairs:
+        if plan.key_checks or plan.fanout_pairs or plan.composite_checks:
             estimate, per_table = drift_mod.grain_estimate(adapter, plan)
             unconfirmed = command_args.billed_handshake(
                 "maintain grain", adapter, estimate, per_table=per_table
@@ -171,9 +171,10 @@ def cmd_grain(args: argparse.Namespace) -> env.Envelope:
         findings = drift_mod.grain_drift(
             adapter, plan, timeout_seconds=config.query.timeout_seconds
         )
-        notes = _adapter_notes(
-            adapter, [dataset.identifier for dataset, _keys, _rows in plan.key_checks]
-        )
+        noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
+            dataset.identifier for dataset, _combos, _rows in plan.composite_checks
+        }
+        notes = _adapter_notes(adapter, sorted(noted))
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
@@ -306,7 +307,9 @@ def cmd_check(args: argparse.Namespace) -> env.Envelope:
 
         plan = drift_mod.grain_plan(adapter, snap)
         checks = drift_mod.cardinality_plan(current_semantic, snap)
-        scans_needed = bool(plan.key_checks or plan.fanout_pairs or checks)
+        scans_needed = bool(
+            plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
+        )
         if scans_needed and command_args.cost_gate(adapter) is not None:
             grain_total, grain_per = drift_mod.grain_estimate(adapter, plan)
             card_total, card_per = drift_mod.cardinality_estimate(adapter, checks)

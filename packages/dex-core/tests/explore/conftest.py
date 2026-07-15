@@ -79,6 +79,30 @@ def many_tables_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def composite_grain_duckdb(tmp_path: Path) -> Path:
+    """A TPCH-shaped pair: a fact table whose only key is the composite
+    (order_key, line_number), where line_number alone has tiny cardinality
+    (the shape single-column detection can never resolve), next to a parent
+    with a clean surrogate key."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "composite.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE orders AS "
+        "SELECT range::INTEGER AS order_key, 'open' AS status FROM range(1, 501)"
+    )
+    conn.execute(
+        "CREATE TABLE line_items AS "
+        "SELECT o.range::INTEGER AS order_key, l.range::INTEGER AS line_number, "
+        "(l.range % 2)::INTEGER AS quantity "
+        "FROM range(1, 501) o, range(1, 5) l"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def f1_duckdb(tmp_path: Path) -> Path:
     """A camelCase star schema: parents key on <entity>Id (not `id`), and the
     fact table's foreign keys use the same camelCase names."""

@@ -18,7 +18,7 @@ caps and truncates them before the envelope.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -162,6 +162,30 @@ def json_safe(value: object | None) -> object | None:
     return str(value)
 
 
+def distinct_combination_sql(
+    table_sql: str,
+    combinations: list[list[str]],
+    quote_ident: Callable[[str], str],
+) -> str:
+    """One statement counting each column combination's distinct tuples, one
+    scalar subquery per combination, results read back by alias ``d_{i}``.
+
+    The subquery form is the one shape every supported dialect accepts
+    (BigQuery has no multi-argument COUNT(DISTINCT); DuckDB needs a struct
+    variant); derived tables are aliased because Postgres requires it.
+    ``table_sql`` and the identifiers must already be quoted/escaped by the
+    calling adapter, which also guards the result as a read-only SELECT.
+    """
+
+    parts = [
+        "(SELECT COUNT(*) FROM (SELECT DISTINCT "  # noqa: S608
+        + ", ".join(quote_ident(name) for name in combo)
+        + f" FROM {table_sql}) AS q_{i}) AS d_{i}"
+        for i, combo in enumerate(combinations)
+    ]
+    return f"SELECT {', '.join(parts)}"
+
+
 @runtime_checkable
 class Adapter(Protocol):
     """Behavioral contract for a connector adapter.
@@ -213,6 +237,17 @@ class Adapter(Protocol):
         statements as possible. The engine calls this only for columns whose
         approximate distinct landed within noise of the non-null count, so the
         spend is bounded and deliberate; a metered adapter never self-escalates."""
+        ...
+
+    def distinct_combination_counts(
+        self, identifier: str, combinations: list[list[str]]
+    ) -> dict[tuple[str, ...], int]:
+        """Exact distinct count for each column combination, all in one
+        statement. The engine calls this only when no single-column key was
+        proven, with a small ranked set of combinations, so the spend is
+        bounded and deliberate; a metered adapter that cannot cover the scan
+        within the confirmed budget returns ``{}`` and explains itself through
+        a table note instead of self-escalating."""
         ...
 
     def run_query(

@@ -14,7 +14,14 @@ from pathlib import Path
 
 from ..envelope import Paradigm
 from ..guards.sql_guard import assert_select_only
-from .base import ColumnAggregate, ColumnMeta, ObjectMeta, QueryResult, json_safe
+from .base import (
+    ColumnAggregate,
+    ColumnMeta,
+    ObjectMeta,
+    QueryResult,
+    distinct_combination_sql,
+    json_safe,
+)
 
 # Conservative defaults so auto-invoked profiling cannot exhaust the machine.
 # Overridable from .dex/config.yml.
@@ -245,6 +252,24 @@ class DuckDBAdapter:
             for i, name in enumerate(batch):
                 results[name] = int(values[f"d_{i}"])
         return results
+
+    def distinct_combination_counts(
+        self, identifier: str, combinations: list[list[str]]
+    ) -> dict[tuple[str, ...], int]:
+        """Exact distinct count per column combination, all in one statement
+        (one scalar subquery each)."""
+
+        if not combinations:
+            return {}
+        sql = distinct_combination_sql(
+            self._quote(identifier), combinations, _quote_ident
+        )
+        row = self._run_select(assert_select_only(sql, dialect=self.dialect))[0]
+        labels = [d[0] for d in self._conn.description]
+        values = dict(zip(labels, row, strict=True))
+        return {
+            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
+        }
 
     def _build_aggregate_sql(
         self, identifier: str, columns: list[ColumnMeta], safe: set[str]

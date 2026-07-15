@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-14
+
 ### Fixed
 
 - **`explore profile` and `explore relationships` now persist their results
@@ -52,6 +54,23 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 - A stale compiled manifest (older than the model sources) is noted rather
   than trusted silently; a repo with no dbt project, several projects, or an
   unreadable one degrades to heuristics exactly as before.
+- **Composite candidate-key detection in `explore profile`** ([#49]). When no
+  single column proves unique, the profiler now tests a small ranked set of
+  2-column combinations with exact distinct-combination counts, so fact tables
+  like TPCH `LINEITEM` report their true grain (`L_ORDERKEY, L_LINENUMBER`)
+  instead of "no candidate key detected; grain unknown". Pairs are pruned on a
+  necessary condition (the product of the members' distinct counts must reach
+  the row count), ranked id-shaped-first then smallest-product-first, and
+  capped at three probes issued as one statement. Works on all connectors;
+  on metered ones the probe spends only inside the already-confirmed budget and
+  degrades to "grain unknown" with an explanatory note when the remaining
+  budget cannot cover it. Proven composite keys flow into `candidate_keys`,
+  `grain`, and downstream test scaffolding.
+- **Composite grain drift in `maintain grain`.** A snapshot whose baseline
+  carries a composite key now re-verifies the combination itself (estimated
+  and gated like every other grain scan) and reports a combination-level
+  `key_lost_uniqueness` finding; composite members are no longer checked one
+  at a time, which would have fabricated findings on every run.
 
 #### AWS Redshift
 
