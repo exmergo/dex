@@ -24,6 +24,7 @@ exmergo-dex-core[duckdb]       # the on-ramp and the eval/benchmark engine
 exmergo-dex-core[snowflake]
 exmergo-dex-core[bigquery]
 exmergo-dex-core[databricks]
+exmergo-dex-core[redshift]
 exmergo-dex-core[postgres]
 exmergo-dex-core[all]          # every connector at once
 ```
@@ -46,13 +47,18 @@ the full surface and the envelope spec.
 ## Status
 
 Early and under active development; expect pre-release versions. Today the engine
-runs Explore and Transform end to end on DuckDB and on BigQuery.
+runs Explore, Transform, and Maintain end to end on every connector: DuckDB,
+BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres.
 
 Explore: ranks what matters in an unfamiliar warehouse, profiles columns
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
 ad-hoc SELECTs behind a PII-aware query firewall (`explore query`), all
-read-only.
+read-only. It starts bare by default; with `--use-project` it reads an existing
+dbt project, promoting declared `relationships` joins, honoring declared grain
+and `unique` tests, and letting metric-backing models surface first in the
+ranking. A repeatable `--scope` narrows the source scope per command without
+writing back to `.dex/config.yml`.
 
 Transform: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and
@@ -97,6 +103,22 @@ same `.dex/spend.jsonl` ledger. Billed work runs only on the SQL warehouse
 the config pins. dbt builds go to a dedicated dev catalog.schema via
 dbt-databricks, which the `[databricks]` extra carries. See
 [`references/databricks.md`](../../references/databricks.md).
+
+Amazon Redshift: Serverless-first and provisioned-compatible. Connects through
+the AWS default credential chain (a pinned Serverless `workgroup` or provisioned
+`cluster_identifier` mints IAM temporary database credentials), the `REDSHIFT_*`
+environment, the committed non-secret target (password via `REDSHIFT_PASSWORD`),
+or a dbt profile; dex never asks for or persists a password. Metadata comes from
+the Postgres catalog (`pg_class` merged with `SVV_TABLE_INFO` and `SVV_COLUMNS`,
+so empty tables still appear). The guarded quantity is compute time, so budgets
+are **compute-seconds** with RPU-hours shown alongside (dollars when
+`redshift.rpu_price_usd` is set), floored once by the 60-second Serverless wake
+minimum; the budget is hard-enforced by a per-statement server-side
+`statement_timeout`, and actual seconds land in the same `.dex/spend.jsonl`
+ledger. Profiling uses `HLL(...)` approximate distincts with exact escalation
+in-budget; the session is read-only at the server. dbt builds go to a dedicated
+dev schema via dbt-redshift, which the `[redshift]` extra carries. See
+[`references/redshift.md`](../../references/redshift.md).
 
 PostgreSQL: the operational-database connector. Connects through discovered
 credentials (`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a
