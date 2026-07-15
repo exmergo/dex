@@ -9,6 +9,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore relationships` now folds same-lineage/replica duplicate edges
+  before caching, matching `explore map`** ([#70]). `relationships` profiles
+  the full inventory, so it is even more likely than `map` to pull a
+  dev/replica schema into scope alongside its source; without folding, a
+  cache last written by `relationships` could carry replica-duplicate edges
+  that a `map` run would have folded away. The folded set now flows into both
+  the envelope and the persisted cache, and a note reports how many edges were
+  folded and how many objects mirror source lineage. Dev-schema matching is
+  also fixed for two cases the original folding logic missed: a BigQuery-style
+  qualified `dev_dataset` (`project.dataset`) is compared by its bare schema
+  name, and schema names are compared case-insensitively so a lower-cased
+  configured `dev_schema` still matches an upper-cased warehouse schema
+  (Snowflake, Redshift).
+
 ## [1.2.0] - 2026-07-14
 
 ### Fixed
