@@ -215,7 +215,12 @@ class ClusterLimits(BaseModel):
     ``k_min``/``k_max`` bound the silhouette sweep when ``-k`` is not given;
     ``silhouette_sample`` caps the (quadratic) silhouette computation.
     ``max_features`` bounds the feature width. ``random_state`` fixes the
-    scikit-learn seed so a run is reproducible and tests are deterministic.
+    scikit-learn seed, and ``sample_seed`` fixes the sample draw: both are
+    needed for a reproducible run, because re-drawing the sample changes the
+    answer (a different draw can change the chosen k, not just the rounding).
+    Only some dialects can seed a sample; where the engine cannot, the envelope
+    says the result is not reproducible rather than implying it is. Set
+    ``sample_seed`` to null for a fresh draw per run.
     """
 
     sample_rows: int = 20000
@@ -225,6 +230,7 @@ class ClusterLimits(BaseModel):
     silhouette_sample: int = 5000
     max_features: int = 20
     random_state: int = 0
+    sample_seed: int | None = 0
     timeout_seconds: float = 60.0
 
 

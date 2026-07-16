@@ -29,6 +29,11 @@ from sqlglot import exp
 # not round to zero percent (which reads the whole table on some engines).
 _MIN_SAMPLE_PERCENT = 0.01
 
+# Below this share of the sample, a cluster is an outlier pocket rather than a
+# segment. Engine-fixed, not configurable: it decides only what the notes say,
+# never what the clustering does, so there is nothing here for a caller to tune.
+_DEGENERATE_CLUSTER_FRACTION = 0.01
+
 
 class ClusterError(Exception):
     """A clustering request that cannot be satisfied (too few rows, too few
@@ -39,8 +44,22 @@ class ClusterDependencyError(Exception):
     """scikit-learn (the ``[cluster]`` extra) is not installed."""
 
 
+# Dialects whose sample clause accepts a seed, each verified against the engine
+# itself rather than assumed from its docs. Everything else re-draws per run, and
+# `sample_is_repeatable` is what makes the envelope say so out loud: a seed knob
+# that silently does nothing on four of six connectors would be a lie, the same
+# reason `references/redshift.md` refuses to ship a sampling threshold there.
+_SEEDABLE_DIALECTS = frozenset({"duckdb"})
+
+
+def sample_is_repeatable(dialect: str, seed: int | None) -> bool:
+    """Whether this dialect's sample clause draws the same rows twice."""
+
+    return seed is not None and dialect in _SEEDABLE_DIALECTS
+
+
 def _sample_parts(
-    dialect: str, sample_rows: int, row_count: int | None
+    dialect: str, sample_rows: int, row_count: int | None, seed: int | None = None
 ) -> tuple[str, str, str]:
     """The dialect-specific sampling pieces: a suffix attached to the table in
     the FROM, a tail appended after WHERE, and a human note naming the method.
@@ -61,6 +80,14 @@ def _sample_parts(
         return max(_MIN_SAMPLE_PERCENT, round(100.0 * n / row_count, 4))
 
     if dialect == "duckdb":
+        if seed is not None:
+            # The seeded form needs the explicit reservoir(...) spelling; DuckDB
+            # rejects REPEATABLE on the bare `USING SAMPLE n ROWS`.
+            return (
+                "",
+                f" USING SAMPLE reservoir({n} ROWS) REPEATABLE ({seed})",
+                f"USING SAMPLE {n} ROWS (reservoir, repeatable seed {seed})",
+            )
         return "", f" USING SAMPLE {n} ROWS", f"USING SAMPLE {n} ROWS (reservoir)"
     if dialect == "snowflake":
         return f" SAMPLE ({n} ROWS)", "", f"SAMPLE ({n} ROWS)"
@@ -92,6 +119,7 @@ def build_sample_sql(
     dialect: str,
     sample_rows: int,
     row_count: int | None,
+    seed: int | None = None,
 ) -> tuple[str, str]:
     """Build the read-only feature-sample SELECT and describe how it samples.
 
@@ -124,7 +152,7 @@ def build_sample_sql(
         f"{render(exp.column(name))} IS NOT NULL" for name in feature_names
     )
 
-    table_suffix, tail, method = _sample_parts(dialect, sample_rows, row_count)
+    table_suffix, tail, method = _sample_parts(dialect, sample_rows, row_count, seed)
     sql = f"SELECT {cols_sql} FROM {table_ref}{table_suffix} WHERE {where_sql}{tail}"  # noqa: S608
     return sql, method
 
@@ -343,6 +371,18 @@ def cluster_features(
         notes.append(
             f"silhouette computed on a {silhouette_sample}-row subsample of the "
             f"{n_samples}-row sample"
+        )
+
+    tiny = [c for c in clusters if c["fraction"] < _DEGENERATE_CLUSTER_FRACTION]
+    if tiny and len(tiny) < k:
+        worst = min(c["fraction"] for c in tiny)
+        notes.append(
+            f"{len(tiny)} of {k} cluster(s) hold under "
+            f"{_DEGENERATE_CLUSTER_FRACTION:.0%} of the sample (smallest: "
+            f"{worst:.2%}, {min(c['size'] for c in tiny)} row(s)); a cluster that "
+            "small is an outlier pocket rather than a segment, and it inflates "
+            "the silhouette. Read this as outlier detection, or re-run with -k "
+            "to force a split of the bulk"
         )
 
     return ClusterResult(

@@ -69,7 +69,14 @@ Subcommands, in the usual order:
    inferred), and the columns named like one; prefer `map` over a bare
    `profile` here, because without inferred joins a foreign key is caught only
    if its name gives it away. The notes name every excluded column, so check
-   them before trusting a result. Only aggregates cross the
+   them before trusting a result. Two things the silhouette alone will not tell
+   you, both of which the notes will. A cluster holding under 1% of the sample
+   is an outlier pocket, not a segment, and it pushes the score up precisely
+   because it sits so far out: report that as outlier detection, or re-run with
+   `-k` to split the bulk. And on connectors that cannot seed a sample the draw
+   changes per run, so two runs can disagree on k; the envelope's
+   `sample_repeatable` says which case you are in, and comparing runs across
+   different draws is meaningless. Only aggregates cross the
    boundary: the sample rows are clustered in-process and never enter context.
    On a metered connector it takes the same cost handshake as the scanning
    commands below (only the feature columns are scanned, and a dialect-aware
