@@ -121,6 +121,29 @@ _STRING_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
 
 _MAX_CONFIDENCE = 0.95
 
+# Confidence levels for the generic `*_name` flag and its value-shape verdicts.
+# The generic flag starts at 0.6 (weaker than an exact person token at 0.75);
+# shape evidence computed in the profiling scan can corroborate it up to the
+# exact-token level or de-rate it to 0.3, below the query firewall's blocking
+# threshold. Evidence moves confidence in both directions and its absence moves
+# nothing (fail closed: an unverifiable flag keeps blocking).
+_GENERIC_NAME_CONFIDENCE = 0.6
+_SHAPE_PERSON_CONFIDENCE = 0.75
+_SHAPE_REFERENCE_CONFIDENCE = 0.3
+
+# Shape-rule thresholds. A column where half the values look like "Given
+# Surname" is treated as person names. The reference verdict requires person
+# shape to be essentially absent AND either a tiny closed all-caps vocabulary
+# (the R_NAME/N_NAME shape; the distinct cap keeps a large all-caps
+# customer-name column blocked, since an all-caps person name defeats the
+# person-shape check) or long multi-token labels (person names essentially
+# never average 3.5+ tokens; part and product descriptions do).
+_PERSON_FRACTION_RAISE = 0.5
+_PERSON_FRACTION_ABSENT = 0.05
+_UPPER_VOCAB_FRACTION = 0.9
+_UPPER_VOCAB_MAX_DISTINCT = 32
+_LABEL_AVG_TOKENS = 3.5
+
 # Splits camelCase boundaries so patterns written against snake_case also match
 # camelCase warehouses ("firstName" -> "first_name", "reviewerName" -> "reviewer_name").
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -144,20 +167,36 @@ def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     apply only to string columns (a numeric `comments` count is not PII).
     """
 
+    flag, _generic = _classify_pii(column_name, data_type)
+    return flag
+
+
+def _classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool]:
+    """The detector plus a marker for the generic `*_name` match.
+
+    The marker tells :func:`profile` which flags are eligible for value-shape
+    refinement. It is deliberately a return value and never persisted: keying
+    eligibility on the flag itself (e.g. its confidence value) would couple the
+    shape rules to the base-confidence table.
+    """
+
     name = _normalize(column_name)
     for pattern, category, confidence in _PII_PATTERNS:
         if pattern.search(name):
-            return PIIFlag(category=category, confidence=confidence)
+            return PIIFlag(category=category, confidence=confidence), False
 
     if _is_string_type(data_type):
         match = _GENERIC_NAME.search(name)
         if match is not None:
             qualifier = name[: match.start()].rstrip("_").rsplit("_", 1)[-1]
             if qualifier not in _NONPERSON_NAME_QUALIFIERS:
-                return PIIFlag(category=PIICategory.NAME, confidence=0.6)
+                flag = PIIFlag(
+                    category=PIICategory.NAME, confidence=_GENERIC_NAME_CONFIDENCE
+                )
+                return flag, True
         if _FREE_TEXT.search(name):
-            return PIIFlag(category=PIICategory.FREE_TEXT, confidence=0.5)
-    return None
+            return PIIFlag(category=PIICategory.FREE_TEXT, confidence=0.5), False
+    return None, False
 
 
 def is_min_max_safe(data_type: str, pii: PIIFlag | None) -> bool:
@@ -175,23 +214,54 @@ def is_min_max_safe(data_type: str, pii: PIIFlag | None) -> bool:
     )
 
 
-def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
-    """Profile each object into a Dataset of aggregate-derived ColumnProfiles."""
+def profile(
+    adapter: Adapter,
+    identifiers: list[str],
+    *,
+    pii_overrides: set[str] | None = None,
+) -> list[Dataset]:
+    """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
 
+    ``pii_overrides`` holds lowered ``identifier.column`` paths a human has
+    reviewed as not PII (from `.dex/config.yml`). An overridden column's flag is
+    suppressed at the source, before min/max safety and shape-stat eligibility
+    are decided, and the suppressed category is recorded on the profile as the
+    audit trail. Re-applied on every profile, which is what makes the override
+    durable: the cache is overwritten wholesale by re-profiling.
+    """
+
+    override_paths = pii_overrides or set()
     datasets: list[Dataset] = []
     for identifier in identifiers:
         meta, columns = adapter.table_metadata(identifier)
 
         # Decide min/max safety BEFORE querying, from name + type, so the adapter
         # never even computes a suppressed extreme.
-        prelim_pii = {c.name: detect_pii(c.name, c.data_type) for c in columns}
+        classified = {c.name: _classify_pii(c.name, c.data_type) for c in columns}
+        prelim_pii = {name: flag for name, (flag, _g) in classified.items()}
+        overridden: dict[str, PIICategory] = {}
+        for c in columns:
+            flag = prelim_pii[c.name]
+            if flag is not None and f"{identifier}.{c.name}".lower() in override_paths:
+                overridden[c.name] = flag.category
+                prelim_pii[c.name] = None
         safe = {
             c.name for c in columns if is_min_max_safe(c.data_type, prelim_pii[c.name])
+        }
+        # Shape evidence is bought only for generic-name flags that still stand:
+        # exact person tokens need no corroboration, and a human-cleared column
+        # deserves no scan spend.
+        shape = {
+            name
+            for name, (flag, generic) in classified.items()
+            if generic and prelim_pii[name] is not None
         }
 
         aggregates = {
             a.name: a
-            for a in adapter.column_aggregates(identifier, columns, safe_min_max=safe)
+            for a in adapter.column_aggregates(
+                identifier, columns, safe_min_max=safe, shape_stats=shape
+            )
         }
         # Re-read the metadata after the aggregate scan: adapters whose
         # inventory row counts are planner estimates (Postgres reltuples)
@@ -221,7 +291,9 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
 
         for col in columns:
             agg = aggregates.get(col.name)
-            pii = _refine_confidence(prelim_pii[col.name], agg)
+            pii = _refine_confidence(
+                prelim_pii[col.name], agg, generic=col.name in shape
+            )
             profiles.append(
                 ColumnProfile(
                     name=col.name,
@@ -234,6 +306,7 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                     min_value=json_safe(agg.min_value) if agg else None,
                     max_value=json_safe(agg.max_value) if agg else None,
                     pii=pii,
+                    pii_overridden=overridden.get(col.name),
                 )
             )
 
@@ -374,9 +447,19 @@ def _probe_composite_keys(
 
 
 def _refine_confidence(
-    pii: PIIFlag | None, aggregate: ColumnAggregate | None
+    pii: PIIFlag | None,
+    aggregate: ColumnAggregate | None,
+    *,
+    generic: bool = False,
 ) -> PIIFlag | None:
-    """Nudge PII confidence using aggregate signals (never raw values)."""
+    """Nudge PII confidence using aggregate signals (never raw values).
+
+    ``generic`` marks the flag as the generic `*_name` match, the only one whose
+    confidence the value-shape rules may move. The flag itself is never removed:
+    a de-rated flag stays recorded at reference-data confidence, and what to do
+    with a weak flag is the consumer's decision (the query firewall blocks at
+    its threshold; min/max suppression and dbt meta stay presence-based).
+    """
 
     if pii is None or aggregate is None:
         return pii
@@ -395,4 +478,36 @@ def _refine_confidence(
         and pii.category in {PIICategory.LOCATION, PIICategory.ADDRESS}
     ):
         confidence = max(0.1, confidence - 0.3)
+    if generic and pii.category is PIICategory.NAME:
+        confidence = _shape_verdict(confidence, aggregate)
     return PIIFlag(category=pii.category, confidence=round(confidence, 4))
+
+
+def _shape_verdict(confidence: float, aggregate: ColumnAggregate) -> float:
+    """Map value-shape evidence to a generic-name confidence.
+
+    Fail closed: whenever the evidence is missing or ambiguous the name-derived
+    confidence stands unchanged, which keeps the column blocked. Only the two
+    provably non-person shapes de-rate, and a person-shaped distribution
+    corroborates up to the exact-token level.
+    """
+
+    person = aggregate.person_shape_fraction
+    if person is None:
+        return confidence
+    if person >= _PERSON_FRACTION_RAISE:
+        return _SHAPE_PERSON_CONFIDENCE
+    if person > _PERSON_FRACTION_ABSENT:
+        return confidence
+    upper = aggregate.upper_vocab_fraction
+    if (
+        upper is not None
+        and upper >= _UPPER_VOCAB_FRACTION
+        and aggregate.distinct_count is not None
+        and aggregate.distinct_count <= _UPPER_VOCAB_MAX_DISTINCT
+    ):
+        return _SHAPE_REFERENCE_CONFIDENCE
+    tokens = aggregate.avg_token_count
+    if tokens is not None and tokens >= _LABEL_AVG_TOKENS:
+        return _SHAPE_REFERENCE_CONFIDENCE
+    return confidence

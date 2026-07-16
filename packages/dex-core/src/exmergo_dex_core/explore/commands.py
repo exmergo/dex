@@ -20,7 +20,7 @@ from .. import envelope as env
 from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
 from ..cache import Dataset, DexCache, DexStore, Relationship, match_identifier
-from ..config import DexConfig, QueryLimits, load_config
+from ..config import DexConfig, QueryLimits, load_config, pii_override_paths
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
@@ -34,6 +34,56 @@ from . import relationships as rel_mod
 # Below this many objects, profile everything: enumeration is cheap and complete.
 # Above it, profile only the top-ranked unless --full is passed.
 _AUTO_PROFILE_ALL = 50
+
+
+def _override_notes(datasets: list[Dataset]) -> list[str]:
+    cleared = sum(1 for d in datasets for c in d.columns if c.pii_overridden)
+    if not cleared:
+        return []
+    return [
+        f"{cleared} column(s) cleared by pii_overrides in .dex/config.yml "
+        "(recorded as overridden in the cache)"
+    ]
+
+
+def _override_mismatches(
+    datasets: list[Dataset], override_paths: set[str]
+) -> list[str]:
+    """Warn when an override entry names a profiled table but no column of it:
+    almost certainly a typo, and silence would read as the override working."""
+
+    warnings = []
+    for path in sorted(override_paths):
+        table, _, column = path.rpartition(".")
+        for dataset in datasets:
+            if dataset.identifier.lower() != table:
+                continue
+            if not any(c.name.lower() == column for c in dataset.columns):
+                warnings.append(
+                    f"pii_overrides entry '{path}' matches no column of "
+                    f"{dataset.identifier}"
+                )
+            break
+    return warnings
+
+
+def _mask_overridden(cache: DexCache, override_paths: set[str]) -> DexCache:
+    """Apply config overrides to a loaded cache in memory, so an override takes
+    effect at query time immediately instead of demanding a re-profile (a billed
+    scan on metered connectors). The persisted cache is untouched; the next
+    profile writes the override through durably."""
+
+    if not override_paths:
+        return cache
+    for dataset in cache.datasets:
+        for column in dataset.columns:
+            if (
+                column.pii is not None
+                and f"{dataset.identifier}.{column.name}".lower() in override_paths
+            ):
+                column.pii_overridden = column.pii.category
+                column.pii = None
+    return cache
 
 
 def _profile_estimate(
@@ -88,6 +138,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     repo_root = command_args.repo_root(args)
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
+    override_paths = pii_override_paths(config.pii_overrides)
     adapter = command_args.open_from_args(args)
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
@@ -97,7 +148,9 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(adapter, identifiers)
+        datasets = profile_mod.profile(
+            adapter, identifiers, pii_overrides=override_paths
+        )
         connector = adapter.name
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
@@ -114,14 +167,17 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     cache, stats = _merge_profiles(store.load_cache(), datasets, connector, now)
     path = store.save_cache(cache, now=now)
 
+    notes = [_persist_note(stats, len(datasets), keeps_relationships=True)]
+    notes.extend(_override_notes(datasets))
     envelope.data.update(
         {
             "datasets": [d.model_dump(mode="json") for d in datasets],
             "cache_path": str(path),
             "updated_at": now.isoformat(),
-            "notes": [_persist_note(stats, len(datasets), keeps_relationships=True)],
+            "notes": notes,
         }
     )
+    envelope.warnings.extend(_override_mismatches(datasets, override_paths))
     return envelope
 
 
@@ -158,7 +214,9 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(adapter, identifiers)
+        datasets = profile_mod.profile(
+            adapter, identifiers, pii_overrides=pii_override_paths(config.pii_overrides)
+        )
         connector = adapter.name
         inferred = rel_mod.infer_relationships(datasets)
         if verify:
@@ -233,6 +291,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
 
     config = load_config(repo_root) or DexConfig()
     limits = config.query
+    cache = _mask_overridden(cache, pii_override_paths(config.pii_overrides))
     # The firewall parses in the active connector's dialect, so BigQuery SQL
     # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
     dialect = get_dialect(getattr(args, "connector", None) or config.connector)
@@ -281,16 +340,20 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
 
     data = _shape_query_payload(result, inspected, limits)
     envelope.data.update(data)
-    store.append_query_log(
-        {
-            "at": at,
-            "sql": inspected.sql,
-            "decision": "allowed",
-            "tables": inspected.tables,
-            "row_count": data["row_count"],
-            "truncated": data["truncated"],
-        }
-    )
+    envelope.warnings.extend(inspected.warnings)
+    log_entry = {
+        "at": at,
+        "sql": inspected.sql,
+        "decision": "allowed",
+        "tables": inspected.tables,
+        "row_count": data["row_count"],
+        "truncated": data["truncated"],
+    }
+    # The audit trail records which allowed queries projected sub-threshold
+    # PII-flagged columns, so a later review can find every such projection.
+    if inspected.warnings:
+        log_entry["pii_warnings"] = inspected.warnings
+    store.append_query_log(log_entry)
     return envelope
 
 
@@ -325,7 +388,11 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        profiled = profile_mod.profile(adapter, [m.identifier for m in selected])
+        profiled = profile_mod.profile(
+            adapter,
+            [m.identifier for m in selected],
+            pii_overrides=pii_override_paths(config.pii_overrides),
+        )
         _annotate_grain(profiled, defs)
         inferred = rel_mod.infer_relationships(profiled)
         if getattr(args, "verify", False):
