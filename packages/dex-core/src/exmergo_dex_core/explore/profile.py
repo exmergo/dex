@@ -11,6 +11,7 @@ source so the value never leaves the engine.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -199,11 +200,13 @@ def profile(
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
 
-    An optional ``progress`` reporter emits a throttled stderr line per object so
-    a long run is visibly distinguishable from a hung one; ``None`` (the default)
-    keeps existing callers silent and unchanged.
+    ``on_complete`` is invoked with each raw Dataset as soon as it is fully
+    profiled, so callers can checkpoint budget-paid work before a later object's
+    cost gate can abort the run. It fires *after* the object is appended and only
+    for fully-profiled objects, never a half-scanned one.
+    on_complete: Callable[[Dataset], None] | None = None,
     """
-
+    
     datasets: list[Dataset] = []
     for identifier in identifiers:
         meta, columns = adapter.table_metadata(identifier)
@@ -263,20 +266,21 @@ def profile(
                 )
             )
 
-        datasets.append(
-            Dataset(
-                identifier=identifier,
-                object_type=meta.object_type,
-                row_count=meta.row_count,
-                byte_size=meta.byte_size,
-                columns=profiles,
-                composite_keys=composite_keys,
-                data_quality=data_quality,
-                profiled_at=datetime.now(UTC).isoformat(),
-            )
+        ds = Dataset(
+            identifier=identifier,
+            object_type=meta.object_type,
+            row_count=meta.row_count,
+            byte_size=meta.byte_size,
+            columns=profiles,
+            composite_keys=composite_keys,
+            data_quality=data_quality,
+            profiled_at=datetime.now(UTC).isoformat(),
         )
         if progress is not None:
             progress.advance()
+        datasets.append(ds)
+        if on_complete is not None:
+            on_complete(ds)
     return datasets
 
 
