@@ -1,11 +1,11 @@
 # exmergo-dex-core
 
 The portable, Apache-2.0 analytics-engineering engine behind
-[dex](https://github.com/exmergo/dex). All non-trivial logic lives here; the
+[Dex](https://github.com/exmergo/dex). All non-trivial logic lives here; the
 Claude Code skills and the cross-agent `AGENTS.md` are thin wrappers that drive it
 through one stable command contract.
 
-dex is the agent-native analytics engineering toolkit: explore an unfamiliar
+Dex is the agent-native analytics engineering toolkit: explore an unfamiliar
 warehouse, transform raw data into clean dbt models and a semantic layer on top,
 and maintain all of it as the data underneath changes. Read-only against your data;
 every change is a reviewable diff.
@@ -16,8 +16,9 @@ every change is a reviewable diff.
 pip install "exmergo-dex-core"
 ```
 
-Connector client libraries live behind extras, so the zero-credential DuckDB
-on-ramp installs only `duckdb` and `sqlglot`:
+Connector client libraries live behind extras. DuckDB is an in-memory data warehouse,
+so you can start from there if you want to test Dex locally. We aim to support all major
+data warehouses. Please suggest any missing connectors on [GitHub](https://github.com/exmergo/dex)!
 
 ```
 exmergo-dex-core[duckdb]       # the on-ramp and the eval/benchmark engine
@@ -46,11 +47,13 @@ the full surface and the envelope spec.
 
 ## Status
 
-Early and under active development; expect pre-release versions. Today the engine
+Early and under active development; open issues on [GitHub](https://github.com/exmergo/dex)! Today the engine
 runs Explore, Transform, and Maintain end to end on every connector: DuckDB,
 BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres.
 
-Explore: ranks what matters in an unfamiliar warehouse, profiles columns
+### Commands
+
+`explore`: ranks what matters in an unfamiliar warehouse, profiles columns
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
 ad-hoc SELECTs behind a PII-aware query firewall (`explore query`), all
@@ -60,13 +63,25 @@ and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
 writing back to `.dex/config.yml`.
 
-Transform: bootstraps a dbt project where none exists (`transform init`, with an
+`transform`: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and
 deterministic staging scaffolds into reviewable, conflict-checked diffs
 (`transform plan` / `apply`, with human edits authoritative on conflict), runs
 gated dev-target-only builds with cost surfaced before any spend
 (`transform build`), and authors the semantic layer as MetricFlow-validated dbt
 semantic models (`semantic define|update|plan`, applied with `transform apply`).
+
+`maintain`: detects drift against the `.dex/` snapshot on four axes and proposes
+the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
+and semantic (definitions, dangling references, and dimension cardinality).
+`maintain check` sweeps all of them, ranked by blast radius; `reconcile`
+proposes reviewable diffs tagged mechanical or advisory, applied through
+`transform apply`. Detection is read-only on every connector; on billed
+connectors the metadata axes (schema, volume, references) stay free while the
+scanning axes (grain, dimension cardinality) take the `--confirm --budget`
+handshake, so `check` is two-phase.
+
+### Connectors
 
 BigQuery: connects through Application Default Credentials
 (`gcloud auth application-default login`; dex discovers credentials, it never
@@ -134,18 +149,6 @@ planner's own statistics instead of scanning distincts, and dbt builds go to
 a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
 carries, with the ceiling injected as a statement timeout through
 `PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
-
-Maintain detects drift against the `.dex/` snapshot on four axes and proposes
-the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
-and semantic (definitions, dangling references, and dimension cardinality).
-`maintain check` sweeps all of them, ranked by blast radius; `reconcile`
-proposes reviewable diffs tagged mechanical or advisory, applied through
-`transform apply`. Detection is read-only on every connector; on billed
-connectors the metadata axes (schema, volume, references) stay free while the
-scanning axes (grain, dimension cardinality) take the `--confirm --budget`
-handshake, so `check` is two-phase.
-
-The Viz preview reports `not_implemented` until it lands.
 
 ## License
 
