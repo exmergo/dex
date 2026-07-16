@@ -367,6 +367,44 @@ def test_aggregates_one_cheap_pass_no_count_distinct(fake_pg_connection):
     assert by_name["email"].null_fraction == pytest.approx(0.1)
 
 
+def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(
+        rows=[
+            {
+                "n_total": 100,
+                "nn_0": 100,
+                "nn_1": 90,
+                "nn_2": 80,
+                "nn_3": 70,
+                "su_1": 0.8,
+                "sp_1": 0.1,
+                "st_1": 2.5,
+            }
+        ],
+        seconds=0.5,
+    )
+    adapter = make_adapter(fake_pg_connection)
+    _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    aggregates = adapter.column_aggregates(
+        "dexdb.shop.customers", columns, shape_stats={"email"}
+    )
+    sql = fake_pg_connection.data_statements[0].sql
+    assert '"email" ~ \'' in sql
+    for alias in ("su_1", "sp_1", "st_1"):
+        assert f" AS {alias}" in sql
+    assert assert_select_only(sql, dialect="postgres") == sql
+    by_name = {a.name: a for a in aggregates}
+    assert by_name["email"].upper_vocab_fraction == pytest.approx(0.8)
+    assert by_name["email"].person_shape_fraction == pytest.approx(0.1)
+    assert by_name["email"].avg_token_count == pytest.approx(2.5)
+    # id was not requested: its shape fields stay None.
+    assert by_name["id"].upper_vocab_fraction is None
+    assert by_name["id"].person_shape_fraction is None
+    assert by_name["id"].avg_token_count is None
+
+
 def test_degraded_types_get_non_null_counts_only(fake_pg_connection):
     fake_pg_connection.row_resolver = _aggregate_rows
     adapter = make_adapter(fake_pg_connection)

@@ -43,6 +43,68 @@ def airbnb_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def tpch_names_duckdb(tmp_path: Path) -> Path:
+    """The Snowflake TPC-H shapes behind the standing `name` over-flag, seeded
+    verbatim where it matters: `region.R_NAME` is 5 distinct all-caps values
+    over 5 rows (perfectly unique, so cardinality alone can never clear it),
+    `nation.N_NAME` is the 25 all-caps nations including two-token ones, and
+    `part.P_NAME` is lowercase five-word labels. `hosts.name` is the
+    counter-shape: full person names that must stay flagged at or above the
+    firewall threshold."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "tpch_names.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE region (r_regionkey INTEGER, R_NAME VARCHAR)")
+    conn.execute(
+        "INSERT INTO region VALUES (0, 'AFRICA'), (1, 'AMERICA'), (2, 'ASIA'), "
+        "(3, 'EUROPE'), (4, 'MIDDLE EAST')"
+    )
+    nations = [
+        "ALGERIA",
+        "ARGENTINA",
+        "BRAZIL",
+        "CANADA",
+        "EGYPT",
+        "ETHIOPIA",
+        "FRANCE",
+        "GERMANY",
+        "INDIA",
+        "INDONESIA",
+        "IRAN",
+        "IRAQ",
+        "JAPAN",
+        "JORDAN",
+        "KENYA",
+        "MOROCCO",
+        "MOZAMBIQUE",
+        "PERU",
+        "CHINA",
+        "ROMANIA",
+        "SAUDI ARABIA",
+        "VIETNAM",
+        "RUSSIA",
+        "UNITED KINGDOM",
+        "UNITED STATES",
+    ]
+    conn.execute("CREATE TABLE nation (n_nationkey INTEGER, N_NAME VARCHAR)")
+    conn.executemany("INSERT INTO nation VALUES (?, ?)", list(enumerate(nations)))
+    words = ["goldenrod", "lavender", "spring", "chocolate", "lace", "midnight"]
+    parts = [
+        (i, " ".join(words[(i + j) % len(words)] for j in range(5))) for i in range(30)
+    ]
+    conn.execute("CREATE TABLE part (p_partkey INTEGER, P_NAME VARCHAR)")
+    conn.executemany("INSERT INTO part VALUES (?, ?)", parts)
+    conn.execute("CREATE TABLE hosts (id INTEGER, name VARCHAR)")
+    conn.execute(
+        "INSERT INTO hosts VALUES (1, 'Ada Lovelace'), (2, 'Alan Turing'), "
+        "(3, 'Grace Hopper'), (4, 'Edsger Dijkstra')"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def near_unique_duckdb(tmp_path: Path) -> Path:
     """Tables big enough for approx_count_distinct to genuinely err: a 50k-row
     table with an exactly-unique key (the field failure: HLL noise made every

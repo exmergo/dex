@@ -224,3 +224,118 @@ def test_tables_are_reported_for_the_query_log(cache: DexCache):
         LIMITS,
     )
     assert inspected.tables == ["db.main.RAW_HOSTS", "db.main.RAW_LISTINGS"]
+
+
+# --- the confidence threshold: sub-threshold flags warn, never block -------------
+
+
+def _cache_with_confidence(confidence: float) -> DexCache:
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.REGION",
+                columns=[
+                    ColumnProfile(name="R_REGIONKEY", data_type="INTEGER"),
+                    ColumnProfile(
+                        name="R_NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=confidence),
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
+def test_sub_threshold_flag_projects_with_a_warning():
+    inspected = inspect_query(
+        "SELECT R_NAME FROM REGION", _cache_with_confidence(0.3), LIMITS
+    )
+    assert inspected.sql
+    (warning,) = inspected.warnings
+    assert "REGION.R_NAME" in warning
+    assert "(name)" in warning
+    assert "0.3" in warning and "0.5" in warning
+    assert "pii_overrides" in warning
+
+
+def test_threshold_boundary_is_inclusive():
+    # 0.5 exactly blocks; just below allows with a warning. The boundary is >=.
+    with pytest.raises(QueryRefusedError):
+        inspect_query("SELECT R_NAME FROM REGION", _cache_with_confidence(0.5), LIMITS)
+    inspected = inspect_query(
+        "SELECT R_NAME FROM REGION", _cache_with_confidence(0.49), LIMITS
+    )
+    assert inspected.warnings
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM REGION",
+        "WITH x AS (SELECT R_NAME FROM REGION) SELECT R_NAME FROM x",
+        "SELECT t.R_NAME FROM (SELECT R_NAME FROM REGION) t",
+    ],
+)
+def test_sub_threshold_warnings_survive_star_cte_and_subquery(sql: str):
+    inspected = inspect_query(sql, _cache_with_confidence(0.3), LIMITS)
+    assert any("REGION.R_NAME" in w for w in inspected.warnings)
+
+
+def test_measuring_aggregate_over_sub_threshold_flag_carries_no_warning():
+    # The statistic path is as clean as ever: no value crosses, nothing to flag.
+    inspected = inspect_query(
+        "SELECT COUNT(DISTINCT R_NAME) FROM REGION", _cache_with_confidence(0.3), LIMITS
+    )
+    assert inspected.warnings == []
+
+
+def test_refusal_points_at_the_override_path(cache: DexCache):
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", cache)
+    assert "pii_overrides" in message
+    assert ".dex/config.yml" in message
+
+
+def test_stale_cache_refusal_hints_at_reprofiling():
+    from exmergo_dex_core.cache import CACHE_SCHEMA_VERSION
+
+    stale = _cache_with_confidence(0.6)
+    stale.schema_version = CACHE_SCHEMA_VERSION - 1
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query("SELECT R_NAME FROM REGION", stale, LIMITS)
+    assert "re-profile" in str(excinfo.value)
+
+    current = _cache_with_confidence(0.6)
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query("SELECT R_NAME FROM REGION", current, LIMITS)
+    assert "re-profile" not in str(excinfo.value)
+
+
+def test_sub_threshold_column_qualifies_as_a_recovery_twin():
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.PRODUCTS",
+                columns=[
+                    ColumnProfile(
+                        name="NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                ],
+            ),
+            Dataset(
+                identifier="db.main.INVENTORY_ITEMS",
+                columns=[
+                    ColumnProfile(
+                        name="PRODUCT_NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.3),
+                    ),
+                ],
+            ),
+        ]
+    )
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query("SELECT NAME FROM PRODUCTS", cache, LIMITS)
+    assert "INVENTORY_ITEMS.PRODUCT_NAME" in str(excinfo.value)

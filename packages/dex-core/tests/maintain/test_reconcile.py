@@ -11,6 +11,38 @@ def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+def test_drift_added_column_honors_pii_override():
+    """A drift-added column gets a name-based flag at base confidence (no
+    aggregates exist yet, so it blocks until the next profile); an override
+    clears it with the audit recorded."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _patched_dataset
+
+    base = Dataset(
+        identifier="db.main.orders",
+        columns=[ColumnProfile(name="id", data_type="INTEGER")],
+    )
+    finding = DriftFinding(
+        axis="schema",
+        code="column_added",
+        identifier="db.main.orders",
+        column="customer_name",
+        detail="column customer_name added",
+        data={"data_type": "VARCHAR"},
+    )
+
+    plain = _patched_dataset(base, [finding], set())
+    added = next(c for c in plain.columns if c.name == "customer_name")
+    assert added.pii is not None and added.pii.confidence == 0.6
+
+    cleared = _patched_dataset(base, [finding], {"db.main.orders.customer_name"})
+    added = next(c for c in cleared.columns if c.name == "customer_name")
+    assert added.pii is None
+    assert added.pii_overridden is not None
+
+
 def test_reconcile_needs_a_drift_report(maintain_repo):
     maintain_repo.snapshot()
     rc, payload = maintain_repo.dex("maintain", "reconcile")

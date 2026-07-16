@@ -298,6 +298,9 @@ def test_cache_without_new_fields_still_loads():
     cache = DexCache.model_validate(old_shape)
     assert cache.datasets[0].profiled_at is None
     assert cache.datasets[0].columns[0].distinct_count_exact is False
+    # A v2 cache (pre pii_overridden) loads with the audit field defaulted; its
+    # stored flags keep blocking as they did when written (fail closed).
+    assert cache.datasets[0].columns[0].pii_overridden is None
 
 
 # --- edge cases --------------------------------------------------------------

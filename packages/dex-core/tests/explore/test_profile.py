@@ -135,6 +135,225 @@ def test_airbnb_pii_columns_are_flagged_with_min_max_suppressed(
         assert set(col["pii"]) == {"category", "confidence"}  # never a value
 
 
+def test_tpch_reference_names_derate_below_threshold_and_person_names_hold(
+    tpch_names_duckdb: Path, capsys
+):
+    """Issue 54's exact shapes: the flag is never removed, but value-shape
+    evidence de-rates reference vocabularies (R_NAME, N_NAME) and long labels
+    (P_NAME) below the firewall threshold, while full person names corroborate
+    up to the exact-token confidence."""
+
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "region",
+            "nation",
+            "part",
+            "hosts",
+            "--path",
+            str(tpch_names_duckdb),
+        ],
+        capsys,
+    )
+    ds = {d["identifier"].split(".")[-1]: d for d in payload["data"]["datasets"]}
+    r_name = {c["name"]: c for c in ds["region"]["columns"]}["R_NAME"]
+    n_name = {c["name"]: c for c in ds["nation"]["columns"]}["N_NAME"]
+    p_name = {c["name"]: c for c in ds["part"]["columns"]}["P_NAME"]
+    person = {c["name"]: c for c in ds["hosts"]["columns"]}["name"]
+
+    for col in (r_name, n_name, p_name):
+        assert col["pii"]["category"] == "name", "the flag is never removed"
+        assert col["pii"]["confidence"] < 0.5
+    assert person["pii"]["category"] == "name"
+    assert person["pii"]["confidence"] == 0.75, "person shape corroborates"
+    # De-rating never weakens min/max suppression: string columns stay hidden.
+    for col in (r_name, n_name, p_name, person):
+        assert col["min_value"] is None and col["max_value"] is None
+        assert set(col["pii"]) == {"category", "confidence"}
+
+
+def test_single_first_names_keep_base_confidence(airbnb_duckdb: Path, capsys):
+    """Single-token first names ('Grace', 'Alan') match no shape rule in either
+    direction: ambiguity keeps the name-derived 0.6, which blocks."""
+
+    payload = _run(
+        ["explore", "profile", "RAW_REVIEWS", "--path", str(airbnb_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    reviewer = {c["name"]: c for c in dataset["columns"]}["REVIEWER_NAME"]
+    assert reviewer["pii"]["confidence"] == 0.6
+
+
+# --- _refine_confidence: the shape rules ---------------------------------------
+
+
+def _aggregate(**kwargs):
+    from exmergo_dex_core.adapters.base import ColumnAggregate
+
+    defaults = {
+        "name": "x",
+        "null_fraction": 0.0,
+        "distinct_count": 100,
+        "is_unique": False,
+        "min_value": None,
+        "max_value": None,
+    }
+    return ColumnAggregate(**{**defaults, **kwargs})
+
+
+def _generic_name_flag():
+    from exmergo_dex_core.cache import PIIFlag
+
+    return PIIFlag(category=PIICategory.NAME, confidence=0.6)
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "expected"),
+    [
+        # Person-shaped distribution corroborates to the exact-token level.
+        ({"person_shape_fraction": 0.5}, 0.75),
+        ({"person_shape_fraction": 1.0}, 0.75),
+        # Tiny closed all-caps vocabulary: the R_NAME shape (5/5 distinct, so
+        # only value shape, never cardinality, can clear it).
+        (
+            {
+                "person_shape_fraction": 0.0,
+                "upper_vocab_fraction": 1.0,
+                "distinct_count": 5,
+            },
+            0.3,
+        ),
+        # The distinct cap bounds the all-caps rule: a large all-caps vocabulary
+        # (an uppercased person-name column defeats the person-shape check).
+        (
+            {
+                "person_shape_fraction": 0.0,
+                "upper_vocab_fraction": 1.0,
+                "distinct_count": 33,
+            },
+            0.6,
+        ),
+        # Long multi-token labels: the P_NAME / product-title shape.
+        ({"person_shape_fraction": 0.0, "avg_token_count": 5.0}, 0.3),
+        ({"person_shape_fraction": 0.0, "avg_token_count": 3.5}, 0.3),
+        # Ambiguity blocks: person shape present but not dominant.
+        ({"person_shape_fraction": 0.2, "avg_token_count": 5.0}, 0.6),
+        # Two-token title case ('Australian Grand Prix' averages ~3 tokens,
+        # 'Memphis TN' fails the person shape): no rule fires, stays blocked.
+        ({"person_shape_fraction": 0.0, "avg_token_count": 2.0}, 0.6),
+        # Fail closed: no evidence moves nothing.
+        ({}, 0.6),
+    ],
+)
+def test_shape_rules_move_generic_name_confidence(aggregate: dict, expected: float):
+    from exmergo_dex_core.explore.profile import _refine_confidence
+
+    refined = _refine_confidence(
+        _generic_name_flag(), _aggregate(**aggregate), generic=True
+    )
+    assert refined.category == PIICategory.NAME, "the flag is never removed"
+    assert refined.confidence == expected
+
+
+def test_shape_rules_apply_only_to_generic_marked_name_flags():
+    from exmergo_dex_core.cache import PIIFlag
+    from exmergo_dex_core.explore.profile import _refine_confidence
+
+    reference_shaped = _aggregate(
+        person_shape_fraction=0.0, upper_vocab_fraction=1.0, distinct_count=5
+    )
+    # An exact person token is not generic: shape evidence never de-rates it.
+    exact = PIIFlag(category=PIICategory.NAME, confidence=0.75)
+    assert _refine_confidence(exact, reference_shaped, generic=False).confidence == 0.75
+    # Other categories are untouched by the shape rules even if marked.
+    free_text = PIIFlag(category=PIICategory.FREE_TEXT, confidence=0.5)
+    assert (
+        _refine_confidence(free_text, reference_shaped, generic=True).confidence == 0.5
+    )
+
+
+def test_shape_stats_requested_only_for_generic_name_string_columns():
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.shape_requests: list[set[str]] = []
+            self.columns = [
+                ColumnMeta("id", "INTEGER", False, 0),
+                ColumnMeta("reviewer_name", "VARCHAR", True, 1),
+                ColumnMeta("first_name", "VARCHAR", True, 2),
+                ColumnMeta("product_name", "VARCHAR", True, 3),
+                ColumnMeta("email", "VARCHAR", True, 4),
+            ]
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=1,
+                byte_size=None,
+                column_count=len(self.columns),
+            )
+            return meta, self.columns
+
+        def column_aggregates(
+            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+        ):
+            self.shape_requests.append(set(shape_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    profile_mod.profile(adapter, ["db.s.t"])
+    # Only the generic `*_name` flag buys shape SQL: not the exact token
+    # (first_name), not the denylisted qualifier (product_name), not another
+    # category (email), not a numeric column.
+    assert adapter.shape_requests == [{"reviewer_name"}]
+
+
+# --- pii_overrides: the durable human decision ---------------------------------
+
+
+def _write_overrides(entries: list[str]) -> None:
+    from exmergo_dex_core.config import DexConfig, PIIOverride, save_config
+
+    save_config(
+        DexConfig(pii_overrides=[PIIOverride(column=e) for e in entries]),
+    )
+
+
+def test_pii_override_clears_flag_with_audit_and_survives_reprofile(
+    tpch_names_duckdb: Path, capsys
+):
+    _write_overrides(["tpch_names.main.hosts.name"])
+    for _ in range(2):  # the second run proves the override survives re-profiling
+        payload = _run(
+            ["explore", "profile", "hosts", "--path", str(tpch_names_duckdb)], capsys
+        )
+        (dataset,) = payload["data"]["datasets"]
+        person = {c["name"]: c for c in dataset["columns"]}["name"]
+        assert person["pii"] is None
+        assert person["pii_overridden"] == "name", "the audit trail"
+        assert any("pii_overrides" in n for n in payload["data"]["notes"])
+
+
+def test_pii_override_matching_no_column_warns(tpch_names_duckdb: Path, capsys):
+    _write_overrides(["tpch_names.main.hosts.nmae"])
+    rc = main(["explore", "profile", "hosts", "--path", str(tpch_names_duckdb)])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert any("matches no column" in w for w in payload["warnings"])
+    (dataset,) = payload["data"]["datasets"]
+    person = {c["name"]: c for c in dataset["columns"]}["name"]
+    assert person["pii"] is not None, "a typo must not clear anything"
+
+
 def test_non_unique_id_gets_fan_out_warning(airbnb_duckdb: Path, capsys):
     payload = _run(
         ["explore", "profile", "RAW_HOSTS", "--path", str(airbnb_duckdb)], capsys
@@ -477,7 +696,9 @@ class _StubAdapter:
         ]
         return meta, columns
 
-    def column_aggregates(self, identifier, columns, *, safe_min_max=None):
+    def column_aggregates(
+        self, identifier, columns, *, safe_min_max=None, shape_stats=None
+    ):
         from exmergo_dex_core.adapters.base import ColumnAggregate
 
         return [
@@ -688,7 +909,9 @@ def test_row_count_refreshes_after_the_aggregate_scan():
                 ColumnMeta(name="id", data_type="INTEGER", nullable=False, ordinal=0)
             ]
 
-        def column_aggregates(self, identifier, columns, *, safe_min_max=None):
+        def column_aggregates(
+            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+        ):
             self.scanned = True
             return [
                 ColumnAggregate(
