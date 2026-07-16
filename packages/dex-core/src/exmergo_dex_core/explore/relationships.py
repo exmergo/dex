@@ -192,8 +192,13 @@ def fold_replica_relationships(
     def bare(identifier: str) -> str:
         return identifier.rsplit(".", 1)[-1]
 
+    # Compare case-insensitive short names on both sides: a BigQuery dev_dataset
+    # may be configured qualified (`project.dataset`), and Snowflake/Redshift
+    # schema identifiers are often cased differently from the configured value.
+    dev_short = {s.rsplit(".", 1)[-1].casefold() for s in dev_schemas}
+
     def is_dev(schema: str) -> bool:
-        return schema.rsplit(".", 1)[-1] in dev_schemas
+        return schema.rsplit(".", 1)[-1].casefold() in dev_short
 
     # An entity+columns fingerprint held by more than one schema is a mirrored
     # entity; a dev schema is a replica by declaration even without a structural

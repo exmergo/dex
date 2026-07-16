@@ -265,7 +265,7 @@ def test_dealiased_match_skips_when_stripped_to_a_bare_suffix():
 # --- same-lineage / replica folding --------------------------------------------
 
 
-def _mirror_world() -> list[Dataset]:
+def _mirror_world(dev_schema: str = "dbt_dev") -> list[Dataset]:
     """A source schema and a dev/replica schema holding the same entities: the
     shape that inflated one foreign key into several edges in the field."""
 
@@ -277,11 +277,15 @@ def _mirror_world() -> list[Dataset]:
         ),
         _ds("db.main.customers", [_col("id", distinct=2, unique=True)], rows=2),
         _ds(
-            "db.dbt_dev.stg_orders",
+            f"db.{dev_schema}.stg_orders",
             [_col("id", distinct=3, unique=True), _col("customer_id", distinct=2)],
             rows=3,
         ),
-        _ds("db.dbt_dev.dim_customers", [_col("id", distinct=2, unique=True)], rows=2),
+        _ds(
+            f"db.{dev_schema}.dim_customers",
+            [_col("id", distinct=2, unique=True)],
+            rows=2,
+        ),
     ]
 
 
@@ -330,6 +334,38 @@ def test_fold_is_a_noop_without_a_mirror():
     assert mirrored == 0
 
 
+def test_fold_matches_qualified_dev_dataset_config():
+    """A BigQuery-style qualified dev_dataset (`project.dataset`) must still mark
+    the replica schema, so the source edge is kept as canonical."""
+
+    datasets = _mirror_world()
+    rels = infer_relationships(datasets)
+    kept, folded, mirrored = fold_replica_relationships(
+        datasets, rels, frozenset({"db.dbt_dev"})
+    )
+    assert folded == 3
+    assert len(kept) == 1
+    assert kept[0].from_dataset == "db.main.orders"
+    assert kept[0].to_dataset == "db.main.customers"
+    assert mirrored == 2
+
+
+def test_fold_matches_dev_schema_case_insensitively():
+    """A lower-case configured dev_schema must match an upper-cased warehouse
+    schema (Snowflake/Redshift casing), keeping the source edge as canonical."""
+
+    datasets = _mirror_world(dev_schema="DBT_DEV")
+    rels = infer_relationships(datasets)
+    kept, folded, mirrored = fold_replica_relationships(
+        datasets, rels, frozenset({"dbt_dev"})
+    )
+    assert folded == 3
+    assert len(kept) == 1
+    assert kept[0].from_dataset == "db.main.orders"
+    assert kept[0].to_dataset == "db.main.customers"
+    assert mirrored == 2
+
+
 def test_map_folds_mirrored_lineage_and_notes_it(tmp_path: Path, capsys):
     duckdb = pytest.importorskip("duckdb")
     db = tmp_path / "mirror.duckdb"
@@ -353,6 +389,47 @@ def test_map_folds_mirrored_lineage_and_notes_it(tmp_path: Path, capsys):
     assert any("mirror source lineage" in n for n in payload["data"]["notes"])
     # One real foreign key survives instead of the inflated cross-schema fan-out.
     assert payload["data"]["relationship_count"] <= 2
+
+
+def test_relationships_folds_mirrored_lineage_and_persists_folded_set(
+    tmp_path: Path, capsys
+):
+    """`explore relationships` must fold replica duplicates exactly as `map` does,
+    in both the envelope and the persisted cache — the coverage gap that let the
+    two commands' caches disagree."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "mirror.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1), (2, 2), (3, 1)")
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2)")
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute("CREATE TABLE dbt_dev.stg_orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO dbt_dev.stg_orders VALUES (1, 1), (2, 2), (3, 1)")
+    conn.execute("CREATE TABLE dbt_dev.dim_customers (id INTEGER)")
+    conn.execute("INSERT INTO dbt_dev.dim_customers VALUES (1), (2)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        ["explore", "relationships", "--path", str(db), "--repo-root", str(repo)],
+        capsys,
+    )
+    data = payload["data"]
+    assert any("mirror source lineage" in n for n in data["notes"])
+    # One real foreign key survives instead of the inflated cross-schema fan-out.
+    assert len(data["relationships"]) == 1
+
+    cache = DexStore(repo).load_cache()
+    assert len(cache.relationships) == 1
+    envelope_edge = data["relationships"][0]
+    assert (cache.relationships[0].from_dataset, cache.relationships[0].to_dataset) == (
+        envelope_edge["from_dataset"],
+        envelope_edge["to_dataset"],
+    )
 
 
 # --- grain and data-quality notes ----------------------------------------------
