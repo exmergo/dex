@@ -30,6 +30,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore map`, `explore relationships`, and `explore profile` now persist
+  each object's profile as it completes on billed connectors** ([#75]).
+  Previously the cache was written exactly once, at the very end of the command,
+  after the whole profiling pass plus inference and ranking finished. When a run
+  against a billed connector (BigQuery, Snowflake, Redshift, Postgres,
+  Databricks) exhausted its budget partway through, the cost gate raised mid-pass
+  and none of the profiling already paid for reached `.dex/cache.json` real
+  spend, no cache. Each of the three commands now checkpoints every fully
+  profiled object to the cache as it completes, so a run that dies at object 60
+  of 90 leaves 60 objects' worth of raw profile behind, and reports how many of
+  how many objects were saved. A fully successful run still overwrites the
+  checkpoints with the authoritative composed cache (relationships, ranking,
+  carry-forward), and the free DuckDB path is unchanged (its re-runs are free, so
+  it never checkpoints).
 - **`explore relationships` now folds same-lineage/replica duplicate edges
   before caching, matching `explore map`** ([#70]). `relationships` profiles
   the full inventory, so it is even more likely than `map` to pull a

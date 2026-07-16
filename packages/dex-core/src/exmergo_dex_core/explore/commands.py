@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,8 +20,16 @@ from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
-from ..cache import Dataset, DexCache, DexStore, Relationship, match_identifier
+from ..cache import (
+    CACHE_FILE,
+    Dataset,
+    DexCache,
+    DexStore,
+    Relationship,
+    match_identifier,
+)
 from ..config import DexConfig, QueryLimits, load_config
+from ..guards.cost_guard import OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
@@ -105,6 +114,13 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
     adapter = command_args.open_from_args(args)
+    # Capture pre-run cache state before any checkpoint write, so the success-path
+    # compose reads the pre-run cache rather than a checkpoint this run wrote.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    prior = store.load_cache()
+    accumulated: list[Dataset] = []
+    over_ceiling = False
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
         estimate, per_table = _profile_estimate(adapter, identifiers)
@@ -113,21 +129,35 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(adapter, identifiers)
         connector = adapter.name
+        # Checkpoint per object only on billed connectors: DuckDB can never
+        # exhaust budget and its re-runs are free, so the extra full-file writes
+        # (and O(n^2) serialization on large warehouses) are scoped precisely to
+        # the population the bug affects.
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, connector, now
+            )
+        try:
+            datasets = profile_mod.profile(adapter, identifiers, on_complete=checkpoint)
+        except OverCeilingError:
+            over_ceiling = True
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    if over_ceiling:
+        envelope = _over_ceiling_error(store, accumulated, len(identifiers))
+        command_args.stamp_spend(envelope, adapter)
+        return envelope
     _annotate_grain(datasets, defs)
 
     # Persist what the scan already paid for: after profiling a table, `explore
     # query` on that table must work without a second warehouse scan (the query
     # firewall's own refusal messages promise exactly this). Prior relationships
     # are preserved because profile runs no inference pass.
-    store = DexStore(repo_root)
-    now = datetime.now(UTC)
-    cache, stats = _merge_profiles(store.load_cache(), datasets, connector, now)
+    cache, stats = _merge_profiles(prior, datasets, connector, now)
     path = store.save_cache(cache, now=now)
 
     envelope.data.update(
@@ -148,6 +178,13 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     defs = _project_definitions(args, config)
 
     adapter = command_args.open_from_args(args)
+    # Capture pre-run cache state before any checkpoint write, so the success-path
+    # compose reads the pre-run cache rather than a checkpoint this run wrote.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    prior = store.load_cache()
+    accumulated: list[Dataset] = []
+    over_ceiling = False
     try:
         # Relationship inference needs uniqueness signals, so profile every object
         # first (free and local on DuckDB), then infer across the full set.
@@ -174,17 +211,31 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(adapter, identifiers)
         connector = adapter.name
-        inferred = rel_mod.infer_relationships(datasets)
-        if verify:
-            rel_mod.verify_relationships(
-                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+        # Billed-connector-gated per-object checkpointing (see cmd_profile).
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, connector, now
             )
+        try:
+            datasets = profile_mod.profile(adapter, identifiers, on_complete=checkpoint)
+        except OverCeilingError:
+            over_ceiling = True
+        if not over_ceiling:
+            inferred = rel_mod.infer_relationships(datasets)
+            if verify:
+                rel_mod.verify_relationships(
+                    adapter, inferred, timeout_seconds=config.query.timeout_seconds
+                )
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    if over_ceiling:
+        envelope = _over_ceiling_error(store, accumulated, len(identifiers))
+        command_args.stamp_spend(envelope, adapter)
+        return envelope
     # Annotate before persisting so cached datasets carry candidate_keys and
     # grain, the same shape a `map`-written cache has.
     _annotate_grain(datasets, defs)
@@ -222,11 +273,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     # Persist the profiles this run already paid for. Because relationships
     # inventories and profiles the full set and infers across all of it, its
     # relationship set is authoritative for this run and replaces the prior one.
-    store = DexStore(repo_root)
-    now = datetime.now(UTC)
-    cache, stats = _merge_profiles(
-        store.load_cache(), datasets, connector, now, relationships=rels
-    )
+    cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
     path = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
@@ -332,6 +379,13 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     full = getattr(args, "full", False)
 
     adapter = command_args.open_from_args(args)
+    # Capture pre-run cache state before any checkpoint write, so the success-path
+    # compose reads the pre-run cache rather than a checkpoint this run wrote.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    prior = store.load_cache()
+    accumulated: list[Dataset] = []
+    over_ceiling = False
     try:
         metas = inventory_mod.inventory(adapter)
         # First-pass rank on cheap signals (no connectivity yet) to choose what to
@@ -355,17 +409,33 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        profiled = profile_mod.profile(adapter, [m.identifier for m in selected])
-        _annotate_grain(profiled, defs)
-        inferred = rel_mod.infer_relationships(profiled)
-        if getattr(args, "verify", False):
-            rel_mod.verify_relationships(
-                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+        # Billed-connector-gated per-object checkpointing (see cmd_profile).
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, adapter.name, now
             )
+        try:
+            profiled = profile_mod.profile(
+                adapter, [m.identifier for m in selected], on_complete=checkpoint
+            )
+        except OverCeilingError:
+            over_ceiling = True
+        if not over_ceiling:
+            _annotate_grain(profiled, defs)
+            inferred = rel_mod.infer_relationships(profiled)
+            if getattr(args, "verify", False):
+                rel_mod.verify_relationships(
+                    adapter, inferred, timeout_seconds=config.query.timeout_seconds
+                )
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    if over_ceiling:
+        envelope = _over_ceiling_error(store, accumulated, len(selected))
+        command_args.stamp_spend(envelope, adapter)
+        return envelope
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
     # into source, replica, and cross-dataset lookalike edges.
@@ -377,10 +447,6 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         defs, [m.identifier for m in metas]
     )
     relationships, confirmed = _merge_relationships(declared, inferred)
-
-    store = DexStore(repo_root)
-    now = datetime.now(UTC)
-    prior = store.load_cache()
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     final_scores = rank_mod.rank(metas, relationships, hints)
@@ -952,6 +1018,54 @@ def _compose_datasets(
 
 # Sentinel: preserve the prior cache's relationships (profile has no inference
 # pass, so it has no business touching them).
+def _profile_checkpointer(
+    store: DexStore,
+    prior: DexCache | None,
+    connector: str,
+    now: datetime,
+) -> tuple[Callable[[Dataset], None], list[Dataset]]:
+    """Persist each profiled dataset as it completes, so a budget-exhaustion
+    failure mid-run still leaves the objects already paid for in the cache.
+
+    Reuses ``_merge_profiles`` (KEEP_RELATIONSHIPS), so a partial write is exactly
+    a ``cmd_profile``-shaped result: fresh profiles folded over the same-connector
+    prior, prior relationships preserved, no fabricated stubs. ``accumulated`` is
+    returned so the failure handler can report "N of M".
+    """
+
+    accumulated: list[Dataset] = []
+
+    def checkpoint(ds: Dataset) -> None:
+        accumulated.append(ds)
+        cache, _ = _merge_profiles(prior, accumulated, connector, now)
+        store.save_cache(cache, now=now)
+
+    return checkpoint, accumulated
+
+
+def _over_ceiling_error(
+    store: DexStore, accumulated: list[Dataset], selected: int
+) -> env.Envelope:
+    """The partial-completion error envelope for a mid-run budget exhaustion.
+
+    Because ``charge()`` fires before an object's ``Dataset`` is appended,
+    ``accumulated`` holds only fully-profiled objects — a truthful "N of M"."""
+
+    n = len(accumulated)
+    if n == 0:
+        return env.error(
+            f"budget exhausted before the first of {selected} object(s) finished "
+            "profiling; no partial profiles were saved — raise --budget or narrow "
+            "scope, then re-run"
+        )
+    cache_path = store.dex_dir / CACHE_FILE
+    return env.error(
+        f"budget exhausted after profiling {n} of {selected} object(s); partial "
+        f"profiles saved to {cache_path} — raise --budget or narrow scope, then "
+        "re-run"
+    )
+
+
 _KEEP_RELATIONSHIPS = object()
 
 
