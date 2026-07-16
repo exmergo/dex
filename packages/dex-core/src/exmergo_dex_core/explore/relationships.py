@@ -23,6 +23,7 @@ from ..cache import (
     match_identifier,
 )
 from ..dbt_project import ProjectDefinitions
+from ..progress import ProgressReporter
 from .profile import NEAR_UNIQUE_RATIO
 
 # Warehouse-layer prefixes stripped from a table name before entity matching, so
@@ -330,6 +331,7 @@ def verify_relationships(
     relationships: list[Relationship],
     *,
     timeout_seconds: float = 30.0,
+    progress: ProgressReporter | None = None,
 ) -> None:
     """Measure each inferred join with one overlap probe and adjust in place.
 
@@ -338,6 +340,11 @@ def verify_relationships(
     is strong evidence the name-based guess was wrong and demotes it well below
     the emission threshold rather than deleting it, so the agent still sees what
     was tried. Aggregate counts only; no key value ever leaves the engine.
+
+    An optional ``progress`` reporter emits a throttled stderr line per probed
+    join. It advances only on iterations that actually ran a probe, never on the
+    declared-join skip, so its counts match the reporter's ``total`` of inferred
+    joins; ``None`` (the default) keeps existing callers silent and unchanged.
     """
 
     for rel in relationships:
@@ -352,6 +359,8 @@ def verify_relationships(
         rel.verified = True
         if nonnull == 0:
             rel.orphan_fraction = None
+            if progress is not None:
+                progress.advance()  # this iteration ran a probe; count it
             continue
         fraction = orphans / nonnull
         rel.orphan_fraction = round(fraction, 4)
@@ -366,6 +375,9 @@ def verify_relationships(
         else:
             confidence -= 0.1
         rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
+
+        if progress is not None:
+            progress.advance()
 
 
 def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
