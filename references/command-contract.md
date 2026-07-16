@@ -36,7 +36,8 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
 dex explore map                   -> write/update the .dex cache; print a summary
 dex explore query "<SELECT ...>"  -> run one agent-authored SELECT through the query firewall
-dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII columns;
+dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII non-key columns
+                                     (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows
                                      (--features to choose columns, -k to fix the cluster count)
 dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit

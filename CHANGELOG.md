@@ -15,8 +15,12 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   sample.** Discovers structure in a table without ever loading it into
   context. Cache-gated like `explore query`, so it auto-selects features from
   profiled numeric, non-PII, non-key columns (or takes an explicit
-  `--features` list, where naming a PII column opts it in deliberately and only
-  its per-cluster mean, an aggregate, is reported). The sample query scans only
+  `--features` list, where naming a PII column or a key opts it in deliberately
+  and only its per-cluster mean, an aggregate, is reported). A key is never a
+  feature: its mean is meaningless, and a fact table is mostly keys plus a few
+  measures, so clustering on them just partitions surrogate ranges. Unique
+  columns, columns that join out (per the joins `explore map` inferred), and
+  columns named like a key are all excluded, and the notes name each one. The sample query scans only
   the feature columns and carries a dialect-aware sample clause (DuckDB
   `USING SAMPLE`, BigQuery/Postgres `TABLESAMPLE SYSTEM`, Snowflake `SAMPLE`,
   Databricks `TABLESAMPLE`, Redshift random top-N), so a metered warehouse

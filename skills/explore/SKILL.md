@@ -56,8 +56,15 @@ Subcommands, in the usual order:
    when `-k` is omitted, the k it picked plus the silhouette sweep it chose from.
    Requires the `.dex/` cache (run `map`/`profile` first) so features can be
    auto-selected from profiled numeric, non-PII, non-key columns; pass
-   `--features` to choose them yourself (naming a PII column opts it in
-   deliberately, and only its mean is ever reported). Only aggregates cross the
+   `--features` to choose them yourself (naming a PII column, or a key, opts it
+   in deliberately, and only its mean is ever reported). A key is never a
+   feature: its mean is meaningless, and a fact table is mostly keys plus a
+   handful of measures, so clustering on them just partitions surrogate ranges.
+   Keys are the unique columns, the columns that join out (from the joins `map`
+   inferred), and the columns named like one; prefer `map` over a bare
+   `profile` here, because without inferred joins a foreign key is caught only
+   if its name gives it away. The notes name every excluded column, so check
+   them before trusting a result. Only aggregates cross the
    boundary: the sample rows are clustered in-process and never enter context.
    On a metered connector it takes the same cost handshake as the scanning
    commands below (only the feature columns are scanned, and a dialect-aware

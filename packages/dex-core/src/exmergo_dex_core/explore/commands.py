@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -497,7 +498,7 @@ def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
     requested = _split_features(getattr(args, "features", None))
     try:
         features, selection_notes = _select_cluster_features(
-            dataset, requested, limits.max_features
+            dataset, requested, limits.max_features, cache.relationships
         )
     except ValueError as exc:
         return env.error(str(exc))
@@ -588,17 +589,62 @@ def _is_constant_column(col) -> bool:
     return col.distinct_count is not None and col.distinct_count <= 1
 
 
+_KEY_WORDS = ("id", "uuid", "guid", "key")
+_ID_NAME_RE = re.compile(
+    "|".join(
+        (
+            rf"(?:^|_)(?:{'|'.join(_KEY_WORDS)})$",
+            rf"[a-z0-9](?:{'|'.join(w.capitalize() for w in _KEY_WORDS)})$",
+            rf"(?:^|_)(?:{'|'.join(w.upper() for w in _KEY_WORDS)})$",
+        )
+    ),
+    re.ASCII,
+)
+
+
+def _is_id_shaped(name: str) -> bool:
+    """Whether a column name looks like a key, on word boundaries only."""
+
+    return bool(_ID_NAME_RE.search(name))
+
+
+def _foreign_key_columns(
+    dataset: Dataset, relationships: list[Relationship]
+) -> set[str]:
+    """Lower-cased columns of ``dataset`` that join out to another object.
+
+    Only the ``from`` side is a foreign key; the ``to`` side is the referenced
+    key, which auto-selection already drops via its own uniqueness. Joins are
+    what `explore map` inferred, so this costs no extra scan.
+    """
+
+    identifier = dataset.identifier.lower()
+    return {
+        col.lower()
+        for rel in relationships
+        if rel.from_dataset.lower() == identifier
+        for col in rel.from_columns
+    }
+
+
 def _select_cluster_features(
-    dataset: Dataset, requested: list[str] | None, max_features: int
+    dataset: Dataset,
+    requested: list[str] | None,
+    max_features: int,
+    relationships: list[Relationship] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Resolve the feature columns for clustering plus notes explaining the set.
 
     Explicit ``--features`` are honored as given (validated numeric); a PII
     column may be named deliberately, and only its per-cluster mean, an
     aggregate, is ever reported. Auto-selection is conservative: numeric columns
-    that are not PII-flagged, not a proven unique key (an identifier is not a
-    feature), and not constant. Raises ``ValueError`` with an actionable message
-    when the request cannot be satisfied.
+    that are not PII-flagged, not a key, and not constant. A key is any of a
+    proven unique column (the primary key), a column joining out to another
+    object (a foreign key, per the joins `explore map` inferred), or a column
+    named like one. A fact table is mostly foreign keys and a handful of
+    measures, and clustering on the keys just partitions surrogate ranges.
+    Raises ``ValueError`` with an actionable message when the request cannot be
+    satisfied.
     """
 
     by_lower = {col.name.lower(): col for col in dataset.columns}
@@ -628,6 +674,8 @@ def _select_cluster_features(
             )
         features = [c.name for c in chosen]
     else:
+        rels = relationships or []
+        fk_columns = _foreign_key_columns(dataset, rels)
         numeric = [
             c for c in dataset.columns if profile_mod.is_numeric_type(c.data_type)
         ]
@@ -635,6 +683,10 @@ def _select_cluster_features(
         remaining = [c for c in numeric if c.pii is None]
         excluded_id = [c.name for c in remaining if c.is_unique is True]
         remaining = [c for c in remaining if c.is_unique is not True]
+        excluded_fk = [c.name for c in remaining if c.name.lower() in fk_columns]
+        remaining = [c for c in remaining if c.name.lower() not in fk_columns]
+        excluded_named = [c.name for c in remaining if _is_id_shaped(c.name)]
+        remaining = [c for c in remaining if not _is_id_shaped(c.name)]
         excluded_const = [c.name for c in remaining if _is_constant_column(c)]
         candidates = [c for c in remaining if not _is_constant_column(c)]
         features = [c.name for c in candidates]
@@ -649,6 +701,24 @@ def _select_cluster_features(
                 f"excluded {len(excluded_id)} unique-key column(s) "
                 f"({', '.join(excluded_id)}); an identifier is not a feature"
             )
+        if excluded_fk:
+            notes.append(
+                f"excluded {len(excluded_fk)} foreign-key column(s) "
+                f"({', '.join(excluded_fk)}) that join out to another object; a "
+                "key is not a feature. Name one in --features to include it"
+            )
+        if excluded_named:
+            notes.append(
+                f"excluded {len(excluded_named)} column(s) named like a key "
+                f"({', '.join(excluded_named)}); name one in --features to "
+                "include it"
+            )
+        if not rels and (excluded_named or features):
+            notes.append(
+                "no relationships in the .dex cache, so key detection fell back "
+                "to column names; run `explore relationships` (or `explore map`) "
+                "for join-based detection"
+            )
         if excluded_const:
             notes.append(f"excluded {len(excluded_const)} constant column(s)")
 
@@ -660,10 +730,11 @@ def _select_cluster_features(
             "(raise cluster.max_features or pass --features)"
         )
     if len(features) < 2:
+        why = f" ({'; '.join(notes)})" if notes else ""
         raise ValueError(
             f"found {len(features)} usable numeric feature column(s) for "
             f"{dataset.identifier}; k-means needs at least 2. Pass --features to "
-            "choose columns, or profile a table with more numeric columns"
+            f"choose columns, or profile a table with more numeric columns{why}"
         )
     return features, notes
 
