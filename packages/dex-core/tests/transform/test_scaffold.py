@@ -80,6 +80,30 @@ def test_scaffold_builds_staging_skeletons_with_pii_meta(
     assert not (dbt_project_dir / "models/staging/stg_orders.sql").exists()
 
 
+def test_overridden_column_gets_no_pii_meta():
+    """A column a human cleared via pii_overrides carries pii=None (with the
+    audit field set), so the scaffold stamps no contains_pii, at either level."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.transform.scaffold import model_edits
+
+    dataset = Dataset(
+        identifier="db.main.region",
+        columns=[
+            ColumnProfile(name="r_regionkey", data_type="INTEGER", nullable=False),
+            ColumnProfile(
+                name="r_name",
+                data_type="VARCHAR",
+                pii=None,
+                pii_overridden="name",
+            ),
+        ],
+    )
+    yaml_edit = next(e for e in model_edits(dataset) if e.path.endswith(".yml"))
+    assert "contains_pii" not in yaml_edit.new_content
+    assert "pii_category" not in yaml_edit.new_content
+
+
 def test_scaffolded_plan_applies_cleanly(
     dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
 ):

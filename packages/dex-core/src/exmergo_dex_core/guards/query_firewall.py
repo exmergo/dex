@@ -25,12 +25,12 @@ trusted to agent frugality) and records which cache tables the query touches.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import expressions as exp
 
-from ..cache import Dataset, DexCache, match_identifier
+from ..cache import CACHE_SCHEMA_VERSION, Dataset, DexCache, match_identifier
 from ..config import QueryLimits
 from .sql_guard import NotSelectOnlyError, assert_select_only
 
@@ -41,17 +41,28 @@ class QueryRefusedError(Exception):
     rewrite, not a debugging session."""
 
 
+# A flag at or above this confidence blocks projection; below it, the query runs
+# and the envelope carries a warning naming the column, category, and number.
+# Hard-coded engine policy, uniform across categories: a configurable threshold
+# would let a one-line config edit quietly widen the PII boundary. At today's
+# base confidences everything blocks; only evidence-de-rated flags fall below.
+PII_BLOCK_CONFIDENCE = 0.5
+
+
 @dataclass(frozen=True)
 class InspectedQuery:
     """A query the firewall approved: the (possibly rewritten) SQL, the row cap
     the caller must enforce when fetching, whether the engine imposed that cap
-    (only then is a result at the cap reported as truncated), and the cache
-    identifiers the query reads."""
+    (only then is a result at the cap reported as truncated), the cache
+    identifiers the query reads, and per-column warnings for projections of
+    sub-threshold PII flags (built from column names, categories, and numbers
+    only, never values)."""
 
     sql: str
     row_cap: int
     capped_by_engine: bool
     tables: list[str]
+    warnings: list[str] = field(default_factory=list)
 
 
 # Aggregates whose output is a statistic, not a value: they cut the value path
@@ -100,8 +111,11 @@ _QUERY_ROOTS = tuple(
 
 # A derived source (CTE, subquery, set operation) is represented by its output
 # taints: output column name (lowered) -> the flagged columns whose values can
-# reach it. A physical source is the cached Dataset itself.
-_Outputs = dict[str, set[str]]
+# reach it, each a (label, confidence) pair. Presence taints; whether a taint
+# blocks or merely warns is decided once, at the projection root, against
+# PII_BLOCK_CONFIDENCE. A physical source is the cached Dataset itself.
+_Taint = tuple[str, float]
+_Outputs = dict[str, set[_Taint]]
 _Source = Dataset | dict
 
 # Warehouse-layer prefixes stripped before entity matching, so stg_products and
@@ -149,7 +163,12 @@ def recovery_hints(offending: list[str], cache: DexCache) -> list[str]:
         for dataset in cache.datasets:
             short = dataset.identifier.rsplit(".", 1)[-1]
             for col in dataset.columns:
-                if col.pii is not None or not _is_string_type(col.data_type):
+                # A sub-threshold flag is a lawful projection target, so it
+                # qualifies as a twin (its projection warns, never blocks).
+                blocked = (
+                    col.pii is not None and col.pii.confidence >= PII_BLOCK_CONFIDENCE
+                )
+                if blocked or not _is_string_type(col.data_type):
                     continue
                 normalized = _normalize_name(col.name)
                 tokens = set(normalized.split("_"))
@@ -185,7 +204,10 @@ def inspect_query(
     tables: set[str] = set()
     outputs = _query_outputs(root, {}, known, tables)
 
-    offending = sorted({flag for taint in outputs.values() for flag in taint})
+    flagged = {taint for taints in outputs.values() for taint in taints}
+    offending = sorted(
+        {label for label, conf in flagged if conf >= PII_BLOCK_CONFIDENCE}
+    )
     if offending:
         message = (
             "the projection would carry values from PII-flagged column(s): "
@@ -201,7 +223,26 @@ def inspect_query(
                 + ", ".join(hints)
                 + "."
             )
+        message += (
+            " A column reviewed as not PII can be cleared durably with a "
+            "pii_overrides entry in .dex/config.yml."
+        )
+        if cache.schema_version < CACHE_SCHEMA_VERSION and any(
+            "(name)" in label for label in offending
+        ):
+            message += (
+                " This cache predates value-shape profiling; re-profile the "
+                "table to refine name flags with value-shape evidence."
+            )
         raise QueryRefusedError(message)
+
+    warnings = [
+        f"{label} is PII-flagged at confidence {conf:g}, below the "
+        f"{PII_BLOCK_CONFIDENCE:g} block threshold, so the projection ran. If "
+        "its values are personal data, drop the column; if it is reviewed as "
+        "not PII, record a pii_overrides entry in .dex/config.yml."
+        for label, conf in sorted(flagged)
+    ]
 
     new_sql, row_cap, capped = _apply_limit(root, limits.max_rows, dialect)
     return InspectedQuery(
@@ -209,6 +250,7 @@ def inspect_query(
         row_cap=row_cap,
         capped_by_engine=capped,
         tables=sorted(tables),
+        warnings=warnings,
     )
 
 
@@ -338,13 +380,14 @@ def _expand_star(source: _Source, alias: str) -> _Outputs:
     return {name: set(taint) for name, taint in source.items()}
 
 
-def _column_taint(dataset: Dataset, column_name: str) -> set[str]:
+def _column_taint(dataset: Dataset, column_name: str) -> set[_Taint]:
     for col in dataset.columns:
         if col.name.lower() == column_name.lower():
             if col.pii is None:
                 return set()
             table = dataset.identifier.rsplit(".", 1)[-1]
-            return {f"{table}.{col.name} ({col.pii.category.value})"}
+            label = f"{table}.{col.name} ({col.pii.category.value})"
+            return {(label, col.pii.confidence)}
     raise QueryRefusedError(
         f"column '{column_name}' is not in the profiled cache for "
         f"'{dataset.identifier}'; the cache may be stale, re-run `explore map`"
@@ -356,13 +399,13 @@ def _expr_taint(
     sources: dict[str, _Source],
     known: dict[str, Dataset],
     tables: set[str],
-) -> set[str]:
+) -> set[_Taint]:
     if isinstance(node, exp.Column):
         return _resolve_column(node, sources)
     if isinstance(node, exp.Star):
         # A bare * as a function argument: conservatively the union of every
         # source column (COUNT(*) never gets here; COUNT is cut first).
-        taint: set[str] = set()
+        taint: set[_Taint] = set()
         for alias, source in sources.items():
             for sub in _expand_star(source, alias).values():
                 taint |= sub
@@ -389,7 +432,7 @@ def _expr_taint(
     return taint
 
 
-def _resolve_column(node: exp.Column, sources: dict[str, _Source]) -> set[str]:
+def _resolve_column(node: exp.Column, sources: dict[str, _Source]) -> set[_Taint]:
     name = node.name
     qualifier = node.table.lower() if node.table else ""
 
@@ -418,7 +461,7 @@ def _source_has_column(source: _Source, name: str) -> bool:
     return name.lower() in source
 
 
-def _source_column_taint(source: _Source, name: str) -> set[str]:
+def _source_column_taint(source: _Source, name: str) -> set[_Taint]:
     if isinstance(source, Dataset):
         return _column_taint(source, name)
     taint = source.get(name.lower())

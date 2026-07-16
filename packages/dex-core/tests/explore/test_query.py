@@ -288,7 +288,89 @@ def test_log_never_contains_result_values(airbnb_duckdb: Path, tmp_path: Path, c
             "tables",
             "row_count",
             "truncated",
+            "pii_warnings",
         }
+
+
+# --- sub-threshold flags at the envelope boundary ---------------------------------
+
+
+def test_sub_threshold_projection_runs_with_warning_and_audit(
+    tpch_names_duckdb: Path, tmp_path: Path, capsys
+):
+    """Issue 54 end to end: after profiling, the region labels are projectable,
+    the envelope warns, and the audit log records the sub-threshold projection."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run(
+        [
+            "explore",
+            "profile",
+            "region",
+            "hosts",
+            "--path",
+            str(tpch_names_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    payload = _query(
+        "SELECT R_NAME FROM region ORDER BY R_NAME",
+        tpch_names_duckdb,
+        repo,
+        capsys,
+    )
+    values = [row[0] for row in payload["data"]["cells"]]
+    assert values == ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"]
+    assert any("region.R_NAME" in w for w in payload["warnings"])
+
+    (allowed,) = [e for e in _log_entries(repo) if e["decision"] == "allowed"]
+    assert any("region.R_NAME" in w for w in allowed["pii_warnings"])
+
+    # The person-name table profiled alongside it still refuses.
+    refusal = _query(
+        "SELECT name FROM hosts", tpch_names_duckdb, repo, capsys, expect_error=True
+    )
+    assert "hosts.name" in refusal["errors"][0]
+
+
+def test_override_unblocks_at_query_time_without_reprofiling(
+    tpch_names_duckdb: Path, tmp_path: Path, capsys
+):
+    """An override added after profiling works immediately: demanding a billed
+    re-profile before a reviewed column unblocks would tax the review."""
+
+    from exmergo_dex_core.config import PIIOverride
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run(
+        [
+            "explore",
+            "profile",
+            "hosts",
+            "--path",
+            str(tpch_names_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    _query("SELECT name FROM hosts", tpch_names_duckdb, repo, capsys, expect_error=True)
+    save_config(
+        DexConfig(pii_overrides=[PIIOverride(column="tpch_names.main.hosts.name")]),
+        repo,
+    )
+    payload = _query(
+        "SELECT name FROM hosts ORDER BY id LIMIT 1",
+        tpch_names_duckdb,
+        repo,
+        capsys,
+    )
+    assert payload["data"]["cells"] == [["Ada Lovelace"]]
+    assert payload["warnings"] == [], "an overridden column is clear, not weak"
 
 
 def test_query_log_helper_appends(tmp_path: Path):

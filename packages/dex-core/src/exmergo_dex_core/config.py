@@ -228,6 +228,29 @@ class ClusterLimits(BaseModel):
     timeout_seconds: float = 60.0
 
 
+class PIIOverride(BaseModel):
+    """One reviewed column the team has decided is not PII.
+
+    ``column`` is fully qualified (the cache's connector-normalized identifier
+    plus the column name, e.g. ``MY_DB.PUBLIC.REGION.R_NAME``) so an override
+    can never silently widen to a same-named column elsewhere. No wildcards: an
+    override records a per-column human decision, and living in the committed
+    config makes that decision reviewable in git and durable across re-profiles.
+    """
+
+    column: str
+    reason: str | None = None
+
+
+def pii_override_paths(overrides: list[PIIOverride]) -> set[str]:
+    """Lowered fully-qualified column paths, the form the engine matches columns
+    against. Case-insensitive because the connectors disagree about identifier
+    case (same rationale as ``scope_within``), and a case mismatch must never
+    re-block a reviewed column."""
+
+    return {entry.column.strip().lower() for entry in overrides}
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -250,6 +273,10 @@ class DexConfig(BaseModel):
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25
+    # Columns a human has reviewed and cleared as not PII. The only way to
+    # durably clear a detector flag; hand-edits to the cache are overwritten by
+    # the next profile, this list is re-applied on every profile.
+    pii_overrides: list[PIIOverride] = Field(default_factory=list)
 
 
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:

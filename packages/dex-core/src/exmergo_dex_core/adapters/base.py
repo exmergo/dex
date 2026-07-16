@@ -77,6 +77,14 @@ class ColumnAggregate:
     min_value: object | None
     max_value: object | None
     distinct_count_exact: bool = False
+    #: Value-shape statistics, computed only for columns the engine requested via
+    #: ``shape_stats`` (name-flagged generic-name columns). Numeric fractions and
+    #: averages derived in-engine from regex predicates inside aggregates; never
+    #: values. ``None`` means not computed (not requested, non-string, degraded,
+    #: or the dialect could not), which the engine treats as absent evidence.
+    upper_vocab_fraction: float | None = None
+    person_shape_fraction: float | None = None
+    avg_token_count: float | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +194,63 @@ def distinct_combination_sql(
     return f"SELECT {', '.join(parts)}"
 
 
+# Value-shape regex patterns, shared by every adapter so the shape evidence the
+# engine reasons over means the same thing on every connector. Both are plain
+# POSIX-class regexes (no \d, no lookaround) so they parse in every supported
+# engine's regex flavor, and both anchor in the pattern because some predicates
+# (Databricks RLIKE, Postgres ~) match substrings.
+#
+# UPPER_VOCAB: values that are entirely upper-case tokens (spaces/hyphens
+# allowed), the signature of a closed reference vocabulary like region or nation
+# labels ("MIDDLE EAST"). PERSON_SHAPE: exactly two capitalized words, the
+# given/surname shape; deliberately not "two or more tokens", which would
+# misread multi-word labels ("Australian Grand Prix") as person-shaped.
+UPPER_VOCAB_PATTERN = "^[A-Z]+([ -][A-Z]+)*$"
+PERSON_SHAPE_PATTERN = "^[A-Z][a-z]+ [A-Z][a-z]+$"
+
+
+def shape_stat_expressions(
+    qcol: str,
+    i: int,
+    regexp_predicate: Callable[[str, str], str],
+) -> list[str]:
+    """The three value-shape aggregate expressions for one column, read back by
+    aliases ``su_{i}`` / ``sp_{i}`` / ``st_{i}``.
+
+    Results are numeric fractions and an average token count, never values. The
+    CASE has no ELSE so a NULL input yields NULL, which AVG skips: nulls never
+    dilute the fraction denominators. ``qcol`` must already be quoted/escaped by
+    the calling adapter, and ``regexp_predicate(qcol, pattern)`` renders that
+    dialect's full-match predicate (anchors ride in the pattern).
+    """
+
+    def fraction(pattern: str, alias: str) -> str:
+        predicate = regexp_predicate(qcol, pattern)
+        return (
+            f"AVG(CASE WHEN {predicate} THEN 1.0 "
+            f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS {alias}"
+        )
+
+    token_count = f"LENGTH({qcol}) - LENGTH(REPLACE({qcol}, ' ', '')) + 1"
+    return [
+        fraction(UPPER_VOCAB_PATTERN, f"su_{i}"),
+        fraction(PERSON_SHAPE_PATTERN, f"sp_{i}"),
+        f"AVG({token_count}) AS st_{i}",
+    ]
+
+
+def shape_stat_value(
+    values: dict[str, object], alias: str, wanted: bool
+) -> float | None:
+    """Read one shape statistic back from an alias/value row, ``None`` when it
+    was not requested or the engine returned NULL (e.g. an all-NULL column)."""
+
+    if not wanted:
+        return None
+    value = values.get(alias)
+    return float(value) if value is not None else None
+
+
 @runtime_checkable
 class Adapter(Protocol):
     """Behavioral contract for a connector adapter.
@@ -224,10 +289,13 @@ class Adapter(Protocol):
         columns: list[ColumnMeta],
         *,
         safe_min_max: set[str] | None = None,
+        shape_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
-        be computed; all others get ``None`` so values never leave the engine."""
+        be computed; all others get ``None`` so values never leave the engine.
+        ``shape_stats`` is the set of string column names for which the value-shape
+        fractions are computed (in the same scan); all others keep them ``None``."""
         ...
 
     def exact_distinct_counts(

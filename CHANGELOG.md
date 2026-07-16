@@ -9,6 +9,35 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The query firewall is confidence-aware.** A PII flag blocks projection at
+  confidence 0.5 and above (`PII_BLOCK_CONFIDENCE`, a hard-coded engine
+  constant, uniform across categories); a flag below the threshold projects
+  with an envelope warning naming the column, category, and confidence, and
+  the allowed entry in `.dex/queries.jsonl` records those warnings under
+  `pii_warnings`. Every base confidence in the detector sits at or above the
+  threshold, so nothing unblocks without value-shape evidence. Refusal
+  messages now also point at the `pii_overrides` recovery path, and, on a
+  cache written before value-shape profiling existed, suggest re-profiling.
+  Min/max suppression and dbt `meta` stamping remain presence-based at any
+  confidence.
+- **Generic `name` flags are refined by value-shape evidence** (the standing
+  over-flag reproduced on four datasets, most recently Snowflake TPC-H
+  `R_NAME`/`N_NAME`/`P_NAME`). The profiling scan computes three in-engine
+  shape statistics for generic `*_name` string columns (all-caps vocabulary
+  fraction, given-plus-surname shape fraction, average token count) as regex
+  predicates inside measuring aggregates, so only numeric fractions leave the
+  engine. Evidence moves confidence in both directions and fails closed: a
+  person-shaped distribution corroborates 0.6 to 0.75, a tiny closed all-caps
+  vocabulary (at most 32 distinct values) or long multi-token labels de-rate
+  0.6 to 0.3, and missing or ambiguous evidence changes nothing. The flag is
+  never removed by evidence; detector recall is unchanged.
+- **`.dex/cache.json` schema version is now 3** (column profiles gained the
+  `pii_overridden` audit field, and flag confidence became load-bearing for
+  the firewall). A v2 cache still loads; its stored flags keep blocking
+  exactly as they did until a re-profile computes shape evidence.
+
 ### Added
 
 - **`explore map`, `explore relationships`, and `explore profile` now emit
@@ -35,6 +64,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   from. scikit-learn rides behind a new `[cluster]` extra, lazy-imported so the
   light default install stays light and the explore skill wrapper adds it
   automatically for this subcommand.
+- **`pii_overrides` in `.dex/config.yml`: a durable, reviewable way to clear a
+  false-positive PII flag.** Each entry names a fully qualified column
+  (`db.schema.table.column`, case-insensitive, no wildcards) with an optional
+  reason. An overridden column's flag is suppressed at profile time (min/max
+  return for safe types, no `contains_pii` in scaffolded dbt meta), the
+  firewall honors the override immediately without a re-profile, drift-added
+  columns in `maintain reconcile` honor it too, and the cache records which
+  category the detector had matched (`pii_overridden`) as the audit trail.
+  Profiling warns when an entry matches no column of a profiled table.
 
 ### Fixed
 

@@ -45,6 +45,8 @@ from .base import (
     distinct_combination_sql,
     json_safe,
     name_list,
+    shape_stat_expressions,
+    shape_stat_value,
 )
 
 PARADIGM = "compute_time"
@@ -110,6 +112,12 @@ _ESTIMATE_QUALITY_NOTE = (
     "the confirmed budget is still hard-enforced by a per-statement "
     "server-side STATEMENT_TIMEOUT"
 )
+
+
+def _regexp_predicate(qcol: str, pattern: str) -> str:
+    # RLIKE matches substrings; the shared patterns' anchors make it a full
+    # match.
+    return f"{qcol} RLIKE '{pattern}'"
 
 
 def warehouse_http_path(value: str) -> str:
@@ -768,8 +776,10 @@ class DatabricksAdapter:
         columns: list[ColumnMeta],
         *,
         safe_min_max: set[str] | None = None,
+        shape_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
+        shape = shape_stats or set()
         self._ensure_detail(identifier)
         meta, _ = self.table_metadata(identifier)
         sample_percent = self._sample_percent(identifier, meta.byte_size)
@@ -777,7 +787,7 @@ class DatabricksAdapter:
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, sample_percent=sample_percent
+                identifier, batch, safe, shape, sample_percent=sample_percent
             )
             rows, labels = self._execute(
                 sql, estimate=self._statement_seconds(meta.byte_size)
@@ -811,17 +821,19 @@ class DatabricksAdapter:
         identifier: str,
         columns: list[ColumnMeta],
         safe: set[str],
+        shape: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
-        # non-null count, an approximate distinct, and min/max only where
-        # allowed. Pure (no connection), so the SELECT-only property is
-        # testable offline. Nested and semi-structured columns get the
-        # non-null count only (approx_count_distinct and MIN/MAX are invalid
-        # or meaningless on them).
+        # non-null count, an approximate distinct, min/max only where allowed,
+        # and value-shape fractions only where requested. Pure (no
+        # connection), so the SELECT-only property is testable offline. Nested
+        # and semi-structured columns get the non-null count only
+        # (approx_count_distinct and MIN/MAX are invalid or meaningless on
+        # them).
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -833,7 +845,10 @@ class DatabricksAdapter:
             if wants_min_max:
                 select_parts.append(f"MIN({qcol}) AS mn_{i}")
                 select_parts.append(f"MAX({qcol}) AS mx_{i}")
-            plan.append((i, col, wants_distinct, wants_min_max))
+            wants_shape = (col.name in shape) and not nested
+            if wants_shape:
+                select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
+            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
         source = self._quote(identifier)
         if sample_percent is not None:
             source += f" TABLESAMPLE ({sample_percent} PERCENT)"
@@ -849,13 +864,13 @@ class DatabricksAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max in plan:
+        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -882,6 +897,13 @@ class DatabricksAdapter:
                     max_value=(
                         json_safe(values.get(f"mx_{i}")) if wants_min_max else None
                     ),
+                    upper_vocab_fraction=shape_stat_value(
+                        values, f"su_{i}", wants_shape
+                    ),
+                    person_shape_fraction=shape_stat_value(
+                        values, f"sp_{i}", wants_shape
+                    ),
+                    avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
                 )
             )
         return aggregates

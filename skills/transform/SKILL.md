@@ -165,4 +165,6 @@ database, which is fine for model-only builds.
   authoritative; on conflict the engine surfaces a diff and asks rather than
   overwriting.
 - PII flags propagate from the cache into emitted dbt (model and column `meta`),
-  never example values.
+  never example values. Stamping is presence-based at any confidence; only a
+  column cleared by a human `pii_overrides` entry in `.dex/config.yml` is
+  scaffolded without the meta.

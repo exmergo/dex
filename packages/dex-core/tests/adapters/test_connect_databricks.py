@@ -469,6 +469,44 @@ def test_column_aggregates_profile_scalar_columns(fake_databricks):
     assert "APPROX_COUNT_DISTINCT" in executed[0].sql
 
 
+def test_shape_stats_ride_the_aggregate_batch(fake_databricks):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [
+        {
+            "n_total": 100,
+            "nn_0": 100,
+            "nd_0": 100,
+            "nn_1": 90,
+            "nd_1": 40,
+            "su_1": 0.8,
+            "sp_1": 0.1,
+            "st_1": 2.5,
+        }
+    ]
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    _meta, columns = adapter.table_metadata("shop.core.customers")
+    aggs = {
+        a.name: a
+        for a in adapter.column_aggregates(
+            "shop.core.customers", columns, shape_stats={"email"}
+        )
+    }
+    sql = data_statements(fake_databricks)[0].sql
+    assert "`email` RLIKE '" in sql
+    for alias in ("su_1", "sp_1", "st_1"):
+        assert f" AS {alias}" in sql
+    assert assert_select_only(sql, dialect="databricks") == sql
+    assert aggs["email"].upper_vocab_fraction == pytest.approx(0.8)
+    assert aggs["email"].person_shape_fraction == pytest.approx(0.1)
+    assert aggs["email"].avg_token_count == pytest.approx(2.5)
+    # id was not requested: its shape fields stay None.
+    assert aggs["id"].upper_vocab_fraction is None
+    assert aggs["id"].person_shape_fraction is None
+    assert aggs["id"].avg_token_count is None
+
+
 def test_nested_columns_degrade_to_non_null_counts(fake_databricks):
     warm(fake_databricks)
     fake_databricks.connection.row_resolver = _aggregate_resolver

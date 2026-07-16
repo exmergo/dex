@@ -45,7 +45,7 @@ release is connector-neutral.
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
 | `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe; `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge) |
 | `explore map [--verify] [--use-project]` | writes/updates the `.dex/` map; prints a summary; `--use-project` additionally applies declared grain and ranks metric-backing models higher |
-| `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled, PII-cleared columns; requires the `.dex/` cache (`explore map` first) |
+| `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); requires the `.dex/` cache (`explore map` first) |
 | `explore cluster <object> [--features a,b] [-k N]` | k-means over a bounded, column-pruned, dialect-sampled scan of numeric columns; returns cluster sizes + centroids (feature means) + silhouette, never rows; auto-selects non-PII, non-key numeric features (or takes `--features`; a named PII column is opt-in, mean only); requires the `.dex/` cache and the `[cluster]` extra; billed connectors take the cost handshake |
 | `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required) |
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
@@ -131,9 +131,14 @@ them.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.
-6. PII is flagged (column, category, confidence), never surfaced. The query
-   firewall enforces this on agent SQL: any expression that would carry a
-   flagged column's values is refused.
+6. PII is flagged (column, category, confidence), never surfaced, and a flag is
+   never removed by evidence: value-shape statistics computed in the profiling
+   scan only move its confidence, in both directions and fail-closed. The query
+   firewall enforces the policy on agent SQL: any expression that would carry
+   values from a column flagged at confidence 0.5 or above is refused (the
+   threshold is a hard-coded engine constant); a projection of a lower-confidence
+   flag runs with an envelope warning. A human clears a reviewed column durably
+   with a `pii_overrides` entry in `.dex/config.yml`, never by editing the cache.
 7. Persistence is git, not a service. The dbt project is the source of truth; the
    `.dex/` directory is a non-canonical cache (exploration artifacts and the
    reconcile snapshot).

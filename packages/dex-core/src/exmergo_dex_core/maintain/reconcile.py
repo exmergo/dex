@@ -57,8 +57,14 @@ def build(
     snap: Snapshot,
     cache: DexCache | None,
     view: DbtProjectView,
+    *,
+    pii_overrides: set[str] | None = None,
 ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
-    """Map findings to proposals and plan edits. Pure: writes nothing."""
+    """Map findings to proposals and plan edits. Pure: writes nothing.
+
+    ``pii_overrides`` carries the config's reviewed non-PII column paths, so a
+    drift-added column a human already cleared is not re-flagged into the
+    scaffolded meta."""
 
     proposals: list[Proposal] = []
     edits: list[PlanEdit] = []
@@ -99,7 +105,7 @@ def build(
                 for finding in table_findings
             )
             continue
-        patched = _patched_dataset(base, table_findings)
+        patched = _patched_dataset(base, table_findings, pii_overrides or set())
         table_edits = model_edits(patched)
         edits.extend(table_edits)
         changes = ", ".join(
@@ -202,20 +208,27 @@ def _base_dataset(
     return None
 
 
-def _patched_dataset(base: Dataset, findings: list[DriftFinding]) -> Dataset:
+def _patched_dataset(
+    base: Dataset, findings: list[DriftFinding], pii_overrides: set[str]
+) -> Dataset:
     """Apply the detected column drift to the baseline profile, so the
     re-scaffold reflects the warehouse as it is now without re-profiling.
-    New columns get name-based PII flags; a re-profile can refine them later."""
+    New columns get name-based PII flags at base confidence (no aggregates
+    exist yet, so no shape evidence: the flag blocks until the next profile
+    refines it); an overridden column is cleared with the audit recorded."""
 
     patched = base.model_copy(deep=True)
     columns = {c.name: c for c in patched.columns}
     for finding in findings:
         if finding.code == "column_added" and finding.column not in columns:
             data_type = str(finding.data.get("data_type", ""))
+            flag = detect_pii(finding.column, data_type)
+            overridden = f"{base.identifier}.{finding.column}".lower() in pii_overrides
             profile = ColumnProfile(
                 name=finding.column,
                 data_type=data_type,
-                pii=detect_pii(finding.column, data_type),
+                pii=None if overridden else flag,
+                pii_overridden=flag.category if overridden and flag else None,
             )
             patched.columns.append(profile)
             columns[finding.column] = profile

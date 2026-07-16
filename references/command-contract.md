@@ -210,20 +210,31 @@ only refuses or bounds. The gate, in order:
    `.dex/cache.json`; no cache or an unprofiled object refuses with the fix
    ("run `explore map` first"). Profiling is what makes the PII policy
    computable, so probing requires it.
-3. **Classify the projection.** Output may carry values only from profiled,
-   unflagged columns. Every value path from a PII-flagged column must pass
-   through a measuring aggregate (COUNT, APPROX_COUNT_DISTINCT, AVG, SUM,
-   STDDEV, ...). Value-carrying aggregates (MIN, MAX, ANY_VALUE, STRING_AGG,
-   ...) do not qualify, unknown functions fail closed, and `SELECT *` is refused
-   when the expansion includes a flagged column. Filters, join conditions,
-   GROUP BY and ORDER BY are unrestricted: values flow in, not out.
+3. **Classify the projection.** Output may carry values only from profiled
+   columns whose PII flag is absent or below the blocking threshold. A flag at
+   confidence 0.5 or above blocks projection; the threshold is a hard-coded
+   engine constant, uniform across categories, deliberately not configurable.
+   Every value path from a blocking column must pass through a measuring
+   aggregate (COUNT, APPROX_COUNT_DISTINCT, AVG, SUM, STDDEV, ...).
+   Value-carrying aggregates (MIN, MAX, ANY_VALUE, STRING_AGG, ...) do not
+   qualify, unknown functions fail closed, and `SELECT *` is refused when the
+   expansion includes a blocking column. Projecting a column whose flag sits
+   below the threshold (de-rated by value-shape evidence at profile time) runs,
+   with an envelope warning naming the column, category, and confidence.
+   Filters, join conditions, GROUP BY and ORDER BY are unrestricted: values
+   flow in, not out. A column a human has reviewed as not PII is cleared by a
+   `pii_overrides` entry in `.dex/config.yml` (fully qualified column, optional
+   reason), which unblocks querying immediately and suppresses the flag durably
+   on every later profile.
 4. **Bound the result.** LIMIT is clamped (default 50 rows), long cells are cut
    (default 256 chars), the payload is byte-capped (default 16 KiB), and every
    cut is announced in `notes`. A watchdog interrupts queries that outlive
    their time budget (default 30s). All four are configurable under `query:` in
    `.dex/config.yml`.
 5. **Record.** Every decision, allowed, refused, or failed, is appended to
-   `.dex/queries.jsonl` (SQL text and counts, never result values).
+   `.dex/queries.jsonl` (SQL text and counts, never result values). An allowed
+   query that projected sub-threshold flagged columns records those warnings
+   under `pii_warnings`, so the audit trail keeps every such projection findable.
 
 Results are columnar (`columns`, `cells` as a list of lists, `row_count`,
 `truncated`, `notes`), which is cheaper in tokens than records and keeps the

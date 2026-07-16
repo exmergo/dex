@@ -75,6 +75,13 @@ def test_profile_handshake_then_confirmed_run(
     assert dataset["identifier"] == REGION
     columns = {c["name"] for c in dataset["columns"]}
     assert {"R_REGIONKEY", "R_NAME", "R_COMMENT"} <= columns
+    # The standing name over-flag, live: R_NAME (5 distinct all-caps region
+    # labels) keeps its flag but de-rates below the firewall threshold on
+    # value-shape evidence computed in the same scan.
+    by_name = {c["name"]: c for c in dataset["columns"]}
+    r_name = by_name["R_NAME"]
+    assert r_name["pii"]["category"] == "name"
+    assert r_name["pii"]["confidence"] < 0.5
     # The estimate the agent confirmed is what the envelope reports; actual
     # spend (wall seconds) is in data.spend and the ledger.
     assert second["cost"]["estimate"] == pytest.approx(estimate, rel=0.5)
