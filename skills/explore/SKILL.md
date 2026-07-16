@@ -1,6 +1,6 @@
 ---
 name: explore
-description: 'Use this to make sense of a database, warehouse, or DuckDB file: inventory and rank what is there, profile columns, detect PII, flag grain and data-quality problems, infer and verify how tables join, and answer ad-hoc data questions with guarded SQL probes, producing a draft map without dumping the schema into context. Trigger it for casual, artifact-first prompts like "what''s in my duckdb", "what''s in this database", "what data do I have", "take a look at data.duckdb", or "any PII in here", as well as analyst questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", "is this data any good", "profile these columns", or ad-hoc counts and distributions like "how many orders have no customer". Any mention of exploring, inspecting, querying, or understanding a .duckdb or .db file, a warehouse connection, or unfamiliar data qualifies. This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).'
+description: 'Use this to make sense of a database, warehouse, or DuckDB file: inventory and rank what is there, profile columns, detect PII, flag grain and data-quality problems, infer and verify how tables join, answer ad-hoc data questions with guarded SQL probes, and cluster rows into segments with k-means, producing a draft map without dumping the schema into context. Trigger it for casual, artifact-first prompts like "what''s in my duckdb", "what''s in this database", "what data do I have", "take a look at data.duckdb", or "any PII in here", as well as analyst questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", "is this data any good", "profile these columns", or ad-hoc counts and distributions like "how many orders have no customer", and unsupervised segmentation like "cluster my customers", "find natural segments in this table", or "run k-means on these columns". Any mention of exploring, inspecting, querying, understanding, or clustering a .duckdb or .db file, a warehouse connection, or unfamiliar data qualifies. This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).'
 ---
 
 # Explore
@@ -49,6 +49,21 @@ Subcommands, in the usual order:
    and capped; a refusal names the offending column and the fix, so one rewrite
    is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
    writing a probe: it maps common questions to effective probe shapes.
+7. `explore cluster <object> [--features a,b,c] [-k N]` runs k-means over a
+   bounded sample of the object's numeric columns and returns the segment
+   structure: per-cluster sizes and fractions, centroids (each coordinate is a
+   cluster's mean of that feature, an aggregate), the silhouette score, and,
+   when `-k` is omitted, the k it picked plus the silhouette sweep it chose from.
+   Requires the `.dex/` cache (run `map`/`profile` first) so features can be
+   auto-selected from profiled numeric, non-PII, non-key columns; pass
+   `--features` to choose them yourself (naming a PII column opts it in
+   deliberately, and only its mean is ever reported). Only aggregates cross the
+   boundary: the sample rows are clustered in-process and never enter context.
+   On a metered connector it takes the same cost handshake as the scanning
+   commands below (only the feature columns are scanned, and a dialect-aware
+   sample clause reads a fraction), so surface the estimate and get a budget
+   first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
+   automatically for this subcommand.
 
 Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single

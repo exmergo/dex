@@ -93,25 +93,55 @@ def _resolve_connector(argv: list[str], cwd: Path) -> str:
     return connector if connector in _KNOWN_CONNECTORS else _DEFAULT_CONNECTOR
 
 
-def _engine_spec(connector: str, skill_dir: Path | None = None) -> list[str]:
+# Value-taking global flags: declared only so their values are not mistaken for
+# the group/subcommand positionals when we peek at the command being run.
+_VALUE_FLAGS = (
+    "--connector",
+    "--path",
+    "--scope",
+    "--project",
+    "--dataset",
+    "--repo-root",
+    "--budget",
+)
+
+
+def _wants_cluster_extra(argv: list[str]) -> bool:
+    """Whether this invocation is `explore cluster`, which needs the [cluster]
+    extra (scikit-learn) on top of the connector. Flag-position agnostic: the
+    value flags above are consumed so the first two bare tokens are the group and
+    subcommand, wherever the connection flags sit."""
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    for flag in _VALUE_FLAGS:
+        parser.add_argument(flag)
+    _, remaining = parser.parse_known_args(argv)
+    positionals = [tok for tok in remaining if not tok.startswith("-")]
+    return positionals[:2] == ["explore", "cluster"]
+
+
+def _engine_spec(extras: str, skill_dir: Path | None = None) -> list[str]:
     skill_dir = skill_dir or Path(
         os.environ.get("CLAUDE_SKILL_DIR", Path(__file__).resolve().parent.parent)
     )
     local_pkg = (skill_dir / ".." / ".." / "packages" / "dex-core").resolve()
     if local_pkg.is_dir():
-        # Resolve the local package WITH the connector extra (a plain path drops
+        # Resolve the local package WITH the resolved extras (a plain path drops
         # extras). Non-editable is fine: the engine is imported fresh each run.
-        return ["--with", f"exmergo-dex-core[{connector}] @ {local_pkg.as_uri()}"]
-    return ["--with", f"exmergo-dex-core[{connector}]=={DEX_CORE_VERSION}"]
+        return ["--with", f"exmergo-dex-core[{extras}] @ {local_pkg.as_uri()}"]
+    return ["--with", f"exmergo-dex-core[{extras}]=={DEX_CORE_VERSION}"]
 
 
 def main() -> int:
     argv = sys.argv[1:]
     connector = _resolve_connector(argv, Path.cwd())
+    # The connector extra is always installed; `explore cluster` adds the
+    # scikit-learn [cluster] extra so the light default install stays light.
+    extras = f"{connector},cluster" if _wants_cluster_extra(argv) else connector
     cmd = [
         "uv",
         "run",
-        *_engine_spec(connector),
+        *_engine_spec(extras),
         "python",
         "-m",
         "exmergo_dex_core",

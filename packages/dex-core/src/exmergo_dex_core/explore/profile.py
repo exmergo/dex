@@ -135,6 +135,21 @@ def _is_string_type(data_type: str) -> bool:
     return any(h in upper for h in _STRING_HINTS)
 
 
+def is_numeric_type(data_type: str) -> bool:
+    """Whether a connector's raw column type is numeric (integer, decimal, or
+    float). Substring-matched against ``_NUMERIC_HINTS`` so it holds across
+    dialects (DuckDB BIGINT/HUGEINT, BigQuery INT64/FLOAT64/NUMERIC, Snowflake
+    NUMBER, Postgres double precision). Booleans and temporals are excluded
+    first, because ``INTERVAL`` and ``BOOL`` would otherwise match the ``INT``
+    hint. Shared so numeric-feature selection for `explore cluster` and min/max
+    safety stay single-sourced on one hint set."""
+
+    upper = data_type.upper()
+    if any(h in upper for h in _BOOLEAN_HINTS + _TEMPORAL_HINTS):
+        return False
+    return any(h in upper for h in _NUMERIC_HINTS)
+
+
 def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     """Classify a column as PII from its name (and, loosely, type). Never a value.
 

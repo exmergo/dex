@@ -33,6 +33,8 @@ def _all_commands() -> list[list[str]]:
                     # A missing repo-root means no .dex cache, so the firewall
                     # refuses cleanly and nothing is written anywhere.
                     argv += ["SELECT 1", "--repo-root", "missing-dex-fixture-dir"]
+                if group == "explore" and sub == "cluster":
+                    argv += ["some_table", "--repo-root", "missing-dex-fixture-dir"]
                 argvs.append(argv)
         else:
             argvs.append([group])
@@ -124,7 +126,7 @@ def test_scope_is_accepted_on_every_subcommand():
     for group, subcommands in COMMAND_SURFACE.items():
         for sub in subcommands:
             argv = [group, sub, "--scope", "raw"]
-            if group == "explore" and sub == "profile":
+            if group == "explore" and sub in {"profile", "cluster"}:
                 argv.append("t")
             elif group == "explore" and sub == "query":
                 argv.append("select 1")

@@ -26,6 +26,7 @@ from ..guards.query_firewall import (
     QueryRefusedError,
     inspect_query,
 )
+from . import cluster as cluster_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
@@ -450,7 +451,221 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
+def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
+    """k-means clustering over a bounded sample of one object's numeric columns.
+
+    Cache-gated like `explore query`: profiling is what tells us which columns
+    are numeric and which are PII, so `explore map`/`profile` must have run. Only
+    the feature columns are scanned, only a bounded sample is fetched into the
+    engine for scikit-learn, and only aggregates (cluster sizes and centroids)
+    reach the envelope. The sample query goes through the same cost-before-spend
+    handshake as every other scanning command.
+    """
+
+    repo_root = command_args.repo_root(args)
+    store = DexStore(repo_root)
+    cache = store.load_cache()
+    if cache is None:
+        return env.error(
+            "no .dex/cache.json in this repo; run `explore map` (or `explore "
+            "profile <object>`) first so clustering knows which columns are "
+            "numeric and which are PII"
+        )
+
+    # Fail fast if the [cluster] extra is missing: no connection, no spend.
+    try:
+        cluster_mod.ensure_available()
+    except cluster_mod.ClusterDependencyError as exc:
+        return env.error(str(exc))
+
+    config = load_config(repo_root) or DexConfig()
+    limits = config.cluster
+
+    known = [d.identifier for d in cache.datasets if d.columns]
+    matches = match_identifier(args.object, known)
+    if not matches:
+        return env.error(
+            f"'{args.object}' is not a profiled object in the .dex cache; run "
+            f"`explore profile {args.object}` (or `explore map`) first"
+        )
+    if len(matches) > 1:
+        return env.error(
+            f"'{args.object}' is ambiguous: {', '.join(matches)}; qualify it"
+        )
+    dataset = next(d for d in cache.datasets if d.identifier == matches[0])
+
+    requested = _split_features(getattr(args, "features", None))
+    try:
+        features, selection_notes = _select_cluster_features(
+            dataset, requested, limits.max_features
+        )
+    except ValueError as exc:
+        return env.error(str(exc))
+
+    k = getattr(args, "k", None)
+
+    adapter = command_args.open_from_args(args)
+    try:
+        sample_sql, sample_method = cluster_mod.build_sample_sql(
+            dataset.identifier,
+            features,
+            dialect=adapter.dialect,
+            sample_rows=limits.sample_rows,
+            row_count=dataset.row_count,
+        )
+        query_estimate = getattr(adapter, "query_estimate", None)
+        estimate = query_estimate(sample_sql) if query_estimate else 0.0
+        unconfirmed = command_args.billed_handshake(
+            "explore cluster",
+            adapter,
+            estimate,
+            notes=[
+                f"clusters a sample of up to {limits.sample_rows} rows over "
+                f"{len(features)} feature column(s); sampling: {sample_method}"
+            ],
+        )
+        if unconfirmed is not None:
+            return unconfirmed
+        result = adapter.run_query(
+            sample_sql,
+            max_rows=limits.sample_rows,
+            timeout_seconds=limits.timeout_seconds,
+        )
+        envelope = env.ok({})
+        command_args.stamp_spend(envelope, adapter)
+    finally:
+        adapter.close()
+
+    try:
+        cluster_result = cluster_mod.cluster_features(
+            features,
+            result.cells,
+            k=k,
+            k_min=limits.k_min,
+            k_max=limits.k_max,
+            silhouette_sample=limits.silhouette_sample,
+            random_state=limits.random_state,
+        )
+    except cluster_mod.ClusterError as exc:
+        return env.error(str(exc))
+
+    data = cluster_result.to_data()
+    notes = [*selection_notes, *data.pop("notes", [])]
+    if result.truncated:
+        notes.append(
+            f"the sample hit the {limits.sample_rows}-row cap (the table has more "
+            "rows); raise cluster.sample_rows in .dex/config.yml to widen it"
+        )
+    envelope.data.update(
+        {
+            "object": dataset.identifier,
+            "total_rows": dataset.row_count,
+            "sample_method": sample_method,
+            **data,
+            "notes": notes,
+        }
+    )
+    return envelope
+
+
 # --- helpers -----------------------------------------------------------------
+
+
+def _split_features(raw: list[str] | None) -> list[str] | None:
+    """Flatten repeated/comma-joined --features into a clean name list. Both
+    `--features a,b --features c` and `--features "a, b, c"` are natural."""
+
+    if not raw:
+        return None
+    names = [part.strip() for entry in raw for part in entry.split(",")]
+    return [name for name in names if name] or None
+
+
+def _is_constant_column(col) -> bool:
+    """A column proven to hold a single value contributes nothing to a distance
+    and only dilutes the standardization; an unknown distinct count is kept."""
+
+    return col.distinct_count is not None and col.distinct_count <= 1
+
+
+def _select_cluster_features(
+    dataset: Dataset, requested: list[str] | None, max_features: int
+) -> tuple[list[str], list[str]]:
+    """Resolve the feature columns for clustering plus notes explaining the set.
+
+    Explicit ``--features`` are honored as given (validated numeric); a PII
+    column may be named deliberately, and only its per-cluster mean, an
+    aggregate, is ever reported. Auto-selection is conservative: numeric columns
+    that are not PII-flagged, not a proven unique key (an identifier is not a
+    feature), and not constant. Raises ``ValueError`` with an actionable message
+    when the request cannot be satisfied.
+    """
+
+    by_lower = {col.name.lower(): col for col in dataset.columns}
+    notes: list[str] = []
+
+    if requested is not None:
+        chosen = []
+        for name in requested:
+            col = by_lower.get(name.lower())
+            if col is None:
+                raise ValueError(
+                    f"column '{name}' is not among the profiled columns of "
+                    f"{dataset.identifier}"
+                )
+            if not profile_mod.is_numeric_type(col.data_type):
+                raise ValueError(
+                    f"column '{name}' is {col.data_type}, not numeric; k-means "
+                    "clusters numeric features only"
+                )
+            chosen.append(col)
+        pii_named = [c.name for c in chosen if c.pii is not None]
+        if pii_named:
+            notes.append(
+                f"included {len(pii_named)} PII-flagged feature(s) "
+                f"({', '.join(pii_named)}) at your request; only each cluster's "
+                "mean (an aggregate) is reported, never a row value"
+            )
+        features = [c.name for c in chosen]
+    else:
+        numeric = [
+            c for c in dataset.columns if profile_mod.is_numeric_type(c.data_type)
+        ]
+        excluded_pii = [c.name for c in numeric if c.pii is not None]
+        remaining = [c for c in numeric if c.pii is None]
+        excluded_id = [c.name for c in remaining if c.is_unique is True]
+        remaining = [c for c in remaining if c.is_unique is not True]
+        excluded_const = [c.name for c in remaining if _is_constant_column(c)]
+        candidates = [c for c in remaining if not _is_constant_column(c)]
+        features = [c.name for c in candidates]
+        if excluded_pii:
+            notes.append(
+                f"excluded {len(excluded_pii)} PII-flagged numeric column(s) from "
+                f"auto-selection ({', '.join(excluded_pii)}); name one in "
+                "--features to include it (its centroid is a mean)"
+            )
+        if excluded_id:
+            notes.append(
+                f"excluded {len(excluded_id)} unique-key column(s) "
+                f"({', '.join(excluded_id)}); an identifier is not a feature"
+            )
+        if excluded_const:
+            notes.append(f"excluded {len(excluded_const)} constant column(s)")
+
+    if len(features) > max_features:
+        dropped = len(features) - max_features
+        features = features[:max_features]
+        notes.append(
+            f"using the first {max_features} feature(s); {dropped} more available "
+            "(raise cluster.max_features or pass --features)"
+        )
+    if len(features) < 2:
+        raise ValueError(
+            f"found {len(features)} usable numeric feature column(s) for "
+            f"{dataset.identifier}; k-means needs at least 2. Pass --features to "
+            "choose columns, or profile a table with more numeric columns"
+        )
+    return features, notes
 
 
 def _shape_query_payload(
