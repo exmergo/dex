@@ -22,7 +22,7 @@ from . import envelope as env
 # The full command surface. Group -> its subcommands.
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
-    "explore": ["inventory", "profile", "relationships", "map", "query"],
+    "explore": ["inventory", "profile", "relationships", "map", "query", "cluster"],
     "transform": ["init", "plan", "apply", "build", "deps", "plans"],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
@@ -103,6 +103,18 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument("objects", nargs="+")
                 if group == "explore" and name == "query":
                     sp.add_argument("sql")
+                if group == "explore" and name == "cluster":
+                    sp.add_argument("object")
+                    sp.add_argument(
+                        "--features", action="append", default=argparse.SUPPRESS
+                    )
+                    sp.add_argument(
+                        "-k",
+                        "--clusters",
+                        dest="k",
+                        type=int,
+                        default=argparse.SUPPRESS,
+                    )
                 if group == "explore" and name == "map":
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
@@ -186,6 +198,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             "relationships": explore_cmds.cmd_relationships,
             "map": explore_cmds.cmd_map,
             "query": explore_cmds.cmd_query,
+            "cluster": explore_cmds.cmd_cluster,
         }
         return handlers[args.subcommand](args)
 

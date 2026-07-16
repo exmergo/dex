@@ -19,6 +19,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   (and `dex: verified N/M joins` on `--verify`) line now goes to stderr as the
   slow loops advance, gated so fast runs stay completely silent. The stdout
   contract is untouched: progress goes only to stderr, never the JSON envelope.
+- **`explore cluster <object>`: k-means segmentation over a bounded feature
+  sample.** Discovers structure in a table without ever loading it into
+  context. Cache-gated like `explore query`, so it auto-selects features from
+  profiled numeric, non-PII, non-key columns (or takes an explicit
+  `--features` list, where naming a PII column opts it in deliberately and only
+  its per-cluster mean, an aggregate, is reported). The sample query scans only
+  the feature columns and carries a dialect-aware sample clause (DuckDB
+  `USING SAMPLE`, BigQuery/Postgres `TABLESAMPLE SYSTEM`, Snowflake `SAMPLE`,
+  Databricks `TABLESAMPLE`, Redshift random top-N), so a metered warehouse
+  reads a fraction and takes the same cost-before-spend handshake as the other
+  scanning commands. Only aggregates cross the boundary: per-cluster sizes and
+  fractions, centroids (feature means), inertia, and the silhouette score;
+  with `-k` omitted the engine sweeps k and reports the silhouette it chose
+  from. scikit-learn rides behind a new `[cluster]` extra, lazy-imported so the
+  light default install stays light and the explore skill wrapper adds it
+  automatically for this subcommand.
 
 ### Fixed
 
