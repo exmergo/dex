@@ -22,7 +22,8 @@ from exmergo_dex_core.cache import (
     Relationship,
 )
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.explore.profile import detect_pii, is_min_max_safe
+from exmergo_dex_core.explore.profile import detect_pii, is_min_max_safe, profile
+from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
 
 
 def _run(argv: list[str], capsys) -> dict:
@@ -366,6 +367,68 @@ def test_non_unique_id_gets_fan_out_warning(airbnb_duckdb: Path, capsys):
     assert any("grain unknown" in n for n in hosts["data_quality"])
     assert hosts["candidate_keys"] == []
     assert hosts["grain"] is None
+
+
+# --- progress reporting -------------------------------------------------------
+
+
+def test_fast_run_emits_no_stderr_and_one_envelope(airbnb_duckdb: Path, capfd):
+    """The contract guard: a fast local run stays completely silent on stderr and
+    still emits exactly one JSON envelope on stdout, so the progress plumbing
+    never contaminates the boundary."""
+
+    rc = main(
+        [
+            "explore",
+            "profile",
+            "RAW_HOSTS",
+            "RAW_LISTINGS",
+            "RAW_REVIEWS",
+            "--path",
+            str(airbnb_duckdb),
+        ]
+    )
+    captured = capfd.readouterr()
+    assert rc == 0, captured.out
+    assert captured.err == ""  # fast run → no progress lines
+    assert captured.out.count("\n") == 1  # exactly one envelope
+    assert json.loads(captured.out)["status"] == "ok"
+
+
+def test_profile_reporter_emits_progress_on_a_slow_run(airbnb_duckdb: Path):
+    """Drive the emission path directly: a reporter forced past first_after over a
+    StringIO stream produces the throttled per-object lines, proving profile()
+    advances it once per profiled object."""
+
+    import io
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    now = [0.0]
+    stream = io.StringIO()
+    reporter = ProgressReporter(
+        3,
+        "profiled",
+        "objects",
+        stream=stream,
+        clock=lambda: now[0],
+        interval=0.0,  # no throttle: every advance past first_after emits
+    )
+    now[0] = PROGRESS_FIRST_AFTER + 0.1  # every advance is past the threshold
+
+    adapter = DuckDBAdapter(airbnb_duckdb)
+    try:
+        identifiers = [m.identifier for m in adapter.list_objects()]
+        profile(adapter, identifiers[:3], progress=reporter)
+    finally:
+        adapter.close()
+
+    lines = stream.getvalue().splitlines()
+    # The final object is announced by done(), not advance(); advance() fires for
+    # the first two of three objects.
+    assert lines == ["dex: profiled 1/3 objects", "dex: profiled 2/3 objects"]
+    reporter.done()
+    assert stream.getvalue().endswith("dex: profiled 3/3 objects\n")
 
 
 def test_clean_table_gets_no_warnings_and_a_grain(airbnb_duckdb: Path, capsys):
