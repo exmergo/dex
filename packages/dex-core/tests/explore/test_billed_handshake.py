@@ -195,6 +195,46 @@ def test_unconfirmed_query_returns_estimate_and_logs(
     assert json.loads(log_lines[-1])["decision"] == "needs_confirmation"
 
 
+def _seed_cluster_cache(tmp_path: Path) -> None:
+    store = DexStore(tmp_path)
+    store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier="test-proj.shop.customers",
+                    row_count=100,
+                    columns=[
+                        ColumnProfile(name="amount", data_type="INTEGER"),
+                        ColumnProfile(name="score", data_type="FLOAT64"),
+                    ],
+                )
+            ]
+        )
+    )
+
+
+def test_unconfirmed_cluster_returns_needs_confirmation(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Clustering scans the feature columns, so on a billed connector it takes
+    the same cost-before-spend handshake: an estimate and needs_confirmation,
+    with nothing executed."""
+
+    pytest.importorskip("sklearn")
+    _seed_cluster_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = explore_cmds.cmd_cluster(
+        _args(tmp_path, subcommand="cluster", object="customers")
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
+    # The single-table feature scan floors to the per-query billing minimum.
+    assert envelope.cost.estimate == 10 * MB
+    assert any("sampl" in note for note in envelope.data.get("notes", []))
+    # Nothing executed: only free dry-runs happened.
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
 def test_confirmed_query_runs_through_the_firewall(
     fake_bq_client, route_adapter, tmp_path
 ):

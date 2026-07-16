@@ -202,6 +202,32 @@ class QueryLimits(BaseModel):
     timeout_seconds: float = 30.0
 
 
+class ClusterLimits(BaseModel):
+    """Bounds on `explore cluster`, enforced in the engine.
+
+    Clustering must never load a giant table into anything: only a bounded
+    sample of the feature columns is pulled into the engine process for
+    scikit-learn, and only aggregates (cluster sizes and centroids) cross the
+    stdout boundary. ``sample_rows`` caps how many rows the sample query fetches;
+    the sample clause the engine emits is dialect-aware (TABLESAMPLE / SAMPLE /
+    USING SAMPLE) so a metered warehouse scans a fraction, not the whole table.
+    ``min_rows`` refuses clustering a sample too small to be meaningful.
+    ``k_min``/``k_max`` bound the silhouette sweep when ``-k`` is not given;
+    ``silhouette_sample`` caps the (quadratic) silhouette computation.
+    ``max_features`` bounds the feature width. ``random_state`` fixes the
+    scikit-learn seed so a run is reproducible and tests are deterministic.
+    """
+
+    sample_rows: int = 20000
+    min_rows: int = 50
+    k_min: int = 2
+    k_max: int = 8
+    silhouette_sample: int = 5000
+    max_features: int = 20
+    random_state: int = 0
+    timeout_seconds: float = 60.0
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -220,6 +246,7 @@ class DexConfig(BaseModel):
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
     query: QueryLimits = Field(default_factory=QueryLimits)
+    cluster: ClusterLimits = Field(default_factory=ClusterLimits)
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25

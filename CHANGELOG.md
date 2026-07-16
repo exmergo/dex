@@ -9,6 +9,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore cluster <object>`: k-means segmentation over a bounded feature
+  sample.** Discovers structure in a table without ever loading it into
+  context. Cache-gated like `explore query`, so it auto-selects features from
+  profiled numeric, non-PII, non-key columns (or takes an explicit
+  `--features` list, where naming a PII column opts it in deliberately and only
+  its per-cluster mean, an aggregate, is reported). The sample query scans only
+  the feature columns and carries a dialect-aware sample clause (DuckDB
+  `USING SAMPLE`, BigQuery/Postgres `TABLESAMPLE SYSTEM`, Snowflake `SAMPLE`,
+  Databricks `TABLESAMPLE`, Redshift random top-N), so a metered warehouse
+  reads a fraction and takes the same cost-before-spend handshake as the other
+  scanning commands. Only aggregates cross the boundary: per-cluster sizes and
+  fractions, centroids (feature means), inertia, and the silhouette score;
+  with `-k` omitted the engine sweeps k and reports the silhouette it chose
+  from. scikit-learn rides behind a new `[cluster]` extra, lazy-imported so the
+  light default install stays light and the explore skill wrapper adds it
+  automatically for this subcommand.
+
 ### Fixed
 
 - **`explore relationships` now folds same-lineage/replica duplicate edges
