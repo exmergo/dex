@@ -23,6 +23,7 @@ from exmergo_dex_core.cache import (
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
 from exmergo_dex_core.explore.commands import _merge_relationships
+from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.explore.relationships import (
     candidate_keys,
     data_quality_notes,
@@ -31,7 +32,9 @@ from exmergo_dex_core.explore.relationships import (
     fk_candidate_count,
     fold_replica_relationships,
     infer_relationships,
+    verify_relationships,
 )
+from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
 
 
 def _col(
@@ -617,6 +620,60 @@ def test_verify_measures_overlap_and_lifts_clean_joins(airbnb_duckdb: Path, caps
         assert by_fk[fk]["confidence"] >= base_by_fk[fk]["confidence"]
     assert by_fk[("HOST_ID",)]["confidence"] < 0.85  # parent key still not unique
     assert any("overlap probes" in n for n in verified["notes"])
+
+
+def test_verify_fast_run_emits_no_stderr_and_one_envelope(airbnb_duckdb: Path, capfd):
+    """Contract guard on the verify path: a fast run stays silent on stderr and
+    still emits exactly one envelope, so neither the profile nor the verify
+    reporter contaminates stdout."""
+
+    rc = main(["explore", "relationships", "--verify", "--path", str(airbnb_duckdb)])
+    captured = capfd.readouterr()
+    assert rc == 0, captured.out
+    assert captured.err == ""  # fast run → no progress lines
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out)["status"] == "ok"
+
+
+def test_verify_reporter_emits_one_line_per_probed_join(airbnb_duckdb: Path):
+    """Drive the verify emission path directly: a reporter forced past first_after
+    advances once per inferred join actually probed, and never on declared joins
+    (which the loop skips before probing)."""
+
+    import io
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter(airbnb_duckdb)
+    try:
+        datasets = profile(adapter, [m.identifier for m in adapter.list_objects()])
+        inferred = infer_relationships(datasets)
+        assert len(inferred) >= 2  # HOST_ID and LISTING_ID joins
+
+        now = [0.0]
+        stream = io.StringIO()
+        reporter = ProgressReporter(
+            len(inferred),
+            "verified",
+            "joins",
+            stream=stream,
+            clock=lambda: now[0],
+            interval=0.0,
+        )
+        now[0] = PROGRESS_FIRST_AFTER + 0.1  # every advance is past the threshold
+        verify_relationships(adapter, inferred, progress=reporter)
+    finally:
+        adapter.close()
+
+    lines = stream.getvalue().splitlines()
+    # advance() fires for all but the final probed join; done() closes it out.
+    assert lines == [
+        f"dex: verified {i}/{len(inferred)} joins" for i in range(1, len(inferred))
+    ]
+    reporter.done()
+    assert stream.getvalue().endswith(
+        f"dex: verified {len(inferred)}/{len(inferred)} joins\n"
+    )
 
 
 def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):

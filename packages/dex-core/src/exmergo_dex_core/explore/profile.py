@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 from ..adapters.base import Adapter, ColumnAggregate, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
 # directions at tens of thousands of rows (27,044 approx on 26,599 unique;
@@ -195,9 +196,13 @@ def profile(
     adapter: Adapter,
     identifiers: list[str],
     *,
+    progress: ProgressReporter | None = None,
     on_complete: Callable[[Dataset], None] | None = None,
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
+
+    ``progress``, when supplied, is advanced once per profiled object so a long
+    run emits periodic ``profiled N/M objects`` lines to stderr.
 
     ``on_complete`` is invoked with each raw Dataset as soon as it is fully
     profiled, so callers can checkpoint budget-paid work before a later object's
@@ -274,6 +279,8 @@ def profile(
             data_quality=data_quality,
             profiled_at=datetime.now(UTC).isoformat(),
         )
+        if progress is not None:
+            progress.advance()
         datasets.append(ds)
         if on_complete is not None:
             on_complete(ds)

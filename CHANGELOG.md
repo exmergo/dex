@@ -11,6 +11,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`explore map`, `explore relationships`, and `explore profile` now emit
+  periodic progress to stderr on long runs** ([#84]). Previously these commands
+  produced no output until they completed or errored, so a slow profiling run
+  (many objects, or `--verify` adding an overlap probe per inferred join) was
+  indistinguishable from a hung one. A minimal `dex: profiled 40/90 objects`
+  (and `dex: verified N/M joins` on `--verify`) line now goes to stderr as the
+  slow loops advance, gated so fast runs stay completely silent. The stdout
+  contract is untouched: progress goes only to stderr, never the JSON envelope.
 - **`explore cluster <object>`: k-means segmentation over a bounded feature
   sample.** Discovers structure in a table without ever loading it into
   context. Cache-gated like `explore query`, so it auto-selects features from

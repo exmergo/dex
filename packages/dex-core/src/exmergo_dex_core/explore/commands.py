@@ -35,6 +35,7 @@ from ..guards.query_firewall import (
     QueryRefusedError,
     inspect_query,
 )
+from ..progress import ProgressReporter
 from . import cluster as cluster_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
@@ -53,6 +54,18 @@ def _profile_estimate(
     if estimate is None:
         return 0.0, {}
     return estimate(identifiers)
+
+
+def _reporter(total: int, label: str, noun: str) -> ProgressReporter:
+    """A stderr progress reporter for one long explore loop.
+
+    Constructed at the call site after the billed handshake's early return, so an
+    unconfirmed preflight never even builds one. Construction emits nothing (no
+    "starting..." line), so a 0/1-object run stays silent by the reporter's own
+    gating.
+    """
+
+    return ProgressReporter(total, label, noun)
 
 
 def _dev_schemas(config: DexConfig) -> frozenset[str]:
@@ -139,8 +152,12 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
             checkpoint, accumulated = _profile_checkpointer(
                 store, prior, connector, now
             )
+        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
         try:
-            datasets = profile_mod.profile(adapter, identifiers, on_complete=checkpoint)
+            datasets = profile_mod.profile(
+                adapter, identifiers, progress=profile_reporter, on_complete=checkpoint
+            )
+            profile_reporter.done()
         except OverCeilingError:
             over_ceiling = True
         envelope = env.ok({})
@@ -212,22 +229,37 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         if unconfirmed is not None:
             return unconfirmed
         connector = adapter.name
+
         # Billed-connector-gated per-object checkpointing (see cmd_profile).
         checkpoint = None
         if command_args.cost_gate(adapter) is not None:
             checkpoint, accumulated = _profile_checkpointer(
                 store, prior, connector, now
             )
+
+        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
         try:
-            datasets = profile_mod.profile(adapter, identifiers, on_complete=checkpoint)
+            datasets = profile_mod.profile(
+                adapter,
+                identifiers,
+                progress=profile_reporter,
+                on_complete=checkpoint,
+            )
+            profile_reporter.done()
         except OverCeilingError:
             over_ceiling = True
+
         if not over_ceiling:
             inferred = rel_mod.infer_relationships(datasets)
             if verify:
+                verify_reporter = _reporter(len(inferred), "verified", "joins")
                 rel_mod.verify_relationships(
-                    adapter, inferred, timeout_seconds=config.query.timeout_seconds
+                    adapter,
+                    inferred,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
                 )
+                verify_reporter.done()
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
@@ -415,19 +447,31 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             checkpoint, accumulated = _profile_checkpointer(
                 store, prior, adapter.name, now
             )
+
+        profile_reporter = _reporter(len(selected), "profiled", "objects")
         try:
             profiled = profile_mod.profile(
-                adapter, [m.identifier for m in selected], on_complete=checkpoint
+                adapter,
+                [m.identifier for m in selected],
+                progress=profile_reporter,
+                on_complete=checkpoint,
             )
+            profile_reporter.done()
         except OverCeilingError:
             over_ceiling = True
+
         if not over_ceiling:
             _annotate_grain(profiled, defs)
             inferred = rel_mod.infer_relationships(profiled)
             if getattr(args, "verify", False):
+                verify_reporter = _reporter(len(inferred), "verified", "joins")
                 rel_mod.verify_relationships(
-                    adapter, inferred, timeout_seconds=config.query.timeout_seconds
+                    adapter,
+                    inferred,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
                 )
+                verify_reporter.done()
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
