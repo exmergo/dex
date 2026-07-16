@@ -142,9 +142,6 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        reporter = _reporter(len(identifiers), "profiled", "objects")
-        datasets = profile_mod.profile(adapter, identifiers, progress=reporter)
-        reporter.done()
         connector = adapter.name
         # Checkpoint per object only on billed connectors: DuckDB can never
         # exhaust budget and its re-runs are free, so the extra full-file writes
@@ -155,8 +152,12 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
             checkpoint, accumulated = _profile_checkpointer(
                 store, prior, connector, now
             )
+        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
         try:
-            datasets = profile_mod.profile(adapter, identifiers, on_complete=checkpoint)
+            datasets = profile_mod.profile(
+                adapter, identifiers, progress=profile_reporter, on_complete=checkpoint
+            )
+            profile_reporter.done()
         except OverCeilingError:
             over_ceiling = True
         envelope = env.ok({})

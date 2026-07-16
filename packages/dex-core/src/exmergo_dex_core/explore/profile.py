@@ -197,16 +197,19 @@ def profile(
     identifiers: list[str],
     *,
     progress: ProgressReporter | None = None,
+    on_complete: Callable[[Dataset], None] | None = None,
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
+
+    ``progress``, when supplied, is advanced once per profiled object so a long
+    run emits periodic ``profiled N/M objects`` lines to stderr.
 
     ``on_complete`` is invoked with each raw Dataset as soon as it is fully
     profiled, so callers can checkpoint budget-paid work before a later object's
     cost gate can abort the run. It fires *after* the object is appended and only
     for fully-profiled objects, never a half-scanned one.
-    on_complete: Callable[[Dataset], None] | None = None,
     """
-    
+
     datasets: list[Dataset] = []
     for identifier in identifiers:
         meta, columns = adapter.table_metadata(identifier)
