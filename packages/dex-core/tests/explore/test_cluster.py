@@ -14,8 +14,10 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
+from exmergo_dex_core.cache import ColumnProfile, Dataset, Relationship
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.explore import cluster as cluster_mod
+from exmergo_dex_core.explore import commands
 from exmergo_dex_core.guards.sql_guard import assert_select_only
 
 _HAS_SKLEARN = importlib.util.find_spec("sklearn") is not None
@@ -236,6 +238,113 @@ def test_unknown_feature_is_refused(clusterable_duckdb: Path, tmp_path: Path, ca
         clusterable_duckdb, repo, "--features", "nope", capsys=capsys, expect_error=True
     )
     assert "not among the profiled columns" in payload["errors"][0]
+
+
+def _numeric(name: str, **kw) -> ColumnProfile:
+    return ColumnProfile(name=name, data_type="INTEGER", **kw)
+
+
+def _fact(*columns: ColumnProfile) -> Dataset:
+    return Dataset(identifier="db.main.lap_times", columns=list(columns))
+
+
+def _joins_out(*columns: str) -> list[Relationship]:
+    return [
+        Relationship(
+            from_dataset="db.main.lap_times",
+            from_columns=[col],
+            to_dataset="db.main.dim",
+            to_columns=[col],
+        )
+        for col in columns
+    ]
+
+
+def test_foreign_keys_are_excluded_even_when_not_named_like_one():
+    """The join is the evidence, not the name: a fact table is mostly foreign
+    keys plus a few measures, and clustering on the keys just partitions
+    surrogate ranges. `region` joins out, so it is a key however it is spelled."""
+
+    dataset = _fact(
+        _numeric("region"), _numeric("lap"), _numeric("position"), _numeric("ms")
+    )
+    features, notes = commands._select_cluster_features(
+        dataset, None, 10, _joins_out("region")
+    )
+
+    assert features == ["lap", "position", "ms"]
+    joined = " ".join(notes)
+    assert "foreign-key" in joined and "region" in joined
+
+
+def test_foreign_key_may_be_opted_back_in_by_name():
+    dataset = _fact(_numeric("region"), _numeric("lap"), _numeric("ms"))
+    features, _ = commands._select_cluster_features(
+        dataset, ["region", "lap"], 10, _joins_out("region")
+    )
+    assert features == ["region", "lap"]
+
+
+def test_key_shaped_names_are_excluded_when_no_relationships_are_cached():
+    """`explore cluster` is gated on a cache that `explore profile <object>`
+    alone can write, and that path infers no joins. The name fallback covers it,
+    and says so, rather than silently clustering on the keys."""
+
+    dataset = _fact(
+        _numeric("driverId"), _numeric("product_id"), _numeric("lap"), _numeric("ms")
+    )
+    features, notes = commands._select_cluster_features(dataset, None, 10, [])
+
+    assert features == ["lap", "ms"]
+    joined = " ".join(notes)
+    assert "named like a key" in joined
+    assert "explore relationships" in joined, "the fallback names its own upgrade"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "id",
+        "ID",
+        "raceId",
+        "product_id",
+        "HOST_ID",
+        "entity_uuid",  # an integer entity key, seen in the wild
+        "customer_key",  # a Kimball surrogate key
+        "orderGuid",
+    ],
+)
+def test_key_spellings_are_all_recognized(name: str):
+    dataset = _fact(_numeric(name), _numeric("lap"), _numeric("ms"))
+    features, _ = commands._select_cluster_features(dataset, None, 10, [])
+    assert features == ["lap", "ms"], f"{name} should read as a key"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["grid", "paid", "valid", "void", "bid_amount", "monkey", "turkey", "keyword"],
+)
+def test_measures_that_merely_contain_a_key_word_are_kept(name: str):
+    """The boundary is the whole point of the name rule: `grid` (starting grid
+    position) and `monkey` are real measures, and a bare endswith('id') or
+    endswith('key') would eat them."""
+
+    dataset = _fact(_numeric(name), _numeric("lap"), _numeric("ms"))
+    features, _ = commands._select_cluster_features(dataset, None, 10, [])
+    assert name in features
+
+
+def test_too_few_features_says_which_exclusion_caused_it():
+    """A bare count is unactionable; the error carries the exclusions so the
+    caller can see that --features is the way back in."""
+
+    dataset = _fact(_numeric("driverId"), _numeric("lap"))
+    with pytest.raises(ValueError) as excinfo:
+        commands._select_cluster_features(dataset, None, 10, _joins_out("driverId"))
+
+    message = str(excinfo.value)
+    assert "needs at least 2" in message
+    assert "foreign-key" in message and "driverId" in message
 
 
 # --- the free path stays confirmation-free -----------------------------------
