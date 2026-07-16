@@ -425,8 +425,13 @@ def cmd_reconcile(args: argparse.Namespace) -> env.Envelope:
     except DbtProjectError as exc:
         return env.error(f"reconcile edits a dbt project: {exc}")
 
+    config = load_config(repo_root) or DexConfig()
     proposals, edits, build_warnings = reconcile_mod.build(
-        findings, snap, store.load_cache(), view
+        findings,
+        snap,
+        store.load_cache(),
+        view,
+        pii_overrides={e.column.strip().lower() for e in config.pii_overrides},
     )
     warnings.extend(build_warnings)
 
