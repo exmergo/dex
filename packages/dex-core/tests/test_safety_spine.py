@@ -44,10 +44,14 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
                 ColumnMeta("email", "VARCHAR", True, 1),
             ],
             safe={"id"},
+            shape={"email"},
         )
     finally:
         adapter.close()
     assert sql.lstrip().upper().startswith("SELECT")
+    # Shape statistics ride the same guarded statement (regex predicates inside
+    # measuring aggregates, never a raw value in the projection).
+    assert "su_1" in sql and "sp_1" in sql and "st_1" in sql
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
 
@@ -213,6 +217,85 @@ def test_query_firewall_enforces_pii_flagged_never_surfaced():
             inspect_query(bad, cache, QueryLimits())
     # Measuring the flagged column is fine: a statistic is not a value.
     inspect_query("SELECT COUNT(DISTINCT email) FROM customers", cache, QueryLimits())
+
+
+def test_firewall_block_threshold_is_a_hard_coded_engine_constant():
+    # The threshold is engine policy, not configuration: a config edit must
+    # never be able to widen the PII boundary. Its value is load-bearing (every
+    # base confidence in the detector sits at or above it, so nothing unblocks
+    # without value-shape evidence), so the number itself is pinned here.
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.guards.query_firewall import PII_BLOCK_CONFIDENCE
+
+    assert PII_BLOCK_CONFIDENCE == 0.5
+    assert not any("threshold" in name for name in DexConfig.model_fields)
+
+
+def test_firewall_threshold_boundary_and_warning_carry_no_values():
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    def cache_at(confidence: float) -> DexCache:
+        return DexCache(
+            datasets=[
+                Dataset(
+                    identifier="db.main.region",
+                    columns=[
+                        ColumnProfile(
+                            name="r_name",
+                            data_type="VARCHAR",
+                            pii=PIIFlag(category="name", confidence=confidence),
+                        ),
+                    ],
+                )
+            ]
+        )
+
+    with pytest.raises(QueryRefusedError):
+        inspect_query("SELECT r_name FROM region", cache_at(0.5), QueryLimits())
+
+    inspected = inspect_query(
+        "SELECT r_name FROM region", cache_at(0.49), QueryLimits()
+    )
+    (warning,) = inspected.warnings
+    # The warning is built from the column name, category, and numbers only:
+    # nothing shaped like a cell value can appear in it by construction.
+    assert "region.r_name" in warning and "(name)" in warning
+    assert "AFRICA" not in warning and "@" not in warning
+
+
+def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
+    # A hand-edit to the cache is overwritten by the next profile; only the
+    # committed config entry durably clears a reviewed column, and the clear is
+    # recorded on the profile as an audit trail.
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "override.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE region (r_name VARCHAR)")
+    conn.execute("INSERT INTO region VALUES ('AFRICA')")
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (without,) = profile(adapter, ["override.main.region"])
+        (with_override,) = profile(
+            adapter,
+            ["override.main.region"],
+            pii_overrides={"override.main.region.r_name"},
+        )
+    finally:
+        adapter.close()
+
+    assert without.columns[0].pii is not None, "no override: the flag stands"
+    assert with_override.columns[0].pii is None
+    assert with_override.columns[0].pii_overridden is not None, "the audit trail"
 
 
 # --- Family 4: propose-don't-impose ------------------------------------------
@@ -502,10 +585,18 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
 
     adapter = _bq_adapter(fake_bq_client)
     _meta, columns = adapter.table_metadata("test-proj.shop.customers")
+    shape = {
+        c.name
+        for c in columns
+        if "CHAR" in c.data_type.upper()
+        or "STRING" in c.data_type.upper()
+        or "TEXT" in c.data_type.upper()
+    }
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}
+        "test-proj.shop.customers", columns, {"id"}, shape
     )
     assert sql.lstrip().upper().startswith("SELECT")
+    assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
@@ -841,8 +932,18 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
 
     adapter = _sf_adapter(fake_sf_connection)
     _meta, columns = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
-    sql, _plan = adapter._build_aggregate_sql("SHOP.PUBLIC.CUSTOMERS", columns, {"ID"})
+    shape = {
+        c.name
+        for c in columns
+        if "CHAR" in c.data_type.upper()
+        or "STRING" in c.data_type.upper()
+        or "TEXT" in c.data_type.upper()
+    }
+    sql, _plan = adapter._build_aggregate_sql(
+        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape
+    )
     assert sql.lstrip().upper().startswith("SELECT")
+    assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert assert_select_only(sql, dialect="snowflake") == sql
 
 
@@ -1101,8 +1202,18 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
 
     adapter = _dbx_adapter(fake_databricks)
     _meta, columns = adapter.table_metadata("shop.core.customers")
-    sql, _plan = adapter._build_aggregate_sql("shop.core.customers", columns, {"id"})
+    shape = {
+        c.name
+        for c in columns
+        if "CHAR" in c.data_type.upper()
+        or "STRING" in c.data_type.upper()
+        or "TEXT" in c.data_type.upper()
+    }
+    sql, _plan = adapter._build_aggregate_sql(
+        "shop.core.customers", columns, {"id"}, shape
+    )
     assert sql.lstrip().upper().startswith("SELECT")
+    assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
 
 
@@ -1295,8 +1406,18 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
 
     adapter = _pg_adapter(fake_pg_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
-    sql, _plan = adapter._build_aggregate_sql("dexdb.shop.customers", columns, {"id"})
+    shape = {
+        c.name
+        for c in columns
+        if "CHAR" in c.data_type.upper()
+        or "STRING" in c.data_type.upper()
+        or "TEXT" in c.data_type.upper()
+    }
+    sql, _plan = adapter._build_aggregate_sql(
+        "dexdb.shop.customers", columns, {"id"}, shape
+    )
     assert sql.lstrip().upper().startswith("SELECT")
+    assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
 
 
@@ -1519,8 +1640,18 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
 
     adapter = _redshift_adapter(fake_redshift_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
-    sql, _plan = adapter._build_aggregate_sql("dexdb.shop.customers", columns, {"id"})
+    shape = {
+        c.name
+        for c in columns
+        if "CHAR" in c.data_type.upper()
+        or "STRING" in c.data_type.upper()
+        or "TEXT" in c.data_type.upper()
+    }
+    sql, _plan = adapter._build_aggregate_sql(
+        "dexdb.shop.customers", columns, {"id"}, shape
+    )
     assert sql.lstrip().upper().startswith("SELECT")
+    assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert assert_select_only(sql, dialect="redshift") == sql
 
 
