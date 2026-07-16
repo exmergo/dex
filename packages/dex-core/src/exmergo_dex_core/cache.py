@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .maintain.snapshot import Snapshot
 
 # Bump when the on-disk cache shape changes in a way old readers cannot handle.
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 class PIICategory(str, Enum):
@@ -71,6 +71,11 @@ class ColumnProfile(BaseModel):
     min_value: object | None = None
     max_value: object | None = None
     pii: PIIFlag | None = None
+    #: The category the name detector matched before a `pii_overrides` entry in
+    #: `.dex/config.yml` suppressed it: the audit trail that a human, not the
+    #: detector, cleared this column. None when no override applied or the
+    #: detector matched nothing.
+    pii_overridden: PIICategory | None = None
 
 
 class Dataset(BaseModel):
