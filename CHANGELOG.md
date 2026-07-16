@@ -17,7 +17,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   after the whole profiling pass plus inference and ranking finished. When a run
   against a billed connector (BigQuery, Snowflake, Redshift, Postgres,
   Databricks) exhausted its budget partway through, the cost gate raised mid-pass
-  and none of the profiling already paid for reached `.dex/cache.json` — real
+  and none of the profiling already paid for reached `.dex/cache.json` real
   spend, no cache. Each of the three commands now checkpoints every fully
   profiled object to the cache as it completes, so a run that dies at object 60
   of 90 leaves 60 objects' worth of raw profile behind, and reports how many of
