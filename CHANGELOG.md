@@ -65,9 +65,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   scanning commands. Only aggregates cross the boundary: per-cluster sizes and
   fractions, centroids (feature means), inertia, and the silhouette score;
   with `-k` omitted the engine sweeps k and reports the silhouette it chose
-  from. scikit-learn rides behind a new `[cluster]` extra, lazy-imported so the
-  light default install stays light and the explore skill wrapper adds it
-  automatically for this subcommand.
+  from. The sample is seeded where the dialect allows it (`cluster.sample_seed`,
+  default 0; DuckDB `REPEATABLE`), because a re-drawn sample is a different
+  dataset and can change the chosen k, not just the rounding. Where an engine
+  has no seedable sample, nothing is invented: `sample_repeatable` is false and
+  a note says the run cannot be compared to another. A cluster holding under 1%
+  of the sample is called out as an outlier pocket rather than a segment, since
+  it inflates the silhouette and a high score on it otherwise reads as a
+  confident segmentation. scikit-learn rides behind a new `[cluster]` extra,
+  lazy-imported so the light default install stays light and the explore skill
+  wrapper adds it automatically for this subcommand.
 - **`pii_overrides` in `.dex/config.yml`: a durable, reviewable way to clear a
   false-positive PII flag.** Each entry names a fully qualified column
   (`db.schema.table.column`, case-insensitive, no wildcards) with an optional

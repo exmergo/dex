@@ -88,6 +88,72 @@ def _mapped_repo(db: Path, tmp_path: Path, capsys) -> Path:
     return repo
 
 
+def _cluster_table(db: Path, repo: Path, table: str, *args: str, capsys):
+    """`_cluster` for a table other than `customers`."""
+
+    rc = main(
+        [
+            "explore",
+            "cluster",
+            table,
+            *args,
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ]
+    )
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert rc == 0 and payload["status"] == "ok", payload
+    return payload
+
+
+@pytest.fixture
+def sampled_duckdb(tmp_path: Path) -> Path:
+    """A table comfortably over the 20000-row sample cap, so the sample clause
+    actually draws (a table under the cap is read whole and would be trivially
+    reproducible, proving nothing). Three blobs, deterministic."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "wide.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE wide AS
+        SELECT
+            CASE i % 3 WHEN 0 THEN 10.0 WHEN 1 THEN 50.0 ELSE 90.0 END
+                + (i % 7) * 0.1 AS spend,
+            CASE i % 3 WHEN 0 THEN 1.0 WHEN 1 THEN 5.0 ELSE 9.0 END
+                + (i % 7) * 0.1 AS visits
+        FROM range(60000) t(i)
+        """
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def outlier_duckdb(tmp_path: Path) -> Path:
+    """One dense blob plus 3 extreme rows in 3000: the shape that makes k-means
+    peel off a sub-1% cluster and report a high silhouette for it."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "spikes.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE spikes AS
+        SELECT
+            CASE WHEN i < 3 THEN 500000.0 ELSE 10.0 + (i % 5) * 0.1 END AS amount,
+            CASE WHEN i < 3 THEN 400000.0 ELSE 5.0 + (i % 5) * 0.1 END AS duration
+        FROM range(3000) t(i)
+        """
+    )
+    conn.close()
+    return path
+
+
 # --- the cache gate ----------------------------------------------------------
 
 
@@ -414,6 +480,124 @@ def test_sample_sql_skips_percent_sampling_when_row_count_unknown():
     assert "TABLESAMPLE" not in sql
     assert "no sample clause" in method
     assert_select_only(sql, dialect="bigquery")
+
+
+# --- a seeded sample draws the same rows twice -------------------------------
+
+
+def test_duckdb_seeded_sample_emits_a_repeatable_reservoir():
+    """DuckDB rejects REPEATABLE on the bare `USING SAMPLE n ROWS`, so the seeded
+    form has to spell out reservoir(...). Pinned because the two spellings look
+    interchangeable and only one parses."""
+
+    sql, method = cluster_mod.build_sample_sql(
+        "db.main.customers",
+        ["spend", "visits"],
+        dialect="duckdb",
+        sample_rows=100,
+        row_count=1000,
+        seed=7,
+    )
+    assert sql.rstrip().endswith("USING SAMPLE reservoir(100 ROWS) REPEATABLE (7)")
+    assert "repeatable seed 7" in method
+    assert_select_only(sql, dialect="duckdb")
+    assert cluster_mod.sample_is_repeatable("duckdb", 7) is True
+
+
+def test_seed_is_omitted_where_the_dialect_cannot_honor_it():
+    """No seed clause is invented for an engine that has none, and the engine
+    reports the sample as not repeatable rather than implying otherwise."""
+
+    for dialect in ("snowflake", "bigquery", "postgres", "redshift", "databricks"):
+        sql, _ = cluster_mod.build_sample_sql(
+            "db.sch.customers",
+            ["spend", "visits"],
+            dialect=dialect,
+            sample_rows=100,
+            row_count=1000,
+            seed=7,
+        )
+        assert "REPEATABLE" not in sql.upper(), dialect
+        assert cluster_mod.sample_is_repeatable(dialect, 7) is False, dialect
+        assert_select_only(sql, dialect=dialect)
+
+
+def test_a_null_seed_opts_out_of_repeatability():
+    sql, _ = cluster_mod.build_sample_sql(
+        "db.main.customers",
+        ["spend", "visits"],
+        dialect="duckdb",
+        sample_rows=100,
+        row_count=1000,
+        seed=None,
+    )
+    assert "REPEATABLE" not in sql.upper()
+    assert cluster_mod.sample_is_repeatable("duckdb", None) is False
+
+
+@requires_sklearn
+def test_two_identical_runs_return_identical_clusters(
+    sampled_duckdb: Path, tmp_path: Path, capsys
+):
+    """The regression this exists for: with the sample unseeded, the same command
+    on the same table returned a different k run to run, because a re-drawn
+    sample is a different dataset. Uses a table well over the sample cap, so a
+    sample is genuinely drawn rather than the whole table read."""
+
+    repo = _mapped_repo(sampled_duckdb, tmp_path, capsys)
+    first = _cluster_table(sampled_duckdb, repo, "wide", capsys=capsys)["data"]
+    second = _cluster_table(sampled_duckdb, repo, "wide", capsys=capsys)["data"]
+
+    assert first["sample_repeatable"] is True
+    assert first["k"] == second["k"]
+    assert first["silhouette"] == second["silhouette"]
+    assert first["clusters"] == second["clusters"]
+
+
+@requires_sklearn
+def test_an_unrepeatable_sample_says_so(sampled_duckdb: Path, tmp_path: Path, capsys):
+    """With the seed off, the result is still valid but no longer comparable
+    across runs, and the envelope has to admit that rather than let a reader
+    diff two runs and think the data moved."""
+
+    repo = _mapped_repo(sampled_duckdb, tmp_path, capsys)
+    (repo / ".dex" / "config.yml").write_text("cluster:\n  sample_seed: null\n")
+    payload = _cluster_table(sampled_duckdb, repo, "wide", capsys=capsys)
+
+    assert payload["data"]["sample_repeatable"] is False
+    assert "not reproducible" in " ".join(payload["data"]["notes"])
+
+
+# --- a tiny cluster is an outlier pocket, not a segment -----------------------
+
+
+@requires_sklearn
+def test_a_degenerate_cluster_is_called_out(
+    outlier_duckdb: Path, tmp_path: Path, capsys
+):
+    """A handful of extreme rows split off as their own cluster and drive the
+    silhouette up, which reads as a confident segmentation when it is really
+    outlier detection. The score alone cannot tell those apart, so the note
+    must."""
+
+    repo = _mapped_repo(outlier_duckdb, tmp_path, capsys)
+    data = _cluster_table(outlier_duckdb, repo, "spikes", capsys=capsys)["data"]
+
+    tiny = [c for c in data["clusters"] if c["fraction"] < 0.01]
+    assert tiny, "fixture must produce a sub-1% cluster"
+    assert data["silhouette"] > 0.7, "and it must look confident"
+    note = " ".join(data["notes"])
+    assert "outlier pocket rather than a segment" in note
+    assert "inflates" in note
+
+
+@requires_sklearn
+def test_even_clusters_are_not_called_degenerate(
+    clusterable_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(clusterable_duckdb, tmp_path, capsys)
+    payload = _cluster(clusterable_duckdb, repo, capsys=capsys)
+    assert "outlier pocket" not in " ".join(payload["data"]["notes"])
 
 
 # --- the pure clustering engine ---------------------------------------------

@@ -688,7 +688,12 @@ def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
             dialect=adapter.dialect,
             sample_rows=limits.sample_rows,
             row_count=dataset.row_count,
+            seed=limits.sample_seed,
         )
+        repeatable = cluster_mod.sample_is_repeatable(
+            adapter.dialect, limits.sample_seed
+        )
+        adapter_name = adapter.name
         query_estimate = getattr(adapter, "query_estimate", None)
         estimate = query_estimate(sample_sql) if query_estimate else 0.0
         unconfirmed = command_args.billed_handshake(
@@ -732,11 +737,18 @@ def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
             f"the sample hit the {limits.sample_rows}-row cap (the table has more "
             "rows); raise cluster.sample_rows in .dex/config.yml to widen it"
         )
+    if not repeatable and dataset.row_count and dataset.row_count > limits.sample_rows:
+        notes.append(
+            f"this sample is not reproducible on {adapter_name}: re-running can "
+            "draw different rows and reach a different k. Compare runs only with "
+            "an identical sample"
+        )
     envelope.data.update(
         {
             "object": dataset.identifier,
             "total_rows": dataset.row_count,
             "sample_method": sample_method,
+            "sample_repeatable": repeatable,
             **data,
             "notes": notes,
         }
