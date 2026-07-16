@@ -56,6 +56,8 @@ from .base import (
     distinct_combination_sql,
     json_safe,
     name_list,
+    shape_stat_expressions,
+    shape_stat_value,
 )
 
 PARADIGM = "compute_time"
@@ -136,6 +138,11 @@ _SIZE_FACTS_NOTE = (
     "via the server-side statement_timeout); grant it with: GRANT SELECT ON "
     "svv_table_info TO <user>"
 )
+
+
+def _regexp_predicate(qcol: str, pattern: str) -> str:
+    # ~ matches substrings; the shared patterns' anchors make it a full match.
+    return f"{qcol} ~ '{pattern}'"
 
 
 class RedshiftConnectionError(Exception):
@@ -702,13 +709,15 @@ class RedshiftAdapter:
         columns: list[ColumnMeta],
         *,
         safe_min_max: set[str] | None = None,
+        shape_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
+        shape = shape_stats or set()
         meta, _ = self.table_metadata(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
-            sql, plan = self._build_aggregate_sql(identifier, batch, safe)
+            sql, plan = self._build_aggregate_sql(identifier, batch, safe, shape)
             rows, labels = self._execute(
                 sql, estimate=self._scan_seconds(meta.byte_size)
             )
@@ -722,17 +731,18 @@ class RedshiftAdapter:
         identifier: str,
         columns: list[ColumnMeta],
         safe: set[str],
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool]]]:
+        shape: set[str],
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
         # One aggregate statement per batch, a single pass: COUNT(*) once,
         # then per column a non-null count, an approximate distinct (HLL),
-        # and min/max only where allowed. Pure (no connection), so the
-        # SELECT-only property is testable offline. Degraded types get the
-        # non-null count only: a distinct count over serialized SUPER or
-        # geometry values is not a meaningful cardinality even where the
-        # server accepts it (verified live: it does), and MIN/MAX would
-        # carry values.
+        # min/max only where allowed, and value-shape fractions only where
+        # requested. Pure (no connection), so the SELECT-only property is
+        # testable offline. Degraded types get the non-null count only: a
+        # distinct count over serialized SUPER or geometry values is not a
+        # meaningful cardinality even where the server accepts it (verified
+        # live: it does), and MIN/MAX would carry values.
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             degraded = self._is_degraded(col.data_type)
@@ -748,7 +758,10 @@ class RedshiftAdapter:
             if wants_min_max:
                 select_parts.append(f"MIN({qcol}) AS mn_{i}")
                 select_parts.append(f"MAX({qcol}) AS mx_{i}")
-            plan.append((i, col, wants_distinct, wants_min_max))
+            wants_shape = (col.name in shape) and not degraded
+            if wants_shape:
+                select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
+            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         sql = f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}"  # noqa: S608
@@ -761,11 +774,11 @@ class RedshiftAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max in plan:
+        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -787,6 +800,13 @@ class RedshiftAdapter:
                     max_value=(
                         json_safe(values.get(f"mx_{i}")) if wants_min_max else None
                     ),
+                    upper_vocab_fraction=shape_stat_value(
+                        values, f"su_{i}", wants_shape
+                    ),
+                    person_shape_fraction=shape_stat_value(
+                        values, f"sp_{i}", wants_shape
+                    ),
+                    avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
                 )
             )
         return aggregates
