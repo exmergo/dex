@@ -30,9 +30,7 @@ class _Clock:
 
 
 def _reporter(total: int, clock: _Clock, stream: io.StringIO) -> ProgressReporter:
-    return ProgressReporter(
-        total, "profiled", "objects", stream=stream, clock=clock
-    )
+    return ProgressReporter(total, "profiled", "objects", stream=stream, clock=clock)
 
 
 def test_fast_run_stays_silent() -> None:
