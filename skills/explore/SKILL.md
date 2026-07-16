@@ -28,7 +28,12 @@ Subcommands, in the usual order:
 3. `explore profile <objects>` (space- or comma-separated) returns column
    profiles, PII flags recorded as (column, category, confidence) and never
    example values, plus candidate keys, the likely grain, and data-quality
-   warnings (e.g. a non-unique id that will fan out on joins). Distinct counts
+   warnings (e.g. a non-unique id that will fan out on joins). A generic
+   `*_name` flag's confidence is refined by value-shape evidence from the same
+   scan, in both directions: person-shaped values corroborate it, a closed
+   reference vocabulary or long labels de-rate it below the firewall's blocking
+   threshold, and missing evidence changes nothing (the flag itself is never
+   removed). Distinct counts
    are approximate for scale, but any column that looks unique within
    approximation noise is escalated to an exact COUNT(DISTINCT)
    (`distinct_count_exact: true`), so uniqueness and grain verdicts rest on
@@ -54,8 +59,14 @@ Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single
 query rather than issuing many; aggregates over PII-flagged columns must be
 measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
-(MIN, ANY_VALUE, STRING_AGG). Never fall back to raw Python or a database CLI to
-run SQL; the firewall path is the only sanctioned one.
+(MIN, ANY_VALUE, STRING_AGG). A column whose flag was de-rated below the 0.5
+blocking threshold projects normally, with an envelope warning naming it; treat
+the warning as information for the user, not an error to fix. If the user says a
+refused column is not personal data, recommend a `pii_overrides` entry in
+`.dex/config.yml` (fully qualified column, optional reason): it unblocks
+querying immediately, survives re-profiles, and is reviewable in git. Never
+hand-edit `.dex/cache.json` to clear a flag. Never fall back to raw Python or a
+database CLI to run SQL; the firewall path is the only sanctioned one.
 
 ## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift)
 
@@ -110,4 +121,6 @@ thing to reach for on a warehouse whose full map would be expensive.
   schema into context.
 - Profile, don't exfiltrate. Understanding comes from aggregates. PII is flagged,
   never surfaced, and the query firewall enforces it on your own SQL: values
-  cross the envelope only from profiled, PII-cleared columns, bounded and capped.
+  cross the envelope only from profiled columns whose flag is absent or below
+  the blocking threshold, bounded and capped. Only a human's `pii_overrides`
+  entry clears a flag entirely; never suggest weakening the detection.

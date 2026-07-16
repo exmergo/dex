@@ -120,3 +120,23 @@ the value-carrying expression for a measuring one, or drop the column from the
 projection. Do not retry the same shape, do not route around the engine with
 Python or a database CLI, and if the refusal says a table is not profiled, run
 `explore profile <table>` (or `explore map`) and probe again.
+
+Two newer paths the refusal may name:
+
+- A refusal on a column the user says is not personal data (a region label, a
+  product line) is resolved with a `pii_overrides` entry in `.dex/config.yml`
+  naming the fully qualified column, with an optional reason. It takes effect on
+  the next query without re-profiling. Recommend the entry; never edit the
+  cache.
+- If the refusal suggests re-profiling, the cache predates value-shape
+  profiling: one `explore profile <table>` recomputes the flag's confidence
+  with shape evidence and may clear the block on its own.
+
+## When a probe runs with a PII warning
+
+A projection of a column whose flag sits below the blocking threshold runs and
+adds a warning to the envelope naming the column, category, and confidence.
+That is the designed behavior for de-rated reference columns (a region or
+nation dimension), not an error: pass the caveat on to the user alongside the
+result, and if they confirm the column is personal data after all, drop it from
+later probes.

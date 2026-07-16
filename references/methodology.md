@@ -84,6 +84,29 @@ weakens it). The result is recorded strictly as (column, category, confidence)
 with no example value, and that flag is what propagates downstream into emitted
 dbt.
 
+For the weakest signal, a generic `*_name` string column, the profiling scan also
+computes three **value-shape statistics** as in-engine SQL aggregates: the
+fraction of values that are all-caps tokens, the fraction shaped like a given
+name plus surname, and the average token count. These are regex predicates
+inside measuring aggregates, so only numeric fractions leave the engine, never a
+value. The evidence moves confidence in both directions: a person-shaped
+distribution corroborates the flag up to the exact-token level, while a tiny
+closed all-caps vocabulary (a region or nation dimension) or long multi-token
+labels (part and product descriptions) de-rate it to reference-data confidence.
+When the evidence is missing or ambiguous, the name-derived confidence stands:
+absence of evidence never weakens a flag.
+
+The flag itself is never removed by evidence. What a weak flag means is the
+consumer's decision: the query firewall blocks projection at confidence 0.5 and
+above (a hard-coded engine constant) and allows lower-confidence columns with an
+envelope warning, while min/max suppression and dbt `meta` stamping remain
+presence-based at any confidence. The only way to clear a flag entirely is a
+human decision recorded as a `pii_overrides` entry in `.dex/config.yml` (fully
+qualified column plus an optional reason). An override is re-applied on every
+profile, so it survives re-profiling, takes effect at query time immediately,
+and leaves an audit trail in the cache recording which category the detector had
+matched.
+
 ## Relationships: joins from metadata, not scans
 
 Relationship inference reads the profiles already gathered and never scans data to
