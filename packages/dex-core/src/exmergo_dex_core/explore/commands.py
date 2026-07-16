@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,13 +20,23 @@ from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
-from ..cache import Dataset, DexCache, DexStore, Relationship, match_identifier
+from ..cache import (
+    CACHE_FILE,
+    Dataset,
+    DexCache,
+    DexStore,
+    Relationship,
+    match_identifier,
+)
 from ..config import DexConfig, QueryLimits, load_config, pii_override_paths
+from ..guards.cost_guard import OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
     inspect_query,
 )
+from ..progress import ProgressReporter
+from . import cluster as cluster_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
@@ -95,6 +106,18 @@ def _profile_estimate(
     return estimate(identifiers)
 
 
+def _reporter(total: int, label: str, noun: str) -> ProgressReporter:
+    """A stderr progress reporter for one long explore loop.
+
+    Constructed at the call site after the billed handshake's early return, so an
+    unconfirmed preflight never even builds one. Construction emits nothing (no
+    "starting..." line), so a 0/1-object run stays silent by the reporter's own
+    gating.
+    """
+
+    return ProgressReporter(total, label, noun)
+
+
 def _dev_schemas(config: DexConfig) -> frozenset[str]:
     """Dev/replica namespaces declared per connector (where dbt dev builds write)."""
     return frozenset(
@@ -155,6 +178,13 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     defs = _project_definitions(args, config)
     override_paths = pii_override_paths(config.pii_overrides)
     adapter = command_args.open_from_args(args)
+    # Capture pre-run cache state before any checkpoint write, so the success-path
+    # compose reads the pre-run cache rather than a checkpoint this run wrote.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    prior = store.load_cache()
+    accumulated: list[Dataset] = []
+    over_ceiling = False
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
         estimate, per_table = _profile_estimate(adapter, identifiers)
@@ -163,23 +193,43 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(
-            adapter, identifiers, pii_overrides=override_paths
-        )
         connector = adapter.name
+        # Checkpoint per object only on billed connectors: DuckDB can never
+        # exhaust budget and its re-runs are free, so the extra full-file writes
+        # (and O(n^2) serialization on large warehouses) are scoped precisely to
+        # the population the bug affects.
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, connector, now
+            )
+        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
+        try:
+            datasets = profile_mod.profile(
+                adapter,
+                identifiers,
+                progress=profile_reporter,
+                on_complete=checkpoint,
+                pii_overrides=override_paths,
+            )
+            profile_reporter.done()
+        except OverCeilingError:
+            over_ceiling = True
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    if over_ceiling:
+        envelope = _over_ceiling_error(store, accumulated, len(identifiers))
+        command_args.stamp_spend(envelope, adapter)
+        return envelope
     _annotate_grain(datasets, defs)
 
     # Persist what the scan already paid for: after profiling a table, `explore
     # query` on that table must work without a second warehouse scan (the query
     # firewall's own refusal messages promise exactly this). Prior relationships
     # are preserved because profile runs no inference pass.
-    store = DexStore(repo_root)
-    now = datetime.now(UTC)
-    cache, stats = _merge_profiles(store.load_cache(), datasets, connector, now)
+    cache, stats = _merge_profiles(prior, datasets, connector, now)
     path = store.save_cache(cache, now=now)
 
     notes = [_persist_note(stats, len(datasets), keeps_relationships=True)]
@@ -203,6 +253,13 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     defs = _project_definitions(args, config)
 
     adapter = command_args.open_from_args(args)
+    # Capture pre-run cache state before any checkpoint write, so the success-path
+    # compose reads the pre-run cache rather than a checkpoint this run wrote.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    prior = store.load_cache()
+    accumulated: list[Dataset] = []
+    over_ceiling = False
     try:
         # Relationship inference needs uniqueness signals, so profile every object
         # first (free and local on DuckDB), then infer across the full set.
@@ -229,19 +286,47 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(
-            adapter, identifiers, pii_overrides=pii_override_paths(config.pii_overrides)
-        )
         connector = adapter.name
-        inferred = rel_mod.infer_relationships(datasets)
-        if verify:
-            rel_mod.verify_relationships(
-                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+
+        # Billed-connector-gated per-object checkpointing (see cmd_profile).
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, connector, now
             )
+
+        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
+        try:
+            datasets = profile_mod.profile(
+                adapter,
+                identifiers,
+                progress=profile_reporter,
+                on_complete=checkpoint,
+                pii_overrides=pii_override_paths(config.pii_overrides),
+            )
+            profile_reporter.done()
+        except OverCeilingError:
+            over_ceiling = True
+
+        if not over_ceiling:
+            inferred = rel_mod.infer_relationships(datasets)
+            if verify:
+                verify_reporter = _reporter(len(inferred), "verified", "joins")
+                rel_mod.verify_relationships(
+                    adapter,
+                    inferred,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
+                )
+                verify_reporter.done()
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    if over_ceiling:
+        envelope = _over_ceiling_error(store, accumulated, len(identifiers))
+        command_args.stamp_spend(envelope, adapter)
+        return envelope
     # Annotate before persisting so cached datasets carry candidate_keys and
     # grain, the same shape a `map`-written cache has.
     _annotate_grain(datasets, defs)
@@ -279,11 +364,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     # Persist the profiles this run already paid for. Because relationships
     # inventories and profiles the full set and infers across all of it, its
     # relationship set is authoritative for this run and replaces the prior one.
-    store = DexStore(repo_root)
-    now = datetime.now(UTC)
-    cache, stats = _merge_profiles(
-        store.load_cache(), datasets, connector, now, relationships=rels
-    )
+    cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
     path = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
@@ -394,6 +475,13 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     full = getattr(args, "full", False)
 
     adapter = command_args.open_from_args(args)
+    # Capture pre-run cache state before any checkpoint write, so the success-path
+    # compose reads the pre-run cache rather than a checkpoint this run wrote.
+    store = DexStore(repo_root)
+    now = datetime.now(UTC)
+    prior = store.load_cache()
+    accumulated: list[Dataset] = []
+    over_ceiling = False
     try:
         metas = inventory_mod.inventory(adapter)
         # First-pass rank on cheap signals (no connectivity yet) to choose what to
@@ -417,21 +505,46 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        profiled = profile_mod.profile(
-            adapter,
-            [m.identifier for m in selected],
-            pii_overrides=pii_override_paths(config.pii_overrides),
-        )
-        _annotate_grain(profiled, defs)
-        inferred = rel_mod.infer_relationships(profiled)
-        if getattr(args, "verify", False):
-            rel_mod.verify_relationships(
-                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+        # Billed-connector-gated per-object checkpointing (see cmd_profile).
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, adapter.name, now
             )
+
+        profile_reporter = _reporter(len(selected), "profiled", "objects")
+        try:
+            profiled = profile_mod.profile(
+                adapter,
+                [m.identifier for m in selected],
+                progress=profile_reporter,
+                on_complete=checkpoint,
+                pii_overrides=pii_override_paths(config.pii_overrides),
+            )
+            profile_reporter.done()
+        except OverCeilingError:
+            over_ceiling = True
+
+        if not over_ceiling:
+            _annotate_grain(profiled, defs)
+            inferred = rel_mod.infer_relationships(profiled)
+            if getattr(args, "verify", False):
+                verify_reporter = _reporter(len(inferred), "verified", "joins")
+                rel_mod.verify_relationships(
+                    adapter,
+                    inferred,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
+                )
+                verify_reporter.done()
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
+    if over_ceiling:
+        envelope = _over_ceiling_error(store, accumulated, len(selected))
+        command_args.stamp_spend(envelope, adapter)
+        return envelope
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
     # into source, replica, and cross-dataset lookalike edges.
@@ -443,10 +556,6 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         defs, [m.identifier for m in metas]
     )
     relationships, confirmed = _merge_relationships(declared, inferred)
-
-    store = DexStore(repo_root)
-    now = datetime.now(UTC)
-    prior = store.load_cache()
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     final_scores = rank_mod.rank(metas, relationships, hints)
@@ -517,7 +626,221 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
+def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
+    """k-means clustering over a bounded sample of one object's numeric columns.
+
+    Cache-gated like `explore query`: profiling is what tells us which columns
+    are numeric and which are PII, so `explore map`/`profile` must have run. Only
+    the feature columns are scanned, only a bounded sample is fetched into the
+    engine for scikit-learn, and only aggregates (cluster sizes and centroids)
+    reach the envelope. The sample query goes through the same cost-before-spend
+    handshake as every other scanning command.
+    """
+
+    repo_root = command_args.repo_root(args)
+    store = DexStore(repo_root)
+    cache = store.load_cache()
+    if cache is None:
+        return env.error(
+            "no .dex/cache.json in this repo; run `explore map` (or `explore "
+            "profile <object>`) first so clustering knows which columns are "
+            "numeric and which are PII"
+        )
+
+    # Fail fast if the [cluster] extra is missing: no connection, no spend.
+    try:
+        cluster_mod.ensure_available()
+    except cluster_mod.ClusterDependencyError as exc:
+        return env.error(str(exc))
+
+    config = load_config(repo_root) or DexConfig()
+    limits = config.cluster
+
+    known = [d.identifier for d in cache.datasets if d.columns]
+    matches = match_identifier(args.object, known)
+    if not matches:
+        return env.error(
+            f"'{args.object}' is not a profiled object in the .dex cache; run "
+            f"`explore profile {args.object}` (or `explore map`) first"
+        )
+    if len(matches) > 1:
+        return env.error(
+            f"'{args.object}' is ambiguous: {', '.join(matches)}; qualify it"
+        )
+    dataset = next(d for d in cache.datasets if d.identifier == matches[0])
+
+    requested = _split_features(getattr(args, "features", None))
+    try:
+        features, selection_notes = _select_cluster_features(
+            dataset, requested, limits.max_features
+        )
+    except ValueError as exc:
+        return env.error(str(exc))
+
+    k = getattr(args, "k", None)
+
+    adapter = command_args.open_from_args(args)
+    try:
+        sample_sql, sample_method = cluster_mod.build_sample_sql(
+            dataset.identifier,
+            features,
+            dialect=adapter.dialect,
+            sample_rows=limits.sample_rows,
+            row_count=dataset.row_count,
+        )
+        query_estimate = getattr(adapter, "query_estimate", None)
+        estimate = query_estimate(sample_sql) if query_estimate else 0.0
+        unconfirmed = command_args.billed_handshake(
+            "explore cluster",
+            adapter,
+            estimate,
+            notes=[
+                f"clusters a sample of up to {limits.sample_rows} rows over "
+                f"{len(features)} feature column(s); sampling: {sample_method}"
+            ],
+        )
+        if unconfirmed is not None:
+            return unconfirmed
+        result = adapter.run_query(
+            sample_sql,
+            max_rows=limits.sample_rows,
+            timeout_seconds=limits.timeout_seconds,
+        )
+        envelope = env.ok({})
+        command_args.stamp_spend(envelope, adapter)
+    finally:
+        adapter.close()
+
+    try:
+        cluster_result = cluster_mod.cluster_features(
+            features,
+            result.cells,
+            k=k,
+            k_min=limits.k_min,
+            k_max=limits.k_max,
+            silhouette_sample=limits.silhouette_sample,
+            random_state=limits.random_state,
+        )
+    except cluster_mod.ClusterError as exc:
+        return env.error(str(exc))
+
+    data = cluster_result.to_data()
+    notes = [*selection_notes, *data.pop("notes", [])]
+    if result.truncated:
+        notes.append(
+            f"the sample hit the {limits.sample_rows}-row cap (the table has more "
+            "rows); raise cluster.sample_rows in .dex/config.yml to widen it"
+        )
+    envelope.data.update(
+        {
+            "object": dataset.identifier,
+            "total_rows": dataset.row_count,
+            "sample_method": sample_method,
+            **data,
+            "notes": notes,
+        }
+    )
+    return envelope
+
+
 # --- helpers -----------------------------------------------------------------
+
+
+def _split_features(raw: list[str] | None) -> list[str] | None:
+    """Flatten repeated/comma-joined --features into a clean name list. Both
+    `--features a,b --features c` and `--features "a, b, c"` are natural."""
+
+    if not raw:
+        return None
+    names = [part.strip() for entry in raw for part in entry.split(",")]
+    return [name for name in names if name] or None
+
+
+def _is_constant_column(col) -> bool:
+    """A column proven to hold a single value contributes nothing to a distance
+    and only dilutes the standardization; an unknown distinct count is kept."""
+
+    return col.distinct_count is not None and col.distinct_count <= 1
+
+
+def _select_cluster_features(
+    dataset: Dataset, requested: list[str] | None, max_features: int
+) -> tuple[list[str], list[str]]:
+    """Resolve the feature columns for clustering plus notes explaining the set.
+
+    Explicit ``--features`` are honored as given (validated numeric); a PII
+    column may be named deliberately, and only its per-cluster mean, an
+    aggregate, is ever reported. Auto-selection is conservative: numeric columns
+    that are not PII-flagged, not a proven unique key (an identifier is not a
+    feature), and not constant. Raises ``ValueError`` with an actionable message
+    when the request cannot be satisfied.
+    """
+
+    by_lower = {col.name.lower(): col for col in dataset.columns}
+    notes: list[str] = []
+
+    if requested is not None:
+        chosen = []
+        for name in requested:
+            col = by_lower.get(name.lower())
+            if col is None:
+                raise ValueError(
+                    f"column '{name}' is not among the profiled columns of "
+                    f"{dataset.identifier}"
+                )
+            if not profile_mod.is_numeric_type(col.data_type):
+                raise ValueError(
+                    f"column '{name}' is {col.data_type}, not numeric; k-means "
+                    "clusters numeric features only"
+                )
+            chosen.append(col)
+        pii_named = [c.name for c in chosen if c.pii is not None]
+        if pii_named:
+            notes.append(
+                f"included {len(pii_named)} PII-flagged feature(s) "
+                f"({', '.join(pii_named)}) at your request; only each cluster's "
+                "mean (an aggregate) is reported, never a row value"
+            )
+        features = [c.name for c in chosen]
+    else:
+        numeric = [
+            c for c in dataset.columns if profile_mod.is_numeric_type(c.data_type)
+        ]
+        excluded_pii = [c.name for c in numeric if c.pii is not None]
+        remaining = [c for c in numeric if c.pii is None]
+        excluded_id = [c.name for c in remaining if c.is_unique is True]
+        remaining = [c for c in remaining if c.is_unique is not True]
+        excluded_const = [c.name for c in remaining if _is_constant_column(c)]
+        candidates = [c for c in remaining if not _is_constant_column(c)]
+        features = [c.name for c in candidates]
+        if excluded_pii:
+            notes.append(
+                f"excluded {len(excluded_pii)} PII-flagged numeric column(s) from "
+                f"auto-selection ({', '.join(excluded_pii)}); name one in "
+                "--features to include it (its centroid is a mean)"
+            )
+        if excluded_id:
+            notes.append(
+                f"excluded {len(excluded_id)} unique-key column(s) "
+                f"({', '.join(excluded_id)}); an identifier is not a feature"
+            )
+        if excluded_const:
+            notes.append(f"excluded {len(excluded_const)} constant column(s)")
+
+    if len(features) > max_features:
+        dropped = len(features) - max_features
+        features = features[:max_features]
+        notes.append(
+            f"using the first {max_features} feature(s); {dropped} more available "
+            "(raise cluster.max_features or pass --features)"
+        )
+    if len(features) < 2:
+        raise ValueError(
+            f"found {len(features)} usable numeric feature column(s) for "
+            f"{dataset.identifier}; k-means needs at least 2. Pass --features to "
+            "choose columns, or profile a table with more numeric columns"
+        )
+    return features, notes
 
 
 def _shape_query_payload(
@@ -804,6 +1127,54 @@ def _compose_datasets(
 
 # Sentinel: preserve the prior cache's relationships (profile has no inference
 # pass, so it has no business touching them).
+def _profile_checkpointer(
+    store: DexStore,
+    prior: DexCache | None,
+    connector: str,
+    now: datetime,
+) -> tuple[Callable[[Dataset], None], list[Dataset]]:
+    """Persist each profiled dataset as it completes, so a budget-exhaustion
+    failure mid-run still leaves the objects already paid for in the cache.
+
+    Reuses ``_merge_profiles`` (KEEP_RELATIONSHIPS), so a partial write is exactly
+    a ``cmd_profile``-shaped result: fresh profiles folded over the same-connector
+    prior, prior relationships preserved, no fabricated stubs. ``accumulated`` is
+    returned so the failure handler can report "N of M".
+    """
+
+    accumulated: list[Dataset] = []
+
+    def checkpoint(ds: Dataset) -> None:
+        accumulated.append(ds)
+        cache, _ = _merge_profiles(prior, accumulated, connector, now)
+        store.save_cache(cache, now=now)
+
+    return checkpoint, accumulated
+
+
+def _over_ceiling_error(
+    store: DexStore, accumulated: list[Dataset], selected: int
+) -> env.Envelope:
+    """The partial-completion error envelope for a mid-run budget exhaustion.
+
+    Because ``charge()`` fires before an object's ``Dataset`` is appended,
+    ``accumulated`` holds only fully-profiled objects — a truthful "N of M"."""
+
+    n = len(accumulated)
+    if n == 0:
+        return env.error(
+            f"budget exhausted before the first of {selected} object(s) finished "
+            "profiling; no partial profiles were saved — raise --budget or narrow "
+            "scope, then re-run"
+        )
+    cache_path = store.dex_dir / CACHE_FILE
+    return env.error(
+        f"budget exhausted after profiling {n} of {selected} object(s); partial "
+        f"profiles saved to {cache_path} — raise --budget or narrow scope, then "
+        "re-run"
+    )
+
+
 _KEEP_RELATIONSHIPS = object()
 
 

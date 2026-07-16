@@ -40,6 +40,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`explore map`, `explore relationships`, and `explore profile` now emit
+  periodic progress to stderr on long runs** ([#84]). Previously these commands
+  produced no output until they completed or errored, so a slow profiling run
+  (many objects, or `--verify` adding an overlap probe per inferred join) was
+  indistinguishable from a hung one. A minimal `dex: profiled 40/90 objects`
+  (and `dex: verified N/M joins` on `--verify`) line now goes to stderr as the
+  slow loops advance, gated so fast runs stay completely silent. The stdout
+  contract is untouched: progress goes only to stderr, never the JSON envelope.
+- **`explore cluster <object>`: k-means segmentation over a bounded feature
+  sample.** Discovers structure in a table without ever loading it into
+  context. Cache-gated like `explore query`, so it auto-selects features from
+  profiled numeric, non-PII, non-key columns (or takes an explicit
+  `--features` list, where naming a PII column opts it in deliberately and only
+  its per-cluster mean, an aggregate, is reported). The sample query scans only
+  the feature columns and carries a dialect-aware sample clause (DuckDB
+  `USING SAMPLE`, BigQuery/Postgres `TABLESAMPLE SYSTEM`, Snowflake `SAMPLE`,
+  Databricks `TABLESAMPLE`, Redshift random top-N), so a metered warehouse
+  reads a fraction and takes the same cost-before-spend handshake as the other
+  scanning commands. Only aggregates cross the boundary: per-cluster sizes and
+  fractions, centroids (feature means), inertia, and the silhouette score;
+  with `-k` omitted the engine sweeps k and reports the silhouette it chose
+  from. scikit-learn rides behind a new `[cluster]` extra, lazy-imported so the
+  light default install stays light and the explore skill wrapper adds it
+  automatically for this subcommand.
 - **`pii_overrides` in `.dex/config.yml`: a durable, reviewable way to clear a
   false-positive PII flag.** Each entry names a fully qualified column
   (`db.schema.table.column`, case-insensitive, no wildcards) with an optional
@@ -52,6 +76,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore map`, `explore relationships`, and `explore profile` now persist
+  each object's profile as it completes on billed connectors** ([#75]).
+  Previously the cache was written exactly once, at the very end of the command,
+  after the whole profiling pass plus inference and ranking finished. When a run
+  against a billed connector (BigQuery, Snowflake, Redshift, Postgres,
+  Databricks) exhausted its budget partway through, the cost gate raised mid-pass
+  and none of the profiling already paid for reached `.dex/cache.json` real
+  spend, no cache. Each of the three commands now checkpoints every fully
+  profiled object to the cache as it completes, so a run that dies at object 60
+  of 90 leaves 60 objects' worth of raw profile behind, and reports how many of
+  how many objects were saved. A fully successful run still overwrites the
+  checkpoints with the authoritative composed cache (relationships, ranking,
+  carry-forward), and the free DuckDB path is unchanged (its re-runs are free, so
+  it never checkpoints).
 - **`explore relationships` now folds same-lineage/replica duplicate edges
   before caching, matching `explore map`** ([#70]). `relationships` profiles
   the full inventory, so it is even more likely than `map` to pull a

@@ -11,11 +11,13 @@ source so the value never leaves the engine.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
 from ..adapters.base import Adapter, ColumnAggregate, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
 # directions at tens of thousands of rows (27,044 approx on 26,599 unique;
@@ -158,6 +160,21 @@ def _is_string_type(data_type: str) -> bool:
     return any(h in upper for h in _STRING_HINTS)
 
 
+def is_numeric_type(data_type: str) -> bool:
+    """Whether a connector's raw column type is numeric (integer, decimal, or
+    float). Substring-matched against ``_NUMERIC_HINTS`` so it holds across
+    dialects (DuckDB BIGINT/HUGEINT, BigQuery INT64/FLOAT64/NUMERIC, Snowflake
+    NUMBER, Postgres double precision). Booleans and temporals are excluded
+    first, because ``INTERVAL`` and ``BOOL`` would otherwise match the ``INT``
+    hint. Shared so numeric-feature selection for `explore cluster` and min/max
+    safety stay single-sourced on one hint set."""
+
+    upper = data_type.upper()
+    if any(h in upper for h in _BOOLEAN_HINTS + _TEMPORAL_HINTS):
+        return False
+    return any(h in upper for h in _NUMERIC_HINTS)
+
+
 def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     """Classify a column as PII from its name (and, loosely, type). Never a value.
 
@@ -218,9 +235,19 @@ def profile(
     adapter: Adapter,
     identifiers: list[str],
     *,
+    progress: ProgressReporter | None = None,
+    on_complete: Callable[[Dataset], None] | None = None,
     pii_overrides: set[str] | None = None,
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
+
+    ``progress``, when supplied, is advanced once per profiled object so a long
+    run emits periodic ``profiled N/M objects`` lines to stderr.
+
+    ``on_complete`` is invoked with each raw Dataset as soon as it is fully
+    profiled, so callers can checkpoint budget-paid work before a later object's
+    cost gate can abort the run. It fires *after* the object is appended and only
+    for fully-profiled objects, never a half-scanned one.
 
     ``pii_overrides`` holds lowered ``identifier.column`` paths a human has
     reviewed as not PII (from `.dex/config.yml`). An overridden column's flag is
@@ -310,18 +337,21 @@ def profile(
                 )
             )
 
-        datasets.append(
-            Dataset(
-                identifier=identifier,
-                object_type=meta.object_type,
-                row_count=meta.row_count,
-                byte_size=meta.byte_size,
-                columns=profiles,
-                composite_keys=composite_keys,
-                data_quality=data_quality,
-                profiled_at=datetime.now(UTC).isoformat(),
-            )
+        ds = Dataset(
+            identifier=identifier,
+            object_type=meta.object_type,
+            row_count=meta.row_count,
+            byte_size=meta.byte_size,
+            columns=profiles,
+            composite_keys=composite_keys,
+            data_quality=data_quality,
+            profiled_at=datetime.now(UTC).isoformat(),
         )
+        if progress is not None:
+            progress.advance()
+        datasets.append(ds)
+        if on_complete is not None:
+            on_complete(ds)
     return datasets
 
 
