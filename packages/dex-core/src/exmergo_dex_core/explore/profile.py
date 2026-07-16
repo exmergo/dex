@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 
 from ..adapters.base import Adapter, ColumnAggregate, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
 # directions at tens of thousands of rows (27,044 approx on 26,599 unique;
@@ -175,8 +176,18 @@ def is_min_max_safe(data_type: str, pii: PIIFlag | None) -> bool:
     )
 
 
-def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
-    """Profile each object into a Dataset of aggregate-derived ColumnProfiles."""
+def profile(
+    adapter: Adapter,
+    identifiers: list[str],
+    *,
+    progress: ProgressReporter | None = None,
+) -> list[Dataset]:
+    """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
+
+    An optional ``progress`` reporter emits a throttled stderr line per object so
+    a long run is visibly distinguishable from a hung one; ``None`` (the default)
+    keeps existing callers silent and unchanged.
+    """
 
     datasets: list[Dataset] = []
     for identifier in identifiers:
@@ -249,6 +260,8 @@ def profile(adapter: Adapter, identifiers: list[str]) -> list[Dataset]:
                 profiled_at=datetime.now(UTC).isoformat(),
             )
         )
+        if progress is not None:
+            progress.advance()
     return datasets
 
 

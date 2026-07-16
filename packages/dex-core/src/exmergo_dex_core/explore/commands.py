@@ -26,6 +26,7 @@ from ..guards.query_firewall import (
     QueryRefusedError,
     inspect_query,
 )
+from ..progress import ProgressReporter
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
@@ -43,6 +44,18 @@ def _profile_estimate(
     if estimate is None:
         return 0.0, {}
     return estimate(identifiers)
+
+
+def _reporter(total: int, label: str, noun: str) -> ProgressReporter:
+    """A stderr progress reporter for one long explore loop.
+
+    Constructed at the call site after the billed handshake's early return, so an
+    unconfirmed preflight never even builds one. Construction emits nothing (no
+    "starting..." line), so a 0/1-object run stays silent by the reporter's own
+    gating.
+    """
+
+    return ProgressReporter(total, label, noun)
 
 
 def _dev_schemas(config: DexConfig) -> frozenset[str]:
@@ -112,7 +125,9 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(adapter, identifiers)
+        reporter = _reporter(len(identifiers), "profiled", "objects")
+        datasets = profile_mod.profile(adapter, identifiers, progress=reporter)
+        reporter.done()
         connector = adapter.name
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
@@ -173,13 +188,20 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        datasets = profile_mod.profile(adapter, identifiers)
+        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
+        datasets = profile_mod.profile(adapter, identifiers, progress=profile_reporter)
+        profile_reporter.done()
         connector = adapter.name
         inferred = rel_mod.infer_relationships(datasets)
         if verify:
+            verify_reporter = _reporter(len(inferred), "verified", "joins")
             rel_mod.verify_relationships(
-                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+                adapter,
+                inferred,
+                timeout_seconds=config.query.timeout_seconds,
+                progress=verify_reporter,
             )
+            verify_reporter.done()
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
@@ -354,13 +376,22 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         )
         if unconfirmed is not None:
             return unconfirmed
-        profiled = profile_mod.profile(adapter, [m.identifier for m in selected])
+        profile_reporter = _reporter(len(selected), "profiled", "objects")
+        profiled = profile_mod.profile(
+            adapter, [m.identifier for m in selected], progress=profile_reporter
+        )
+        profile_reporter.done()
         _annotate_grain(profiled, defs)
         inferred = rel_mod.infer_relationships(profiled)
         if getattr(args, "verify", False):
+            verify_reporter = _reporter(len(inferred), "verified", "joins")
             rel_mod.verify_relationships(
-                adapter, inferred, timeout_seconds=config.query.timeout_seconds
+                adapter,
+                inferred,
+                timeout_seconds=config.query.timeout_seconds,
+                progress=verify_reporter,
             )
+            verify_reporter.done()
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
