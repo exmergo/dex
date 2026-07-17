@@ -49,6 +49,8 @@ dex transform plans               -> list stored plans, pending and applied, new
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
                                      auto-runs dbt deps when packages are declared but not installed
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
+dex transform macro [name]        -> list the shipped dbt macros, or plan scaffolding one into the
+                                     project's macro directory (dbt-parse-checked; apply like any plan)
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
@@ -81,16 +83,20 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
-`semantic define|update`, which imply `semantic_yml`), or `packages_yml`. The
-engine validates each edit (model SQL must be a single read-only SELECT once
-jinja is stripped; YAML must parse; semantic YAML must satisfy MetricFlow's
-schemas; a `packages_yml` edit must carry a `packages:` or `dependencies:` list
-and targets the project-root `packages.yml` or `dependencies.yml`), pins it to
-the sha256 of the file it would change, computes the diffs, and stores the plan
-under `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an
-apply. `packages_yml` is the guarded way to declare dbt package dependencies: a
-reviewable diff like any other edit, then `transform deps` (or the automatic
-deps step in `transform build`) installs them.
+`semantic define|update`, which imply `semantic_yml`), `packages_yml`, or
+`macro_sql`. The engine validates each edit (model SQL must be a single
+read-only SELECT once jinja is stripped; YAML must parse; semantic YAML must
+satisfy MetricFlow's schemas; a `packages_yml` edit must carry a `packages:`
+or `dependencies:` list and targets the project-root `packages.yml` or
+`dependencies.yml`; a `macro_sql` edit must hold only macro definitions and
+jinja comments and must target the project's macro paths, where no other kind
+may go), pins it to the sha256 of the file it would change, computes the
+diffs, and stores the plan under `.dex/plans/<plan-id>.json`. Nothing touches
+the dbt project until an apply. `packages_yml` is the guarded way to declare
+dbt package dependencies: a reviewable diff like any other edit, then
+`transform deps` (or the automatic deps step in `transform build`) installs
+them. `macro_sql` is how a macro is repaired or customized by hand;
+`transform macro <name>` is the scaffolding path for the macros dex ships.
 
 - `transform init "<name>" --connector <duckdb|snowflake|bigquery|databricks|postgres>`
   bootstraps a dbt project when none exists: `dbt_project.yml`, `models/staging/`
