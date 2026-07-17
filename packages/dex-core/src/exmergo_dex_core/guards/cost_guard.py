@@ -164,6 +164,25 @@ class CostGate:
             )
         return cost
 
+    def preflight_phase(self, estimate: float) -> Cost:
+        """Mid-command gate for a phase whose cost is only knowable after
+        earlier spend (verify probes are priced only after inference finds
+        candidates). Runs on an already-confirmed command, so it asks for
+        confirmation only when the phase would not fit what remains of the
+        ceiling. The raised cost's estimate is the whole-command total the
+        re-run needs (charged so far plus the phase), so the agent can pick a
+        budget directly from it. Raises :class:`ConfirmationRequiredError`
+        rather than :class:`OverCeilingError` because a bigger budget on
+        re-run can cover it; ``needs_confirmation`` is the recovery channel.
+        """
+
+        ceiling = self.effective_ceiling()
+        needed = self._estimated + estimate
+        cost = Cost(paradigm=self.paradigm, estimate=needed, ceiling=ceiling)
+        if ceiling is not None and needed > ceiling:
+            raise ConfirmationRequiredError(cost)
+        return cost
+
     def charge(self, estimate: float) -> None:
         """Gate one statement on the confirmed run. Accumulates estimates so a
         sequence of statements is bounded as a whole, not just individually."""

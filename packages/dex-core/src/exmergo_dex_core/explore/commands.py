@@ -27,6 +27,7 @@ from ..cache import (
     DexCache,
     DexStore,
     Relationship,
+    RelationshipKind,
     match_identifier,
 )
 from ..config import DexConfig, QueryLimits, load_config, pii_override_paths
@@ -105,6 +106,25 @@ def _profile_estimate(
     if estimate is None:
         return 0.0, {}
     return estimate(identifiers)
+
+
+def _verify_estimate(
+    adapter: Adapter, relationships: list[Relationship]
+) -> tuple[float, int, int]:
+    """Free dry-run pricing of the overlap probes verify would run, plus the
+    candidate/object counts for the checkpoint payload; zero-cost on free
+    adapters or when inference found nothing to probe."""
+
+    candidates = [r for r in relationships if r.kind is RelationshipKind.INFERRED]
+    objects = {r.from_dataset for r in candidates} | {r.to_dataset for r in candidates}
+    query_estimate = getattr(adapter, "query_estimate", None)
+    if query_estimate is None or not candidates:
+        return 0.0, len(candidates), len(objects)
+    total = sum(
+        query_estimate(sql)
+        for sql in rel_mod.probe_statements(candidates, adapter.dialect)
+    )
+    return total, len(candidates), len(objects)
 
 
 def _reporter(total: int, label: str, noun: str) -> ProgressReporter:
@@ -261,6 +281,8 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
+    verify_pending: env.Envelope | None = None
+    verify_warning: str | None = None
     try:
         # Relationship inference needs uniqueness signals, so profile every object
         # first (free and local on DuckDB), then infer across the full set.
@@ -274,9 +296,10 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         ]
         if verify:
             handshake_notes.append(
-                "--verify overlap probes depend on what inference finds, so "
-                "they are billed within the confirmed budget, not in this "
-                "upfront estimate"
+                "--verify overlap probes depend on what inference finds; they "
+                "are priced after profiling, and if their estimate exceeds "
+                "what remains of this budget a second confirmation checkpoint "
+                "appears before any probe runs"
             )
         unconfirmed = command_args.billed_handshake(
             "explore relationships",
@@ -312,15 +335,35 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         if not over_ceiling:
             inferred = rel_mod.infer_relationships(datasets)
             if verify:
-                verify_reporter = _reporter(len(inferred), "verified", "joins")
-                rel_mod.verify_relationships(
+                probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
+                verify_pending = command_args.verify_handshake(
+                    "explore relationships",
                     adapter,
-                    inferred,
-                    timeout_seconds=config.query.timeout_seconds,
-                    progress=verify_reporter,
+                    probe_cost,
+                    candidate_count=candidates,
+                    object_count=objects,
                 )
-                verify_reporter.done()
-        envelope = env.ok({})
+                if verify_pending is None:
+                    verify_reporter = _reporter(len(inferred), "verified", "joins")
+                    try:
+                        rel_mod.verify_relationships(
+                            adapter,
+                            inferred,
+                            timeout_seconds=config.query.timeout_seconds,
+                            progress=verify_reporter,
+                        )
+                        verify_reporter.done()
+                    except OverCeilingError:
+                        # Estimate drift mid-loop; the relationship set itself
+                        # is complete, so finish with a warning (see cmd_map).
+                        done = sum(1 for r in inferred if r.verified)
+                        verify_warning = (
+                            f"budget exhausted after verifying {done} of "
+                            f"{len(inferred)} candidate join(s); verified "
+                            "results are saved; raise --budget and re-run to "
+                            "finish verification"
+                        )
+        envelope = verify_pending or env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
@@ -351,10 +394,17 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         notes.append(
             f"{confirmed} inferred join(s) match declared tests; kept as declared"
         )
-    if verify and inferred:
+    if verify and inferred and verify_pending is None and verify_warning is None:
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
+    if verify_pending is not None:
+        notes.append(
+            "relationships saved unverified; verification awaits confirmation "
+            "(see hint)"
+        )
+    if verify_warning:
+        envelope.warnings.append(verify_warning)
     if folded_edges > 0:
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
@@ -376,7 +426,9 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "inferred_count": len(rels) - len(declared),
             "cache_path": str(path),
             "updated_at": now.isoformat(),
-            "notes": notes,
+            # Merge, not overwrite: a verify checkpoint envelope may already
+            # carry notes from the adapter's estimate description.
+            "notes": [*envelope.data.get("notes", []), *notes],
         }
     )
     return envelope
@@ -483,6 +535,8 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
+    verify_pending: env.Envelope | None = None
+    verify_warning: str | None = None
     try:
         metas = inventory_mod.inventory(adapter)
         # First-pass rank on cheap signals (no connectivity yet) to choose what to
@@ -497,9 +551,10 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         handshake_notes = None
         if getattr(args, "verify", False):
             handshake_notes = [
-                "--verify overlap probes depend on what inference finds, so "
-                "they are billed within the confirmed budget, not in this "
-                "upfront estimate"
+                "--verify overlap probes depend on what inference finds; they "
+                "are priced after profiling, and if their estimate exceeds "
+                "what remains of this budget a second confirmation checkpoint "
+                "appears before any probe runs"
             ]
         unconfirmed = command_args.billed_handshake(
             "explore map", adapter, estimate, per_table=per_table, notes=handshake_notes
@@ -530,15 +585,37 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             _annotate_grain(profiled, defs)
             inferred = rel_mod.infer_relationships(profiled)
             if getattr(args, "verify", False):
-                verify_reporter = _reporter(len(inferred), "verified", "joins")
-                rel_mod.verify_relationships(
+                probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
+                verify_pending = command_args.verify_handshake(
+                    "explore map",
                     adapter,
-                    inferred,
-                    timeout_seconds=config.query.timeout_seconds,
-                    progress=verify_reporter,
+                    probe_cost,
+                    candidate_count=candidates,
+                    object_count=objects,
                 )
-                verify_reporter.done()
-        envelope = env.ok({})
+                if verify_pending is None:
+                    verify_reporter = _reporter(len(inferred), "verified", "joins")
+                    try:
+                        rel_mod.verify_relationships(
+                            adapter,
+                            inferred,
+                            timeout_seconds=config.query.timeout_seconds,
+                            progress=verify_reporter,
+                        )
+                        verify_reporter.done()
+                    except OverCeilingError:
+                        # The upfront probe pricing fit, but per-statement
+                        # estimates drifted past the ceiling mid-loop. The map
+                        # itself is complete, so finish with a warning instead
+                        # of the profiling phase's partial-completion error.
+                        done = sum(1 for r in inferred if r.verified)
+                        verify_warning = (
+                            f"budget exhausted after verifying {done} of "
+                            f"{len(inferred)} candidate join(s); verified "
+                            "results are saved; raise --budget and re-run to "
+                            "finish verification"
+                        )
+        envelope = verify_pending or env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
@@ -603,6 +680,13 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
             "dataset mapped alongside its source)"
         )
+    if verify_pending is not None:
+        notes.append(
+            "relationships saved unverified; verification awaits confirmation "
+            "(see hint)"
+        )
+    if verify_warning:
+        envelope.warnings.append(verify_warning)
 
     pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
     quality_notes = sum(len(d.data_quality) for d in profiled)
@@ -620,7 +704,9 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             "top_objects": [
                 {"identifier": d.identifier, "rank_score": d.rank_score} for d in top
             ],
-            "notes": notes,
+            # Merge, not overwrite: a verify checkpoint envelope may already
+            # carry notes from the adapter's estimate description.
+            "notes": [*envelope.data.get("notes", []), *notes],
             "updated_at": now.isoformat(),
         }
     )
