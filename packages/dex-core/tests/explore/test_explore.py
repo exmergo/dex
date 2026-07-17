@@ -166,6 +166,62 @@ def test_relationships_infers_orders_to_customers(duckdb_file: Path, capsys):
     assert fk["confidence"] and fk["confidence"] >= 0.6
 
 
+def test_relationships_reuses_fresh_cached_profiles(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """A second `explore relationships` with nothing changed re-scans nothing,
+    yet still re-infers joins over the reused profiles and can be forced to
+    re-profile with --refresh."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "relationships",
+        "--path",
+        str(duckdb_file),
+        "--repo-root",
+        str(repo),
+    ]
+    _run(argv, capsys)
+    store = DexStore(repo)
+    first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
+
+    payload = _run(argv, capsys)
+    assert payload["data"]["profiled_count"] == 0
+    assert payload["data"]["cache_hit_count"] == 2
+    # Inference still runs over the reused profiles, so the join survives.
+    assert payload["data"]["inferred_count"] >= 1
+    assert any("reused 2 fresh cached profile" in n for n in payload["data"]["notes"])
+    assert {
+        d.identifier: d.profiled_at for d in store.load_cache().datasets
+    } == first_stamps
+
+    refreshed = _run([*argv, "--refresh"], capsys)
+    assert refreshed["data"]["profiled_count"] == 2
+    assert refreshed["data"]["cache_hit_count"] == 0
+
+
+def test_relationships_freshness_zero_disables_reuse(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_config(DexConfig(profile_freshness_hours=0.0), repo)
+    argv = [
+        "explore",
+        "relationships",
+        "--path",
+        str(duckdb_file),
+        "--repo-root",
+        str(repo),
+    ]
+    _run(argv, capsys)
+    payload = _run(argv, capsys)
+    assert payload["data"]["profiled_count"] == 2
+    assert payload["data"]["cache_hit_count"] == 0
+
+
 # --- map ---------------------------------------------------------------------
 
 
@@ -266,8 +322,11 @@ def test_map_carries_forward_prior_profiles(
     first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
     assert all(first_stamps.values()), "a full map stamps every profile"
 
-    payload = _run(argv, capsys)
+    # --refresh forces the selected top-25 back through profiling (fresh stamp),
+    # isolating the below-cutoff carry-forward path from skip-if-cached reuse.
+    payload = _run([*argv, "--refresh"], capsys)
     assert payload["data"]["profiled_count"] == 25
+    assert payload["data"]["cache_hit_count"] == 0
     assert payload["data"]["carried_forward_count"] == 35
     assert any("carried forward 35" in n for n in payload["data"]["notes"])
 
@@ -280,6 +339,130 @@ def test_map_carries_forward_prior_profiles(
         if d.profiled_at == first_stamps[d.identifier]
     ]
     assert len(unchanged) == 35, "carried profiles keep their original stamp"
+
+
+def test_map_reuses_fresh_cached_profiles(
+    many_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    """A second `map --full` with nothing changed re-scans nothing: every
+    selected object is served from the fresh cache, stamps untouched."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(many_tables_duckdb),
+        "--repo-root",
+        str(repo),
+        "--full",
+    ]
+    _run(argv, capsys)
+    store = DexStore(repo)
+    first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
+
+    payload = _run(argv, capsys)
+    assert payload["data"]["profiled_count"] == 0
+    assert payload["data"]["cache_hit_count"] == 60
+    assert payload["data"]["skipped_count"] == 0
+    assert any("reused 60 fresh cached profile" in n for n in payload["data"]["notes"])
+
+    cache = store.load_cache()
+    assert all(d.columns for d in cache.datasets)
+    assert {d.identifier: d.profiled_at for d in cache.datasets} == first_stamps, (
+        "reused profiles keep their original stamp; nothing was re-scanned"
+    )
+
+
+def test_map_reprofiles_only_the_schema_changed_object(
+    many_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    """Altering one table's columns between two `map --full` runs re-profiles
+    only that object; the rest stay fresh cache hits."""
+
+    duckdb = pytest.importorskip("duckdb")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(many_tables_duckdb),
+        "--repo-root",
+        str(repo),
+        "--full",
+    ]
+    _run(argv, capsys)
+    store = DexStore(repo)
+    first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
+
+    conn = duckdb.connect(str(many_tables_duckdb))
+    conn.execute("ALTER TABLE t_00 ADD COLUMN extra VARCHAR")
+    conn.close()
+
+    payload = _run(argv, capsys)
+    assert payload["data"]["profiled_count"] == 1
+    assert payload["data"]["cache_hit_count"] == 59
+
+    cache = store.load_cache()
+    reprofiled = [
+        d.identifier
+        for d in cache.datasets
+        if d.profiled_at != first_stamps[d.identifier]
+    ]
+    assert len(reprofiled) == 1
+    assert reprofiled[0].endswith(".t_00")
+    altered = next(d for d in cache.datasets if d.identifier.endswith(".t_00"))
+    assert any(c.name == "extra" for c in altered.columns), (
+        "re-profile saw the new column"
+    )
+
+
+def test_map_freshness_zero_disables_reuse(
+    many_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    """profile_freshness_hours: 0 forces a re-profile of every selected object
+    even when the schema is unchanged and the cache was just written."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_config(DexConfig(profile_freshness_hours=0.0), repo)
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(many_tables_duckdb),
+        "--repo-root",
+        str(repo),
+        "--full",
+    ]
+    _run(argv, capsys)
+    payload = _run(argv, capsys)
+    assert payload["data"]["profiled_count"] == 60
+    assert payload["data"]["cache_hit_count"] == 0
+
+
+def test_map_refresh_forces_full_reprofile(
+    many_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    """`--refresh` re-scans every selected object even when all are fresh."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(many_tables_duckdb),
+        "--repo-root",
+        str(repo),
+        "--full",
+    ]
+    _run(argv, capsys)
+    payload = _run([*argv, "--refresh"], capsys)
+    assert payload["data"]["profiled_count"] == 60
+    assert payload["data"]["cache_hit_count"] == 0
 
 
 def test_cache_without_new_fields_still_loads():
