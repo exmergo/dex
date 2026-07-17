@@ -255,6 +255,68 @@ def test_tpch_alias_prefixed_keys_are_inferred():
     assert ("db.tpch.nation", "N_REGIONKEY", "db.tpch.region") in found
 
 
+def _cdc_collections(n: int) -> list[Dataset]:
+    """`n` unrelated tables, each with its own `document_id` unique key, shaped
+    like a Firestore/Mongo/DynamoDB-style CDC export."""
+
+    return [
+        _ds(
+            f"db.main.collection_{i}",
+            [_col("document_id", distinct=5, unique=True)],
+            rows=5,
+        )
+        for i in range(n)
+    ]
+
+
+def test_generic_id_name_shared_across_many_tables_is_not_matched():
+    """A column name that's the norm for every collection in Firestore/Mongo/
+    DynamoDB-style CDC exports (e.g. `document_id`) is a naming convention, not
+    a reference: matching on it alone across many unrelated tables would
+    otherwise generate a near-complete cross product (issue #77)."""
+
+    assert infer_relationships(_cdc_collections(4)) == []
+
+
+def test_generic_id_name_match_is_recorded_as_suppressed():
+    suppressed: list = []
+    assert infer_relationships(_cdc_collections(4), suppressed=suppressed) == []
+    assert len(suppressed) == 4 * 3  # every ordered (child, parent) pair
+    assert all(s.shared_name == "document_id" for s in suppressed)
+    assert all(s.host_count == 4 for s in suppressed)
+
+
+def test_generic_name_threshold_is_three_hosts():
+    """Below the threshold, a shared exact key name is an ordinary same-named
+    FK; at or above it, it's treated as a naming convention."""
+
+    two_hosts = [
+        _ds(f"db.main.t{i}", [_col("thing_id", distinct=2, unique=True)], rows=2)
+        for i in range(2)
+    ]
+    assert len(infer_relationships(two_hosts)) == 2  # each matches the other
+
+    three_hosts = [
+        _ds(f"db.main.t{i}", [_col("thing_id", distinct=2, unique=True)], rows=2)
+        for i in range(3)
+    ]
+    assert infer_relationships(three_hosts) == []
+
+
+def test_shared_key_name_below_generic_threshold_still_matches():
+    """A same-named FK shared by only one other table (accounts.customer_id and
+    orders.customer_id, with no entity-name tie to `orders`) is a real signal,
+    not a naming convention, and must still be inferred."""
+
+    accounts = _ds(
+        "db.main.accounts", [_col("customer_id", distinct=2, unique=True)], rows=2
+    )
+    orders = _ds("db.main.orders", [_col("customer_id", distinct=2)], rows=5)
+    rels = infer_relationships([accounts, orders])
+    assert len(rels) == 1
+    assert rels[0].to_dataset == "db.main.accounts"
+
+
 def test_dealiased_match_skips_when_stripped_to_a_bare_suffix():
     """`x_key` / `y_key` collapse to the bare suffix `key` once dealiased; that's
     too generic to trust, so two unrelated single-letter-prefixed keys must not

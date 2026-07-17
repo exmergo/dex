@@ -19,6 +19,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   still fails immediately), across a window wide enough to cover the wake. A
   per-attempt connect timeout bounds a stalled handshake and is cleared once the
   connection is up so it never caps a later billed query's result read.
+- **Relationship inference no longer floods `--verify` with generic id-column
+  collisions** ([#77]). On warehouses where many unrelated tables share a
+  generic id-shaped column name (the norm for Firestore/Mongo/DynamoDB-style
+  CDC exports, e.g. every collection has its own `document_id`), name-based
+  inference matched every such pair as a candidate join, spending real verify
+  query cost confirming what was, essentially always, a naming convention
+  rather than a relationship. A same-named-FK match is now withheld when its
+  column name is held as a key by three or more unrelated datasets, and the
+  withheld count and names are surfaced in `explore relationships`/`explore
+  map`'s notes instead of silently inferring less.
 
 ## [1.2.1] - 2026-07-17
 

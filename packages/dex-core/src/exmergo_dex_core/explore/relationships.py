@@ -13,6 +13,7 @@ work without a dbt project).
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 from ..adapters.base import Adapter
 from ..cache import (
@@ -42,6 +43,30 @@ _ID_SUFFIXES = ("id", "key")
 # doesn't hide a shared suffix. Bounded to 3 chars so a genuine entity name
 # (`customer_id`) is never mistaken for an alias.
 _COLUMN_ALIAS_PREFIX = re.compile(r"^[a-z]{1,3}_", re.IGNORECASE)
+
+# A single-column key name held, verbatim, by this many or more datasets is a
+# naming convention rather than a specific entity's identifier: CDC exports
+# from Firestore/Mongo/DynamoDB-style sources routinely name every
+# collection's own id column identically (`document_id` in all ~90 of them),
+# and two tables merely sharing that name is not evidence they're related.
+# Below this, a shared name is still a useful same-named-FK signal; at or
+# above it, matching on the bare name alone degenerates into a near-complete
+# cross product on this class of source (issue #77). Only the same-named-FK
+# tier of `_match_parent` needs this guard: the entity-name tier already ties
+# a match to one specific parent by name, and the dealiased tier already
+# refuses a match that collapses to a bare suffix, so neither is vulnerable to
+# a name that's merely popular.
+_GENERIC_NAME_MIN_HOSTS = 3
+
+
+class SuppressedMatch(NamedTuple):
+    """A same-named-FK match withheld because the shared name is too generic
+    to trust (see `_GENERIC_NAME_MIN_HOSTS`). Recorded so a caller can report
+    what inference declined to verify, and why, instead of silently doing
+    less."""
+
+    shared_name: str
+    host_count: int
 
 
 def _fk_stem(column_name: str) -> str | None:
@@ -131,16 +156,41 @@ def detect_grain(dataset: Dataset) -> list[str] | None:
     return by_card[0]
 
 
-def infer_relationships(datasets: list[Dataset]) -> list[Relationship]:
+def _key_host_counts(keyed: dict[str, list[list[str]]]) -> dict[str, int]:
+    """How many distinct datasets hold each single-column key name (lowercased).
+
+    A name held as a key by only one or two datasets is a specific entity's own
+    identifier; held by many, it is a naming convention rather than a reference
+    (see `_GENERIC_NAME_MIN_HOSTS`). Metadata-only: derived entirely from the
+    candidate keys already computed at profile time, no extra queries.
+    """
+
+    counts: dict[str, int] = {}
+    for keys in keyed.values():
+        names = {k[0].lower() for k in keys if len(k) == 1}
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def infer_relationships(
+    datasets: list[Dataset], *, suppressed: list[SuppressedMatch] | None = None
+) -> list[Relationship]:
     """Infer many-to-one joins from column names, type compatibility, and the
     aggregate signals already profiled (uniqueness, distinct counts, min/max).
 
     A parent whose key is not unique still yields a join, at reduced confidence:
     suppressing it entirely would hide a real join behind a data-quality problem
     that :func:`data_quality_notes` reports separately.
+
+    A same-named-FK match withheld as a generic-name collision (see
+    `_GENERIC_NAME_MIN_HOSTS`) is recorded to ``suppressed`` when a caller
+    passes a list, so the withheld count and the names involved can be
+    reported; the default ``None`` costs nothing extra.
     """
 
     keyed = {d.identifier: candidate_keys(d) for d in datasets}
+    host_counts = _key_host_counts(keyed)
     relationships: list[Relationship] = []
 
     for child in datasets:
@@ -151,7 +201,9 @@ def infer_relationships(datasets: list[Dataset]) -> list[Relationship]:
             for parent in datasets:
                 if parent.identifier == child.identifier:
                     continue
-                match = _match_parent(col, stem, parent, keyed[parent.identifier])
+                match = _match_parent(
+                    col, stem, parent, keyed[parent.identifier], host_counts, suppressed
+                )
                 if match is not None:
                     to_columns, confidence = match
                     relationships.append(
@@ -520,6 +572,8 @@ def _match_parent(
     stem: str,
     parent: Dataset,
     parent_keys: list[list[str]],
+    host_counts: dict[str, int],
+    suppressed: list[SuppressedMatch] | None,
 ) -> tuple[list[str], float] | None:
     parent_table = parent.identifier.rsplit(".", 1)[-1]
     stripped = _LAYER_PREFIX.sub("", parent_table)
@@ -550,11 +604,19 @@ def _match_parent(
                 return [pcol.name], _score(base, col, pcol)
 
     # Same-named foreign key shared by both tables (e.g. customer_id in both),
-    # joining to the parent's key of that name.
+    # joining to the parent's key of that name. Trusted only when the name
+    # isn't itself a generic convention shared by many unrelated datasets'
+    # own keys (_GENERIC_NAME_MIN_HOSTS) — otherwise every table sharing the
+    # convention would cross-match every other, as CDC exports do.
     if fk in parent_cols and fk in parent_key_names:
         pcol = parent_cols[fk]
         if _type_compatible(col.data_type, pcol.data_type):
-            return [pcol.name], _score(0.6, col, pcol)
+            host_count = host_counts.get(fk, 0)
+            if host_count >= _GENERIC_NAME_MIN_HOSTS:
+                if suppressed is not None:
+                    suppressed.append(SuppressedMatch(fk, host_count))
+            else:
+                return [pcol.name], _score(0.6, col, pcol)
 
     # Same key suffix once each side's table-alias prefix is stripped: TPC-H
     # names a foreign key after the *child's* alias, not the parent's entity

@@ -310,7 +310,8 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             over_ceiling = True
 
         if not over_ceiling:
-            inferred = rel_mod.infer_relationships(datasets)
+            suppressed: list[rel_mod.SuppressedMatch] = []
+            inferred = rel_mod.infer_relationships(datasets, suppressed=suppressed)
             if verify:
                 verify_reporter = _reporter(len(inferred), "verified", "joins")
                 rel_mod.verify_relationships(
@@ -361,6 +362,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
             "dataset mapped alongside its source)"
         )
+    notes.extend(_generic_name_notes(suppressed))
 
     # Persist the profiles this run already paid for. Because relationships
     # inventories and profiles the full set and infers across all of it, its
@@ -528,7 +530,8 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
 
         if not over_ceiling:
             _annotate_grain(profiled, defs)
-            inferred = rel_mod.infer_relationships(profiled)
+            suppressed: list[rel_mod.SuppressedMatch] = []
+            inferred = rel_mod.infer_relationships(profiled, suppressed=suppressed)
             if getattr(args, "verify", False):
                 verify_reporter = _reporter(len(inferred), "verified", "joins")
                 rel_mod.verify_relationships(
@@ -603,6 +606,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
             "dataset mapped alongside its source)"
         )
+    notes.extend(_generic_name_notes(suppressed))
 
     pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
     quality_notes = sum(len(d.data_quality) for d in profiled)
@@ -1150,6 +1154,30 @@ def _relationship_notes(
     if not fk_columns:
         notes.append("no id-shaped columns found, so there was nothing to infer from")
     return notes
+
+
+def _generic_name_notes(suppressed: list[rel_mod.SuppressedMatch]) -> list[str]:
+    """Explain what a generic shared id-column name cost inference, so the
+    withheld count doesn't read as "nothing more to find" when it's really
+    "found, and declined to trust".
+
+    Empty when nothing was withheld: the common case on warehouses without a
+    CDC-style universal id column.
+    """
+
+    if not suppressed:
+        return []
+    names = sorted({s.shared_name for s in suppressed})
+    max_hosts = max(s.host_count for s in suppressed)
+    shown = ", ".join(names[:5])
+    more = f", +{len(names) - 5} more" if len(names) > 5 else ""
+    return [
+        f"declined to infer {len(suppressed)} candidate join(s) that matched only "
+        f"on a column name shared as a key by {max_hosts} unrelated object(s) "
+        f"({shown}{more}); a name shared this widely (the norm for Firestore/"
+        "Mongo/DynamoDB-style CDC exports) is a naming convention, not evidence "
+        "of a relationship, so these never reached --verify"
+    ]
 
 
 def _select_for_profiling(
