@@ -195,3 +195,74 @@ def pg_dsn() -> str:
 @pytest.fixture
 def pg_dev_password() -> str | None:
     return os.environ.get("DEX_TEST_PG_DEV_PASSWORD")
+
+
+# --- the unpivot_json_object live fixture ----------------------------------------
+#
+# One payload shape shared by every connector's macro build test: a staging
+# model inlining three rows (two JSON documents whose values are themselves
+# objects, one NULL), the unpivot mart, and the schema tests that pin the
+# nested-key failure mode (a surfaced nested key like `role` fails
+# accepted_values; the NULL row must yield no rows at all).
+
+UNPIVOT_DOC_A = (
+    '{"rel_a": {"role": "admin", "since": 2020}, "rel_b": {"role": "viewer"}}'
+)
+UNPIVOT_DOC_B = '{"rel_c": {"role": "editor"}}'
+
+
+def unpivot_fixture_edits(wrap, null_expr: str) -> dict:
+    """The edits payload, parameterized by the connector's JSON idiom:
+    ``wrap`` renders a JSON document literal into the column's type and
+    ``null_expr`` is a typed NULL for it."""
+
+    return {
+        "edits": [
+            {
+                "path": "models/staging/stg_entities.sql",
+                "kind": "model_sql",
+                "content": (
+                    f"select 1 as id, {wrap(UNPIVOT_DOC_A)} as attributes\n"
+                    f"union all select 2, {wrap(UNPIVOT_DOC_B)}\n"
+                    f"union all select 3, {null_expr}\n"
+                ),
+            },
+            {
+                "path": "models/marts/entity_relations.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select id, key as related_id, value as attrs\n"
+                    "from (\n"
+                    "  {{ unpivot_json_object(relation=ref('stg_entities'),"
+                    " json_column='attributes', passthrough=['id']) }}\n"
+                    ")\n"
+                ),
+            },
+            {
+                "path": "models/marts/entity_relations.yml",
+                "kind": "schema_yml",
+                "content": (
+                    "version: 2\n"
+                    "models:\n"
+                    "  - name: entity_relations\n"
+                    "    columns:\n"
+                    "      - name: related_id\n"
+                    "        data_tests:\n"
+                    "          - not_null\n"
+                    "          - accepted_values:\n"
+                    "              values: ['rel_a', 'rel_b', 'rel_c']\n"
+                ),
+            },
+        ]
+    }
+
+
+def assert_unpivot_build(built: dict) -> None:
+    """The build envelope assertions shared by every connector: models built,
+    every schema test passed (accepted_values is the nested-key tripwire)."""
+
+    assert built["status"] == "ok", built
+    statuses = {n["name"]: n["status"] for n in built["data"]["nodes"]}
+    assert statuses.get("stg_entities") == "success"
+    assert statuses.get("entity_relations") == "success"
+    assert all(s in {"success", "pass"} for s in statuses.values()), statuses

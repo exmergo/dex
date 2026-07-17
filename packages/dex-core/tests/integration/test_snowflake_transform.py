@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import SF_MAX_SECONDS
+from .conftest import SF_MAX_SECONDS, assert_unpivot_build, unpivot_fixture_edits
 from .test_snowflake_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.snowflake]
@@ -146,6 +146,66 @@ def test_init_plan_apply_build_into_the_scratch_database(
         cursor.execute(f"DROP VIEW IF EXISTS {relation}")
     finally:
         conn.close()
+
+
+def test_unpivot_json_object_macro_builds_live(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    root = str(tmp_path)
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, envelope
+
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            unpivot_fixture_edits(
+                lambda d: f"parse_json('{d}')", "cast(null as variant)"
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "unpivot fixture",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    rc, built = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            str(SF_MAX_SECONDS * 10),
+        ],
+        capsys,
+    )
+    assert rc == 0, built
+    assert_unpivot_build(built)
 
 
 def test_missing_dev_database_is_refused_before_the_cost_gate(
