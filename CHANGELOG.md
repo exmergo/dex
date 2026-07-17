@@ -9,6 +9,17 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Redshift connections survive a Serverless cold start.** An idle Serverless
+  workgroup resumes on first contact, and a slow resume can reset the startup
+  handshake, so the first command to touch a cold workgroup failed hard while
+  everything after it ran warm. The connect is now retried with backoff on the
+  transient connection errors a resume produces (a wrong credential or database
+  still fails immediately), across a window wide enough to cover the wake. A
+  per-attempt connect timeout bounds a stalled handshake and is cleared once the
+  connection is up so it never caps a later billed query's result read.
+
 ## [1.2.1] - 2026-07-17
 
 ### Changed
