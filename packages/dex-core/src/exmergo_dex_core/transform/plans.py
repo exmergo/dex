@@ -54,6 +54,9 @@ class EditKind(str, Enum):
     # A dbt project-root manifest, not a model-path file: authoring it brings
     # dependency declaration inside the plan/apply guardrail like every other edit.
     PACKAGES_YML = "packages_yml"
+    # A macro definition under the project's macro paths, the surface widened
+    # for scaffolded and hand-repaired macros alike.
+    MACRO_SQL = "macro_sql"
 
 
 class PlanEdit(Edit):
@@ -148,10 +151,30 @@ def plan(
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
     diffs: list[dict[str, Any]] = []
+    project_resolved = project.resolve()
+    macro_bases = [(project_resolved / mp).resolve() for mp in view.macro_paths]
     for edit in edits:
         # Containment is checked at plan time as well as at write time, so a bad
         # path is refused before it ever becomes a stored proposal.
-        contained_path(project, edit.path, view.model_paths)
+        resolved = contained_path(
+            project, edit.path, view.model_paths, view.macro_paths
+        ).resolve()
+        # Kind and surface must agree: a macro written into models/ would be
+        # parsed as a model and fail the build, and a model written into
+        # macros/ would silently never become a model.
+        in_macros = any(
+            resolved == base or base in resolved.parents for base in macro_bases
+        )
+        if edit.kind is EditKind.MACRO_SQL and not in_macros:
+            raise PlanError(
+                f"a macro_sql edit must live under the project's macro paths "
+                f"({', '.join(view.macro_paths)}), got '{edit.path}'"
+            )
+        if edit.kind is not EditKind.MACRO_SQL and in_macros:
+            raise PlanError(
+                f"'{edit.path}' is under a macro path but the edit kind is "
+                f"{edit.kind.value}; use macro_sql for macro files"
+            )
         warnings.extend(validate_edit(edit))
         current = view.files.get(edit.path)
         pinned.append(
@@ -162,6 +185,11 @@ def plan(
         diffs.append(
             file_diff(edit.path, current.content if current else None, edit.new_content)
         )
+
+    # Late import: scaffold imports PlanEdit from this module.
+    from .scaffold import missing_macro_warnings
+
+    warnings.extend(missing_macro_warnings(edits, view))
 
     created_at = datetime.now(UTC).isoformat()
     try:
