@@ -1142,6 +1142,96 @@ def test_discovery_never_surfaces_a_password(tmp_path: Path):
     assert "supersecret" not in method
 
 
+# --- the cold-start connection retry: a resuming workgroup is not a fatal error ------
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeout: float | None = -1.0  # sentinel: never touched
+
+    def settimeout(self, value) -> None:
+        self.timeout = value
+
+
+class _FakeDriverConnection:
+    def __init__(self) -> None:
+        self.autocommit = False
+        self._usock = _FakeSocket()
+
+
+class _FakeDriver:
+    """Stands in for the redshift_connector module: connect fails with the
+    supplied exceptions in order, then returns a connection."""
+
+    def __init__(self, failures: list[Exception]) -> None:
+        self._failures = list(failures)
+        self.calls = 0
+        self.last_kwargs: dict = {}
+
+    def connect(self, **kwargs):
+        self.calls += 1
+        self.last_kwargs = kwargs
+        if self._failures:
+            raise self._failures.pop(0)
+        return _FakeDriverConnection()
+
+
+@pytest.fixture(autouse=True)
+def _no_backoff_sleep(monkeypatch):
+    """The retry backoff must not slow the unit suite."""
+
+    from exmergo_dex_core import connect as connect_module
+
+    monkeypatch.setattr(connect_module.time, "sleep", lambda _s: None)
+
+
+def test_connect_retries_a_cold_serverless_resume():
+    from redshift_connector.error import InterfaceError
+
+    from exmergo_dex_core.connect import _connect_redshift
+
+    driver = _FakeDriver(
+        [InterfaceError("communication error"), InterfaceError("network error")]
+    )
+    connection = _connect_redshift(driver, {"iam": True, "host": "wg", "database": "d"})
+    assert driver.calls == 3  # two transient failures, then success
+    assert connection.autocommit is True
+    # The per-attempt connect timeout is applied, then cleared so it never caps
+    # a later billed query's result read.
+    assert driver.last_kwargs["timeout"] is not None
+    assert driver.last_kwargs["application_name"] == "dex"
+    assert connection._usock.timeout is None
+
+
+def test_connect_gives_up_after_retries_and_names_the_resume():
+    from redshift_connector.error import OperationalError
+
+    from exmergo_dex_core.connect import CredentialDiscoveryError, _connect_redshift
+
+    driver = _FakeDriver([OperationalError("connection time out")] * 10)
+    with pytest.raises(CredentialDiscoveryError, match="resume") as excinfo:
+        _connect_redshift(driver, {"iam": True, "host": "wg", "database": "d"})
+    # It tried the full budget (initial attempt + one per backoff step) and
+    # chained the underlying driver error rather than swallowing it.
+    assert driver.calls == 4
+    assert isinstance(excinfo.value.__cause__, OperationalError)
+
+
+def test_connect_does_not_retry_a_credential_refusal():
+    """A server-side refusal (bad credential, missing database, denied grant)
+    is a ProgrammingError: it must surface on the first attempt, not wait out
+    the backoff meant for a resuming workgroup."""
+
+    from redshift_connector.error import ProgrammingError
+
+    from exmergo_dex_core.connect import _connect_redshift
+
+    driver = _FakeDriver([ProgrammingError("password authentication failed")])
+    with pytest.raises(ProgrammingError):
+        _connect_redshift(driver, {"iam": True, "host": "wg", "database": "d"})
+    assert driver.calls == 1
+
+
 # --- scope resolution: an entry that names nothing is refused, not dropped ------------
 
 

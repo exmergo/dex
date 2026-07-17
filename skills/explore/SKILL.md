@@ -47,7 +47,13 @@ Subcommands, in the usual order:
    rank and says so in `notes` (with `skipped_count`); pass `--full` to profile
    everything. On a re-map, objects skipped this run keep their prior profiles
    (`carried_forward_count`), each stamped with its own `profiled_at` so
-   staleness is visible instead of column detail silently vanishing.
+   staleness is visible instead of column detail silently vanishing. A selected
+   object whose cached profile is still fresh (same connector, schema unchanged,
+   profiled within `profile_freshness_hours`, default 24) is reused without a
+   re-scan (`cache_hit_count`), so re-runs cost nothing to spend; pass
+   `--refresh` to force a full re-profile when the source changed in a way the
+   free metadata check cannot see (e.g. rows changed but the schema did not).
+   `explore relationships` reuses fresh profiles the same way.
 6. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
    don't cover: you write the SQL, the engine's query firewall refuses or bounds
    it. Requires the `.dex/` cache (run `map` first). Results come back columnar

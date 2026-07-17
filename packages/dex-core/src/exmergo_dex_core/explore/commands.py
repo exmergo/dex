@@ -14,7 +14,7 @@ import argparse
 import json
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .. import command_args, dbt_project
@@ -27,6 +27,7 @@ from ..cache import (
     DexCache,
     DexStore,
     Relationship,
+    RelationshipKind,
     match_identifier,
 )
 from ..config import DexConfig, QueryLimits, load_config, pii_override_paths
@@ -105,6 +106,25 @@ def _profile_estimate(
     if estimate is None:
         return 0.0, {}
     return estimate(identifiers)
+
+
+def _verify_estimate(
+    adapter: Adapter, relationships: list[Relationship]
+) -> tuple[float, int, int]:
+    """Free dry-run pricing of the overlap probes verify would run, plus the
+    candidate/object counts for the checkpoint payload; zero-cost on free
+    adapters or when inference found nothing to probe."""
+
+    candidates = [r for r in relationships if r.kind is RelationshipKind.INFERRED]
+    objects = {r.from_dataset for r in candidates} | {r.to_dataset for r in candidates}
+    query_estimate = getattr(adapter, "query_estimate", None)
+    if query_estimate is None or not candidates:
+        return 0.0, len(candidates), len(objects)
+    total = sum(
+        query_estimate(sql)
+        for sql in rel_mod.probe_statements(candidates, adapter.dialect)
+    )
+    return total, len(candidates), len(objects)
 
 
 def _reporter(total: int, label: str, noun: str) -> ProgressReporter:
@@ -261,12 +281,26 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
+    verify_pending: env.Envelope | None = None
+    verify_warning: str | None = None
     try:
         # Relationship inference needs uniqueness signals, so profile every object
         # first (free and local on DuckDB), then infer across the full set.
         metas = inventory_mod.inventory(adapter)
-        identifiers = [m.identifier for m in metas]
-        estimate, per_table = _profile_estimate(adapter, identifiers)
+        connector = adapter.name
+        # Skip re-scanning objects whose cached profile is still fresh (same
+        # connector, schema unchanged, within the freshness window); only the
+        # stale remainder is estimated, confirmed, and profiled below.
+        stale, fresh_reused = _split_fresh_stale(
+            metas,
+            prior,
+            connector,
+            adapter,
+            timedelta(hours=config.profile_freshness_hours),
+            now,
+            refresh=getattr(args, "refresh", False),
+        )
+        estimate, per_table = _profile_estimate(adapter, [m.identifier for m in stale])
         handshake_notes = [
             "relationship inference profiles every object; on a metered "
             "connector `explore map` (top-ranked objects only) is usually the "
@@ -274,63 +308,97 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         ]
         if verify:
             handshake_notes.append(
-                "--verify overlap probes depend on what inference finds, so "
-                "they are billed within the confirmed budget, not in this "
-                "upfront estimate"
+                "--verify overlap probes depend on what inference finds; they "
+                "are priced after profiling, and if their estimate exceeds "
+                "what remains of this budget a second confirmation checkpoint "
+                "appears before any probe runs"
             )
-        unconfirmed = command_args.billed_handshake(
-            "explore relationships",
-            adapter,
-            estimate,
-            per_table=per_table,
-            notes=handshake_notes,
-        )
-        if unconfirmed is not None:
-            return unconfirmed
-        connector = adapter.name
-
-        # Billed-connector-gated per-object checkpointing (see cmd_profile).
-        checkpoint = None
-        if command_args.cost_gate(adapter) is not None:
-            checkpoint, accumulated = _profile_checkpointer(
-                store, prior, connector, now
+        if fresh_reused:
+            handshake_notes.append(
+                f"{len(fresh_reused)} object(s) excluded from this estimate as "
+                "fresh-cached (schema unchanged, profiled within the freshness "
+                "window); pass --refresh to re-profile them"
             )
-
-        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
-        try:
-            datasets = profile_mod.profile(
+        profiled: list[Dataset] = []
+        # Nothing stale means nothing to price or confirm: skip the handshake and
+        # the scan entirely, and reuse the cached profiles wholesale.
+        if stale:
+            unconfirmed = command_args.billed_handshake(
+                "explore relationships",
                 adapter,
-                identifiers,
-                progress=profile_reporter,
-                on_complete=checkpoint,
-                pii_overrides=pii_override_paths(config.pii_overrides),
+                estimate,
+                per_table=per_table,
+                notes=handshake_notes,
             )
-            profile_reporter.done()
-        except OverCeilingError:
-            over_ceiling = True
+            if unconfirmed is not None:
+                return unconfirmed
 
+            # Billed-connector-gated per-object checkpointing (see cmd_profile).
+            checkpoint = None
+            if command_args.cost_gate(adapter) is not None:
+                checkpoint, accumulated = _profile_checkpointer(
+                    store, prior, connector, now
+                )
+
+            profile_reporter = _reporter(len(stale), "profiled", "objects")
+            try:
+                profiled = profile_mod.profile(
+                    adapter,
+                    [m.identifier for m in stale],
+                    progress=profile_reporter,
+                    on_complete=checkpoint,
+                    pii_overrides=pii_override_paths(config.pii_overrides),
+                )
+                profile_reporter.done()
+            except OverCeilingError:
+                over_ceiling = True
+
+        # Freshly profiled plus fresh-cached: the full inventory, whether scanned
+        # this run or reused. Inference and merge fold by identifier over the union.
+        datasets = profiled + list(fresh_reused.values())
         if not over_ceiling:
             inferred = rel_mod.infer_relationships(datasets)
             if verify:
-                verify_reporter = _reporter(len(inferred), "verified", "joins")
-                rel_mod.verify_relationships(
+                probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
+                verify_pending = command_args.verify_handshake(
+                    "explore relationships",
                     adapter,
-                    inferred,
-                    timeout_seconds=config.query.timeout_seconds,
-                    progress=verify_reporter,
+                    probe_cost,
+                    candidate_count=candidates,
+                    object_count=objects,
                 )
-                verify_reporter.done()
-        envelope = env.ok({})
+                if verify_pending is None:
+                    verify_reporter = _reporter(len(inferred), "verified", "joins")
+                    try:
+                        rel_mod.verify_relationships(
+                            adapter,
+                            inferred,
+                            timeout_seconds=config.query.timeout_seconds,
+                            progress=verify_reporter,
+                        )
+                        verify_reporter.done()
+                    except OverCeilingError:
+                        # Estimate drift mid-loop; the relationship set itself
+                        # is complete, so finish with a warning (see cmd_map).
+                        done = sum(1 for r in inferred if r.verified)
+                        verify_warning = (
+                            f"budget exhausted after verifying {done} of "
+                            f"{len(inferred)} candidate join(s); verified "
+                            "results are saved; raise --budget and re-run to "
+                            "finish verification"
+                        )
+        envelope = verify_pending or env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     if over_ceiling:
-        envelope = _over_ceiling_error(store, accumulated, len(identifiers))
+        envelope = _over_ceiling_error(store, accumulated, len(stale))
         command_args.stamp_spend(envelope, adapter)
         return envelope
     # Annotate before persisting so cached datasets carry candidate_keys and
-    # grain, the same shape a `map`-written cache has.
-    _annotate_grain(datasets, defs)
+    # grain, the same shape a `map`-written cache has. Only the freshly profiled
+    # need it; the fresh-cached already carry theirs from the cache write.
+    _annotate_grain(profiled, defs)
 
     # Fold same-lineage duplicates before the merge, as `map` does, so the folded
     # set flows into both the cache and the envelope. Relationships profiles the
@@ -351,10 +419,24 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         notes.append(
             f"{confirmed} inferred join(s) match declared tests; kept as declared"
         )
-    if verify and inferred:
+    if verify and inferred and verify_pending is None and verify_warning is None:
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
+    if fresh_reused:
+        window = config.profile_freshness_hours
+        notes.append(
+            f"reused {len(fresh_reused)} fresh cached profile(s) (schema "
+            f"unchanged, profiled within {window:g}h); pass --refresh to force "
+            "re-profiling"
+        )
+    if verify_pending is not None:
+        notes.append(
+            "relationships saved unverified; verification awaits confirmation "
+            "(see hint)"
+        )
+    if verify_warning:
+        envelope.warnings.append(verify_warning)
     if folded_edges > 0:
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
@@ -374,9 +456,13 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "relationships": [r.model_dump(mode="json") for r in rels],
             "declared_count": len(declared),
             "inferred_count": len(rels) - len(declared),
+            "profiled_count": len(profiled),
+            "cache_hit_count": len(fresh_reused),
             "cache_path": str(path),
             "updated_at": now.isoformat(),
-            "notes": notes,
+            # Merge, not overwrite: a verify checkpoint envelope may already
+            # carry notes from the adapter's estimate description.
+            "notes": [*envelope.data.get("notes", []), *notes],
         }
     )
     return envelope
@@ -483,74 +569,127 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
+    verify_pending: env.Envelope | None = None
+    verify_warning: str | None = None
     try:
         metas = inventory_mod.inventory(adapter)
         # First-pass rank on cheap signals (no connectivity yet) to choose what to
         # profile; re-ranked with connectivity once relationships are known.
         first_pass = rank_mod.rank(metas, None, hints)
         selected = _select_for_profiling(metas, first_pass, config, full)
+        # Skip re-scanning a selected object whose cached profile is still fresh
+        # (same connector, schema unchanged, within the freshness window); only
+        # the stale remainder is estimated, confirmed, and profiled below.
+        stale, fresh_reused = _split_fresh_stale(
+            selected,
+            prior,
+            adapter.name,
+            adapter,
+            timedelta(hours=config.profile_freshness_hours),
+            now,
+            refresh=getattr(args, "refresh", False),
+        )
         # Inventory and ranking are free, so an unconfirmed billed run repeats
         # them on re-issue; only the profiling scans below need the handshake.
-        estimate, per_table = _profile_estimate(
-            adapter, [m.identifier for m in selected]
-        )
-        handshake_notes = None
+        estimate, per_table = _profile_estimate(adapter, [m.identifier for m in stale])
+        handshake_notes: list[str] = []
         if getattr(args, "verify", False):
-            handshake_notes = [
-                "--verify overlap probes depend on what inference finds, so "
-                "they are billed within the confirmed budget, not in this "
-                "upfront estimate"
-            ]
-        unconfirmed = command_args.billed_handshake(
-            "explore map", adapter, estimate, per_table=per_table, notes=handshake_notes
-        )
-        if unconfirmed is not None:
-            return unconfirmed
-        # Billed-connector-gated per-object checkpointing (see cmd_profile).
-        checkpoint = None
-        if command_args.cost_gate(adapter) is not None:
-            checkpoint, accumulated = _profile_checkpointer(
-                store, prior, adapter.name, now
+            handshake_notes.append(
+                "--verify overlap probes depend on what inference finds; they "
+                "are priced after profiling, and if their estimate exceeds "
+                "what remains of this budget a second confirmation checkpoint "
+                "appears before any probe runs"
             )
-
-        profile_reporter = _reporter(len(selected), "profiled", "objects")
-        try:
-            profiled = profile_mod.profile(
+        if fresh_reused:
+            handshake_notes.append(
+                f"{len(fresh_reused)} object(s) excluded from this estimate as "
+                "fresh-cached (schema unchanged, profiled within the freshness "
+                "window); pass --refresh to re-profile them"
+            )
+        profiled: list[Dataset] = []
+        # Nothing stale means nothing to price or confirm: skip the handshake and
+        # the scan entirely, and reuse the cached profiles wholesale.
+        if stale:
+            unconfirmed = command_args.billed_handshake(
+                "explore map",
                 adapter,
-                [m.identifier for m in selected],
-                progress=profile_reporter,
-                on_complete=checkpoint,
-                pii_overrides=pii_override_paths(config.pii_overrides),
+                estimate,
+                per_table=per_table,
+                notes=handshake_notes or None,
             )
-            profile_reporter.done()
-        except OverCeilingError:
-            over_ceiling = True
+            if unconfirmed is not None:
+                return unconfirmed
+            # Billed-connector-gated per-object checkpointing (see cmd_profile).
+            checkpoint = None
+            if command_args.cost_gate(adapter) is not None:
+                checkpoint, accumulated = _profile_checkpointer(
+                    store, prior, adapter.name, now
+                )
 
+            profile_reporter = _reporter(len(stale), "profiled", "objects")
+            try:
+                profiled = profile_mod.profile(
+                    adapter,
+                    [m.identifier for m in stale],
+                    progress=profile_reporter,
+                    on_complete=checkpoint,
+                    pii_overrides=pii_override_paths(config.pii_overrides),
+                )
+                profile_reporter.done()
+            except OverCeilingError:
+                over_ceiling = True
+
+        # Freshly profiled plus fresh-cached: the full selected set, whether
+        # scanned this run or reused. Only the freshly profiled need annotation;
+        # the reused already carry theirs from the cache write that stored them.
+        all_selected = profiled + list(fresh_reused.values())
         if not over_ceiling:
             _annotate_grain(profiled, defs)
-            inferred = rel_mod.infer_relationships(profiled)
+            inferred = rel_mod.infer_relationships(all_selected)
             if getattr(args, "verify", False):
-                verify_reporter = _reporter(len(inferred), "verified", "joins")
-                rel_mod.verify_relationships(
+                probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
+                verify_pending = command_args.verify_handshake(
+                    "explore map",
                     adapter,
-                    inferred,
-                    timeout_seconds=config.query.timeout_seconds,
-                    progress=verify_reporter,
+                    probe_cost,
+                    candidate_count=candidates,
+                    object_count=objects,
                 )
-                verify_reporter.done()
-        envelope = env.ok({})
+                if verify_pending is None:
+                    verify_reporter = _reporter(len(inferred), "verified", "joins")
+                    try:
+                        rel_mod.verify_relationships(
+                            adapter,
+                            inferred,
+                            timeout_seconds=config.query.timeout_seconds,
+                            progress=verify_reporter,
+                        )
+                        verify_reporter.done()
+                    except OverCeilingError:
+                        # The upfront probe pricing fit, but per-statement
+                        # estimates drifted past the ceiling mid-loop. The map
+                        # itself is complete, so finish with a warning instead
+                        # of the profiling phase's partial-completion error.
+                        done = sum(1 for r in inferred if r.verified)
+                        verify_warning = (
+                            f"budget exhausted after verifying {done} of "
+                            f"{len(inferred)} candidate join(s); verified "
+                            "results are saved; raise --budget and re-run to "
+                            "finish verification"
+                        )
+        envelope = verify_pending or env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     if over_ceiling:
-        envelope = _over_ceiling_error(store, accumulated, len(selected))
+        envelope = _over_ceiling_error(store, accumulated, len(stale))
         command_args.stamp_spend(envelope, adapter)
         return envelope
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
     # into source, replica, and cross-dataset lookalike edges.
     inferred, folded_edges, mirrored_objects = rel_mod.fold_replica_relationships(
-        profiled, inferred, _dev_schemas(config)
+        all_selected, inferred, _dev_schemas(config)
     )
 
     declared, declared_notes = rel_mod.declared_relationships(
@@ -560,7 +699,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     final_scores = rank_mod.rank(metas, relationships, hints)
-    datasets, carried = _compose_datasets(metas, profiled, final_scores, reusable)
+    datasets, carried = _compose_datasets(metas, all_selected, final_scores, reusable)
 
     cache = DexCache(datasets=datasets, relationships=relationships)
     cache.provenance.connector = adapter.name
@@ -571,7 +710,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     )
     path = store.save_cache(cache, now=now)
 
-    notes = _relationship_notes(profiled, declared, inferred, defs)
+    notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
     notes.extend(defs.notes)
     if confirmed:
@@ -584,13 +723,23 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             f"{metric_hint_count} model(s) back metric definitions; ranking "
             "favors them alongside configured hints"
         )
-    skipped = len(metas) - len(profiled)
+    # Rank-cutoff skip is an axis of its own: objects not selected for profiling.
+    # It is decoupled from len(profiled), which no longer equals len(selected)
+    # once some selected objects are served from cache.
+    skipped = len(metas) - len(selected)
     if skipped > 0:
         notes.append(
-            f"profiled top {len(profiled)} of {len(metas)} objects by rank "
+            f"profiled top {len(selected)} of {len(metas)} objects by rank "
             f"(profile_top_n={config.profile_top_n}; all objects are profiled "
             f"automatically at {_AUTO_PROFILE_ALL} or fewer); pass --full to "
             "profile everything"
+        )
+    if fresh_reused:
+        window = config.profile_freshness_hours
+        notes.append(
+            f"reused {len(fresh_reused)} fresh cached profile(s) for selected "
+            f"object(s) (schema unchanged, profiled within {window:g}h); pass "
+            "--refresh to force re-profiling"
         )
     if carried > 0:
         notes.append(
@@ -603,15 +752,23 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             f"{mirrored_objects} object(s) mirror source lineage (a dev/replica "
             "dataset mapped alongside its source)"
         )
+    if verify_pending is not None:
+        notes.append(
+            "relationships saved unverified; verification awaits confirmation "
+            "(see hint)"
+        )
+    if verify_warning:
+        envelope.warnings.append(verify_warning)
 
-    pii_columns = sum(1 for d in profiled for c in d.columns if c.pii is not None)
-    quality_notes = sum(len(d.data_quality) for d in profiled)
+    pii_columns = sum(1 for d in all_selected for c in d.columns if c.pii is not None)
+    quality_notes = sum(len(d.data_quality) for d in all_selected)
     top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
     envelope.data.update(
         {
             "cache_path": str(path),
             "object_count": len(metas),
             "profiled_count": len(profiled),
+            "cache_hit_count": len(fresh_reused),
             "skipped_count": skipped,
             "carried_forward_count": carried,
             "relationship_count": len(relationships),
@@ -620,7 +777,9 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             "top_objects": [
                 {"identifier": d.identifier, "rank_score": d.rank_score} for d in top
             ],
-            "notes": notes,
+            # Merge, not overwrite: a verify checkpoint envelope may already
+            # carry notes from the adapter's estimate description.
+            "notes": [*envelope.data.get("notes", []), *notes],
             "updated_at": now.isoformat(),
         }
     )
@@ -1162,6 +1321,68 @@ def _select_for_profiling(
         return metas
     ranked = sorted(metas, key=lambda m: scores.get(m.identifier, 0.0), reverse=True)
     return ranked[: config.profile_top_n]
+
+
+def _column_signature(columns) -> list[tuple[str, str, bool]]:
+    """The (name, data_type, nullable) shape of a column set, sorted so two
+    profiles compare independent of column order. Shared shape as
+    ``maintain/drift.py``'s schema diff, applied here pre-profile against cheap
+    metadata instead of post-profile against two cached snapshots."""
+
+    return sorted((c.name, c.data_type, c.nullable) for c in columns)
+
+
+def _split_fresh_stale(
+    metas: list[ObjectMeta],
+    prior: DexCache | None,
+    connector: str,
+    adapter: Adapter,
+    max_age: timedelta,
+    now: datetime,
+    *,
+    refresh: bool,
+) -> tuple[list[ObjectMeta], dict[str, Dataset]]:
+    """Split selected metas into (still need profiling, reusable-fresh datasets).
+
+    An object is *fresh* (skip the re-scan) only when its cached profile came
+    from this same connector, was actually profiled before (has columns and a
+    ``profiled_at``), was profiled within ``max_age``, and its column signature
+    still matches the warehouse's cheap metadata. Anything else is *stale* and
+    goes back through the billed profiling scan. ``refresh`` forces every object
+    stale (the pre-fix, unconditional-reprofile behavior), and so does a
+    mismatched-connector or absent prior — mirroring ``cmd_map``'s reuse gate.
+
+    Freshness is fail-closed: a missing or unparseable ``profiled_at``, or any
+    doubt, re-profiles rather than trusting a stale scan.
+    """
+
+    if refresh or prior is None or prior.provenance.connector != connector:
+        return list(metas), {}
+
+    prior_by_id = {d.identifier: d for d in prior.datasets if d.columns}
+    stale: list[ObjectMeta] = []
+    fresh: dict[str, Dataset] = {}
+    for meta in metas:
+        prior_ds = prior_by_id.get(meta.identifier)
+        if prior_ds is None or prior_ds.profiled_at is None:
+            stale.append(meta)
+            continue
+        try:
+            profiled_at = datetime.fromisoformat(prior_ds.profiled_at)
+        except ValueError:
+            stale.append(meta)
+            continue
+        if now - profiled_at > max_age:
+            stale.append(meta)
+            continue
+        # The same free, no-scan metadata call profile() makes first: confirms
+        # the schema has not drifted since the cached profile was written.
+        _meta, columns = adapter.table_metadata(meta.identifier)
+        if _column_signature(columns) != _column_signature(prior_ds.columns):
+            stale.append(meta)
+            continue
+        fresh[meta.identifier] = prior_ds.model_copy(deep=True)
+    return stale, fresh
 
 
 def _compose_datasets(

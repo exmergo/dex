@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -144,6 +145,89 @@ def test_unconfirmed_map_estimates_selected_objects(
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
+def _fresh_bq_dataset(identifier: str, columns, *, now: str) -> Dataset:
+    """A same-connector prior profile stamped just now, so skip-if-cached treats
+    it as fresh. Column signatures mirror the fake BigQuery schema exactly so the
+    pre-profile metadata check finds no drift."""
+
+    return Dataset(
+        identifier=identifier,
+        row_count=100,
+        columns=columns,
+        candidate_keys=[["id"]],
+        grain=["id"],
+        profiled_at=now,
+    )
+
+
+def _seed_bq_map_cache(tmp_path: Path, *, identifiers: set[str]) -> None:
+    """Seed a bigquery-connector cache holding fresh profiles for the named
+    objects (schema-matching the fake client's tables)."""
+
+    now = datetime.now(UTC).isoformat()
+    catalog = {
+        "test-proj.shop.customers": [
+            ColumnProfile(name="id", data_type="INTEGER", nullable=False),
+            ColumnProfile(name="email", data_type="STRING", nullable=True),
+        ],
+        "test-proj.shop.events": [
+            ColumnProfile(name="id", data_type="INTEGER", nullable=True),
+            ColumnProfile(name="payload", data_type="STRUCT", nullable=True),
+            ColumnProfile(name="labels", data_type="ARRAY<STRING>", nullable=True),
+        ],
+        "test-proj.logs.requests": [
+            ColumnProfile(name="day", data_type="DATE", nullable=True),
+        ],
+    }
+    cache = DexCache(
+        datasets=[
+            _fresh_bq_dataset(identifier, catalog[identifier], now=now)
+            for identifier in identifiers
+        ]
+    )
+    cache.provenance.connector = "bigquery"
+    DexStore(tmp_path).save_cache(cache)
+
+
+def test_unconfirmed_map_excludes_fresh_cached_objects(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """A fresh cached profile for customers is excluded from the preflight
+    estimate and its per-table breakdown; only the stale events is priced."""
+
+    _seed_bq_map_cache(tmp_path, identifiers={"test-proj.shop.customers"})
+    route_adapter(fake_bq_client)
+    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    assert envelope.status.value == "needs_confirmation"
+    # Only events is priced now (customers is fresh-cached, requests is
+    # partition-filtered to zero), so the estimate halves versus the no-cache run.
+    assert envelope.cost.estimate == 10 * MB
+    assert "test-proj.shop.customers" not in envelope.data["per_table_bytes"]
+    assert any("fresh-cached" in note for note in envelope.data["notes"])
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_fully_fresh_map_needs_no_confirmation(fake_bq_client, route_adapter, tmp_path):
+    """When every object is fresh-cached there is nothing to scan: the billed
+    handshake is skipped entirely and the run completes without confirmation."""
+
+    _seed_bq_map_cache(
+        tmp_path,
+        identifiers={
+            "test-proj.shop.customers",
+            "test-proj.shop.events",
+            "test-proj.logs.requests",
+        },
+    )
+    route_adapter(fake_bq_client)
+    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    assert envelope.status.value == "ok"
+    assert envelope.data["profiled_count"] == 0
+    assert envelope.data["cache_hit_count"] == 3
+    # No estimate and no scan: not even a dry-run job was issued.
+    assert fake_bq_client.query_calls == []
+
+
 def test_unconfirmed_relationships_recommends_map(
     fake_bq_client, route_adapter, tmp_path
 ):
@@ -268,3 +352,231 @@ def test_duckdb_explore_stays_confirmation_free(duckdb_file: Path, capsys):
     assert payload["status"] == "ok"
     assert payload["cost"]["paradigm"] == "free_local"
     assert "spend" not in payload["data"]
+
+
+# --- the verify-phase checkpoint -------------------------------------------------
+#
+# Verify probes can only be priced after profiling finds the candidate joins, so
+# the confirm handshake cannot cover them upfront. These tests pin the second,
+# headroom-gated checkpoint: a budget that covers profiling and the probes runs
+# in one pass; one that does not gets needs_confirmation after profiling, with
+# the profiles and unverified relationships already persisted.
+
+
+@pytest.fixture
+def fk_bq_client():
+    """A fake warehouse where inference finds a candidate join: orders carries
+    a customer_id foreign key into customers, whose id the aggregate resolver
+    reports as unique. Local to these tests so the shared fixture's estimate
+    assertions stay untouched."""
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    tables = [
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="customers",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("email", "STRING"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="orders",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("customer_id", "INTEGER"),
+                bigquery.SchemaField("total", "NUMERIC"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+    ]
+    client = FakeBigQueryClient(project="test-proj", tables=tables)
+    client.row_resolver = _aggregate_resolver
+    return client
+
+
+def _probe_executed(client) -> bool:
+    return any(not c.dry_run and "nonnull_fk" in c.sql for c in client.query_calls)
+
+
+def test_verify_within_budget_runs_in_one_pass(fk_bq_client, route_adapter, tmp_path):
+    route_adapter(fk_bq_client)
+    envelope = explore_cmds.cmd_map(
+        _args(
+            tmp_path,
+            subcommand="map",
+            verify=True,
+            confirm=True,
+            budget=float(100 * MB),
+        )
+    )
+    assert envelope.status.value == "ok"
+    assert "phase" not in envelope.data
+    assert _probe_executed(fk_bq_client)
+    cache = DexStore(tmp_path).load_cache()
+    assert cache.relationships and cache.relationships[0].verified
+
+
+def test_verify_beyond_budget_checkpoints_before_any_probe(
+    fk_bq_client, route_adapter, tmp_path
+):
+    # 20 MB covers the profiling handshake exactly (two tables floored to the
+    # per-query minimum each) but leaves no headroom for the two-table probe,
+    # which floors to another 20 MB.
+    route_adapter(fk_bq_client)
+    envelope = explore_cmds.cmd_map(
+        _args(
+            tmp_path,
+            subcommand="map",
+            verify=True,
+            confirm=True,
+            budget=float(20 * MB),
+        )
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "verify"
+    assert envelope.data["candidate_count"] == 1
+    assert envelope.data["object_count"] == 2
+    assert envelope.data["per_table_bytes"] == {"(join overlap probes)": 20 * MB}
+    assert "--budget" in envelope.data["hint"]
+    # The raised estimate is the whole-command total the re-run needs.
+    assert envelope.cost.estimate > envelope.cost.ceiling
+    assert envelope.cost.ceiling == 20 * MB
+    # No probe was billed; profiling spend is reported on the checkpoint.
+    assert not _probe_executed(fk_bq_client)
+    assert envelope.data["spend"]["bytes_billed"] > 0
+    # The map itself completed and persisted: profiles and the unverified
+    # relationship are in the cache, and the summary rides along.
+    assert envelope.data["relationship_count"] == 1
+    assert Path(envelope.data["cache_path"]).exists()
+    cache = DexStore(tmp_path).load_cache()
+    assert cache.relationships and not cache.relationships[0].verified
+    assert any("unverified" in note for note in envelope.data["notes"])
+
+
+def test_relationships_verify_beyond_budget_checkpoints(
+    fk_bq_client, route_adapter, tmp_path
+):
+    route_adapter(fk_bq_client)
+    envelope = explore_cmds.cmd_relationships(
+        _args(
+            tmp_path,
+            subcommand="relationships",
+            verify=True,
+            confirm=True,
+            budget=float(20 * MB),
+        )
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "verify"
+    assert envelope.data["command"] == "explore relationships"
+    assert not _probe_executed(fk_bq_client)
+    assert not any(
+        "verified" in note and "overlap" in note for note in envelope.data["notes"]
+    )
+    cache = DexStore(tmp_path).load_cache()
+    assert cache.relationships and not cache.relationships[0].verified
+
+
+def test_verify_with_no_candidates_skips_the_checkpoint(
+    fake_bq_client, route_adapter, tmp_path
+):
+    # The shared fixture's tables share no foreign-key stem, so inference finds
+    # nothing to probe and the confirmed budget alone carries the run.
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = explore_cmds.cmd_map(
+        _args(
+            tmp_path,
+            subcommand="map",
+            verify=True,
+            confirm=True,
+            budget=float(20 * MB),
+        )
+    )
+    assert envelope.status.value == "ok"
+    assert "phase" not in envelope.data
+
+
+def test_mid_verify_budget_exhaustion_degrades_to_a_warning(
+    fk_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    # Estimate drift can still trip the per-statement gate after the phase
+    # checkpoint passed; the map is complete, so the run finishes with a
+    # warning instead of the generic error it used to die with.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    def exhaust(adapter, relationships, *, timeout_seconds=None, progress=None):
+        relationships[0].verified = True
+        raise OverCeilingError("drifted past the ceiling")
+
+    monkeypatch.setattr(explore_cmds.rel_mod, "verify_relationships", exhaust)
+    route_adapter(fk_bq_client)
+    envelope = explore_cmds.cmd_map(
+        _args(
+            tmp_path,
+            subcommand="map",
+            verify=True,
+            confirm=True,
+            budget=float(100 * MB),
+        )
+    )
+    assert envelope.status.value == "ok"
+    assert any("1 of 1" in w and "budget exhausted" in w for w in envelope.warnings)
+    cache = DexStore(tmp_path).load_cache()
+    assert cache.relationships
+
+
+def test_verify_handshake_uses_the_adapters_estimate_description():
+    # Connectors that speak credits/seconds describe their own estimate; the
+    # checkpoint payload keeps that shape and overlays the phase fields.
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore map",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+                "notes": ["seconds are a coarse translation"],
+            }
+
+    envelope = command_args.verify_handshake(
+        "explore map", StubAdapter(), 5.0, candidate_count=3, object_count=2
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["estimated_seconds"] == 5.0
+    assert envelope.data["per_table_seconds"] == {"(join overlap probes)": 5.0}
+    assert envelope.data["candidate_count"] == 3
+    assert envelope.data["object_count"] == 2
+    assert "notes" in envelope.data
+    assert envelope.cost.estimate == 13.0
+
+
+def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
+    from exmergo_dex_core.cli import main
+
+    rc = main(["explore", "map", "--verify", "--path", str(duckdb_file)])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["status"] == "ok"
+    assert payload["cost"]["paradigm"] == "free_local"
+    assert "phase" not in payload["data"]

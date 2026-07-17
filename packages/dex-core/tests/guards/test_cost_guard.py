@@ -115,6 +115,39 @@ def test_gate_session_remainder_binds_when_tighter():
         gate.preflight_command(400.0)
 
 
+def test_gate_phase_within_remaining_headroom_passes():
+    gate = _gate()
+    gate.charge(600.0)
+    cost = gate.preflight_phase(300.0)
+    assert cost.estimate == 900.0
+    assert cost.ceiling == 1_000.0
+
+
+def test_gate_phase_beyond_remaining_headroom_asks_for_confirmation():
+    # The raised estimate is the whole-command total (charged so far plus the
+    # phase), so it is directly the budget a re-run needs.
+    gate = _gate()
+    gate.charge(600.0)
+    with pytest.raises(ConfirmationRequiredError) as exc_info:
+        gate.preflight_phase(500.0)
+    assert exc_info.value.cost.estimate == 1_100.0
+    assert exc_info.value.cost.ceiling == 1_000.0
+    assert exc_info.value.cost.paradigm is Paradigm.BYTES_SCANNED
+
+
+def test_gate_phase_session_remainder_binds_when_tighter():
+    gate = _gate(ceiling=1_000.0, session_ceiling=800.0, session_spent=500.0)
+    with pytest.raises(ConfirmationRequiredError) as exc_info:
+        gate.preflight_phase(400.0)
+    assert exc_info.value.cost.ceiling == 300.0
+
+
+def test_gate_phase_zero_estimate_and_no_ceiling_never_raise():
+    assert _gate().preflight_phase(0.0).estimate == 0.0
+    gate = _gate(ceiling=None, session_ceiling=None)
+    assert gate.preflight_phase(500.0).ceiling is None
+
+
 def test_gate_max_bytes_tracks_actual_billing():
     gate = _gate(ceiling=1_000.0)
     assert gate.remaining_for_statement() == 1_000

@@ -24,8 +24,10 @@ for.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import time
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1002,6 +1004,67 @@ def _postgres_from_dbt_profiles(repo_root: str | Path) -> dict | None:
     return None
 
 
+# An idle Redshift Serverless workgroup resumes on the first connection: the
+# startup/auth handshake blocks until compute is ready, and a resume slower
+# than the endpoint tolerates is torn down mid-handshake, so the first command
+# to touch a cold workgroup gets a connection error while everything after it
+# runs warm. The bare connect is therefore retried across a window wide enough
+# to cover a cold resume. A per-attempt timeout bounds a stalled handshake so a
+# reset that never arrives cannot block forever, and it is cleared once the
+# connection is up so it never bounds a later billed query's result read. No
+# statement runs here, so the retries add no billed compute; the wake is billed
+# once by the first real statement regardless.
+_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 90
+_CONNECT_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+
+
+def _connect_redshift(redshift_connector, params: dict):
+    """Open the redshift_connector connection, retrying a cold-start resume.
+
+    Retries only the connection-level failures a resuming Serverless workgroup
+    produces (a reset handshake surfaces as InterfaceError, a stalled one as
+    OperationalError) with backoff, then re-raises as a discovery error that
+    names the resume. A server-side refusal (a bad credential, a missing
+    database, a denied privilege) is a ProgrammingError and surfaces on the
+    first attempt rather than waiting out the backoff.
+    """
+
+    from redshift_connector.error import InterfaceError, OperationalError
+
+    transient = (InterfaceError, OperationalError)
+    attempts = len(_CONNECT_BACKOFF_SECONDS) + 1
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            connection = redshift_connector.connect(
+                **params,
+                application_name="dex",
+                timeout=_CONNECT_ATTEMPT_TIMEOUT_SECONDS,
+            )
+            connection.autocommit = True
+            # The connect timeout is a socket timeout that would otherwise
+            # persist and cap every later result read; a billed scan on a
+            # just-woken workgroup can legitimately outlast it. Clear it now
+            # that the handshake is done (best-effort: never fail the connect
+            # over a driver internal).
+            usock = getattr(connection, "_usock", None)
+            if usock is not None:
+                with contextlib.suppress(OSError):
+                    usock.settimeout(None)
+            return connection
+        except transient as exc:
+            last_exc = exc
+            if attempt < len(_CONNECT_BACKOFF_SECONDS):
+                time.sleep(_CONNECT_BACKOFF_SECONDS[attempt])
+
+    raise CredentialDiscoveryError(
+        f"could not establish a Redshift connection after {attempts} attempts; "
+        "an idle Serverless workgroup can be slow to resume on first contact. "
+        "Retry the command, or check the workgroup is AVAILABLE and its "
+        "endpoint is reachable"
+    ) from last_exc
+
+
 def _open_redshift(
     config: DexConfig,
     repo_root: str | Path,
@@ -1027,9 +1090,9 @@ def _open_redshift(
     # adapter additionally sets query_group and a best-effort session
     # read-only mode before any statement runs. autocommit keeps session SETs
     # (statement_timeout) outside any transaction the driver would otherwise
-    # open.
-    connection = redshift_connector.connect(**params, application_name="dex")
-    connection.autocommit = True
+    # open. The connect itself is retried: an idle Serverless workgroup resumes
+    # on first contact, and a slow resume can reset the startup handshake.
+    connection = _connect_redshift(redshift_connector, params)
 
     store = DexStore(repo_root)
     utc_midnight = (
