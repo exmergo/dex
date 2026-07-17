@@ -9,6 +9,44 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore query` can unnest JSON and array columns** (#78). The firewall's
+  FROM clause now admits each connector's native unnest idiom (BigQuery
+  `UNNEST`, Snowflake `LATERAL FLATTEN`, Databricks `LATERAL VIEW EXPLODE`,
+  Postgres set-returning functions, Redshift PartiQL navigation and
+  `UNPIVOT ... AT`, DuckDB `UNNEST`) when the unnested value derives from a
+  column of a table the query already reads, either bare or through an
+  allowlisted JSON/array function (`JSON_KEYS`, `JSON_EXTRACT_ARRAY`,
+  `OBJECT_KEYS`, `jsonb_object_keys`, `jsonb_each`, and kin). Unnesting a
+  subquery, another table, a literal, or a generator stays refused, and every
+  column an unnest produces (values, keys, paths, offsets) inherits the source
+  column's PII flags, so the reshape cannot launder a flagged value. This
+  unblocks the headline schemaless-exploration probe, "which keys appear
+  across every row of this JSON column".
+- **A shipped dbt macro library, scaffolded, starting with
+  `unpivot_json_object`** (#85). `transform macro` lists the macros dex
+  ships; `transform macro <name>` proposes the macro file into the project's
+  macro directory as a reviewable plan (dbt-parse-checked, applied with
+  `transform apply`; re-running diffs the project's copy against the shipped
+  version). `unpivot_json_object(relation, json_column, key_alias, value_alias,
+  passthrough)` unpivots a dynamic-key JSON object column into one row per
+  top-level key on every connector, key as a plain string, value in the
+  warehouse's native semi-structured type, with BigQuery's two JSON gotchas
+  (literal-only path arguments; `JSON_KEYS` recursing into nested objects by
+  default) baked in. Plans gained the `macro_sql` edit kind: the editing
+  surface now includes the project's macro paths, macro files are validated
+  structurally and by dbt's parser, and a planned model that calls a shipped
+  macro the project lacks warns with the scaffold command.
+
+### Changed
+
+- Model validation's jinja stripping is parenthesis-aware: a jinja-only line
+  inside parentheses (a macro rendering a whole SELECT, for example
+  `from ( {{ unpivot_json_object(...) }} )`) is validated as a placeholder
+  subquery instead of failing the SELECT-only parse; top-level jinja-only
+  lines (a `{{ config(...) }}` header) vanish as before.
+
 ## [1.2.1] - 2026-07-17
 
 ### Changed
