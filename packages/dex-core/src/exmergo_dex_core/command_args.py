@@ -11,6 +11,7 @@ instead of re-deriving it.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from . import envelope as env
@@ -96,14 +97,84 @@ def billed_handshake(
     return None
 
 
+def verify_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    candidate_count: int,
+    object_count: int,
+) -> env.Envelope | None:
+    """The mid-command checkpoint for the verify phase on billed connectors.
+
+    Verify probes can only be priced after profiling finds the candidate
+    relationships, so this runs after inference on an already-confirmed
+    command: the probes are dry-run priced (free), and only when that estimate
+    does not fit what remains of the confirmed budget does it return the
+    ``needs_confirmation`` envelope — otherwise the confirmed budget already
+    covers verify and the command proceeds in one pass.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None or candidate_count == 0:
+        return None
+    try:
+        gate.preflight_phase(estimate)
+    except ConfirmationRequiredError as exc:
+        # Same aggregate key maintain grain uses for probe pricing, so agents
+        # see one vocabulary for overlap-probe cost across commands.
+        per_table = {"(join overlap probes)": estimate}
+        describe = getattr(adapter, "describe_estimate", None)
+        if describe is not None:
+            data = {"command": command, **describe(estimate, per_table)}
+        else:
+            data = {
+                "command": command,
+                "estimated_bytes": estimate,
+                "per_table_bytes": per_table,
+            }
+        data.update(
+            {
+                "phase": "verify",
+                "candidate_count": candidate_count,
+                "object_count": object_count,
+                "hint": (
+                    f"found {candidate_count} candidate relationship(s) across "
+                    f"{object_count} object(s); verifying them all is estimated "
+                    f"at {estimate:.0f} {gate.paradigm.value} beyond what "
+                    "remains of the confirmed budget. Profiles and unverified "
+                    "relationships are saved to .dex/cache.json; re-run the "
+                    "same command with --confirm --budget "
+                    f"{math.ceil(exc.cost.estimate)} to profile and verify in "
+                    "one pass (a re-run re-profiles first)"
+                ),
+            }
+        )
+        if (
+            gate.session_ceiling is not None
+            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
+        ):
+            data.setdefault("notes", [])
+            data["notes"] = [
+                *data["notes"],
+                "the session budget is the binding ceiling; raising --budget "
+                "alone will not unlock this, raise the session budget in "
+                ".dex/config.yml instead",
+            ]
+        return env.needs_confirmation(data, cost=exc.cost)
+    return None
+
+
 def stamp_spend(envelope: env.Envelope, adapter: Adapter) -> env.Envelope:
     """Stamp the preflight cost and the actual spend onto an OK envelope. The
     ``cost`` field stays a preflight estimate by contract; actual billed bytes
-    live in ``data.spend``."""
+    live in ``data.spend``. An envelope already carrying a cost (a phase
+    checkpoint) keeps it; only the spend summary is refreshed."""
 
     gate = cost_gate(adapter)
     if gate is not None:
-        envelope.cost = gate.cost()
+        if envelope.cost.estimate is None:
+            envelope.cost = gate.cost()
         spend = gate.spend_summary()
         display = getattr(adapter, "spend_display", None)
         if display is not None:
