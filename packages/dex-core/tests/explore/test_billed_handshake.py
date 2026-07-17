@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,89 @@ def test_unconfirmed_map_estimates_selected_objects(
     # needs a partition filter, so it contributes zero.
     assert envelope.cost.estimate == 2 * 10 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def _fresh_bq_dataset(identifier: str, columns, *, now: str) -> Dataset:
+    """A same-connector prior profile stamped just now, so skip-if-cached treats
+    it as fresh. Column signatures mirror the fake BigQuery schema exactly so the
+    pre-profile metadata check finds no drift."""
+
+    return Dataset(
+        identifier=identifier,
+        row_count=100,
+        columns=columns,
+        candidate_keys=[["id"]],
+        grain=["id"],
+        profiled_at=now,
+    )
+
+
+def _seed_bq_map_cache(tmp_path: Path, *, identifiers: set[str]) -> None:
+    """Seed a bigquery-connector cache holding fresh profiles for the named
+    objects (schema-matching the fake client's tables)."""
+
+    now = datetime.now(UTC).isoformat()
+    catalog = {
+        "test-proj.shop.customers": [
+            ColumnProfile(name="id", data_type="INTEGER", nullable=False),
+            ColumnProfile(name="email", data_type="STRING", nullable=True),
+        ],
+        "test-proj.shop.events": [
+            ColumnProfile(name="id", data_type="INTEGER", nullable=True),
+            ColumnProfile(name="payload", data_type="STRUCT", nullable=True),
+            ColumnProfile(name="labels", data_type="ARRAY<STRING>", nullable=True),
+        ],
+        "test-proj.logs.requests": [
+            ColumnProfile(name="day", data_type="DATE", nullable=True),
+        ],
+    }
+    cache = DexCache(
+        datasets=[
+            _fresh_bq_dataset(identifier, catalog[identifier], now=now)
+            for identifier in identifiers
+        ]
+    )
+    cache.provenance.connector = "bigquery"
+    DexStore(tmp_path).save_cache(cache)
+
+
+def test_unconfirmed_map_excludes_fresh_cached_objects(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """A fresh cached profile for customers is excluded from the preflight
+    estimate and its per-table breakdown; only the stale events is priced."""
+
+    _seed_bq_map_cache(tmp_path, identifiers={"test-proj.shop.customers"})
+    route_adapter(fake_bq_client)
+    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    assert envelope.status.value == "needs_confirmation"
+    # Only events is priced now (customers is fresh-cached, requests is
+    # partition-filtered to zero), so the estimate halves versus the no-cache run.
+    assert envelope.cost.estimate == 10 * MB
+    assert "test-proj.shop.customers" not in envelope.data["per_table_bytes"]
+    assert any("fresh-cached" in note for note in envelope.data["notes"])
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_fully_fresh_map_needs_no_confirmation(fake_bq_client, route_adapter, tmp_path):
+    """When every object is fresh-cached there is nothing to scan: the billed
+    handshake is skipped entirely and the run completes without confirmation."""
+
+    _seed_bq_map_cache(
+        tmp_path,
+        identifiers={
+            "test-proj.shop.customers",
+            "test-proj.shop.events",
+            "test-proj.logs.requests",
+        },
+    )
+    route_adapter(fake_bq_client)
+    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    assert envelope.status.value == "ok"
+    assert envelope.data["profiled_count"] == 0
+    assert envelope.data["cache_hit_count"] == 3
+    # No estimate and no scan: not even a dry-run job was issued.
+    assert fake_bq_client.query_calls == []
 
 
 def test_unconfirmed_relationships_recommends_map(

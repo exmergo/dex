@@ -177,7 +177,14 @@ stale manifest (older than the model sources) is noted, not trusted silently.
 `profile_top_n` (default 25) by rank and announces the cutoff in `notes`
 alongside `skipped_count` (`--full` profiles everything). Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
-stamped with its own `profiled_at`.
+stamped with its own `profiled_at`. A selected object whose cached profile is
+still fresh (same connector, schema unchanged, profiled within
+`profile_freshness_hours`, default 24; `0` disables reuse) is reused without a
+re-scan and reported as `cache_hit_count`, so it never enters the cost preflight
+or the billed handshake. `--refresh` forces a full re-profile of every selected
+object even when the cache is fresh, for a source that changed in a way the free
+metadata check cannot see. `explore relationships` reuses fresh profiles the
+same way (`cache_hit_count`); both accept `--refresh`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,

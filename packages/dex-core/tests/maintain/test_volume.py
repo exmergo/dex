@@ -58,7 +58,10 @@ def test_axis_results_merge_in_drift_json(maintain_repo):
     # Accepting the new state means re-mapping and re-snapshotting (the
     # documented discipline); that invalidates the report, so axes measured
     # against the old baseline drop rather than lingering as stale findings.
-    _rc, payload = maintain_repo.dex("explore", "map")
+    # --refresh forces a full re-profile: skip-if-cached would otherwise reuse
+    # the still-fresh, schema-unchanged profiles (including orders' pre-DELETE
+    # row count), which is precisely the volume-only change reuse cannot see.
+    _rc, payload = maintain_repo.dex("explore", "map", "--refresh")
     assert payload["status"] == "ok"
     maintain_repo.snapshot()
     _rc, payload = maintain_repo.dex("maintain", "volume")

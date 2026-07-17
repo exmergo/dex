@@ -123,6 +123,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
+                # Force a full re-profile even when the cache holds a fresh,
+                # schema-matching profile for a selected object (the default is
+                # skip-if-cached; --refresh is the escape hatch when the source
+                # changed in a way the cheap metadata check cannot see).
+                if group == "explore" and name in {"map", "relationships"}:
+                    sp.add_argument(
+                        "--refresh", action="store_true", default=argparse.SUPPRESS
+                    )
                 # Exploration starts bare: warehouse truth, independent of
                 # whatever repo dex runs from. --use-project opts in to folding
                 # the project's declared definitions (joins, grain, metric

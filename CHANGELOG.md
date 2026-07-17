@@ -9,6 +9,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`explore map` and `explore relationships` skip re-profiling an object whose
+  cached profile is still fresh.** Before scanning a selected object, each
+  command now checks `.dex/cache.json` for a same-connector profile of that
+  exact object that was profiled within a freshness window and whose column
+  signature (name, type, nullability) still matches the warehouse's free
+  metadata; a match is reused wholesale instead of re-scanned, so it never
+  enters the cost preflight or the billed handshake. Iterative workflows on a
+  metered warehouse (map, tweak, map again) and `--verify` re-runs no longer
+  re-pay the full profiling scan when nothing changed. The freshness check is
+  fail-closed: a missing or unparseable `profiled_at`, a schema change, or a
+  different connector re-profiles. The envelope gains a `cache_hit_count` field
+  (distinct from the existing `carried_forward_count`, which covers
+  below-rank-cutoff objects) and a note when reuse happened.
+- **New `--refresh` flag on `explore map` / `explore relationships`** forces a
+  full re-profile of every selected object even when the cache is fresh, for
+  callers who know the source changed in a way the cheap metadata check cannot
+  see.
+- **New `profile_freshness_hours` config knob** (`DexConfig`, default `24.0`)
+  sets how fresh a cached profile must be to be reused; `0` disables reuse
+  (always re-profile). No cache schema change: `Dataset.profiled_at` and the
+  stored column signatures already carry everything the check needs.
+
 ### Fixed
 
 - **Redshift connections survive a Serverless cold start.** An idle Serverless
