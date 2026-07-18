@@ -101,7 +101,38 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
             "transform plan needs content: pass --edits-file <path|-> with the "
             "authored edits, or --scaffold <table> for a staging skeleton"
         )
-    return _make_plan(args, intent, edits)
+
+    parse_notes: list[str] = []
+    if any(e.kind in (EditKind.PROJECT_YML, EditKind.PROFILES_YML) for e in edits):
+        # A broken dbt_project.yml or profiles.yml breaks the whole project, so
+        # config edits are gated by dbt's own parser at plan time (the same
+        # authoritative gate semantic and macro plans use), not left to surface
+        # for the first time at build. The secret-guard runs first, so an
+        # inlined credential is never handed to the dbt subprocess.
+        from ..config import DexConfig, load_config
+        from ..dbt_project import load as load_project
+        from .build import shadow_parse
+        from .validate import assert_profiles_safe
+
+        project = command_args.project_dir(args)
+        view = load_project(project)
+        assert_profiles_safe(view, edits)
+        config = load_config(command_args.repo_root(args)) or DexConfig()
+        parse_result = shadow_parse(project, edits, target=config.dbt_target)
+        if not parse_result["available"]:
+            parse_notes.append(parse_result["reason"])
+        elif not parse_result["success"]:
+            return env.error(
+                _failure_message("dbt parse failed", parse_result["messages"]),
+                warnings=parse_result["messages"][1:],
+            )
+        elif parse_result["messages"]:
+            parse_notes = [f"dbt: {m}" for m in parse_result["messages"]]
+
+    envelope = _make_plan(args, intent, edits)
+    if parse_notes and envelope.status is env.Status.OK:
+        envelope.warnings.extend(parse_notes)
+    return envelope
 
 
 def cmd_macro(args: argparse.Namespace) -> env.Envelope:
