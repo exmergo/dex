@@ -368,6 +368,57 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     assert not new_model.exists()
 
 
+def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: Path):
+    # profiles.yml is an editable surface, but a credential must never reach the
+    # plan diff (and thus agent context). An inlined literal is refused whether
+    # it is in the proposed content or already on disk (the diff's removed side).
+    from exmergo_dex_core import transform
+
+    (dbt_project_dir / "profiles.yml").write_text(
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      host: localhost\n      user: u\n      password: s3cr3t-on-disk\n"
+        "      dbname: d\n      schema: public\n",
+        encoding="utf-8",
+    )
+    proposed_secret = transform.PlanEdit(
+        path="profiles.yml",
+        kind=transform.EditKind.PROFILES_YML,
+        new_content=(
+            "dex_test:\n  outputs:\n    dev:\n      type: postgres\n"
+            "      password: s3cr3t-proposed\n"
+        ),
+    )
+    with pytest.raises(Exception) as proposed_exc:
+        transform.plan(
+            "inline a secret",
+            [proposed_secret],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+        )
+    assert "s3cr3t-proposed" not in str(proposed_exc.value)
+
+    # Even a clean (env_var) proposal is refused while the on-disk file still
+    # inlines a secret, since diffing it would surface the removed literal.
+    clean_proposal = transform.PlanEdit(
+        path="profiles.yml",
+        kind=transform.EditKind.PROFILES_YML,
+        new_content=(
+            "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+            "      host: localhost\n      user: u\n"
+            "      password: \"{{ env_var('PGPASSWORD') }}\"\n"
+            "      dbname: d\n      schema: public\n"
+        ),
+    )
+    with pytest.raises(Exception) as current_exc:
+        transform.plan(
+            "env-var the password",
+            [clean_proposal],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+        )
+    assert "s3cr3t-on-disk" not in str(current_exc.value)
+
+
 def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     from exmergo_dex_core import transform
 
