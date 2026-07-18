@@ -18,6 +18,16 @@ out of them. Row-level projections of a flagged column (including comparisons
 like ``name LIKE 'A%'``) are refused; per-row predicates over PII are still
 row-level PII-derived data.
 
+A FROM clause may unnest, in each dialect's native idiom (UNNEST, LATERAL
+FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL navigation and
+UNPIVOT ... AT), provided the unnested value derives from columns of tables the
+query already reads: either a bare column, or an allowlisted JSON/array
+function over such columns. Tables, subqueries, literals, and generators
+inside an unnest stay refused; they are where the arbitrary-read and
+row-synthesis risks live. Every column an unnest produces (values, keys,
+paths, offsets) inherits the taint of the columns it derives from, so PII
+cannot be laundered through a reshape.
+
 The firewall also clamps LIMIT (token protection, enforced here rather than
 trusted to agent frugality) and records which cache tables the query touches.
 """
@@ -93,6 +103,71 @@ _MEASURING = frozenset(
         "skewness",
     }
 )
+
+# JSON/array functions whose result a FROM clause may unnest, per dialect:
+# key enumeration (JSON_KEYS, OBJECT_KEYS, jsonb_object_keys), array-element
+# extraction (JSON_EXTRACT_ARRAY, FLATTEN, explode, jsonb_array_elements), and
+# the parse/navigation calls needed to reach an array inside a document
+# (PARSE_JSON, from_json, ->). Matching is by sqlglot expression class where a
+# canonical class exists and by lowered Anonymous name otherwise; sql_name() is
+# unreliable for matching (JSONKeysAtDepth renders as j_s_o_n_keys_at_depth).
+# Deliberately absent: generators (GENERATE_ARRAY and friends synthesize rows
+# from nothing, the row-explosion shape), string splitters (not needed for
+# JSON exploration; extendable if demand appears), and every aggregate.
+# Redshift's native idioms (PartiQL navigation, UNPIVOT ... AT) take bare
+# columns rather than function calls, so its entry is empty and the
+# bare-column rule in _unnest_source carries it.
+_UNNEST_FUNCS: dict[str, tuple[tuple[type, ...], frozenset[str]]] = {
+    "bigquery": (
+        (
+            exp.JSONKeysAtDepth,
+            exp.JSONExtractArray,
+            exp.JSONValueArray,
+            exp.JSONExtract,
+            exp.ParseJSON,
+        ),
+        frozenset(),
+    ),
+    "snowflake": (
+        (exp.Explode, exp.JSONKeys, exp.ParseJSON, exp.JSONExtract),
+        frozenset(),
+    ),
+    "databricks": (
+        (exp.Explode, exp.JSONKeys, exp.JSONExtractScalar, exp.ParseJSON),
+        frozenset({"from_json", "variant_explode", "try_parse_json"}),
+    ),
+    "postgres": (
+        (exp.JSONExtract, exp.JSONExtractScalar),
+        frozenset(
+            {
+                "json_object_keys",
+                "jsonb_object_keys",
+                "json_each",
+                "jsonb_each",
+                "json_each_text",
+                "jsonb_each_text",
+                "json_array_elements",
+                "jsonb_array_elements",
+                "json_array_elements_text",
+                "jsonb_array_elements_text",
+            }
+        ),
+    ),
+    "redshift": ((), frozenset()),
+    "duckdb": (
+        (exp.JSONKeys, exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON),
+        frozenset({"json_each"}),
+    ),
+}
+
+# Output columns a lateral/flatten construct produces when the query does not
+# alias them: Snowflake's FLATTEN emits a fixed six-column shape; the other
+# explode-style constructs emit some subset of these depending on the input
+# (array vs map, with or without position). Over-listing is safe: a name that
+# does not really exist can only cause an ambiguity refusal or a live query
+# error, never a leak, because every listed name carries the full taint.
+_FLATTEN_COLUMNS = ("seq", "key", "path", "index", "value", "this")
+_EXPLODE_COLUMNS = ("col", "key", "value", "pos")
 
 # Roots an agent query may have. Stricter than sql_guard's read-only set:
 # DESCRIBE/PRAGMA are introspection with their own commands (inventory/profile),
@@ -202,7 +277,7 @@ def inspect_query(
 
     known = {d.identifier: d for d in cache.datasets}
     tables: set[str] = set()
-    outputs = _query_outputs(root, {}, known, tables)
+    outputs = _query_outputs(root, {}, known, tables, dialect)
 
     flagged = {taint for taints in outputs.values() for taint in taints}
     offending = sorted(
@@ -262,14 +337,15 @@ def _query_outputs(
     env: dict[str, _Source],
     known: dict[str, Dataset],
     tables: set[str],
+    dialect: str,
 ) -> _Outputs:
     """Output taints of a whole query node (SELECT or a set operation)."""
 
     if isinstance(node, exp.Select):
-        return _select_outputs(node, env, known, tables)
+        return _select_outputs(node, env, known, tables, dialect)
     if isinstance(node, _QUERY_ROOTS):  # set operation: UNION/INTERSECT/EXCEPT
-        left = _query_outputs(node.left, env, known, tables)
-        right = _query_outputs(node.right, env, known, tables)
+        left = _query_outputs(node.left, env, known, tables, dialect)
+        right = _query_outputs(node.right, env, known, tables, dialect)
         # Column names come from the left side; taints merge positionally, and a
         # length mismatch (invalid SQL anyway) merges everything conservatively.
         left_items = list(left.items())
@@ -281,7 +357,7 @@ def _query_outputs(
             name: taint | right_taints[i] for i, (name, taint) in enumerate(left_items)
         }
     if isinstance(node, exp.Subquery):
-        return _query_outputs(node.this, env, known, tables)
+        return _query_outputs(node.this, env, known, tables, dialect)
     raise QueryRefusedError(f"unsupported query shape: {type(node).__name__}")
 
 
@@ -290,12 +366,15 @@ def _select_outputs(
     outer_env: dict[str, _Source],
     known: dict[str, Dataset],
     tables: set[str],
+    dialect: str,
 ) -> _Outputs:
     env = dict(outer_env)
     for cte in select.ctes:
-        env[cte.alias_or_name.lower()] = _query_outputs(cte.this, env, known, tables)
+        env[cte.alias_or_name.lower()] = _query_outputs(
+            cte.this, env, known, tables, dialect
+        )
 
-    sources = _resolve_sources(select, env, known, tables)
+    sources = _resolve_sources(select, env, known, tables, dialect)
 
     outputs: _Outputs = {}
     for projection in select.expressions:
@@ -310,7 +389,7 @@ def _select_outputs(
             outputs.update(_expand_star(sources[alias], alias))
             continue
         name = (projection.alias_or_name or projection.sql()).lower()
-        outputs[name] = _expr_taint(projection, sources, known, tables)
+        outputs[name] = _expr_taint(projection, sources, known, tables, dialect)
     return outputs
 
 
@@ -319,6 +398,7 @@ def _resolve_sources(
     env: dict[str, _Source],
     known: dict[str, Dataset],
     tables: set[str],
+    dialect: str,
 ) -> dict[str, _Source]:
     source_nodes: list[exp.Expression] = []
     # sqlglot renamed the arg key "from" to "from_" between major versions.
@@ -326,11 +406,13 @@ def _resolve_sources(
     if from_clause is not None:
         source_nodes.append(from_clause.this)
     source_nodes.extend(join.this for join in select.args.get("joins") or [])
+    # LATERAL VIEW (Databricks/Hive) hangs off the select, not the join list.
+    source_nodes.extend(select.args.get("laterals") or [])
 
     sources: dict[str, _Source] = {}
     for node in source_nodes:
         alias = node.alias_or_name.lower()
-        if isinstance(node, exp.Table):
+        if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
             dotted = ".".join(p for p in (node.catalog, node.db, node.name) if p)
             if node.name.lower() in env and not (node.catalog or node.db):
                 sources[alias] = env[node.name.lower()]  # a CTE shadows tables
@@ -338,7 +420,17 @@ def _resolve_sources(
             sources[alias] = _resolve_dataset(dotted, known, tables)
         elif isinstance(node, exp.Subquery):
             merged = env | sources
-            sources[alias] = _query_outputs(node.this, merged, known, tables)
+            sources[alias] = _query_outputs(node.this, merged, known, tables, dialect)
+        elif isinstance(
+            node, (exp.Unnest, exp.Lateral, exp.TableFromRows, exp.Table)
+        ) or (isinstance(node, exp.Pivot) and node.args.get("unpivot")):
+            merged = env | sources
+            key, outputs = _unnest_source(node, merged, known, tables, dialect)
+            if key in sources:
+                raise QueryRefusedError(
+                    f"duplicate source alias '{key}'; give each unnest its own alias"
+                )
+            sources[key] = outputs
         else:
             raise QueryRefusedError(
                 f"unsupported FROM source: {type(node).__name__}; query cached "
@@ -399,6 +491,7 @@ def _expr_taint(
     sources: dict[str, _Source],
     known: dict[str, Dataset],
     tables: set[str],
+    dialect: str,
 ) -> set[_Taint]:
     if isinstance(node, exp.Column):
         return _resolve_column(node, sources)
@@ -414,21 +507,175 @@ def _expr_taint(
         isinstance(node, exp.Select) and node.parent is not None
     ):
         inner = node.this if isinstance(node, exp.Subquery) else node
-        outputs = _query_outputs(inner, dict(sources), known, tables)
+        outputs = _query_outputs(inner, dict(sources), known, tables, dialect)
         return set().union(*outputs.values()) if outputs else set()
     if isinstance(node, exp.Filter):
         # FILTER (WHERE ...) is a filter: values flow in, not out.
-        return _expr_taint(node.this, sources, known, tables)
+        return _expr_taint(node.this, sources, known, tables, dialect)
     if isinstance(node, exp.Window):
         # PARTITION BY / ORDER BY route rows; only the function's output crosses.
-        return _expr_taint(node.this, sources, known, tables)
+        return _expr_taint(node.this, sources, known, tables, dialect)
     if isinstance(node, exp.Func) and _func_name(node) in _MEASURING:
         return set()
     # Everything else (carrying/unknown functions, operators, CASE, casts)
     # passes taint through from all children: fail closed.
     taint = set()
     for child in node.iter_expressions():
-        taint |= _expr_taint(child, sources, known, tables)
+        taint |= _expr_taint(child, sources, known, tables, dialect)
+    return taint
+
+
+def _unnest_source(
+    node: exp.Expression,
+    sources: dict[str, _Source],
+    known: dict[str, Dataset],
+    tables: set[str],
+    dialect: str,
+) -> tuple[str, _Outputs]:
+    """Admit a FROM-clause unnest construct, or refuse it.
+
+    Handles every dialect's native spelling: UNNEST (BigQuery, DuckDB,
+    Postgres, and Redshift's PartiQL navigation, which parses as an Unnest of
+    a bare column), LATERAL / LATERAL VIEW over explode-style calls (Snowflake
+    FLATTEN, Databricks explode and variant_explode), TABLE(FLATTEN(...)),
+    set-returning functions as a FROM item (Postgres), and Redshift's
+    UNPIVOT ... AT. The policy is uniform: each unnested expression must be a
+    bare column of an already-resolved source or an allowlisted JSON/array
+    call whose subtree reads nothing but such columns. Returns the alias to
+    register and the output columns, every one carrying the union of the
+    inner expressions' taints.
+    """
+
+    if isinstance(node, exp.Unnest):
+        inner = list(node.expressions)
+        table_alias = node.args.get("alias")
+        offset = node.args.get("offset")
+    elif isinstance(node, (exp.Lateral, exp.TableFromRows)):
+        inner = [node.this]
+        table_alias = node.args.get("alias")
+        offset = None
+    elif isinstance(node, exp.Table):
+        inner = [node.this]
+        table_alias = node.args.get("alias")
+        offset = node.args.get("ordinality")
+    else:  # Pivot(unpivot=True): UNPIVOT <col> AS <value> AT <key>
+        at_index = node.this
+        if not isinstance(at_index, exp.AtIndex):
+            raise QueryRefusedError(
+                "unsupported FROM source: Pivot; query cached tables and views only"
+            )
+        value_expr = at_index.this
+        value_name = ""
+        if isinstance(value_expr, exp.Alias):
+            value_name = value_expr.alias
+            value_expr = value_expr.this
+        key_name = at_index.expression.name if at_index.expression is not None else ""
+        taint = _unnest_taint([value_expr], sources, known, tables, dialect)
+        outputs = {
+            name.lower(): set(taint)
+            for name in (value_name or "value", key_name or "key")
+        }
+        return (value_name or key_name or "unpivot").lower(), outputs
+
+    if not inner:
+        raise QueryRefusedError(
+            "unnest has nothing to unnest; give it a column of a queried "
+            "table or a permitted JSON/array function over one"
+        )
+    taint = _unnest_taint(inner, sources, known, tables, dialect)
+
+    # Output naming. Explicit column aliases win; otherwise the construct's
+    # own convention applies: a lone table alias doubles as the column name
+    # (BigQuery UNNEST(...) AS k, Postgres jsonb_object_keys(...) AS k), and
+    # explode-style constructs emit their fixed columns.
+    alias_name = ""
+    columns: list[str] = []
+    if table_alias is not None:
+        this = table_alias.args.get("this")
+        # BigQuery synthesizes a _tN table alias for UNNEST(...) AS k; the
+        # user-visible name is the column alias, not the synthetic one.
+        if isinstance(this, exp.Identifier) and not re.fullmatch(r"_t\d+", this.name):
+            alias_name = this.name
+        columns = [c.name for c in table_alias.columns]
+    if not columns:
+        if isinstance(node, (exp.Lateral, exp.TableFromRows)):
+            fixed = _FLATTEN_COLUMNS if dialect == "snowflake" else _EXPLODE_COLUMNS
+            columns = list(fixed)
+        elif isinstance(node, exp.Table):
+            columns = [alias_name, "key", "value"] if alias_name else ["key", "value"]
+        elif alias_name:
+            columns = [alias_name]
+        elif len(inner) == 1 and dialect == "duckdb":
+            columns = ["unnest"]  # DuckDB's default name for a bare UNNEST
+        else:
+            raise QueryRefusedError(
+                "alias the unnest so its output has a column name, e.g. "
+                "UNNEST(...) AS u(k)"
+            )
+    if isinstance(offset, exp.Expression):
+        columns.append(offset.name or "offset")
+    elif offset:
+        columns.append("offset" if isinstance(node, exp.Unnest) else "ordinality")
+
+    key = (alias_name or columns[0]).lower()
+    return key, {name.lower(): set(taint) for name in columns if name}
+
+
+def _unnest_taint(
+    inner: list[exp.Expression],
+    sources: dict[str, _Source],
+    known: dict[str, Dataset],
+    tables: set[str],
+    dialect: str,
+) -> set[_Taint]:
+    """Validate the expressions a FROM-clause unnest reads and return their
+    combined taint. A bare column may be dotted past two parts (Redshift
+    PartiQL navigates into SUPER: t.doc.items); the leftmost identifier is the
+    source alias and the next one is the profiled column, so navigation
+    inherits that column's taint."""
+
+    classes, names = _UNNEST_FUNCS.get(dialect, ((), frozenset()))
+    taint: set[_Taint] = set()
+    for expr in inner:
+        if isinstance(expr, exp.Column):
+            parts = [p.name for p in expr.parts]
+            if len(parts) == 1:
+                taint |= _resolve_column(expr, sources)
+                continue
+            qualifier = parts[0].lower()
+            if qualifier not in sources:
+                raise QueryRefusedError(
+                    f"unknown table or alias '{parts[0]}' for unnest of '{expr.sql()}'"
+                )
+            taint |= _source_column_taint(sources[qualifier], parts[1])
+            continue
+        allowed_call = isinstance(expr, classes) or (
+            isinstance(expr, exp.Anonymous) and str(expr.this).lower() in names
+        )
+        if not allowed_call:
+            permitted = sorted({c.__name__ for c in classes} | set(names))
+            raise QueryRefusedError(
+                f"unnest of {type(expr).__name__} is not permitted; unnest a "
+                "column of a queried table directly, or through one of: "
+                + ", ".join(permitted)
+            )
+        for sub in expr.walk():
+            if isinstance(sub, (exp.Select, exp.Subquery, exp.Table)):
+                raise QueryRefusedError(
+                    "unnest must not read a table or subquery; unnest a "
+                    "column of an already-queried table, directly or through "
+                    "a permitted JSON/array function"
+                )
+            if isinstance(sub, exp.Func) and not isinstance(sub, exp.Cast):
+                sub_allowed = isinstance(sub, classes) or (
+                    isinstance(sub, exp.Anonymous) and str(sub.this).lower() in names
+                )
+                if not sub_allowed:
+                    raise QueryRefusedError(
+                        f"unnest argument calls {type(sub).__name__}, which is "
+                        "not a permitted JSON/array function here"
+                    )
+        taint |= _expr_taint(expr, sources, known, tables, dialect)
     return taint
 
 

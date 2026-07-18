@@ -138,6 +138,32 @@ def test_query_firewall_allows_measuring_and_refuses_pii_values(tmp_path: Path, 
     assert "PII" in envelope["errors"][0]
 
 
+def test_query_firewall_unpivots_the_seeded_super_column(tmp_path: Path, capsys):
+    seed_repo(tmp_path, schemas=["app"], budget=MAP_BUDGET)
+    rc, _ = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--confirm"], capsys
+    )
+    assert rc == 0
+
+    # PartiQL object UNPIVOT: every distinct top-level key of the SUPER column.
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "query",
+            "SELECT k, count(*) AS n FROM app.products p, "
+            "UNPIVOT p.attrs AS v AT k GROUP BY k ORDER BY n DESC",
+            "--confirm",
+            "--budget",
+            str(QUERY_BUDGET),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["row_count"] >= 1
+
+
 # --- scope resolution against the live database (one catalog SELECT) -----------------
 
 

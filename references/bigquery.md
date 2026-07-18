@@ -109,3 +109,20 @@ profile carries `maximum_bytes_billed` so every statement dbt runs is capped
 server-side; `transform build` has no upfront estimate (dbt has no dry-run)
 but still requires `--confirm` and a `--budget`, and its billed bytes land in
 the spend ledger.
+
+## JSON quirks
+
+Two BigQuery behaviors cost real debugging time when modeling JSON with
+dynamic (data-dependent) keys, the shape NoSQL-sourced CDC exports land in:
+
+- A JSON function's path argument must be a compile-time literal; building it
+  per row (string concatenation into `JSON_QUERY`) is rejected at compile
+  time. The subscript operator on the JSON value (`doc[key_expr]`) accepts a
+  computed key.
+- `JSON_KEYS` recurses into nested objects by default, silently returning
+  nested field names alongside the real top-level keys; pass an explicit
+  depth (`JSON_KEYS(doc, 1)`) to stop it. The symptom of the default is
+  quiet: extra rows that orphan a downstream join.
+
+The shipped `unpivot_json_object` macro (`transform macro unpivot_json_object`)
+bakes both fixes in; prefer it to hand-rolling this pattern.

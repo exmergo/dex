@@ -219,6 +219,54 @@ def test_query_firewall_enforces_pii_flagged_never_surfaced():
     inspect_query("SELECT COUNT(DISTINCT email) FROM customers", cache, QueryLimits())
 
 
+def test_query_firewall_unnest_reshapes_but_never_smuggles():
+    # Every dialect's native FROM-clause unnest idiom is admitted over a clear
+    # column, refused when a subquery hides inside, and refused when it would
+    # project a flagged column's values: the reshape inherits the taint.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.events",
+                columns=[
+                    ColumnProfile(name="id", data_type="INTEGER"),
+                    ColumnProfile(name="doc", data_type="JSON"),
+                    ColumnProfile(
+                        name="payload",
+                        data_type="JSON",
+                        pii=PIIFlag(category="email", confidence=0.9),
+                    ),
+                ],
+            )
+        ]
+    )
+    idioms = {
+        "bigquery": "FROM events, UNNEST(JSON_KEYS({col})) AS k",
+        "snowflake": "FROM events, LATERAL FLATTEN(input => {col}) AS k(k)",
+        "databricks": (
+            "FROM events LATERAL VIEW EXPLODE(json_object_keys({col})) x AS k"
+        ),
+        "postgres": "FROM events, jsonb_object_keys({col}) AS k",
+        "redshift": "FROM events e, UNPIVOT e.{col} AS v AT k",
+        "duckdb": "FROM events, UNNEST(json_keys({col})) AS u(k)",
+    }
+    for dialect, idiom in idioms.items():
+        allowed = "SELECT k " + idiom.format(col="doc")
+        inspect_query(allowed, cache, QueryLimits(), dialect=dialect)
+        smuggle = "SELECT k " + idiom.format(col="(SELECT doc FROM events)")  # noqa: S608
+        with pytest.raises(QueryRefusedError):
+            inspect_query(smuggle, cache, QueryLimits(), dialect=dialect)
+        flagged = "SELECT k " + idiom.format(col="payload")
+        with pytest.raises(QueryRefusedError):
+            inspect_query(flagged, cache, QueryLimits(), dialect=dialect)
+
+
 def test_firewall_block_threshold_is_a_hard_coded_engine_constant():
     # The threshold is engine policy, not configuration: a config edit must
     # never be able to widen the PII boundary. Its value is load-bearing (every

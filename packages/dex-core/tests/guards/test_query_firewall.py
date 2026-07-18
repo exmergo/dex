@@ -339,3 +339,233 @@ def test_sub_threshold_column_qualifies_as_a_recovery_twin():
     with pytest.raises(QueryRefusedError) as excinfo:
         inspect_query("SELECT NAME FROM PRODUCTS", cache, LIMITS)
     assert "INVENTORY_ITEMS.PRODUCT_NAME" in str(excinfo.value)
+
+
+# --- FROM-clause unnest: reshape without smuggling -------------------------------
+
+
+@pytest.fixture
+def json_cache() -> DexCache:
+    """A JSON-bearing table: ATTRS is clear, PROFILE is flagged above the block
+    threshold, and HINT sits below it (projects with a warning)."""
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.RAW_HOSTS",
+                columns=[
+                    ColumnProfile(name="ID", data_type="INTEGER"),
+                    ColumnProfile(name="ATTRS", data_type="JSON"),
+                    ColumnProfile(
+                        name="PROFILE",
+                        data_type="JSON",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                    ColumnProfile(
+                        name="HINT",
+                        data_type="JSON",
+                        pii=PIIFlag(category="name", confidence=0.3),
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
+UNNEST_ALLOWED = [
+    (
+        "bigquery",
+        "SELECT k, COUNT(*) AS n FROM RAW_HOSTS, UNNEST(JSON_KEYS(ATTRS)) AS k "
+        "GROUP BY k ORDER BY n DESC",
+    ),
+    (
+        "bigquery",
+        "SELECT k, pos FROM RAW_HOSTS, UNNEST(JSON_KEYS(ATTRS)) AS k WITH OFFSET pos",
+    ),
+    (
+        "bigquery",
+        "SELECT e FROM RAW_HOSTS, UNNEST(JSON_EXTRACT_ARRAY(ATTRS, '$.tags')) AS e",
+    ),
+    ("bigquery", "SELECT e FROM RAW_HOSTS, UNNEST(ATTRS) AS e"),
+    (
+        "snowflake",
+        "SELECT f.key, f.value FROM RAW_HOSTS, LATERAL FLATTEN(input => ATTRS) f",
+    ),
+    (
+        "snowflake",
+        "SELECT f.value FROM RAW_HOSTS, TABLE(FLATTEN(input => ATTRS)) f",
+    ),
+    (
+        "snowflake",
+        "SELECT f.value FROM RAW_HOSTS r, LATERAL FLATTEN(input => r.ATTRS:items) f",
+    ),
+    (
+        "databricks",
+        "SELECT k FROM RAW_HOSTS LATERAL VIEW EXPLODE(json_object_keys(ATTRS)) x AS k",
+    ),
+    (
+        "databricks",
+        "SELECT e.key, e.value FROM RAW_HOSTS, LATERAL variant_explode(ATTRS) e",
+    ),
+    (
+        "databricks",
+        "SELECT e.value FROM RAW_HOSTS, "
+        "LATERAL explode(from_json(ATTRS, 'map<string,string>')) e",
+    ),
+    (
+        "postgres",
+        "SELECT k, COUNT(*) FROM RAW_HOSTS, jsonb_object_keys(ATTRS) AS k GROUP BY k",
+    ),
+    (
+        "postgres",
+        "SELECT e.k, e.v FROM RAW_HOSTS "
+        "CROSS JOIN LATERAL jsonb_each(ATTRS) AS e(k, v)",
+    ),
+    ("postgres", "SELECT e FROM RAW_HOSTS, jsonb_array_elements(ATTRS) AS e"),
+    ("redshift", "SELECT elem FROM RAW_HOSTS r, r.ATTRS AS elem"),
+    ("redshift", "SELECT e FROM RAW_HOSTS r, r.ATTRS.items AS e"),
+    ("redshift", "SELECT k, v FROM RAW_HOSTS r, UNPIVOT r.ATTRS AS v AT k"),
+    (
+        "duckdb",
+        "SELECT k, COUNT(*) FROM RAW_HOSTS, UNNEST(json_keys(ATTRS)) AS u(k) "
+        "GROUP BY k",
+    ),
+    ("duckdb", "SELECT unnest FROM RAW_HOSTS, UNNEST(json_keys(ATTRS))"),
+    ("duckdb", "SELECT e FROM RAW_HOSTS, UNNEST(json_extract(ATTRS, '$.a')) AS u(e)"),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql"), UNNEST_ALLOWED)
+def test_unnest_allowed(dialect: str, sql: str, json_cache: DexCache):
+    inspected = inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert inspected.tables == ["db.main.RAW_HOSTS"]
+    assert not inspected.warnings
+
+
+UNNEST_REFUSED = [
+    (
+        "bigquery",
+        "SELECT e FROM RAW_HOSTS, UNNEST((SELECT ATTRS FROM RAW_HOSTS)) AS e",
+        "not permitted",
+    ),
+    (
+        "snowflake",
+        "SELECT f.value FROM RAW_HOSTS, "
+        "LATERAL FLATTEN(input => (SELECT ATTRS FROM RAW_HOSTS)) f",
+        "table or subquery",
+    ),
+    (
+        "databricks",
+        "SELECT e.value FROM RAW_HOSTS, "
+        "LATERAL explode((SELECT ATTRS FROM RAW_HOSTS)) e",
+        "table or subquery",
+    ),
+    (
+        "postgres",
+        "SELECT k FROM RAW_HOSTS, "
+        "jsonb_object_keys((SELECT ATTRS FROM RAW_HOSTS)) AS k",
+        "table or subquery",
+    ),
+    ("duckdb", "SELECT e FROM RAW_HOSTS, UNNEST([1, 2]) AS u(e)", "not permitted"),
+    (
+        "bigquery",
+        "SELECT e FROM RAW_HOSTS, UNNEST(GENERATE_ARRAY(1, 1000000)) AS e",
+        "not permitted",
+    ),
+    (
+        "bigquery",
+        "SELECT e FROM RAW_HOSTS, UNNEST(SPLIT(ATTRS, ',')) AS e",
+        "not permitted",
+    ),
+    (
+        "postgres",
+        "SELECT k FROM RAW_HOSTS, some_udf(ATTRS) AS k",
+        "not permitted",
+    ),
+    (
+        "bigquery",
+        "SELECT k FROM UNNEST(JSON_KEYS(t.ATTRS)) AS k, RAW_HOSTS t",
+        "unknown table or alias",
+    ),
+    (
+        "bigquery",
+        "SELECT k FROM RAW_HOSTS, UNNEST(JSON_KEYS(NOPE)) AS k",
+        "not in any queried table's profile",
+    ),
+    (
+        "duckdb",
+        "SELECT 1 FROM RAW_HOSTS, UNNEST(json_keys(ATTRS)), UNNEST(json_keys(ATTRS))",
+        "duplicate source alias",
+    ),
+    # An unknown qualifier does not even parse as navigation: sqlglot reads
+    # x.ATTRS as a table reference, so the cache gate refuses it.
+    (
+        "redshift",
+        "SELECT elem FROM RAW_HOSTS r, x.ATTRS AS elem",
+        "not in the .dex cache",
+    ),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql", "fragment"), UNNEST_REFUSED)
+def test_unnest_refused(dialect: str, sql: str, fragment: str, json_cache: DexCache):
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert fragment.lower() in str(excinfo.value).lower()
+
+
+UNNEST_PII_BLOCKED = [
+    ("bigquery", "SELECT k FROM RAW_HOSTS, UNNEST(JSON_KEYS(PROFILE)) AS k"),
+    ("bigquery", "SELECT pos FROM RAW_HOSTS, UNNEST(PROFILE) AS e WITH OFFSET pos"),
+    ("snowflake", "SELECT f.index FROM RAW_HOSTS, LATERAL FLATTEN(input => PROFILE) f"),
+    ("databricks", "SELECT e.key FROM RAW_HOSTS, LATERAL variant_explode(PROFILE) e"),
+    ("postgres", "SELECT k FROM RAW_HOSTS, jsonb_object_keys(PROFILE) AS k"),
+    ("redshift", "SELECT v FROM RAW_HOSTS r, UNPIVOT r.PROFILE AS v AT k"),
+    ("redshift", "SELECT k FROM RAW_HOSTS r, UNPIVOT r.PROFILE AS v AT k"),
+    ("duckdb", "SELECT k FROM RAW_HOSTS, UNNEST(json_keys(PROFILE)) AS u(k)"),
+    (
+        "bigquery",
+        "SELECT * FROM RAW_HOSTS, UNNEST(JSON_KEYS(ATTRS)) AS k",  # * pulls PROFILE
+    ),
+]
+
+
+@pytest.mark.parametrize(("dialect", "sql"), UNNEST_PII_BLOCKED)
+def test_unnest_output_carries_the_source_taint(
+    dialect: str, sql: str, json_cache: DexCache
+):
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert "PROFILE" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql"),
+    [
+        (
+            "bigquery",
+            "SELECT COUNT(DISTINCT k) FROM RAW_HOSTS, UNNEST(JSON_KEYS(PROFILE)) AS k",
+        ),
+        (
+            "snowflake",
+            "SELECT COUNT(f.key) FROM RAW_HOSTS, LATERAL FLATTEN(input => PROFILE) f",
+        ),
+    ],
+)
+def test_measuring_aggregate_still_cuts_the_unnest_taint(
+    dialect: str, sql: str, json_cache: DexCache
+):
+    inspected = inspect_query(sql, json_cache, LIMITS, dialect=dialect)
+    assert inspected.tables == ["db.main.RAW_HOSTS"]
+
+
+def test_sub_threshold_flag_flows_through_the_unnest_as_a_warning(
+    json_cache: DexCache,
+):
+    inspected = inspect_query(
+        "SELECT k FROM RAW_HOSTS, UNNEST(JSON_KEYS(HINT)) AS k",
+        json_cache,
+        LIMITS,
+        dialect="bigquery",
+    )
+    assert any("HINT" in warning for warning in inspected.warnings)

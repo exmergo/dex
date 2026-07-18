@@ -31,19 +31,38 @@ _JINJA_STMT = re.compile(r"\{%.*?%\}", re.DOTALL)
 _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _PLACEHOLDER = "__dex_jinja__"
 
+# Macro definition delimiters, tolerant of whitespace-control markers. A macro
+# file is jinja, not SQL, so its shape check is structural: definitions only,
+# nothing loose between them. dbt's own parser is the authoritative gate.
+_MACRO_OPEN = re.compile(r"\{%-?\s*macro\s+\w+\s*\(")
+_MACRO_CLOSE = re.compile(r"\{%-?\s*endmacro\s*-?%\}")
+_MACRO_BLOCK = re.compile(r"\{%-?\s*macro\s.*?\{%-?\s*endmacro\s*-?%\}", re.DOTALL)
+
 
 def strip_jinja(sql: str) -> str:
     """Reduce a dbt model to plain SQL for the SELECT-only check.
 
     Inline expressions (``{{ ref(...) }}``) become an identifier placeholder;
-    statement and comment blocks are removed; a line that was nothing but jinja
-    (a ``{{ config(...) }}`` header) is dropped entirely.
+    statement and comment blocks are removed. A line that was nothing but
+    jinja is dropped at the top level (a ``{{ config(...) }}`` header), but
+    inside parentheses it becomes a placeholder subquery, because there it is
+    a macro rendering a whole SELECT (``from ( {{ unpivot_json_object(...) }} )``)
+    and dropping it would leave unparseable SQL. Depth counting is naive about
+    parens inside string literals; a miscount only ever refuses, never admits.
     """
 
     text = _JINJA_COMMENT.sub("", sql)
     text = _JINJA_STMT.sub("", text)
     text = _JINJA_EXPR.sub(_PLACEHOLDER, text)
-    lines = [line for line in text.splitlines() if line.strip() != _PLACEHOLDER]
+    lines: list[str] = []
+    depth = 0
+    for line in text.splitlines():
+        if line.strip() == _PLACEHOLDER:
+            if depth > 0:
+                lines.append(line.replace(_PLACEHOLDER, f"select {_PLACEHOLDER}"))
+            continue
+        depth += line.count("(") - line.count(")")
+        lines.append(line)
     return "\n".join(lines).strip()
 
 
@@ -53,7 +72,26 @@ def validate_edit(edit: PlanEdit) -> list[str]:
     from .plans import EditKind
 
     warnings: list[str] = []
-    if edit.kind is EditKind.MODEL_SQL:
+    if edit.kind is EditKind.MACRO_SQL:
+        opens = len(_MACRO_OPEN.findall(edit.new_content))
+        closes = len(_MACRO_CLOSE.findall(edit.new_content))
+        if opens == 0:
+            raise EditValidationError(
+                f"{edit.path}: a macro_sql edit needs at least one "
+                "{% macro name(...) %} definition"
+            )
+        if opens != closes:
+            raise EditValidationError(
+                f"{edit.path}: unbalanced macro definitions "
+                f"({opens} macro, {closes} endmacro)"
+            )
+        outside = _JINJA_COMMENT.sub("", _MACRO_BLOCK.sub("", edit.new_content))
+        if outside.strip():
+            raise EditValidationError(
+                f"{edit.path}: a macro file holds only macro definitions and "
+                "jinja comments; found loose content outside them"
+            )
+    elif edit.kind is EditKind.MODEL_SQL:
         stripped = strip_jinja(edit.new_content)
         if not stripped:
             warnings.append(

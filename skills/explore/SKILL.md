@@ -94,7 +94,17 @@ Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single
 query rather than issuing many; aggregates over PII-flagged columns must be
 measuring (COUNT, APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), never value-carrying
-(MIN, ANY_VALUE, STRING_AGG). A column whose flag was de-rated below the 0.5
+(MIN, ANY_VALUE, STRING_AGG). The FROM clause may unnest JSON and array
+columns in the connector's native idiom, which is the right way to explore
+schemaless data (for example "which keys appear across every row of this JSON
+column"): BigQuery `t, UNNEST(JSON_KEYS(doc)) AS k`, Snowflake
+`t, LATERAL FLATTEN(input => doc) f`, Databricks
+`t LATERAL VIEW EXPLODE(json_object_keys(doc)) x AS k`, Postgres
+`t, jsonb_object_keys(doc) AS k`, Redshift `t, UNPIVOT t.doc AS v AT k`,
+DuckDB `t, UNNEST(json_keys(doc)) AS u(k)`. The unnested value must come from
+a column of a table in the query (bare, or through a JSON/array function);
+unnesting a subquery, another table, a literal, or a generator is refused,
+and the unnest's outputs inherit the source column's PII flags. A column whose flag was de-rated below the 0.5
 blocking threshold projects normally, with an envelope warning naming it; treat
 the warning as information for the user, not an error to fix. If the user says a
 refused column is not personal data, recommend a `pii_overrides` entry in

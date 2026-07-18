@@ -232,7 +232,9 @@ def shadow_parse(
             ),
         )
         for edit in edits:
-            edit_path = contained_path(shadow, edit.path, view.model_paths)
+            edit_path = contained_path(
+                shadow, edit.path, view.model_paths, view.macro_paths
+            )
             edit_path.parent.mkdir(parents=True, exist_ok=True)
             edit_path.write_text(edit.new_content, encoding="utf-8")
 

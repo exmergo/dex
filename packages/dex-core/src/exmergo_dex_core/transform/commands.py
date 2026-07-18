@@ -104,6 +104,69 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
     return _make_plan(args, intent, edits)
 
 
+def cmd_macro(args: argparse.Namespace) -> env.Envelope:
+    """List the shipped macros, or plan scaffolding one into the project."""
+
+    from ..dbt_project import load as load_project
+    from . import scaffold as scaffold_mod
+
+    name = getattr(args, "argument", None)
+    if not name:
+        return env.ok(
+            {
+                "macros": [
+                    {"name": macro_name, "description": description}
+                    for macro_name, description in sorted(
+                        scaffold_mod.MACRO_ASSETS.items()
+                    )
+                ],
+                "next": "scaffold one with `transform macro <name>`",
+            }
+        )
+
+    project = command_args.project_dir(args)
+    view = load_project(project)
+    edit = scaffold_mod.macro_edit(name, view.macro_paths[0])
+
+    warnings: list[str] = []
+    existing = view.files.get(edit.path)
+    if existing is not None and existing.content == edit.new_content:
+        return env.ok(
+            {
+                "macro": name,
+                "path": edit.path,
+                "up_to_date": True,
+            },
+            warnings=[f"{edit.path} already matches the shipped version"],
+        )
+    if existing is not None:
+        warnings.append(
+            f"{edit.path} differs from the shipped version (customized or "
+            "stale); the diff below reconciles them, and applying it "
+            "overwrites the project's copy"
+        )
+
+    # The authoritative gate, same layering as semantic plans: dbt's own
+    # parser sees the macro in a shadow copy of the project, which also
+    # catches a name collision with a macro defined elsewhere in the project.
+    from ..config import DexConfig, load_config
+    from .build import shadow_parse
+
+    config = load_config(command_args.repo_root(args)) or DexConfig()
+    parse_result = shadow_parse(project, [edit], target=config.dbt_target)
+    if not parse_result["available"]:
+        warnings.append(parse_result["reason"])
+    elif not parse_result["success"]:
+        return env.error(
+            _failure_message("dbt parse failed", parse_result["messages"]),
+            warnings=parse_result["messages"][1:],
+        )
+
+    envelope = _make_plan(args, f"scaffold macro {name}", [edit])
+    envelope.warnings.extend(warnings)
+    return envelope
+
+
 def cmd_apply(args: argparse.Namespace) -> env.Envelope:
     plan_id = getattr(args, "argument", None)
     if not plan_id:

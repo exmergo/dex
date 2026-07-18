@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import DBX_MAX_SECONDS
+from .conftest import DBX_MAX_SECONDS, assert_unpivot_build, unpivot_fixture_edits
 from .test_databricks_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.databricks]
@@ -193,3 +193,71 @@ def test_missing_dev_catalog_is_refused_before_the_cost_gate(
     assert "dex_no_such_dev_catalog" in error
     assert "CREATE CATALOG IF NOT EXISTS dex_no_such_dev_catalog" in error
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_unpivot_json_object_macro_builds_live(
+    tmp_path: Path, capsys, dbx_warehouse, dbx_scratch_catalog
+):
+    """Also pins the macro's VARIANT floor: variant_explode must exist on the
+    scratch SQL warehouse (DBR 15.3+ / current warehouses)."""
+
+    pytest.importorskip("dbt.adapters.databricks")
+    if not dbx_scratch_catalog:
+        pytest.skip("transform needs DEX_TEST_DATABRICKS_CATALOG (a writable scratch)")
+    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_HOST"):
+        pytest.skip("DATABRICKS_HOST is set without DATABRICKS_TOKEN; dbt needs one")
+    root = str(tmp_path)
+    seed_repo(tmp_path, dbx_warehouse, dbx_scratch_catalog)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, envelope
+
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            unpivot_fixture_edits(
+                lambda d: f"parse_json('{d}')", "cast(null as variant)"
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "unpivot fixture",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    rc, built = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            str(DBX_MAX_SECONDS * 10),
+        ],
+        capsys,
+    )
+    assert rc == 0, built
+    assert_unpivot_build(built)
