@@ -261,6 +261,12 @@ class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
 
+    # The DuckDB on-ramp: a config that omits `connector:` (or a bare `--path`
+    # read with no config) means the free local connector. This default only
+    # applies to a config that actually exists or an explicit `--path`; it is NOT
+    # a fallback for a missing config. `open_adapter` refuses when no config
+    # resolves and nothing explicit is given, rather than fabricating a duckdb
+    # target, so this default can never stand in for a config that was not found.
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
     bigquery: BigQueryTarget | None = None
