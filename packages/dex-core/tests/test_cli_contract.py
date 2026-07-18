@@ -107,10 +107,11 @@ def test_scope_parses_in_either_position_and_repeats(argv_builder, tmp_path, cap
     """`--scope` is a connection option like `--path`, so it has to work on both
     sides of the subcommand and accumulate."""
 
-    rc = main(["--repo-root", str(tmp_path), *argv_builder()])
+    # An explicit --connector, so this exercises scope parsing rather than the
+    # no-config refusal: DuckDB has no scope, so a parsed --scope is a clean
+    # refusal naming the flag, which proves argparse accepted it in this position.
+    rc = main(["--repo-root", str(tmp_path), "--connector", "duckdb", *argv_builder()])
     payload = json.loads(capsys.readouterr().out)
-    # DuckDB is the default connector and has no scope, so this is a clean refusal
-    # rather than a parse error: the point is that argparse accepted the flag.
     assert rc == 1
     assert payload["status"] == "error"
     assert "--scope" in payload["errors"][0]

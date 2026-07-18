@@ -75,3 +75,28 @@ def test_distinct_combination_counts_are_exact(duckdb_file: Path):
 def test_open_adapter_requires_a_path():
     with pytest.raises(ValueError):
         open_adapter(connector="duckdb", path=None, repo_root="/nonexistent-root")
+
+
+def test_committed_duckdb_path_resolves_against_repo_root_not_cwd(
+    duckdb_file: Path, tmp_path: Path, monkeypatch
+):
+    # A relative duckdb.path in .dex/config.yml is a committed target, so it must
+    # resolve against the project root the config lives in, not the process cwd.
+    # This is what lets a command run from a subdirectory open the same file.
+    import shutil
+
+    from exmergo_dex_core.config import DexConfig, DuckDBTarget, save_config
+
+    shutil.copy(duckdb_file, tmp_path / "w.duckdb")
+    save_config(
+        DexConfig(connector="duckdb", duckdb=DuckDBTarget(path="w.duckdb")), tmp_path
+    )
+    elsewhere = tmp_path / "sub" / "dir"
+    elsewhere.mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+
+    adapter = open_adapter(repo_root=str(tmp_path))
+    try:
+        assert adapter.capabilities()["read_only"] is True
+    finally:
+        adapter.close()

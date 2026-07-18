@@ -103,14 +103,37 @@ def open_adapter(
     ignored by free ones; ``command`` labels ledger entries.
     """
 
-    config = load_config(repo_root) or DexConfig()
+    loaded = load_config(repo_root)
+    if loaded is None and connector is None and path is None:
+        # No config resolved anywhere up the tree, and nothing explicit to fall
+        # back on. Refusing here (rather than defaulting to duckdb) is the
+        # connector-selection half of "no silent connector default": a run from a
+        # subdirectory with a real config higher up is fixed by the walk-up in
+        # command_args, so reaching this point means there is genuinely nothing.
+        raise ValueError(
+            f"no .dex/config.yml found searching from '{repo_root}' up to the git "
+            "root: run inside your dex project, pass --repo-root, or pass "
+            "--connector/--path for an ad-hoc read"
+        )
+    config = loaded or DexConfig()
     connector = connector or config.connector
     assert_scope_vocabulary(
         connector, project=project, datasets=datasets, scopes=scopes
     )
 
     if connector == "duckdb":
-        resolved = path or (config.duckdb.path if config.duckdb else None)
+        if path:
+            # A live --path is typed in the user's shell, so it stays relative to
+            # the process cwd.
+            resolved = path
+        elif config.duckdb and config.duckdb.path:
+            # A committed duckdb.path is relative to the config's project root, not
+            # the cwd, so the same target resolves from any subdirectory (config
+            # is now found by walking up). An absolute path is left untouched.
+            target = Path(config.duckdb.path)
+            resolved = str(target if target.is_absolute() else Path(repo_root) / target)
+        else:
+            resolved = None
         if not resolved:
             raise ValueError(
                 "no DuckDB path: pass --path or set duckdb.path in .dex/config.yml"

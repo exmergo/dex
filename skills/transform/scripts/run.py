@@ -19,10 +19,14 @@ The engine version is pinned; the connector *extra* is chosen at runtime from th
 active connector, so one published release serves every warehouse. This wrapper is
 stdlib-only and runs before the engine is installed, so it resolves the connector
 itself (it cannot import the engine) with the same precedence the engine uses:
-an explicit --connector flag, then the top-level `connector:` in
-<repo-root>/.dex/config.yml, then DuckDB. The guess only picks which extra to
-install; the full argv is still forwarded, so the engine stays authoritative for
-the actual connection and a wrong guess surfaces as a clean error envelope.
+an explicit --connector flag, then the top-level `connector:` in the
+`.dex/config.yml` found by walking up from the run directory to the git root (the
+way git and dbt find their project), then DuckDB. The walk-up must mirror the
+engine's: if it did not, a run from a subdirectory would install the DuckDB extra
+while the engine resolves the project's real connector and then fails for want of
+that connector's deps. The guess only picks which extra to install; the full argv
+is still forwarded, so the engine stays authoritative for the actual connection
+and a wrong guess surfaces as a clean error envelope.
 
 `DEX_CORE_VERSION` is the single line bumped at release time, by
 scripts/prepare_release.sh before the tag; nothing else here changes per release.
@@ -76,9 +80,30 @@ def _connector_from_config(config_path: Path) -> str | None:
     return None
 
 
+def _find_config(start: Path) -> Path | None:
+    """Nearest ancestor `.dex/config.yml` at or above `start`, mirroring the
+    engine's resolution: walk up to the enclosing git repo (the ceiling), and
+    without one do not walk above `start`. Anchors on the file so a subdirectory
+    holding only a `.dex/` cache never shadows the real config higher up."""
+
+    start = start.resolve()
+    ceiling = start
+    for directory in (start, *start.parents):
+        if (directory / ".git").exists():
+            ceiling = directory
+            break
+    for directory in (start, *start.parents):
+        candidate = directory / ".dex" / "config.yml"
+        if candidate.is_file():
+            return candidate
+        if directory == ceiling:
+            break
+    return None
+
+
 def _resolve_connector(argv: list[str], cwd: Path) -> str:
     """Pick the connector whose extra we install, mirroring the engine's order:
-    explicit --connector, then .dex/config.yml, then DuckDB."""
+    explicit --connector, then the walked-up .dex/config.yml, then DuckDB."""
 
     # allow_abbrev=False and parse_known_args so we only peek at these two flags
     # and never consume or reorder the argv that is forwarded to the engine.
@@ -87,9 +112,11 @@ def _resolve_connector(argv: list[str], cwd: Path) -> str:
     parser.add_argument("--repo-root", default=".")
     known, _ = parser.parse_known_args(argv)
 
-    connector = known.connector or _connector_from_config(
-        cwd / known.repo_root / ".dex" / "config.yml"
-    )
+    connector = known.connector
+    if connector is None:
+        config_path = _find_config(cwd / known.repo_root)
+        if config_path is not None:
+            connector = _connector_from_config(config_path)
     return connector if connector in _KNOWN_CONNECTORS else _DEFAULT_CONNECTOR
 
 

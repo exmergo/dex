@@ -35,8 +35,13 @@ Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
 `[postgres]`, `[redshift]`, or `[all]` for every connector at once. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
-connector (an explicit `--connector`, then `.dex/config.yml`, then DuckDB), so a
-release is connector-neutral.
+connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
+found by walking up from the run directory to the git root, then DuckDB), so a
+release is connector-neutral. The engine resolves the same way but does not default
+silently: with no `.dex/config.yml` anywhere up the tree and no explicit
+`--connector`/`--path`, it refuses and names the fix rather than reading a phantom
+DuckDB target, so a command run from a subdirectory of your project resolves the
+project's real config instead of a wrong default.
 
 | Subcommand | Returns |
 |---|---|

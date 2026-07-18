@@ -10,7 +10,8 @@ logic.
 - A surface (SKILL.md or AGENTS.md) tells the agent which subcommand to run.
 - A thin PEP 723 wrapper (`skills/<skill>/scripts/run.py`) runs it via `uv run`
   against the pinned engine version, installing the connector extra it resolves at
-  runtime (an explicit `--connector`, then `.dex/config.yml`, then DuckDB), so the
+  runtime (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
+  found by walking up from the run directory to the git root, then DuckDB), so the
   pin stays connector-neutral.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
@@ -98,9 +99,10 @@ deps step in `transform build`) installs them.
   target wired to the warehouse dex already knows (`--path`, or `duckdb.path` in
   `.dex/config.yml`). It is strictly additive (any existing dbt project is a
   refusal, so nothing is ever overwritten), and everything created is reported
-  as `create` diffs. **Init never defaults the connector**: the engine-wide
-  fall-through to DuckDB is safe for read-only commands but wrong here, because
-  init bakes the connector into the generated profile. `--connector` wins, a
+  as `create` diffs. **Init never defaults the connector**: the DuckDB on-ramp a
+  read-only command may take (an explicit `--path`, or a committed config that
+  omits `connector:`) is wrong here, because init bakes the connector into the
+  generated profile. `--connector` wins, a
   `connector:` already committed in `.dex/config.yml` is accepted (the envelope
   names which source was used), and bare init is an error listing the valid
   connectors. On success init writes `connector`, `dbt_project_dir`, and
@@ -189,6 +191,17 @@ same way (`cache_hit_count`); both accept `--refresh`.
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,
 `--confirm`, `--budget`.
+
+`.dex/config.yml` is found by walking up from the `--repo-root` directory (default
+the shell cwd) to the enclosing git root, the way git and dbt locate their project,
+so a command run from a subdirectory resolves the project's config rather than the
+current directory's. The walk anchors on the config file (a subdirectory holding
+only a `.dex/` cache never shadows the real config higher up) and stops at the git
+root (a stray `.dex/config.yml` above the repo cannot capture the session). With no
+config found anywhere and no explicit `--connector`/`--path`, the engine refuses
+and names the fix rather than defaulting to DuckDB. A committed relative
+`duckdb.path` resolves against the project root the config lives in, so the same
+target opens from any subdirectory; a live `--path` stays relative to the shell cwd.
 
 `--scope` is repeatable and narrows the source allowlist for one command. Each
 connector reads it in its own namespace vocabulary: a `dataset` on BigQuery, a

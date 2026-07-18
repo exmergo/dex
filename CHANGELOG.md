@@ -35,6 +35,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`.dex/config.yml` resolves from any subdirectory instead of silently
+  defaulting to DuckDB.** Config was only ever looked for relative to the run
+  directory, so a command issued from a subdirectory of a project (a scaffolded
+  dbt project folder, say) found no config and fell back to a default whose
+  connector is `duckdb`. The failure then surfaced far downstream as a phantom
+  "config and profiles disagree about the connector" error naming a `duckdb` that
+  appears in no file on disk. dex now walks up from the run directory to the
+  enclosing git repository looking for the `.dex/config.yml` that owns the tree,
+  the way git and dbt find their project roots, so the current directory no longer
+  matters. The walk anchors on the config file (a subdirectory holding only a
+  `.dex/` cache never shadows the real config higher up) and stops at the git root
+  (a stray `.dex/config.yml` above the repo can never capture the session). When
+  no config is found anywhere and no `--connector`/`--path` is given, dex refuses
+  and names the fix rather than reading a wrong default. The skill wrapper that
+  picks the install extra walks up the same way, so a subdirectory run installs
+  the project's real connector, not the DuckDB on-ramp.
 - **Redshift connections survive a Serverless cold start.** An idle Serverless
   workgroup resumes on first contact, and a slow resume can reset the startup
   handshake, so the first command to touch a cold workgroup failed hard while
