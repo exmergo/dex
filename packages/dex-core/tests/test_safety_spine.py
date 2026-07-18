@@ -497,6 +497,36 @@ def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys)
     assert not (tmp_path / "analytics").exists()
 
 
+def test_config_resolves_from_a_subdirectory_not_a_silent_default(tmp_path: Path):
+    # The other half of "no silent connector default": a command run from a
+    # subdirectory of a project must resolve the project's own .dex/config.yml
+    # (walked up to the git root), never fall through to the engine-wide DuckDB
+    # default and then surface as a phantom config/profiles connector mismatch.
+    import argparse
+
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.config import DexConfig, save_config
+
+    (tmp_path / ".git").mkdir()
+    save_config(DexConfig(connector="bigquery"), tmp_path)
+    sub = tmp_path / "analytics" / "models"
+    sub.mkdir(parents=True)
+
+    resolved = command_args.repo_root(argparse.Namespace(repo_root=str(sub)))
+    assert resolved == str(tmp_path.resolve())
+
+
+def test_no_config_anywhere_refuses_rather_than_defaulting_to_duckdb(tmp_path: Path):
+    # With no config resolvable and nothing explicit to fall back on, the engine
+    # refuses instead of reading a phantom DuckDB target. An explicit --connector
+    # or --path still drives the bare ad-hoc read.
+    from exmergo_dex_core.connect import open_adapter
+
+    (tmp_path / ".git").mkdir()
+    with pytest.raises(ValueError, match=r"no \.dex/config\.yml found"):
+        open_adapter(repo_root=str(tmp_path))
+
+
 def test_init_profile_is_dev_only_with_no_secrets(tmp_path: Path):
     # The generated profiles.yml is why bootstrap is engine-owned: a single dev
     # default target, nothing prod-named, and no secret-like keys anywhere.
