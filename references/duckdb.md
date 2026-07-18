@@ -17,6 +17,11 @@ duckdb:
 
 or pass `--path ./warehouse.duckdb` on any command.
 
+A relative `path:` in `.dex/config.yml` resolves against the project root the
+config lives in, not the shell cwd, so the same file opens whether you run from the
+project root or a subdirectory (config is found by walking up to the git root). A
+live `--path` is typed in your shell, so it stays relative to the current directory.
+
 ## Read-only and resource bounds
 
 DuckDB is always opened **read-only** (`read_only=True`). A read-only open of a
