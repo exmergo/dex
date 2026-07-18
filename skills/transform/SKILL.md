@@ -29,12 +29,16 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 ```
 
 `kind` is `model_sql`, `schema_yml`, `semantic_yml` (optional on
-`semantic define|update|plan`, which imply it), or `macro_sql` (a macro file
-under the project's macro paths). Model SQL must be a single read-only SELECT
-once its jinja is stripped; semantic YAML is validated against MetricFlow's
-schemas, cross-reference-checked, and (when dbt is available) parsed by dbt
-itself before the plan is accepted; a macro file must hold only macro
-definitions and jinja comments.
+`semantic define|update|plan`, which imply it), `macro_sql` (a macro file under
+the project's macro paths), `packages_yml`, `project_yml` (the project-root
+`dbt_project.yml`), or `profiles_yml` (the project-root `profiles.yml`). Model
+SQL must be a single read-only SELECT once its jinja is stripped; semantic YAML
+is validated against MetricFlow's schemas, cross-reference-checked, and (when
+dbt is available) parsed by dbt itself before the plan is accepted; a macro file
+must hold only macro definitions and jinja comments. `project_yml` must keep a
+`name`; `profiles_yml` must reference every secret via `{{ env_var('NAME') }}`
+(a literal credential is refused so none reaches the diff), and both config
+kinds are parsed by dbt at plan time.
 
 ### Bootstrapping a project
 

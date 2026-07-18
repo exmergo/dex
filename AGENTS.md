@@ -81,10 +81,13 @@ engine does not care which skill fronts a subcommand.
 
 Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "content"}, ...]}` with
-`kind` one of `model_sql`, `schema_yml`, `semantic_yml`, or `packages_yml` (the
+`kind` one of `model_sql`, `schema_yml`, `semantic_yml`, `packages_yml` (the
 guarded way to author the project-root `packages.yml`/`dependencies.yml`, so
-declaring a dbt package is a reviewable diff too). The engine validates, diffs,
-and stores the plan under `.dex/plans/`; nothing touches the dbt project until
+declaring a dbt package is a reviewable diff too), `macro_sql`, `project_yml`
+(the project-root `dbt_project.yml`), or `profiles_yml` (the project-root
+`profiles.yml`, secret-guarded so a credential never enters the diff: reference
+secrets via `{{ env_var('NAME') }}`). The engine validates, diffs, and stores
+the plan under `.dex/plans/`; nothing touches the dbt project until
 `transform apply`. See `references/command-contract.md`.
 
 ### The envelope
