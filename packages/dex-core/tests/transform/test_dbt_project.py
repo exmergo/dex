@@ -180,7 +180,6 @@ def test_write_edits_all_or_nothing(dbt_project_dir: Path):
     [
         "../outside.sql",
         "models/../../escape.sql",
-        "dbt_project.yml",
         "seeds/data.yml",
     ],
 )
@@ -200,26 +199,31 @@ def test_write_edits_refuses_absolute_paths(dbt_project_dir: Path, tmp_path: Pat
         write_edits([edit], dbt_project_dir)
 
 
-@pytest.mark.parametrize("manifest", ["packages.yml", "dependencies.yml"])
-def test_write_edits_allows_dbt_package_manifests_at_root(
-    dbt_project_dir: Path, manifest: str
-):
+@pytest.mark.parametrize(
+    "root_file", ["packages.yml", "dependencies.yml", "dbt_project.yml", "profiles.yml"]
+)
+def test_write_edits_allows_root_config_files(dbt_project_dir: Path, root_file: str):
+    # Containment now admits the project config and profiles alongside the
+    # package manifests. Pin the current hash so an existing fixture file is a
+    # clean apply, not a conflict, and a not-yet-present one is a create.
+    existing = dbt_project_dir / root_file
+    old_hash = content_hash(existing.read_text()) if existing.is_file() else None
     edit = Edit(
-        path=manifest,
-        new_content="packages:\n  - package: dbt-labs/dbt_utils\n    version: 1.1.1\n",
-        old_content_hash=None,
+        path=root_file,
+        new_content="name: dex_test\nprofile: dex_test\n# authored\n",
+        old_content_hash=old_hash,
     )
     result = write_edits([edit], dbt_project_dir)
-    assert result.written == [manifest]
-    assert (dbt_project_dir / manifest).is_file()
+    assert result.written == [root_file]
+    assert existing.is_file()
 
 
-@pytest.mark.parametrize("root_file", ["profiles.yml", "dbt_project.yml", "random.yml"])
+@pytest.mark.parametrize("root_file", ["random.yml", "Makefile", "secrets.env"])
 def test_write_edits_still_refuses_other_root_files(
     dbt_project_dir: Path, root_file: str
 ):
-    # The carve-out is exactly the two package manifests, not project-root files
-    # in general.
+    # The carve-out is exactly the known dbt files (package manifests, project
+    # config, profiles), not project-root files in general.
     edit = Edit(path=root_file, new_content="x: 1\n", old_content_hash=None)
     with pytest.raises(DbtProjectError):
         write_edits([edit], dbt_project_dir)

@@ -40,6 +40,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform plan` can author the two project-root config files** (#83). New
+  edit kinds `project_yml` (`dbt_project.yml`) and `profiles_yml`
+  (`profiles.yml`) bring project settings and connection targets into the same
+  plan -> diff -> apply flow as models, schema, semantic, macro, and packages
+  edits, so a project-wide config change is a reviewable, hash-pinned diff
+  rather than a raw file write outside the guardrail. Each kind is pinned by
+  name to the one root file it may target (and no other kind may reach those
+  files), a `project_yml` edit must keep a `name` (and warns when it drops a
+  `model-paths`/`macro-paths` entry that would orphan files), and both are
+  gated by dbt's own parser at plan time. `profiles_yml` is secret-guarded: an
+  edit is refused when it, or the file it would replace, inlines a literal
+  credential, so no secret ever reaches the diff or agent context; reference
+  secrets via `{{ env_var('NAME') }}`. As a side effect, the loader now carries
+  root config files into its view, so edits to an existing `packages.yml` /
+  `dependencies.yml` pin the real content hash instead of mis-registering as a
+  create.
 - **`explore query` can unnest JSON and array columns** (#78). The firewall's
   FROM clause now admits each connector's native unnest idiom (BigQuery
   `UNNEST`, Snowflake `LATERAL FLATTEN`, Databricks `LATERAL VIEW EXPLODE`,
