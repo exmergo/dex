@@ -26,7 +26,13 @@ from typing import Any
 
 import yaml
 
-from ..dbt_project import DbtProjectError, Edit, contained_path, profiles_dir
+from ..dbt_project import (
+    PROFILES_FILE,
+    DbtProjectError,
+    Edit,
+    contained_path,
+    profiles_dir,
+)
 from ..dbt_project import load as load_project
 from ..envelope import Cost, Paradigm, redact
 from ..guards.cost_guard import preflight
@@ -238,13 +244,24 @@ def shadow_parse(
             edit_path.parent.mkdir(parents=True, exist_ok=True)
             edit_path.write_text(edit.new_content, encoding="utf-8")
 
+        # A profiles.yml edit only takes effect if dbt reads the shadowed copy;
+        # pointing --profiles-dir at the real project would parse the edit
+        # against the unedited profile. Redirect to the shadow when the
+        # project-local profiles is the one being edited (the copytree already
+        # placed it there and the overlay above wrote the new content).
+        profiles_arg = profiles.resolve()
+        if profiles_arg == project and any(
+            Path(edit.path).name == PROFILES_FILE and Path(edit.path).parent == Path()
+            for edit in edits
+        ):
+            profiles_arg = shadow.resolve()
         argv = [
             executable,
             "parse",
             "--project-dir",
             str(shadow),
             "--profiles-dir",
-            str(profiles.resolve()),
+            str(profiles_arg),
             "--log-format",
             "json",
         ]

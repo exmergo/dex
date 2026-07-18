@@ -45,10 +45,15 @@ REF_PATTERN = re.compile(r"ref\(\s*['\"]([^'\"]+)['\"]")
 SOURCE_PATTERN = re.compile(r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]")
 BARE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-# dbt project-root manifests dex may author outside the model paths. They declare
-# package dependencies (not model content), so the editing surface widens by
-# exactly these two known files, never to arbitrary root files.
-_ALLOWED_ROOT_FILES = frozenset({"packages.yml", "dependencies.yml"})
+# dbt project-root files dex may author outside the model paths: the package
+# manifests (dependency declarations), the project config, and the connection
+# profiles. Each governs the whole project, not one model, which is why the
+# editing surface widens by exactly these known names and never to arbitrary
+# root files. Kinds are pinned to the specific file each one may target in
+# ``transform.plans``; here we only gate containment.
+_ALLOWED_ROOT_FILES = frozenset(
+    {"packages.yml", "dependencies.yml", PROJECT_FILE, PROFILES_FILE}
+)
 
 
 class DbtProjectError(Exception):
@@ -187,6 +192,18 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
             content = path.read_text(encoding="utf-8")
             files[rel] = SourceFile(
                 path=rel, content=content, sha256=content_hash(content)
+            )
+
+    # Root-level config files dex may author (project settings, connection
+    # targets, package manifests). Included so an edit to an existing one pins
+    # the real content hash instead of mis-registering as a create, which would
+    # otherwise surface at apply as a spurious conflict.
+    for root_file in _ALLOWED_ROOT_FILES:
+        path = root / root_file
+        if path.is_file():
+            content = path.read_text(encoding="utf-8")
+            files[root_file] = SourceFile(
+                path=root_file, content=content, sha256=content_hash(content)
             )
 
     manifest: dict[str, Any] | None = None
