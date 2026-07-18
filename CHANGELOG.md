@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-18
+
 ### Changed
 
 - **`explore map` and `explore relationships` skip re-profiling an object whose
