@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from .conftest import assert_unpivot_build, unpivot_fixture_edits
 from .test_postgres_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
@@ -95,6 +96,58 @@ def test_init_and_build_write_only_the_dev_schema(
     assert entry["connector"] == "postgres"
     assert entry["command"] == "transform build"
     assert entry["billed_seconds"] > 0
+
+
+def test_unpivot_json_object_macro_builds_live(tmp_path: Path, capsys, dev_dsn):
+    seed_repo(tmp_path, schemas=["app"], budget=300)
+    root = str(tmp_path)
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "postgres",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, envelope
+
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(unpivot_fixture_edits(lambda d: f"'{d}'::jsonb", "null::jsonb")),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "unpivot fixture",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    rc, built = run_cli(
+        ["--repo-root", root, "transform", "build", "--confirm", "--budget", "300"],
+        capsys,
+    )
+    assert rc == 0, built
+    assert_unpivot_build(built)
 
 
 def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(

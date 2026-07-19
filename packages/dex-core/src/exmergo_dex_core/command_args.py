@@ -16,12 +16,50 @@ from pathlib import Path
 
 from . import envelope as env
 from .adapters.base import Adapter
+from .cache import DEX_DIR
+from .config import CONFIG_FILE
 from .connect import open_adapter
 from .guards.cost_guard import ConfirmationRequiredError, CostGate
 
 
+def _resolve_dex_root(start: Path) -> Path | None:
+    """Nearest ancestor of ``start`` holding a ``.dex/config.yml``, or None.
+
+    dex is used like git or dbt: the config lives at the project root, but
+    commands are run from anywhere inside the tree. So resolution walks up rather
+    than trusting the current directory to be the root. The enclosing git repo is
+    the ceiling, and a project without one does not walk above ``start`` at all,
+    so a stray ``~/.dex/config.yml`` can never capture a session run from inside a
+    real project. Anchoring on the file (not just a ``.dex/`` directory) means a
+    subdirectory that holds only a ``.dex/`` cache never shadows the real config
+    higher up.
+    """
+
+    start = start.resolve()
+    ceiling = start
+    for directory in (start, *start.parents):
+        if (directory / ".git").exists():
+            ceiling = directory
+            break
+    for directory in (start, *start.parents):
+        if (directory / DEX_DIR / CONFIG_FILE).is_file():
+            return directory
+        if directory == ceiling:
+            break
+    return None
+
+
 def repo_root(args: argparse.Namespace) -> str:
-    return getattr(args, "repo_root", ".")
+    """The project root every command-layer path keys off (config load, cache
+    store, dbt discovery, dev-target preflight). Resolved by walking up from the
+    ``--repo-root`` run directory to the ``.dex/config.yml`` that owns it; when
+    none is found the raw value is returned unchanged, so the no-config paths
+    (an explicit ``--connector``/``--path`` read, or the loud refusal in
+    ``open_adapter``) behave as designed."""
+
+    raw = getattr(args, "repo_root", ".")
+    resolved = _resolve_dex_root(Path(raw))
+    return str(resolved) if resolved is not None else raw
 
 
 def open_from_args(args: argparse.Namespace) -> Adapter:

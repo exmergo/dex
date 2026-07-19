@@ -10,7 +10,8 @@ logic.
 - A surface (SKILL.md or AGENTS.md) tells the agent which subcommand to run.
 - A thin PEP 723 wrapper (`skills/<skill>/scripts/run.py`) runs it via `uv run`
   against the pinned engine version, installing the connector extra it resolves at
-  runtime (an explicit `--connector`, then `.dex/config.yml`, then DuckDB), so the
+  runtime (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
+  found by walking up from the run directory to the git root, then DuckDB), so the
   pin stays connector-neutral.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
@@ -49,6 +50,8 @@ dex transform plans               -> list stored plans, pending and applied, new
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
                                      auto-runs dbt deps when packages are declared but not installed
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
+dex transform macro [name]        -> list the shipped dbt macros, or plan scaffolding one into the
+                                     project's macro directory (dbt-parse-checked; apply like any plan)
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
@@ -81,16 +84,28 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
-`semantic define|update`, which imply `semantic_yml`), or `packages_yml`. The
-engine validates each edit (model SQL must be a single read-only SELECT once
-jinja is stripped; YAML must parse; semantic YAML must satisfy MetricFlow's
-schemas; a `packages_yml` edit must carry a `packages:` or `dependencies:` list
-and targets the project-root `packages.yml` or `dependencies.yml`), pins it to
-the sha256 of the file it would change, computes the diffs, and stores the plan
-under `.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an
-apply. `packages_yml` is the guarded way to declare dbt package dependencies: a
+`semantic define|update`, which imply `semantic_yml`), `packages_yml`,
+`macro_sql`, `project_yml`, or `profiles_yml`. The engine validates each edit
+(model SQL must be a single read-only SELECT once jinja is stripped; YAML must
+parse; semantic YAML must satisfy MetricFlow's schemas; a `packages_yml` edit
+must carry a `packages:` or `dependencies:` list and targets the project-root
+`packages.yml` or `dependencies.yml`; a `macro_sql` edit must hold only macro
+definitions and jinja comments and must target the project's macro paths, where
+no other kind may go; a `project_yml` edit targets the project-root
+`dbt_project.yml` and must keep a `name`; a `profiles_yml` edit targets the
+project-root `profiles.yml` and must reference every secret via
+`{{ env_var('NAME') }}`, never a literal), pins it to the sha256 of the file it
+would change, computes the diffs, and stores the plan under
+`.dex/plans/<plan-id>.json`. Nothing touches the dbt project until an apply.
+`packages_yml` is the guarded way to declare dbt package dependencies: a
 reviewable diff like any other edit, then `transform deps` (or the automatic
-deps step in `transform build`) installs them.
+deps step in `transform build`) installs them. `macro_sql` is how a macro is
+repaired or customized by hand; `transform macro <name>` is the scaffolding path
+for the macros dex ships. `project_yml` and `profiles_yml` bring the two
+project-root config files into the same plan/diff/apply flow; because they carry
+project-wide settings and connection targets, they are gated by dbt's own parser
+at plan time, and a `profiles_yml` edit is refused if it (or the file it would
+replace) inlines a literal credential, so no secret ever reaches the diff.
 
 - `transform init "<name>" --connector <duckdb|snowflake|bigquery|databricks|postgres>`
   bootstraps a dbt project when none exists: `dbt_project.yml`, `models/staging/`
@@ -98,9 +113,10 @@ deps step in `transform build`) installs them.
   target wired to the warehouse dex already knows (`--path`, or `duckdb.path` in
   `.dex/config.yml`). It is strictly additive (any existing dbt project is a
   refusal, so nothing is ever overwritten), and everything created is reported
-  as `create` diffs. **Init never defaults the connector**: the engine-wide
-  fall-through to DuckDB is safe for read-only commands but wrong here, because
-  init bakes the connector into the generated profile. `--connector` wins, a
+  as `create` diffs. **Init never defaults the connector**: the DuckDB on-ramp a
+  read-only command may take (an explicit `--path`, or a committed config that
+  omits `connector:`) is wrong here, because init bakes the connector into the
+  generated profile. `--connector` wins, a
   `connector:` already committed in `.dex/config.yml` is accepted (the envelope
   names which source was used), and bare init is an error listing the valid
   connectors. On success init writes `connector`, `dbt_project_dir`, and
@@ -177,11 +193,29 @@ stale manifest (older than the model sources) is noted, not trusted silently.
 `profile_top_n` (default 25) by rank and announces the cutoff in `notes`
 alongside `skipped_count` (`--full` profiles everything). Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
-stamped with its own `profiled_at`.
+stamped with its own `profiled_at`. A selected object whose cached profile is
+still fresh (same connector, schema unchanged, profiled within
+`profile_freshness_hours`, default 24; `0` disables reuse) is reused without a
+re-scan and reported as `cache_hit_count`, so it never enters the cost preflight
+or the billed handshake. `--refresh` forces a full re-profile of every selected
+object even when the cache is fresh, for a source that changed in a way the free
+metadata check cannot see. `explore relationships` reuses fresh profiles the
+same way (`cache_hit_count`); both accept `--refresh`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,
 `--confirm`, `--budget`.
+
+`.dex/config.yml` is found by walking up from the `--repo-root` directory (default
+the shell cwd) to the enclosing git root, the way git and dbt locate their project,
+so a command run from a subdirectory resolves the project's config rather than the
+current directory's. The walk anchors on the config file (a subdirectory holding
+only a `.dex/` cache never shadows the real config higher up) and stops at the git
+root (a stray `.dex/config.yml` above the repo cannot capture the session). With no
+config found anywhere and no explicit `--connector`/`--path`, the engine refuses
+and names the fix rather than defaulting to DuckDB. A committed relative
+`duckdb.path` resolves against the project root the config lives in, so the same
+target opens from any subdirectory; a live `--path` stays relative to the shell cwd.
 
 `--scope` is repeatable and narrows the source allowlist for one command. Each
 connector reads it in its own namespace vocabulary: a `dataset` on BigQuery, a

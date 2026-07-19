@@ -293,3 +293,161 @@ def test_plan_without_content_is_a_clean_error(
     assert rc == 1
     assert envelope["status"] == "error"
     assert "edits-file" in envelope["errors"][0]
+
+
+# --- project config kinds (project_yml / profiles_yml) ------------------------
+#
+# These exercise the engine directly (`transform.plan`), which does not run dbt
+# parse, so containment, the profiles secret-guard, and the path drop-check are
+# deterministic without a dbt subprocess. The CLI tests below cover the
+# parse-gated path.
+
+from exmergo_dex_core import transform  # noqa: E402
+
+
+def _cfg_edit(path: str, content: str, kind) -> transform.PlanEdit:
+    return transform.PlanEdit(path=path, new_content=content, kind=kind)
+
+
+def test_project_yml_edit_pins_the_existing_file(dbt_project_dir: Path):
+    # load() now carries root config into the view, so an edit to the existing
+    # dbt_project.yml diffs as an update against a real pinned hash, not a create.
+    edit = _cfg_edit(
+        "dbt_project.yml",
+        'name: dex_test\nversion: "1.0.0"\nprofile: dex_test\n'
+        'model-paths: ["models"]\n# tuned\n',
+        transform.EditKind.PROJECT_YML,
+    )
+    plan, diffs, _warnings = transform.plan(
+        "tune project", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+    )
+    assert diffs[0]["op"] == "update"
+    assert plan.edits[0].old_content_hash is not None
+
+
+def test_project_yml_kind_must_target_dbt_project(dbt_project_dir: Path):
+    edit = _cfg_edit(
+        "models/staging/x.yml", "name: x\n", transform.EditKind.PROJECT_YML
+    )
+    with pytest.raises(transform.PlanError):
+        transform.plan(
+            "misaimed", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+        )
+
+
+def test_config_file_reached_by_the_wrong_kind_is_refused(dbt_project_dir: Path):
+    edit = _cfg_edit("dbt_project.yml", "select 1\n", transform.EditKind.MODEL_SQL)
+    with pytest.raises(transform.PlanError):
+        transform.plan(
+            "wrong kind", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+        )
+
+
+def test_profiles_yml_refuses_a_secret_already_on_disk(dbt_project_dir: Path):
+    # The diff's removed side would leak a pre-existing inlined credential even
+    # when the proposed content is clean, so the current file is guarded too.
+    (dbt_project_dir / "profiles.yml").write_text(
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      host: localhost\n      user: u\n      password: hunter2\n"
+        "      dbname: d\n      schema: public\n",
+        encoding="utf-8",
+    )
+    safe = (
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      host: localhost\n      user: u\n"
+        "      password: \"{{ env_var('PGPASSWORD') }}\"\n"
+        "      dbname: d\n      schema: public\n"
+    )
+    edit = _cfg_edit("profiles.yml", safe, transform.EditKind.PROFILES_YML)
+    with pytest.raises(transform.PlanError) as exc:
+        transform.plan(
+            "env-var the password",
+            [edit],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+        )
+    assert "hunter2" not in str(exc.value)
+    assert "password" in str(exc.value)
+
+
+def test_project_yml_dropping_a_model_path_warns(dbt_project_dir: Path):
+    edit = _cfg_edit(
+        "dbt_project.yml",
+        'name: dex_test\nprofile: dex_test\nmodel-paths: ["staging"]\n',
+        transform.EditKind.PROJECT_YML,
+    )
+    _plan, _diffs, warnings = transform.plan(
+        "restructure", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+    )
+    assert any("model-paths drops" in w and "models" in w for w in warnings)
+
+
+def test_plan_cli_refuses_an_inlined_profiles_secret(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "profiles.yml",
+                "kind": "profiles_yml",
+                "content": (
+                    "dex_test:\n  target: dev\n  outputs:\n    dev:\n"
+                    "      type: postgres\n      host: h\n      user: u\n"
+                    "      password: hunter2\n      dbname: d\n      schema: public\n"
+                ),
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "set profile",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    blob = json.dumps(envelope)
+    assert "hunter2" not in blob
+    assert "env_var" in blob or "credential" in blob
+    plans_dir = tmp_path / ".dex" / "plans"
+    assert not plans_dir.exists() or not list(plans_dir.glob("*.json"))
+
+
+def test_plan_cli_project_yml_pins_an_update(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "dbt_project.yml",
+                "kind": "project_yml",
+                "content": (
+                    'name: dex_test\nversion: "1.0.0"\nprofile: dex_test\n'
+                    'model-paths: ["models"]\n# tuned by dex\n'
+                ),
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "tune project",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert envelope["status"] == "ok"
+    assert envelope["diffs"][0]["op"] == "update"

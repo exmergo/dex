@@ -9,8 +9,101 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-18
+
+### Changed
+
+- **`explore map` and `explore relationships` skip re-profiling an object whose
+  cached profile is still fresh.** Before scanning a selected object, each
+  command now checks `.dex/cache.json` for a same-connector profile of that
+  exact object that was profiled within a freshness window and whose column
+  signature (name, type, nullability) still matches the warehouse's free
+  metadata; a match is reused wholesale instead of re-scanned, so it never
+  enters the cost preflight or the billed handshake. Iterative workflows on a
+  metered warehouse (map, tweak, map again) and `--verify` re-runs no longer
+  re-pay the full profiling scan when nothing changed. The freshness check is
+  fail-closed: a missing or unparseable `profiled_at`, a schema change, or a
+  different connector re-profiles. The envelope gains a `cache_hit_count` field
+  (distinct from the existing `carried_forward_count`, which covers
+  below-rank-cutoff objects) and a note when reuse happened.
+- **New `--refresh` flag on `explore map` / `explore relationships`** forces a
+  full re-profile of every selected object even when the cache is fresh, for
+  callers who know the source changed in a way the cheap metadata check cannot
+  see.
+- **New `profile_freshness_hours` config knob** (`DexConfig`, default `24.0`)
+  sets how fresh a cached profile must be to be reused; `0` disables reuse
+  (always re-profile). No cache schema change: `Dataset.profiled_at` and the
+  stored column signatures already carry everything the check needs.
+- Model validation's jinja stripping is parenthesis-aware: a jinja-only line
+  inside parentheses (a macro rendering a whole SELECT, for example
+  `from ( {{ unpivot_json_object(...) }} )`) is validated as a placeholder
+  subquery instead of failing the SELECT-only parse; top-level jinja-only
+  lines (a `{{ config(...) }}` header) vanish as before.
+
+### Added
+
+- **`transform plan` can author the two project-root config files** (#83). New
+  edit kinds `project_yml` (`dbt_project.yml`) and `profiles_yml`
+  (`profiles.yml`) bring project settings and connection targets into the same
+  plan -> diff -> apply flow as models, schema, semantic, macro, and packages
+  edits, so a project-wide config change is a reviewable, hash-pinned diff
+  rather than a raw file write outside the guardrail. Each kind is pinned by
+  name to the one root file it may target (and no other kind may reach those
+  files), a `project_yml` edit must keep a `name` (and warns when it drops a
+  `model-paths`/`macro-paths` entry that would orphan files), and both are
+  gated by dbt's own parser at plan time. `profiles_yml` is secret-guarded: an
+  edit is refused when it, or the file it would replace, inlines a literal
+  credential, so no secret ever reaches the diff or agent context; reference
+  secrets via `{{ env_var('NAME') }}`. As a side effect, the loader now carries
+  root config files into its view, so edits to an existing `packages.yml` /
+  `dependencies.yml` pin the real content hash instead of mis-registering as a
+  create.
+- **`explore query` can unnest JSON and array columns** (#78). The firewall's
+  FROM clause now admits each connector's native unnest idiom (BigQuery
+  `UNNEST`, Snowflake `LATERAL FLATTEN`, Databricks `LATERAL VIEW EXPLODE`,
+  Postgres set-returning functions, Redshift PartiQL navigation and
+  `UNPIVOT ... AT`, DuckDB `UNNEST`) when the unnested value derives from a
+  column of a table the query already reads, either bare or through an
+  allowlisted JSON/array function (`JSON_KEYS`, `JSON_EXTRACT_ARRAY`,
+  `OBJECT_KEYS`, `jsonb_object_keys`, `jsonb_each`, and kin). Unnesting a
+  subquery, another table, a literal, or a generator stays refused, and every
+  column an unnest produces (values, keys, paths, offsets) inherits the source
+  column's PII flags, so the reshape cannot launder a flagged value. This
+  unblocks the headline schemaless-exploration probe, "which keys appear
+  across every row of this JSON column".
+- **A shipped dbt macro library, scaffolded, starting with
+  `unpivot_json_object`** (#85). `transform macro` lists the macros dex
+  ships; `transform macro <name>` proposes the macro file into the project's
+  macro directory as a reviewable plan (dbt-parse-checked, applied with
+  `transform apply`; re-running diffs the project's copy against the shipped
+  version). `unpivot_json_object(relation, json_column, key_alias, value_alias,
+  passthrough)` unpivots a dynamic-key JSON object column into one row per
+  top-level key on every connector, key as a plain string, value in the
+  warehouse's native semi-structured type, with BigQuery's two JSON gotchas
+  (literal-only path arguments; `JSON_KEYS` recursing into nested objects by
+  default) baked in. Plans gained the `macro_sql` edit kind: the editing
+  surface now includes the project's macro paths, macro files are validated
+  structurally and by dbt's parser, and a planned model that calls a shipped
+  macro the project lacks warns with the scaffold command.
+
 ### Fixed
 
+- **`.dex/config.yml` resolves from any subdirectory instead of silently
+  defaulting to DuckDB.** Config was only ever looked for relative to the run
+  directory, so a command issued from a subdirectory of a project (a scaffolded
+  dbt project folder, say) found no config and fell back to a default whose
+  connector is `duckdb`. The failure then surfaced far downstream as a phantom
+  "config and profiles disagree about the connector" error naming a `duckdb` that
+  appears in no file on disk. dex now walks up from the run directory to the
+  enclosing git repository looking for the `.dex/config.yml` that owns the tree,
+  the way git and dbt find their project roots, so the current directory no longer
+  matters. The walk anchors on the config file (a subdirectory holding only a
+  `.dex/` cache never shadows the real config higher up) and stops at the git root
+  (a stray `.dex/config.yml` above the repo can never capture the session). When
+  no config is found anywhere and no `--connector`/`--path` is given, dex refuses
+  and names the fix rather than reading a wrong default. The skill wrapper that
+  picks the install extra walks up the same way, so a subdirectory run installs
+  the project's real connector, not the DuckDB on-ramp.
 - **Redshift connections survive a Serverless cold start.** An idle Serverless
   workgroup resumes on first contact, and a slow resume can reset the startup
   handshake, so the first command to touch a cold workgroup failed hard while
@@ -29,6 +122,27 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   column name is held as a key by three or more unrelated datasets, and the
   withheld count and names are surfaced in `explore relationships`/`explore
   map`'s notes instead of silently inferring less.
+- **`transform build` names dbt's real error on every connector, not just
+  Snowflake** ([#76], a connector-parity follow-up to [#50]/[#55]). dbt wraps
+  a failure's actual cause behind one or more generic, information-free
+  headers: a per-node failure as "<Type> Error in <node> (<path>)", a
+  whole-invocation fatal again in "Encountered an error:", a nested exception
+  chain once more per level. For a per-node failure specifically, it also logs
+  a bare progress line and a bare "Failure in <node> (<path>)" header before
+  the message that actually names the cause. This shape is identical on every
+  adapter (it comes from dbt_common, not a connector), but keeping only the
+  first captured line let whichever of these uninformative lines happened to
+  log first silently win the envelope's `errors[0]` slot, on Snowflake as much
+  as BigQuery; #50/#55's own repro just never happened to hit it. The real
+  cause line now rides alongside its header instead of being dropped, and
+  dbt's own per-node/per-run "this is what actually failed" events are
+  promoted ahead of a progress line or bare header the same way the #50 fix
+  already promoted them ahead of a deprecation notice. Also fixed in the same
+  pass: a stale `target/run_results.json` left over from a prior successful
+  build, which a whole-invocation fatal never rewrites, is now cleared before
+  each build so it can never be misreported as this invocation's node
+  results; and ANSI color codes dbt bakes into its messages even under
+  `--log-format json` no longer leak into the envelope.
 
 ## [1.2.1] - 2026-07-17
 

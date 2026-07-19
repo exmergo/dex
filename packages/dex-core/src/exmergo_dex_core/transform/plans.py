@@ -19,6 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import BaseModel
 
 from ..cache import DEX_DIR
@@ -34,7 +35,7 @@ from ..dbt_project import (
     load as load_project,
 )
 from ..diffs import file_diff
-from .validate import validate_edit
+from .validate import find_inlined_secret, validate_edit
 
 PLANS_DIR = "plans"
 
@@ -54,6 +55,15 @@ class EditKind(str, Enum):
     # A dbt project-root manifest, not a model-path file: authoring it brings
     # dependency declaration inside the plan/apply guardrail like every other edit.
     PACKAGES_YML = "packages_yml"
+    # A macro definition under the project's macro paths, the surface widened
+    # for scaffolded and hand-repaired macros alike.
+    MACRO_SQL = "macro_sql"
+    # dbt project-root config: the project settings and the connection profiles.
+    # Each governs the whole project (a wider blast radius than a single model),
+    # so each is pinned by name to the one root file it may target, and
+    # profiles carries a secret-guard so no credential enters the plan diff.
+    PROJECT_YML = "project_yml"
+    PROFILES_YML = "profiles_yml"
 
 
 class PlanEdit(Edit):
@@ -148,12 +158,77 @@ def plan(
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
     diffs: list[dict[str, Any]] = []
+    project_resolved = project.resolve()
+    macro_bases = [(project_resolved / mp).resolve() for mp in view.macro_paths]
+    # The one root file each config kind may target, resolved once. Both the
+    # kind and the path must agree: a config kind aimed elsewhere, or one of
+    # these files reached by any other kind, is refused.
+    root_config = {
+        EditKind.PROJECT_YML: (project_resolved / "dbt_project.yml").resolve(),
+        EditKind.PROFILES_YML: (project_resolved / "profiles.yml").resolve(),
+    }
+    config_targets = {target: kind for kind, target in root_config.items()}
     for edit in edits:
         # Containment is checked at plan time as well as at write time, so a bad
         # path is refused before it ever becomes a stored proposal.
-        contained_path(project, edit.path, view.model_paths)
+        resolved = contained_path(
+            project, edit.path, view.model_paths, view.macro_paths
+        ).resolve()
+        # Kind and surface must agree: a macro written into models/ would be
+        # parsed as a model and fail the build, and a model written into
+        # macros/ would silently never become a model.
+        in_macros = any(
+            resolved == base or base in resolved.parents for base in macro_bases
+        )
+        if edit.kind is EditKind.MACRO_SQL and not in_macros:
+            raise PlanError(
+                f"a macro_sql edit must live under the project's macro paths "
+                f"({', '.join(view.macro_paths)}), got '{edit.path}'"
+            )
+        if edit.kind is not EditKind.MACRO_SQL and in_macros:
+            raise PlanError(
+                f"'{edit.path}' is under a macro path but the edit kind is "
+                f"{edit.kind.value}; use macro_sql for macro files"
+            )
+        if edit.kind in root_config and resolved != root_config[edit.kind]:
+            raise PlanError(
+                f"a {edit.kind.value} edit must target the project's "
+                f"{root_config[edit.kind].name}, got '{edit.path}'"
+            )
+        target_kind = config_targets.get(resolved)
+        if target_kind is not None and edit.kind is not target_kind:
+            raise PlanError(
+                f"'{edit.path}' is a project config file but the edit kind is "
+                f"{edit.kind.value}; use {target_kind.value} for it"
+            )
         warnings.extend(validate_edit(edit))
         current = view.files.get(edit.path)
+        # The profiles secret-guard, current side: validate_edit covers the
+        # proposed content, but the diff also surfaces the removed (on-disk)
+        # content, so a pre-existing inlined credential is refused before any
+        # diff is built, never reaching agent context.
+        if edit.kind is EditKind.PROFILES_YML and current is not None:
+            secret_key = find_inlined_secret(current.content)
+            if secret_key is not None:
+                raise PlanError(
+                    f"{edit.path}: the current profiles.yml inlines a literal "
+                    f"credential in '{secret_key}'; move it to "
+                    "{{ env_var('NAME') }} before editing so no credential "
+                    "enters the plan diff"
+                )
+        # A dbt_project.yml that drops model or macro paths silently orphans the
+        # files under them; warn rather than refuse, since a deliberate
+        # restructure is a legitimate reason to change them.
+        if edit.kind is EditKind.PROJECT_YML and current is not None:
+            old = yaml.safe_load(current.content) or {}
+            new = yaml.safe_load(edit.new_content) or {}
+            for key in ("model-paths", "macro-paths"):
+                dropped = set(old.get(key) or []) - set(new.get(key) or [])
+                if dropped:
+                    warnings.append(
+                        f"{edit.path}: {key} drops {sorted(dropped)}; files under "
+                        "those paths would no longer be part of the project"
+                    )
         pinned.append(
             edit.model_copy(
                 update={"old_content_hash": current.sha256 if current else None}
@@ -162,6 +237,11 @@ def plan(
         diffs.append(
             file_diff(edit.path, current.content if current else None, edit.new_content)
         )
+
+    # Late import: scaffold imports PlanEdit from this module.
+    from .scaffold import missing_macro_warnings
+
+    warnings.extend(missing_macro_warnings(edits, view))
 
     created_at = datetime.now(UTC).isoformat()
     try:

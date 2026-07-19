@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,13 @@ from typing import Any
 
 import yaml
 
-from ..dbt_project import DbtProjectError, Edit, contained_path, profiles_dir
+from ..dbt_project import (
+    PROFILES_FILE,
+    DbtProjectError,
+    Edit,
+    contained_path,
+    profiles_dir,
+)
 from ..dbt_project import load as load_project
 from ..envelope import Cost, Paradigm, redact
 from ..guards.cost_guard import preflight
@@ -154,6 +161,16 @@ def build(
     if select:
         argv += ["--select", select]
 
+    # A hard compile-time/parse-time failure (a Jinja context error, for
+    # instance) dies before dbt ever reaches node execution, so it never
+    # (re)writes target/run_results.json -- a stale one left over from a prior
+    # successful build would otherwise still be sitting there, and _summarize
+    # would report its node results as if they belonged to this invocation
+    # (issue #76). Clearing it first means "file absent" always means "this
+    # invocation wrote nothing", never "an old invocation's results carried
+    # over".
+    (project / "target" / "run_results.json").unlink(missing_ok=True)
+
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
     # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
     # against whatever directory the caller happened to launch from.
@@ -232,17 +249,30 @@ def shadow_parse(
             ),
         )
         for edit in edits:
-            edit_path = contained_path(shadow, edit.path, view.model_paths)
+            edit_path = contained_path(
+                shadow, edit.path, view.model_paths, view.macro_paths
+            )
             edit_path.parent.mkdir(parents=True, exist_ok=True)
             edit_path.write_text(edit.new_content, encoding="utf-8")
 
+        # A profiles.yml edit only takes effect if dbt reads the shadowed copy;
+        # pointing --profiles-dir at the real project would parse the edit
+        # against the unedited profile. Redirect to the shadow when the
+        # project-local profiles is the one being edited (the copytree already
+        # placed it there and the overlay above wrote the new content).
+        profiles_arg = profiles.resolve()
+        if profiles_arg == project and any(
+            Path(edit.path).name == PROFILES_FILE and Path(edit.path).parent == Path()
+            for edit in edits
+        ):
+            profiles_arg = shadow.resolve()
         argv = [
             executable,
             "parse",
             "--project-dir",
             str(shadow),
             "--profiles-dir",
-            str(profiles.resolve()),
+            str(profiles_arg),
             "--log-format",
             "json",
         ]
@@ -386,9 +416,47 @@ def _default_runner(
 # message text regardless of `info.level`. Left undistinguished from a real
 # failure, one of these reliably wins the errors[0] slot merely by logging
 # before the actual cause does. `MainEncounteredError` is dbt's own summary of
-# what actually killed the run and always leads when present.
+# what actually killed a *run-level* fatal (a connection or parse failure,
+# before any node executes) and always leads when present.
+#
+# A per-node failure has no MainEncounteredError at all; instead dbt fires, in
+# order, a bare progress line (`LogModelResult`, e.g. "1 of 1 ERROR creating
+# sql view model x .... [ERROR in 0.1s]"), a bare `RunResultFailure` header
+# ("Failure in model x (models/x.sql)"), and only then `RunResultError`, whose
+# `msg` is the actual dbt exception text (`result.message`) -- the one event
+# that names *why* the node failed. None of the first two are deprecation-
+# tagged, so without also promoting `RunResultError`, whichever of them
+# logged first silently wins errors[0] ahead of the real cause -- verified
+# against a real `dbt build --log-format json` failure (issue #76).
 _DEPRECATION_MARKER = "[WARNING]"
 _MAIN_ENCOUNTERED_ERROR = "MainEncounteredError"
+_RUN_RESULT_ERROR = "RunResultError"
+
+# dbt wraps a failure's actual cause behind one or more generic headers with no
+# information of their own. dbt_common's DbtRuntimeError (and its Database/
+# Compilation/Validation/Runtime subclasses) render a per-node failure as
+# "<Type> Error in <node> (<path>)", with the cause on the next line (e.g.
+# "Database Error in model x (models/x.sql)\n  Argument 2 to JSON_VALUE must
+# be a constant expression\n  compiled code at ..."). A whole-invocation fatal
+# caught by dbt's own top-level handler is wrapped again in "Encountered an
+# error:", and a chained/nested exception repeats a bare "<Type> Error" once
+# per level before the innermost, actual message (verified against a real
+# `dbt build --log-format json` run: "Encountered an error:\nRuntime Error\n
+# Compilation Error\n    Could not render {{ 1/0 }}: division by zero"). This
+# shape comes from dbt_common, not from any connector, so it is identical on
+# Snowflake, BigQuery, or any other adapter. Keeping only the first line (a
+# bare "first line of msg" truncation) silently dropped the cause behind
+# whichever of these wrappers led; the #50 deprecation fix never caught it
+# because #50's own repro didn't spell one out in its test message (#76).
+_GENERIC_HEADER = re.compile(
+    r"^(?:Encountered an error:|"
+    r"(?:Database|Runtime|Compilation|Validation|Internal) Error(?: in .+)?)$"
+)
+
+# dbt colors its console messages (red failures, yellow warnings) even under
+# --log-format json, baking raw ANSI escapes into info.msg; harmless on a
+# terminal, but unreadable noise once that text crosses into a JSON envelope.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _collect_messages(
@@ -397,11 +465,16 @@ def _collect_messages(
     """Reduce dbt's output to actionable one-liners for the envelope.
 
     Keeps the first line of each error/warn message (redacted, length-capped,
-    deduplicated); deprecation notices sink below real errors so they cannot
-    poison the errors[0] slot, and dbt's own MainEncounteredError event (the
-    structured summary of the actual failure) always leads when present. When
-    anything was cut, the last entry points at the full log instead of letting
-    a raw traceback cross the envelope boundary.
+    deduplicated) -- except a generic header (see _GENERIC_HEADER), which says
+    nothing about why the node or run failed on its own, so the nearest
+    following line that isn't itself another generic header rides along with
+    it. Deprecation notices sink below real errors so they cannot poison the
+    errors[0] slot, and dbt's own structured summaries of what actually
+    failed -- MainEncounteredError for a run-level fatal, RunResultError for a
+    per-node one -- always lead over an uninformative progress line or bare
+    failure header that merely logged first. When anything was cut, the last
+    entry points at the full log
+    instead of letting a raw traceback cross the envelope boundary.
     """
 
     entries: list[tuple[str, str]] = []
@@ -415,8 +488,22 @@ def _collect_messages(
         info = event.get("info", {})
         if info.get("level") not in {"error", "warn"} or not info.get("msg"):
             continue
-        msg = redact(str(info["msg"]))
-        first_line = msg.splitlines()[0] if msg else msg
+        msg = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
+        msg_lines = msg.splitlines()
+        first_line = msg_lines[0].strip() if msg_lines else msg.strip()
+        if _GENERIC_HEADER.match(first_line):
+            cause = next(
+                (
+                    stripped
+                    for line in msg_lines[1:]
+                    if (stripped := line.strip())
+                    and not _GENERIC_HEADER.match(stripped)
+                ),
+                None,
+            )
+            if cause:
+                sep = "" if first_line.endswith(":") else ":"
+                first_line = f"{first_line}{sep} {cause}"
         if len(first_line) > _MESSAGE_MAX_CHARS:
             first_line = first_line[:_MESSAGE_MAX_CHARS] + "..."
             trimmed = True
@@ -433,8 +520,15 @@ def _collect_messages(
     main_error = next(
         (m for name, m in entries if name == _MAIN_ENCOUNTERED_ERROR), None
     )
-    if main_error is not None:
-        primary = [main_error] + [m for m in primary if m != main_error]
+    # Per-node cause(s), in case a build fails several models at once; a
+    # run-level MainEncounteredError (when present) still leads them, since it
+    # is the reason none of them, or nothing after them, ran at all.
+    node_causes = [
+        m for name, m in entries if name == _RUN_RESULT_ERROR and m != main_error
+    ]
+    promoted = ([main_error] if main_error is not None else []) + node_causes
+    if promoted:
+        primary = promoted + [m for m in primary if m not in promoted]
     messages = primary + deprecations
 
     if not messages and completed.stderr:

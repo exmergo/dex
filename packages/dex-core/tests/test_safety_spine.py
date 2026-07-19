@@ -219,6 +219,54 @@ def test_query_firewall_enforces_pii_flagged_never_surfaced():
     inspect_query("SELECT COUNT(DISTINCT email) FROM customers", cache, QueryLimits())
 
 
+def test_query_firewall_unnest_reshapes_but_never_smuggles():
+    # Every dialect's native FROM-clause unnest idiom is admitted over a clear
+    # column, refused when a subquery hides inside, and refused when it would
+    # project a flagged column's values: the reshape inherits the taint.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.events",
+                columns=[
+                    ColumnProfile(name="id", data_type="INTEGER"),
+                    ColumnProfile(name="doc", data_type="JSON"),
+                    ColumnProfile(
+                        name="payload",
+                        data_type="JSON",
+                        pii=PIIFlag(category="email", confidence=0.9),
+                    ),
+                ],
+            )
+        ]
+    )
+    idioms = {
+        "bigquery": "FROM events, UNNEST(JSON_KEYS({col})) AS k",
+        "snowflake": "FROM events, LATERAL FLATTEN(input => {col}) AS k(k)",
+        "databricks": (
+            "FROM events LATERAL VIEW EXPLODE(json_object_keys({col})) x AS k"
+        ),
+        "postgres": "FROM events, jsonb_object_keys({col}) AS k",
+        "redshift": "FROM events e, UNPIVOT e.{col} AS v AT k",
+        "duckdb": "FROM events, UNNEST(json_keys({col})) AS u(k)",
+    }
+    for dialect, idiom in idioms.items():
+        allowed = "SELECT k " + idiom.format(col="doc")
+        inspect_query(allowed, cache, QueryLimits(), dialect=dialect)
+        smuggle = "SELECT k " + idiom.format(col="(SELECT doc FROM events)")  # noqa: S608
+        with pytest.raises(QueryRefusedError):
+            inspect_query(smuggle, cache, QueryLimits(), dialect=dialect)
+        flagged = "SELECT k " + idiom.format(col="payload")
+        with pytest.raises(QueryRefusedError):
+            inspect_query(flagged, cache, QueryLimits(), dialect=dialect)
+
+
 def test_firewall_block_threshold_is_a_hard_coded_engine_constant():
     # The threshold is engine policy, not configuration: a config edit must
     # never be able to widen the PII boundary. Its value is load-bearing (every
@@ -318,6 +366,57 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     # Planning returns reviewable diffs and touches nothing in the project.
     assert diffs and diffs[0]["unified"]
     assert not new_model.exists()
+
+
+def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: Path):
+    # profiles.yml is an editable surface, but a credential must never reach the
+    # plan diff (and thus agent context). An inlined literal is refused whether
+    # it is in the proposed content or already on disk (the diff's removed side).
+    from exmergo_dex_core import transform
+
+    (dbt_project_dir / "profiles.yml").write_text(
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+        "      host: localhost\n      user: u\n      password: s3cr3t-on-disk\n"
+        "      dbname: d\n      schema: public\n",
+        encoding="utf-8",
+    )
+    proposed_secret = transform.PlanEdit(
+        path="profiles.yml",
+        kind=transform.EditKind.PROFILES_YML,
+        new_content=(
+            "dex_test:\n  outputs:\n    dev:\n      type: postgres\n"
+            "      password: s3cr3t-proposed\n"
+        ),
+    )
+    with pytest.raises(Exception) as proposed_exc:
+        transform.plan(
+            "inline a secret",
+            [proposed_secret],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+        )
+    assert "s3cr3t-proposed" not in str(proposed_exc.value)
+
+    # Even a clean (env_var) proposal is refused while the on-disk file still
+    # inlines a secret, since diffing it would surface the removed literal.
+    clean_proposal = transform.PlanEdit(
+        path="profiles.yml",
+        kind=transform.EditKind.PROFILES_YML,
+        new_content=(
+            "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: postgres\n"
+            "      host: localhost\n      user: u\n"
+            "      password: \"{{ env_var('PGPASSWORD') }}\"\n"
+            "      dbname: d\n      schema: public\n"
+        ),
+    )
+    with pytest.raises(Exception) as current_exc:
+        transform.plan(
+            "env-var the password",
+            [clean_proposal],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+        )
+    assert "s3cr3t-on-disk" not in str(current_exc.value)
 
 
 def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
@@ -495,6 +594,36 @@ def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys)
     assert payload["status"] == "error"
     assert "--connector" in payload["errors"][0]
     assert not (tmp_path / "analytics").exists()
+
+
+def test_config_resolves_from_a_subdirectory_not_a_silent_default(tmp_path: Path):
+    # The other half of "no silent connector default": a command run from a
+    # subdirectory of a project must resolve the project's own .dex/config.yml
+    # (walked up to the git root), never fall through to the engine-wide DuckDB
+    # default and then surface as a phantom config/profiles connector mismatch.
+    import argparse
+
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.config import DexConfig, save_config
+
+    (tmp_path / ".git").mkdir()
+    save_config(DexConfig(connector="bigquery"), tmp_path)
+    sub = tmp_path / "analytics" / "models"
+    sub.mkdir(parents=True)
+
+    resolved = command_args.repo_root(argparse.Namespace(repo_root=str(sub)))
+    assert resolved == str(tmp_path.resolve())
+
+
+def test_no_config_anywhere_refuses_rather_than_defaulting_to_duckdb(tmp_path: Path):
+    # With no config resolvable and nothing explicit to fall back on, the engine
+    # refuses instead of reading a phantom DuckDB target. An explicit --connector
+    # or --path still drives the bare ad-hoc read.
+    from exmergo_dex_core.connect import open_adapter
+
+    (tmp_path / ".git").mkdir()
+    with pytest.raises(ValueError, match=r"no \.dex/config\.yml found"):
+        open_adapter(repo_root=str(tmp_path))
 
 
 def test_init_profile_is_dev_only_with_no_secrets(tmp_path: Path):

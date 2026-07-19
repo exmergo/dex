@@ -149,6 +149,46 @@ def test_firewalled_query_round_trip(
     assert envelope["data"]["spend"]["seconds_billed"] >= 0
 
 
+def test_lateral_view_explode_runs_live(
+    tmp_path: Path, capsys, dbx_warehouse, dbx_scratch_catalog
+):
+    # The LATERAL VIEW EXPLODE shape the firewall now admits, end to end over
+    # the 5-row region sample: each region row fans out to the two keys of a
+    # literal JSON object through an allowlisted function.
+    seed_repo(tmp_path, dbx_warehouse, dbx_scratch_catalog)
+    DexStore(tmp_path).save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier=REGION,
+                    columns=[
+                        ColumnProfile(name="r_regionkey", data_type="bigint"),
+                        ColumnProfile(name="r_name", data_type="string"),
+                        ColumnProfile(name="r_comment", data_type="string"),
+                    ],
+                )
+            ]
+        )
+    )
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "query",
+            f"SELECT k, COUNT(*) AS n FROM {REGION} "  # noqa: S608
+            'LATERAL VIEW EXPLODE(json_object_keys(\'{"a": 1, "b": 2}\')) x AS k '
+            "GROUP BY k ORDER BY k",
+            "--confirm",
+            "--budget",
+            str(DBX_MAX_SECONDS + 60),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["cells"] == [["a", 5], ["b", 5]]
+
+
 # --- scope resolution against the live workspace (free: Unity Catalog REST) -----------
 
 

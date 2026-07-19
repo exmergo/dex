@@ -28,11 +28,17 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 ]}
 ```
 
-`kind` is `model_sql`, `schema_yml`, or `semantic_yml` (optional on
-`semantic define|update|plan`, which imply it). Model SQL must be a single
-read-only SELECT once its jinja is stripped; semantic YAML is validated against
-MetricFlow's schemas, cross-reference-checked, and (when dbt is available)
-parsed by dbt itself before the plan is accepted.
+`kind` is `model_sql`, `schema_yml`, `semantic_yml` (optional on
+`semantic define|update|plan`, which imply it), `macro_sql` (a macro file under
+the project's macro paths), `packages_yml`, `project_yml` (the project-root
+`dbt_project.yml`), or `profiles_yml` (the project-root `profiles.yml`). Model
+SQL must be a single read-only SELECT once its jinja is stripped; semantic YAML
+is validated against MetricFlow's schemas, cross-reference-checked, and (when
+dbt is available) parsed by dbt itself before the plan is accepted; a macro file
+must hold only macro definitions and jinja comments. `project_yml` must keep a
+`name`; `profiles_yml` must reference every secret via `{{ env_var('NAME') }}`
+(a literal credential is refused so none reaches the diff), and both config
+kinds are parsed by dbt at plan time.
 
 ### Bootstrapping a project
 
@@ -101,6 +107,43 @@ resolves. Init refuses if any dbt project already exists.
 - `transform deps` installs dbt packages explicitly (also the refresh path when
   `dbt_packages/` exists but is stale). No confirmation needed: deps writes only
   inside the project and never touches the warehouse.
+
+### Shipped macros
+
+- `transform macro` lists the macros dex ships; `transform macro <name>`
+  proposes scaffolding one into the project's macro directory as a plan,
+  applied with `transform apply` like any other. The user's copy is theirs to
+  edit; re-running the command diffs it back against the shipped version (a
+  warning says whether it is customized or stale), and applying that plan
+  overwrites deliberately.
+- `unpivot_json_object` turns a JSON object column with dynamic keys (the
+  NoSQL-sourced shape: a Firestore/Mongo/DynamoDB document keyed by a related
+  entity's id) into one row per top-level key. Use it instead of hand-rolling
+  JSON SQL; it renders a complete SELECT:
+
+  ```sql
+  select id, key as related_id, value as attrs
+  from (
+    {{ unpivot_json_object(relation=ref('stg_entities'),
+                           json_column='attributes', passthrough=['id']) }}
+  )
+  ```
+
+  The contract on every connector: one row per top-level key, `key` a plain
+  string, `value` the warehouse's native semi-structured type (BigQuery JSON,
+  Snowflake VARIANT, Databricks VARIANT, Postgres jsonb, Redshift SUPER,
+  DuckDB JSON), a NULL object yields no rows, and a nested object's own field
+  names never surface as top-level keys. For a string-typed source column
+  pass the parse expression as `json_column` (`parse_json(payload)` on
+  BigQuery, Snowflake, and Databricks; `json_parse(payload)` on Redshift);
+  Postgres and DuckDB accept JSON-bearing text directly. Databricks needs
+  VARIANT support (DBR 15.3+ or a current SQL warehouse). Two BigQuery quirks
+  are absorbed by the macro, so do not "fix" them back in: a JSON path
+  argument must be a compile-time literal (the macro reads values with the
+  subscript operator, which accepts a computed key), and `JSON_KEYS` recurses
+  into nested objects unless depth-limited (the macro pins depth 1). When a
+  planned model calls the macro and the project lacks it, the plan warns and
+  names the scaffold command; scaffold it rather than inlining a copy.
 
 ### Preparing the dev target
 

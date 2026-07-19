@@ -137,6 +137,52 @@ def test_query_firewall_allows_measuring_and_refuses_pii_values(tmp_path: Path, 
     assert "PII" in envelope["errors"][0]
 
 
+def test_query_firewall_unnests_the_seeded_jsonb_column(tmp_path: Path, capsys):
+    seed_repo(tmp_path, schemas=["app"], budget=120)
+    rc, _ = run_cli(
+        ["--repo-root", str(tmp_path), "explore", "map", "--confirm"], capsys
+    )
+    assert rc == 0
+
+    # The schemaless-exploration probe the firewall exists to admit: every
+    # distinct top-level key of a JSON column, with its frequency.
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "query",
+            "SELECT k, count(*) AS n FROM app.products, "
+            "jsonb_object_keys(attrs) AS k GROUP BY k ORDER BY n DESC",
+            "--confirm",
+            "--budget",
+            "30",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    keys = {row[0] for row in envelope["data"]["cells"]}
+    assert {"weight_g", "in_stock"} <= keys
+
+    # Smuggling a subquery through the unnest stays refused, before execution.
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "query",
+            "SELECT k FROM app.products, "
+            "jsonb_object_keys((SELECT attrs FROM app.products LIMIT 1)) AS k",
+            "--confirm",
+            "--budget",
+            "30",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "query refused" in envelope["errors"][0]
+
+
 # --- scope resolution against the live database (free: one pg_catalog SELECT) ---------
 
 

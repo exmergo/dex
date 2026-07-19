@@ -154,6 +154,53 @@ def test_firewalled_query_round_trip(tmp_path: Path, capsys, bq_project: str):
     assert decisions == ["needs_confirmation", "allowed"]
 
 
+def test_unnest_of_a_function_derived_array_runs_live(
+    tmp_path: Path, capsys, bq_project: str
+):
+    # The FROM-clause UNNEST the firewall now admits, exercised end to end on
+    # BigQuery. The array derives from an allowlisted JSON function over a
+    # literal, so the probe scans zero table bytes; a real column works the
+    # same way (the unit suite covers taint inheritance).
+    seed_repo(tmp_path, bq_project)
+    DexStore(tmp_path).save_cache(DexCache(datasets=[]))
+    root = str(tmp_path)
+
+    sql = 'SELECT k FROM UNNEST(JSON_EXTRACT_ARRAY(\'["x","y","z"]\')) AS k'
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "explore",
+            "query",
+            sql,
+            "--confirm",
+            "--budget",
+            str(MAX_BYTES),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["row_count"] == 3
+
+    # The smuggle shape is refused statically, before any job is created.
+    bad = f"SELECT k FROM UNNEST((SELECT ARRAY_AGG(word) FROM `{SHAKESPEARE}`)) AS k"  # noqa:S608
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "explore",
+            "query",
+            bad,
+            "--confirm",
+            "--budget",
+            str(MAX_BYTES),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "query refused" in envelope["errors"][0]
+
+
 # --- scope resolution against the live project (free: metadata GET, no query) ---------
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import RS_MAX_SECONDS
+from .conftest import RS_MAX_SECONDS, assert_unpivot_build, unpivot_fixture_edits
 from .test_redshift_connect import run_cli
 
 pytestmark = [pytest.mark.integration, pytest.mark.redshift]
@@ -114,6 +114,72 @@ def test_init_and_build_write_only_the_dev_schema(tmp_path: Path, capsys, dev_en
     assert entry["connector"] == "redshift"
     assert entry["command"] == "transform build"
     assert entry["billed_seconds"] > 0
+
+
+def test_unpivot_json_object_macro_builds_live(tmp_path: Path, capsys, dev_env):
+    """Also settles the two Redshift questions the macro carries: PartiQL
+    UNPIVOT accepts the qualified column expression, and the AT key arrives as
+    the plain string the accepted_values test compares against."""
+
+    seed_repo_password_path(tmp_path, schemas=["app"], budget=BUILD_BUDGET)
+    root = str(tmp_path)
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "redshift",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, envelope
+
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            unpivot_fixture_edits(lambda d: f"json_parse('{d}')", "cast(null as super)")
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "unpivot fixture",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    rc, built = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "build",
+            "--confirm",
+            "--budget",
+            str(BUILD_BUDGET),
+        ],
+        capsys,
+    )
+    assert rc == 0, built
+    assert_unpivot_build(built)
 
 
 def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(

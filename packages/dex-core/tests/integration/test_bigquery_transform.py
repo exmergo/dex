@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import MAX_BYTES
+from .conftest import MAX_BYTES, assert_unpivot_build, unpivot_fixture_edits
 from .test_bigquery_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.bigquery]
@@ -116,6 +116,81 @@ def test_init_plan_apply_build_into_the_scratch_dataset(
         table = client.get_table(f"{bq_project}.{bq_scratch_dataset}.{MODEL_NAME}")
         assert table.table_id == MODEL_NAME
         client.delete_table(table, not_found_ok=True)
+    finally:
+        client.close()
+
+
+def test_unpivot_json_object_macro_builds_live(
+    tmp_path: Path, capsys, bq_project: str, bq_scratch_dataset: str
+):
+    """The macro's two BigQuery fixes proven on BigQuery itself: the subscript
+    read of a computed key compiles (a dynamic path string would not), and the
+    depth-limited json_keys keeps nested field names out of the key rows (the
+    accepted_values test fails if either regresses)."""
+
+    pytest.importorskip("dbt.adapters.bigquery")
+    root = str(tmp_path)
+    _seed_transform_repo(tmp_path, bq_project, bq_scratch_dataset)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
+    )
+    assert rc == 0, envelope
+    rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, envelope
+
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            unpivot_fixture_edits(lambda d: f"json '{d}'", "cast(null as json)")
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "unpivot fixture",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    rc, built = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            str(MAX_BYTES),
+        ],
+        capsys,
+    )
+    assert rc == 0, built
+    assert_unpivot_build(built)
+
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=bq_project)
+    try:
+        for name in ("entity_relations", "stg_entities"):
+            client.delete_table(
+                f"{bq_project}.{bq_scratch_dataset}.{name}", not_found_ok=True
+            )
     finally:
         client.close()
 

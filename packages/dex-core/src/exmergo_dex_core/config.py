@@ -261,6 +261,12 @@ class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
 
+    # The DuckDB on-ramp: a config that omits `connector:` (or a bare `--path`
+    # read with no config) means the free local connector. This default only
+    # applies to a config that actually exists or an explicit `--path`; it is NOT
+    # a fallback for a missing config. `open_adapter` refuses when no config
+    # resolves and nothing explicit is given, rather than fabricating a duckdb
+    # target, so this default can never stand in for a config that was not found.
     connector: str = "duckdb"
     duckdb: DuckDBTarget | None = None
     bigquery: BigQueryTarget | None = None
@@ -279,6 +285,9 @@ class DexConfig(BaseModel):
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25
+    # How fresh a cached profile must be to skip re-scanning it (`explore map` /
+    # `explore relationships`); 0 disables reuse (always re-profile).
+    profile_freshness_hours: float = 24.0
     # Columns a human has reviewed and cleared as not PII. The only way to
     # durably clear a detector flag; hand-edits to the cache are overwritten by
     # the next profile, this list is re-applied on every profile.

@@ -161,6 +161,33 @@ def test_firewalled_query_round_trip(
     assert envelope["data"]["spend"]["seconds_billed"] >= 0
 
 
+def test_flatten_of_a_parsed_json_literal_runs_live(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    # The FROM-clause FLATTEN the firewall now admits, exercised end to end.
+    # The input derives from an allowlisted function over a literal, so no
+    # table is read; a VARIANT column works the same way (the unit suite
+    # covers taint inheritance).
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+    DexStore(tmp_path).save_cache(DexCache(datasets=[]))
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "query",
+            "SELECT f.key AS k FROM TABLE(FLATTEN(input => "
+            'PARSE_JSON(\'{"a": 1, "b": 2}\'))) f ORDER BY k',
+            "--confirm",
+            "--budget",
+            str(SF_MAX_SECONDS + 90),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert [row[0] for row in envelope["data"]["cells"]] == ["a", "b"]
+
+
 def test_scope_bounds_the_estimate_to_the_named_schema(
     tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
 ):

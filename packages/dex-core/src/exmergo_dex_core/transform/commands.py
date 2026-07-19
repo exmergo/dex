@@ -101,7 +101,101 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
             "transform plan needs content: pass --edits-file <path|-> with the "
             "authored edits, or --scaffold <table> for a staging skeleton"
         )
-    return _make_plan(args, intent, edits)
+
+    parse_notes: list[str] = []
+    if any(e.kind in (EditKind.PROJECT_YML, EditKind.PROFILES_YML) for e in edits):
+        # A broken dbt_project.yml or profiles.yml breaks the whole project, so
+        # config edits are gated by dbt's own parser at plan time (the same
+        # authoritative gate semantic and macro plans use), not left to surface
+        # for the first time at build. The secret-guard runs first, so an
+        # inlined credential is never handed to the dbt subprocess.
+        from ..config import DexConfig, load_config
+        from ..dbt_project import load as load_project
+        from .build import shadow_parse
+        from .validate import assert_profiles_safe
+
+        project = command_args.project_dir(args)
+        view = load_project(project)
+        assert_profiles_safe(view, edits)
+        config = load_config(command_args.repo_root(args)) or DexConfig()
+        parse_result = shadow_parse(project, edits, target=config.dbt_target)
+        if not parse_result["available"]:
+            parse_notes.append(parse_result["reason"])
+        elif not parse_result["success"]:
+            return env.error(
+                _failure_message("dbt parse failed", parse_result["messages"]),
+                warnings=parse_result["messages"][1:],
+            )
+        elif parse_result["messages"]:
+            parse_notes = [f"dbt: {m}" for m in parse_result["messages"]]
+
+    envelope = _make_plan(args, intent, edits)
+    if parse_notes and envelope.status is env.Status.OK:
+        envelope.warnings.extend(parse_notes)
+    return envelope
+
+
+def cmd_macro(args: argparse.Namespace) -> env.Envelope:
+    """List the shipped macros, or plan scaffolding one into the project."""
+
+    from ..dbt_project import load as load_project
+    from . import scaffold as scaffold_mod
+
+    name = getattr(args, "argument", None)
+    if not name:
+        return env.ok(
+            {
+                "macros": [
+                    {"name": macro_name, "description": description}
+                    for macro_name, description in sorted(
+                        scaffold_mod.MACRO_ASSETS.items()
+                    )
+                ],
+                "next": "scaffold one with `transform macro <name>`",
+            }
+        )
+
+    project = command_args.project_dir(args)
+    view = load_project(project)
+    edit = scaffold_mod.macro_edit(name, view.macro_paths[0])
+
+    warnings: list[str] = []
+    existing = view.files.get(edit.path)
+    if existing is not None and existing.content == edit.new_content:
+        return env.ok(
+            {
+                "macro": name,
+                "path": edit.path,
+                "up_to_date": True,
+            },
+            warnings=[f"{edit.path} already matches the shipped version"],
+        )
+    if existing is not None:
+        warnings.append(
+            f"{edit.path} differs from the shipped version (customized or "
+            "stale); the diff below reconciles them, and applying it "
+            "overwrites the project's copy"
+        )
+
+    # The authoritative gate, same layering as semantic plans: dbt's own
+    # parser sees the macro in a shadow copy of the project, which also
+    # catches a name collision with a macro defined elsewhere in the project.
+    from ..config import DexConfig, load_config
+    from .build import shadow_parse
+
+    config = load_config(command_args.repo_root(args)) or DexConfig()
+    parse_result = shadow_parse(project, [edit], target=config.dbt_target)
+    if not parse_result["available"]:
+        warnings.append(parse_result["reason"])
+    elif not parse_result["success"]:
+        return env.error(
+            _failure_message("dbt parse failed", parse_result["messages"]),
+            warnings=parse_result["messages"][1:],
+        )
+
+    envelope = _make_plan(args, f"scaffold macro {name}", [edit])
+    envelope.warnings.extend(warnings)
+    return envelope
 
 
 def cmd_apply(args: argparse.Namespace) -> env.Envelope:

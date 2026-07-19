@@ -1,6 +1,6 @@
-"""Deterministic staging-model skeletons from the `.dex/` exploration cache.
+"""Deterministic authoring paths that need no agent-written content.
 
-The one authoring path that needs no agent-written content: given a profiled
+Staging-model skeletons from the `.dex/` exploration cache: given a profiled
 table, emit a `stg_<table>.sql` skeleton (explicit column list over a source())
 and its per-model YAML with key tests and PII flags propagated into column
 `meta`. The cache is the only place PII flags live, so this is the mechanical
@@ -9,16 +9,32 @@ through the normal edits-file flow.
 
 Per-model YAML files (plus one shared sources file) keep the scaffold merge-free:
 it never has to rewrite an existing hand-written schema.yml.
+
+Shipped macros: dbt macro files carried as package assets and scaffolded into
+the user's project through the same plan/apply flow (`transform macro <name>`).
+The user's copy is theirs to edit; re-scaffolding proposes a diff back to the
+shipped version.
 """
 
 from __future__ import annotations
 
+from importlib import resources
 from pathlib import Path
 
 from ..cache import Dataset, DexStore
+from ..dbt_project import DbtProjectView
 from .plans import EditKind, PlanEdit
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
+
+# name -> one-line description, surfaced by `transform macro` with no argument.
+MACRO_ASSETS: dict[str, str] = {
+    "unpivot_json_object": (
+        "unpivot a JSON object column with dynamic keys into (key, value) "
+        "rows, top-level keys only; native semi-structured value type on "
+        "every connector"
+    ),
+}
 
 
 class ScaffoldError(Exception):
@@ -48,6 +64,60 @@ def scaffold_edits(tables: list[str], repo_root: Path | str = ".") -> list[PlanE
     for dataset in datasets:
         edits.extend(model_edits(dataset))
     return edits
+
+
+def macro_edit(name: str, macro_dir: str) -> PlanEdit:
+    """The plan edit that scaffolds a shipped macro into the project."""
+
+    if name not in MACRO_ASSETS:
+        raise ScaffoldError(
+            f"no shipped macro named '{name}'; available: "
+            + ", ".join(sorted(MACRO_ASSETS))
+        )
+    asset = (
+        resources.files("exmergo_dex_core.transform")
+        / "assets"
+        / "macros"
+        / f"{name}.sql"
+    )
+    return PlanEdit(
+        path=f"{macro_dir}/{name}.sql",
+        kind=EditKind.MACRO_SQL,
+        new_content=asset.read_text(encoding="utf-8"),
+    )
+
+
+def missing_macro_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[str]:
+    """Warn when a planned model calls a shipped macro the project lacks.
+
+    A warning, never an injected edit: plans hold exactly what their caller
+    submitted. The check is presence-based (the call spelled anywhere in the
+    model, the definition spelled anywhere under a macro path or in this same
+    plan), which is as much as static text can say."""
+
+    warnings: list[str] = []
+    macro_files = [
+        f
+        for f in view.files.values()
+        if any(f.path.startswith(f"{mp}/") for mp in view.macro_paths)
+    ]
+    for name in MACRO_ASSETS:
+        called = any(
+            e.kind is EditKind.MODEL_SQL and f"{name}(" in e.new_content for e in edits
+        )
+        if not called:
+            continue
+        defined_in_project = any(f"macro {name}(" in f.content for f in macro_files)
+        defined_in_plan = any(
+            e.kind is EditKind.MACRO_SQL and f"macro {name}(" in e.new_content
+            for e in edits
+        )
+        if not defined_in_project and not defined_in_plan:
+            warnings.append(
+                f"a planned model calls {name}() but the project has no such "
+                f"macro; run `transform macro {name}` and apply it first"
+            )
+    return warnings
 
 
 def model_edits(dataset: Dataset) -> list[PlanEdit]:

@@ -35,8 +35,13 @@ Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
 `[postgres]`, `[redshift]`, or `[all]` for every connector at once. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
-connector (an explicit `--connector`, then `.dex/config.yml`, then DuckDB), so a
-release is connector-neutral.
+connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
+found by walking up from the run directory to the git root, then DuckDB), so a
+release is connector-neutral. The engine resolves the same way but does not default
+silently: with no `.dex/config.yml` anywhere up the tree and no explicit
+`--connector`/`--path`, it refuses and names the fix rather than reading a phantom
+DuckDB target, so a command run from a subdirectory of your project resolves the
+project's real config instead of a wrong default.
 
 | Subcommand | Returns |
 |---|---|
@@ -45,12 +50,13 @@ release is connector-neutral.
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
 | `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe; `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge) |
 | `explore map [--verify] [--use-project]` | writes/updates the `.dex/` map; prints a summary; `--use-project` additionally applies declared grain and ranks metric-backing models higher |
-| `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); requires the `.dex/` cache (`explore map` first) |
+| `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); the FROM clause may unnest JSON/array columns in the connector's native idiom (UNNEST, LATERAL FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL) when the unnested value derives from a queried table's column, with the outputs inheriting that column's flags; requires the `.dex/` cache (`explore map` first) |
 | `explore cluster <object> [--features a,b] [-k N]` | k-means over a bounded, column-pruned, dialect-sampled scan of numeric columns; returns cluster sizes + centroids (feature means) + silhouette, never rows; auto-selects non-PII, non-key numeric features (or takes `--features`; a named PII column is opt-in, mean only); requires the `.dex/` cache and the `[cluster]` extra; billed connectors take the cost handshake |
 | `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required) |
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
 | `transform apply [plan-id]` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite; no id applies the latest unapplied plan of any kind |
 | `transform plans` | list stored plans, pending and applied, newest first |
+| `transform macro [name]` | no name lists the shipped dbt macros; a name proposes scaffolding it into the project's macro directory as a plan (dbt-parse-checked, applied with `transform apply`); re-running diffs the project's copy against the shipped version |
 | `transform build --target dev` | prod-looking targets refused outright; then a free dev-target preflight (refuses when `.dex/config.yml` and the rendered `profiles.yml` disagree, or when the dev database does not exist, naming the fix); then the cost preflight; runs only with `--confirm` and a budget; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
 | `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
 | `semantic define\|update\|plan ... --edits-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies per name; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
@@ -75,10 +81,13 @@ engine does not care which skill fronts a subcommand.
 
 Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "content"}, ...]}` with
-`kind` one of `model_sql`, `schema_yml`, `semantic_yml`, or `packages_yml` (the
+`kind` one of `model_sql`, `schema_yml`, `semantic_yml`, `packages_yml` (the
 guarded way to author the project-root `packages.yml`/`dependencies.yml`, so
-declaring a dbt package is a reviewable diff too). The engine validates, diffs,
-and stores the plan under `.dex/plans/`; nothing touches the dbt project until
+declaring a dbt package is a reviewable diff too), `macro_sql`, `project_yml`
+(the project-root `dbt_project.yml`), or `profiles_yml` (the project-root
+`profiles.yml`, secret-guarded so a credential never enters the diff: reference
+secrets via `{{ env_var('NAME') }}`). The engine validates, diffs, and stores
+the plan under `.dex/plans/`; nothing touches the dbt project until
 `transform apply`. See `references/command-contract.md`.
 
 ### The envelope

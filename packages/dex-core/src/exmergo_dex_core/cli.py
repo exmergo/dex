@@ -23,7 +23,7 @@ from . import envelope as env
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": ["inventory", "profile", "relationships", "map", "query", "cluster"],
-    "transform": ["init", "plan", "apply", "build", "deps", "plans"],
+    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro"],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
@@ -123,6 +123,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
+                # Force a full re-profile even when the cache holds a fresh,
+                # schema-matching profile for a selected object (the default is
+                # skip-if-cached; --refresh is the escape hatch when the source
+                # changed in a way the cheap metadata check cannot see).
+                if group == "explore" and name in {"map", "relationships"}:
+                    sp.add_argument(
+                        "--refresh", action="store_true", default=argparse.SUPPRESS
+                    )
                 # Exploration starts bare: warehouse truth, independent of
                 # whatever repo dex runs from. --use-project opts in to folding
                 # the project's declared definitions (joins, grain, metric
@@ -134,8 +142,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=argparse.SUPPRESS,
                     )
                 # transform init takes the project name; plan the intent; apply
-                # the plan id.
-                if group == "transform" and name in {"init", "plan", "apply"}:
+                # the plan id; macro the shipped-macro name (none lists them).
+                if group == "transform" and name in {"init", "plan", "apply", "macro"}:
                     sp.add_argument("argument", nargs="?", default=None)
                 if group == "transform" and name == "plan":
                     # The agent-authored edits payload: a JSON file, or - for stdin.
@@ -212,6 +220,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
         ("transform", "build"),
         ("transform", "deps"),
         ("transform", "plans"),
+        ("transform", "macro"),
         ("semantic", "define"),
         ("semantic", "update"),
         ("semantic", "plan"),
@@ -242,6 +251,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             ("transform", "build"): transform_cmds.cmd_build,
             ("transform", "deps"): transform_cmds.cmd_deps,
             ("transform", "plans"): transform_cmds.cmd_plans,
+            ("transform", "macro"): transform_cmds.cmd_macro,
             ("semantic", "define"): transform_cmds.cmd_semantic_define,
             ("semantic", "update"): transform_cmds.cmd_semantic_update,
             ("semantic", "plan"): transform_cmds.cmd_semantic_plan,

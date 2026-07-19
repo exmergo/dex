@@ -45,10 +45,15 @@ REF_PATTERN = re.compile(r"ref\(\s*['\"]([^'\"]+)['\"]")
 SOURCE_PATTERN = re.compile(r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]")
 BARE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-# dbt project-root manifests dex may author outside the model paths. They declare
-# package dependencies (not model content), so the editing surface widens by
-# exactly these two known files, never to arbitrary root files.
-_ALLOWED_ROOT_FILES = frozenset({"packages.yml", "dependencies.yml"})
+# dbt project-root files dex may author outside the model paths: the package
+# manifests (dependency declarations), the project config, and the connection
+# profiles. Each governs the whole project, not one model, which is why the
+# editing surface widens by exactly these known names and never to arbitrary
+# root files. Kinds are pinned to the specific file each one may target in
+# ``transform.plans``; here we only gate containment.
+_ALLOWED_ROOT_FILES = frozenset(
+    {"packages.yml", "dependencies.yml", PROJECT_FILE, PROFILES_FILE}
+)
 
 
 class DbtProjectError(Exception):
@@ -75,6 +80,7 @@ class DbtProjectView(BaseModel):
     project_name: str
     profile_name: str
     model_paths: list[str] = Field(default_factory=lambda: ["models"])
+    macro_paths: list[str] = Field(default_factory=lambda: ["macros"])
     files: dict[str, SourceFile] = Field(default_factory=dict)
     manifest: dict[str, Any] | None = None
 
@@ -170,9 +176,12 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
     if not project_name:
         raise DbtProjectError(f"{project_file} has no 'name'")
     model_paths = list(raw.get("model-paths", ["models"]))
+    # dbt's own default when the key is absent, so a skeleton project's first
+    # scaffolded macro lands where dbt will look for it.
+    macro_paths = list(raw.get("macro-paths", ["macros"]))
 
     files: dict[str, SourceFile] = {}
-    for model_path in model_paths:
+    for model_path in model_paths + macro_paths:
         base = root / model_path
         if not base.is_dir():
             continue
@@ -183,6 +192,18 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
             content = path.read_text(encoding="utf-8")
             files[rel] = SourceFile(
                 path=rel, content=content, sha256=content_hash(content)
+            )
+
+    # Root-level config files dex may author (project settings, connection
+    # targets, package manifests). Included so an edit to an existing one pins
+    # the real content hash instead of mis-registering as a create, which would
+    # otherwise surface at apply as a spurious conflict.
+    for root_file in _ALLOWED_ROOT_FILES:
+        path = root / root_file
+        if path.is_file():
+            content = path.read_text(encoding="utf-8")
+            files[root_file] = SourceFile(
+                path=root_file, content=content, sha256=content_hash(content)
             )
 
     manifest: dict[str, Any] | None = None
@@ -201,6 +222,7 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
         # dbt defaults the profile name to the project name when unset.
         profile_name=raw.get("profile", project_name),
         model_paths=model_paths,
+        macro_paths=macro_paths,
         files=files,
         manifest=manifest,
     )
@@ -421,7 +443,9 @@ def write_edits(
     conflicts: list[Conflict] = []
     diffs: list[dict[str, Any]] = []
     for edit in edits:
-        target_path = contained_path(root, edit.path, view.model_paths)
+        target_path = contained_path(
+            root, edit.path, view.model_paths, view.macro_paths
+        )
         current = (
             target_path.read_text(encoding="utf-8") if target_path.is_file() else None
         )
@@ -452,12 +476,19 @@ def write_edits(
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
 
 
-def contained_path(root: Path, rel_path: str, model_paths: list[str]) -> Path:
-    """Resolve an edit path and refuse anything outside the project's model paths.
+def contained_path(
+    root: Path,
+    rel_path: str,
+    model_paths: list[str],
+    macro_paths: list[str] | None = None,
+) -> Path:
+    """Resolve an edit path and refuse anything outside the project's editing
+    surface.
 
     Writes are confined to the repo, and within the repo to the dbt editing
-    surface: model SQL, schema.yml, and semantic YAML all live under the model
-    paths. Escapes (absolute paths, ``..``) are refused outright.
+    surface: model SQL, schema.yml, and semantic YAML live under the model
+    paths, and macros under the macro paths. Escapes (absolute paths, ``..``)
+    are refused outright.
     """
 
     candidate = Path(rel_path)
@@ -469,13 +500,14 @@ def contained_path(root: Path, rel_path: str, model_paths: list[str]) -> Path:
     # name (still inside the project, still not an arbitrary escape).
     if resolved.parent == root_resolved and resolved.name in _ALLOWED_ROOT_FILES:
         return root / candidate
-    for model_path in model_paths:
-        base = (root_resolved / model_path).resolve()
+    allowed = list(model_paths) + list(macro_paths or [])
+    for allowed_path in allowed:
+        base = (root_resolved / allowed_path).resolve()
         if resolved == base or base in resolved.parents:
             return root / candidate
     raise DbtProjectError(
-        f"edit path '{rel_path}' is outside the project's model paths "
-        f"({', '.join(model_paths)}); dex edits only the dbt project surface"
+        f"edit path '{rel_path}' is outside the project's model and macro "
+        f"paths ({', '.join(allowed)}); dex edits only the dbt project surface"
     )
 
 
