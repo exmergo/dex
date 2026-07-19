@@ -50,6 +50,13 @@ message rather than letting dbt create an empty database: seed the dev target fi
 source-less project is allowed to create its dev database on first build, with a
 warning.
 
+The dev target being the source file is also why `transform init`'s content
+preflight skips DuckDB's base namespace: "the file already holds objects" is
+true of every working setup, so warning on it would only teach users to skim.
+With `--layered-schemas` the layer schemas inside the file (`staging_dev`,
+`intermediate_dev`, `marts_dev` on the `dev` target) are genuinely dbt-owned,
+and those are checked and warned about when populated.
+
 ## Capabilities probe
 
 ```bash

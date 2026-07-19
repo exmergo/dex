@@ -50,6 +50,13 @@ refuses with the fix named. Pin the smallest warehouse that works (a 2X-Small
 serverless with the minimum auto-stop is the intended shape;
 `scripts/setup_databricks_ci.sh` provisions exactly that).
 
+`transform init` content-checks every schema the new project would build into
+through Unity Catalog REST only, so the pinned warehouse is never woken: the
+base `dev_catalog.dev_schema`, plus the sibling layer schemas (`staging_dev`,
+`intermediate_dev`, `marts_dev` on the `dev` target) when `--layered-schemas`
+is on. A schema that already holds tables or views is warned about, never
+refused.
+
 ## Cost model: two clients, one guarded quantity
 
 Metadata is free and scans cost warehouse runtime, so dex guards

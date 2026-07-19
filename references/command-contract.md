@@ -42,7 +42,10 @@ dex explore cluster <object>      -> k-means over a bounded sample of numeric no
                                      returns cluster sizes + centroids (means) + silhouette, no rows
                                      (--features to choose columns, -k to fix the cluster count)
 dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
-                                     --connector (never defaults); refuses if a project exists
+                                     --connector (never defaults); refuses if a project exists;
+                                     --layered-schemas routes staging/intermediate/marts to their
+                                     own <layer>_<target name> schemas; warns when a target
+                                     namespace already holds objects (free metadata check)
 dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applied yet)
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind
@@ -122,7 +125,33 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   connectors. On success init writes `connector`, `dbt_project_dir`, and
   `dbt_target: dev` back to `.dex/config.yml`, so the choice is made once and is
   ambient for every later command. Every connector renders: DuckDB, BigQuery,
-  Snowflake, Databricks, and Postgres.
+  Snowflake, Databricks, Postgres, and Redshift.
+
+  `--layered-schemas` opts into per-layer schema routing: init additionally
+  scaffolds `models/intermediate/`, the shipped `generate_schema_name` macro
+  override, and a `models:` block with `+schema: staging|intermediate|marts`.
+  The override composes `<custom schema>_<target name>` (layer first, target
+  last), so a dev build lands in `staging_dev` / `intermediate_dev` /
+  `marts_dev`; a model with no custom schema falls back to `target.schema`. On
+  BigQuery the layer namespaces are sibling datasets in the profile's project;
+  on Snowflake and Databricks they are sibling schemas inside the dev
+  database/catalog; on Postgres and Redshift sibling schemas in the database;
+  on DuckDB schemas inside the target file. The same macro is available to
+  existing projects via `transform macro generate_schema_name`.
+
+  Init also runs a content preflight over every namespace the new project
+  would build into (the base dev namespace, plus each layer namespace when
+  `--layered-schemas` is on): a free, metadata-only listing on every connector
+  (never a query, never a warehouse wake-up). A namespace that already exists
+  *with* tables or views produces a warning naming it, the object count, and up
+  to five object names, because a later build would write alongside that
+  content and replace same-named relations; init is the one point where the
+  name is still trivial to change. It is advisory by design: init still
+  succeeds, an empty or absent namespace stays silent, and when dex cannot open
+  a connection the check degrades to a single note (init is credential-optional
+  and stays that way). DuckDB's base namespace is exempt, since the dev target
+  is the same file as the source warehouse; only the layer schemas are probed
+  there.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.
