@@ -426,6 +426,21 @@ class PostgresAdapter:
         ]
         return [f'{", ".join(missing)} on dev_schema "{schema}"'] if missing else []
 
+    def dev_namespace_objects(self, schema: str) -> list[str]:
+        """Table and view names already in one schema. Free: one catalog SELECT,
+        no scan. A schema that does not exist yields no rows, i.e. nothing to
+        collide with. No role parameter: content is role-independent, unlike the
+        privilege question ``missing_dev_namespaces`` asks."""
+
+        rows = self._catalog(
+            "SELECT c.relname AS object_name "  # noqa: S608
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relkind IN ('r', 'p', 'f', 'm', 'v') "
+            f"AND n.nspname = '{_escape_literal(schema)}'"
+        )
+        return sorted(str(row["object_name"]) for row in rows)
+
     def _role_exists(self, role: str) -> bool:
         rows = self._catalog(
             "SELECT 1 AS present FROM pg_catalog.pg_roles "  # noqa: S608

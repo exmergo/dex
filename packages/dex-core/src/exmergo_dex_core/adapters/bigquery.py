@@ -316,6 +316,17 @@ class BigQueryAdapter:
             return [f'dev_dataset "{qualified}"']
         return []
 
+    def dev_namespace_objects(self, dataset: str) -> list[str]:
+        """Table and view names already in one dataset. Free: the tables.list
+        metadata API, never INFORMATION_SCHEMA (which bills a 10 MB minimum).
+        An absent dataset reads as empty: nothing is there to collide with."""
+
+        qualified = dataset if "." in dataset else f"{self.project}.{dataset}"
+        try:
+            return sorted(item.table_id for item in self._client.list_tables(qualified))
+        except self._api_exceptions.NotFound:
+            return []
+
     def _get_table(self, identifier: str) -> Any:
         cached = self._tables.get(identifier)
         if cached is not None:
