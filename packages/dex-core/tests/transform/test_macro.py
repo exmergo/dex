@@ -99,6 +99,26 @@ def test_macro_scaffolds_a_plan_and_apply_writes_it(
     assert (dbt_project_dir / "macros" / "unpivot_json_object.sql").is_file()
 
 
+def test_generate_schema_name_scaffolds_into_an_existing_project(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # The layered-init macro is also reachable on its own, for projects that
+    # adopt per-layer schemas after the fact.
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "macro", "generate_schema_name"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["macros/generate_schema_name.sql"]
+    unified = envelope["diffs"][0]["unified"]
+    assert "{{ custom_schema_name | trim }}_{{ target.name }}" in unified
+    assert "{{ target.schema }}" in unified
+
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, envelope
+    assert (dbt_project_dir / "macros" / "generate_schema_name.sql").is_file()
+
+
 def test_macro_refuses_an_unknown_name_naming_the_available(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

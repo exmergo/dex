@@ -705,3 +705,11 @@ def test_an_unreachable_dev_project_is_raised(fake_bq_client):
     assert "no-such-project" in message
     assert "dbt creates datasets but never projects" in message
     assert fake_bq_client.query_calls == []
+
+
+def test_dev_namespace_objects_lists_one_dataset_from_metadata(fake_bq_client):
+    adapter = make_adapter(fake_bq_client)
+    assert adapter.dev_namespace_objects("shop") == ["customers", "events"]
+    # Bare names qualify against the adapter's project; absence reads as empty.
+    assert adapter.dev_namespace_objects("not_there") == []
+    assert fake_bq_client.query_calls == []

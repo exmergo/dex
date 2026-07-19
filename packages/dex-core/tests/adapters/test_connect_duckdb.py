@@ -100,3 +100,23 @@ def test_committed_duckdb_path_resolves_against_repo_root_not_cwd(
         assert adapter.capabilities()["read_only"] is True
     finally:
         adapter.close()
+
+
+def test_dev_namespace_objects_lists_one_schema(tmp_path):
+    import duckdb
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("CREATE SCHEMA staging_dev")
+    conn.execute("CREATE TABLE staging_dev.stg_leftover (id INTEGER)")
+    conn.execute("CREATE VIEW staging_dev.v_leftover AS SELECT * FROM customers")
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    assert adapter.dev_namespace_objects("staging_dev") == [
+        "stg_leftover",
+        "v_leftover",
+    ]
+    assert adapter.dev_namespace_objects("not_there") == []
+    adapter.close()

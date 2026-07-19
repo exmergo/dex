@@ -734,3 +734,140 @@ def test_an_unopenable_connection_degrades_to_a_note_on_every_connector(
     assert len(warnings) == 1
     assert "could not preflight the dev database" in warnings[0]
     assert "RuntimeError" in warnings[0]
+
+
+# --- the init-time content check: what the new project would build into --------------
+
+
+class _RecordingAdapter:
+    """Answers dev_namespace_objects from a canned map and records every probe,
+    so the composition (which namespaces, in what shape, per connector) is what
+    gets asserted rather than any real listing."""
+
+    def __init__(self, contents: dict | None = None, raises: Exception | None = None):
+        self.contents = contents or {}
+        self.raises = raises
+        self.calls: list[tuple] = []
+        self.closed = False
+
+    def dev_namespace_objects(self, *args):
+        self.calls.append(args)
+        if self.raises is not None:
+            raise self.raises
+        return self.contents.get(args, [])
+
+    def close(self):
+        self.closed = True
+
+
+def test_content_check_composes_base_and_layer_namespaces_per_connector(monkeypatch):
+    from exmergo_dex_core.config import (
+        BigQueryTarget,
+        DatabricksTarget,
+        PostgresTarget,
+    )
+
+    cases = [
+        (
+            DexConfig(
+                connector="snowflake",
+                dbt_target="dev",
+                snowflake=SnowflakeTarget(warehouse="WH", dev_database="Scratch"),
+            ),
+            [
+                ("SCRATCH", "DBT_DEV"),
+                ("SCRATCH", "STAGING_DEV"),
+                ("SCRATCH", "INTERMEDIATE_DEV"),
+                ("SCRATCH", "MARTS_DEV"),
+            ],
+        ),
+        (
+            DexConfig(
+                connector="bigquery",
+                dbt_target="dev",
+                bigquery=BigQueryTarget(project="test-proj", dev_dataset="dbt_dev"),
+            ),
+            [("dbt_dev",), ("staging_dev",), ("intermediate_dev",), ("marts_dev",)],
+        ),
+        (
+            DexConfig(
+                connector="databricks",
+                dbt_target="dev",
+                databricks=DatabricksTarget(warehouse="wh", dev_catalog="dex_dev"),
+            ),
+            [
+                ("dex_dev", "dbt_dev"),
+                ("dex_dev", "staging_dev"),
+                ("dex_dev", "intermediate_dev"),
+                ("dex_dev", "marts_dev"),
+            ],
+        ),
+        (
+            DexConfig(
+                connector="postgres",
+                dbt_target="dev",
+                postgres=PostgresTarget(dev_schema="dbt_dev"),
+            ),
+            [("dbt_dev",), ("staging_dev",), ("intermediate_dev",), ("marts_dev",)],
+        ),
+    ]
+    for config, expected in cases:
+        adapter = _RecordingAdapter()
+        _fake_open(monkeypatch, adapter)
+        assert dev_target.content_check(config, ".", layered=True) == []
+        assert adapter.calls == expected, config.connector
+        assert adapter.closed
+
+
+def test_content_check_probes_only_the_base_namespace_without_the_flag(monkeypatch):
+    adapter = _RecordingAdapter()
+    _fake_open(monkeypatch, adapter)
+    config = _snowflake_config()
+    assert dev_target.content_check(config, ".") == []
+    assert adapter.calls == [("DBT_DEV", "DBT_DEV")]
+
+
+def test_content_check_warning_qualifies_bigquery_datasets_with_the_project(
+    monkeypatch,
+):
+    from exmergo_dex_core.config import BigQueryTarget
+
+    adapter = _RecordingAdapter(contents={("staging_dev",): ["stg_orders"]})
+    _fake_open(monkeypatch, adapter)
+    config = DexConfig(
+        connector="bigquery",
+        dbt_target="dev",
+        bigquery=BigQueryTarget(project="test-proj", dev_dataset="dbt_dev"),
+    )
+    warnings = dev_target.content_check(config, ".", layered=True)
+    assert len(warnings) == 1
+    assert "test-proj.staging_dev" in warnings[0]
+    assert "1 object (stg_orders)" in warnings[0]
+
+
+def test_content_check_never_opens_for_a_bare_duckdb_target():
+    """No probes to run means no adapter opened: the autouse raiser is live and
+    no degrade note appears."""
+
+    config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path="/wh.duckdb"))
+    assert dev_target.content_check(config, ".") == []
+
+
+def test_content_check_degrades_to_a_note_when_a_probe_raises(monkeypatch):
+    adapter = _RecordingAdapter(raises=RuntimeError("catalog listing exploded"))
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.content_check(_snowflake_config(), ".")
+    assert len(warnings) == 1
+    assert "could not check the dev namespaces" in warnings[0]
+    assert "catalog listing exploded" in warnings[0]
+    assert adapter.closed
+
+
+def test_content_check_degrades_to_a_note_when_no_connection_opens():
+    """The autouse raiser stands in for absent credentials: one note, never a
+    raise, because init is credential-optional."""
+
+    warnings = dev_target.content_check(_snowflake_config(), ".")
+    assert len(warnings) == 1
+    assert "could not check the dev namespaces" in warnings[0]
+    assert "RuntimeError" in warnings[0]

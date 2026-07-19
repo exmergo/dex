@@ -249,6 +249,9 @@ class FakeCursor:
                     )
             self._emit(rows)
         elif "pg_catalog.pg_class" in lowered:
+            # A scoped census (nspname = '<x>') answers only that schema, the
+            # way the real catalog would; the unscoped census answers everything.
+            scoped = re.search(r"nspname = '([^']*)'", sql)
             rows = [
                 {
                     "schema_name": t.schema,
@@ -256,6 +259,7 @@ class FakeCursor:
                     "kind": t.relkind,
                 }
                 for t in sorted(self._conn.tables, key=lambda t: (t.schema, t.name))
+                if scoped is None or t.schema == scoped.group(1)
             ]
             self._emit(rows)
         elif "pg_catalog.pg_user" in lowered:
