@@ -133,9 +133,21 @@ def test_non_dev_target_is_refused(
 
 
 def _fake_runner_factory(
-    monkeypatch, *, returncode: int, stdout: str = "", stderr: str = ""
+    monkeypatch,
+    *,
+    returncode: int,
+    stdout: str = "",
+    stderr: str = "",
+    run_results_json: tuple[Path, str] | None = None,
 ):
-    """Replace _default_runner with a recorder returning a canned dbt result."""
+    """Replace _default_runner with a recorder returning a canned dbt result.
+
+    ``run_results_json``, when given, is written only once the fake ``run()``
+    is actually invoked -- matching real dbt, which writes the artifact as
+    part of running rather than beforehand (`build()` clears any stale one
+    right before invocation, so pre-seeding it ahead of the call would just
+    have it deleted unread).
+    """
 
     import subprocess
 
@@ -145,6 +157,10 @@ def _fake_runner_factory(
     def fake(timeout: float, cwd, env=None):
         def run(argv: list[str]):
             calls.append({"argv": argv, "cwd": cwd, "env": env})
+            if run_results_json is not None:
+                path, content = run_results_json
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
             return subprocess.CompletedProcess(
                 args=argv, returncode=returncode, stdout=stdout, stderr=stderr
             )
@@ -263,6 +279,196 @@ def test_build_failure_error_skips_deprecation_warnings_for_the_real_cause(
         '"NOPE_MISSING_DB"'
     )
     assert any("PropertyMovedToConfigDeprecation" in w for w in envelope["warnings"])
+
+
+def test_build_failure_names_the_cause_behind_a_per_node_database_error(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Regression for #76: a per-node `Database/Runtime/Compilation Error in
+    <node> (<path>)` header (dbt_common's DbtRuntimeError.__str__ shape, the
+    same on every adapter) carries no cause of its own -- the real one is the
+    next line. Shape confirmed against a real `dbt build --log-format json`
+    failure, not hand-guessed."""
+
+    real_error = (
+        "Runtime Error in model my_model (models/staging/my_model.sql)\n"
+        "  Argument 2 to JSON_VALUE must be a constant expression\n"
+        "  compiled code at target/run/dex_test/models/staging/my_model.sql"
+    )
+    lines = [
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "LogModelResult",
+                    "msg": "1 of 1 ERROR creating sql view model my_model ... "
+                    "[ERROR in 0.12s]",
+                }
+            }
+        ),
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "RunResultFailure",
+                    "msg": "Failure in model my_model (models/staging/my_model.sql)",
+                }
+            }
+        ),
+        json.dumps(
+            {"info": {"level": "error", "name": "RunResultError", "msg": real_error}}
+        ),
+    ]
+    _fake_runner_factory(monkeypatch, returncode=1, stdout="\n".join(lines))
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt build failed: Runtime Error in model my_model "
+        "(models/staging/my_model.sql): Argument 2 to JSON_VALUE must be a "
+        "constant expression"
+    )
+    # The uninformative progress line and bare failure header are demoted to
+    # warnings, not lost, and not mistaken for the cause.
+    assert any("Failure in model my_model" in w for w in envelope["warnings"])
+    assert any("ERROR creating" in w for w in envelope["warnings"])
+
+
+def test_build_failure_names_the_cause_behind_a_whole_run_fatal(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A whole-invocation fatal (no node ever ran) is wrapped by dbt's own
+    top-level handler in "Encountered an error:", then by each nested
+    exception level in a bare "<Type> Error" -- confirmed against a real `dbt
+    build` failure (a division-by-zero in a profile Jinja expression)."""
+
+    real_error = (
+        "Encountered an error:\n"
+        "Runtime Error\n"
+        "  Compilation Error\n"
+        "    Could not render {{ 1/0 }}: division by zero"
+    )
+    lines = [
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "MainEncounteredError",
+                    "msg": real_error,
+                }
+            }
+        ),
+    ]
+    _fake_runner_factory(monkeypatch, returncode=2, stdout="\n".join(lines))
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt build failed: Encountered an error: Could not render {{ 1/0 }}: "
+        "division by zero"
+    )
+
+
+def test_build_failure_message_strips_ansi_color_codes(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """dbt colors console messages even under --log-format json; the escapes
+    are noise once that text crosses into the JSON envelope."""
+
+    lines = [
+        json.dumps(
+            {
+                "info": {
+                    "level": "error",
+                    "name": "RunResultFailure",
+                    "msg": "\x1b[31mFailure in model x (models/x.sql)\x1b[0m",
+                }
+            }
+        ),
+    ]
+    _fake_runner_factory(monkeypatch, returncode=1, stdout="\n".join(lines))
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["errors"][0] == (
+        "dbt build failed: Failure in model x (models/x.sql)"
+    )
+    assert "\x1b" not in envelope["errors"][0]
+
+
+def test_build_ignores_a_stale_run_results_json_from_a_prior_invocation(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Regression for #76: a whole-invocation fatal (e.g. a Jinja context
+    error) dies before dbt ever reaches node execution, so it never rewrites
+    target/run_results.json. A stale one left over from a prior successful
+    build must not be reported as this invocation's node results -- verified
+    against real dbt behavior (its mtime is untouched by such a failure)."""
+
+    target_dir = dbt_project_dir / "target"
+    target_dir.mkdir(exist_ok=True)
+    (target_dir / "run_results.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "unique_id": "model.dex_test.stg_customers",
+                        "status": "success",
+                        "execution_time": 1.23,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    # A fatal that never touches run_results.json: empty stdout, no node ever
+    # ran, matching a real whole-invocation compile/parse-time crash.
+    _fake_runner_factory(monkeypatch, returncode=2, stdout="")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["data"]["nodes"] == []
+    assert envelope["data"]["counts"] == {}
 
 
 def test_missing_dev_db_with_sources_is_an_actionable_error(
@@ -527,29 +733,29 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
 ):
     import json as json_mod
 
-    _fake_runner_factory(monkeypatch, returncode=0)
     target_dir = bigquery_project_dir / "target"
-    target_dir.mkdir(exist_ok=True)
-    (target_dir / "run_results.json").write_text(
-        json_mod.dumps(
-            {
-                "results": [
-                    {
-                        "unique_id": "model.dex_test.stg_customers",
-                        "status": "success",
-                        "execution_time": 1.0,
-                        "adapter_response": {"bytes_billed": 1000},
-                    },
-                    {
-                        "unique_id": "model.dex_test.mart_customers",
-                        "status": "success",
-                        "execution_time": 1.0,
-                        "adapter_response": {"bytes_billed": 2000},
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
+    run_results = json_mod.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 1000},
+                },
+                {
+                    "unique_id": "model.dex_test.mart_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 2000},
+                },
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(target_dir / "run_results.json", run_results),
     )
     rc, envelope = _run(
         [
