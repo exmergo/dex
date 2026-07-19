@@ -22,15 +22,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 - **`transform build` names dbt's real error on every connector, not just
   Snowflake** ([#76], a connector-parity follow-up to [#50]/[#55]). dbt wraps
   a failure's actual cause behind one or more generic, information-free
-  headers -- a per-node failure as "<Type> Error in <node> (<path>)", a
+  headers: a per-node failure as "<Type> Error in <node> (<path>)", a
   whole-invocation fatal again in "Encountered an error:", a nested exception
-  chain once more per level -- and, for a per-node failure specifically, logs
+  chain once more per level. For a per-node failure specifically, it also logs
   a bare progress line and a bare "Failure in <node> (<path>)" header before
   the message that actually names the cause. This shape is identical on every
   adapter (it comes from dbt_common, not a connector), but keeping only the
   first captured line let whichever of these uninformative lines happened to
   log first silently win the envelope's `errors[0]` slot, on Snowflake as much
-  as BigQuery -- #50/#55's own repro just never happened to hit it. The real
+  as BigQuery; #50/#55's own repro just never happened to hit it. The real
   cause line now rides alongside its header instead of being dropped, and
   dbt's own per-node/per-run "this is what actually failed" events are
   promoted ahead of a progress line or bare header the same way the #50 fix
