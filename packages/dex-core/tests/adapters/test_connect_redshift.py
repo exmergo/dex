@@ -1340,7 +1340,7 @@ def test_a_profile_user_the_database_does_not_know_is_refused():
     assert "ghost" in str(exc.value)
 
 
-def test_dev_namespace_objects_lists_only_the_asked_schema(fake_redshift_connection):
+def test_list_namespace_objects_lists_only_the_asked_schema(fake_redshift_connection):
     from fakes.redshift import FakeRedshiftTable
 
     fake_redshift_connection.tables.append(
@@ -1352,6 +1352,6 @@ def test_dev_namespace_objects_lists_only_the_asked_schema(fake_redshift_connect
     )
     adapter = make_adapter(fake_redshift_connection)
     # The mv_tbl__ backing table is an implementation detail, not content.
-    assert adapter.dev_namespace_objects("shop") == ["customers", "events", "signups"]
-    assert adapter.dev_namespace_objects("not_there") == []
+    assert adapter.list_namespace_objects("shop") == ["customers", "events", "signups"]
+    assert adapter.list_namespace_objects("not_there") == []
     assert fake_redshift_connection.data_statements == []

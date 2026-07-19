@@ -102,7 +102,7 @@ def test_committed_duckdb_path_resolves_against_repo_root_not_cwd(
         adapter.close()
 
 
-def test_dev_namespace_objects_lists_one_schema(tmp_path):
+def test_list_namespace_objects_lists_one_schema(tmp_path):
     import duckdb
 
     path = tmp_path / "wh.duckdb"
@@ -114,9 +114,9 @@ def test_dev_namespace_objects_lists_one_schema(tmp_path):
     conn.close()
 
     adapter = DuckDBAdapter(path)
-    assert adapter.dev_namespace_objects("staging_dev") == [
+    assert adapter.list_namespace_objects("staging_dev") == [
         "stg_leftover",
         "v_leftover",
     ]
-    assert adapter.dev_namespace_objects("not_there") == []
+    assert adapter.list_namespace_objects("not_there") == []
     adapter.close()

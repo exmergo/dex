@@ -147,7 +147,7 @@ class DuckDBAdapter:
             )
         return objects
 
-    def dev_namespace_objects(self, schema: str) -> list[str]:
+    def list_namespace_objects(self, schema: str) -> list[str]:
         """Table and view names already in one schema of the attached file.
         Free: one catalog round-trip, local. A schema that does not exist
         yields no rows, i.e. nothing to collide with."""

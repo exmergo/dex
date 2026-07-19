@@ -740,7 +740,7 @@ def test_an_unopenable_connection_degrades_to_a_note_on_every_connector(
 
 
 class _RecordingAdapter:
-    """Answers dev_namespace_objects from a canned map and records every probe,
+    """Answers list_namespace_objects from a canned map and records every probe,
     so the composition (which namespaces, in what shape, per connector) is what
     gets asserted rather than any real listing."""
 
@@ -750,7 +750,7 @@ class _RecordingAdapter:
         self.calls: list[tuple] = []
         self.closed = False
 
-    def dev_namespace_objects(self, *args):
+    def list_namespace_objects(self, *args):
         self.calls.append(args)
         if self.raises is not None:
             raise self.raises

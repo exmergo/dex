@@ -469,7 +469,7 @@ class DatabricksAdapter:
         visible = {name.lower() for name in self._catalogs()}
         return [] if catalog.lower() in visible else [f'dev_catalog "{catalog}"']
 
-    def dev_namespace_objects(self, catalog: str, schema: str) -> list[str]:
+    def list_namespace_objects(self, catalog: str, schema: str) -> list[str]:
         """Table and view names already in one schema. Free: Unity Catalog REST
         only, so the billed SQL warehouse is never woken. A catalog or schema
         that does not exist holds nothing to collide with, so it reads as empty.

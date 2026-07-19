@@ -460,7 +460,7 @@ def content_check(
     Run at ``transform init`` time, where a colliding dev namespace is still
     trivial to rename; discovered any later and it surfaces as a confusing
     model-name clash in the middle of a build. Free on every connector (each
-    ``dev_namespace_objects`` rides the same metadata path as the build
+    ``list_namespace_objects`` rides the same metadata path as the build
     preflight) and advisory by design: existing content is a warning, never a
     refusal, and a connection dex cannot open degrades to a note, because init
     is credential-optional and must stay that way.
@@ -478,7 +478,7 @@ def content_check(
         return []
 
     # Each probe is (display name for the warning, args for the connector's
-    # dev_namespace_objects). The layered names mirror what the scaffolded
+    # list_namespace_objects). The layered names mirror what the scaffolded
     # generate_schema_name macro will compose: <layer>_<target name>.
     layer_names = [f"{layer}_{target_name}" for layer in _LAYER_SCHEMAS]
     probes: list[tuple[str, tuple[str, ...]]] = []
@@ -533,7 +533,7 @@ def content_check(
     warnings: list[str] = []
     try:
         for display, args in probes:
-            objects = adapter.dev_namespace_objects(*args)
+            objects = adapter.list_namespace_objects(*args)
             if not objects:
                 continue
             shown = ", ".join(objects[:_CONTENT_SAMPLE_CAP])

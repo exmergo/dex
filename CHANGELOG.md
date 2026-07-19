@@ -38,7 +38,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   functions), so nothing is billed and no warehouse wakes. DuckDB's base
   namespace is exempt (the dev target is the source file); only its layer
   schemas are checked. Backing this, every adapter gains a
-  `dev_namespace_objects` metadata method alongside `missing_dev_namespaces`.
+  `list_namespace_objects` metadata method alongside `missing_dev_namespaces`.
 
 ## [1.2.2] - 2026-07-18
 

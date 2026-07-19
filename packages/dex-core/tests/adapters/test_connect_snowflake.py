@@ -907,7 +907,7 @@ def test_bare_schema_on_a_wide_open_account_asks_for_qualification(monkeypatch):
     assert "qualify it as <database>.RAW" in message
 
 
-def test_dev_namespace_objects_lists_tables_and_views(multi_db_connection):
+def test_list_namespace_objects_lists_tables_and_views(multi_db_connection):
     from fakes.snowflake import FakeSnowflakeTable
 
     multi_db_connection.tables.append(
@@ -921,13 +921,13 @@ def test_dev_namespace_objects_lists_tables_and_views(multi_db_connection):
     )
     adapter = make_adapter(multi_db_connection)
     # Case-folded like every Snowflake identifier, and views count as content.
-    listed = adapter.dev_namespace_objects("raw", "staging_dev")
+    listed = adapter.list_namespace_objects("raw", "staging_dev")
     assert listed == ["V_LEFTOVER"]
     assert data_statements(multi_db_connection) == []
 
 
-def test_dev_namespace_objects_reads_an_absent_schema_as_empty(multi_db_connection):
+def test_list_namespace_objects_reads_an_absent_schema_as_empty(multi_db_connection):
     adapter = make_adapter(multi_db_connection)
-    assert adapter.dev_namespace_objects("RAW", "NOT_THERE") == []
-    assert adapter.dev_namespace_objects("NO_SUCH_DB", "STAGING_DEV") == []
+    assert adapter.list_namespace_objects("RAW", "NOT_THERE") == []
+    assert adapter.list_namespace_objects("NO_SUCH_DB", "STAGING_DEV") == []
     assert data_statements(multi_db_connection) == []

@@ -511,7 +511,7 @@ class SnowflakeAdapter:
         rows = self._show(f"SHOW DATABASES LIKE '{_escape_literal(database.upper())}'")
         return [] if rows else [f'dev_database "{database}"']
 
-    def dev_namespace_objects(self, database: str, schema: str) -> list[str]:
+    def list_namespace_objects(self, database: str, schema: str) -> list[str]:
         """Table and view names already in one schema. Free: SHOW only, no
         warehouse. A schema (or database) that does not exist holds nothing to
         collide with, so the ProgrammingError it raises reads as empty."""

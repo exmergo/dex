@@ -426,7 +426,7 @@ class PostgresAdapter:
         ]
         return [f'{", ".join(missing)} on dev_schema "{schema}"'] if missing else []
 
-    def dev_namespace_objects(self, schema: str) -> list[str]:
+    def list_namespace_objects(self, schema: str) -> list[str]:
         """Table and view names already in one schema. Free: one catalog SELECT,
         no scan. A schema that does not exist yields no rows, i.e. nothing to
         collide with. No role parameter: content is role-independent, unlike the

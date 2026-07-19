@@ -316,7 +316,7 @@ class BigQueryAdapter:
             return [f'dev_dataset "{qualified}"']
         return []
 
-    def dev_namespace_objects(self, dataset: str) -> list[str]:
+    def list_namespace_objects(self, dataset: str) -> list[str]:
         """Table and view names already in one dataset. Free: the tables.list
         metadata API, never INFORMATION_SCHEMA (which bills a 10 MB minimum).
         An absent dataset reads as empty: nothing is there to collide with."""
