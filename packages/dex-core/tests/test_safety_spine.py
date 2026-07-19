@@ -658,6 +658,91 @@ def test_init_project_round_trips_through_the_loader(tmp_path: Path):
     assert dbt_project.resolve_target(tmp_path / "analytics").name == "dev"
 
 
+def test_layered_init_keeps_every_init_invariant(tmp_path: Path):
+    # The layered variant adds files but changes no safety property: still one
+    # dev-only target, still no secret-like keys anywhere in the generated set,
+    # still credential-free (this test runs with no connection of any kind).
+    import yaml
+
+    from exmergo_dex_core import transform
+
+    transform.init_project(
+        "analytics",
+        "duckdb",
+        path=str(tmp_path / "w.duckdb"),
+        repo_root=tmp_path,
+        layered_schemas=True,
+    )
+    project = tmp_path / "analytics"
+    profiles = yaml.safe_load((project / "profiles.yml").read_text(encoding="utf-8"))
+    assert profiles["analytics"]["target"] == "dev"
+    assert set(profiles["analytics"]["outputs"]) == {"dev"}
+    generated = {
+        rel: (project / rel).read_text(encoding="utf-8")
+        for rel in (
+            "dbt_project.yml",
+            "profiles.yml",
+            "macros/generate_schema_name.sql",
+        )
+    }
+    env.sanitize(env.ok(generated))
+
+
+def test_init_content_preflight_is_free_and_never_gates(tmp_path: Path, monkeypatch):
+    # The init-time content check rides the free metadata door on a billed
+    # connector: an unconfirmed zero-budget cost gate would refuse any spend,
+    # and the probe must never ask it. Nothing may cross the data door either.
+    pytest.importorskip("snowflake.connector")
+    from fakes.snowflake import (
+        FakeSnowflakeConnection,
+        FakeSnowflakeTable,
+        FakeWarehouse,
+    )
+
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+    from exmergo_dex_core.config import DexConfig, SnowflakeTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.transform import dev_target
+
+    connection = FakeSnowflakeConnection(
+        tables=[
+            FakeSnowflakeTable(
+                database="SCRATCH",
+                schema="STAGING_DEV",
+                name="LEFTOVER",
+                columns=[("ID", "FIXED", False)],
+            )
+        ],
+        warehouses=[FakeWarehouse(name="DEX_WH")],
+    )
+    adapter = SnowflakeAdapter(
+        connection=connection,
+        cost_gate=CostGate(
+            paradigm=env.Paradigm.COMPUTE_TIME,
+            ceiling=0.0,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="snowflake",
+        ),
+        target=SnowflakeTarget(warehouse="DEX_WH"),
+        clock=connection.clock,
+    )
+    monkeypatch.setattr(
+        "exmergo_dex_core.connect.open_adapter", lambda **_kwargs: adapter
+    )
+    config = DexConfig(
+        connector="snowflake",
+        dbt_target="dev",
+        snowflake=SnowflakeTarget(warehouse="DEX_WH", dev_database="SCRATCH"),
+    )
+    warnings = dev_target.content_check(config, tmp_path, layered=True)
+    assert any("SCRATCH.STAGING_DEV" in w for w in warnings)
+    assert connection.data_statements == []
+    # The warnings themselves must be message-clean: names and counts only.
+    env.emit(env.ok({}, warnings=warnings))
+
+
 # --- Family 5: credentials and raw rows never enter stdout data ---------------
 
 
