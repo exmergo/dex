@@ -41,7 +41,7 @@ _DEFAULT_COMPUTE_TIME_CAP_NOTE = (
 
 
 def cmd_init(args: argparse.Namespace) -> env.Envelope:
-    from ..config import load_config
+    from ..config import DexConfig, load_config
     from . import init as init_mod
 
     repo_root = command_args.repo_root(args)
@@ -63,12 +63,24 @@ def cmd_init(args: argparse.Namespace) -> env.Envelope:
             "connector: in .dex/config.yml"
         )
 
+    layered = bool(getattr(args, "layered_schemas", False))
     result = init_mod.init_project(
         getattr(args, "argument", None) or "",
         connector,
         path=getattr(args, "path", None),
         repo_root=repo_root,
+        layered_schemas=layered,
     )
+
+    # The renderers persisted the resolved dev namespaces into .dex/config.yml,
+    # so a fresh load has exactly the names the profile was rendered from. The
+    # check is advisory and files are already written: existing content in a
+    # namespace the project will build into is a warning, never a refusal.
+    from . import dev_target
+
+    fresh = load_config(repo_root) or DexConfig()
+    preflight = dev_target.content_check(fresh, repo_root, layered=layered)
+
     return env.ok(
         {
             "project_name": result.project_name,
@@ -80,6 +92,7 @@ def cmd_init(args: argparse.Namespace) -> env.Envelope:
             "models with `transform plan --scaffold <table>`",
         },
         diffs=result.diffs,
+        warnings=preflight,
     )
 
 

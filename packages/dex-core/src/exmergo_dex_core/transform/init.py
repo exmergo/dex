@@ -86,6 +86,7 @@ def init_project(
     *,
     path: str | None = None,
     repo_root: Path | str = ".",
+    layered_schemas: bool = False,
 ) -> InitResult:
     """Render a fresh dbt project skeleton and record the choices in config.
 
@@ -95,6 +96,11 @@ def init_project(
     ``dbt_target: dev`` back to ``.dex/config.yml`` so the choice is explicit
     once and ambient for every later command. Everything written is returned as
     reviewable diffs.
+
+    ``layered_schemas`` additionally scaffolds ``models/intermediate/``, the
+    shipped ``generate_schema_name`` macro override, and per-folder ``+schema:``
+    config, so each layer builds into its own ``<layer>_<target name>`` schema
+    instead of one shared dev namespace.
     """
 
     root = Path(repo_root)
@@ -124,11 +130,20 @@ def init_project(
     profiles_text = render_profile(project_name, path, config, root)
 
     files: dict[str, str] = {
-        f"{project_name}/{PROJECT_FILE}": _project_yaml(project_name),
+        f"{project_name}/{PROJECT_FILE}": _project_yaml(
+            project_name, layered_schemas=layered_schemas
+        ),
         f"{project_name}/{PROFILES_FILE}": profiles_text,
         f"{project_name}/models/staging/.gitkeep": "",
         f"{project_name}/models/marts/.gitkeep": "",
     }
+    if layered_schemas:
+        from .scaffold import macro_edit
+
+        files[f"{project_name}/models/intermediate/.gitkeep"] = ""
+        files[f"{project_name}/macros/generate_schema_name.sql"] = macro_edit(
+            "generate_schema_name", "macros"
+        ).new_content
     collisions = sorted(rel for rel in files if (root / rel).exists())
     if collisions:
         raise InitError(
@@ -697,13 +712,21 @@ _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]]
 }
 
 
-def _project_yaml(project_name: str) -> str:
-    return yaml.safe_dump(
-        {
-            "name": project_name,
-            "version": "1.0.0",
-            "profile": project_name,
-            "model-paths": ["models"],
-        },
-        sort_keys=False,
-    )
+def _project_yaml(project_name: str, *, layered_schemas: bool = False) -> str:
+    doc: dict[str, Any] = {
+        "name": project_name,
+        "version": "1.0.0",
+        "profile": project_name,
+        "model-paths": ["models"],
+    }
+    if layered_schemas:
+        # The +schema values are the bare layer names; the scaffolded
+        # generate_schema_name override composes the final name as
+        # <layer>_<target name>, so a dev build lands in staging_dev and so on.
+        doc["models"] = {
+            project_name: {
+                layer: {"+schema": layer}
+                for layer in ("staging", "intermediate", "marts")
+            }
+        }
+    return yaml.safe_dump(doc, sort_keys=False)

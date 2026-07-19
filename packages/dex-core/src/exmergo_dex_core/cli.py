@@ -145,6 +145,10 @@ def _build_parser() -> argparse.ArgumentParser:
                 # the plan id; macro the shipped-macro name (none lists them).
                 if group == "transform" and name in {"init", "plan", "apply", "macro"}:
                     sp.add_argument("argument", nargs="?", default=None)
+                if group == "transform" and name == "init":
+                    sp.add_argument(
+                        "--layered-schemas", action="store_true", default=False
+                    )
                 if group == "transform" and name == "plan":
                     # The agent-authored edits payload: a JSON file, or - for stdin.
                     sp.add_argument("--edits-file", default=None)
