@@ -11,6 +11,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`pii_overrides` gains an opt-in pattern form** (#106). Alongside the
+  existing exact `column` entry, a `column_name` + `scope` entry clears a
+  named column on every table whose fully-qualified identifier matches the
+  `scope` glob, so one reviewed decision (for example, "this CDC export's
+  `document_name` is a resource path, not a person name") no longer costs one
+  config entry per table per environment on Firestore/Mongo/DynamoDB-style
+  sources, where the same column exists by construction on every entity's
+  table in every environment mirror. `column` and `column_name`/`scope` are
+  mutually exclusive on one entry (enforced at load). The profile-time typo
+  guard now covers pattern entries too: it warns when a `scope` matches
+  profiled tables but none carries the named column, and stays silent when
+  the scope matches no table yet, since new entities landing later under the
+  same scope is the point of the pattern form. `blob_overrides` keeps its
+  exact-only shape for now.
 - **`transform init --layered-schemas`: per-layer schema routing out of the
   box.** The flag additionally scaffolds `models/intermediate/`, a
   `generate_schema_name` macro override, and a `dbt_project.yml` `models:`

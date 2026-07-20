@@ -23,6 +23,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from ..cache import ColumnProfile, Dataset, DexCache
+from ..config import PIIOverrideMatcher
 from ..dbt_project import DbtProjectView
 from ..explore.profile import detect_pii
 from ..transform.plans import EditKind, PlanEdit
@@ -58,7 +59,7 @@ def build(
     cache: DexCache | None,
     view: DbtProjectView,
     *,
-    pii_overrides: set[str] | None = None,
+    pii_overrides: PIIOverrideMatcher | None = None,
 ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
     """Map findings to proposals and plan edits. Pure: writes nothing.
 
@@ -209,7 +210,9 @@ def _base_dataset(
 
 
 def _patched_dataset(
-    base: Dataset, findings: list[DriftFinding], pii_overrides: set[str]
+    base: Dataset,
+    findings: list[DriftFinding],
+    pii_overrides: PIIOverrideMatcher | set[str],
 ) -> Dataset:
     """Apply the detected column drift to the baseline profile, so the
     re-scaffold reflects the warehouse as it is now without re-profiling.

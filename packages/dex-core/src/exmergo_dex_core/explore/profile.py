@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 
 from ..adapters.base import Adapter, ColumnAggregate, is_blob_type, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..config import PIIOverrideMatcher
 from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
@@ -237,7 +238,7 @@ def profile(
     *,
     progress: ProgressReporter | None = None,
     on_complete: Callable[[Dataset], None] | None = None,
-    pii_overrides: set[str] | None = None,
+    pii_overrides: PIIOverrideMatcher | None = None,
     include_blobs: set[str] | None = None,
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.

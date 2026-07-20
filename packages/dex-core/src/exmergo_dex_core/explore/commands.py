@@ -11,6 +11,7 @@ and only to the ``.dex/`` cache, so a scan is never paid for twice.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 from collections.abc import Callable
@@ -32,6 +33,7 @@ from ..cache import (
 )
 from ..config import (
     DexConfig,
+    PIIOverride,
     QueryLimits,
     blob_override_paths,
     load_config,
@@ -66,23 +68,45 @@ def _override_notes(datasets: list[Dataset]) -> list[str]:
 
 
 def _override_mismatches(
-    datasets: list[Dataset], override_paths: set[str]
+    datasets: list[Dataset], overrides: list[PIIOverride]
 ) -> list[str]:
-    """Warn when an override entry names a profiled table but no column of it:
-    almost certainly a typo, and silence would read as the override working."""
+    """Warn when an override entry can't possibly do anything: an exact entry
+    names a profiled table but no column of it, or a pattern entry's scope
+    matches profiled tables but none carries the named column. Almost
+    certainly a typo, and silence would read as the override working.
+
+    A pattern matching zero tables stays silent, same escape hatch as an exact
+    entry on a not-yet-profiled table: new entities landing later under the
+    same scope are the whole point of the pattern form."""
 
     warnings = []
-    for path in sorted(override_paths):
-        table, _, column = path.rpartition(".")
-        for dataset in datasets:
-            if dataset.identifier.lower() != table:
-                continue
-            if not any(c.name.lower() == column for c in dataset.columns):
+    for entry in overrides:
+        if entry.column:
+            path = entry.column.strip().lower()
+            table, _, column = path.rpartition(".")
+            for dataset in datasets:
+                if dataset.identifier.lower() != table:
+                    continue
+                if not any(c.name.lower() == column for c in dataset.columns):
+                    warnings.append(
+                        f"pii_overrides entry '{path}' matches no column of "
+                        f"{dataset.identifier}"
+                    )
+                break
+        else:
+            column_name = entry.column_name.strip().lower()  # type: ignore[union-attr]
+            scope = entry.scope.strip().lower()  # type: ignore[union-attr]
+            matched = [
+                d for d in datasets if fnmatch.fnmatchcase(d.identifier.lower(), scope)
+            ]
+            if matched and not any(
+                c.name.lower() == column_name for d in matched for c in d.columns
+            ):
                 warnings.append(
-                    f"pii_overrides entry '{path}' matches no column of "
-                    f"{dataset.identifier}"
+                    f"pii_overrides pattern entry (column_name='{entry.column_name}', "
+                    f"scope='{entry.scope}') matches no column named "
+                    f"'{entry.column_name}' in {len(matched)} matched dataset(s)"
                 )
-            break
     return warnings
 
 
@@ -273,7 +297,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
             "notes": notes,
         }
     )
-    envelope.warnings.extend(_override_mismatches(datasets, override_paths))
+    envelope.warnings.extend(_override_mismatches(datasets, config.pii_overrides))
     return envelope
 
 
