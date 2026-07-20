@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from ..adapters.base import Adapter, ColumnAggregate, json_safe
+from ..adapters.base import Adapter, ColumnAggregate, is_blob_type, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
 from ..progress import ProgressReporter
 
@@ -238,6 +238,7 @@ def profile(
     progress: ProgressReporter | None = None,
     on_complete: Callable[[Dataset], None] | None = None,
     pii_overrides: set[str] | None = None,
+    include_blobs: set[str] | None = None,
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
 
@@ -255,9 +256,18 @@ def profile(
     are decided, and the suppressed category is recorded on the profile as the
     audit trail. Re-applied on every profile, which is what makes the override
     durable: the cache is overwritten wholesale by re-profiling.
+
+    ``include_blobs`` holds lowered ``identifier.column`` paths a human has opted
+    back into profiling despite being blob-typed (from `.dex/config.yml`). Blob
+    columns (BYTES/BLOB/bytea/BINARY, scalar or repeated) are excluded from the
+    aggregate scan by default: their profile can only ever be a null fraction
+    and a distinct estimate, yet a columnar engine bills for the whole column
+    once it is referenced at all, so scanning them by default trades most of a
+    table's scan cost for stats that rarely inform a decision.
     """
 
     override_paths = pii_overrides or set()
+    blob_paths = include_blobs or set()
     datasets: list[Dataset] = []
     for identifier in identifiers:
         meta, columns = adapter.table_metadata(identifier)
@@ -284,10 +294,22 @@ def profile(
             if generic and prelim_pii[name] is not None
         }
 
+        # Blob-type columns can only ever yield a null fraction and a distinct
+        # estimate, yet a columnar engine bills for the whole column once it is
+        # referenced at all, so they are dropped from the scan before it is
+        # built (unless a human opted a specific one back in via config).
+        blob_excluded = [
+            c.name
+            for c in columns
+            if is_blob_type(c.data_type)
+            and f"{identifier}.{c.name}".lower() not in blob_paths
+        ]
+        scan_columns = [c for c in columns if c.name not in blob_excluded]
+
         aggregates = {
             a.name: a
             for a in adapter.column_aggregates(
-                identifier, columns, safe_min_max=safe, shape_stats=shape
+                identifier, scan_columns, safe_min_max=safe, shape_stats=shape
             )
         }
         # Re-read the metadata after the aggregate scan: adapters whose
@@ -307,6 +329,15 @@ def profile(
         data_quality: list[str] = []
         if meta.row_count == 0:
             data_quality.append("empty table (no rows)")
+        if blob_excluded:
+            data_quality.append(
+                f"excluded {len(blob_excluded)} blob-type column(s) from "
+                f"profiling scan ({', '.join(sorted(blob_excluded))}): "
+                "BYTES/BLOB-shaped columns only ever yield a null fraction and "
+                "a distinct estimate, and a columnar engine bills for the whole "
+                "column once referenced; add a blob_overrides entry in "
+                ".dex/config.yml to include one"
+            )
 
         # Adapters that degrade a profile (partition-filter tables, block
         # sampling, skipped escalations) explain themselves through this

@@ -30,7 +30,13 @@ from ..cache import (
     RelationshipKind,
     match_identifier,
 )
-from ..config import DexConfig, QueryLimits, load_config, pii_override_paths
+from ..config import (
+    DexConfig,
+    QueryLimits,
+    blob_override_paths,
+    load_config,
+    pii_override_paths,
+)
 from ..guards.cost_guard import OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
@@ -100,12 +106,12 @@ def _mask_overridden(cache: DexCache, override_paths: set[str]) -> DexCache:
 
 
 def _profile_estimate(
-    adapter: Adapter, identifiers: list[str]
+    adapter: Adapter, identifiers: list[str], *, include_blobs: set[str] | None = None
 ) -> tuple[float, dict[str, float]]:
     estimate = getattr(adapter, "profile_estimate", None)
     if estimate is None:
         return 0.0, {}
-    return estimate(identifiers)
+    return estimate(identifiers, include_blobs=include_blobs or set())
 
 
 def _verify_estimate(
@@ -198,6 +204,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
     override_paths = pii_override_paths(config.pii_overrides)
+    blob_paths = blob_override_paths(config.blob_overrides)
     adapter = command_args.open_from_args(args)
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
@@ -208,7 +215,9 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     over_ceiling = False
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
-        estimate, per_table = _profile_estimate(adapter, identifiers)
+        estimate, per_table = _profile_estimate(
+            adapter, identifiers, include_blobs=blob_paths
+        )
         unconfirmed = command_args.billed_handshake(
             "explore profile", adapter, estimate, per_table=per_table
         )
@@ -232,6 +241,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
                 progress=profile_reporter,
                 on_complete=checkpoint,
                 pii_overrides=override_paths,
+                include_blobs=blob_paths,
             )
             profile_reporter.done()
         except OverCeilingError:
@@ -300,7 +310,10 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             now,
             refresh=getattr(args, "refresh", False),
         )
-        estimate, per_table = _profile_estimate(adapter, [m.identifier for m in stale])
+        blob_paths = blob_override_paths(config.blob_overrides)
+        estimate, per_table = _profile_estimate(
+            adapter, [m.identifier for m in stale], include_blobs=blob_paths
+        )
         handshake_notes = [
             "relationship inference profiles every object; on a metered "
             "connector `explore map` (top-ranked objects only) is usually the "
@@ -348,6 +361,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
                     progress=profile_reporter,
                     on_complete=checkpoint,
                     pii_overrides=pii_override_paths(config.pii_overrides),
+                    include_blobs=blob_paths,
                 )
                 profile_reporter.done()
             except OverCeilingError:
@@ -593,7 +607,10 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         )
         # Inventory and ranking are free, so an unconfirmed billed run repeats
         # them on re-issue; only the profiling scans below need the handshake.
-        estimate, per_table = _profile_estimate(adapter, [m.identifier for m in stale])
+        blob_paths = blob_override_paths(config.blob_overrides)
+        estimate, per_table = _profile_estimate(
+            adapter, [m.identifier for m in stale], include_blobs=blob_paths
+        )
         handshake_notes: list[str] = []
         if getattr(args, "verify", False):
             handshake_notes.append(
@@ -636,6 +653,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
                     progress=profile_reporter,
                     on_complete=checkpoint,
                     pii_overrides=pii_override_paths(config.pii_overrides),
+                    include_blobs=blob_paths,
                 )
                 profile_reporter.done()
             except OverCeilingError:

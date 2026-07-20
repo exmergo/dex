@@ -355,6 +355,60 @@ def test_pii_override_matching_no_column_warns(tpch_names_duckdb: Path, capsys):
     assert person["pii"] is not None, "a typo must not clear anything"
 
 
+# --- blob-type column exclusion -------------------------------------------------
+
+
+def test_blob_column_excluded_by_default_with_note(blob_duckdb: Path, capsys):
+    payload = _run(
+        ["explore", "profile", "sessions", "--path", str(blob_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    columns = {c["name"]: c for c in dataset["columns"]}
+    payload_col = columns["payload"]
+    assert payload_col["null_fraction"] is None
+    assert payload_col["distinct_count"] is None
+    # The informative sibling column is untouched by the exclusion.
+    assert columns["id"]["distinct_count"] == 3
+    note = next(n for n in dataset["data_quality"] if "blob-type column" in n)
+    assert "payload" in note
+    assert "blob_overrides" in note
+
+
+def _write_blob_overrides(entries: list[str]) -> None:
+    from exmergo_dex_core.config import BlobOverride, DexConfig, save_config
+
+    save_config(DexConfig(blob_overrides=[BlobOverride(column=e) for e in entries]))
+
+
+def test_blob_override_restores_stats(blob_duckdb: Path, capsys):
+    _write_blob_overrides(["blob.main.sessions.payload"])
+    payload = _run(
+        ["explore", "profile", "sessions", "--path", str(blob_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    payload_col = {c["name"]: c for c in dataset["columns"]}["payload"]
+    assert payload_col["null_fraction"] == pytest.approx(1 / 3)
+    assert payload_col["distinct_count"] == 2
+    assert not any("blob-type column" in n for n in dataset["data_quality"])
+
+
+def test_profile_include_blobs_param_matches_by_identifier_column(blob_duckdb: Path):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter(blob_duckdb)
+    try:
+        (dataset,) = profile(
+            adapter,
+            ["blob.main.sessions"],
+            include_blobs={"blob.main.sessions.payload"},
+        )
+    finally:
+        adapter.close()
+    payload_col = {c.name: c for c in dataset.columns}["payload"]
+    assert payload_col.null_fraction is not None
+    assert payload_col.distinct_count is not None
+
+
 def test_non_unique_id_gets_fan_out_warning(airbnb_duckdb: Path, capsys):
     payload = _run(
         ["explore", "profile", "RAW_HOSTS", "--path", str(airbnb_duckdb)], capsys

@@ -257,6 +257,24 @@ def pii_override_paths(overrides: list[PIIOverride]) -> set[str]:
     return {entry.column.strip().lower() for entry in overrides}
 
 
+class BlobOverride(BaseModel):
+    """One reviewed blob-type column a human wants profiled despite the default
+    exclusion (see ``adapters.base.is_blob_type``). ``column`` is fully
+    qualified, same shape and rationale as :class:`PIIOverride`: a per-column
+    human decision, durable and reviewable in git, never a wildcard."""
+
+    column: str
+    reason: str | None = None
+
+
+def blob_override_paths(overrides: list[BlobOverride]) -> set[str]:
+    """Lowered fully-qualified column paths a human has opted back into
+    profiling despite being blob-typed. Same matching rules as
+    ``pii_override_paths``."""
+
+    return {entry.column.strip().lower() for entry in overrides}
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -292,6 +310,10 @@ class DexConfig(BaseModel):
     # durably clear a detector flag; hand-edits to the cache are overwritten by
     # the next profile, this list is re-applied on every profile.
     pii_overrides: list[PIIOverride] = Field(default_factory=list)
+    # Blob-type columns (BYTES/BLOB/bytea/BINARY, scalar or repeated) a human has
+    # reviewed and wants profiled despite the default exclusion. Re-applied on
+    # every profile, same durability rationale as pii_overrides.
+    blob_overrides: list[BlobOverride] = Field(default_factory=list)
 
 
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:
