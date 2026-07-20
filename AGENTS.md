@@ -52,6 +52,8 @@ project's real config instead of a wrong default.
 | `explore map [--verify] [--use-project]` | writes/updates the `.dex/` map; prints a summary; `--use-project` additionally applies declared grain and ranks metric-backing models higher |
 | `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); the FROM clause may unnest JSON/array columns in the connector's native idiom (UNNEST, LATERAL FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL) when the unnested value derives from a queried table's column, with the outputs inheriting that column's flags; requires the `.dex/` cache (`explore map` first) |
 | `explore cluster <object> [--features a,b] [-k N]` | k-means over a bounded, column-pruned, dialect-sampled scan of numeric columns; returns cluster sizes + centroids (feature means) + silhouette, never rows; auto-selects non-PII, non-key numeric features (or takes `--features`; a named PII column is opt-in, mean only); requires the `.dex/` cache and the `[cluster]` extra; billed connectors take the cost handshake |
+| `explore semantic list [--local\|--api]` | discover the dbt semantic layer in one shape from either backend: metrics (name, type, label, description, queryable dimensions), dimensions, and entities. Local reads the compiled `target/semantic_manifest.json` (no extra); hosted introspects the dbt Cloud GraphQL API. Distinct from the top-level `semantic` group, which *authors* the layer; `explore semantic` *queries* it |
+| `explore semantic query --metric <m> [--group-by <entity__dim>...] [--where "<jinja>"] [--order-by <c>] [--grain <g>] [--limit N] [--local\|--api]` | run a governed metric query. Local (`[semantic]` extra): MetricFlow `explain()` renders the SQL and dex executes it through its own connector, PII request-gate, SELECT-only assertion, and cost handshake, so cost is surfaced before spend. Hosted (`[semantic-api]` extra): dbt Cloud executes server-side, so the cost guard cannot apply and every result warns so (see guardrail 4); PII is screened from the layer's metadata plus a name heuristic before the query is sent, and the service token never crosses the envelope. Backend is ambient (`.dex/config.yml` `semantic.backend`), overridable with `--local` / `--api` |
 | `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required); `--layered-schemas` additionally scaffolds `models/intermediate/`, a `generate_schema_name` override, and per-folder `+schema:` config so each layer builds into its own `<layer>_<target name>` schema; init also runs a free, metadata-only content check on every namespace the project would build into and warns (never refuses) when one already holds tables or views, degrading to a note when no connection opens |
 | `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
 | `transform apply [plan-id]` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite; no id applies the latest unapplied plan of any kind |
@@ -133,10 +135,18 @@ them.
 3. Read-only against data; writes confined to the repo. DuckDB opens read-only;
    generated SQL is SELECT-only; agent-authored SQL runs only through the query
    firewall; builds run against a dev target only, never prod.
-4. Cost-aware by connector. Nothing runs without a ceiling. The source allowlist
-   in `.dex/config.yml` is a committed cost boundary: `--scope` narrows it for one
-   command and can never widen it, and a scope that names nothing is refused
-   rather than dropped.
+4. Cost-aware by connector. Nothing dex runs touches the warehouse without a
+   ceiling. The source allowlist in `.dex/config.yml` is a committed cost
+   boundary: `--scope` narrows it for one command and can never widen it, and a
+   scope that names nothing is refused rather than dropped. The one place dex
+   cannot enforce a ceiling is the hosted dbt Cloud Semantic Layer (`explore
+   semantic query --api`): dbt Cloud owns the warehouse connection and executes
+   the query server-side, so no dry-run estimate and no `maximum_bytes_billed`
+   are possible from dex. That backend therefore runs without a `--confirm`
+   handshake and instead states, explicitly and on every result, that the cost
+   guard is unavailable and spend is governed by the dbt Cloud environment, not
+   by dex. The local backend (`--local`) executes through dex's own connector and
+   keeps the full cost-before-spend handshake.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.

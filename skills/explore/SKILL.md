@@ -89,6 +89,23 @@ Subcommands, in the usual order:
    sample clause reads a fraction), so surface the estimate and get a budget
    first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
    automatically for this subcommand.
+8. `explore semantic list` and `explore semantic query` reach the dbt semantic
+   layer (metrics, dimensions, entities). `list` is discovery: which metrics
+   exist and which dimensions each can be grouped by. `query --metric <m>
+   --group-by <entity__dim> [--where "<jinja>"] [--grain <g>] [--limit N]`
+   returns a metric's values as a capped, columnar result. Two backends answer
+   these, chosen by `.dex/config.yml` `semantic.backend` and overridable with
+   `--local` / `--api`. `--local` renders the SQL with MetricFlow and executes it
+   through dex's own connector and cost handshake, so cost is surfaced before
+   spend (needs a dbt project and, for `query`, the `[semantic]` extra; `list` is
+   a manifest read-view that needs neither). `--api` sends the query to a hosted
+   dbt Cloud deployment (needs only a host, an environment id, and a
+   `DBT_SL_TOKEN`, plus the `[semantic-api]` extra, no local project). The hosted
+   backend is the one place the cost guard cannot apply: dbt Cloud executes
+   server-side, so the result carries an explicit warning that spend is governed
+   there, not by dex, and no `--confirm` is asked. Either way a PII-shaped grouped
+   or filtered dimension (e.g. `user__email`) is refused before the query runs.
+   This queries the layer; authoring it is `transform`'s job.
 
 Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single
