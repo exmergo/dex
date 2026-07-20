@@ -556,6 +556,42 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
+def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
+    """`explore semantic list|query`: discover and query the dbt semantic layer.
+
+    Backend resolution and the two guard postures (local: dex renders and executes
+    under its own cost guard; hosted: dbt Cloud executes and dex only warns) live in
+    the ``explore.semantic`` package; this orchestrator just resolves the backend
+    and hands it the intent, turning any backend refusal into a clean envelope.
+    """
+
+    from .semantic import SemanticBackendError, SemanticQuery, resolve_backend
+
+    root = command_args.repo_root(args)
+    config = load_config(root) or DexConfig()
+    try:
+        backend = resolve_backend(args, config, root)
+        if getattr(args, "mode", None) == "list":
+            return env.ok(backend.list_definitions().to_data())
+        metrics = getattr(args, "metric", None) or []
+        if not metrics:
+            return env.error(
+                "`explore semantic query` needs at least one --metric "
+                "(discover them with `explore semantic list`)"
+            )
+        query = SemanticQuery(
+            metrics=metrics,
+            group_by=getattr(args, "group_by", None) or [],
+            where=getattr(args, "where", None) or [],
+            order_by=getattr(args, "order_by", None) or [],
+            grain=getattr(args, "grain", None),
+            limit=getattr(args, "limit", None),
+        )
+        return backend.query(query)
+    except SemanticBackendError as exc:
+        return env.error(str(exc))
+
+
 def cmd_map(args: argparse.Namespace) -> env.Envelope:
     repo_root = command_args.repo_root(args)
     config = load_config(repo_root) or DexConfig()
