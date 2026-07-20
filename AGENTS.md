@@ -139,9 +139,9 @@ them.
    ceiling. The source allowlist in `.dex/config.yml` is a committed cost
    boundary: `--scope` narrows it for one command and can never widen it, and a
    scope that names nothing is refused rather than dropped. The one place dex
-   cannot enforce a ceiling is the hosted dbt Cloud Semantic Layer (`explore
-   semantic query --api`): dbt Cloud owns the warehouse connection and executes
-   the query server-side, so no dry-run estimate and no `maximum_bytes_billed`
+   cannot enforce a ceiling is the hosted dbt Cloud Semantic Layer
+   (`explore semantic query --api`): dbt Cloud owns the warehouse connection and
+   executes the query server-side, so no dry-run estimate and no `maximum_bytes_billed`
    are possible from dex. That backend therefore runs without a `--confirm`
    handshake and instead states, explicitly and on every result, that the cost
    guard is unavailable and spend is governed by the dbt Cloud environment, not

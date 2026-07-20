@@ -15,8 +15,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 - **`explore semantic`: query the dbt semantic layer, locally or against dbt
   Cloud, behind one abstraction.** `explore semantic list` discovers metrics,
-  dimensions, and entities; `explore semantic query --metric <m> --group-by
-  <entity__dim>` runs a governed metric query and returns a capped, columnar
+  dimensions, and entities; `explore semantic query` with a `--metric` and a
+  `--group-by` runs a governed metric query and returns a capped, columnar
   result. Two backends answer the same commands, chosen ambiently by
   `.dex/config.yml` `semantic.backend` and overridable per command with `--local`
   / `--api`. `--local` renders the SQL with MetricFlow's `explain()` through a

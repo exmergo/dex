@@ -12,10 +12,10 @@ difference between them is load-bearing, so it is spelled out here.
   metrics (name, type, label, description, and the dimensions each can be grouped
   by), dimensions, and entities. This is the discovery surface an agent reads to
   decide what to query.
-- `explore semantic query --metric <m> [--group-by <entity__dim>...]
-  [--where "<jinja>"] [--order-by <c>] [--grain <g>] [--limit N]` runs a metric
-  query and returns a capped, columnar result, the same envelope shape as
-  `explore query`.
+- `explore semantic query` runs a metric query and returns a capped, columnar
+  result, the same envelope shape as `explore query`. It takes `--metric <m>`
+  (repeatable), and optionally `--group-by <entity__dim>` (repeatable),
+  `--where "<jinja>"`, `--order-by <c>`, `--grain <g>`, and `--limit N`.
 
 The query grammar is identical across backends: entity-qualified group-by tokens
 (`user__pricing_tier`, `metric_time`), the Jinja filter dialect in `--where`

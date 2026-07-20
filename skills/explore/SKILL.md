@@ -91,9 +91,9 @@ Subcommands, in the usual order:
    automatically for this subcommand.
 8. `explore semantic list` and `explore semantic query` reach the dbt semantic
    layer (metrics, dimensions, entities). `list` is discovery: which metrics
-   exist and which dimensions each can be grouped by. `query --metric <m>
-   --group-by <entity__dim> [--where "<jinja>"] [--grain <g>] [--limit N]`
-   returns a metric's values as a capped, columnar result. Two backends answer
+   exist and which dimensions each can be grouped by. `query` takes a `--metric`
+   and a `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
+   `--limit`) and returns a metric's values as a capped, columnar result. Two backends answer
    these, chosen by `.dex/config.yml` `semantic.backend` and overridable with
    `--local` / `--api`. `--local` renders the SQL with MetricFlow and executes it
    through dex's own connector and cost handshake, so cost is surfaced before
