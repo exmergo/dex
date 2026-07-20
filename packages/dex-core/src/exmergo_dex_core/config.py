@@ -278,8 +278,7 @@ class PIIOverride(BaseModel):
             )
         if is_pattern and (self.column_name is None or self.scope is None):
             raise ValueError(
-                "pattern-form pii_overrides entry needs both 'column_name' "
-                "and 'scope'"
+                "pattern-form pii_overrides entry needs both 'column_name' and 'scope'"
             )
         return self
 
