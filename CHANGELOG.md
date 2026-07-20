@@ -9,6 +9,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`transform init --layered-schemas`: per-layer schema routing out of the
+  box.** The flag additionally scaffolds `models/intermediate/`, a
+  `generate_schema_name` macro override, and a `dbt_project.yml` `models:`
+  block with `+schema: staging|intermediate|marts`, so each layer builds into
+  its own `<layer>_<target name>` schema (`staging_dev`, `intermediate_dev`,
+  `marts_dev` on the dev target: sibling datasets on BigQuery, sibling schemas
+  inside the dev database/catalog on Snowflake and Databricks, sibling schemas
+  on Postgres and Redshift, schemas inside the target file on DuckDB). Models
+  with no custom schema still land in `target.schema`. The macro also ships
+  standalone as `transform macro generate_schema_name`, so an existing project
+  can adopt the convention without re-initializing. The default scaffold is
+  unchanged.
+- **`transform init` now warns when a dev namespace already holds content.**
+  A new free, metadata-only content preflight lists every namespace the new
+  project would build into (the base dev namespace, plus each layer namespace
+  under `--layered-schemas`) and warns, naming the namespace, the object
+  count, and up to five object names, when one already contains tables or
+  views, so a name collision surfaces at init (where the name is trivial to
+  change) instead of as a confusing model clash mid-build. Advisory by
+  design: init still succeeds, empty or absent namespaces stay silent, no
+  reachable connection degrades to a single note (init remains
+  credential-optional), and the probe rides each connector's free metadata
+  path (BigQuery `tables.list`, Snowflake `SHOW` on cloud services, Databricks
+  Unity Catalog REST, Postgres/Redshift catalog lookups, DuckDB catalog
+  functions), so nothing is billed and no warehouse wakes. DuckDB's base
+  namespace is exempt (the dev target is the source file); only its layer
+  schemas are checked. Backing this, every adapter gains a
+  `list_namespace_objects` metadata method alongside `missing_dev_namespaces`.
+
 ## [1.2.2] - 2026-07-18
 
 ### Changed

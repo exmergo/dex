@@ -544,6 +544,26 @@ class RedshiftAdapter:
         ]
         return [f'{", ".join(missing)} on dev_schema "{schema}"'] if missing else []
 
+    def list_namespace_objects(self, schema: str) -> list[str]:
+        """Table and view names already in one schema. Cheap: one catalog
+        SELECT, no scan. A schema that does not exist yields no rows, i.e.
+        nothing to collide with. ``mv_tbl__`` backing tables are dropped for
+        the same reason inventory drops them: implementation detail, not an
+        object anyone named. No role parameter: content is role-independent."""
+
+        rows = self._catalog(
+            "SELECT c.relname AS object_name "  # noqa: S608
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relkind IN ('r', 'v') "
+            f"AND n.nspname = '{_escape_literal(schema)}'"
+        )
+        return sorted(
+            str(row["object_name"])
+            for row in rows
+            if not str(row["object_name"]).startswith("mv_tbl__")
+        )
+
     def _user_exists(self, user: str) -> bool:
         rows = self._catalog(
             "SELECT 1 AS present FROM pg_catalog.pg_user "  # noqa: S608

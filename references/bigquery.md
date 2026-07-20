@@ -110,6 +110,14 @@ server-side; `transform build` has no upfront estimate (dbt has no dry-run)
 but still requires `--confirm` and a `--budget`, and its billed bytes land in
 the spend ledger.
 
+With `--layered-schemas`, the scaffolded `generate_schema_name` override makes
+each layer build into its own sibling dataset in the profile's project
+(`staging_dev`, `intermediate_dev`, `marts_dev` on the `dev` target);
+dbt-bigquery creates them on first build. Init's content preflight lists each
+target dataset through the free `tables.list` metadata API (never
+`INFORMATION_SCHEMA`, which bills a minimum per query) and warns when one
+already holds tables or views.
+
 ## JSON quirks
 
 Two BigQuery behaviors cost real debugging time when modeling JSON with

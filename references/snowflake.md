@@ -98,6 +98,13 @@ CREATE DATABASE IF NOT EXISTS DBT_DEV;
 dex never creates it for you, and never rewrites your `profiles.yml`: its only
 writes are reviewable diffs inside the repo.
 
+`transform init` runs its own free preflight in the other direction: a
+SHOW-only content check (cloud-services layer, no warehouse) of every schema
+the new project would build into, warning when one already holds tables or
+views. With `--layered-schemas` the layers build into sibling schemas of
+`snowflake.dev_database` (`STAGING_DEV`, `INTERMEDIATE_DEV`, `MARTS_DEV` on
+the `dev` target), and those are checked too.
+
 ## Cost model: the inversion from BigQuery
 
 On BigQuery, metadata is free and scans bill by bytes. On Snowflake the rule

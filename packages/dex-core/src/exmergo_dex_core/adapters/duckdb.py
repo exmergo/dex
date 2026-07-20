@@ -147,6 +147,23 @@ class DuckDBAdapter:
             )
         return objects
 
+    def list_namespace_objects(self, schema: str) -> list[str]:
+        """Table and view names already in one schema of the attached file.
+        Free: one catalog round-trip, local. A schema that does not exist
+        yields no rows, i.e. nothing to collide with."""
+
+        rows = self._run_select(
+            """
+            SELECT table_name FROM duckdb_tables()
+            WHERE NOT internal AND schema_name = ?
+            UNION ALL
+            SELECT view_name FROM duckdb_views()
+            WHERE NOT internal AND schema_name = ?
+            """,
+            [schema, schema],
+        )
+        return sorted(str(name) for (name,) in rows)
+
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
         db, schema, name = self._split(identifier)
         col_rows = self._run_select(

@@ -140,6 +140,11 @@ as `PGOPTIONS="-c statement_timeout=<ceiling>s"`, the per-statement
 server-side cap (the `maximum_bytes_billed` analogue). Actual per-node
 execution time is summed into `billed_seconds` and recorded to the ledger.
 
+`transform init` content-checks the dev schema (and, with `--layered-schemas`,
+the sibling `staging_dev` / `intermediate_dev` / `marts_dev` layer schemas)
+with one `pg_class` catalog lookup per schema, warning when one already holds
+tables or views; a missing schema stays silent, since dbt creates it.
+
 ## Testing
 
 Offline: a stateful fake connection (`tests/fakes/postgres.py`) that records

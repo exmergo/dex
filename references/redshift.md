@@ -164,7 +164,12 @@ reference, not a value), both with `schema` pinned to the dedicated dev
 schema and one thread. Before the cost gate, and for free, `transform build`
 refuses config that has drifted from the rendered profile, and a dev schema
 the profile's user lacks the privilege to create or write (the Postgres
-question: dbt creates the schema, but only if the user may). dbt has no
+question: dbt creates the schema, but only if the user may). `transform init`
+additionally content-checks the dev schema (and, with `--layered-schemas`,
+the `staging_dev` / `intermediate_dev` / `marts_dev` layer schemas) with one
+catalog lookup per schema, warning when one already holds tables or views;
+this works on IAM profiles too, since content, unlike privilege, is not a
+per-user question. dbt has no
 dry-run and dex cannot inject a per-build server cap through dbt-redshift,
 so the honest layering is: per-node execution time summed into
 `billed_seconds` on the ledger, a durable `ALTER USER dbt_dev SET

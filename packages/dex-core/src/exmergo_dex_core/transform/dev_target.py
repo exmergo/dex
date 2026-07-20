@@ -445,6 +445,114 @@ def _redshift_namespace(
     )
 
 
+# The folder layers a layered init routes to their own schemas, and how many
+# pre-existing object names a content warning spells out before summarizing.
+_LAYER_SCHEMAS = ("staging", "intermediate", "marts")
+_CONTENT_SAMPLE_CAP = 5
+
+
+def content_check(
+    config: DexConfig, repo_root: Path | str = ".", *, layered: bool = False
+) -> list[str]:
+    """Warn when a namespace the new project will build into already holds
+    tables or views.
+
+    Run at ``transform init`` time, where a colliding dev namespace is still
+    trivial to rename; discovered any later and it surfaces as a confusing
+    model-name clash in the middle of a build. Free on every connector (each
+    ``list_namespace_objects`` rides the same metadata path as the build
+    preflight) and advisory by design: existing content is a warning, never a
+    refusal, and a connection dex cannot open degrades to a note, because init
+    is credential-optional and must stay that way.
+
+    DuckDB's base namespace is deliberately not checked: the dev target is the
+    same file as the source warehouse, so "the namespace holds objects" is true
+    of every working setup and warning on it would only train users to skim.
+    Only the layered schemas, which are genuinely dbt-owned, are probed there.
+    """
+
+    target_name = config.dbt_target or "dev"
+    connector = config.connector
+    block = getattr(config, connector, None)
+    if block is None:
+        return []
+
+    # Each probe is (display name for the warning, args for the connector's
+    # list_namespace_objects). The layered names mirror what the scaffolded
+    # generate_schema_name macro will compose: <layer>_<target name>.
+    layer_names = [f"{layer}_{target_name}" for layer in _LAYER_SCHEMAS]
+    probes: list[tuple[str, tuple[str, ...]]] = []
+    if connector == "bigquery" and block.dev_dataset:
+        gcp_project, _, dataset = block.dev_dataset.rpartition(".")
+        gcp_project = gcp_project or (block.project or "")
+        prefix = f"{gcp_project}." if gcp_project else ""
+        probes.append((f"{prefix}{dataset}", (dataset,)))
+        if layered:
+            probes.extend((f"{prefix}{name}", (name,)) for name in layer_names)
+    elif connector == "snowflake" and block.dev_database:
+        from .init import _DEFAULT_SF_DEV_SCHEMA
+
+        database = block.dev_database.upper()
+        schemas = [(block.dev_schema or _DEFAULT_SF_DEV_SCHEMA).upper()]
+        if layered:
+            schemas.extend(name.upper() for name in layer_names)
+        probes.extend(
+            (f"{database}.{schema}", (database, schema)) for schema in schemas
+        )
+    elif connector == "databricks" and block.dev_catalog:
+        from .init import _DEFAULT_DBX_DEV_SCHEMA
+
+        schemas = [block.dev_schema or _DEFAULT_DBX_DEV_SCHEMA]
+        if layered:
+            schemas.extend(layer_names)
+        probes.extend(
+            (f"{block.dev_catalog}.{schema}", (block.dev_catalog, schema))
+            for schema in schemas
+        )
+    elif connector in ("postgres", "redshift") and block.dev_schema:
+        schemas = [block.dev_schema]
+        if layered:
+            schemas.extend(layer_names)
+        probes.extend((schema, (schema,)) for schema in schemas)
+    elif connector == "duckdb" and layered:
+        probes.extend((name, (name,)) for name in layer_names)
+    if not probes:
+        return []
+
+    from ..connect import open_adapter
+
+    degraded = (
+        "could not check the dev namespaces for existing content ({kind}: "
+        "{detail}); a name collision would surface on the first build instead"
+    )
+    try:
+        adapter = open_adapter(connector=connector, repo_root=repo_root)
+    except Exception as exc:
+        return [degraded.format(kind=type(exc).__name__, detail=exc)]
+
+    warnings: list[str] = []
+    try:
+        for display, args in probes:
+            objects = adapter.list_namespace_objects(*args)
+            if not objects:
+                continue
+            shown = ", ".join(objects[:_CONTENT_SAMPLE_CAP])
+            beyond = len(objects) - _CONTENT_SAMPLE_CAP
+            listing = shown if beyond <= 0 else f"{shown}, and {beyond} more"
+            noun = "object" if len(objects) == 1 else "objects"
+            warnings.append(
+                f"dev namespace {display} already contains {len(objects)} "
+                f"{noun} ({listing}); a dbt build writes alongside them and "
+                "replaces same-named relations, so pick a different dev "
+                "namespace if this content is unrelated"
+            )
+    except Exception as exc:
+        return [degraded.format(kind=type(exc).__name__, detail=exc)]
+    finally:
+        adapter.close()
+    return warnings
+
+
 def _declares_sources(project: Path) -> bool:
     view = load_project(project)
     for source in view.files.values():

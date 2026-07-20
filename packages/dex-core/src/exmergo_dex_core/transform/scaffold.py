@@ -29,6 +29,11 @@ _SOURCES_FILE = "models/staging/_dex_sources.yml"
 
 # name -> one-line description, surfaced by `transform macro` with no argument.
 MACRO_ASSETS: dict[str, str] = {
+    "generate_schema_name": (
+        "route each model layer to its own schema, <layer>_<target name> "
+        "(staging_dev / intermediate_dev / marts_dev on the dev target); "
+        "models with no custom schema fall back to target.schema"
+    ),
     "unpivot_json_object": (
         "unpivot a JSON object column with dynamic keys into (key, value) "
         "rows, top-level keys only; native semi-structured value type on "

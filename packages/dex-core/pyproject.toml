@@ -108,6 +108,7 @@ addopts = "--import-mode=importlib"
 pythonpath = ["tests"]
 markers = [
   "integration: hits a live warehouse; gated on DEX_TEST_* environment variables",
+  "live_open_adapter: opts a test out of the hermetic open_adapter raiser (composed flows on local duckdb)",
   "bigquery: BigQuery-specific integration tests",
   "snowflake: Snowflake-specific integration tests",
   "databricks: Databricks-specific integration tests",

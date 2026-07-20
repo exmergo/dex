@@ -77,6 +77,24 @@ reaches dbt only through the `REDSHIFT_PASSWORD` environment variable. All
 of them discover their connections and refuse with the fix named when none
 resolves. Init refuses if any dbt project already exists.
 
+When the user wants staging/intermediate/marts isolated in their own
+datasets/schemas (a common ask when the warehouse is shared with unrelated
+work), offer `--layered-schemas`: init then also scaffolds
+`models/intermediate/`, a `generate_schema_name` override, and per-folder
+`+schema:` config, so builds land in `staging_dev` / `intermediate_dev` /
+`marts_dev` instead of one shared dev namespace. Do not hand-write that macro;
+existing projects can adopt it later via `transform macro
+generate_schema_name`. Note dbt warns about "unused configuration paths" until
+the first model lands in each layer folder; that resolves itself.
+
+Init also checks (free, metadata-only) whether each namespace the project
+would build into already exists with content, and warns naming the namespace
+and a few object names. The warning is advisory: relay it to the user and ask
+whether the content is theirs (a previous dev build) or unrelated; when it is
+unrelated, discard the freshly scaffolded project (nothing has been built),
+point the config at a different dev namespace, and re-run init. A "could not
+check" note just means no connection was reachable at init time.
+
 ### dbt SQL models
 
 - `transform plan "<intent>" --edits-file <path|->` validates the edits and

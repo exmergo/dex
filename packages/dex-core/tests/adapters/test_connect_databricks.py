@@ -857,3 +857,18 @@ def test_existing_but_empty_dev_catalog_is_fine(fake_databricks):
     adapter = make_adapter(fake_databricks)
     assert adapter.missing_dev_namespaces("dex_dev") == []
     assert data_statements(fake_databricks) == []
+
+
+def test_list_namespace_objects_lists_via_unity_catalog_only(fake_databricks):
+    adapter = make_adapter(fake_databricks)
+    # Case-insensitive on both parts, resolved to Unity Catalog's own spelling.
+    assert adapter.list_namespace_objects("SHOP", "Core") == ["customers", "events"]
+    assert data_statements(fake_databricks) == []
+    assert fake_databricks.connect_count == 0
+
+
+def test_list_namespace_objects_reads_an_absent_namespace_as_empty(fake_databricks):
+    adapter = make_adapter(fake_databricks)
+    assert adapter.list_namespace_objects("not_there", "dbt_dev") == []
+    assert adapter.list_namespace_objects("shop", "not_there") == []
+    assert fake_databricks.connect_count == 0

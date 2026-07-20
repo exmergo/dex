@@ -846,3 +846,10 @@ def test_a_profile_role_the_database_does_not_know_is_refused(fake_pg_connection
     with pytest.raises(PostgresConnectionError) as exc:
         adapter.missing_dev_namespaces("dbt_dev", role="ghost")
     assert "ghost" in str(exc.value)
+
+
+def test_list_namespace_objects_lists_only_the_asked_schema(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection)
+    assert adapter.list_namespace_objects("shop") == ["customers", "events"]
+    assert adapter.list_namespace_objects("not_there") == []
+    assert fake_pg_connection.data_statements == []
