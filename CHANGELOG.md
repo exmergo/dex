@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-21
+
 ### Added
 
 - **`explore semantic`: query the dbt semantic layer, locally or against dbt
