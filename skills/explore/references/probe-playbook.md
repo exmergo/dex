@@ -115,7 +115,7 @@ FROM users
 ```
 
 Recipes 4, 6, and 8 above use `FILTER (WHERE ...)`, which is not available on
-BigQuery -- BigQuery's engine will reject that clause outright, and the firewall
+BigQuery BigQuery's engine will reject that clause outright, and the firewall
 will not catch it first (it parses fine). On BigQuery, spell the same batched
 filtered count as `COUNTIF(cond)` instead, e.g. recipe 4's blank/sentinel
 breakdown becomes:
