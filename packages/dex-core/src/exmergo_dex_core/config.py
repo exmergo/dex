@@ -8,10 +8,11 @@ Secrets (passwords, keys, tokens) are read at runtime from their own stores by
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .cache import DEX_DIR
 from .envelope import Paradigm
@@ -235,24 +236,109 @@ class ClusterLimits(BaseModel):
 
 
 class PIIOverride(BaseModel):
-    """One reviewed column the team has decided is not PII.
+    """One reviewed column, or a reviewed *class* of structurally identical
+    columns, the team has decided is not PII.
 
-    ``column`` is fully qualified (the cache's connector-normalized identifier
-    plus the column name, e.g. ``MY_DB.PUBLIC.REGION.R_NAME``) so an override
-    can never silently widen to a same-named column elsewhere. No wildcards: an
-    override records a per-column human decision, and living in the committed
-    config makes that decision reviewable in git and durable across re-profiles.
+    Two mutually exclusive shapes:
+
+    - Exact (default): ``column`` is fully qualified (the cache's
+      connector-normalized identifier plus the column name, e.g.
+      ``MY_DB.PUBLIC.REGION.R_NAME``) so the override can never silently widen
+      to a same-named column elsewhere. This is a per-column human decision.
+    - Pattern (opt-in): ``column_name`` + ``scope`` clears every column named
+      ``column_name`` on any table whose fully-qualified identifier matches
+      the ``scope`` glob (``*`` wildcards, case-insensitive). For the
+      Firestore/Mongo/DynamoDB-export case, where the same structurally
+      identical column exists by construction on every entity's table in
+      every environment mirror, so the exact form would otherwise cost one
+      entry per table per environment for a single human decision.
+
+    Either shape lives in the committed config, so the decision stays
+    reviewable in git and durable across re-profiles.
     """
+
+    column: str | None = None
+    column_name: str | None = None
+    scope: str | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> PIIOverride:
+        is_exact = self.column is not None
+        is_pattern = self.column_name is not None or self.scope is not None
+        if is_exact and is_pattern:
+            raise ValueError(
+                "pii_overrides entry must be either 'column' (exact) or "
+                "'column_name' + 'scope' (pattern), not both"
+            )
+        if not is_exact and not is_pattern:
+            raise ValueError(
+                "pii_overrides entry needs either 'column' (exact) or "
+                "'column_name' + 'scope' (pattern)"
+            )
+        if is_pattern and (self.column_name is None or self.scope is None):
+            raise ValueError(
+                "pattern-form pii_overrides entry needs both 'column_name' and 'scope'"
+            )
+        return self
+
+
+class PIIOverrideMatcher:
+    """Resolves ``pii_overrides`` against a fully-qualified ``identifier.column``
+    path. Exact entries match verbatim; pattern entries (``column_name`` +
+    ``scope``) match any column of that name in any dataset whose identifier
+    matches the ``scope`` glob. Duck-types the exact-match set every call site
+    already used (``path in matcher``, ``if not matcher``), so pattern support
+    needs no change at the match sites in ``explore/profile.py`` or
+    ``maintain/reconcile.py``."""
+
+    def __init__(self, overrides: list[PIIOverride]):
+        self._exact = {
+            entry.column.strip().lower() for entry in overrides if entry.column
+        }
+        self._patterns = [
+            (entry.column_name.strip().lower(), entry.scope.strip().lower())
+            for entry in overrides
+            if entry.column_name
+        ]
+
+    def __contains__(self, path: str) -> bool:
+        path = path.strip().lower()
+        if path in self._exact:
+            return True
+        table, _, column = path.rpartition(".")
+        return any(
+            column == name and fnmatch.fnmatchcase(table, scope)
+            for name, scope in self._patterns
+        )
+
+    def __bool__(self) -> bool:
+        return bool(self._exact or self._patterns)
+
+
+def pii_override_paths(overrides: list[PIIOverride]) -> PIIOverrideMatcher:
+    """The form the engine matches columns against: lowered exact paths plus
+    any pattern entries, case-insensitive because the connectors disagree
+    about identifier case (same rationale as ``scope_within``), and a case
+    mismatch must never re-block a reviewed column."""
+
+    return PIIOverrideMatcher(overrides)
+
+
+class BlobOverride(BaseModel):
+    """One reviewed blob-type column a human wants profiled despite the default
+    exclusion (see ``adapters.base.is_blob_type``). ``column`` is fully
+    qualified, same shape and rationale as :class:`PIIOverride`: a per-column
+    human decision, durable and reviewable in git, never a wildcard."""
 
     column: str
     reason: str | None = None
 
 
-def pii_override_paths(overrides: list[PIIOverride]) -> set[str]:
-    """Lowered fully-qualified column paths, the form the engine matches columns
-    against. Case-insensitive because the connectors disagree about identifier
-    case (same rationale as ``scope_within``), and a case mismatch must never
-    re-block a reviewed column."""
+def blob_override_paths(overrides: list[BlobOverride]) -> set[str]:
+    """Lowered fully-qualified column paths a human has opted back into
+    profiling despite being blob-typed. Same matching rules as
+    ``pii_override_paths``."""
 
     return {entry.column.strip().lower() for entry in overrides}
 
@@ -292,6 +378,10 @@ class DexConfig(BaseModel):
     # durably clear a detector flag; hand-edits to the cache are overwritten by
     # the next profile, this list is re-applied on every profile.
     pii_overrides: list[PIIOverride] = Field(default_factory=list)
+    # Blob-type columns (BYTES/BLOB/bytea/BINARY, scalar or repeated) a human has
+    # reviewed and wants profiled despite the default exclusion. Re-applied on
+    # every profile, same durability rationale as pii_overrides.
+    blob_overrides: list[BlobOverride] = Field(default_factory=list)
 
 
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:

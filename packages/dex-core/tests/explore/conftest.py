@@ -105,6 +105,23 @@ def tpch_names_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def blob_duckdb(tmp_path: Path) -> Path:
+    """A table with an informative numeric column next to a `BLOB` column
+    (serialized-state shape): the profile scan-pruning gap the blob-column
+    exclusion targets."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "blob.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE sessions (id INTEGER, payload BLOB)")
+    conn.execute(
+        "INSERT INTO sessions VALUES (1, 'abc'::BLOB), (2, 'defgh'::BLOB), (3, NULL)"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def near_unique_duckdb(tmp_path: Path) -> Path:
     """Tables big enough for approx_count_distinct to genuinely err: a 50k-row
     table with an exactly-unique key (the field failure: HLL noise made every

@@ -170,6 +170,25 @@ def json_safe(value: object | None) -> object | None:
     return str(value)
 
 
+# Substring hints for arbitrary binary-blob column types across dialects
+# (BigQuery BYTES, DuckDB BLOB, Postgres bytea, Snowflake/Databricks
+# BINARY/VARBINARY). Matched the same way as profile.is_numeric_type, so a
+# repeated spelling (ARRAY<BYTES>, BLOB[]) is caught by the same substring
+# search without a separate case.
+_BLOB_HINTS = ("BYTES", "BLOB", "BYTEA", "BINARY")
+
+
+def is_blob_type(data_type: str) -> bool:
+    """Whether a connector's raw column type is an arbitrary binary blob, scalar
+    or repeated. A blob column's profile can only ever be a null fraction and a
+    distinct estimate, yet a columnar engine bills for the whole column once it
+    is referenced by any aggregate at all -- so ``explore profile`` excludes
+    these columns from its scan by default (see ``explore.profile.profile``)."""
+
+    upper = data_type.upper()
+    return any(h in upper for h in _BLOB_HINTS)
+
+
 def distinct_combination_sql(
     table_sql: str,
     combinations: list[list[str]],

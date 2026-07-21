@@ -355,6 +355,171 @@ def test_pii_override_matching_no_column_warns(tpch_names_duckdb: Path, capsys):
     assert person["pii"] is not None, "a typo must not clear anything"
 
 
+# --- pii_overrides pattern form (column_name + scope): issue #106 --------------
+
+
+def _write_pattern_override(column_name: str, scope: str) -> None:
+    from exmergo_dex_core.config import DexConfig, PIIOverride, save_config
+
+    save_config(
+        DexConfig(pii_overrides=[PIIOverride(column_name=column_name, scope=scope)]),
+    )
+
+
+def test_pii_override_pattern_clears_flag_with_audit(tpch_names_duckdb: Path, capsys):
+    _write_pattern_override("name", "tpch_names.main.*")
+    payload = _run(
+        ["explore", "profile", "hosts", "--path", str(tpch_names_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    person = {c["name"]: c for c in dataset["columns"]}["name"]
+    assert person["pii"] is None
+    assert person["pii_overridden"] == "name", "the audit trail"
+    assert any("pii_overrides" in n for n in payload["data"]["notes"])
+
+
+def test_pii_override_pattern_scope_excludes_non_matching_dataset(
+    tpch_names_duckdb: Path, capsys
+):
+    _write_pattern_override("name", "tpch_names.main.other_*")
+    payload = _run(
+        ["explore", "profile", "hosts", "--path", str(tpch_names_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    person = {c["name"]: c for c in dataset["columns"]}["name"]
+    assert person["pii"] is not None, "a non-matching scope must not clear anything"
+
+
+def test_pii_override_pattern_matching_no_column_warns(tpch_names_duckdb: Path, capsys):
+    _write_pattern_override("nmae", "tpch_names.main.*")
+    rc = main(["explore", "profile", "hosts", "--path", str(tpch_names_duckdb)])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert any("matches no column" in w for w in payload["warnings"])
+
+
+def test_pii_override_pattern_matching_zero_tables_stays_silent(
+    tpch_names_duckdb: Path, capsys
+):
+    # A scope naming an entity that hasn't landed yet must not warn: that's
+    # the whole point of the pattern form (new tables land under scope later).
+    _write_pattern_override("name", "no_such_db.*")
+    payload = _run(
+        ["explore", "profile", "hosts", "--path", str(tpch_names_duckdb)], capsys
+    )
+    assert payload["warnings"] == []
+
+
+def test_pii_override_pattern_clears_across_multiple_tables():
+    """The point of the pattern form: one config entry clears the same
+    structurally identical column on every table its scope glob matches, and
+    leaves it alone outside that scope."""
+
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.config import PIIOverride, pii_override_paths
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.shape_requests: list[set[str]] = []
+
+        def table_metadata(self, identifier):
+            columns = [ColumnMeta("document_name", "VARCHAR", True, 0)]
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name=identifier,
+                row_count=1,
+                byte_size=None,
+                column_count=len(columns),
+            )
+            return meta, columns
+
+        def column_aggregates(
+            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+        ):
+            self.shape_requests.append(set(shape_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    matcher = pii_override_paths(
+        [PIIOverride(column_name="document_name", scope="db.raw_*")]
+    )
+    datasets = profile_mod.profile(
+        adapter,
+        ["db.raw_orders_dev", "db.raw_users_qa", "db.other_table"],
+        pii_overrides=matcher,
+    )
+    by_id = {d.identifier: d for d in datasets}
+    assert by_id["db.raw_orders_dev"].columns[0].pii is None
+    assert by_id["db.raw_orders_dev"].columns[0].pii_overridden is not None
+    assert by_id["db.raw_users_qa"].columns[0].pii is None
+    assert by_id["db.raw_users_qa"].columns[0].pii_overridden is not None
+    # Outside the scope glob, the same-named column is untouched.
+    assert by_id["db.other_table"].columns[0].pii is not None
+    assert by_id["db.other_table"].columns[0].pii_overridden is None
+    # No shape SQL spent on the two overridden columns; only the unmatched one.
+    assert adapter.shape_requests == [set(), set(), {"document_name"}]
+
+
+# --- blob-type column exclusion -------------------------------------------------
+
+
+def test_blob_column_excluded_by_default_with_note(blob_duckdb: Path, capsys):
+    payload = _run(
+        ["explore", "profile", "sessions", "--path", str(blob_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    columns = {c["name"]: c for c in dataset["columns"]}
+    payload_col = columns["payload"]
+    assert payload_col["null_fraction"] is None
+    assert payload_col["distinct_count"] is None
+    # The informative sibling column is untouched by the exclusion.
+    assert columns["id"]["distinct_count"] == 3
+    note = next(n for n in dataset["data_quality"] if "blob-type column" in n)
+    assert "payload" in note
+    assert "blob_overrides" in note
+
+
+def _write_blob_overrides(entries: list[str]) -> None:
+    from exmergo_dex_core.config import BlobOverride, DexConfig, save_config
+
+    save_config(DexConfig(blob_overrides=[BlobOverride(column=e) for e in entries]))
+
+
+def test_blob_override_restores_stats(blob_duckdb: Path, capsys):
+    _write_blob_overrides(["blob.main.sessions.payload"])
+    payload = _run(
+        ["explore", "profile", "sessions", "--path", str(blob_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    payload_col = {c["name"]: c for c in dataset["columns"]}["payload"]
+    assert payload_col["null_fraction"] == pytest.approx(1 / 3)
+    assert payload_col["distinct_count"] == 2
+    assert not any("blob-type column" in n for n in dataset["data_quality"])
+
+
+def test_profile_include_blobs_param_matches_by_identifier_column(blob_duckdb: Path):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter(blob_duckdb)
+    try:
+        (dataset,) = profile(
+            adapter,
+            ["blob.main.sessions"],
+            include_blobs={"blob.main.sessions.payload"},
+        )
+    finally:
+        adapter.close()
+    payload_col = {c.name: c for c in dataset.columns}["payload"]
+    assert payload_col.null_fraction is not None
+    assert payload_col.distinct_count is not None
+
+
 def test_non_unique_id_gets_fan_out_warning(airbnb_duckdb: Path, capsys):
     payload = _run(
         ["explore", "profile", "RAW_HOSTS", "--path", str(airbnb_duckdb)], capsys

@@ -43,6 +43,38 @@ def test_drift_added_column_honors_pii_override():
     assert added.pii_overridden is not None
 
 
+def test_drift_added_column_honors_pattern_pii_override():
+    """A pattern-form override (column_name + scope) reaches drift-added
+    columns the same way an exact override does: this is the path
+    `maintain/commands.py` feeds through `pii_override_paths()`."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.config import PIIOverride, pii_override_paths
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _patched_dataset
+
+    base = Dataset(
+        identifier="db.raw_orders_qa",
+        columns=[ColumnProfile(name="id", data_type="INTEGER")],
+    )
+    finding = DriftFinding(
+        axis="schema",
+        code="column_added",
+        identifier="db.raw_orders_qa",
+        column="customer_name",
+        detail="column customer_name added",
+        data={"data_type": "VARCHAR"},
+    )
+    matcher = pii_override_paths(
+        [PIIOverride(column_name="customer_name", scope="db.raw_*")]
+    )
+
+    cleared = _patched_dataset(base, [finding], matcher)
+    added = next(c for c in cleared.columns if c.name == "customer_name")
+    assert added.pii is None
+    assert added.pii_overridden is not None
+
+
 def test_reconcile_needs_a_drift_report(maintain_repo):
     maintain_repo.snapshot()
     rc, payload = maintain_repo.dex("maintain", "reconcile")
