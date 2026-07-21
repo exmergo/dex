@@ -16,7 +16,12 @@ cache does not know, refuses with the fix ("profile it first"). Filters, join
 conditions, GROUP BY and ORDER BY are unrestricted: values flow into them, not
 out of them. Row-level projections of a flagged column (including comparisons
 like ``name LIKE 'A%'``) are refused; per-row predicates over PII are still
-row-level PII-derived data.
+row-level PII-derived data. The same reasoning cuts the path through
+``FILTER (WHERE ...)`` and ``COUNTIF``/``COUNT_IF``: their condition argument is
+a filter, not a projected value, so it is never walked for taint -- only the
+aggregate's own (measuring) output crosses the envelope. This is what lets
+BigQuery, which has no ``FILTER (WHERE ...)`` clause, express a batched
+filtered count as ``COUNTIF(cond)`` instead.
 
 A FROM clause may unnest, in each dialect's native idiom (UNNEST, LATERAL
 FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL navigation and
@@ -79,9 +84,19 @@ class InspectedQuery:
 # from a flagged column to the projection. MIN/MAX/ANY_VALUE/MODE/percentiles
 # and the collecting aggregates (STRING_AGG, ARRAY_AGG, LIST, HISTOGRAM) all
 # return actual values, so they are deliberately absent.
+#
+# count_if: sqlglot parses COUNTIF/COUNT_IF (BigQuery, Snowflake, DuckDB) into
+# its own exp.CountIf node, normalized to "count_if" by sql_name() regardless
+# of dialect. Its sole argument is grammatically always a boolean condition,
+# never a value-carrying expression -- structurally the same as a
+# FILTER (WHERE ...) clause, which already passes via the exp.Filter carve-out
+# in _expr_taint. Listing it here (rather than a separate carve-out) skips its
+# condition entirely, exactly as intended: the condition is a filter, not a
+# projection.
 _MEASURING = frozenset(
     {
         "count",
+        "count_if",
         "approx_distinct",
         "approx_count_distinct",
         "avg",
@@ -287,7 +302,7 @@ def inspect_query(
         message = (
             "the projection would carry values from PII-flagged column(s): "
             + "; ".join(offending)
-            + ". Use a measuring aggregate over them (COUNT, "
+            + ". Use a measuring aggregate over them (COUNT, COUNTIF, "
             "APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), or drop them from the "
             "output. PII values never cross the envelope."
         )

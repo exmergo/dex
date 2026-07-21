@@ -71,6 +71,7 @@ def _refusal(sql: str, cache: DexCache) -> str:
         "SELECT COUNT(*) FROM RAW_HOSTS WHERE NAME = 'Ada'",  # values flow in
         "SELECT COUNT(*) FROM RAW_HOSTS GROUP BY NAME",  # group key not projected
         "SELECT COUNT(*) FILTER (WHERE NAME LIKE 'A%') FROM RAW_HOSTS",
+        "SELECT COUNTIF(NAME LIKE 'A%') FROM RAW_HOSTS",
         "WITH x AS (SELECT NAME FROM RAW_HOSTS) SELECT COUNT(NAME) FROM x",
         "SELECT ID FROM (SELECT ID, NAME FROM RAW_HOSTS) t",
         "SELECT l.HOST_ID FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID",
@@ -83,6 +84,20 @@ def test_allowed(sql: str, cache: DexCache):
     inspected = inspect_query(sql, cache, LIMITS)
     assert inspected.sql
     assert inspected.row_cap <= LIMITS.max_rows
+
+
+def test_countif_allowed_on_bigquery(cache: DexCache):
+    """BigQuery has no FILTER (WHERE ...) clause, so COUNTIF(cond) is its only
+    batched filtered-count spelling; it must pass exactly like FILTER already
+    does on engines that support it."""
+
+    inspected = inspect_query(
+        "select countif(name like 'A%') as names_starting_a from RAW_HOSTS",
+        cache,
+        LIMITS,
+        dialect="bigquery",
+    )
+    assert inspected.sql
 
 
 @pytest.mark.parametrize(
