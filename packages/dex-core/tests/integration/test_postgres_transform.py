@@ -88,6 +88,10 @@ def test_init_and_build_write_only_the_dev_schema(
     data = envelope["data"]
     assert data["success"] is True
     assert any(n["name"] == "stg_orders" for n in data["nodes"])
+    # The build is priced upfront now: a database-seconds estimate from the free
+    # EXPLAIN planner preflight is surfaced before the run.
+    assert envelope["cost"]["estimate"] is not None
+    assert envelope["cost"]["estimate"] > 0
     assert data["seconds_billed"] > 0
     assert any("statement_timeout" in w for w in envelope["warnings"])
 

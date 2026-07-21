@@ -680,9 +680,87 @@ def test_relative_project_dir_builds_without_path_doubling(
 # --- billed connectors (BigQuery): the ceiling binds, spend is ledgered --------
 
 
-def test_billed_build_unconfirmed_needs_confirmation_with_unknown_estimate(
-    bigquery_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+def _install_fake_pricing(
+    monkeypatch,
+    *,
+    connector: str,
+    paradigm,
+    estimate: float | None,
+    per_node: dict,
+    confirmed: bool,
+    ceiling: float | None,
+    describe=None,
+    notes: list[str] = (),
 ):
+    """Make ``cmd_build`` price a billed build without a real warehouse.
+
+    Replaces the adapter open with a fake carrying a real ``CostGate``, stubs
+    ``compile_estimate`` so no dbt compile or dry-run runs, and neutralizes the
+    dev-target check (which would otherwise open its own connection). Returns the
+    fake adapter, whose ``.closed`` records that ``cmd_build`` closed it.
+    """
+
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.transform import dev_target
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+
+    class FakeAdapter:
+        def __init__(self):
+            self.paradigm = paradigm
+            self.name = connector
+            self.cost_gate = CostGate(
+                paradigm=paradigm,
+                ceiling=ceiling,
+                session_ceiling=None,
+                session_spent=0.0,
+                confirmed=confirmed,
+                connector=connector,
+                command="transform build",
+            )
+            self.closed = False
+
+        def query_estimate(self, sql):  # not exercised: compile_estimate is stubbed
+            return 0.0
+
+        def close(self):
+            self.closed = True
+
+    adapter = FakeAdapter()
+    if describe is not None:
+        adapter.describe_estimate = describe
+    monkeypatch.setattr(command_args, "open_from_args", lambda args: adapter)
+    monkeypatch.setattr(
+        build_module,
+        "compile_estimate",
+        lambda project, adp, *, target, select=None, **kw: (
+            estimate,
+            dict(per_node),
+            list(notes),
+        ),
+    )
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    return adapter
+
+
+def test_billed_build_unconfirmed_needs_confirmation_with_estimate(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The build is priced upfront (a free `dbt compile` dry-run of each node),
+    so the confirm handshake carries a real byte estimate, not a null."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=False,
+        ceiling=100_000_000,
+    )
     rc, envelope = _run(
         [
             "--repo-root",
@@ -701,14 +779,112 @@ def test_billed_build_unconfirmed_needs_confirmation_with_unknown_estimate(
     assert rc == 0
     assert envelope["status"] == "needs_confirmation"
     assert envelope["cost"]["paradigm"] == "bytes_scanned"
-    # dbt has no dry-run: the estimate is honestly unknown, not a fake zero.
+    assert envelope["cost"]["estimate"] == 5_000_000.0
+    assert envelope["cost"]["ceiling"] == 100_000_000
+    # BigQuery has no describe_estimate, so the default bytes payload is used.
+    assert envelope["data"]["estimated_bytes"] == 5_000_000.0
+    assert envelope["data"]["per_table_bytes"]["stg_customers"] == 5_000_000.0
+
+
+def test_billed_build_surfaces_estimate_quality_on_compute_time(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Compute-time connectors price via a heuristic; the handshake carries the
+    honest `estimate_quality` label the connector's describe_estimate returns."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    def describe(estimate, per_table=None):
+        return {
+            "estimated_seconds": estimate,
+            "estimate_quality": "heuristic",
+            "per_table_seconds": per_table or {},
+        }
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="snowflake",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=42.0,
+        per_node={"stg_customers": 42.0},
+        confirmed=False,
+        ceiling=600,
+        describe=describe,
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "snowflake",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "600",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    assert envelope["cost"]["estimate"] == 42.0
+    assert envelope["data"]["estimated_seconds"] == 42.0
+    assert envelope["data"]["estimate_quality"] == "heuristic"
+
+
+def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch, forbid_dbt
+):
+    """dex discovers its own connection separately from dbt's profile, so a
+    connection dex cannot open must not break a build dbt could run: pricing
+    degrades to no estimate with a note, and the gate still binds."""
+
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.transform import dev_target
+
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+
+    def boom(args):
+        raise RuntimeError("no application default credentials")
+
+    monkeypatch.setattr(command_args, "open_from_args", boom)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert envelope["status"] == "needs_confirmation"
     assert envelope["cost"]["estimate"] is None
-    assert envelope["cost"]["ceiling"] == 100000000
+    assert any("could not price" in w for w in envelope["warnings"])
 
 
 def test_billed_build_without_a_budget_is_refused(
-    bigquery_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=None,
+    )
     rc, envelope = _run(
         [
             "--repo-root",
@@ -733,6 +909,17 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
 ):
     import json as json_mod
 
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
     target_dir = bigquery_project_dir / "target"
     run_results = json_mod.dumps(
         {
@@ -752,6 +939,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
             ]
         }
     )
+    # compile_estimate is stubbed, so the fake runner only serves the dbt build.
     _fake_runner_factory(
         monkeypatch,
         returncode=0,
@@ -774,6 +962,8 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
         capsys,
     )
     assert rc == 0, envelope
+    # The confirmed run's envelope carries the preflight estimate and the actual.
+    assert envelope["cost"]["estimate"] == 5_000_000.0
     assert envelope["data"]["bytes_billed"] == 3000
     assert any("maximum_bytes_billed" in w for w in envelope["warnings"])
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
@@ -789,6 +979,17 @@ def test_billed_build_failure_names_the_real_error_in_errors(
     rides in errors, not buried in warnings (guards the sanitized-failure fix on
     the bytes_scanned paradigm)."""
 
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
     msg = "Database Error in model x: Access Denied on dataset dbt_dev"
     _fake_runner_factory(
         monkeypatch,
@@ -875,3 +1076,155 @@ def test_prod_refusal_still_beats_the_dev_target_check(
     assert rc == 1
     assert "prod" in envelope["errors"][0].lower()
     assert "seed" not in envelope["errors"][0]
+
+
+# --- compile_estimate: pricing a build from a free dbt compile dry-run --------
+
+
+def _compile_runner(
+    monkeypatch, project: Path, run_results: dict, *, returncode: int = 0
+):
+    """Fake ``_default_runner`` for compile: writes the given run_results.json on
+    invocation (mirroring real dbt) and returns the requested code."""
+
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            (project / "target").mkdir(parents=True, exist_ok=True)
+            (project / "target" / "run_results.json").write_text(
+                json.dumps(run_results), encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(argv, returncode, "", "")
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
+class _EstimatingAdapter:
+    """Prices each SQL at a fixed cost, raising for any SQL containing ``fail``
+    (standing in for a node whose dev-target input does not exist yet)."""
+
+    def __init__(self, per_sql: float = 10.0):
+        self._per_sql = per_sql
+
+    def query_estimate(self, sql: str) -> float:
+        if "fail" in sql:
+            raise RuntimeError("relation not found in the dev target")
+        return self._per_sql
+
+
+def _write_manifest(project: Path, nodes: dict) -> None:
+    (project / "target").mkdir(parents=True, exist_ok=True)
+    (project / "target" / "manifest.json").write_text(
+        json.dumps({"nodes": nodes}), encoding="utf-8"
+    )
+
+
+def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
+    dbt_project_dir: Path, monkeypatch
+):
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    nodes = {
+        "model.p.stg_a": {
+            "resource_type": "model",
+            "name": "stg_a",
+            "compiled_code": "select 1",
+            "config": {"materialized": "view"},
+        },
+        "model.p.eph": {
+            "resource_type": "model",
+            "name": "eph",
+            "compiled_code": "select 2",
+            "config": {"materialized": "ephemeral"},
+        },
+        "snapshot.p.snap": {
+            "resource_type": "snapshot",
+            "name": "snap",
+            "compiled_code": "select 3",
+            "config": {},
+        },
+        "test.p.nn": {
+            "resource_type": "test",
+            "name": "not_null_stg_a",
+            "compiled_code": "select 4",
+            "config": {},
+        },
+        "seed.p.s": {
+            "resource_type": "seed",
+            "name": "s",
+            "compiled_code": "",
+            "config": {},
+        },
+    }
+    _write_manifest(dbt_project_dir, nodes)
+    _compile_runner(
+        monkeypatch,
+        dbt_project_dir,
+        {"results": [{"unique_id": uid} for uid in nodes]},
+    )
+    total, per_node, notes = build_mod.compile_estimate(
+        dbt_project_dir, _EstimatingAdapter(), target="dev"
+    )
+    # model(view) + snapshot + test priced at 10 each; ephemeral and seed skipped.
+    assert total == 30.0
+    assert set(per_node) == {"stg_a", "snap", "not_null_stg_a"}
+    assert notes == []
+
+
+def test_compile_estimate_skips_and_notes_unpriceable_nodes(
+    dbt_project_dir: Path, monkeypatch
+):
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    nodes = {
+        "model.p.stg_a": {
+            "resource_type": "model",
+            "name": "stg_a",
+            "compiled_code": "select 1 from raw",
+            "config": {"materialized": "view"},
+        },
+        "model.p.mart_b": {
+            "resource_type": "model",
+            "name": "mart_b",
+            "compiled_code": "select * from fail_stg_a",  # its input is not built yet
+            "config": {"materialized": "table"},
+        },
+    }
+    _write_manifest(dbt_project_dir, nodes)
+    _compile_runner(
+        monkeypatch,
+        dbt_project_dir,
+        {"results": [{"unique_id": uid} for uid in nodes]},
+    )
+    total, per_node, notes = build_mod.compile_estimate(
+        dbt_project_dir, _EstimatingAdapter(), target="dev"
+    )
+    assert total == 10.0
+    assert set(per_node) == {"stg_a"}
+    assert any("could not be priced" in n and "mart_b" in n for n in notes)
+
+
+def test_compile_estimate_raises_when_compile_fails(dbt_project_dir: Path, monkeypatch):
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    _compile_runner(monkeypatch, dbt_project_dir, {"results": []}, returncode=1)
+    with pytest.raises(build_mod.DbtRunError):
+        build_mod.compile_estimate(dbt_project_dir, _EstimatingAdapter(), target="dev")
+
+
+def test_compile_estimate_without_an_estimator_is_a_zero_with_a_note(
+    dbt_project_dir: Path,
+):
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    total, per_node, notes = build_mod.compile_estimate(
+        dbt_project_dir, object(), target="dev"
+    )
+    assert total == 0.0
+    assert per_node == {}
+    assert any("no estimator" in n for n in notes)
