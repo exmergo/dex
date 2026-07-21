@@ -40,6 +40,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   schemas are checked. Backing this, every adapter gains a
   `list_namespace_objects` metadata method alongside `missing_dev_namespaces`.
 
+### Fixed
+
+- **`explore query` now resolves CTE aliases across set operations.** `WITH`
+  clause relations attached to `UNION`, `INTERSECT`, or `EXCEPT` roots are
+  registered before either branch is inspected, including later CTEs that
+  reference earlier ones. Multi-CTE probes no longer misdiagnose query-local
+  aliases as tables missing from the `.dex` cache (#117).
+
 ## [1.2.2] - 2026-07-18
 
 ### Changed
