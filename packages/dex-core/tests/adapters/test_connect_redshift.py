@@ -284,6 +284,47 @@ def test_estimate_scales_with_base_capacity(fake_redshift_connection):
     )
 
 
+def _wide_blob_table() -> FakeRedshiftTable:
+    # 50 plain columns plus one binary column: without exclusion this is 2
+    # batches (51 columns), with exclusion (the default) it's 1 (50 columns).
+    # size_mb matches `customers` so CUSTOMERS_SCAN_SECONDS is the per-batch rate.
+    columns = [(f"c_{i}", "bigint", True) for i in range(50)]
+    columns.append(("payload", "binary", True))
+    return FakeRedshiftTable(
+        schema="raw", name="sessions", columns=columns, size_mb=5_000, tbl_rows=100.0
+    )
+
+
+def test_profile_estimate_accepts_include_blobs_without_crashing(
+    fake_redshift_connection,
+):
+    # Regression test: explore/commands.py::_profile_estimate always calls
+    # adapter.profile_estimate(identifiers, include_blobs=...), so every
+    # adapter with a profile_estimate must accept that kwarg.
+    adapter = make_adapter(fake_redshift_connection)
+    adapter.profile_estimate(["dexdb.shop.customers"], include_blobs=set())
+
+
+def test_profile_estimate_excludes_blob_columns_from_batch_count(
+    fake_redshift_connection,
+):
+    fake_redshift_connection.tables.append(_wide_blob_table())
+    adapter = make_adapter(fake_redshift_connection)
+    _total, per_table = adapter.profile_estimate(["dexdb.raw.sessions"])
+    assert per_table["dexdb.raw.sessions"] == pytest.approx(CUSTOMERS_SCAN_SECONDS)
+
+
+def test_profile_estimate_include_blobs_override_adds_a_batch(
+    fake_redshift_connection,
+):
+    fake_redshift_connection.tables.append(_wide_blob_table())
+    adapter = make_adapter(fake_redshift_connection)
+    _total, per_table = adapter.profile_estimate(
+        ["dexdb.raw.sessions"], include_blobs={"dexdb.raw.sessions.payload"}
+    )
+    assert per_table["dexdb.raw.sessions"] == pytest.approx(2 * CUSTOMERS_SCAN_SECONDS)
+
+
 def test_query_estimate_sums_referenced_tables(fake_redshift_connection):
     adapter = make_adapter(fake_redshift_connection)
     estimate = adapter.query_estimate("SELECT count(*) FROM dexdb.shop.customers")
