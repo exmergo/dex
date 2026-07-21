@@ -258,8 +258,10 @@ def _bigquery_profile(
     if target.location:
         output["location"] = target.location
     if config.budget.ceiling is not None:
-        # Server-side cap per statement dbt runs; the engine cannot dry-run a
-        # dbt build, so this is the binding cost control for `transform build`.
+        # Server-side per-statement cap: `transform build` prices the build
+        # upfront by dry-running each compiled node, but a per-statement estimate
+        # can still under-count, so this cap is the binding backstop that a build
+        # statement cannot scan past regardless of the estimate.
         output["maximum_bytes_billed"] = int(config.budget.ceiling)
     return yaml.safe_dump(
         {project_name: {"target": "dev", "outputs": {"dev": output}}},
