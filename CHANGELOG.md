@@ -9,6 +9,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`transform build` now surfaces an upfront cost estimate on every billed
+  connector.** Previously a build asked for a `--budget` with no number to base
+  it on, framed as a BigQuery limitation ("dbt has no dry-run"). dex now runs a
+  free `dbt compile` and prices each compiled node (models, snapshots, and tests)
+  through the connector's own execution-free estimator, the same one `explore`
+  uses: a real dry-run on BigQuery, an `EXPLAIN` planner cost on Postgres, and an
+  honestly-labeled size heuristic on Snowflake, Databricks, and Redshift. The
+  summed estimate rides the `needs_confirmation` handshake in the connector's
+  unit (bytes, warehouse-seconds, or database-seconds) with the same
+  `estimate_quality` label. On a cold dev target, nodes whose inputs are not
+  built yet cannot be priced and are noted, so the total is an honest partial
+  floor; when dex cannot open its own connection the estimate degrades to none
+  with a note, and the ceiling plus the server-side per-statement cap still bind.
+
 ## [1.3.0] - 2026-07-21
 
 ### Added
