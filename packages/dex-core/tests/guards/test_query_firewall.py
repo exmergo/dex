@@ -85,6 +85,30 @@ def test_allowed(sql: str, cache: DexCache):
     assert inspected.row_cap <= LIMITS.max_rows
 
 
+@pytest.mark.parametrize(
+    ("sql", "expected_tables"),
+    [
+        (
+            "WITH listings AS (SELECT ID FROM RAW_LISTINGS), "
+            "hosts AS (SELECT ID FROM RAW_HOSTS) "
+            "SELECT ID FROM listings UNION ALL SELECT ID FROM hosts",
+            ["db.main.RAW_HOSTS", "db.main.RAW_LISTINGS"],
+        ),
+        (
+            "WITH base AS (SELECT ID, HOST_ID FROM RAW_LISTINGS), "
+            "host_ids AS (SELECT HOST_ID FROM base) "
+            "SELECT HOST_ID FROM host_ids UNION ALL SELECT HOST_ID FROM base",
+            ["db.main.RAW_LISTINGS"],
+        ),
+    ],
+)
+def test_multiple_ctes_resolve_across_set_operations(
+    sql: str, expected_tables: list[str], cache: DexCache
+):
+    inspected = inspect_query(sql, cache, LIMITS)
+    assert inspected.tables == expected_tables
+
+
 # --- refused: value-carrying paths from flagged columns -------------------------
 
 

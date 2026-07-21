@@ -341,11 +341,22 @@ def _query_outputs(
 ) -> _Outputs:
     """Output taints of a whole query node (SELECT or a set operation)."""
 
+    # sqlglot attaches a WITH clause to the query root. For a plain query that
+    # root is a Select, but for UNION/INTERSECT/EXCEPT it is the set operation.
+    # Register CTEs here so both sides of any query shape resolve the same local
+    # relations. Process them in order because later CTEs may reference earlier
+    # ones.
+    local_env = dict(env)
+    for cte in node.ctes:
+        local_env[cte.alias_or_name.lower()] = _query_outputs(
+            cte.this, local_env, known, tables, dialect
+        )
+
     if isinstance(node, exp.Select):
-        return _select_outputs(node, env, known, tables, dialect)
+        return _select_outputs(node, local_env, known, tables, dialect)
     if isinstance(node, _QUERY_ROOTS):  # set operation: UNION/INTERSECT/EXCEPT
-        left = _query_outputs(node.left, env, known, tables, dialect)
-        right = _query_outputs(node.right, env, known, tables, dialect)
+        left = _query_outputs(node.left, local_env, known, tables, dialect)
+        right = _query_outputs(node.right, local_env, known, tables, dialect)
         # Column names come from the left side; taints merge positionally, and a
         # length mismatch (invalid SQL anyway) merges everything conservatively.
         left_items = list(left.items())
@@ -357,7 +368,7 @@ def _query_outputs(
             name: taint | right_taints[i] for i, (name, taint) in enumerate(left_items)
         }
     if isinstance(node, exp.Subquery):
-        return _query_outputs(node.this, env, known, tables, dialect)
+        return _query_outputs(node.this, local_env, known, tables, dialect)
     raise QueryRefusedError(f"unsupported query shape: {type(node).__name__}")
 
 
@@ -369,10 +380,6 @@ def _select_outputs(
     dialect: str,
 ) -> _Outputs:
     env = dict(outer_env)
-    for cte in select.ctes:
-        env[cte.alias_or_name.lower()] = _query_outputs(
-            cte.this, env, known, tables, dialect
-        )
 
     sources = _resolve_sources(select, env, known, tables, dialect)
 
