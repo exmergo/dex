@@ -11,6 +11,7 @@ and only to the ``.dex/`` cache, so a scan is never paid for twice.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 from collections.abc import Callable
@@ -30,7 +31,14 @@ from ..cache import (
     RelationshipKind,
     match_identifier,
 )
-from ..config import DexConfig, QueryLimits, load_config, pii_override_paths
+from ..config import (
+    DexConfig,
+    PIIOverride,
+    QueryLimits,
+    blob_override_paths,
+    load_config,
+    pii_override_paths,
+)
 from ..guards.cost_guard import OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
@@ -60,23 +68,45 @@ def _override_notes(datasets: list[Dataset]) -> list[str]:
 
 
 def _override_mismatches(
-    datasets: list[Dataset], override_paths: set[str]
+    datasets: list[Dataset], overrides: list[PIIOverride]
 ) -> list[str]:
-    """Warn when an override entry names a profiled table but no column of it:
-    almost certainly a typo, and silence would read as the override working."""
+    """Warn when an override entry can't possibly do anything: an exact entry
+    names a profiled table but no column of it, or a pattern entry's scope
+    matches profiled tables but none carries the named column. Almost
+    certainly a typo, and silence would read as the override working.
+
+    A pattern matching zero tables stays silent, same escape hatch as an exact
+    entry on a not-yet-profiled table: new entities landing later under the
+    same scope are the whole point of the pattern form."""
 
     warnings = []
-    for path in sorted(override_paths):
-        table, _, column = path.rpartition(".")
-        for dataset in datasets:
-            if dataset.identifier.lower() != table:
-                continue
-            if not any(c.name.lower() == column for c in dataset.columns):
+    for entry in overrides:
+        if entry.column:
+            path = entry.column.strip().lower()
+            table, _, column = path.rpartition(".")
+            for dataset in datasets:
+                if dataset.identifier.lower() != table:
+                    continue
+                if not any(c.name.lower() == column for c in dataset.columns):
+                    warnings.append(
+                        f"pii_overrides entry '{path}' matches no column of "
+                        f"{dataset.identifier}"
+                    )
+                break
+        else:
+            column_name = entry.column_name.strip().lower()  # type: ignore[union-attr]
+            scope = entry.scope.strip().lower()  # type: ignore[union-attr]
+            matched = [
+                d for d in datasets if fnmatch.fnmatchcase(d.identifier.lower(), scope)
+            ]
+            if matched and not any(
+                c.name.lower() == column_name for d in matched for c in d.columns
+            ):
                 warnings.append(
-                    f"pii_overrides entry '{path}' matches no column of "
-                    f"{dataset.identifier}"
+                    f"pii_overrides pattern entry (column_name='{entry.column_name}', "
+                    f"scope='{entry.scope}') matches no column named "
+                    f"'{entry.column_name}' in {len(matched)} matched dataset(s)"
                 )
-            break
     return warnings
 
 
@@ -100,12 +130,12 @@ def _mask_overridden(cache: DexCache, override_paths: set[str]) -> DexCache:
 
 
 def _profile_estimate(
-    adapter: Adapter, identifiers: list[str]
+    adapter: Adapter, identifiers: list[str], *, include_blobs: set[str] | None = None
 ) -> tuple[float, dict[str, float]]:
     estimate = getattr(adapter, "profile_estimate", None)
     if estimate is None:
         return 0.0, {}
-    return estimate(identifiers)
+    return estimate(identifiers, include_blobs=include_blobs or set())
 
 
 def _verify_estimate(
@@ -198,6 +228,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
     override_paths = pii_override_paths(config.pii_overrides)
+    blob_paths = blob_override_paths(config.blob_overrides)
     adapter = command_args.open_from_args(args)
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
@@ -208,7 +239,9 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     over_ceiling = False
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
-        estimate, per_table = _profile_estimate(adapter, identifiers)
+        estimate, per_table = _profile_estimate(
+            adapter, identifiers, include_blobs=blob_paths
+        )
         unconfirmed = command_args.billed_handshake(
             "explore profile", adapter, estimate, per_table=per_table
         )
@@ -232,6 +265,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
                 progress=profile_reporter,
                 on_complete=checkpoint,
                 pii_overrides=override_paths,
+                include_blobs=blob_paths,
             )
             profile_reporter.done()
         except OverCeilingError:
@@ -263,7 +297,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
             "notes": notes,
         }
     )
-    envelope.warnings.extend(_override_mismatches(datasets, override_paths))
+    envelope.warnings.extend(_override_mismatches(datasets, config.pii_overrides))
     return envelope
 
 
@@ -300,7 +334,10 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             now,
             refresh=getattr(args, "refresh", False),
         )
-        estimate, per_table = _profile_estimate(adapter, [m.identifier for m in stale])
+        blob_paths = blob_override_paths(config.blob_overrides)
+        estimate, per_table = _profile_estimate(
+            adapter, [m.identifier for m in stale], include_blobs=blob_paths
+        )
         handshake_notes = [
             "relationship inference profiles every object; on a metered "
             "connector `explore map` (top-ranked objects only) is usually the "
@@ -348,6 +385,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
                     progress=profile_reporter,
                     on_complete=checkpoint,
                     pii_overrides=pii_override_paths(config.pii_overrides),
+                    include_blobs=blob_paths,
                 )
                 profile_reporter.done()
             except OverCeilingError:
@@ -629,7 +667,10 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         )
         # Inventory and ranking are free, so an unconfirmed billed run repeats
         # them on re-issue; only the profiling scans below need the handshake.
-        estimate, per_table = _profile_estimate(adapter, [m.identifier for m in stale])
+        blob_paths = blob_override_paths(config.blob_overrides)
+        estimate, per_table = _profile_estimate(
+            adapter, [m.identifier for m in stale], include_blobs=blob_paths
+        )
         handshake_notes: list[str] = []
         if getattr(args, "verify", False):
             handshake_notes.append(
@@ -672,6 +713,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
                     progress=profile_reporter,
                     on_complete=checkpoint,
                     pii_overrides=pii_override_paths(config.pii_overrides),
+                    include_blobs=blob_paths,
                 )
                 profile_reporter.done()
             except OverCeilingError:

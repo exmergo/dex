@@ -16,10 +16,11 @@ Two habits pay for everything else:
 
 Firewall rules that shape your SQL: values may be projected only from profiled,
 PII-cleared columns; over a flagged column use a measuring aggregate (COUNT,
-COUNT(DISTINCT ...), APPROX_COUNT_DISTINCT, AVG, SUM, STDDEV), never a
-value-carrying one (MIN, MAX, ANY_VALUE, STRING_AGG, ARRAY_AGG). Filters and join
-conditions may reference anything. Results are capped (rows, cell width, bytes),
-and every cut is announced in `notes`, so aggregate first rather than paging.
+COUNT(DISTINCT ...), COUNTIF/COUNT_IF, APPROX_COUNT_DISTINCT, AVG, SUM, STDDEV),
+never a value-carrying one (MIN, MAX, ANY_VALUE, STRING_AGG, ARRAY_AGG). Filters and
+join conditions may reference anything. Results are capped (rows, cell width,
+bytes), and every cut is announced in `notes`, so aggregate first rather than
+paging.
 
 ## The recipes
 
@@ -112,6 +113,22 @@ SELECT COUNT(email)                    AS present,
        COUNT(*) FILTER (WHERE email NOT LIKE '%@%') AS shape_violations
 FROM users
 ```
+
+Recipes 4, 6, and 8 above use `FILTER (WHERE ...)`, which is not available on
+BigQuery BigQuery's engine will reject that clause outright, and the firewall
+will not catch it first (it parses fine). On BigQuery, spell the same batched
+filtered count as `COUNTIF(cond)` instead, e.g. recipe 4's blank/sentinel
+breakdown becomes:
+
+```sql
+SELECT COUNT(*)                            AS rows,
+       COUNTIF(TRIM(col) = '')             AS blank,
+       COUNTIF(col IN ('N/A', 'none'))     AS sentinel
+FROM t
+```
+
+`COUNTIF(cond)` is equivalent to `COUNT(*) FILTER (WHERE cond)` and passes the
+firewall the same way: the condition is a filter, not a projected value.
 
 ## When a probe is refused
 

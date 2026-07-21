@@ -15,8 +15,9 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from ..adapters.base import Adapter, ColumnAggregate, json_safe
+from ..adapters.base import Adapter, ColumnAggregate, is_blob_type, json_safe
 from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..config import PIIOverrideMatcher
 from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
@@ -116,7 +117,19 @@ _FREE_TEXT = re.compile(
     r"(^|_)(comments?|notes?|message|body|feedback|review_text|bio|about)(_|$)"
 )
 
-_NUMERIC_HINTS = ("INT", "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "HUGEINT")
+# "FIXED" is Snowflake's SHOW COLUMNS token for every integer and NUMBER type
+# (surfaced by snowflake._render_type); without it no Snowflake integer column
+# reads as numeric, and the type-aware PII gates below would be inert there.
+_NUMERIC_HINTS = (
+    "INT",
+    "DECIMAL",
+    "NUMERIC",
+    "DOUBLE",
+    "FLOAT",
+    "REAL",
+    "HUGEINT",
+    "FIXED",
+)
 _TEMPORAL_HINTS = ("DATE", "TIME", "TIMESTAMP", "INTERVAL")
 _BOOLEAN_HINTS = ("BOOL",)
 _STRING_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
@@ -175,13 +188,61 @@ def is_numeric_type(data_type: str) -> bool:
     return any(h in upper for h in _NUMERIC_HINTS)
 
 
+# Per-category structural type gate. Type evidence is known before any scan, so
+# an impossible pairing (an EMAIL on an integer) suppresses the flag outright at
+# classification time rather than being re-scored later. The gate is
+# per-category impossibility, never blanket: several categories legitimately
+# live on non-string columns (zip as INT64, ssn as INT64, salary as NUMERIC,
+# lat/lng as FLOAT, dob as DATE) and must keep flagging there.
+def _type_permits(category: PIICategory, data_type: str) -> bool:
+    """Whether ``category`` can structurally sit on a column of ``data_type``.
+
+    Built on the existing type predicates; adds no fourth type-hint tuple.
+
+    - EMAIL / NAME / FREE_TEXT: string only (an integer cannot hold an address
+      or a person name; this matches the pre-existing generic-name/free-text
+      gate, extended to the exact-token patterns).
+    - PHONE: anything but boolean or temporal (phone-as-INT is bad practice but
+      real, so a numeric phone still flags).
+    - every other category (ADDRESS, GOVERNMENT_ID, FINANCIAL, LOCATION, DOB,
+      CREDENTIAL): unchanged, permitted on any type.
+    """
+
+    if category in {PIICategory.EMAIL, PIICategory.NAME, PIICategory.FREE_TEXT}:
+        return _is_string_type(data_type)
+    if category is PIICategory.PHONE:
+        upper = data_type.upper()
+        return not any(h in upper for h in _BOOLEAN_HINTS + _TEMPORAL_HINTS)
+    return True
+
+
+# Aggregate-name suffixes. A non-string column whose name ends in one of these
+# is a derived statistic (a COUNT/SUM/AVG), not a value, so it is suppressed even
+# for categories the type gate above still permits on numbers (ssn_count,
+# zip_count, salary_sum). The conjunction with non-string type is what keeps this
+# safe: a string column named `email_count` is odd enough to stay flagged.
+#
+# Deliberately excluded, and do not "complete" this list: `_num` (phone_num,
+# account_num, cc_num are values, and cc_num is already a FINANCIAL token) and
+# `_total` (salary_total reads as a value as readily as an aggregate).
+_AGGREGATE_SUFFIXES = ("_count", "_cnt", "_sum", "_avg", "_pct", "_ratio")
+
+
+def _is_derived_statistic(name: str, data_type: str) -> bool:
+    """A non-string column whose normalized name ends in an aggregate suffix."""
+
+    return not _is_string_type(data_type) and name.endswith(_AGGREGATE_SUFFIXES)
+
+
 def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     """Classify a column as PII from its name (and, loosely, type). Never a value.
 
     Returns the first matching category with a base confidence; aggregate signals
-    refine the confidence later in :func:`_refine_confidence`. The exact-token
-    patterns apply to any type; the weaker generic-name and free-text patterns
-    apply only to string columns (a numeric `comments` count is not PII).
+    refine the confidence later in :func:`_refine_confidence`. Each match is
+    gated by :func:`_type_permits` (a category impossible on the column's type is
+    skipped) and :func:`_is_derived_statistic` (an aggregate-suffixed numeric
+    column is a count, not a value); the weaker generic-name and free-text
+    patterns remain string-only.
     """
 
     flag, _generic = _classify_pii(column_name, data_type)
@@ -200,6 +261,14 @@ def _classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, boo
     name = _normalize(column_name)
     for pattern, category, confidence in _PII_PATTERNS:
         if pattern.search(name):
+            # A type-forbidden or derived-statistic match continues past this
+            # pattern rather than returning None, so a later pattern still gets a
+            # fair look (e.g. `phone_count` on a numeric column short-circuits
+            # nothing).
+            if not _type_permits(category, data_type):
+                continue
+            if _is_derived_statistic(name, data_type):
+                continue
             return PIIFlag(category=category, confidence=confidence), False
 
     if _is_string_type(data_type):
@@ -237,7 +306,8 @@ def profile(
     *,
     progress: ProgressReporter | None = None,
     on_complete: Callable[[Dataset], None] | None = None,
-    pii_overrides: set[str] | None = None,
+    pii_overrides: PIIOverrideMatcher | None = None,
+    include_blobs: set[str] | None = None,
 ) -> list[Dataset]:
     """Profile each object into a Dataset of aggregate-derived ColumnProfiles.
 
@@ -255,9 +325,18 @@ def profile(
     are decided, and the suppressed category is recorded on the profile as the
     audit trail. Re-applied on every profile, which is what makes the override
     durable: the cache is overwritten wholesale by re-profiling.
+
+    ``include_blobs`` holds lowered ``identifier.column`` paths a human has opted
+    back into profiling despite being blob-typed (from `.dex/config.yml`). Blob
+    columns (BYTES/BLOB/bytea/BINARY, scalar or repeated) are excluded from the
+    aggregate scan by default: their profile can only ever be a null fraction
+    and a distinct estimate, yet a columnar engine bills for the whole column
+    once it is referenced at all, so scanning them by default trades most of a
+    table's scan cost for stats that rarely inform a decision.
     """
 
     override_paths = pii_overrides or set()
+    blob_paths = include_blobs or set()
     datasets: list[Dataset] = []
     for identifier in identifiers:
         meta, columns = adapter.table_metadata(identifier)
@@ -284,10 +363,22 @@ def profile(
             if generic and prelim_pii[name] is not None
         }
 
+        # Blob-type columns can only ever yield a null fraction and a distinct
+        # estimate, yet a columnar engine bills for the whole column once it is
+        # referenced at all, so they are dropped from the scan before it is
+        # built (unless a human opted a specific one back in via config).
+        blob_excluded = [
+            c.name
+            for c in columns
+            if is_blob_type(c.data_type)
+            and f"{identifier}.{c.name}".lower() not in blob_paths
+        ]
+        scan_columns = [c for c in columns if c.name not in blob_excluded]
+
         aggregates = {
             a.name: a
             for a in adapter.column_aggregates(
-                identifier, columns, safe_min_max=safe, shape_stats=shape
+                identifier, scan_columns, safe_min_max=safe, shape_stats=shape
             )
         }
         # Re-read the metadata after the aggregate scan: adapters whose
@@ -307,6 +398,15 @@ def profile(
         data_quality: list[str] = []
         if meta.row_count == 0:
             data_quality.append("empty table (no rows)")
+        if blob_excluded:
+            data_quality.append(
+                f"excluded {len(blob_excluded)} blob-type column(s) from "
+                f"profiling scan ({', '.join(sorted(blob_excluded))}): "
+                "BYTES/BLOB-shaped columns only ever yield a null fraction and "
+                "a distinct estimate, and a columnar engine bills for the whole "
+                "column once referenced; add a blob_overrides entry in "
+                ".dex/config.yml to include one"
+            )
 
         # Adapters that degrade a profile (partition-filter tables, block
         # sampling, skipped escalations) explain themselves through this

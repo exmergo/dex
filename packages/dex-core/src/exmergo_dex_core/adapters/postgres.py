@@ -49,6 +49,7 @@ from .base import (
     QueryResult,
     blame,
     distinct_combination_sql,
+    is_blob_type,
     json_safe,
     name_list,
     shape_stat_expressions,
@@ -475,16 +476,29 @@ class PostgresAdapter:
     # --- estimation (free; feeds the confirm handshake) -------------------------
 
     def profile_estimate(
-        self, identifiers: list[str]
+        self, identifiers: list[str], *, include_blobs: set[str] | None = None
     ) -> tuple[float, dict[str, float]]:
         """The heuristic database-seconds estimate for profiling: per table,
         its bytes over a conservative scan rate times the number of aggregate
-        batches. Free: everything comes from catalog metadata."""
+        batches. Free: everything comes from catalog metadata.
 
+        Blob-type columns are excluded from the batch count the same way
+        ``explore.profile.profile`` excludes them from the scan itself
+        (``include_blobs`` names the ``identifier.column`` paths a human
+        opted back in), so this estimate's batch count matches what the run
+        will actually issue."""
+
+        blob_paths = include_blobs or set()
         per_table: dict[str, float] = {}
         for identifier in identifiers:
             meta, columns = self.table_metadata(identifier)
-            batches = max((len(columns) + _COLUMN_BATCH - 1) // _COLUMN_BATCH, 1)
+            scan_columns = [
+                c
+                for c in columns
+                if not is_blob_type(c.data_type)
+                or f"{identifier}.{c.name}".lower() in blob_paths
+            ]
+            batches = max((len(scan_columns) + _COLUMN_BATCH - 1) // _COLUMN_BATCH, 1)
             per_table[identifier] = batches * self._scan_seconds(meta.byte_size)
         return sum(per_table.values()), per_table
 

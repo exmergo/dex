@@ -430,6 +430,44 @@ def test_profile_estimate_sums_free_dry_runs(fake_bq_client):
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
+def _blob_fake_client():
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    tables = [
+        FakeTable(
+            project="test-proj",
+            dataset_id="raw",
+            table_id="sessions",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER"),
+                bigquery.SchemaField("payload", "BYTES"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+    ]
+    return FakeBigQueryClient(project="test-proj", tables=tables)
+
+
+def test_profile_estimate_excludes_blob_columns_by_default():
+    client = _blob_fake_client()
+    adapter = make_adapter(client)
+    adapter.profile_estimate(["test-proj.raw.sessions"])
+    dry_run_sql = next(c.sql for c in client.query_calls if c.dry_run)
+    assert "`payload`" not in dry_run_sql
+
+
+def test_profile_estimate_include_blobs_override_restores_the_column():
+    client = _blob_fake_client()
+    adapter = make_adapter(client)
+    adapter.profile_estimate(
+        ["test-proj.raw.sessions"],
+        include_blobs={"test-proj.raw.sessions.payload"},
+    )
+    dry_run_sql = next(c.sql for c in client.query_calls if c.dry_run)
+    assert "`payload`" in dry_run_sql
+
+
 def test_exact_distinct_counts_degrade_when_budget_cannot_cover(fake_bq_client):
     fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
     adapter = make_adapter(fake_bq_client, ceiling=100 * MB)

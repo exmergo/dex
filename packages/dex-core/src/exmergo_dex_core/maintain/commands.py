@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from .. import command_args
 from .. import envelope as env
 from ..cache import DexStore
-from ..config import DexConfig, load_config
+from ..config import DexConfig, load_config, pii_override_paths
 from ..dbt_project import DbtProjectError
 from ..dbt_project import load as load_project
 from . import drift as drift_mod
@@ -431,7 +431,7 @@ def cmd_reconcile(args: argparse.Namespace) -> env.Envelope:
         snap,
         store.load_cache(),
         view,
-        pii_overrides={e.column.strip().lower() for e in config.pii_overrides},
+        pii_overrides=pii_override_paths(config.pii_overrides),
     )
     warnings.extend(build_warnings)
 

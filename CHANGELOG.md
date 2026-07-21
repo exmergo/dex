@@ -39,6 +39,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   rendered SQL's relations against the cached inventory and refuses, before the
   cost handshake, when the project was compiled against a namespace this
   connection does not have.
+- - **`pii_overrides` gains an opt-in pattern form** (#106). Alongside the
+  existing exact `column` entry, a `column_name` + `scope` entry clears a
+  named column on every table whose fully-qualified identifier matches the
+  `scope` glob, so one reviewed decision (for example, "this CDC export's
+  `document_name` is a resource path, not a person name") no longer costs one
+  config entry per table per environment on Firestore/Mongo/DynamoDB-style
+  sources, where the same column exists by construction on every entity's
+  table in every environment mirror. `column` and `column_name`/`scope` are
+  mutually exclusive on one entry (enforced at load). The profile-time typo
+  guard now covers pattern entries too: it warns when a `scope` matches
+  profiled tables but none carries the named column, and stays silent when
+  the scope matches no table yet, since new entities landing later under the
+  same scope is the point of the pattern form. `blob_overrides` keeps its
+  exact-only shape for now.
 - **`transform init --layered-schemas`: per-layer schema routing out of the
   box.** The flag additionally scaffolds `models/intermediate/`, a
   `generate_schema_name` macro override, and a `dbt_project.yml` `models:`
@@ -67,6 +81,63 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   namespace is exempt (the dev target is the source file); only its layer
   schemas are checked. Backing this, every adapter gains a
   `list_namespace_objects` metadata method alongside `missing_dev_namespaces`.
+
+### Fixed
+
+- **`explore profile` no longer flags non-string columns as EMAIL/NAME/PHONE,
+  nor aggregate-count columns as PII.** PII classification is now type-aware: a
+  category that cannot structurally live on a column's type is suppressed at
+  classification time rather than flagged and then worked around. An integer
+  `<x>_email_count` (the PII-safe derived replacement for a staging-only array
+  of addresses) is no longer flagged `EMAIL` at 0.9, so the query firewall stops
+  refusing value-carrying aggregates on it and its min/max are surfaced again.
+  The gate is per-category impossibility, not blanket: `EMAIL`/`NAME`/`FREE_TEXT`
+  are string-only, `PHONE` excludes only boolean and temporal (a phone-as-INT
+  still flags), and `ADDRESS`/`GOVERNMENT_ID`/`FINANCIAL`/`LOCATION`/`DOB` keep
+  flagging on numeric and temporal types where they legitimately belong (`zip`,
+  `ssn`, `salary` as `INT`, `lat`/`lng` as `FLOAT`, `dob` as `DATE`). Separately,
+  a non-string column whose name ends in an aggregate suffix (`_count`, `_cnt`,
+  `_sum`, `_avg`, `_pct`, `_ratio`) is treated as a derived statistic and
+  suppressed even for those categories, so `ssn_count` and `zip_count` no longer
+  flag. `pii_overrides` still works and existing entries are untouched; they
+  simply stop being necessary for this class of column (#112).
+- **Snowflake integer and NUMBER columns now read as numeric everywhere the
+  engine reasons about type.** Snowflake's `SHOW COLUMNS` surfaces every
+  integer/NUMBER as the token `FIXED`, which matched none of the numeric type
+  hints, so on Snowflake no integer column was recognized as numeric. `FIXED` is
+  now a numeric hint. Beyond making the type-aware PII gate above effective on
+  Snowflake, this is a visible pre-existing correction: Snowflake numeric columns
+  now surface min/max in profiles (a numeric extreme is not sensitive) and become
+  eligible features for `explore cluster`, matching how every other connector's
+  integers have always been treated (#112).
+- **`explore query` now allows `COUNTIF(cond)` over a PII-flagged column.**
+  `COUNTIF`/`COUNT_IF` (BigQuery, Snowflake, DuckDB) releases exactly what
+  `COUNT(*) FILTER (WHERE cond)` already released a row count, with the
+  condition never crossing the envelope so the firewall now treats it as a
+  measuring aggregate instead of refusing it as value-carrying. This closes a
+  dialect gap: BigQuery has no `FILTER (WHERE ...)` clause, so `COUNTIF` was
+  its only batched filtered-count spelling, and it was the one form the
+  firewall still refused. The refusal message's example list and the probe
+  playbook now name `COUNTIF` alongside `COUNT` (#105).
+- **`explore profile` no longer scans blob-type columns by default.**
+  `BYTES`/`BLOB`/`bytea`/`BINARY` columns, scalar or repeated, are excluded
+  from the aggregate scan across every connector (DuckDB, BigQuery,
+  Snowflake, Databricks, Postgres, Redshift): their profile can only ever be
+  a null fraction and a distinct estimate, yet a columnar engine bills for a
+  column's full stored bytes once it is referenced at all, so blob-heavy
+  tables had these columns dominating scan cost for negligible signal.
+  Excluded columns are named in the dataset's `data_quality` notes, the same
+  convention `explore cluster` already uses for excluded keys. A new
+  `blob_overrides` list in `.dex/config.yml` (mirroring `pii_overrides`)
+  restores real stats for a specific column when they matter. Every
+  connector's `profile_estimate` reflects the same exclusion, so the
+  pre-execution cost estimate matches what the pruned scan actually runs
+  (#108).
+- **`explore query` now resolves CTE aliases across set operations.** `WITH`
+  clause relations attached to `UNION`, `INTERSECT`, or `EXCEPT` roots are
+  registered before either branch is inspected, including later CTEs that
+  reference earlier ones. Multi-CTE probes no longer misdiagnose query-local
+  aliases as tables missing from the `.dex` cache (#117).
 
 ## [1.2.2] - 2026-07-18
 

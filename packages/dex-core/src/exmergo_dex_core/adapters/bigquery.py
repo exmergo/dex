@@ -29,6 +29,7 @@ from .base import (
     QueryResult,
     blame,
     distinct_combination_sql,
+    is_blob_type,
     json_safe,
     name_list,
     shape_stat_expressions,
@@ -580,7 +581,7 @@ class BigQueryAdapter:
     # --- estimation (free dry-runs; feeds the confirm handshake) --------------
 
     def profile_estimate(
-        self, identifiers: list[str]
+        self, identifiers: list[str], *, include_blobs: set[str] | None = None
     ) -> tuple[float, dict[str, float]]:
         """Dry-run every aggregate batch profiling would issue and sum the
         bytes, per table and in total. Free: metadata GETs and dry-run jobs
@@ -590,24 +591,36 @@ class BigQueryAdapter:
         Each batch is one billed query over one table, so its cost is floored
         to the per-query minimum: on small tables the raw scan is a fraction of
         what BigQuery actually bills, and an unfloored estimate would send the
-        agent into a ladder of budget rejections."""
+        agent into a ladder of budget rejections.
 
+        Blob-type columns are excluded from the batches the same way
+        ``explore.profile.profile`` excludes them from the scan itself
+        (``include_blobs`` names the ``identifier.column`` paths a human opted
+        back in), so this estimate matches what the run will actually bill."""
+
+        blob_paths = include_blobs or set()
         per_table: dict[str, float] = {}
         for identifier in identifiers:
             _meta, columns = self.table_metadata(identifier)
             if self._unqueryable(identifier):
                 per_table[identifier] = 0.0
                 continue
+            scan_columns = [
+                c
+                for c in columns
+                if not is_blob_type(c.data_type)
+                or f"{identifier}.{c.name}".lower() in blob_paths
+            ]
             # min/max and shape fractions add no scanned bytes: columnar
             # billing already charges the whole column.
             safe: set[str] = set()
             shape: set[str] = set()
             sample_percent = self._sample_percent(identifier)
             total = 0.0
-            for start in range(0, len(columns), _COLUMN_BATCH):
+            for start in range(0, len(scan_columns), _COLUMN_BATCH):
                 sql, _plan = self._build_aggregate_sql(
                     identifier,
-                    columns[start : start + _COLUMN_BATCH],
+                    scan_columns[start : start + _COLUMN_BATCH],
                     safe,
                     shape,
                     sample_percent=sample_percent,
