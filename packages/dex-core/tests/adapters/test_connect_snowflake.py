@@ -158,6 +158,44 @@ def test_no_resume_floor_on_a_running_warehouse(fake_sf_connection):
     assert total == pytest.approx(per_table["SHOP.PUBLIC.CUSTOMERS"])
 
 
+def _wide_blob_table():
+    from fakes.snowflake import FakeSnowflakeTable
+
+    # 50 plain columns plus one BINARY column: without exclusion this is 2
+    # batches (51 columns), with exclusion (the default) it's 1 (50 columns).
+    columns = [(f"C_{i}", "FIXED", True) for i in range(50)]
+    columns.append(("PAYLOAD", "BINARY", True))
+    return FakeSnowflakeTable(
+        database="SHOP",
+        schema="PUBLIC",
+        name="SESSIONS",
+        columns=columns,
+        rows=100,
+        bytes=5_000_000_000,
+    )
+
+
+def test_profile_estimate_accepts_include_blobs_without_crashing(fake_sf_connection):
+    # Regression test: explore/commands.py::_profile_estimate always calls
+    # adapter.profile_estimate(identifiers, include_blobs=...), so every
+    # adapter with a profile_estimate must accept that kwarg.
+    adapter = make_adapter(fake_sf_connection)
+    adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"], include_blobs=set())
+
+
+def test_profile_estimate_excludes_blob_columns_from_batch_count(fake_sf_connection):
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    fake_sf_connection.warehouse_resumes_pending = False
+    fake_sf_connection.tables.append(_wide_blob_table())
+    adapter = make_adapter(fake_sf_connection)
+    total_excluded, _per_table = adapter.profile_estimate(["SHOP.PUBLIC.SESSIONS"])
+    total_included, _per_table = adapter.profile_estimate(
+        ["SHOP.PUBLIC.SESSIONS"], include_blobs={"shop.public.sessions.payload"}
+    )
+    # 1 batch (50 cols) vs 2 batches (51 cols), no resume floor to muddy the ratio.
+    assert total_included == pytest.approx(2 * total_excluded)
+
+
 def test_query_estimate_sums_referenced_tables(fake_sf_connection):
     fake_sf_connection.warehouses[0].state = "STARTED"
     fake_sf_connection.warehouse_resumes_pending = False
