@@ -1544,3 +1544,62 @@ def _project_from_dbt_profiles(repo_root: str | Path) -> str | None:
             ):
                 return str(output["project"])
     return None
+
+
+def resolve_semantic_layer_connection(
+    semantic: object | None,
+    env: dict | os._Environ,
+) -> tuple[str, str, str, str]:
+    """Resolve the hosted dbt Cloud Semantic Layer coordinates and token.
+
+    Discover, don't ask, same as every connector. Non-secret coordinates come
+    from the environment first (``DBT_SL_HOST`` / ``DBT_SL_ENV_ID``), then the
+    ``.dex/config.yml`` ``semantic`` block. The token is a secret and is never in
+    config: ``DBT_SL_TOKEN`` first, then a ``token-value`` in
+    ``~/.dbt/dbt_cloud.yml``. Returns ``(host, environment_id, token,
+    credential_kind)``; the token value is never logged and ``credential_kind``
+    (``"service_token"``) is the only class safe to surface. Every failure names
+    the fix, never a value.
+    """
+
+    host = env.get("DBT_SL_HOST") or getattr(semantic, "host", None)
+    env_id = env.get("DBT_SL_ENV_ID") or getattr(semantic, "environment_id", None)
+    if not host or not env_id:
+        raise CredentialDiscoveryError(
+            "the hosted semantic layer needs a host and environment id; set them "
+            "under `semantic:` in .dex/config.yml (host, environment_id) or export "
+            "DBT_SL_HOST and DBT_SL_ENV_ID (both are shown in the dbt Cloud "
+            "Semantic Layer panel and are not secret)"
+        )
+    token = env.get("DBT_SL_TOKEN") or _dbt_cloud_service_token(env)
+    if not token:
+        raise CredentialDiscoveryError(
+            "no dbt Cloud Semantic Layer token found; export DBT_SL_TOKEN (a "
+            "'Semantic Layer Only' service token) or add one to ~/.dbt/dbt_cloud.yml"
+        )
+    return str(host), str(env_id), str(token), "service_token"
+
+
+def _dbt_cloud_service_token(env: dict | os._Environ) -> str | None:
+    """A ``token-value`` from ``~/.dbt/dbt_cloud.yml`` (the dbt Cloud CLI config),
+    the active project's first. It may be a dbt Cloud API token rather than a
+    Semantic Layer service token; if so the API rejects it with a clear message,
+    which is why ``DBT_SL_TOKEN`` is the documented primary source."""
+
+    directory = env.get("DBT_CLOUD_CONFIG_DIR")
+    path = (Path(directory) if directory else Path.home() / ".dbt") / "dbt_cloud.yml"
+    if not path.is_file():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    projects = data.get("projects") or []
+    active = (data.get("context") or {}).get("active-project")
+    for project in projects:
+        if str(project.get("project-id")) == str(active) and project.get("token-value"):
+            return str(project["token-value"])
+    for project in projects:
+        if project.get("token-value"):
+            return str(project["token-value"])
+    return None

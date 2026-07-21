@@ -343,6 +343,30 @@ def blob_override_paths(overrides: list[BlobOverride]) -> set[str]:
     return {entry.column.strip().lower() for entry in overrides}
 
 
+class SemanticConfig(BaseModel):
+    """How ``explore semantic`` reaches the semantic layer.
+
+    Two backends, selected by ``backend`` and overridable per command with
+    ``--local`` / ``--api``. ``local`` renders metric queries with MetricFlow and
+    executes them through dex's own connector and cost guard, so a dbt project
+    must be present (like DuckDB needs a local file). ``dbt_cloud`` sends the
+    query to a hosted dbt Cloud Semantic Layer over GraphQL and needs no local
+    project (like BigQuery needs no local DuckDB); dbt Cloud owns the warehouse
+    connection and executes server-side, so **dex's cost guard does not apply on
+    that path** (the dbt Cloud environment governs spend, and every hosted result
+    says so).
+
+    ``host`` and ``environment_id`` are the non-secret hosted coordinates, copied
+    from the dbt Cloud Semantic Layer panel (or ``DBT_SL_HOST`` / ``DBT_SL_ENV_ID``
+    at runtime). The service token is a secret and is never here: connect.py reads
+    it from ``DBT_SL_TOKEN`` (then ``~/.dbt/dbt_cloud.yml``) at runtime.
+    """
+
+    backend: str = "local"
+    host: str | None = None
+    environment_id: str | None = None
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -364,6 +388,10 @@ class DexConfig(BaseModel):
     # Pins the dbt project directory (relative to the repo root) when discovery
     # would be ambiguous; by default the project is located automatically.
     dbt_project_dir: str | None = None
+    # How `explore semantic` reaches the semantic layer (local MetricFlow vs a
+    # hosted dbt Cloud deployment). Defaults to local; a bare project queries the
+    # dbt project it lives in.
+    semantic: SemanticConfig = Field(default_factory=SemanticConfig)
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
     query: QueryLimits = Field(default_factory=QueryLimits)

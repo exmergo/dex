@@ -37,6 +37,11 @@ class Paradigm(str, Enum):
     BYTES_SCANNED = "bytes_scanned"
     COMPUTE_TIME = "compute_time"
     DB_LOAD = "db_load"
+    # The hosted dbt Cloud Semantic Layer executes queries server-side under its
+    # own warehouse connection, so dex's cost guard is structurally unavailable:
+    # no dry-run estimate and no ceiling. `estimate` and `ceiling` stay None and
+    # the command warns that dbt Cloud, not dex, governs spend.
+    HOSTED = "hosted"
 
 
 class Cost(BaseModel):

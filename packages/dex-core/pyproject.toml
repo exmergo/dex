@@ -62,6 +62,19 @@ postgres = ["psycopg[binary]>=3", "sqlglot>=25", "dbt-postgres>=1.9"]
 # capacity) come from the control plane, and the driver mints IAM temporary
 # database credentials through the same chain.
 redshift = ["redshift-connector>=2.1", "boto3>=1.34", "sqlglot>=25", "dbt-redshift>=1.9"]
+# The local semantic-layer query backend (`explore semantic query --local`):
+# MetricFlow renders metric SQL via explain(), and dex executes it through its own
+# connector and cost guard. Just the metricflow library (not dbt-metricflow, whose
+# CLI bundle pulls a dbt adapter the active connector extra already provides). 0.211
+# is the floor that resolves against a released dbt-semantic-interfaces (0.209 pins
+# a prerelease). `explore semantic list --local` is a pure manifest read-view and
+# needs none of this.
+semantic = ["metricflow>=0.211,<0.212", "sqlglot>=25"]
+# The hosted dbt Cloud Semantic Layer backend (`explore semantic --api`): a thin
+# GraphQL client over httpx, nothing else. No warehouse client and no dbt-core:
+# dbt Cloud owns the warehouse connection and executes server-side, so a
+# pure-remote user (no local dbt project) installs only this.
+semantic-api = ["httpx>=0.27"]
 # k-means clustering (`explore cluster`). scikit-learn pulls numpy and scipy, so
 # it is deliberately NOT a base dependency: the light default and the [duckdb]
 # on-ramp stay lean, and this extra is installed only when clustering is actually

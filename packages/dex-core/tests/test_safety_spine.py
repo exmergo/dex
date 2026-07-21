@@ -2280,3 +2280,147 @@ def test_maintain_envelopes_pass_the_sanitizer(tmp_path: Path, capsys):
     ):
         payload = _run(["--repo-root", str(root), *argv], capsys)
         assert payload["status"] in {"ok", "needs_confirmation"}
+
+
+# --- Family 5 + cost honesty: the hosted semantic-layer backend --------------
+#
+# The hosted dbt Cloud Semantic Layer executes server-side under its own warehouse
+# credential, so dex's cost guard is structurally unavailable there. Two invariants
+# guard that seam: the service token never crosses the stdout boundary, and the
+# backend is honest about the missing guard rather than faking one.
+
+
+def test_hosted_semantic_token_never_crosses_the_boundary():
+    import json
+
+    from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery
+
+    backend = FakeHostedBackend(
+        result=table_json_result(["sessions"], ["string"], [[5.0]])
+    )
+    envelope = backend.query(SemanticQuery(metrics=["sessions"]))
+    env.sanitize(envelope)  # a secret-like key would hard-fail here
+    assert SECRET_TOKEN not in json.dumps(envelope.model_dump(mode="json"))
+
+
+def test_hosted_semantic_is_warn_only_never_silently_priced():
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery
+
+    backend = FakeHostedBackend(
+        result=table_json_result(["sessions"], ["string"], [[5.0]])
+    )
+    envelope = backend.query(SemanticQuery(metrics=["sessions"]))
+    # ok WITHOUT any --confirm (dex governs nothing on this path)...
+    assert envelope.status == env.Status.OK
+    # ...but it never pretends to have priced or bounded the spend...
+    assert envelope.cost.paradigm == env.Paradigm.HOSTED
+    assert envelope.cost.estimate is None and envelope.cost.ceiling is None
+    # ...and it says so, loudly, on every result.
+    assert any("cost guard unavailable" in w for w in envelope.warnings)
+
+
+def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
+    tmp_path: Path,
+):
+    # Family 3: on the local backend the .dex cache's value-evidence flags decide,
+    # so a dimension whose NAME reads clean is still refused when the physical
+    # column it resolves to is flagged. The name heuristic alone would allow it.
+    import json as _json
+
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import screen_dimension_refs
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "proj"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "orders",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": "wh.main.orders",
+                        },
+                        "entities": [{"name": "order", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [{"name": "order_count", "agg": "count"}],
+                    }
+                ],
+                "metrics": [],
+            }
+        )
+    )
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.orders",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+    backend = LocalMetricFlowBackend(project, None, None, "duckdb", QueryLimits())
+    lookup = backend._cache_pii_lookup(cache)
+    assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
+
+
+def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Path):
+    # Family 2 + 1: rendered metric SQL bakes in the relations the project was
+    # compiled against. Reading a namespace this connection does not have is
+    # refused BEFORE the cost handshake, so a mismatch never bills a failed job.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    backend = LocalMetricFlowBackend(tmp_path, None, None, "duckdb", QueryLimits())
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.orders",
+                columns=[ColumnProfile(name="status", data_type="VARCHAR")],
+            )
+        ]
+    )
+    verdict = backend._namespace_mismatch(
+        "SELECT status FROM other_db.main.orders", cache, "duckdb"
+    )
+    assert verdict is not None and "different namespace" in verdict
+
+
+def test_hosted_semantic_pii_dimension_refused_not_surfaced():
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery
+
+    backend = FakeHostedBackend()
+    envelope = backend.query(
+        SemanticQuery(metrics=["sessions"], group_by=["user__email"])
+    )
+    assert envelope.status == env.Status.ERROR
+    assert "PII" in envelope.errors[0]
+    # refused before the query was ever submitted for execution
+    assert not any("createQuery" in posted for posted in backend.posted)

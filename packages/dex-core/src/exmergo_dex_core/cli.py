@@ -22,7 +22,15 @@ from . import envelope as env
 # The full command surface. Group -> its subcommands.
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
-    "explore": ["inventory", "profile", "relationships", "map", "query", "cluster"],
+    "explore": [
+        "inventory",
+        "profile",
+        "relationships",
+        "map",
+        "query",
+        "cluster",
+        "semantic",
+    ],
     "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro"],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
@@ -115,6 +123,25 @@ def _build_parser() -> argparse.ArgumentParser:
                         type=int,
                         default=argparse.SUPPRESS,
                     )
+                # `explore semantic list|query` queries the dbt semantic layer
+                # (distinct from the top-level `semantic` group, which authors it).
+                # The backend (local MetricFlow vs a hosted dbt Cloud deployment) is
+                # ambient: the .dex config `semantic.backend`, overridable here with
+                # --local / --api.
+                if group == "explore" and name == "semantic":
+                    # Bare `explore semantic` lists (discovery is first-class);
+                    # `explore semantic query` runs a metric query.
+                    sp.add_argument(
+                        "mode", nargs="?", choices=["list", "query"], default="list"
+                    )
+                    sp.add_argument("--metric", action="append", default=None)
+                    sp.add_argument("--group-by", action="append", default=None)
+                    sp.add_argument("--where", action="append", default=None)
+                    sp.add_argument("--order-by", action="append", default=None)
+                    sp.add_argument("--grain", default=None)
+                    sp.add_argument("--limit", type=int, default=None)
+                    sp.add_argument("--local", action="store_true", default=False)
+                    sp.add_argument("--api", action="store_true", default=False)
                 if group == "explore" and name == "map":
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
@@ -211,6 +238,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             "map": explore_cmds.cmd_map,
             "query": explore_cmds.cmd_query,
             "cluster": explore_cmds.cmd_cluster,
+            "semantic": explore_cmds.cmd_semantic,
         }
         return handlers[args.subcommand](args)
 

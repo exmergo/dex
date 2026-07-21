@@ -9,9 +9,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-21
+
 ### Added
 
-- **`pii_overrides` gains an opt-in pattern form** (#106). Alongside the
+- **`explore semantic`: query the dbt semantic layer, locally or against dbt
+  Cloud, behind one abstraction.** `explore semantic list` discovers metrics,
+  dimensions, and entities; `explore semantic query` with a `--metric` and a
+  `--group-by` runs a governed metric query and returns a capped, columnar
+  result. Two backends answer the same commands, chosen ambiently by
+  `.dex/config.yml` `semantic.backend` and overridable per command with `--local`
+  / `--api`. `--local` renders the SQL with MetricFlow's `explain()` through a
+  renderer-only client (MetricFlow never opens a connection or sees a credential)
+  and executes it through dex's own connector, PII request-gate, SELECT-only
+  assertion, and cost-before-spend handshake; it needs a dbt project and the
+  `[semantic]` extra, while `list` is a pure `semantic_manifest.json` read-view
+  that needs neither. `--api` queries a hosted dbt Cloud Semantic Layer over
+  GraphQL with no local project required (the `[semantic-api]` extra plus a
+  `DBT_SL_TOKEN`); because dbt Cloud owns the warehouse connection and executes
+  server-side, dex's cost guard is structurally unavailable there, so every hosted
+  result warns, explicitly, that spend is governed by the dbt Cloud environment,
+  not by dex. No credential ever crosses the envelope on either backend.
+  PII is gated before any query runs: locally, each grouped or filtered dimension
+  resolves through the manifest to its physical column and that column's `.dex/`
+  cache flag decides (honoring `pii_overrides`), so a dimension whose name reads
+  clean is still refused when its column is flagged, and a profiled, cleared column
+  is not re-blocked by a PII-shaped name; where the cache cannot speak, a name
+  heuristic is the fail-closed floor. The local backend also pre-checks the
+  rendered SQL's relations against the cached inventory and refuses, before the
+  cost handshake, when the project was compiled against a namespace this
+  connection does not have.
+- - **`pii_overrides` gains an opt-in pattern form** (#106). Alongside the
   existing exact `column` entry, a `column_name` + `scope` entry clears a
   named column on every table whose fully-qualified identifier matches the
   `scope` glob, so one reviewed decision (for example, "this CDC export's
