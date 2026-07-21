@@ -174,6 +174,47 @@ def test_profile_estimate_scales_with_bytes_and_batches(fake_pg_connection):
     assert fake_pg_connection.data_statements == []
 
 
+def _wide_blob_table() -> FakePostgresTable:
+    # 50 plain columns plus one bytea column: without exclusion this is 2
+    # batches (51 columns), with exclusion (the default) it's 1 (50 columns).
+    columns = [(f"c_{i}", "integer", True) for i in range(50)]
+    columns.append(("payload", "bytea", True))
+    return FakePostgresTable(
+        schema="raw",
+        name="sessions",
+        columns=columns,
+        reltuples=100.0,
+        total_bytes=5_000_000_000,
+    )
+
+
+def test_profile_estimate_accepts_include_blobs_without_crashing(fake_pg_connection):
+    # Regression test: explore/commands.py::_profile_estimate always calls
+    # adapter.profile_estimate(identifiers, include_blobs=...), so every
+    # adapter with a profile_estimate must accept that kwarg.
+    adapter = make_adapter(fake_pg_connection)
+    adapter.profile_estimate(["dexdb.shop.customers"], include_blobs=set())
+
+
+def test_profile_estimate_excludes_blob_columns_from_batch_count(fake_pg_connection):
+    fake_pg_connection.tables.append(_wide_blob_table())
+    adapter = make_adapter(fake_pg_connection)
+    total, per_table = adapter.profile_estimate(["dexdb.raw.sessions"])
+    expected = 1 * (5_000_000_000 / _SCAN_BYTES_PER_SECOND)  # 1 batch, blob excluded
+    assert per_table["dexdb.raw.sessions"] == pytest.approx(expected)
+    assert total == pytest.approx(expected)
+
+
+def test_profile_estimate_include_blobs_override_adds_a_batch(fake_pg_connection):
+    fake_pg_connection.tables.append(_wide_blob_table())
+    adapter = make_adapter(fake_pg_connection)
+    total, _per_table = adapter.profile_estimate(
+        ["dexdb.raw.sessions"], include_blobs={"dexdb.raw.sessions.payload"}
+    )
+    expected = 2 * (5_000_000_000 / _SCAN_BYTES_PER_SECOND)  # 2 batches, 51 columns
+    assert total == pytest.approx(expected)
+
+
 def test_query_estimate_uses_the_free_planner(fake_pg_connection):
     fake_pg_connection.plan_costs = lambda sql: 640_000.0  # planner cost units
     adapter = make_adapter(fake_pg_connection)

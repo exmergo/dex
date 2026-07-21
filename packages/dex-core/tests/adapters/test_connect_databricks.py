@@ -180,6 +180,44 @@ def test_no_startup_floor_on_a_running_warehouse(fake_databricks):
     assert total == pytest.approx(per_table["shop.core.customers"])
 
 
+def _wide_blob_table():
+    from fakes.databricks import FakeDatabricksTable
+
+    # 50 plain columns plus one binary column: without exclusion this is 2
+    # batches (51 columns), with exclusion (the default) it's 1 (50 columns).
+    # bytes=0 keeps _statement_seconds at the floor regardless of warehouse info.
+    columns = [(f"c_{i}", "bigint", True) for i in range(50)]
+    columns.append(("payload", "binary", True))
+    return FakeDatabricksTable(
+        catalog="shop", schema="core", name="sessions", columns=columns, rows=100
+    )
+
+
+def test_profile_estimate_accepts_include_blobs_without_crashing(fake_databricks):
+    # Regression test: explore/commands.py::_profile_estimate always calls
+    # adapter.profile_estimate(identifiers, include_blobs=...), so every
+    # adapter with a profile_estimate must accept that kwarg.
+    warm(fake_databricks)
+    adapter = make_adapter(fake_databricks)
+    adapter.profile_estimate(["shop.core.customers"], include_blobs=set())
+
+
+def test_profile_estimate_excludes_blob_columns_from_batch_count(fake_databricks):
+    warm(fake_databricks)
+    fake_databricks.tables.append(_wide_blob_table())
+    adapter = make_adapter(fake_databricks)
+    _total, per_table = adapter.profile_estimate(["shop.core.sessions"])
+    assert per_table["shop.core.sessions"] == pytest.approx(
+        1 * _MIN_STATEMENT_SECONDS + _DETAIL_SECONDS
+    )
+    _total, per_table = adapter.profile_estimate(
+        ["shop.core.sessions"], include_blobs={"shop.core.sessions.payload"}
+    )
+    assert per_table["shop.core.sessions"] == pytest.approx(
+        2 * _MIN_STATEMENT_SECONDS + _DETAIL_SECONDS
+    )
+
+
 def test_query_estimate_is_the_floor_until_a_size_is_known(fake_databricks):
     warm(fake_databricks)
     adapter = make_adapter(fake_databricks)

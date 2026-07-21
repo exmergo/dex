@@ -65,6 +65,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   its only batched filtered-count spelling, and it was the one form the
   firewall still refused. The refusal message's example list and the probe
   playbook now name `COUNTIF` alongside `COUNT` (#105).
+- **`explore profile` no longer scans blob-type columns by default.**
+  `BYTES`/`BLOB`/`bytea`/`BINARY` columns, scalar or repeated, are excluded
+  from the aggregate scan across every connector (DuckDB, BigQuery,
+  Snowflake, Databricks, Postgres, Redshift): their profile can only ever be
+  a null fraction and a distinct estimate, yet a columnar engine bills for a
+  column's full stored bytes once it is referenced at all, so blob-heavy
+  tables had these columns dominating scan cost for negligible signal.
+  Excluded columns are named in the dataset's `data_quality` notes, the same
+  convention `explore cluster` already uses for excluded keys. A new
+  `blob_overrides` list in `.dex/config.yml` (mirroring `pii_overrides`)
+  restores real stats for a specific column when they matter. Every
+  connector's `profile_estimate` reflects the same exclusion, so the
+  pre-execution cost estimate matches what the pruned scan actually runs
+  (#108).
 - **`explore query` now resolves CTE aliases across set operations.** `WITH`
   clause relations attached to `UNION`, `INTERSECT`, or `EXCEPT` roots are
   registered before either branch is inspected, including later CTEs that
