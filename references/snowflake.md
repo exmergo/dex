@@ -132,7 +132,8 @@ every handshake payload carries `estimate_quality: "heuristic"`. The estimate
 also floors in the **60-second resume minimum** when the pinned warehouse is
 suspended (Snowflake bills at least 60 seconds per resume), so a two-second
 probe against a cold warehouse is quoted at what the account will actually
-see.
+see. The same estimator prices `transform build`: each compiled model,
+snapshot, and test is estimated and summed into the build's upfront cost.
 
 **The budget is hard-enforced regardless of estimate quality.** Before every
 billed statement the session's `STATEMENT_TIMEOUT_IN_SECONDS` is set to the
