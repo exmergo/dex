@@ -58,6 +58,15 @@ def _run(argv: list[str], capsys) -> dict:
         ("notes", "VARCHAR", PIICategory.FREE_TEXT),
         ("review_text", "VARCHAR", PIICategory.FREE_TEXT),
         ("feedback", "STRING", PIICategory.FREE_TEXT),
+        # Must-not-regress: genuinely sensitive numeric/temporal columns whose
+        # category legitimately lives off strings keep flagging (the type gate
+        # is per-category impossibility, not blanket).
+        ("zip", "INT64", PIICategory.ADDRESS),
+        ("ssn", "INT64", PIICategory.GOVERNMENT_ID),
+        ("salary", "NUMERIC", PIICategory.FINANCIAL),
+        ("latitude", "FLOAT64", PIICategory.LOCATION),
+        ("dob", "DATE", PIICategory.DOB),
+        ("phone", "INT64", PIICategory.PHONE),
     ],
 )
 def test_detect_pii_flags(column: str, data_type: str, category: PIICategory):
@@ -79,6 +88,16 @@ def test_detect_pii_flags(column: str, data_type: str, category: PIICategory):
         # The weak patterns are string-only: a numeric `comments` is a count.
         ("comments", "INTEGER"),
         ("name", "INTEGER"),
+        # Exact-token categories that cannot hold a value off a string: an
+        # integer email/name count is the PII-safe derived replacement.
+        ("user_email_count", "INT64"),
+        ("email_count", "INTEGER"),
+        ("contact_email_flag", "BOOL"),
+        ("phone_verified", "BOOLEAN"),
+        # Aggregate-suffixed numeric columns are derived statistics even where
+        # the category (GOVERNMENT_ID, ADDRESS) still permits a numeric value.
+        ("ssn_count", "BIGINT"),
+        ("zip_count", "INT64"),
         # Substrings without a word boundary do not over-trigger.
         ("username_hash", "VARCHAR"),
         ("emailable", "BOOLEAN"),
@@ -105,6 +124,23 @@ def test_new_flags_suppress_min_max():
         flag = detect_pii(column, "VARCHAR")
         assert flag is not None
         assert not is_min_max_safe("VARCHAR", flag)
+
+
+def test_derated_count_column_restores_min_max():
+    """The fix must restore min/max, not merely unblock the firewall: an integer
+    `_email_count` is unflagged, so its extreme is a plain non-sensitive number."""
+
+    assert detect_pii("user_email_count", "INT64") is None
+    assert is_min_max_safe("INT64", detect_pii("user_email_count", "INT64")) is True
+
+
+def test_snowflake_fixed_type_reads_as_numeric():
+    """Snowflake surfaces every integer/NUMBER as FIXED; without this the
+    type-aware gates and min/max safety are inert on Snowflake."""
+
+    from exmergo_dex_core.explore.profile import is_numeric_type
+
+    assert is_numeric_type("FIXED") is True
 
 
 # --- envelope: the Airbnb-shaped session --------------------------------------

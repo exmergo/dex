@@ -56,6 +56,32 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore profile` no longer flags non-string columns as EMAIL/NAME/PHONE,
+  nor aggregate-count columns as PII.** PII classification is now type-aware: a
+  category that cannot structurally live on a column's type is suppressed at
+  classification time rather than flagged and then worked around. An integer
+  `<x>_email_count` (the PII-safe derived replacement for a staging-only array
+  of addresses) is no longer flagged `EMAIL` at 0.9, so the query firewall stops
+  refusing value-carrying aggregates on it and its min/max are surfaced again.
+  The gate is per-category impossibility, not blanket: `EMAIL`/`NAME`/`FREE_TEXT`
+  are string-only, `PHONE` excludes only boolean and temporal (a phone-as-INT
+  still flags), and `ADDRESS`/`GOVERNMENT_ID`/`FINANCIAL`/`LOCATION`/`DOB` keep
+  flagging on numeric and temporal types where they legitimately belong (`zip`,
+  `ssn`, `salary` as `INT`, `lat`/`lng` as `FLOAT`, `dob` as `DATE`). Separately,
+  a non-string column whose name ends in an aggregate suffix (`_count`, `_cnt`,
+  `_sum`, `_avg`, `_pct`, `_ratio`) is treated as a derived statistic and
+  suppressed even for those categories, so `ssn_count` and `zip_count` no longer
+  flag. `pii_overrides` still works and existing entries are untouched; they
+  simply stop being necessary for this class of column (#112).
+- **Snowflake integer and NUMBER columns now read as numeric everywhere the
+  engine reasons about type.** Snowflake's `SHOW COLUMNS` surfaces every
+  integer/NUMBER as the token `FIXED`, which matched none of the numeric type
+  hints, so on Snowflake no integer column was recognized as numeric. `FIXED` is
+  now a numeric hint. Beyond making the type-aware PII gate above effective on
+  Snowflake, this is a visible pre-existing correction: Snowflake numeric columns
+  now surface min/max in profiles (a numeric extreme is not sensitive) and become
+  eligible features for `explore cluster`, matching how every other connector's
+  integers have always been treated (#112).
 - **`explore query` now allows `COUNTIF(cond)` over a PII-flagged column.**
   `COUNTIF`/`COUNT_IF` (BigQuery, Snowflake, DuckDB) releases exactly what
   `COUNT(*) FILTER (WHERE cond)` already released a row count, with the

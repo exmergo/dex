@@ -117,7 +117,19 @@ _FREE_TEXT = re.compile(
     r"(^|_)(comments?|notes?|message|body|feedback|review_text|bio|about)(_|$)"
 )
 
-_NUMERIC_HINTS = ("INT", "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "HUGEINT")
+# "FIXED" is Snowflake's SHOW COLUMNS token for every integer and NUMBER type
+# (surfaced by snowflake._render_type); without it no Snowflake integer column
+# reads as numeric, and the type-aware PII gates below would be inert there.
+_NUMERIC_HINTS = (
+    "INT",
+    "DECIMAL",
+    "NUMERIC",
+    "DOUBLE",
+    "FLOAT",
+    "REAL",
+    "HUGEINT",
+    "FIXED",
+)
 _TEMPORAL_HINTS = ("DATE", "TIME", "TIMESTAMP", "INTERVAL")
 _BOOLEAN_HINTS = ("BOOL",)
 _STRING_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
@@ -176,13 +188,61 @@ def is_numeric_type(data_type: str) -> bool:
     return any(h in upper for h in _NUMERIC_HINTS)
 
 
+# Per-category structural type gate. Type evidence is known before any scan, so
+# an impossible pairing (an EMAIL on an integer) suppresses the flag outright at
+# classification time rather than being re-scored later. The gate is
+# per-category impossibility, never blanket: several categories legitimately
+# live on non-string columns (zip as INT64, ssn as INT64, salary as NUMERIC,
+# lat/lng as FLOAT, dob as DATE) and must keep flagging there.
+def _type_permits(category: PIICategory, data_type: str) -> bool:
+    """Whether ``category`` can structurally sit on a column of ``data_type``.
+
+    Built on the existing type predicates; adds no fourth type-hint tuple.
+
+    - EMAIL / NAME / FREE_TEXT: string only (an integer cannot hold an address
+      or a person name; this matches the pre-existing generic-name/free-text
+      gate, extended to the exact-token patterns).
+    - PHONE: anything but boolean or temporal (phone-as-INT is bad practice but
+      real, so a numeric phone still flags).
+    - every other category (ADDRESS, GOVERNMENT_ID, FINANCIAL, LOCATION, DOB,
+      CREDENTIAL): unchanged, permitted on any type.
+    """
+
+    if category in {PIICategory.EMAIL, PIICategory.NAME, PIICategory.FREE_TEXT}:
+        return _is_string_type(data_type)
+    if category is PIICategory.PHONE:
+        upper = data_type.upper()
+        return not any(h in upper for h in _BOOLEAN_HINTS + _TEMPORAL_HINTS)
+    return True
+
+
+# Aggregate-name suffixes. A non-string column whose name ends in one of these
+# is a derived statistic (a COUNT/SUM/AVG), not a value, so it is suppressed even
+# for categories the type gate above still permits on numbers (ssn_count,
+# zip_count, salary_sum). The conjunction with non-string type is what keeps this
+# safe: a string column named `email_count` is odd enough to stay flagged.
+#
+# Deliberately excluded, and do not "complete" this list: `_num` (phone_num,
+# account_num, cc_num are values, and cc_num is already a FINANCIAL token) and
+# `_total` (salary_total reads as a value as readily as an aggregate).
+_AGGREGATE_SUFFIXES = ("_count", "_cnt", "_sum", "_avg", "_pct", "_ratio")
+
+
+def _is_derived_statistic(name: str, data_type: str) -> bool:
+    """A non-string column whose normalized name ends in an aggregate suffix."""
+
+    return not _is_string_type(data_type) and name.endswith(_AGGREGATE_SUFFIXES)
+
+
 def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     """Classify a column as PII from its name (and, loosely, type). Never a value.
 
     Returns the first matching category with a base confidence; aggregate signals
-    refine the confidence later in :func:`_refine_confidence`. The exact-token
-    patterns apply to any type; the weaker generic-name and free-text patterns
-    apply only to string columns (a numeric `comments` count is not PII).
+    refine the confidence later in :func:`_refine_confidence`. Each match is
+    gated by :func:`_type_permits` (a category impossible on the column's type is
+    skipped) and :func:`_is_derived_statistic` (an aggregate-suffixed numeric
+    column is a count, not a value); the weaker generic-name and free-text
+    patterns remain string-only.
     """
 
     flag, _generic = _classify_pii(column_name, data_type)
@@ -201,6 +261,14 @@ def _classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, boo
     name = _normalize(column_name)
     for pattern, category, confidence in _PII_PATTERNS:
         if pattern.search(name):
+            # A type-forbidden or derived-statistic match continues past this
+            # pattern rather than returning None, so a later pattern still gets a
+            # fair look (e.g. `phone_count` on a numeric column short-circuits
+            # nothing).
+            if not _type_permits(category, data_type):
+                continue
+            if _is_derived_statistic(name, data_type):
+                continue
             return PIIFlag(category=category, confidence=confidence), False
 
     if _is_string_type(data_type):
