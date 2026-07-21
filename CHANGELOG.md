@@ -42,6 +42,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore query` now allows `COUNTIF(cond)` over a PII-flagged column.**
+  `COUNTIF`/`COUNT_IF` (BigQuery, Snowflake, DuckDB) releases exactly what
+  `COUNT(*) FILTER (WHERE cond)` already released a row count, with the
+  condition never crossing the envelope so the firewall now treats it as a
+  measuring aggregate instead of refusing it as value-carrying. This closes a
+  dialect gap: BigQuery has no `FILTER (WHERE ...)` clause, so `COUNTIF` was
+  its only batched filtered-count spelling, and it was the one form the
+  firewall still refused. The refusal message's example list and the probe
+  playbook now name `COUNTIF` alongside `COUNT` (#105).
 - **`explore query` now resolves CTE aliases across set operations.** `WITH`
   clause relations attached to `UNION`, `INTERSECT`, or `EXCEPT` roots are
   registered before either branch is inspected, including later CTEs that
