@@ -31,6 +31,7 @@ from ..dbt_project import (
     PROFILES_FILE,
     DbtProjectError,
     Edit,
+    EditOp,
     contained_path,
     profiles_dir,
 )
@@ -252,8 +253,13 @@ def shadow_parse(
             edit_path = contained_path(
                 shadow, edit.path, view.model_paths, view.macro_paths
             )
-            edit_path.parent.mkdir(parents=True, exist_ok=True)
-            edit_path.write_text(edit.new_content, encoding="utf-8")
+            if edit.op is EditOp.DELETE:
+                # Remove it from the copy so the parse runs against the true
+                # post-deletion tree: a surviving ref() to it fails dbt's parse.
+                edit_path.unlink(missing_ok=True)
+            else:
+                edit_path.parent.mkdir(parents=True, exist_ok=True)
+                edit_path.write_text(edit.new_content, encoding="utf-8")
 
         # A profiles.yml edit only takes effect if dbt reads the shadowed copy;
         # pointing --profiles-dir at the real project would parse the edit

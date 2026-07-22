@@ -108,13 +108,18 @@ def missing_macro_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[
     ]
     for name in MACRO_ASSETS:
         called = any(
-            e.kind is EditKind.MODEL_SQL and f"{name}(" in e.new_content for e in edits
+            e.kind is EditKind.MODEL_SQL
+            and e.new_content is not None
+            and f"{name}(" in e.new_content
+            for e in edits
         )
         if not called:
             continue
         defined_in_project = any(f"macro {name}(" in f.content for f in macro_files)
         defined_in_plan = any(
-            e.kind is EditKind.MACRO_SQL and f"macro {name}(" in e.new_content
+            e.kind is EditKind.MACRO_SQL
+            and e.new_content is not None
+            and f"macro {name}(" in e.new_content
             for e in edits
         )
         if not defined_in_project and not defined_in_plan:

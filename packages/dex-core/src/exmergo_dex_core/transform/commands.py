@@ -20,7 +20,7 @@ import yaml
 
 from .. import command_args
 from .. import envelope as env
-from ..dbt_project import ApplyResult
+from ..dbt_project import ApplyResult, EditOp
 from . import plans as plans_mod
 from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit, PlanStore
@@ -116,12 +116,17 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
         )
 
     parse_notes: list[str] = []
-    if any(e.kind in (EditKind.PROJECT_YML, EditKind.PROFILES_YML) for e in edits):
-        # A broken dbt_project.yml or profiles.yml breaks the whole project, so
-        # config edits are gated by dbt's own parser at plan time (the same
-        # authoritative gate semantic and macro plans use), not left to surface
-        # for the first time at build. The secret-guard runs first, so an
-        # inlined credential is never handed to the dbt subprocess.
+    has_delete = any(e.op is EditOp.DELETE for e in edits)
+    has_config = any(
+        e.kind in (EditKind.PROJECT_YML, EditKind.PROFILES_YML) for e in edits
+    )
+    if has_delete or has_config:
+        # A broken dbt_project.yml or profiles.yml breaks the whole project, and
+        # a delete can orphan a downstream ref, so both are gated by dbt's own
+        # parser at plan time (the same authoritative gate semantic and macro
+        # plans use), not left to surface for the first time at build. The
+        # secret-guard runs first, so an inlined credential is never handed to
+        # the dbt subprocess.
         from ..config import DexConfig, load_config
         from ..dbt_project import load as load_project
         from .build import shadow_parse
@@ -130,6 +135,12 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
         project = command_args.project_dir(args)
         view = load_project(project)
         assert_profiles_safe(view, edits)
+        # Refuse an orphaning delete with a precise, dbt-independent message
+        # before the subprocess runs (which would otherwise report the same
+        # danglers as a lower-level parse error). This is the always-available
+        # hard gate; the parse below is the authoritative backstop.
+        if has_delete:
+            plans_mod.validate_deletions(view, edits)
         config = load_config(command_args.repo_root(args)) or DexConfig()
         parse_result = shadow_parse(project, edits, target=config.dbt_target)
         if not parse_result["available"]:
@@ -501,6 +512,12 @@ def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
             f"semantic {mode} takes only semantic_yml edits; got other kinds for: "
             + ", ".join(non_semantic)
         )
+    deletions = [e.path for e in edits if e.op is EditOp.DELETE]
+    if deletions:
+        return env.error(
+            f"semantic {mode} authors content and does not delete; remove the "
+            "semantic YAML with `transform plan` instead, for: " + ", ".join(deletions)
+        )
 
     from ..dbt_project import load as load_project
 
@@ -560,8 +577,11 @@ def _edits_from_payload(
 ) -> list[PlanEdit]:
     """Read the agent-authored edits payload (a file path, or ``-`` for stdin).
 
-    Shape: ``{"edits": [{"path": ..., "kind": ..., "content": ...}, ...]}``.
-    ``kind`` may be omitted when the command implies it (semantic define/update).
+    Shape: ``{"edits": [{"path": ..., "kind": ..., "op": ..., "content": ...},
+    ...]}``. ``op`` defaults to ``"upsert"`` (create or update): those carry
+    ``content``. An ``op`` of ``"delete"`` removes the file and carries no
+    ``content``. ``kind`` may be omitted when the command implies it (semantic
+    define/update).
     """
 
     if edits_file is None:
@@ -577,17 +597,32 @@ def _edits_from_payload(
 
     edits: list[PlanEdit] = []
     for i, entry in enumerate(entries):
-        if not isinstance(entry, dict) or "path" not in entry or "content" not in entry:
-            raise ValueError(f"edits[{i}] needs at least path and content")
+        if not isinstance(entry, dict) or "path" not in entry:
+            raise ValueError(f"edits[{i}] needs at least a path")
+        try:
+            op = EditOp(entry.get("op") or EditOp.UPSERT.value)
+        except ValueError as exc:
+            raise ValueError(
+                f"edits[{i}] has an unknown op '{entry.get('op')}': one of "
+                + ", ".join(o.value for o in EditOp)
+            ) from exc
         kind = entry.get("kind") or default_kind
         if kind is None:
             raise ValueError(
                 f"edits[{i}] needs a kind: one of "
                 + ", ".join(k.value for k in EditKind)
             )
+        has_content = "content" in entry
+        if op is EditOp.UPSERT and not has_content:
+            raise ValueError(f"edits[{i}] is an upsert and needs content")
+        if op is EditOp.DELETE and has_content:
+            raise ValueError(f"edits[{i}] is a delete and must not carry content")
         edits.append(
             PlanEdit(
-                path=entry["path"], kind=EditKind(kind), new_content=entry["content"]
+                path=entry["path"],
+                kind=EditKind(kind),
+                op=op,
+                new_content=entry.get("content"),
             )
         )
     return edits
