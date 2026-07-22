@@ -24,7 +24,8 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 ```json
 {"edits": [
   {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
-  {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."}
+  {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
+  {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
@@ -39,6 +40,17 @@ must hold only macro definitions and jinja comments. `project_yml` must keep a
 `name`; `profiles_yml` must reference every secret via `{{ env_var('NAME') }}`
 (a literal credential is refused so none reaches the diff), and both config
 kinds are parsed by dbt at plan time.
+
+`op` is `upsert` (the default: create or update, carrying `content`) or
+`delete` (remove the file, no `content`). A delete is a first-class reviewable
+diff like any other edit, so a reclassification or refactor is one plan rather
+than a plan plus a manual `rm`. Deletes are guarded: the plan is refused if any
+file that survives it still `ref()`s a deleted model, naming the offenders.
+Carry the edits that remove those references in the same plan (for a rename,
+`delete` the old model, `create` the new one, and `update` every referrer to
+point at it, all together) so the post-change project is validated as one unit.
+An unconfirmed delete against a file a human edited after planning surfaces as
+`needs_confirmation`, never a silent removal.
 
 ### Bootstrapping a project
 
