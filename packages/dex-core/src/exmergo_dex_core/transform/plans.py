@@ -24,8 +24,11 @@ from pydantic import BaseModel
 
 from ..cache import DEX_DIR
 from ..dbt_project import (
+    REF_PATTERN,
     ApplyResult,
+    DbtProjectView,
     Edit,
+    EditOp,
     contained_path,
     content_hash,
     find_project,
@@ -201,12 +204,21 @@ def plan(
                 f"'{edit.path}' is a project config file but the edit kind is "
                 f"{edit.kind.value}; use {target_kind.value} for it"
             )
-        warnings.extend(validate_edit(edit))
         current = view.files.get(edit.path)
+        if edit.op is EditOp.DELETE and current is None:
+            raise PlanError(
+                f"nothing to delete at '{edit.path}': the file is not part of "
+                "the project (it may already be gone, or the path is wrong)"
+            )
+        # A delete has no content to structurally validate; the guard that runs
+        # after this loop verifies the post-deletion project instead.
+        if edit.op is EditOp.UPSERT:
+            warnings.extend(validate_edit(edit))
         # The profiles secret-guard, current side: validate_edit covers the
         # proposed content, but the diff also surfaces the removed (on-disk)
         # content, so a pre-existing inlined credential is refused before any
-        # diff is built, never reaching agent context.
+        # diff is built, never reaching agent context. A delete surfaces the same
+        # removed content, so it is guarded too.
         if edit.kind is EditKind.PROFILES_YML and current is not None:
             secret_key = find_inlined_secret(current.content)
             if secret_key is not None:
@@ -219,7 +231,11 @@ def plan(
         # A dbt_project.yml that drops model or macro paths silently orphans the
         # files under them; warn rather than refuse, since a deliberate
         # restructure is a legitimate reason to change them.
-        if edit.kind is EditKind.PROJECT_YML and current is not None:
+        if (
+            edit.kind is EditKind.PROJECT_YML
+            and edit.op is EditOp.UPSERT
+            and current is not None
+        ):
             old = yaml.safe_load(current.content) or {}
             new = yaml.safe_load(edit.new_content) or {}
             for key in ("model-paths", "macro-paths"):
@@ -237,6 +253,11 @@ def plan(
         diffs.append(
             file_diff(edit.path, current.content if current else None, edit.new_content)
         )
+
+    # The whole-plan delete guard: a delete is refused if any file that survives
+    # the plan still refers to a deleted model. Run against the pinned edits so
+    # an update in this same plan that removes the offending ref is honored.
+    warnings.extend(validate_deletions(view, pinned))
 
     # Late import: scaffold imports PlanEdit from this module.
     from .scaffold import missing_macro_warnings
@@ -273,6 +294,84 @@ def apply(
         stored.applied_at = datetime.now(UTC).isoformat()
         store.save(stored)
     return result
+
+
+def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]:
+    """Refuse a plan whose deletions would orphan a ``ref()``, atomically.
+
+    The project state *after* this plan is computed in memory (current files
+    minus the deletions, with this plan's upserts overlaid), then every surviving
+    file is scanned for a ``ref()`` to a deleted model. A dangling ref is a hard
+    refusal naming the offenders; a deleted model whose only remaining trace is a
+    schema.yml doc entry is a soft warning, since an orphaned doc block is a
+    legitimate follow-up edit rather than a broken project.
+
+    Overlaying the upserts is what makes the guard atomic across the whole plan:
+    a plan that deletes a model *and* updates its referrer to drop the ref is
+    accepted, while deleting the model alone is refused.
+    """
+
+    delete_paths = {e.path for e in edits if e.op is EditOp.DELETE}
+    if not delete_paths:
+        return []
+
+    macro_prefixes = tuple(f"{mp}/" for mp in view.macro_paths)
+    deleted_models = {
+        Path(path).stem
+        for path in delete_paths
+        if path.endswith(".sql") and not path.startswith(macro_prefixes)
+    }
+    if not deleted_models:
+        return []
+
+    surviving: dict[str, str] = {
+        path: source.content
+        for path, source in view.files.items()
+        if path not in delete_paths
+    }
+    for edit in edits:
+        if edit.op is EditOp.UPSERT and edit.new_content is not None:
+            surviving[edit.path] = edit.new_content
+
+    danglers: dict[str, list[str]] = {}
+    for path, content in surviving.items():
+        hits = sorted(set(REF_PATTERN.findall(content)) & deleted_models)
+        if hits:
+            danglers[path] = hits
+    if danglers:
+        detail = "; ".join(
+            f"{path} still ref()s {', '.join(names)}"
+            for path, names in sorted(danglers.items())
+        )
+        raise PlanError(
+            "this plan deletes "
+            f"{', '.join(sorted(deleted_models))} but the surviving project "
+            f"still references it: {detail}. Add the edits that remove those "
+            "references to this same plan (or drop the deletion)."
+        )
+
+    warnings: list[str] = []
+    for path, content in surviving.items():
+        if not path.endswith((".yml", ".yaml")):
+            continue
+        try:
+            parsed = yaml.safe_load(content)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        documented = {
+            entry.get("name")
+            for entry in parsed.get("models") or []
+            if isinstance(entry, dict)
+        }
+        orphaned = sorted(documented & deleted_models)
+        if orphaned:
+            warnings.append(
+                f"{path}: still documents deleted model(s) {', '.join(orphaned)}; "
+                "remove the schema.yml entry in a follow-up edit"
+            )
+    return warnings
 
 
 def _plan_id(intent: str, edits: list[PlanEdit]) -> str:
