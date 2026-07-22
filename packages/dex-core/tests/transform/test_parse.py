@@ -289,3 +289,82 @@ def test_real_dbt_parse_accepts_a_valid_semantic_plan(
     # The shadow parse left the project exactly as it was: the plan is the only
     # artifact.
     assert not (dbt_project_dir / "models" / "semantic").exists()
+
+
+# --- Deletes: the shadow parse runs against the true post-deletion tree -------
+
+
+def test_shadow_parse_removes_a_deleted_file_from_the_shadow(
+    dbt_project_dir: Path, tmp_path: Path
+):
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    from exmergo_dex_core.dbt_project import Edit, EditOp, load
+
+    view = load(dbt_project_dir)
+    delete = Edit(
+        path="models/staging/stg_customers.sql",
+        op=EditOp.DELETE,
+        old_content_hash=view.files["models/staging/stg_customers.sql"].sha256,
+    )
+    seen: dict[str, bool] = {}
+
+    def runner(argv):
+        shadow = Path(argv[argv.index("--project-dir") + 1])
+        seen["deleted_gone"] = not (
+            shadow / "models/staging/stg_customers.sql"
+        ).exists()
+        seen["sibling_kept"] = (shadow / "models/staging/schema.yml").exists()
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    result = build_module.shadow_parse(dbt_project_dir, [delete], runner=runner)
+    if not result["available"]:
+        pytest.skip("dbt executable unavailable in this environment")
+    assert seen["deleted_gone"] is True
+    assert seen["sibling_kept"] is True
+    # The real project is untouched: the delete only happened in the copy.
+    assert (dbt_project_dir / "models/staging/stg_customers.sql").exists()
+
+
+def test_real_dbt_parse_accepts_a_clean_delete(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    pytest.importorskip("dbt.cli.main")
+    payload = tmp_path / "delete.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/staging/stg_customers.sql",
+                        "kind": "model_sql",
+                        "op": "delete",
+                    },
+                    {
+                        "path": "models/staging/schema.yml",
+                        "kind": "schema_yml",
+                        "content": "version: 2\n",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert len(_plans_on_disk(tmp_path)) == 1
+    # The project is untouched; the plan is the only artifact.
+    assert (dbt_project_dir / "models/staging/stg_customers.sql").exists()
