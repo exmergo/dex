@@ -184,12 +184,26 @@ def test_query_estimate_floors_per_referenced_table(fake_bq_client):
     assert estimate == 2 * 10 * MB
 
 
+def test_describe_estimate_names_the_per_query_floor(fake_bq_client):
+    adapter = make_adapter(fake_bq_client)
+    described = adapter.describe_estimate(
+        30 * MB, {"test-proj.shop.customers": 30 * MB}
+    )
+    assert described["estimated_bytes"] == 30 * MB
+    assert described["per_table_bytes"] == {"test-proj.shop.customers": 30 * MB}
+    assert "--budget" in described["hint"] and "bytes" in described["hint"]
+    assert any("10,485,760" in note or "10 MB" in note for note in described["notes"])
+
+
 def test_profile_estimate_floors_each_batch_at_the_billing_minimum(fake_bq_client):
     adapter = make_adapter(fake_bq_client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.customers"])
-    # One batch over one table: the raw 5000-byte scan floors to the minimum.
-    assert per_table["test-proj.shop.customers"] == 10 * MB
-    assert total == 10 * MB
+    # One batch over one table (the raw 5000-byte scan floors to the minimum)
+    # plus a floor reserved for each of the two possible escalation queries
+    # (customers has 2 non-blob columns and 100 rows, so both are possible):
+    # 10 MB aggregate + 10 MB near-unique reserve + 10 MB composite reserve.
+    assert per_table["test-proj.shop.customers"] == 30 * MB
+    assert total == 30 * MB
 
 
 def test_every_executed_job_carries_maximum_bytes_billed(fake_bq_client):
@@ -422,12 +436,107 @@ def test_profile_estimate_sums_free_dry_runs(fake_bq_client):
     total, per_table = adapter.profile_estimate(
         ["test-proj.shop.customers", "test-proj.shop.events", "test-proj.logs.requests"]
     )
-    # Each queryable table is one below-floor batch, so both floor to the minimum.
-    assert per_table["test-proj.shop.customers"] == 10 * MB
-    assert per_table["test-proj.shop.events"] == 10 * MB
+    # Each queryable table is one below-floor batch (floors to the minimum)
+    # plus a floor reserved for each of its two possible escalation queries
+    # (both tables have >= 2 non-blob columns and > 0 rows): 30 MB apiece.
+    assert per_table["test-proj.shop.customers"] == 30 * MB
+    assert per_table["test-proj.shop.events"] == 30 * MB
     assert per_table["test-proj.logs.requests"] == 0.0  # unqueryable, skipped
-    assert total == 20 * MB
+    assert total == 60 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_profile_estimate_reserves_only_the_near_unique_floor_for_one_column(
+    fake_bq_client,
+):
+    """A composite-key probe needs at least 2 columns to form a combination;
+    a single-column table can never trigger one, so the estimate must not
+    reserve for it (issue #107)."""
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="single_col",
+                schema=[bigquery.SchemaField("id", "INTEGER")],
+                num_rows=100,
+                num_bytes=5_000,
+            )
+        ],
+    )
+    adapter = make_adapter(client)
+    total, per_table = adapter.profile_estimate(["test-proj.shop.single_col"])
+    # 10 MB aggregate + 10 MB near-unique reserve only (no composite reserve).
+    assert per_table["test-proj.shop.single_col"] == 20 * MB
+    assert total == 20 * MB
+
+
+def test_profile_estimate_skips_the_reserve_for_a_provably_empty_table(fake_bq_client):
+    """Neither escalation query ever runs against zero rows (both bail out on
+    a falsy row count), so a table known to be empty at estimate time needs no
+    reserve (issue #107)."""
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="empty_table",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER"),
+                    bigquery.SchemaField("email", "STRING"),
+                ],
+                num_rows=0,
+                num_bytes=0,
+            )
+        ],
+    )
+    adapter = make_adapter(client)
+    total, per_table = adapter.profile_estimate(["test-proj.shop.empty_table"])
+    # Aggregate batch floor only; no escalation reserve for a known-empty table.
+    assert per_table["test-proj.shop.empty_table"] == 10 * MB
+    assert total == 10 * MB
+
+
+def test_profile_estimate_still_reserves_for_a_view_with_unknown_row_count(
+    fake_bq_client,
+):
+    """A view's row count is never known before the aggregate that reveals it
+    (BigQuery reports no stored row count for a view), so 'unknown' must still
+    reserve for escalation rather than being mistaken for 'empty' (issue #107).
+    """
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="a_view",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER"),
+                    bigquery.SchemaField("email", "STRING"),
+                ],
+                num_rows=12345,  # ignored for a view; _object_meta nulls it out
+                num_bytes=0,
+                table_type="VIEW",
+            )
+        ],
+    )
+    adapter = make_adapter(client)
+    total, per_table = adapter.profile_estimate(["test-proj.shop.a_view"])
+    # Full reserve still applies despite the unknown (None) row count.
+    assert per_table["test-proj.shop.a_view"] == 30 * MB
+    assert total == 30 * MB
 
 
 def _blob_fake_client():
