@@ -169,9 +169,9 @@ def _assert_namespace_exists(
     if config.connector == "duckdb":
         return _duckdb_namespace(project, target)
     if config.connector == "snowflake":
-        return _snowflake_namespace(config, repo_root)
+        return _snowflake_namespace(project, config, repo_root)
     if config.connector == "databricks":
-        return _databricks_namespace(config, repo_root)
+        return _databricks_namespace(project, config, repo_root)
     if config.connector == "bigquery":
         return _bigquery_namespace(project, config, repo_root)
     if config.connector == "postgres":
@@ -225,8 +225,18 @@ def _duckdb_namespace(project: Path, target: str) -> list[str]:
     ]
 
 
-def _snowflake_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
-    """Free: SHOW only, no warehouse, so this costs nothing on a billed connector."""
+def _snowflake_namespace(
+    project: Path, config: DexConfig, repo_root: Path | str
+) -> list[str]:
+    """Free: SHOW only, no warehouse, so this costs nothing on a billed connector.
+
+    A project with per-layer ``+database:`` config never has any node resolve
+    into ``dev_database`` at all, in which case refusing over its absence
+    would block a build that was never going to touch it. A compiled manifest
+    already answers "does anything target it" for free (issue #110); with no
+    manifest to consult yet, there is nothing to rule the database out with,
+    so the refusal stays unconditional, same as before.
+    """
 
     target = config.snowflake
     if target is None or not target.dev_database:
@@ -242,6 +252,8 @@ def _snowflake_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
 
     if not missing:
         return []
+    if _confirmed_out_of_scope(project, "snowflake", "database", target.dev_database):
+        return []
     raise DevTargetError(
         f"snowflake {missing[0]} does not exist; create it with:\n"
         f"  CREATE DATABASE IF NOT EXISTS {target.dev_database};\n"
@@ -251,13 +263,22 @@ def _snowflake_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
     )
 
 
-def _databricks_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
+def _databricks_namespace(
+    project: Path, config: DexConfig, repo_root: Path | str
+) -> list[str]:
     """Free: Unity Catalog REST only, so the billed SQL warehouse is never woken.
 
     The closest analogue of the Snowflake case: dbt-databricks creates the dev
     schema (``create schema if not exists <catalog>.<schema>``) but never the
     catalog it lives in, so a missing catalog fails the first build from inside
     that statement, naming neither the catalog nor the fix.
+
+    Both checks below defer to a compiled manifest when one exists: a project
+    with per-layer ``+catalog:``/``+schema:`` config never resolves any node
+    into ``dev_catalog``/``dev_schema`` at all, in which case neither problem
+    is one this build will ever hit (issue #110). No manifest yet means
+    nothing to rule either out with, so both stay unconditional, same as
+    before.
     """
 
     target = config.databricks
@@ -279,6 +300,10 @@ def _databricks_namespace(config: DexConfig, repo_root: Path | str) -> list[str]
         adapter.close()
 
     if missing:
+        if _confirmed_out_of_scope(
+            project, "databricks", "database", target.dev_catalog
+        ):
+            return []
         raise DevTargetError(
             f"databricks {missing[0]} does not exist; create it with:\n"
             f"  CREATE CATALOG IF NOT EXISTS {target.dev_catalog};\n"
@@ -287,6 +312,8 @@ def _databricks_namespace(config: DexConfig, repo_root: Path | str) -> list[str]
             "can write"
         )
     if not ungranted:
+        return []
+    if _confirmed_out_of_scope(project, "databricks", "schema", schema):
         return []
     grants = "\n".join(f"  GRANT {grant} TO `<principal>`;" for grant in ungranted)
     return [
@@ -339,9 +366,8 @@ def _bigquery_namespace(
 
     if not missing:
         return []
-    schemas = _manifest_schemas(project)
     bare_dataset = dataset.rpartition(".")[2] if "." in dataset else dataset
-    if schemas is not None and bare_dataset not in schemas:
+    if _confirmed_out_of_scope(project, "bigquery", "schema", bare_dataset):
         return []
     location = target.location or "<location>"
     return [
@@ -363,6 +389,13 @@ def _postgres_namespace(
     reading the warehouse read-only and building as a role that can write is a
     perfectly ordinary split, and this preflight exists precisely to catch the
     case where the writing role cannot, in fact, write.
+
+    Both problems this can raise are about ``dev_schema`` specifically, so a
+    compiled manifest proving no node resolves into it at all (a per-layer
+    ``+schema:`` convention) rules out either one at once: neither existence
+    nor privilege on a namespace nothing targets is this build's problem
+    (issue #110). No manifest yet means nothing to rule it out with, so the
+    refusal stays unconditional, same as before.
     """
 
     pg = config.postgres
@@ -385,6 +418,8 @@ def _postgres_namespace(
         adapter.close()
 
     if not missing:
+        return []
+    if _confirmed_out_of_scope(project, "postgres", "schema", pg.dev_schema):
         return []
     problem = missing[0]
     if problem.startswith("dev_schema"):
@@ -417,6 +452,10 @@ def _redshift_namespace(
     is minted from the caller's identity at dbt runtime regardless of what the
     profile's ``user`` field says, so there is no durable user to ask a
     privilege question about and the check degrades to dbt's own error.
+
+    Both problems this can raise are about ``dev_schema`` specifically, so a
+    compiled manifest proving no node resolves into it at all rules out either
+    one at once, the same as Postgres (issue #110).
     """
 
     rs = config.redshift
@@ -441,6 +480,8 @@ def _redshift_namespace(
         adapter.close()
 
     if not missing:
+        return []
+    if _confirmed_out_of_scope(project, "redshift", "schema", rs.dev_schema):
         return []
     problem = missing[0]
     if problem.startswith("dev_schema"):
@@ -576,16 +617,23 @@ def content_check(
 _MATERIALIZING_RESOURCE_TYPES = {"model", "seed", "snapshot"}
 
 
-def _manifest_schemas(project: Path) -> set[str] | None:
-    """Every schema a compiled manifest's model/seed/snapshot nodes resolve
-    into, or ``None`` when there is no manifest to read yet (a project's first
-    build, before dbt has ever compiled it here) or it cannot be parsed.
+def _manifest_namespaces(project: Path, field: str) -> set[str] | None:
+    """Every distinct value a compiled manifest's model/seed/snapshot nodes
+    resolve to at the given namespace level, or ``None`` when there is no
+    manifest to read yet (a project's first build, before dbt has ever
+    compiled it here) or it cannot be parsed.
+
+    ``field`` is one of dbt's own generic three-part naming keys on a node:
+    ``"schema"`` for a schema/dataset check (BigQuery's dataset, Postgres's
+    and Redshift's schema), ``"database"`` for a database/catalog check
+    (Snowflake's database, and Databricks's catalog -- dbt-databricks maps
+    the catalog onto this same generic key).
 
     Reads the file directly rather than going through :func:`dbt_project.load`
     (which raises on a corrupt manifest and scans every project file just to
     reach it): this is a best-effort preflight signal, so any problem reading
-    it degrades to ``None`` -- the caller falls back to warning unconditionally,
-    the same as before this existed (issue #110).
+    it degrades to ``None`` -- the caller falls back to its unconditional
+    check, the same as before this existed (issue #110).
     """
 
     manifest_file = project / MANIFEST_PATH
@@ -599,7 +647,7 @@ def _manifest_schemas(project: Path) -> set[str] | None:
     if not isinstance(nodes, dict):
         return None
 
-    schemas: set[str] = set()
+    values: set[str] = set()
     for node in nodes.values():
         if not isinstance(node, dict):
             continue
@@ -611,10 +659,32 @@ def _manifest_schemas(project: Path) -> set[str] | None:
         )
         if materialized == "ephemeral":
             continue
-        schema = node.get("schema")
-        if isinstance(schema, str) and schema:
-            schemas.add(schema)
-    return schemas
+        value = node.get(field)
+        if isinstance(value, str) and value:
+            values.add(value)
+    return values
+
+
+def _confirmed_out_of_scope(
+    project: Path, connector: str, field: str, candidate: str
+) -> bool:
+    """True only when a compiled manifest exists and proves nothing resolves
+    into ``candidate`` at this namespace level (see :func:`_manifest_namespaces`
+    for what ``field`` means). False when there is no manifest yet (nothing to
+    prove absence with) or something does target it -- the caller's existing
+    refusal or warning stands either way, unchanged from before this existed.
+
+    Folds case for connectors whose identifiers are case-insensitive
+    (``_CASE_FOLDING``), the same rule the drift check already uses, so
+    ``DBT_DEV`` and ``dbt_dev`` are recognized as the same namespace here too.
+    """
+
+    namespaces = _manifest_namespaces(project, field)
+    if namespaces is None:
+        return False
+    fold = connector in _CASE_FOLDING
+    pool = {(n.upper() if fold else n) for n in namespaces}
+    return (candidate.upper() if fold else candidate) not in pool
 
 
 def _declares_sources(project: Path) -> bool:
