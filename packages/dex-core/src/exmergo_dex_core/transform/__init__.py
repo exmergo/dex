@@ -25,6 +25,7 @@ from .build import (
 from .init import InitError, InitResult, init_project
 from .plans import (
     EditKind,
+    EditOp,
     PlanEdit,
     PlanError,
     PlanNotFoundError,
@@ -36,6 +37,7 @@ from .plans import (
 
 __all__ = [
     "EditKind",
+    "EditOp",
     "InitError",
     "InitResult",
     "PlanEdit",

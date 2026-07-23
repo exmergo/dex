@@ -442,6 +442,33 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
 
 
+def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):
+    # Propose-don't-impose extends to removal: a delete never silently drops a
+    # file a human touched after the plan was made.
+    from exmergo_dex_core import transform
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    edits = [
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            op=transform.EditOp.DELETE,
+        )
+    ]
+    planned, _diffs, _warnings = transform.plan(
+        "drop stg_customers", edits, dbt_project_dir, repo_root=dbt_project_dir.parent
+    )
+    # A human edits the file after the delete was planned.
+    model.write_text("select 99 as id -- keep me\n", encoding="utf-8")
+
+    result = transform.apply(planned.plan_id, dbt_project_dir.parent)
+    assert result.written == []
+    assert result.conflicts
+    # The file is still there: an unconfirmed delete against a diverged file is
+    # refused, not carried out.
+    assert model.read_text(encoding="utf-8") == "select 99 as id -- keep me\n"
+
+
 def test_semantic_planning_writes_nothing_even_with_shadow_parse(
     dbt_project_dir: Path, capsys, monkeypatch
 ):

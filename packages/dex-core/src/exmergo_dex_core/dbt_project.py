@@ -25,11 +25,12 @@ import json
 import os
 import re
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .diffs import file_diff
 
@@ -97,17 +98,44 @@ class TargetInfo(BaseModel):
     is_default: bool
 
 
+class EditOp(str, Enum):
+    """The operation an edit performs, orthogonal to the file's ``kind``.
+
+    ``UPSERT`` writes ``new_content`` (create or update, decided by whether the
+    file already exists), the only behavior before deletes existed. ``DELETE``
+    removes the file. The default is ``UPSERT`` so every stored plan written
+    before this field existed deserializes unchanged.
+    """
+
+    UPSERT = "upsert"
+    DELETE = "delete"
+
+
 class Edit(BaseModel):
     """One proposed file change, pinned to the content it was planned against.
 
     ``old_content_hash`` is the sha256 of the file at plan time; ``None`` means
     the file did not exist (a create). ``write_edits`` re-checks it so a human
     edit after planning is detected as a conflict, never silently overwritten.
+
+    ``op`` distinguishes writing content from removing the file. A delete carries
+    no ``new_content`` (there is nothing to write) but still pins
+    ``old_content_hash``, so removing a file a human edited after planning is a
+    conflict, not a silent deletion.
     """
 
     path: str
-    new_content: str
+    new_content: str | None = None
     old_content_hash: str | None = None
+    op: EditOp = EditOp.UPSERT
+
+    @model_validator(mode="after")
+    def _content_matches_op(self) -> Edit:
+        if self.op is EditOp.UPSERT and self.new_content is None:
+            raise ValueError(f"an upsert edit needs new_content: '{self.path}'")
+        if self.op is EditOp.DELETE and self.new_content is not None:
+            raise ValueError(f"a delete edit carries no new_content: '{self.path}'")
+        return self
 
 
 class Conflict(BaseModel):
@@ -451,7 +479,14 @@ def write_edits(
         )
         current_hash = content_hash(current) if current is not None else None
 
-        if current is not None and current == edit.new_content:
+        if edit.op is EditOp.DELETE and current is None:
+            # Already gone (e.g. a re-run): a no-op, not a conflict.
+            continue
+        if (
+            edit.op is EditOp.UPSERT
+            and current is not None
+            and current == edit.new_content
+        ):
             # Already applied (e.g. a re-run): a no-op, not a conflict.
             continue
         if current_hash != edit.old_content_hash:
@@ -462,6 +497,7 @@ def write_edits(
                     found_sha256=current_hash,
                 )
             )
+        # A delete renders as a diff against /dev/null (new is None).
         diffs.append(file_diff(edit.path, current, edit.new_content))
         staged.append((target_path, edit, current))
 
@@ -470,8 +506,11 @@ def write_edits(
 
     written: list[str] = []
     for target_path, edit, _current in staged:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(edit.new_content, encoding="utf-8")
+        if edit.op is EditOp.DELETE:
+            target_path.unlink(missing_ok=True)
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(edit.new_content, encoding="utf-8")
         written.append(edit.path)
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
 

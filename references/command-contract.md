@@ -82,13 +82,22 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 ```json
 {"edits": [
   {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
-  {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."}
+  {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
+  {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
-`macro_sql`, `project_yml`, or `profiles_yml`. The engine validates each edit
+`macro_sql`, `project_yml`, or `profiles_yml`. Each edit also has an `op`:
+`upsert` (create or update, the default, carrying `content`) or `delete` (remove
+the file, no `content`). A delete is a reviewable diff pinned to the file's hash
+like any other edit, and it is guarded: the plan is refused if any surviving file
+still `ref()`s a deleted model (the offenders are named), so the post-deletion
+project is proven free of dangling references before the plan is stored, and,
+when dbt is available, the same post-deletion tree is confirmed by dbt's parser.
+A rename is one plan: `delete` the old model, `create` the new, `update` the
+referrers, validated together. The engine validates each edit
 (model SQL must be a single read-only SELECT once jinja is stripped; YAML must
 parse; semantic YAML must satisfy MetricFlow's schemas; a `packages_yml` edit
 must carry a `packages:` or `dependencies:` list and targets the project-root

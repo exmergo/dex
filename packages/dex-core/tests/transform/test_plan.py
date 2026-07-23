@@ -451,3 +451,274 @@ def test_plan_cli_project_yml_pins_an_update(
     assert rc == 0
     assert envelope["status"] == "ok"
     assert envelope["diffs"][0]["op"] == "update"
+
+
+# --- Deletes: first-class, guarded, atomic across the plan --------------------
+
+
+def _stub_parse_ok(monkeypatch) -> None:
+    """Make the shadow ``dbt parse`` a deterministic success.
+
+    A clean delete plan runs the authoritative parse; stubbing it keeps the
+    guard/diff/warning assertions independent of a real dbt subprocess (the real
+    parse has its own coverage in test_parse.py).
+    """
+
+    import importlib
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def fake(timeout, cwd, env=None):
+        def run(argv):
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
+def _add_referrer(project: Path, name: str, refs: str) -> None:
+    (project / "models" / "marts").mkdir(parents=True, exist_ok=True)
+    (project / "models" / "marts" / f"{name}.sql").write_text(
+        f"select * from {{{{ ref('{refs}') }}}}\n",  # noqa: S608 (test dbt SQL)
+        encoding="utf-8",
+    )
+
+
+def test_plan_delete_emits_delete_diff_and_pins_hash(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            },
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": "version: 2\n",
+            },
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    ops = {d["path"]: d["op"] for d in envelope["diffs"]}
+    assert ops["models/staging/stg_customers.sql"] == "delete"
+    # The plan is stored, the project untouched, and the delete pins the hash it
+    # was planned against so a later human edit surfaces as a conflict.
+    plan_id = envelope["data"]["plan_id"]
+    plan = json.loads((tmp_path / ".dex" / "plans" / f"{plan_id}.json").read_text())
+    deletion = next(e for e in plan["edits"] if e["op"] == "delete")
+    assert deletion["old_content_hash"]
+    assert deletion["new_content"] is None
+    assert (dbt_project_dir / "models/staging/stg_customers.sql").exists()
+
+
+def test_plan_delete_of_a_missing_file_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _write_payload(
+        tmp_path,
+        [{"path": "models/staging/ghost.sql", "kind": "model_sql", "op": "delete"}],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop ghost",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "nothing to delete" in envelope["errors"][0]
+
+
+def test_plan_guard_refuses_a_delete_that_orphans_a_ref(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _add_referrer(dbt_project_dir, "mart_customers", "stg_customers")
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    msg = envelope["errors"][0]
+    assert "stg_customers" in msg and "mart_customers" in msg
+    # Nothing was stored: an orphaning delete never becomes a plan.
+    assert not (tmp_path / ".dex" / "plans").exists() or not list(
+        (tmp_path / ".dex" / "plans").glob("*.json")
+    )
+
+
+def test_plan_accepts_a_delete_plus_the_update_that_removes_the_ref(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    _add_referrer(dbt_project_dir, "mart_customers", "stg_customers")
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            },
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": "version: 2\n",
+            },
+            # The referrer is rewritten to stand on its own, in the same plan.
+            {
+                "path": "models/marts/mart_customers.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            },
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "reclassify",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    ops = {d["path"]: d["op"] for d in envelope["diffs"]}
+    assert ops["models/staging/stg_customers.sql"] == "delete"
+    assert ops["models/marts/mart_customers.sql"] == "update"
+
+
+def test_plan_delete_warns_about_a_lingering_schema_entry(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    # Delete the model but leave its schema.yml doc entry behind.
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop model",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert any("still documents deleted model" in w for w in envelope["warnings"])
+
+
+def test_plan_delete_with_content_is_rejected(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+                "content": "select 1\n",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "bad",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "must not carry content" in envelope["errors"][0]
+
+
+def test_plan_unknown_op_is_rejected(dbt_project_dir: Path, tmp_path: Path, capsys):
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "frobnicate",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "bad",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "unknown op" in envelope["errors"][0]

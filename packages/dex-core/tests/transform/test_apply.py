@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from exmergo_dex_core.cli import main
 
 
@@ -256,3 +258,207 @@ def test_apply_conflict_needs_confirmation_then_confirm_overrides(
         "models/staging/stg_customers.sql"
     ]
     assert target.read_text(encoding="utf-8") == "select 1 as id\n"
+
+
+# --- Deletes end to end, and identical across every connector ----------------
+
+
+def _stub_parse_ok(monkeypatch) -> None:
+    import importlib
+    import subprocess
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def fake(timeout, cwd, env=None):
+        def run(argv):
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
+def _plan(
+    tmp_path: Path, capsys, edits: list[dict], intent: str = "plan"
+) -> tuple[int, dict]:
+    payload = tmp_path / f"edits-{abs(hash(json.dumps(edits)))}.json"
+    payload.write_text(json.dumps({"edits": edits}), encoding="utf-8")
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            intent,
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def test_apply_deletes_a_model_and_marks_applied(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            },
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": "version: 2\n",
+            },
+        ],
+        "drop stg_customers",
+    )
+    assert rc == 0, envelope
+    plan_id = envelope["data"]["plan_id"]
+
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", plan_id], capsys
+    )
+    assert rc == 0, envelope
+    assert "models/staging/stg_customers.sql" in envelope["data"]["written"]
+    assert not (dbt_project_dir / "models/staging/stg_customers.sql").exists()
+    plan_file = tmp_path / ".dex" / "plans" / f"{plan_id}.json"
+    assert json.loads(plan_file.read_text())["applied_at"] is not None
+
+
+def test_apply_delete_needs_confirmation_when_the_file_diverged(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+        "drop stg_customers",
+    )
+    assert rc == 0, envelope
+    plan_id = envelope["data"]["plan_id"]
+
+    # A human edits the model after planning the delete: it must not vanish.
+    target = dbt_project_dir / "models/staging/stg_customers.sql"
+    target.write_text("select 7 as id -- do not delete\n", encoding="utf-8")
+
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", plan_id], capsys
+    )
+    assert envelope["status"] == "needs_confirmation"
+    assert target.exists()
+
+    # With --confirm the deletion is carried out deliberately.
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "--confirm", "transform", "apply", plan_id],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert not target.exists()
+
+
+_CONNECTOR_PROFILES = {
+    "duckdb": (
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        "      path: /tmp/dex_dogfood_dev.duckdb\n"
+    ),
+    "bigquery": (
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: bigquery\n"
+        "      method: oauth\n      project: dex-dogfood\n      dataset: dbt_dev\n"
+        "      location: EU\n"
+    ),
+    "snowflake": (
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: snowflake\n"
+        "      account: dogfood\n      user: dex\n"
+        "      authenticator: externalbrowser\n"
+        "      database: analytics\n      warehouse: wh\n      schema: dbt_dev\n"
+    ),
+    "databricks": (
+        "dex_test:\n  target: dev\n  outputs:\n    dev:\n      type: databricks\n"
+        "      host: dogfood.databricks.com\n      http_path: /sql/1.0/warehouses/abc\n"
+        "      catalog: main\n      schema: dbt_dev\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("connector", sorted(_CONNECTOR_PROFILES))
+def test_guarded_delete_is_identical_across_connectors(
+    connector: str, dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Dogfood: the guarded-delete loop behaves the same on every warehouse.
+
+    The delete path is file-level and never touches an adapter, so retyping the
+    project's dev target to BigQuery, Snowflake, Databricks, or DuckDB must not
+    change a thing: an orphaning delete is refused, and a delete plus its
+    ref-removing update applies cleanly.
+    """
+
+    (dbt_project_dir / "profiles.yml").write_text(
+        _CONNECTOR_PROFILES[connector], encoding="utf-8"
+    )
+    (dbt_project_dir / "models" / "marts").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "models" / "marts" / "mart_customers.sql").write_text(
+        "select * from {{ ref('stg_customers') }}\n", encoding="utf-8"
+    )
+
+    # An orphaning delete is refused identically, without ever reaching dbt.
+    rc, envelope = _plan(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+        "drop stg_customers",
+    )
+    assert rc == 1, connector
+    assert "mart_customers" in envelope["errors"][0]
+
+    # Delete plus the update that removes the ref applies cleanly, everywhere.
+    _stub_parse_ok(monkeypatch)
+    rc, envelope = _plan(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            },
+            {
+                "path": "models/staging/schema.yml",
+                "kind": "schema_yml",
+                "content": "version: 2\n",
+            },
+            {
+                "path": "models/marts/mart_customers.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            },
+        ],
+        "reclassify",
+    )
+    assert rc == 0, (connector, envelope)
+    plan_id = envelope["data"]["plan_id"]
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", plan_id], capsys
+    )
+    assert rc == 0, (connector, envelope)
+    assert not (dbt_project_dir / "models/staging/stg_customers.sql").exists()

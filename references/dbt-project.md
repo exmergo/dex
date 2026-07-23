@@ -34,9 +34,20 @@ under `.dex/plans/`. Applying a plan re-hashes every file first:
   caller either re-plans against current state or overrides with an explicit
   `--confirm`.
 
+Each edit carries an `op`: `upsert` (create or update, the default) or `delete`.
+A delete removes a file as a first-class reviewable diff, pinned to the file's
+hash like any other edit, so it obeys the same conflict rule: a file a human
+touched after planning is never silently removed. Deletes are guarded as a unit:
+a plan is refused if any file that survives it still `ref()`s a deleted model, so
+the post-change project is proven to have no dangling reference before the plan
+is stored (and, when dbt is available, the same post-deletion tree is confirmed
+by dbt's own parser). A rename is expressed as one plan: delete the old model,
+create the new one, and update every referrer, validated together.
+
 Human edits to dbt are authoritative by construction; dex holds no competing copy
 to overwrite them from. Writes are confined to the project's model paths; path
-escapes are refused. dex never builds to a non-dev target.
+escapes are refused. dex never builds to a non-dev target, and a delete only ever
+removes a file from the repo, never a relation from the warehouse.
 
 ## Running dbt (build, deps, parse)
 

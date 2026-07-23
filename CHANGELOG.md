@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-21
+
 ### Changed
 
 - **`transform build` now surfaces an upfront cost estimate on every billed
@@ -24,6 +26,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   built yet cannot be priced and are noted, so the total is an honest partial
   floor; when dex cannot open its own connection the estimate degrades to none
   with a note, and the ceiling plus the server-side per-statement cap still bind.
+
+### Added
+
+- **`transform`: first-class, guarded model deletes.** Plan edits now carry an
+  `op` of `upsert` (create or update, the default) or `delete`, so removing a dbt
+  model is a reviewable diff inside the plan rather than a manual `rm` outside the
+  tool. A delete is pinned to the file's hash like any other edit, so an
+  unconfirmed delete against a file a human edited after planning returns
+  `needs_confirmation` instead of silently removing it. Deletes are guarded as a
+  unit: a plan is refused, naming the offenders, if any file that survives it
+  still `ref()`s a deleted model, so the post-deletion project is proven free of
+  dangling references before the plan is stored; when dbt is available, the same
+  post-deletion tree is confirmed by dbt's own parser. This makes a rename or
+  reclassification a single atomic plan (delete the old model, create the new one,
+  update every referrer), closing the audit gap where a removal escaped the
+  reviewable-diff guarantee. The delete path is file-level and connector-agnostic:
+  it never issues DDL, so it only ever removes a file from the repo, never a
+  relation from the warehouse.
+
 ### Fixed
 
 - **`explore profile`'s BigQuery cost estimate now accounts for the per-query

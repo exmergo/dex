@@ -13,6 +13,7 @@ from exmergo_dex_core import dbt_project
 from exmergo_dex_core.dbt_project import (
     DbtProjectError,
     Edit,
+    EditOp,
     content_hash,
     definitions,
     find_project,
@@ -173,6 +174,84 @@ def test_write_edits_all_or_nothing(dbt_project_dir: Path):
     assert result.conflicts
     assert not (dbt_project_dir / "models/marts/fct_new.sql").exists()
     assert view.files  # project untouched
+
+
+def test_edit_op_content_invariant():
+    # An upsert must carry content; a delete must not. The model refuses both
+    # mistakes so a malformed edit never reaches the write path.
+    with pytest.raises(ValueError):
+        Edit(path="models/x.sql", op=EditOp.UPSERT, new_content=None)
+    with pytest.raises(ValueError):
+        Edit(path="models/x.sql", op=EditOp.DELETE, new_content="select 1\n")
+    # The defaults still describe an upsert, so pre-op plans deserialize unchanged.
+    assert Edit(path="models/x.sql", new_content="select 1\n").op is EditOp.UPSERT
+
+
+def test_write_edits_deletes_a_file(dbt_project_dir: Path):
+    view = load(dbt_project_dir)
+    target = dbt_project_dir / "models/staging/stg_customers.sql"
+    edit = Edit(
+        path="models/staging/stg_customers.sql",
+        op=EditOp.DELETE,
+        old_content_hash=view.files["models/staging/stg_customers.sql"].sha256,
+    )
+    result = write_edits([edit], dbt_project_dir)
+    assert result.written == ["models/staging/stg_customers.sql"]
+    assert not result.conflicts
+    assert result.diffs[0]["op"] == "delete"
+    assert not target.exists()
+
+
+def test_write_edits_delete_of_a_changed_file_is_a_conflict(dbt_project_dir: Path):
+    path = dbt_project_dir / "models/staging/stg_customers.sql"
+    stale_hash = content_hash(path.read_text(encoding="utf-8"))
+    # A human edits the file after the delete was planned.
+    path.write_text("select 42 as id -- keep me\n", encoding="utf-8")
+
+    edit = Edit(
+        path="models/staging/stg_customers.sql",
+        op=EditOp.DELETE,
+        old_content_hash=stale_hash,
+    )
+    result = write_edits([edit], dbt_project_dir)
+    assert result.written == []
+    assert len(result.conflicts) == 1
+    # The divergence is surfaced, and the file is emphatically still there.
+    assert path.read_text(encoding="utf-8") == "select 42 as id -- keep me\n"
+
+
+def test_write_edits_delete_of_a_missing_file_is_a_noop(dbt_project_dir: Path):
+    edit = Edit(
+        path="models/staging/never_existed.sql",
+        op=EditOp.DELETE,
+        old_content_hash=None,
+    )
+    result = write_edits([edit], dbt_project_dir)
+    assert result.written == []
+    assert not result.conflicts
+    assert not result.diffs
+
+
+def test_write_edits_all_or_nothing_across_a_delete_and_an_upsert(
+    dbt_project_dir: Path,
+):
+    view = load(dbt_project_dir)
+    delete = Edit(
+        path="models/staging/stg_customers.sql",
+        op=EditOp.DELETE,
+        old_content_hash=view.files["models/staging/stg_customers.sql"].sha256,
+    )
+    # A conflicting upsert in the same plan must veto the delete too.
+    stale_upsert = Edit(
+        path="models/staging/schema.yml",
+        new_content="version: 2\n",
+        old_content_hash="stale-and-wrong",
+    )
+    result = write_edits([delete, stale_upsert], dbt_project_dir)
+    assert result.written == []
+    assert result.conflicts
+    # The delete did not happen: nothing was written, nothing was removed.
+    assert (dbt_project_dir / "models/staging/stg_customers.sql").exists()
 
 
 @pytest.mark.parametrize(
