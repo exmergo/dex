@@ -104,6 +104,10 @@ def test_init_plan_apply_build_into_the_scratch_dataset(
     )
     assert rc == 0, built
     assert built["status"] == "ok"
+    # The build is priced upfront now: the confirmed envelope carries the summed
+    # dry-run byte estimate (floored to BigQuery's per-query minimum), not a null.
+    assert built["cost"]["estimate"] is not None
+    assert built["cost"]["estimate"] > 0
     statuses = {n["name"]: n["status"] for n in built["data"]["nodes"]}
     assert statuses.get(MODEL_NAME) == "success"
 

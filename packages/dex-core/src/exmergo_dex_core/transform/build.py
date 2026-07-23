@@ -94,6 +94,7 @@ def build(
     ceiling: float | None = None,
     confirmed: bool = False,
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
+    estimate: float | None = None,
     dev_target_check: Callable[[], list[str]] | None = None,
     runner: Runner | None = None,
     timeout: float = _DBT_TIMEOUT_SECONDS,
@@ -108,10 +109,15 @@ def build(
     returns warnings and raises to refuse; the callable is injected so the engine
     stays independent of connection handling and testable without a warehouse.
 
-    On a billed paradigm the estimate is honestly ``None``: dbt has no dry-run,
-    so the engine cannot preflight the bytes a build will scan. The ceiling and
-    confirmation gates still bind, and the generated profile's per-statement
-    ``maximum_bytes_billed`` is the server-side backstop.
+    On a billed paradigm ``estimate`` is the whole-build cost the command layer
+    priced from a free ``dbt compile`` dry-run of each node (see
+    :func:`compile_estimate`); it is ``None`` only when that pricing could not be
+    produced (no reachable connection, a compile failure), in which case the
+    ceiling and confirmation gates still bind and the profile's per-statement
+    server-side cap (``maximum_bytes_billed`` on BigQuery, a statement timeout on
+    the others) is the backstop. The gate here is defense in depth: the command
+    layer has already run the confirm handshake from the same estimate, and this
+    re-check binds every caller of the engine regardless.
     """
 
     assert_dev_target(target, configured_target)
@@ -125,8 +131,8 @@ def build(
 
     target_warnings = dev_target_check() if dev_target_check is not None else []
 
-    estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else None
-    cost = preflight(estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
+    gate_estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else estimate
+    cost = preflight(gate_estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
 
     # Most real projects carry a packages.yml, and dbt refuses to compile until
     # its packages are installed; running deps here (post-gate) means the first
@@ -357,6 +363,141 @@ def deps(
     }
 
 
+_COMPILE_TIMEOUT_SECONDS = 300.0
+
+# Node kinds worth pricing: models materialize a table/view (ephemeral ones are
+# inlined into their dependents, so they have no scan of their own), snapshots
+# write a table, and data tests run a scanning SELECT. Seeds load a local CSV and
+# scan nothing; everything else (operations, analyses, sources) issues no billed
+# build statement.
+_PRICED_RESOURCE_TYPES = {"model", "snapshot", "test"}
+
+
+def compile_estimate(
+    project_dir: Path | str,
+    adapter: Any,
+    *,
+    target: str,
+    select: str | None = None,
+    runner: Runner | None = None,
+    timeout: float = _COMPILE_TIMEOUT_SECONDS,
+) -> tuple[float, dict[str, float], list[str]]:
+    """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
+
+    ``dbt compile`` renders every node's fully-compiled SQL against the dev
+    target without executing it, so the build graph can be priced the same way
+    ``explore`` prices an ad-hoc query: each node's compiled SQL goes through the
+    connector's own free, execution-free estimator (``query_estimate`` -- a real
+    dry-run on BigQuery, an ``EXPLAIN`` planner cost on Postgres, a size-based
+    heuristic on the compute-time connectors). The per-node estimates are summed
+    into a whole-build total in the connector's paradigm unit.
+
+    Returns ``(total, per_node, notes)``. ``per_node`` maps each priced node's
+    short name to its estimate (the breakdown the confirm handshake surfaces);
+    ``notes`` explains anything left out, so nothing is silently dropped.
+
+    Degrades rather than fabricates: a node whose compiled SQL cannot be priced
+    (a downstream model referencing a dev relation an earlier layer has not built
+    yet, an unparseable statement) is skipped and summarized in ``notes``, so on
+    a cold dev target the total is an honest partial floor rather than a failure.
+    ``query_estimate`` is a duck-typed convention, not part of the ``Adapter``
+    protocol, so an adapter that does not expose it yields ``(0.0, {}, [note])``.
+
+    Raises :class:`DbtRunError` when ``dbt compile`` itself fails: that same
+    failure would sink the build, and the caller degrades to no-estimate so dbt's
+    own error is what the user sees, not a masked one from here.
+    """
+
+    project = Path(project_dir).resolve()
+    estimator = getattr(adapter, "query_estimate", None)
+    if estimator is None:
+        return (
+            0.0,
+            {},
+            ["connector exposes no estimator; build cost not priced upfront"],
+        )
+
+    argv = [
+        _dbt_executable(),
+        "compile",
+        "--target",
+        target,
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(profiles_dir(project).resolve()),
+        "--log-format",
+        "json",
+    ]
+    if select:
+        argv += ["--select", select]
+    run = runner or _default_runner(timeout, project)
+    completed = run(argv)
+    if completed.returncode != 0:
+        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+        raise DbtRunError(messages[0] if messages else "dbt compile failed")
+
+    compiled = _compiled_nodes(project)
+    total = 0.0
+    per_node: dict[str, float] = {}
+    skipped: list[str] = []
+    for name, code in compiled:
+        try:
+            per_node[name] = estimator(code)
+            total += per_node[name]
+        except Exception:  # a node dbt could compile but the connector cannot price
+            skipped.append(name)
+    notes: list[str] = []
+    if skipped:
+        shown = ", ".join(skipped[:_MESSAGE_CAP])
+        more = (
+            f", and {len(skipped) - _MESSAGE_CAP} more"
+            if len(skipped) > _MESSAGE_CAP
+            else ""
+        )
+        notes.append(
+            f"{len(skipped)} node(s) could not be priced and are excluded from the "
+            "estimate (their inputs may not exist in the dev target until an earlier "
+            f"layer is built): {shown}{more}; the total is a partial floor"
+        )
+    if not per_node and not skipped:
+        notes.append("no scanning build nodes to price; the estimate is zero")
+    return total, per_node, notes
+
+
+def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
+    """The (short name, compiled SQL) of each priced node dbt just compiled.
+
+    The selected set comes from compile's ``run_results.json`` (which honors the
+    same ``--select`` a build would), joined to ``manifest.json`` for each node's
+    compiled SQL, resource type, and materialization. Ephemeral models and nodes
+    without compiled SQL contribute no billed statement and are dropped here.
+    """
+
+    run_results = project / "target" / "run_results.json"
+    manifest = project / "target" / "manifest.json"
+    if not run_results.is_file() or not manifest.is_file():
+        return []
+    compiled_ids = [
+        str(r.get("unique_id"))
+        for r in json.loads(run_results.read_text(encoding="utf-8")).get("results", [])
+        if r.get("unique_id")
+    ]
+    nodes = json.loads(manifest.read_text(encoding="utf-8")).get("nodes", {})
+    priced: list[tuple[str, str]] = []
+    for uid in compiled_ids:
+        node = nodes.get(uid)
+        if not node or node.get("resource_type") not in _PRICED_RESOURCE_TYPES:
+            continue
+        if (node.get("config") or {}).get("materialized") == "ephemeral":
+            continue
+        code = node.get("compiled_code")
+        if not code or not str(code).strip():
+            continue
+        priced.append((node.get("name") or uid.split(".")[-1], str(code)))
+    return priced
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -381,8 +522,8 @@ def _build_env(paradigm: Paradigm, ceiling: float | None) -> dict[str, str] | No
     On db-load gating (Postgres) the profile has no statement-timeout key, but
     libpq honors ``PGOPTIONS``, so the ceiling becomes a per-statement
     server-side ``statement_timeout`` — the ``maximum_bytes_billed`` analogue:
-    a build statement cannot load the database past the budget even though dbt
-    has no dry-run.
+    a build statement cannot load the database past the budget even if the
+    upfront estimate under-priced it.
     """
 
     if paradigm is not Paradigm.DB_LOAD or ceiling is None:

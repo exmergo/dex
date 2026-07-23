@@ -100,7 +100,9 @@ dollar price: the RPU-hour rate varies by region and agreement.
 and its EXPLAIN costs are relative units with no honest translation to
 seconds, so estimates come from table bytes (`SVV_TABLE_INFO`) over a
 conservative capacity-scaled scan rate; every handshake payload carries
-`estimate_quality: "heuristic"`.
+`estimate_quality: "heuristic"`. The same estimator prices `transform build`:
+each compiled model, snapshot, and test is estimated and summed into the
+build's upfront cost.
 
 **The budget is hard-enforced regardless of estimate quality.** Before every
 metered statement the session's `statement_timeout` is set to the remaining
