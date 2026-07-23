@@ -228,6 +228,60 @@ def test_fully_fresh_map_needs_no_confirmation(fake_bq_client, route_adapter, tm
     assert fake_bq_client.query_calls == []
 
 
+def test_scoped_map_carries_forward_out_of_scope_dataset_profiles(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Regression for #111: a prior cache spanning three datasets, re-mapped
+    with --scope narrowed to just one of them, must not silently drop the
+    other two datasets' profiles from the cache."""
+
+    _seed_bq_map_cache(
+        tmp_path,
+        identifiers={
+            "test-proj.shop.customers",
+            "test-proj.shop.events",
+            "test-proj.logs.requests",
+        },
+    )
+
+    def scoped_opener(args):
+        gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=getattr(args, "budget", None),
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=getattr(args, "confirm", False),
+            connector="bigquery",
+            command="explore",
+        )
+        return BigQueryAdapter(
+            project="test-proj",
+            cost_gate=gate,
+            # Simulates --scope logs: this run's inventory only ever sees the
+            # logs dataset, never shop.customers or shop.events.
+            target=BigQueryTarget(datasets=["logs"]),
+            client=fake_bq_client,
+            principal_type="user",
+        )
+
+    monkeypatch.setattr(command_args, "open_from_args", scoped_opener)
+    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+
+    assert envelope.status.value == "ok"
+    assert envelope.data["out_of_scope_carried_count"] == 2
+    assert any(
+        "outside this run's --scope/--dataset" in note
+        for note in envelope.data["notes"]
+    )
+    cache = DexStore(tmp_path).load_cache()
+    identifiers = {d.identifier for d in cache.datasets}
+    assert identifiers == {
+        "test-proj.shop.customers",
+        "test-proj.shop.events",
+        "test-proj.logs.requests",
+    }
+
+
 def test_unconfirmed_relationships_recommends_map(
     fake_bq_client, route_adapter, tmp_path
 ):
