@@ -9,6 +9,19 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore profile` now honors the same fresh-profile reuse as `explore map`
+  and `explore relationships`** ([#128]). Profiling a table whose cached profile
+  is still fresh (same connector, schema unchanged, profiled within
+  `profile_freshness_hours`) is served from the `.dex/` cache for free instead
+  of re-scanned, so a `profile` run right after a `map` no longer pays a second
+  time. The envelope gains `cache_hit_count` and `profiled_count`, and a
+  fresh-cached object never enters the cost preflight or the billed handshake.
+  `explore profile` also gains the `--refresh` flag its sibling commands already
+  had, to force a full re-profile when the source changed in a way the free
+  metadata check cannot see.
+
 ## [1.3.1] - 2026-07-21
 
 ### Changed
