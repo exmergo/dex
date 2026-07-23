@@ -9,6 +9,23 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore profile`'s BigQuery cost estimate now accounts for the per-query
+  billing floor on every query a profile can issue, not just the aggregate
+  scan** ([#107]). BigQuery bills at least 10 MB per query; the estimate
+  already floored each aggregate batch, but a profile can also issue up to two
+  more queries per table (an exact-distinct-count escalation for a
+  near-unique column, a composite-key probe), priced only after the aggregate
+  batch's own approximate results come back. Those were invisible to the
+  upfront estimate entirely, so a batch of small tables billed up to 1.7x the
+  quoted number. The estimate now reserves a floor for both possible
+  escalations per table (skipped only for a table provably empty at estimate
+  time), turning the number into a ceiling actual spend will not exceed
+  rather than one it silently blows past. The two escalation queries'
+  own internal budget accounting is now floored the same way, and BigQuery's
+  confirmation handshake now names the floor directly in its hint.
+
 ## [1.3.0] - 2026-07-21
 
 ### Added
