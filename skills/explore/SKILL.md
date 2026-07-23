@@ -38,6 +38,11 @@ Subcommands, in the usual order:
    approximation noise is escalated to an exact COUNT(DISTINCT)
    (`distinct_count_exact: true`), so uniqueness and grain verdicts rest on
    proof; a `~` prefix in a warning marks a count that is still approximate.
+   A requested object whose cached profile is still fresh (same connector,
+   schema unchanged, within `profile_freshness_hours`, default 24) is served
+   from the cache (`cache_hit_count`) instead of re-scanned, so profiling a
+   table `map` just wrote costs nothing to spend; pass `--refresh` to force a
+   re-scan when the source changed in a way the free metadata check cannot see.
 4. `explore relationships` returns inferred and declared joins with confidences,
    plus notes explaining what the inference examined (so an empty list is
    meaningful). Add `--verify` to measure each inferred join with an aggregate
@@ -53,7 +58,8 @@ Subcommands, in the usual order:
    re-scan (`cache_hit_count`), so re-runs cost nothing to spend; pass
    `--refresh` to force a full re-profile when the source changed in a way the
    free metadata check cannot see (e.g. rows changed but the schema did not).
-   `explore relationships` reuses fresh profiles the same way.
+   `explore relationships` and the standalone `explore profile` reuse fresh
+   profiles the same way.
 6. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
    don't cover: you write the SQL, the engine's query firewall refuses or bounds
    it. Requires the `.dex/` cache (run `map` first). Results come back columnar
