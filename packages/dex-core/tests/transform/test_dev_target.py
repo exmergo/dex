@@ -237,6 +237,60 @@ def test_missing_snowflake_dev_database_refuses_with_the_create_statement(
     assert connection.data_statements == []
 
 
+def test_a_missing_snowflake_dev_database_is_not_refused_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A project with per-layer `+database:` config never has any node
+    resolve into the fallback dev_database; a compiled manifest already
+    proves that for free, so refusing over a database dbt will never try to
+    create would block a build that was never going to touch it (issue
+    #110, extended from the BigQuery-only fix to every connector with the
+    same gap)."""
+
+    pytest.importorskip("snowflake.connector")
+    from fakes.snowflake import FakeSnowflakeConnection, FakeWarehouse
+
+    from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    connection = FakeSnowflakeConnection(
+        warehouses=[FakeWarehouse(name="DEX_WH")], empty_databases=["SOMETHING_ELSE"]
+    )
+
+    def fake_open_adapter(**_kwargs):
+        return SnowflakeAdapter(
+            connection=connection,
+            cost_gate=CostGate(
+                paradigm=Paradigm.COMPUTE_TIME,
+                ceiling=None,
+                session_ceiling=None,
+                session_spent=0.0,
+                confirmed=False,
+                connector="snowflake",
+            ),
+            target=SnowflakeTarget(warehouse="DEX_WH"),
+            clock=connection.clock,
+        )
+
+    monkeypatch.setattr("exmergo_dex_core.connect.open_adapter", fake_open_adapter)
+    _snowflake_profile(dbt_project_dir)
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "database": "SOME_OTHER_DB",
+                "schema": "staging_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+
+    assert dev_target.check(dbt_project_dir, "dev", _snowflake_config(), tmp_path) == []
+    assert connection.data_statements == []
+
+
 def test_an_unopenable_connection_degrades_to_a_note(
     dbt_project_dir: Path, tmp_path: Path
 ):
@@ -335,6 +389,34 @@ def test_missing_databricks_dev_catalog_refuses_with_the_create_statement(
     assert fake.connect_count == 0
 
 
+def test_a_missing_databricks_dev_catalog_is_not_refused_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Same connector-parity extension as Snowflake/BigQuery: a per-layer
+    `+catalog:` convention that never resolves into dev_catalog means
+    refusing over its absence would block a build that was never going to
+    touch it (issue #110)."""
+
+    fake, adapter, config = _databricks(
+        dbt_project_dir, empty_catalogs=["something_else"]
+    )
+    _fake_open(monkeypatch, adapter)
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "database": "some_other_catalog",
+                "schema": "staging_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert fake.connect_count == 0
+
+
 def test_an_existing_databricks_dev_catalog_the_principal_owns_passes(
     dbt_project_dir: Path, tmp_path: Path, monkeypatch
 ):
@@ -383,6 +465,46 @@ def test_a_databricks_dev_schema_the_principal_cannot_write_is_warned_about(
     assert "GRANT CREATE TABLE ON SCHEMA dex_dev.dbt_dev" in warnings[0]
     # A warning, not a refusal: ownership and metastore-admin rights are invisible
     # to the grants API, so an empty answer cannot prove the build would fail.
+    assert fake.connect_count == 0
+
+
+def test_a_databricks_dev_schema_grant_is_not_warned_about_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The grants warning is gated the same way as the catalog refusal above:
+    a manifest proving no node resolves into dev_schema means the missing
+    privilege on it is not this build's problem either (issue #110)."""
+
+    from fakes.databricks import FakeDatabricksTable
+
+    fake, adapter, config = _databricks(
+        dbt_project_dir,
+        empty_catalogs=[],
+        owners={"dex_dev": "dex@example.com", "dex_dev.dbt_dev": "someone-else"},
+        grants={},
+    )
+    fake.workspace._tables.append(
+        FakeDatabricksTable(
+            catalog="dex_dev",
+            schema="dbt_dev",
+            name="prior",
+            columns=[("id", "bigint", True)],
+        )
+    )
+    _fake_open(monkeypatch, adapter)
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "database": "dex_dev",
+                "schema": "staging_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
     assert fake.connect_count == 0
 
 
@@ -497,6 +619,108 @@ def test_an_unreachable_bigquery_dev_project_refuses(
     assert "dbt creates datasets but never projects" in str(exc.value)
 
 
+def _write_manifest(project: Path, nodes: dict) -> None:
+    import json
+
+    target_dir = project / "target"
+    target_dir.mkdir(exist_ok=True)
+    (target_dir / "manifest.json").write_text(
+        json.dumps({"nodes": nodes}), encoding="utf-8"
+    )
+
+
+def test_a_missing_bigquery_dev_dataset_is_not_warned_about_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A project with per-layer `+schema:` config never has any node resolve
+    into the fallback dev_dataset; a compiled manifest already proves that for
+    free, so the warning about a dataset dbt will never try to create is
+    noise (issue #110)."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "schema": "shop",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+    _fake_open(monkeypatch, adapter)
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert client.query_calls == []
+
+
+def test_a_missing_bigquery_dev_dataset_still_warns_when_a_node_targets_it(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The manifest proves the opposite case too: a node genuinely resolving
+    into the missing dataset keeps the warning exactly as before."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "schema": "dbt_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+    _fake_open(monkeypatch, adapter)
+
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "test-proj.dbt_dev does not exist" in warnings[0]
+    assert client.query_calls == []
+
+
+def test_a_missing_bigquery_dev_dataset_ignores_an_ephemeral_models_schema(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """An ephemeral model never issues its own CREATE; its compiled schema is
+    what it *would* resolve to, not a dataset it will ever touch."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.int_helper": {
+                "resource_type": "model",
+                "schema": "dbt_dev",
+                "config": {"materialized": "ephemeral"},
+            }
+        },
+    )
+    _fake_open(monkeypatch, adapter)
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert client.query_calls == []
+
+
+def test_a_missing_bigquery_dev_dataset_warns_on_an_unreadable_manifest(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A corrupt or hand-rolled manifest degrades to the same unconditional
+    warning as no manifest at all, never a crash: absence of evidence stays
+    absence of evidence."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    target_dir = dbt_project_dir / "target"
+    target_dir.mkdir(exist_ok=True)
+    (target_dir / "manifest.json").write_text("{not valid json", encoding="utf-8")
+    _fake_open(monkeypatch, adapter)
+
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "test-proj.dbt_dev does not exist" in warnings[0]
+    assert client.query_calls == []
+
+
 def _postgres(dbt_project_dir: Path, role, *, dev: str = "dbt_dev", profile_user=None):
     pytest.importorskip("psycopg")
     from fakes.postgres import FakePostgresConnection, FakePostgresTable
@@ -585,6 +809,32 @@ def test_an_absent_postgres_dev_schema_the_role_cannot_create_refuses(
     message = str(exc.value)
     assert 'dev_schema "not_there" does not exist and role dbt_dev may not create it'
     assert "CREATE SCHEMA IF NOT EXISTS not_there AUTHORIZATION dbt_dev;" in message
+
+
+def test_an_absent_postgres_dev_schema_is_not_refused_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Same connector-parity extension: a per-layer `+schema:` convention
+    that never resolves into dev_schema means neither its absence nor the
+    role's privilege on it is this build's problem (issue #110)."""
+
+    from fakes.postgres import FakeRole
+
+    role = FakeRole(name="dbt_dev", may_create_in_database=False)
+    _connection, adapter, config = _postgres(dbt_project_dir, role, dev="not_there")
+    _fake_open(monkeypatch, adapter)
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "schema": "staging_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
 
 
 def test_the_postgres_privilege_is_asked_of_the_profile_role(
@@ -713,6 +963,31 @@ def test_an_unwritable_redshift_dev_schema_refuses_with_the_grant(
     message = str(exc.value)
     assert 'missing CREATE on dev_schema "dbt_dev"' in message
     assert "GRANT USAGE, CREATE ON SCHEMA dbt_dev TO dbt_dev;" in message
+    assert connection.data_statements == []
+
+
+def test_an_unwritable_redshift_dev_schema_is_not_refused_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Same connector-parity extension as Postgres (issue #110)."""
+
+    from fakes.redshift import FakeUser
+
+    user = FakeUser(name="dbt_dev", schema_privileges={"dbt_dev": {"USAGE"}})
+    connection, adapter, config = _redshift(dbt_project_dir, user)
+    _fake_open(monkeypatch, adapter)
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "schema": "staging_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
     assert connection.data_statements == []
 
 

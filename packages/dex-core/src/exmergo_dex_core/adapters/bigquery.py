@@ -526,6 +526,10 @@ class BigQueryAdapter:
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let uniqueness verdicts stay
         approximate. A metered adapter never self-escalates past its ceiling.
+
+        Charged at the floored bytes, not the raw dry-run number: this is one
+        billed query like any other, so it bills (and must be budgeted
+        against) at least the per-query minimum (issue #107).
         """
 
         if self._unqueryable(identifier) or not columns:
@@ -538,7 +542,8 @@ class BigQueryAdapter:
             f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}",  # noqa: S608
             dialect=self.dialect,
         )
-        if not self.cost_gate.try_charge(self._dry_run(sql)):
+        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+        if not self.cost_gate.try_charge(floored):
             self._note(
                 identifier,
                 "distinct-count escalation skipped: the remaining budget could "
@@ -555,7 +560,11 @@ class BigQueryAdapter:
         """Exact distinct count per column combination, spent only within the
         already-confirmed budget: when the remaining budget cannot cover the
         extra scan, return nothing and let the grain stay unknown. A metered
-        adapter never self-escalates past its ceiling."""
+        adapter never self-escalates past its ceiling.
+
+        Charged at the floored bytes, not the raw dry-run number: this is one
+        billed query like any other, so it bills (and must be budgeted
+        against) at least the per-query minimum (issue #107)."""
 
         if self._unqueryable(identifier) or not combinations:
             return {}
@@ -565,7 +574,8 @@ class BigQueryAdapter:
             ),
             dialect=self.dialect,
         )
-        if not self.cost_gate.try_charge(self._dry_run(sql)):
+        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+        if not self.cost_gate.try_charge(floored):
             self._note(
                 identifier,
                 "composite-key probe skipped: the remaining budget could not "
@@ -593,6 +603,19 @@ class BigQueryAdapter:
         what BigQuery actually bills, and an unfloored estimate would send the
         agent into a ladder of budget rejections.
 
+        The total also reserves one floor per table for each of the two
+        possible escalation queries (``exact_distinct_counts`` for a
+        near-unique column, ``distinct_combination_counts`` for a composite
+        key candidate): whether either actually runs depends on the aggregate
+        batch's own approximate results, which do not exist yet at estimate
+        time, so there is no way to dry-run them here. Reserving their floor
+        unconditionally keeps this total a ceiling profiling will not exceed,
+        rather than a number a run that does escalate blows past -- the exact
+        gap this estimator used to leave open (issue #107). Skipped only when
+        a table is provably empty (``row_count == 0``); an unknown row count
+        (views, whose count is never known before the aggregate that reveals
+        it) still reserves, since escalation is not ruled out.
+
         Blob-type columns are excluded from the batches the same way
         ``explore.profile.profile`` excludes them from the scan itself
         (``include_blobs`` names the ``identifier.column`` paths a human opted
@@ -601,7 +624,7 @@ class BigQueryAdapter:
         blob_paths = include_blobs or set()
         per_table: dict[str, float] = {}
         for identifier in identifiers:
-            _meta, columns = self.table_metadata(identifier)
+            meta, columns = self.table_metadata(identifier)
             if self._unqueryable(identifier):
                 per_table[identifier] = 0.0
                 continue
@@ -633,6 +656,10 @@ class BigQueryAdapter:
                         "could not estimate an aggregate scan (dry-run failed); "
                         "the object is skipped",
                     )
+            if scan_columns and meta.row_count != 0:
+                total += float(_MIN_BILLED_BYTES)  # exact_distinct_counts
+                if len(scan_columns) >= 2:
+                    total += float(_MIN_BILLED_BYTES)  # distinct_combination_counts
             per_table[identifier] = total
         return sum(per_table.values()), per_table
 
@@ -643,6 +670,39 @@ class BigQueryAdapter:
 
         checked = assert_select_only(sql, dialect=self.dialect)
         return max(self._dry_run(checked), self._min_billed_floor(checked))
+
+    def describe_estimate(
+        self, estimate: float, per_table: dict[str, float] | None = None
+    ) -> dict:
+        """The bytes-scanned handshake payload: names the per-query billing
+        floor baked into every number here, so a small-table estimate reads as
+        a trustworthy ceiling instead of one the actual bill will exceed
+        (issue #107). The escalation-reserve clause only applies to a
+        multi-table call (``per_table`` set, i.e. a profile-shaped estimate);
+        a single ad-hoc query or cluster sample has no such reserve to explain.
+        """
+
+        note = (
+            f"BigQuery bills at least {_MIN_BILLED_BYTES:,} bytes (10 MB) per "
+            "query; every number here already reflects that floor"
+        )
+        if per_table:
+            note += (
+                ", including a reserve for the escalation queries a "
+                "multi-table profile may still add after its initial scan"
+            )
+        data: dict[str, object] = {
+            "estimated_bytes": estimate,
+            "hint": (
+                "review the estimate, then re-run with --confirm --budget "
+                "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
+                "$0.06 on-demand)"
+            ),
+            "notes": [note],
+        }
+        if per_table:
+            data["per_table_bytes"] = per_table
+        return data
 
     def _min_billed_floor(self, sql: str) -> float:
         """BigQuery bills at least ``_MIN_BILLED_BYTES`` per table a query

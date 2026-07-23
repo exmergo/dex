@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import DexStore
+from exmergo_dex_core.cache import Dataset, DexCache, DexStore
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.explore.commands import _merged_hints
@@ -339,6 +339,91 @@ def test_map_carries_forward_prior_profiles(
         if d.profiled_at == first_stamps[d.identifier]
     ]
     assert len(unchanged) == 35, "carried profiles keep their original stamp"
+
+
+def _stub_meta(identifier: str):
+    from exmergo_dex_core.adapters.base import ObjectMeta
+
+    schema = identifier.rsplit(".", 2)[-2]
+    name = identifier.rsplit(".", 1)[-1]
+    return ObjectMeta(
+        identifier=identifier,
+        object_type="table",
+        schema=schema,
+        name=name,
+        row_count=10,
+        byte_size=100,
+        column_count=1,
+    )
+
+
+def _stub_dataset(identifier: str, *, profiled_at: str = "2026-01-01T00:00:00+00:00"):
+    from exmergo_dex_core.cache import ColumnProfile
+
+    return Dataset(
+        identifier=identifier,
+        columns=[ColumnProfile(name="id", data_type="INTEGER")],
+        profiled_at=profiled_at,
+    )
+
+
+def test_compose_datasets_carries_forward_objects_outside_this_runs_scope():
+    """An object in the prior cache but entirely absent from this run's
+    inventory (a --scope/--dataset narrower than what built the prior cache)
+    is carried forward untouched rather than dropped from the new cache
+    (issue #111): the prior bug replaced the whole cache with just this run's
+    scope, silently losing every other dataset's profile."""
+
+    from exmergo_dex_core.explore.commands import _compose_datasets
+
+    prior = DexCache(
+        datasets=[
+            _stub_dataset("db.shop.customers"),
+            _stub_dataset("db.marts.orders"),
+        ]
+    )
+    # This run's inventory only saw the marts dataset (a narrower --scope).
+    metas = [_stub_meta("db.marts.orders")]
+    datasets, carried, out_of_scope = _compose_datasets(metas, [], {}, prior)
+
+    identifiers = {d.identifier for d in datasets}
+    assert identifiers == {"db.shop.customers", "db.marts.orders"}
+    assert carried == 1  # marts itself: in scope, not freshly profiled
+    assert out_of_scope == 1  # customers: never even in this run's inventory
+    carried_ds = next(d for d in datasets if d.identifier == "db.shop.customers")
+    assert carried_ds.profiled_at == "2026-01-01T00:00:00+00:00"
+    assert carried_ds.columns  # not degraded to an inventory-only stub
+
+
+def test_compose_datasets_out_of_scope_dataset_keeps_its_own_rank_score():
+    """An out-of-scope carry is not part of this run's ranking pass, so its
+    rank_score is left alone rather than reset to None (which would rank it
+    last for no reason connectivity or naming ever said was true)."""
+
+    from exmergo_dex_core.explore.commands import _compose_datasets
+
+    out_of_scope_ds = _stub_dataset("db.shop.customers")
+    out_of_scope_ds.rank_score = 0.75
+    prior = DexCache(datasets=[out_of_scope_ds])
+    metas = [_stub_meta("db.marts.orders")]
+    profiled = [_stub_dataset("db.marts.orders")]
+
+    datasets, _carried, out_of_scope = _compose_datasets(
+        metas, profiled, {"db.marts.orders": 0.5}, prior
+    )
+    assert out_of_scope == 1
+    carried_ds = next(d for d in datasets if d.identifier == "db.shop.customers")
+    assert carried_ds.rank_score == 0.75
+
+
+def test_compose_datasets_without_a_prior_cache_reports_no_out_of_scope():
+    from exmergo_dex_core.explore.commands import _compose_datasets
+
+    metas = [_stub_meta("db.shop.customers")]
+    datasets, carried, out_of_scope = _compose_datasets(metas, [], {}, None)
+    assert [d.identifier for d in datasets] == ["db.shop.customers"]
+    assert carried == 0
+    assert out_of_scope == 0
 
 
 def test_map_reuses_fresh_cached_profiles(
