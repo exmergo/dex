@@ -11,6 +11,24 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`transform build`'s dev-namespace preflight no longer refuses or warns
+  over a database/catalog/schema nothing in the project would ever write
+  to** ([#110]). A project with per-layer `+schema:`/`+database:`/
+  `+catalog:` config (or an equivalent `generate_schema_name` convention)
+  resolves every model into its own namespace and never touches the
+  connector-level `dev_dataset`/`dev_database`/`dev_catalog`/`dev_schema`
+  fallback at all, yet every connector's check fired unconditionally on
+  every build regardless, training users to skim past a line that, in a
+  real missing-and-unwritable scenario, is the one that would explain the
+  failure. Originally fixed for BigQuery's warning alone; a compiled
+  manifest from a prior build already answers "does anything resolve into
+  this namespace" for free, so the same check now also gates Snowflake's
+  and Databricks's missing-database/catalog refusal (the more consequential
+  case: those block the build outright, not just warn) and Postgres's and
+  Redshift's missing-privilege refusal on `dev_schema`. Every check stays
+  silent only when a manifest proves nothing targets the namespace, falling
+  back to the previous unconditional behavior when no manifest exists yet
+  (a project's first build).
 - **A scoped `explore map` no longer drops out-of-scope datasets from the
   cache** ([#111]). `explore map --scope <dataset>` (or `--dataset`) rebuilt
   `.dex/cache.json` from only this run's inventory, so a scope narrower than
