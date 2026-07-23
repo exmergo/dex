@@ -30,6 +30,7 @@ legitimate thing to have, and dex proposes rather than imposes.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -37,6 +38,7 @@ import yaml
 from ..cache import DEX_DIR
 from ..config import CONFIG_FILE, DexConfig
 from ..dbt_project import (
+    MANIFEST_PATH,
     PROFILES_FILE,
     duckdb_target_path,
     target_auth_method,
@@ -171,7 +173,7 @@ def _assert_namespace_exists(
     if config.connector == "databricks":
         return _databricks_namespace(config, repo_root)
     if config.connector == "bigquery":
-        return _bigquery_namespace(config, repo_root)
+        return _bigquery_namespace(project, config, repo_root)
     if config.connector == "postgres":
         return _postgres_namespace(project, target, config, repo_root)
     if config.connector == "redshift":
@@ -297,7 +299,9 @@ def _databricks_namespace(config: DexConfig, repo_root: Path | str) -> list[str]
     ]
 
 
-def _bigquery_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
+def _bigquery_namespace(
+    project: Path, config: DexConfig, repo_root: Path | str
+) -> list[str]:
     """Free: a metadata GET, no query, so nothing is billed on a bytes-billed
     connector.
 
@@ -307,6 +311,14 @@ def _bigquery_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
     and gets a warning rather than a refusal. Refusing it would block a build that
     would have succeeded. What dbt cannot create is the project, and an unreachable
     one is raised by the adapter.
+
+    A project with per-layer ``+schema:`` config (or an equivalent
+    ``generate_schema_name`` convention) never has any node resolve into
+    ``dev_dataset`` at all, in which case the dataset's absence is irrelevant:
+    dbt will never try to create it. A prior build leaves a compiled manifest
+    on disk that already answers this for free (issue #110); with no manifest
+    to consult yet (a project's first build), there is nothing to rule the
+    dataset out with, so the warning stays unconditional, same as before.
     """
 
     target = config.bigquery
@@ -326,6 +338,10 @@ def _bigquery_namespace(config: DexConfig, repo_root: Path | str) -> list[str]:
         adapter.close()
 
     if not missing:
+        return []
+    schemas = _manifest_schemas(project)
+    bare_dataset = dataset.rpartition(".")[2] if "." in dataset else dataset
+    if schemas is not None and bare_dataset not in schemas:
         return []
     location = target.location or "<location>"
     return [
@@ -551,6 +567,54 @@ def content_check(
     finally:
         adapter.close()
     return warnings
+
+
+# Resource types that physically write into a schema; a test asserts against
+# one but creates nothing, and an ephemeral model compiles a schema it will
+# never actually issue a CREATE against (it inlines into whatever depends on
+# it), so neither counts as "targeting" a namespace for this check.
+_MATERIALIZING_RESOURCE_TYPES = {"model", "seed", "snapshot"}
+
+
+def _manifest_schemas(project: Path) -> set[str] | None:
+    """Every schema a compiled manifest's model/seed/snapshot nodes resolve
+    into, or ``None`` when there is no manifest to read yet (a project's first
+    build, before dbt has ever compiled it here) or it cannot be parsed.
+
+    Reads the file directly rather than going through :func:`dbt_project.load`
+    (which raises on a corrupt manifest and scans every project file just to
+    reach it): this is a best-effort preflight signal, so any problem reading
+    it degrades to ``None`` -- the caller falls back to warning unconditionally,
+    the same as before this existed (issue #110).
+    """
+
+    manifest_file = project / MANIFEST_PATH
+    if not manifest_file.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    nodes = manifest.get("nodes") if isinstance(manifest, dict) else None
+    if not isinstance(nodes, dict):
+        return None
+
+    schemas: set[str] = set()
+    for node in nodes.values():
+        if not isinstance(node, dict):
+            continue
+        if node.get("resource_type") not in _MATERIALIZING_RESOURCE_TYPES:
+            continue
+        node_config = node.get("config")
+        materialized = (
+            node_config.get("materialized") if isinstance(node_config, dict) else None
+        )
+        if materialized == "ephemeral":
+            continue
+        schema = node.get("schema")
+        if isinstance(schema, str) and schema:
+            schemas.add(schema)
+    return schemas
 
 
 def _declares_sources(project: Path) -> bool:

@@ -497,6 +497,108 @@ def test_an_unreachable_bigquery_dev_project_refuses(
     assert "dbt creates datasets but never projects" in str(exc.value)
 
 
+def _write_manifest(project: Path, nodes: dict) -> None:
+    import json
+
+    target_dir = project / "target"
+    target_dir.mkdir(exist_ok=True)
+    (target_dir / "manifest.json").write_text(
+        json.dumps({"nodes": nodes}), encoding="utf-8"
+    )
+
+
+def test_a_missing_bigquery_dev_dataset_is_not_warned_about_without_a_matching_node(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A project with per-layer `+schema:` config never has any node resolve
+    into the fallback dev_dataset; a compiled manifest already proves that for
+    free, so the warning about a dataset dbt will never try to create is
+    noise (issue #110)."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "schema": "shop",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+    _fake_open(monkeypatch, adapter)
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert client.query_calls == []
+
+
+def test_a_missing_bigquery_dev_dataset_still_warns_when_a_node_targets_it(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The manifest proves the opposite case too: a node genuinely resolving
+    into the missing dataset keeps the warning exactly as before."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.stg_customers": {
+                "resource_type": "model",
+                "schema": "dbt_dev",
+                "config": {"materialized": "view"},
+            }
+        },
+    )
+    _fake_open(monkeypatch, adapter)
+
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "test-proj.dbt_dev does not exist" in warnings[0]
+    assert client.query_calls == []
+
+
+def test_a_missing_bigquery_dev_dataset_ignores_an_ephemeral_models_schema(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """An ephemeral model never issues its own CREATE; its compiled schema is
+    what it *would* resolve to, not a dataset it will ever touch."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    _write_manifest(
+        dbt_project_dir,
+        {
+            "model.dex_test.int_helper": {
+                "resource_type": "model",
+                "schema": "dbt_dev",
+                "config": {"materialized": "ephemeral"},
+            }
+        },
+    )
+    _fake_open(monkeypatch, adapter)
+
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert client.query_calls == []
+
+
+def test_a_missing_bigquery_dev_dataset_warns_on_an_unreadable_manifest(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A corrupt or hand-rolled manifest degrades to the same unconditional
+    warning as no manifest at all, never a crash: absence of evidence stays
+    absence of evidence."""
+
+    client, adapter, config = _bigquery(dbt_project_dir, dev="dbt_dev")
+    target_dir = dbt_project_dir / "target"
+    target_dir.mkdir(exist_ok=True)
+    (target_dir / "manifest.json").write_text("{not valid json", encoding="utf-8")
+    _fake_open(monkeypatch, adapter)
+
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert len(warnings) == 1
+    assert "test-proj.dbt_dev does not exist" in warnings[0]
+    assert client.query_calls == []
+
+
 def _postgres(dbt_project_dir: Path, role, *, dev: str = "dbt_dev", profile_user=None):
     pytest.importorskip("psycopg")
     from fakes.postgres import FakePostgresConnection, FakePostgresTable
