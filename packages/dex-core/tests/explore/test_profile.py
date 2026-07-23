@@ -22,6 +22,7 @@ from exmergo_dex_core.cache import (
     Relationship,
 )
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.explore.profile import detect_pii, is_min_max_safe, profile
 from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
 
@@ -669,9 +670,18 @@ def test_profile_accepts_comma_separated_objects(airbnb_duckdb: Path, capsys):
 # --- persistence: profile writes through to the .dex/ cache ---------------------
 
 
-def _profile(objects: list[str], db: Path, repo: Path, capsys) -> dict:
+def _profile(objects: list[str], db: Path, repo: Path, capsys, *flags: str) -> dict:
     return _run(
-        ["explore", "profile", *objects, "--path", str(db), "--repo-root", str(repo)],
+        [
+            "explore",
+            "profile",
+            *objects,
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+            *flags,
+        ],
         capsys,
     )
 
@@ -718,7 +728,10 @@ def test_profile_merges_into_existing_map_preserving_relationships_and_rank(
     hosts_before = _dataset(before, "RAW_HOSTS")
     assert hosts_before.rank_score is not None
 
-    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    # --refresh forces the re-profile: without it the just-mapped profile is a
+    # fresh cache hit, which the reuse tests below cover; here the merge path is
+    # what's under test.
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys, "--refresh")
     after = store.load_cache()
 
     assert [r.model_dump() for r in after.relationships] == rels_before
@@ -734,7 +747,7 @@ def test_profile_merges_into_existing_map_preserving_relationships_and_rank(
     assert "relationships preserved" in note
 
 
-def test_profile_refreshes_stale_profile_updates_profiled_at(
+def test_profile_refresh_forces_reprofile_updates_profiled_at(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
     repo = tmp_path / "repo"
@@ -746,13 +759,81 @@ def test_profile_refreshes_stale_profile_updates_profiled_at(
     reviews_stamp = _dataset(before, "RAW_REVIEWS").profiled_at
     assert old.profiled_at is not None
 
-    _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys, "--refresh")
     after = store.load_cache()
     new = _dataset(after, "RAW_HOSTS")
     assert new.profiled_at > old.profiled_at, "the fresh measurement wins"
     assert new.rank_score == old.rank_score
-    # A table not re-profiled keeps its older stamp, which marks its age.
+    # A table neither re-profiled nor requested keeps its older stamp.
     assert _dataset(after, "RAW_REVIEWS").profiled_at == reviews_stamp
+
+
+def test_profile_reuses_fresh_cached_profile(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """`explore profile` on a table `explore map` just profiled serves the
+    cached profile free: nothing is re-scanned, the profile is still returned,
+    and the stamp is untouched (issue #128)."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+    store = DexStore(repo)
+    stamp_before = _dataset(store.load_cache(), "RAW_HOSTS").profiled_at
+
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    assert payload["data"]["profiled_count"] == 0
+    assert payload["data"]["cache_hit_count"] == 1
+    # The cached profile is still served, columns and all, so a follow-on
+    # `explore query` on it works without a second scan.
+    served = payload["data"]["datasets"]
+    assert [d["identifier"].split(".")[-1] for d in served] == ["RAW_HOSTS"]
+    assert served[0]["columns"]
+    assert any("reused 1 fresh cached profile" in n for n in payload["data"]["notes"])
+    assert _dataset(store.load_cache(), "RAW_HOSTS").profiled_at == stamp_before
+
+    # --refresh forces the re-scan even though the cache is fresh.
+    refreshed = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys, "--refresh")
+    assert refreshed["data"]["profiled_count"] == 1
+    assert refreshed["data"]["cache_hit_count"] == 0
+
+
+def test_profile_freshness_zero_disables_reuse(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_config(DexConfig(profile_freshness_hours=0.0), repo)
+    _map(airbnb_duckdb, repo, capsys)
+    payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
+    assert payload["data"]["profiled_count"] == 1
+    assert payload["data"]["cache_hit_count"] == 0
+
+
+def test_profile_reprofiles_only_the_schema_changed_object(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """When one requested table's schema drifts between runs, `explore profile`
+    re-scans only it; the rest stay fresh cache hits."""
+
+    duckdb = pytest.importorskip("duckdb")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+
+    conn = duckdb.connect(str(airbnb_duckdb))
+    conn.execute("ALTER TABLE RAW_HOSTS ADD COLUMN extra VARCHAR")
+    conn.close()
+
+    payload = _profile(["RAW_HOSTS", "RAW_LISTINGS"], airbnb_duckdb, repo, capsys)
+    assert payload["data"]["profiled_count"] == 1
+    assert payload["data"]["cache_hit_count"] == 1
+    hosts = next(
+        d for d in payload["data"]["datasets"] if d["identifier"].endswith(".RAW_HOSTS")
+    )
+    assert any(c["name"] == "extra" for c in hosts["columns"]), (
+        "the re-profile saw the new column"
+    )
 
 
 def test_profile_inserts_new_dataset(airbnb_duckdb: Path, tmp_path: Path, capsys):

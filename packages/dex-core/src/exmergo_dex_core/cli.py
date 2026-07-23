@@ -151,10 +151,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
                 # Force a full re-profile even when the cache holds a fresh,
-                # schema-matching profile for a selected object (the default is
+                # schema-matching profile for a requested object (the default is
                 # skip-if-cached; --refresh is the escape hatch when the source
                 # changed in a way the cheap metadata check cannot see).
-                if group == "explore" and name in {"map", "relationships"}:
+                if group == "explore" and name in {"profile", "map", "relationships"}:
                     sp.add_argument(
                         "--refresh", action="store_true", default=argparse.SUPPRESS
                     )

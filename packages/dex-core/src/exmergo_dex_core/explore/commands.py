@@ -239,59 +239,103 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     over_ceiling = False
     try:
         identifiers = _resolve_identifiers(adapter, args.objects)
-        estimate, per_table = _profile_estimate(
-            adapter, identifiers, include_blobs=blob_paths
-        )
-        unconfirmed = command_args.billed_handshake(
-            "explore profile", adapter, estimate, per_table=per_table
-        )
-        if unconfirmed is not None:
-            return unconfirmed
         connector = adapter.name
-        # Checkpoint per object only on billed connectors: DuckDB can never
-        # exhaust budget and its re-runs are free, so the extra full-file writes
-        # (and O(n^2) serialization on large warehouses) are scoped precisely to
-        # the population the bug affects.
-        checkpoint = None
-        if command_args.cost_gate(adapter) is not None:
-            checkpoint, accumulated = _profile_checkpointer(
-                store, prior, connector, now
-            )
-        profile_reporter = _reporter(len(identifiers), "profiled", "objects")
-        try:
-            datasets = profile_mod.profile(
+        # Skip re-scanning a requested object whose cached profile is still fresh
+        # (same connector, schema unchanged, within the freshness window); only
+        # the stale remainder is estimated, confirmed, and profiled below. A
+        # profile written seconds earlier by `explore map` is served free, the
+        # same reuse `map` and `relationships` already honor (issue #128).
+        stale, fresh_reused = _split_fresh_stale(
+            identifiers,
+            prior,
+            connector,
+            adapter,
+            timedelta(hours=config.profile_freshness_hours),
+            now,
+            refresh=getattr(args, "refresh", False),
+        )
+        estimate, per_table = _profile_estimate(
+            adapter, stale, include_blobs=blob_paths
+        )
+        handshake_notes = None
+        if fresh_reused:
+            handshake_notes = [
+                f"{len(fresh_reused)} object(s) excluded from this estimate as "
+                "fresh-cached (schema unchanged, profiled within the freshness "
+                "window); pass --refresh to re-profile them"
+            ]
+        profiled: list[Dataset] = []
+        # Nothing stale means nothing to price or confirm: skip the handshake and
+        # the scan entirely, and serve the cached profiles wholesale.
+        if stale:
+            unconfirmed = command_args.billed_handshake(
+                "explore profile",
                 adapter,
-                identifiers,
-                progress=profile_reporter,
-                on_complete=checkpoint,
-                pii_overrides=override_paths,
-                include_blobs=blob_paths,
+                estimate,
+                per_table=per_table,
+                notes=handshake_notes,
             )
-            profile_reporter.done()
-        except OverCeilingError:
-            over_ceiling = True
+            if unconfirmed is not None:
+                return unconfirmed
+            # Checkpoint per object only on billed connectors: DuckDB can never
+            # exhaust budget and its re-runs are free, so the extra full-file
+            # writes (and O(n^2) serialization on large warehouses) are scoped
+            # precisely to the population the bug affects.
+            checkpoint = None
+            if command_args.cost_gate(adapter) is not None:
+                checkpoint, accumulated = _profile_checkpointer(
+                    store, prior, connector, now
+                )
+            profile_reporter = _reporter(len(stale), "profiled", "objects")
+            try:
+                profiled = profile_mod.profile(
+                    adapter,
+                    stale,
+                    progress=profile_reporter,
+                    on_complete=checkpoint,
+                    pii_overrides=override_paths,
+                    include_blobs=blob_paths,
+                )
+                profile_reporter.done()
+            except OverCeilingError:
+                over_ceiling = True
         envelope = env.ok({})
         command_args.stamp_spend(envelope, adapter)
     finally:
         adapter.close()
     if over_ceiling:
-        envelope = _over_ceiling_error(store, accumulated, len(identifiers))
+        envelope = _over_ceiling_error(store, accumulated, len(stale))
         command_args.stamp_spend(envelope, adapter)
         return envelope
-    _annotate_grain(datasets, defs)
+    # Only the freshly profiled need annotation; the fresh-cached already carry
+    # their candidate_keys and grain from the cache write that stored them.
+    _annotate_grain(profiled, defs)
+    # Freshly profiled plus fresh-cached: the full requested set, whether scanned
+    # this run or served from the cache.
+    datasets = profiled + list(fresh_reused.values())
 
     # Persist what the scan already paid for: after profiling a table, `explore
     # query` on that table must work without a second warehouse scan (the query
-    # firewall's own refusal messages promise exactly this). Prior relationships
-    # are preserved because profile runs no inference pass.
-    cache, stats = _merge_profiles(prior, datasets, connector, now)
+    # firewall's own refusal messages promise exactly this). Only the freshly
+    # profiled are merged; the reused already live in the cache untouched. Prior
+    # relationships are preserved because profile runs no inference pass.
+    cache, stats = _merge_profiles(prior, profiled, connector, now)
     path = store.save_cache(cache, now=now)
 
-    notes = [_persist_note(stats, len(datasets), keeps_relationships=True)]
+    notes = [_persist_note(stats, len(profiled), keeps_relationships=True)]
     notes.extend(_override_notes(datasets))
+    if fresh_reused:
+        window = config.profile_freshness_hours
+        notes.append(
+            f"reused {len(fresh_reused)} fresh cached profile(s) (schema "
+            f"unchanged, profiled within {window:g}h); pass --refresh to force "
+            "re-profiling"
+        )
     envelope.data.update(
         {
             "datasets": [d.model_dump(mode="json") for d in datasets],
+            "profiled_count": len(profiled),
+            "cache_hit_count": len(fresh_reused),
             "cache_path": str(path),
             "updated_at": now.isoformat(),
             "notes": notes,
@@ -326,7 +370,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         # connector, schema unchanged, within the freshness window); only the
         # stale remainder is estimated, confirmed, and profiled below.
         stale, fresh_reused = _split_fresh_stale(
-            metas,
+            [m.identifier for m in metas],
             prior,
             connector,
             adapter,
@@ -336,7 +380,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         )
         blob_paths = blob_override_paths(config.blob_overrides)
         estimate, per_table = _profile_estimate(
-            adapter, [m.identifier for m in stale], include_blobs=blob_paths
+            adapter, stale, include_blobs=blob_paths
         )
         handshake_notes = [
             "relationship inference profiles every object; on a metered "
@@ -381,7 +425,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             try:
                 profiled = profile_mod.profile(
                     adapter,
-                    [m.identifier for m in stale],
+                    stale,
                     progress=profile_reporter,
                     on_complete=checkpoint,
                     pii_overrides=pii_override_paths(config.pii_overrides),
@@ -671,7 +715,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         # (same connector, schema unchanged, within the freshness window); only
         # the stale remainder is estimated, confirmed, and profiled below.
         stale, fresh_reused = _split_fresh_stale(
-            selected,
+            [m.identifier for m in selected],
             prior,
             adapter.name,
             adapter,
@@ -683,7 +727,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         # them on re-issue; only the profiling scans below need the handshake.
         blob_paths = blob_override_paths(config.blob_overrides)
         estimate, per_table = _profile_estimate(
-            adapter, [m.identifier for m in stale], include_blobs=blob_paths
+            adapter, stale, include_blobs=blob_paths
         )
         handshake_notes: list[str] = []
         if getattr(args, "verify", False):
@@ -723,7 +767,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             try:
                 profiled = profile_mod.profile(
                     adapter,
-                    [m.identifier for m in stale],
+                    stale,
                     progress=profile_reporter,
                     on_complete=checkpoint,
                     pii_overrides=pii_override_paths(config.pii_overrides),
@@ -1505,7 +1549,7 @@ def _column_signature(columns) -> list[tuple[str, str, bool]]:
 
 
 def _split_fresh_stale(
-    metas: list[ObjectMeta],
+    identifiers: list[str],
     prior: DexCache | None,
     connector: str,
     adapter: Adapter,
@@ -1513,8 +1557,9 @@ def _split_fresh_stale(
     now: datetime,
     *,
     refresh: bool,
-) -> tuple[list[ObjectMeta], dict[str, Dataset]]:
-    """Split selected metas into (still need profiling, reusable-fresh datasets).
+) -> tuple[list[str], dict[str, Dataset]]:
+    """Split requested identifiers into (still need profiling, reusable-fresh
+    datasets).
 
     An object is *fresh* (skip the re-scan) only when its cached profile came
     from this same connector, was actually profiled before (has columns and a
@@ -1526,34 +1571,39 @@ def _split_fresh_stale(
 
     Freshness is fail-closed: a missing or unparseable ``profiled_at``, or any
     doubt, re-profiles rather than trusting a stale scan.
+
+    All three profiling commands share this gate but arrive holding identifiers
+    at different points — ``map``/``relationships`` from inventory metas,
+    ``profile`` from resolved arguments — so it works on the identifier strings
+    they have in common, not on ``ObjectMeta``.
     """
 
     if refresh or prior is None or prior.provenance.connector != connector:
-        return list(metas), {}
+        return list(identifiers), {}
 
     prior_by_id = {d.identifier: d for d in prior.datasets if d.columns}
-    stale: list[ObjectMeta] = []
+    stale: list[str] = []
     fresh: dict[str, Dataset] = {}
-    for meta in metas:
-        prior_ds = prior_by_id.get(meta.identifier)
+    for identifier in identifiers:
+        prior_ds = prior_by_id.get(identifier)
         if prior_ds is None or prior_ds.profiled_at is None:
-            stale.append(meta)
+            stale.append(identifier)
             continue
         try:
             profiled_at = datetime.fromisoformat(prior_ds.profiled_at)
         except ValueError:
-            stale.append(meta)
+            stale.append(identifier)
             continue
         if now - profiled_at > max_age:
-            stale.append(meta)
+            stale.append(identifier)
             continue
         # The same free, no-scan metadata call profile() makes first: confirms
         # the schema has not drifted since the cached profile was written.
-        _meta, columns = adapter.table_metadata(meta.identifier)
+        _meta, columns = adapter.table_metadata(identifier)
         if _column_signature(columns) != _column_signature(prior_ds.columns):
-            stale.append(meta)
+            stale.append(identifier)
             continue
-        fresh[meta.identifier] = prior_ds.model_copy(deep=True)
+        fresh[identifier] = prior_ds.model_copy(deep=True)
     return stale, fresh
 
 
