@@ -278,6 +278,8 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     budget = getattr(args, "budget", None)
     ceiling = budget if budget is not None else config.budget.ceiling
     connector = getattr(args, "connector", None) or config.connector
+    select = getattr(args, "select", None)
+    confirmed = bool(getattr(args, "confirm", False))
     paradigm = {
         "bigquery": Paradigm.BYTES_SCANNED,
         "snowflake": Paradigm.COMPUTE_TIME,
@@ -290,90 +292,82 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
+    dev_check = lambda: dev_target.check(project, target, effective, repo_root)  # noqa: E731
 
-    try:
-        summary, cost = run_build(
-            project,
-            target=target,
-            configured_target=config.dbt_target,
-            select=getattr(args, "select", None),
-            ceiling=ceiling,
-            confirmed=bool(getattr(args, "confirm", False)),
-            paradigm=paradigm,
-            dev_target_check=lambda: dev_target.check(
-                project, target, effective, repo_root
-            ),
-        )
-    except ConfirmationRequiredError as exc:
-        return env.needs_confirmation(
-            {
-                "command": "transform build",
-                "target": target,
-                "hint": "review the cost, then re-run with --confirm (and --budget "
-                "on billed connectors)",
-            },
-            cost=exc.cost,
-        )
+    # Free/local (DuckDB): nothing bills, so there is nothing to price. The engine
+    # runs the dev-target check and the confirm handshake itself, as before.
+    if paradigm is Paradigm.FREE_LOCAL:
+        try:
+            summary, cost = run_build(
+                project,
+                target=target,
+                configured_target=config.dbt_target,
+                select=select,
+                ceiling=ceiling,
+                confirmed=confirmed,
+                paradigm=paradigm,
+                dev_target_check=dev_check,
+            )
+        except ConfirmationRequiredError as exc:
+            return _confirmation_needed(target, exc.cost)
+        return _shape_build_result(summary, cost, paradigm, connector, repo_root)
 
-    messages = summary.pop("messages", [])
-    notes = summary.pop("notes", [])
-    if paradigm is Paradigm.BYTES_SCANNED:
-        notes = [
-            "dbt has no dry-run, so this build's scan size could not be "
-            "estimated upfront; each statement was capped server-side by the "
-            "profile's maximum_bytes_billed (a per-statement cap, not per run)",
-            *notes,
-        ]
-        billed = summary.get("bytes_billed")
-        if billed:
-            _record_build_spend(repo_root, connector, billed, "billed_bytes")
-    elif paradigm is Paradigm.COMPUTE_TIME:
-        cap_note = _COMPUTE_TIME_CAP_NOTES.get(
-            connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
-        )
-        notes = [
-            "dbt has no dry-run, so this build's warehouse time could not be "
-            f"estimated upfront; {cap_note}",
-            *notes,
-        ]
-        # dbt-snowflake, dbt-databricks, and dbt-redshift report no billing
-        # figure; per-node execution time is the honest compute-seconds actual.
-        seconds = sum(
-            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
-        )
-        if seconds:
-            summary["seconds_billed"] = seconds
-            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
-    elif paradigm is Paradigm.DB_LOAD:
-        notes = [
-            "dbt has no dry-run, so this build's database time could not be "
-            "estimated upfront; each statement was capped server-side by a "
-            "statement_timeout set to the ceiling (injected via PGOPTIONS)",
-            *notes,
-        ]
-        # dbt-postgres reports no billing figure; per-node execution time is
-        # the honest database-seconds actual.
-        seconds = sum(
-            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
-        )
-        if seconds:
-            summary["seconds_billed"] = seconds
-            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
-    if summary["success"]:
-        return env.ok(summary, cost=cost, warnings=[*notes, *messages])
-    # Agents triage from `errors` first, so the first real dbt message rides
-    # there; the rest stay in warnings.
-    deps_info = summary.get("deps")
-    prefix = (
-        "dbt deps failed"
-        if deps_info and not deps_info.get("success", True)
-        else "dbt build failed"
+    # Billed connectors get a real upfront estimate. The order mirrors the
+    # documented gate: the dev-target check runs first (free, and it must refuse a
+    # broken or undeployable target before anyone weighs a budget), then the build
+    # is priced by a free `dbt compile` dry-run, then the same confirm handshake
+    # `explore` uses gates the spend. The priced estimate is handed to the engine,
+    # whose own gate re-checks it as defense in depth.
+    #
+    # Pricing is best-effort by design: dex discovers its own connection while dbt
+    # reads profiles.yml, and the two can legitimately differ, so a connection dex
+    # cannot open (or a compile that fails) must never break a build dbt could have
+    # run. It degrades to no-estimate with a note; the ceiling and the server-side
+    # per-statement cap still bind.
+    dev_warnings = dev_check()
+    estimate, per_node, price_notes, adapter = _price_build(
+        args, project, target, select
     )
-    return env.error(
-        _failure_message(prefix, messages),
-        data=summary,
-        cost=cost,
-        warnings=[*notes, *(messages[1:] if messages else [])],
+    try:
+        if estimate is not None:
+            unconfirmed = command_args.billed_handshake(
+                "transform build",
+                adapter,
+                estimate,
+                per_table=per_node or None,
+                notes=price_notes or None,
+            )
+            if unconfirmed is not None:
+                return unconfirmed
+        try:
+            summary, cost = run_build(
+                project,
+                target=target,
+                configured_target=config.dbt_target,
+                select=select,
+                ceiling=ceiling,
+                confirmed=confirmed,
+                paradigm=paradigm,
+                estimate=estimate,
+                # The dev-target check already ran above; passing None keeps the
+                # engine from opening its own connection a second time.
+                dev_target_check=None,
+            )
+        except ConfirmationRequiredError as exc:
+            # Reached only when pricing degraded to no estimate; the note explains
+            # why the confirm ask carries no number.
+            return _confirmation_needed(target, exc.cost, notes=price_notes)
+    finally:
+        if adapter is not None:
+            adapter.close()
+
+    return _shape_build_result(
+        summary,
+        cost,
+        paradigm,
+        connector,
+        repo_root,
+        extra_notes=[*price_notes, *dev_warnings],
     )
 
 
@@ -441,6 +435,120 @@ def _record_build_spend(repo_root, connector: str, billed: float, field: str) ->
             "job_id": None,
             "statement_sha256": None,
         }
+    )
+
+
+def _price_build(args: argparse.Namespace, project, target: str, select: str | None):
+    """Price a billed build upfront with a free ``dbt compile`` dry-run.
+
+    Returns ``(estimate, per_node, notes, adapter)``. ``estimate`` is ``None``
+    when pricing could not be produced (no reachable dex connection, a compile
+    failure): the build still runs, gated by the ceiling and the server-side cap,
+    with a note saying why no number was shown. The adapter (when it opened) is
+    returned so the caller closes it after the run.
+    """
+
+    from .build import compile_estimate, needs_deps
+    from .build import deps as run_deps
+
+    adapter = None
+    try:
+        adapter = command_args.open_from_args(args)
+        # dbt compile refuses to run with declared-but-uninstalled packages, and
+        # deps writes only dbt_packages/ (never the warehouse), so installing it
+        # here during the free preflight is consistent and idempotent on the build.
+        if needs_deps(project):
+            run_deps(project)
+        estimate, per_node, notes = compile_estimate(
+            project, adapter, target=target, select=select
+        )
+        return estimate, per_node, notes, adapter
+    except Exception as exc:
+        note = (
+            f"could not price this build upfront ({type(exc).__name__}: {exc}); "
+            "the budget and the server-side per-statement cap still bind"
+        )
+        return None, {}, [env.redact(note)], adapter
+
+
+def _confirmation_needed(target: str, cost, notes=()) -> env.Envelope:
+    return env.needs_confirmation(
+        {
+            "command": "transform build",
+            "target": target,
+            "hint": "review the cost, then re-run with --confirm (and --budget on "
+            "billed connectors)",
+        },
+        cost=cost,
+        warnings=list(notes),
+    )
+
+
+def _shape_build_result(
+    summary: dict, cost, paradigm, connector: str, repo_root, extra_notes=()
+) -> env.Envelope:
+    """Shape a finished dbt run into the sanitized envelope, per paradigm.
+
+    ``extra_notes`` carries anything learned before the run (a degraded-pricing
+    note, dev-target warnings); the per-paradigm note explains the server-side cap
+    that binds the spend, and actual billed magnitude is recorded to the ledger.
+    """
+
+    from ..envelope import Paradigm
+
+    messages = summary.pop("messages", [])
+    notes = [*extra_notes, *summary.pop("notes", [])]
+    if paradigm is Paradigm.BYTES_SCANNED:
+        notes = [
+            "each statement was capped server-side by the profile's "
+            "maximum_bytes_billed (a per-statement cap, not per run)",
+            *notes,
+        ]
+        billed = summary.get("bytes_billed")
+        if billed:
+            _record_build_spend(repo_root, connector, billed, "billed_bytes")
+    elif paradigm is Paradigm.COMPUTE_TIME:
+        cap_note = _COMPUTE_TIME_CAP_NOTES.get(
+            connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
+        )
+        notes = [cap_note, *notes]
+        # dbt-snowflake, dbt-databricks, and dbt-redshift report no billing figure;
+        # per-node execution time is the honest compute-seconds actual.
+        seconds = sum(
+            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
+        )
+        if seconds:
+            summary["seconds_billed"] = seconds
+            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
+    elif paradigm is Paradigm.DB_LOAD:
+        notes = [
+            "each statement was capped server-side by a statement_timeout set to "
+            "the ceiling (injected via PGOPTIONS)",
+            *notes,
+        ]
+        # dbt-postgres reports no billing figure; per-node execution time is the
+        # honest database-seconds actual.
+        seconds = sum(
+            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
+        )
+        if seconds:
+            summary["seconds_billed"] = seconds
+            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
+    if summary["success"]:
+        return env.ok(summary, cost=cost, warnings=[*notes, *messages])
+    # Agents triage from `errors` first, so the first real dbt message rides there;
+    # the rest stay in warnings.
+    deps_info = summary.get("deps")
+    prefix = (
+        "dbt deps failed"
+        if deps_info and not deps_info.get("success", True)
+        else "dbt build failed"
+    )
+    return env.error(
+        _failure_message(prefix, messages),
+        data=summary,
+        cost=cost,
+        warnings=[*notes, *(messages[1:] if messages else [])],
     )
 
 

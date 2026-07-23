@@ -39,6 +39,26 @@ def _aggregate_resolver(sql: str):
     return [values]
 
 
+def _near_unique_not_proven_resolver(sql: str):
+    """Like `_aggregate_resolver`, but the exact-distinct escalation comes back
+    just short of proving column 0 unique (99 of 100, not 100 of 100). Column 0
+    stays a near-unique candidate without ever becoming a proven single-column
+    key, so `_probe_composite_keys` is not short-circuited: the composite-key
+    probe this fixture's tables can trigger actually runs, instead of being
+    skipped the way a proven key would skip it."""
+
+    values = {"n_total": 100}
+    for i in range(10):
+        values[f"nn_{i}"] = 100
+        values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"mn_{i}"] = 1
+        values[f"mx_{i}"] = 100
+        values[f"d_{i}"] = 99 if i == 0 else 40
+    values["nonnull_fk"] = 100
+    values["orphans"] = 0
+    return [values]
+
+
 def _adapter(fake_bq_client, *, confirmed: bool, budget: float | None, record=None):
     gate = CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
@@ -100,9 +120,11 @@ def test_unconfirmed_profile_returns_needs_confirmation(
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    # The single below-floor batch is priced at the per-query billing minimum.
-    assert envelope.cost.estimate == 10 * MB
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 10 * MB}
+    # The single below-floor batch floors to the per-query minimum, plus a
+    # floor reserved for each of the two possible escalation queries (2
+    # columns, 100 rows): 10 + 10 + 10 = 30 MB.
+    assert envelope.cost.estimate == 30 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 30 * MB}
     assert "--confirm" in envelope.data["hint"]
     # Nothing executed: only free metadata and dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -125,7 +147,7 @@ def test_confirmed_profile_runs_and_stamps_spend(
     )
     assert envelope.status.value == "ok"
     assert envelope.data["datasets"][0]["identifier"] == "test-proj.shop.customers"
-    assert envelope.cost.estimate == 10 * MB  # floored preflight estimate
+    assert envelope.cost.estimate == 30 * MB  # floored preflight estimate + reserve
     assert envelope.cost.ceiling == 100 * MB
     # The aggregate batch plus the exact-distinct escalation (optional spend
     # inside the confirmed budget): both scans land in the ledger.
@@ -139,9 +161,10 @@ def test_unconfirmed_map_estimates_selected_objects(
     route_adapter(fake_bq_client)
     envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
     assert envelope.status.value == "needs_confirmation"
-    # customers and events each floor to the per-query minimum; logs.requests
-    # needs a partition filter, so it contributes zero.
-    assert envelope.cost.estimate == 2 * 10 * MB
+    # customers and events each floor to the per-query minimum plus a floor
+    # per possible escalation query (30 MB apiece); logs.requests needs a
+    # partition filter, so it contributes zero.
+    assert envelope.cost.estimate == 2 * 30 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -201,7 +224,7 @@ def test_unconfirmed_map_excludes_fresh_cached_objects(
     assert envelope.status.value == "needs_confirmation"
     # Only events is priced now (customers is fresh-cached, requests is
     # partition-filtered to zero), so the estimate halves versus the no-cache run.
-    assert envelope.cost.estimate == 10 * MB
+    assert envelope.cost.estimate == 30 * MB
     assert "test-proj.shop.customers" not in envelope.data["per_table_bytes"]
     assert any("fresh-cached" in note for note in envelope.data["notes"])
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -226,6 +249,60 @@ def test_fully_fresh_map_needs_no_confirmation(fake_bq_client, route_adapter, tm
     assert envelope.data["cache_hit_count"] == 3
     # No estimate and no scan: not even a dry-run job was issued.
     assert fake_bq_client.query_calls == []
+
+
+def test_scoped_map_carries_forward_out_of_scope_dataset_profiles(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Regression for #111: a prior cache spanning three datasets, re-mapped
+    with --scope narrowed to just one of them, must not silently drop the
+    other two datasets' profiles from the cache."""
+
+    _seed_bq_map_cache(
+        tmp_path,
+        identifiers={
+            "test-proj.shop.customers",
+            "test-proj.shop.events",
+            "test-proj.logs.requests",
+        },
+    )
+
+    def scoped_opener(args):
+        gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=getattr(args, "budget", None),
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=getattr(args, "confirm", False),
+            connector="bigquery",
+            command="explore",
+        )
+        return BigQueryAdapter(
+            project="test-proj",
+            cost_gate=gate,
+            # Simulates --scope logs: this run's inventory only ever sees the
+            # logs dataset, never shop.customers or shop.events.
+            target=BigQueryTarget(datasets=["logs"]),
+            client=fake_bq_client,
+            principal_type="user",
+        )
+
+    monkeypatch.setattr(command_args, "open_from_args", scoped_opener)
+    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+
+    assert envelope.status.value == "ok"
+    assert envelope.data["out_of_scope_carried_count"] == 2
+    assert any(
+        "outside this run's --scope/--dataset" in note
+        for note in envelope.data["notes"]
+    )
+    cache = DexStore(tmp_path).load_cache()
+    identifiers = {d.identifier for d in cache.datasets}
+    assert identifiers == {
+        "test-proj.shop.customers",
+        "test-proj.shop.events",
+        "test-proj.logs.requests",
+    }
 
 
 def test_unconfirmed_relationships_recommends_map(
@@ -428,9 +505,15 @@ def test_verify_within_budget_runs_in_one_pass(fk_bq_client, route_adapter, tmp_
 def test_verify_beyond_budget_checkpoints_before_any_probe(
     fk_bq_client, route_adapter, tmp_path
 ):
-    # 20 MB covers the profiling handshake exactly (two tables floored to the
-    # per-query minimum each) but leaves no headroom for the two-table probe,
-    # which floors to another 20 MB.
+    # 60 MB matches profile_estimate()'s worst-case total exactly (two tables,
+    # each floored aggregate batch plus both possible escalation reserves: 30
+    # MB apiece), so the initial handshake just barely passes. A near-unique
+    # column that escalates without fully proving uniqueness (unlike the
+    # shared resolver's exact d_i == nd_i) leaves the composite-key probe
+    # un-short-circuited, so both escalations this fixture's estimate reserved
+    # for actually run and get charged -- leaving no headroom for the
+    # two-table verify probe, which floors to another 20 MB.
+    fk_bq_client.row_resolver = _near_unique_not_proven_resolver
     route_adapter(fk_bq_client)
     envelope = explore_cmds.cmd_map(
         _args(
@@ -438,7 +521,7 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
             subcommand="map",
             verify=True,
             confirm=True,
-            budget=float(20 * MB),
+            budget=float(60 * MB),
         )
     )
     assert envelope.status.value == "needs_confirmation"
@@ -449,7 +532,7 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     assert "--budget" in envelope.data["hint"]
     # The raised estimate is the whole-command total the re-run needs.
     assert envelope.cost.estimate > envelope.cost.ceiling
-    assert envelope.cost.ceiling == 20 * MB
+    assert envelope.cost.ceiling == 60 * MB
     # No probe was billed; profiling spend is reported on the checkpoint.
     assert not _probe_executed(fk_bq_client)
     assert envelope.data["spend"]["bytes_billed"] > 0
@@ -465,6 +548,7 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
 def test_relationships_verify_beyond_budget_checkpoints(
     fk_bq_client, route_adapter, tmp_path
 ):
+    fk_bq_client.row_resolver = _near_unique_not_proven_resolver
     route_adapter(fk_bq_client)
     envelope = explore_cmds.cmd_relationships(
         _args(
@@ -472,7 +556,7 @@ def test_relationships_verify_beyond_budget_checkpoints(
             subcommand="relationships",
             verify=True,
             confirm=True,
-            budget=float(20 * MB),
+            budget=float(60 * MB),
         )
     )
     assert envelope.status.value == "needs_confirmation"
@@ -499,7 +583,7 @@ def test_verify_with_no_candidates_skips_the_checkpoint(
             subcommand="map",
             verify=True,
             confirm=True,
-            budget=float(20 * MB),
+            budget=float(100 * MB),
         )
     )
     assert envelope.status.value == "ok"

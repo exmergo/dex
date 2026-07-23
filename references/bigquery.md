@@ -106,9 +106,11 @@ renders a single `dev` target with `method: oauth` (ADC; no secret
 is ever written), pointed at `bigquery.dev_dataset` (default `dbt_dev`), and
 refuses a dev dataset that is also a source. When `budget.ceiling` is set, the
 profile carries `maximum_bytes_billed` so every statement dbt runs is capped
-server-side; `transform build` has no upfront estimate (dbt has no dry-run)
-but still requires `--confirm` and a `--budget`, and its billed bytes land in
-the spend ledger.
+server-side. `transform build` surfaces an upfront byte estimate: it runs a free
+`dbt compile`, dry-runs each compiled node the same way `explore` prices a query,
+and sums the result (downstream nodes whose dev inputs are not built yet cannot
+be dry-run, so on a cold target the total is a partial floor). It still requires
+`--confirm` and a `--budget`, and its billed bytes land in the spend ledger.
 
 With `--layered-schemas`, the scaffolded `generate_schema_name` override makes
 each layer build into its own sibling dataset in the profile's project

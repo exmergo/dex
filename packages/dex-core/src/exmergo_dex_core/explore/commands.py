@@ -451,6 +451,11 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
         defs, [d.identifier for d in datasets]
     )
     rels, confirmed = _merge_relationships(declared, inferred)
+    # Prior relationships are only reusable when they came from the same
+    # connector, same as the profiles below.
+    reusable = prior if prior and prior.provenance.connector == connector else None
+    examined = {d.identifier for d in datasets}
+    rels, carried_relationships = _carry_forward_relationships(reusable, examined, rels)
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
     notes.extend(defs.notes)
@@ -483,10 +488,18 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "dataset mapped alongside its source)"
         )
     notes.extend(_generic_name_notes(suppressed))
+    if carried_relationships > 0:
+        notes.append(
+            f"carried forward {carried_relationships} prior relationship(s) "
+            "with an endpoint this run did not profile or reuse fresh (a "
+            "--scope/--dataset narrower than a prior run)"
+        )
 
-    # Persist the profiles this run already paid for. Because relationships
-    # inventories and profiles the full set and infers across all of it, its
-    # relationship set is authoritative for this run and replaces the prior one.
+    # Persist the profiles this run already paid for. Relationships inventories
+    # and profiles the full set and infers across all of it, so its relationship
+    # set is authoritative for every identifier it examined; anything with an
+    # endpoint outside that (a narrower --scope/--dataset than a prior run) is
+    # carried forward above rather than dropped, same as the profiles are.
     cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
     path = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
@@ -498,6 +511,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "inferred_count": len(rels) - len(declared),
             "profiled_count": len(profiled),
             "cache_hit_count": len(fresh_reused),
+            "carried_relationship_count": carried_relationships,
             "cache_path": str(path),
             "updated_at": now.isoformat(),
             # Merge, not overwrite: a verify checkpoint envelope may already
@@ -779,8 +793,14 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     relationships, confirmed = _merge_relationships(declared, inferred)
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
+    examined = {d.identifier for d in all_selected}
+    relationships, carried_relationships = _carry_forward_relationships(
+        reusable, examined, relationships
+    )
     final_scores = rank_mod.rank(metas, relationships, hints)
-    datasets, carried = _compose_datasets(metas, all_selected, final_scores, reusable)
+    datasets, carried, out_of_scope = _compose_datasets(
+        metas, all_selected, final_scores, reusable
+    )
 
     cache = DexCache(datasets=datasets, relationships=relationships)
     cache.provenance.connector = adapter.name
@@ -827,6 +847,17 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             f"carried forward {carried} prior profile(s) for objects not "
             "re-profiled this run; per-dataset profiled_at marks their age"
         )
+    if out_of_scope > 0:
+        notes.append(
+            f"carried forward {out_of_scope} prior profile(s) for object(s) "
+            "outside this run's --scope/--dataset; the cache stays complete "
+            "across every scope it has ever been mapped with, not just this one"
+        )
+    if carried_relationships > 0:
+        notes.append(
+            f"carried forward {carried_relationships} prior relationship(s) "
+            "with an endpoint this run did not profile or reuse fresh"
+        )
     if folded_edges > 0:
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
@@ -853,6 +884,8 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
             "cache_hit_count": len(fresh_reused),
             "skipped_count": skipped,
             "carried_forward_count": carried,
+            "out_of_scope_carried_count": out_of_scope,
+            "carried_relationship_count": carried_relationships,
             "relationship_count": len(relationships),
             "pii_column_count": pii_columns,
             "data_quality_note_count": quality_notes,
@@ -1251,6 +1284,15 @@ def _project_definitions(
     return dbt_project.definitions(repo_root, pin)
 
 
+def _relationship_edge_key(rel: Relationship) -> tuple:
+    return (
+        rel.from_dataset.lower(),
+        tuple(c.lower() for c in rel.from_columns),
+        rel.to_dataset.lower(),
+        tuple(c.lower() for c in rel.to_columns),
+    )
+
+
 def _merge_relationships(
     declared: list[Relationship], inferred: list[Relationship]
 ) -> tuple[list[Relationship], int]:
@@ -1261,23 +1303,47 @@ def _merge_relationships(
     note, and double-reporting the edge would inflate connectivity ranking.
     """
 
-    def edge_key(rel: Relationship) -> tuple:
-        return (
-            rel.from_dataset.lower(),
-            tuple(c.lower() for c in rel.from_columns),
-            rel.to_dataset.lower(),
-            tuple(c.lower() for c in rel.to_columns),
-        )
-
-    declared_keys = {edge_key(rel) for rel in declared}
+    declared_keys = {_relationship_edge_key(rel) for rel in declared}
     merged = list(declared)
     confirmed = 0
     for rel in inferred:
-        if edge_key(rel) in declared_keys:
+        if _relationship_edge_key(rel) in declared_keys:
             confirmed += 1
             continue
         merged.append(rel)
     return merged, confirmed
+
+
+def _carry_forward_relationships(
+    prior: DexCache | None,
+    examined: set[str],
+    relationships: list[Relationship],
+) -> tuple[list[Relationship], int]:
+    """Union back in any prior relationship this run could not possibly have
+    regenerated or superseded: one with an endpoint outside ``examined`` (the
+    identifiers this run actually profiled or reused fresh, not merely
+    inventoried -- a `--scope`/`--dataset` narrower than what built the prior
+    cache, or a rank-cutoff skip on a large `explore map`).
+
+    Without this, a narrower run silently drops every cross-scope edge the
+    prior cache held, the same loss `_compose_datasets` guards against for
+    datasets (issue #111). Deduped against the newly built set by the same
+    edge key `_merge_relationships` uses, so an edge both runs agree on is
+    never doubled.
+    """
+
+    if prior is None or not prior.relationships:
+        return relationships, 0
+    existing = {_relationship_edge_key(rel) for rel in relationships}
+    carried = [
+        rel
+        for rel in prior.relationships
+        if (rel.from_dataset not in examined or rel.to_dataset not in examined)
+        and _relationship_edge_key(rel) not in existing
+    ]
+    if not carried:
+        return relationships, 0
+    return relationships + carried, len(carried)
 
 
 def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
@@ -1496,9 +1562,10 @@ def _compose_datasets(
     profiled: list[Dataset],
     scores: dict[str, float],
     prior: DexCache | None,
-) -> tuple[list[Dataset], int]:
+) -> tuple[list[Dataset], int, int]:
     """Merge this run's profiles over the full inventory. Returns the composed
-    datasets plus how many prior profiles were carried forward.
+    datasets, how many prior profiles were carried forward within this run's
+    inventory, and how many were carried forward from entirely outside it.
 
     An object not profiled this run reuses its prior profile wholesale (columns,
     keys, grain, notes, and its original ``profiled_at``, which marks the age)
@@ -1506,12 +1573,21 @@ def _compose_datasets(
     score is refreshed. ``row_count`` stays the prior one so the carried record
     is internally consistent with its own notes and counts. Carried profiles do
     not feed relationship inference, which runs on this run's profiles only.
+
+    A prior dataset absent from ``metas`` entirely (a ``--scope``/``--dataset``
+    narrower than what built the prior cache) is carried forward untouched,
+    rank score included: this run's inventory never saw it, so it is not
+    stale, not superseded, and not this run's to drop from the cache (issue
+    #111). Its rank score is left alone rather than reset, since a score of
+    ``None`` would rank it last for no reason connectivity or naming ever
+    said was true; it just was not part of this run's ranking pass.
     """
 
     by_id = {d.identifier: d for d in profiled}
     prior_by_id = (
         {d.identifier: d for d in prior.datasets if d.columns} if prior else {}
     )
+    seen = {meta.identifier for meta in metas}
     datasets: list[Dataset] = []
     carried = 0
     for meta in metas:
@@ -1532,7 +1608,14 @@ def _compose_datasets(
                 )
         ds.rank_score = scores.get(meta.identifier)
         datasets.append(ds)
-    return datasets, carried
+
+    out_of_scope = 0
+    for identifier, previous in prior_by_id.items():
+        if identifier in seen:
+            continue
+        datasets.append(previous.model_copy(deep=True))
+        out_of_scope += 1
+    return datasets, carried, out_of_scope
 
 
 # Sentinel: preserve the prior cache's relationships (profile has no inference

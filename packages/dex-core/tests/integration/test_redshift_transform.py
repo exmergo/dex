@@ -106,6 +106,10 @@ def test_init_and_build_write_only_the_dev_schema(tmp_path: Path, capsys, dev_en
     data = envelope["data"]
     assert data["success"] is True
     assert any(n["name"] == "stg_orders" for n in data["nodes"])
+    # The build is priced upfront now: a heuristic compute-seconds estimate is
+    # surfaced before the run (the 5x budget covers it comfortably).
+    assert envelope["cost"]["estimate"] is not None
+    assert envelope["cost"]["estimate"] > 0
     assert data["seconds_billed"] > 0
     assert any("statement_timeout" in w for w in envelope["warnings"])
 

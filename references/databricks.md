@@ -89,7 +89,10 @@ not running (seconds for serverless, minutes for classic). Once you confirm a
 budget, the adapter runs an engine-built `DESCRIBE DETAIL` per table, charged
 inside the confirmed budget, never before it, to learn `sizeInBytes`: that
 sharpens later estimates, drives the sampling decision, and is noted per
-table when unavailable (some shared tables refuse it).
+table when unavailable (some shared tables refuse it). The same estimator
+prices `transform build`: each compiled model, snapshot, and test is estimated
+and summed into the build's upfront cost, labeled `estimate_quality: "low"`
+like any other Databricks estimate.
 
 **The budget is hard-enforced regardless of estimate quality.** Before every
 billed statement the session's `STATEMENT_TIMEOUT` is set to the remaining

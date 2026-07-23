@@ -174,8 +174,15 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
 - `transform build` accepts `--target` and `--select`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
-  the refusal. dbt runs with cwd pinned to the project dir (relative
-  `profiles.yml` paths resolve there, never against the caller's shell). When
+  the refusal. On a billed connector the cost gate is priced upfront: dex runs a
+  free `dbt compile` and dry-runs each compiled node through the connector's own
+  estimator (the same one `explore` uses), summing the result into the
+  `needs_confirmation` estimate. It is a partial floor when a cold dev target has
+  not built a node's inputs yet, and degrades to no estimate (with a note) when
+  dex cannot open its own connection; the ceiling and the server-side
+  per-statement cap bind regardless. dbt runs with cwd pinned to the project dir
+  (relative `profiles.yml` paths resolve there, never against the caller's
+  shell). When
   `packages.yml` (or a `dependencies.yml` with packages) is declared and
   `dbt_packages/` is missing, `dbt deps` runs automatically first; `transform
   deps` is the explicit install/refresh. A missing dev DuckDB database is an

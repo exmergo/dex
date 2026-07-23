@@ -16,13 +16,17 @@ from conftest import write_manifest
 from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
+    DexCache,
     DexStore,
     Relationship,
     RelationshipKind,
 )
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
-from exmergo_dex_core.explore.commands import _merge_relationships
+from exmergo_dex_core.explore.commands import (
+    _carry_forward_relationships,
+    _merge_relationships,
+)
 from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.explore.relationships import (
     candidate_keys,
@@ -967,6 +971,53 @@ def test_merge_keeps_declared_over_matching_inferred():
     merged, confirmed = _merge_relationships([declared], [same_inferred, other])
     assert confirmed == 1
     assert merged == [declared, other]
+
+
+def test_carry_forward_relationships_keeps_an_edge_this_run_never_examined():
+    """A prior relationship with an endpoint outside this run's --scope/
+    --dataset (never profiled or reused fresh) could not have been
+    regenerated or superseded by this run's inference, so it must not be
+    silently dropped from the cache (issue #111)."""
+
+    out_of_scope_edge = Relationship(
+        from_dataset="wh.raw.orders",
+        from_columns=["customer_id"],
+        to_dataset="wh.raw.customers",
+        to_columns=["id"],
+        confidence=0.85,
+    )
+    prior = DexCache(relationships=[out_of_scope_edge])
+    # This run only examined the marts dataset; raw.orders/raw.customers were
+    # never in scope at all.
+    examined = {"wh.marts.mart_orders"}
+    merged, carried = _carry_forward_relationships(prior, examined, [])
+    assert carried == 1
+    assert merged == [out_of_scope_edge]
+
+
+def test_carry_forward_relationships_does_not_duplicate_a_regenerated_edge():
+    """When this run's own inference already reproduced the same edge (both
+    endpoints examined), the prior copy is not also carried forward."""
+
+    edge = Relationship(
+        from_dataset="wh.raw.orders",
+        from_columns=["customer_id"],
+        to_dataset="wh.raw.customers",
+        to_columns=["id"],
+        confidence=0.6,
+    )
+    prior = DexCache(relationships=[edge])
+    examined = {"wh.raw.orders", "wh.raw.customers"}
+    fresh_edge = edge.model_copy(update={"confidence": 0.9})
+    merged, carried = _carry_forward_relationships(prior, examined, [fresh_edge])
+    assert carried == 0
+    assert merged == [fresh_edge]
+
+
+def test_carry_forward_relationships_without_a_prior_cache_is_a_noop():
+    merged, carried = _carry_forward_relationships(None, {"wh.raw.orders"}, [])
+    assert merged == []
+    assert carried == 0
 
 
 def _declared_join_repo(tmp_path: Path, *, with_manifest: bool) -> tuple[Path, Path]:
