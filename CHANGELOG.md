@@ -29,6 +29,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   silent only when a manifest proves nothing targets the namespace, falling
   back to the previous unconditional behavior when no manifest exists yet
   (a project's first build).
+- **A scoped `explore map` no longer drops out-of-scope datasets from the
+  cache** ([#111]). `explore map --scope <dataset>` (or `--dataset`) rebuilt
+  `.dex/cache.json` from only this run's inventory, so a scope narrower than
+  what built the existing cache silently discarded every other dataset's
+  profile, with `carried_forward_count: 0` and no warning: a subsequent
+  `explore query` against a dropped-but-still-real table then refused with
+  "not in the .dex cache". A prior dataset entirely absent from this run's
+  inventory is now carried forward untouched, and its own count
+  (`out_of_scope_carried_count`) and a note say so explicitly. `explore
+  relationships` and `explore map` also both used to replace the cache's
+  relationships wholesale from this run's inference alone; a relationship
+  with an endpoint outside what this run examined is now carried forward the
+  same way (`carried_relationship_count`), since neither declared-resolution
+  nor inference had visibility into that endpoint to regenerate or supersede
+  it. Re-running with the same scope as before was already unaffected by
+  this; only a scope *change* between runs triggered the loss.
 
 ## [1.3.0] - 2026-07-21
 
