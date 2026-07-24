@@ -244,8 +244,10 @@ still fresh (same connector, schema unchanged, profiled within
 re-scan and reported as `cache_hit_count`, so it never enters the cost preflight
 or the billed handshake. `--refresh` forces a full re-profile of every selected
 object even when the cache is fresh, for a source that changed in a way the free
-metadata check cannot see. `explore relationships` reuses fresh profiles the
-same way (`cache_hit_count`); both accept `--refresh`.
+metadata check cannot see. `explore relationships` and the standalone
+`explore profile <objects>` reuse fresh profiles the same way
+(`cache_hit_count`), so a `profile` on a table `map` just wrote is served free;
+all three accept `--refresh`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,
