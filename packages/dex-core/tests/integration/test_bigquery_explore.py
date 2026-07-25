@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, DexStore
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+from exmergo_dex_core.storage import FilesystemStore
 
 from .conftest import MAX_BYTES
 from .test_bigquery_connect import run_cli, seed_repo
@@ -102,7 +103,7 @@ def test_firewalled_query_round_trip(tmp_path: Path, capsys, bq_project: str):
     seed_repo(tmp_path, bq_project)
     # The firewall's PII policy is computed from the cache; seed it directly
     # (the cache is a non-canonical artifact) so this test scans once, not twice.
-    DexStore(tmp_path).save_cache(
+    FilesystemStore(tmp_path).save_cache(
         DexCache(
             datasets=[
                 Dataset(
@@ -162,7 +163,7 @@ def test_unnest_of_a_function_derived_array_runs_live(
     # literal, so the probe scans zero table bytes; a real column works the
     # same way (the unit suite covers taint inheritance).
     seed_repo(tmp_path, bq_project)
-    DexStore(tmp_path).save_cache(DexCache(datasets=[]))
+    FilesystemStore(tmp_path).save_cache(DexCache(datasets=[]))
     root = str(tmp_path)
 
     sql = 'SELECT k FROM UNNEST(JSON_EXTRACT_ARRAY(\'["x","y","z"]\')) AS k'
