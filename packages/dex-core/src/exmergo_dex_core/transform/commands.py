@@ -80,7 +80,7 @@ def cmd_init(args: argparse.Namespace, store: Store) -> env.Envelope:
     from . import dev_target
 
     fresh = load_config(repo_root) or DexConfig()
-    preflight = dev_target.content_check(fresh, repo_root, layered=layered)
+    preflight = dev_target.content_check(fresh, repo_root, layered=layered, store=store)
 
     return env.ok(
         {
@@ -290,7 +290,9 @@ def cmd_build(args: argparse.Namespace, store: Store) -> env.Envelope:
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
-    dev_check = lambda: dev_target.check(project, target, effective, repo_root)  # noqa: E731
+    dev_check = lambda: dev_target.check(  # noqa: E731
+        project, target, effective, repo_root, store=store
+    )
 
     # Free/local (DuckDB): nothing bills, so there is nothing to price. The engine
     # runs the dev-target check and the confirm handshake itself, as before.

@@ -244,6 +244,47 @@ def test_init_snowflake_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch
     assert "password" not in output
 
 
+def test_init_hands_the_content_preflight_a_store_for_a_billed_connector(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """A billed connector refuses to open without a store for its cost gate, and
+    the content preflight degrades to a note rather than raising. Those two
+    together mean a caller that forgets the store loses the check silently, with
+    a green envelope, so the wiring is pinned here rather than inferred."""
+
+    _seed_snowflake_config(tmp_path, warehouse="DEX_WH", dev_database="SCRATCH")
+    _patch_snowflake_discovery(
+        monkeypatch, {"account": "A", "user": "U", "private_key_file": "/k.p8"}
+    )
+
+    probed: list[tuple[str, ...]] = []
+    stores: list[object] = []
+
+    class _Probe:
+        def list_namespace_objects(self, *args):
+            probed.append(args)
+            return []
+
+        def close(self):
+            pass
+
+    def opener(*, store=None, **_kwargs):
+        # Stands in for connect._require_store, so the test fails the same way
+        # production did rather than only asserting a keyword was forwarded.
+        if store is None:
+            raise ValueError("opening 'snowflake' needs a store")
+        stores.append(store)
+        return _Probe()
+
+    _patch_open_adapter(monkeypatch, opener)
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "snowflake"), capsys)
+
+    assert rc == 0, envelope
+    assert stores, "the preflight opened no connection"
+    assert probed == [("SCRATCH", "DBT_DEV")]
+    assert envelope["warnings"] == []
+
+
 def test_init_snowflake_refuses_unpinned_warehouse_and_source_collision(
     tmp_path: Path, capsys, monkeypatch
 ):

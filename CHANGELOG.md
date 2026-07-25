@@ -30,6 +30,18 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **The `transform` dev-target preflight reaches billed connectors again**
+  ([#137]). The storage seam gave `open_adapter` a required store on metered
+  connectors, but the two preflight call sites in `transform/dev_target.py` still
+  opened without one. Every free existence, privilege, and content probe on
+  BigQuery, Snowflake, Databricks, Postgres, and Redshift therefore degraded to
+  "could not preflight the dev database", so `transform build` no longer refused
+  a missing Snowflake database or Databricks catalog, and `transform init` no
+  longer warned about a dev namespace that already held objects. Both call sites
+  now receive the store the command already holds. The degradation was silent by
+  design, because a connection dex cannot open must never break a build dbt could
+  have run, so there are now tests that fail if either caller stops passing it.
+
 - **`explore profile` now honors the same fresh-profile reuse as `explore map`
   and `explore relationships`** ([#128]). Profiling a table whose cached profile
   is still fresh (same connector, schema unchanged, profiled within
