@@ -1,0 +1,190 @@
+"""Plain files under `.dex/` in the user's repo: the CLI's backend.
+
+Layout (all non-secret, committed to the user's repo):
+
+    .dex/config.yml     non-secret config (see config.py; not a store document)
+    .dex/cache.json     the current DexCache (exploration artifacts)
+    .dex/snapshot.json  the maintain baseline (see maintain/snapshot.py)
+    .dex/drift.json     the last drift-detection report (see maintain/drift.py)
+    .dex/queries.jsonl  the append-only `explore query` decision ledger
+    .dex/spend.jsonl    the append-only billed-command ledger
+    .dex/plans/*.json   the stored transform plans
+
+State on disk is what lets the CLI subcommands stay stateless: the agent
+orchestrates multi-step flows by re-reading the cache and the dbt project between
+process invocations, and the session budget survives across commands because the
+spend ledger does. Both properties are why this, not
+:class:`~.memory.MemoryStore`, is the CLI default.
+
+This module is the only place in the engine that knows these file names.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from ..cache import DexCache
+from .base import Document, spend_total
+
+if TYPE_CHECKING:
+    from ..maintain.drift import DriftReport
+    from ..maintain.snapshot import Snapshot
+    from ..transform.plans import EditKind, TransformPlan
+
+DEX_DIR = ".dex"
+CACHE_FILE = "cache.json"
+SNAPSHOT_FILE = "snapshot.json"
+DRIFT_FILE = "drift.json"
+QUERIES_FILE = "queries.jsonl"
+SPEND_FILE = "spend.jsonl"
+PLANS_DIR = "plans"
+
+_DOCUMENT_FILES = {
+    Document.CACHE: CACHE_FILE,
+    Document.SNAPSHOT: SNAPSHOT_FILE,
+    Document.DRIFT: DRIFT_FILE,
+    Document.QUERY_LOG: QUERIES_FILE,
+    Document.SPEND_LOG: SPEND_FILE,
+}
+
+
+class FilesystemStore:
+    """Reads and writes the `.dex/` state for a given repo root."""
+
+    def __init__(self, repo_root: Path | str = "."):
+        self.root = Path(repo_root)
+        self.dex_dir = self.root / DEX_DIR
+        self.plans_dir = self.dex_dir / PLANS_DIR
+
+    # --- documents ------------------------------------------------------------
+
+    def load_cache(self) -> DexCache | None:
+        path = self.dex_dir / CACHE_FILE
+        if not path.is_file():
+            return None
+        return DexCache.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def save_cache(self, cache: DexCache, *, now: datetime | None = None) -> str:
+        if now is not None:
+            cache.provenance.updated_at = now.isoformat()
+        return self._write_document(Document.CACHE, cache.model_dump_json(indent=2))
+
+    def load_snapshot(self) -> Snapshot | None:
+        from ..maintain.snapshot import Snapshot
+
+        path = self.dex_dir / SNAPSHOT_FILE
+        if not path.is_file():
+            return None
+        return Snapshot.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def save_snapshot(self, snapshot: Snapshot) -> str:
+        return self._write_document(
+            Document.SNAPSHOT, snapshot.model_dump_json(indent=2)
+        )
+
+    def load_drift(self) -> DriftReport | None:
+        from ..maintain.drift import DriftReport
+
+        path = self.dex_dir / DRIFT_FILE
+        if not path.is_file():
+            return None
+        return DriftReport.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def save_drift(self, report: DriftReport) -> str:
+        return self._write_document(Document.DRIFT, report.model_dump_json(indent=2))
+
+    # --- ledgers --------------------------------------------------------------
+
+    def append_query_log(self, entry: dict) -> None:
+        self._append(Document.QUERY_LOG, entry)
+
+    def append_spend_log(self, entry: dict) -> None:
+        self._append(Document.SPEND_LOG, entry)
+
+    def spend_since(
+        self,
+        cutoff_iso: str,
+        *,
+        field: str = "billed_bytes",
+        connector: str | None = None,
+    ) -> float:
+        path = self.dex_dir / SPEND_FILE
+        if not path.is_file():
+            return 0.0
+        entries = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return spend_total(entries, cutoff_iso, field=field, connector=connector)
+
+    # --- plans ----------------------------------------------------------------
+
+    def save_plan(self, plan: TransformPlan) -> str:
+        self.plans_dir.mkdir(parents=True, exist_ok=True)
+        path = self.plans_dir / f"{plan.plan_id}.json"
+        path.write_text(
+            json.dumps(plan.model_dump(mode="json"), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def load_plan(self, plan_id: str) -> TransformPlan:
+        from ..transform.plans import PlanNotFoundError, TransformPlan
+
+        path = self.plans_dir / f"{plan_id}.json"
+        if not path.is_file():
+            raise PlanNotFoundError(
+                f"no plan '{plan_id}' under {self.plans_dir}; run `transform plan` "
+                "first or check the id"
+            )
+        return TransformPlan.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def list_plans(self) -> list[TransformPlan]:
+        plans = self._read_plans()
+        return sorted(plans, key=lambda p: p.created_at, reverse=True)
+
+    def latest_plan(self, kind: EditKind | None = None) -> TransformPlan | None:
+        candidates = [
+            plan
+            for plan in self._read_plans()
+            if plan.applied_at is None
+            and (kind is None or all(e.kind is kind for e in plan.edits))
+        ]
+        return max(candidates, key=lambda p: p.created_at, default=None)
+
+    def _read_plans(self) -> list[TransformPlan]:
+        from ..transform.plans import TransformPlan
+
+        if not self.plans_dir.is_dir():
+            return []
+        return [
+            TransformPlan.model_validate_json(path.read_text(encoding="utf-8"))
+            for path in self.plans_dir.glob("*.json")
+        ]
+
+    # --- locators -------------------------------------------------------------
+
+    def locator(self, document: Document) -> str:
+        return str(self.dex_dir / _DOCUMENT_FILES[document])
+
+    def plan_locator(self, plan_id: str) -> str:
+        return str(self.plans_dir / f"{plan_id}.json")
+
+    # --- shared write plumbing ------------------------------------------------
+
+    def _write_document(self, document: Document, body: str) -> str:
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        path = self.dex_dir / _DOCUMENT_FILES[document]
+        path.write_text(body + "\n", encoding="utf-8")
+        return str(path)
+
+    def _append(self, document: Document, entry: dict) -> None:
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        path = self.dex_dir / _DOCUMENT_FILES[document]
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
