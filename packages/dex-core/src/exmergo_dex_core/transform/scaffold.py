@@ -1,7 +1,7 @@
 """Deterministic authoring paths that need no agent-written content.
 
-Staging-model skeletons from the `.dex/` exploration cache: given a profiled
-table, emit a `stg_<table>.sql` skeleton (explicit column list over a source())
+Staging-model skeletons from the exploration cache: given a profiled table,
+emit a `stg_<table>.sql` skeleton (explicit column list over a source())
 and its per-model YAML with key tests and PII flags propagated into column
 `meta`. The cache is the only place PII flags live, so this is the mechanical
 bridge that carries them into emitted dbt; the agent then refines the skeleton
@@ -19,10 +19,10 @@ shipped version.
 from __future__ import annotations
 
 from importlib import resources
-from pathlib import Path
 
-from ..cache import Dataset, DexStore
+from ..cache import Dataset
 from ..dbt_project import DbtProjectView
+from ..storage import Store
 from .plans import EditKind, PlanEdit
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
@@ -46,10 +46,10 @@ class ScaffoldError(Exception):
     pass
 
 
-def scaffold_edits(tables: list[str], repo_root: Path | str = ".") -> list[PlanEdit]:
+def scaffold_edits(tables: list[str], store: Store) -> list[PlanEdit]:
     """Build the plan edits that scaffold staging models for the named tables."""
 
-    cache = DexStore(repo_root).load_cache()
+    cache = store.load_cache()
     if cache is None:
         raise ScaffoldError(
             "no .dex/cache.json; run `explore map` first so the scaffold has "

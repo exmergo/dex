@@ -35,7 +35,6 @@ from pathlib import Path
 
 import yaml
 
-from ..cache import DEX_DIR
 from ..config import CONFIG_FILE, DexConfig
 from ..dbt_project import (
     MANIFEST_PATH,
@@ -46,6 +45,7 @@ from ..dbt_project import (
     target_role,
 )
 from ..dbt_project import load as load_project
+from ..storage import DEX_DIR
 
 
 class DevTargetError(Exception):
