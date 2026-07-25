@@ -14,8 +14,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
-from .cache import DEX_DIR
 from .envelope import Paradigm
+from .storage import DEX_DIR
 
 CONFIG_FILE = "config.yml"
 

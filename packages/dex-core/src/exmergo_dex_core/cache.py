@@ -1,31 +1,23 @@
-"""The `.dex/` cache: dex's own scratch state, which is NOT the source of truth.
+"""The exploration cache: dex's own scratch state, which is NOT the source of truth.
 
 The source of truth is the dbt project (see dbt_project.py). This cache holds only
 what the dbt project has no home for: exploration artifacts (column profiles, PII
 flags, inferred relationships, candidate keys, grain candidates, rankings, and
-data-quality observations) and the reconcile snapshot. It informs dex's proposals;
-it is never authoritative. Delete `.dex/` and nothing canonical is lost: dex
-re-derives the cache from the dbt project and the warehouse.
+data-quality observations). It informs dex's proposals; it is never authoritative.
+Discard it and nothing canonical is lost: dex re-derives the cache from the dbt
+project and the warehouse.
 
-Persistence is plain files under `.dex/` in the user's repo (persistence is git,
-not a service). Secrets never live here.
+This module is the cache's shape. Where it is persisted is a backend choice that
+lives behind the storage contract (see storage/base.py). Secrets never live here.
 """
 
 from __future__ import annotations
 
-import json
-from datetime import datetime
 from enum import Enum
-from pathlib import Path
-from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-if TYPE_CHECKING:
-    from .maintain.drift import DriftReport
-    from .maintain.snapshot import Snapshot
-
-# Bump when the on-disk cache shape changes in a way old readers cannot handle.
+# Bump when the stored cache shape changes in a way old readers cannot handle.
 CACHE_SCHEMA_VERSION = 3
 
 
@@ -171,152 +163,10 @@ class CacheProvenance(BaseModel):
 
 
 class DexCache(BaseModel):
-    """The whole exploration cache for one repo. This is what `.dex/cache.json`
-    holds: what dex has learned about the warehouse, used to inform proposals
-    against the dbt project. Not canonical."""
+    """The whole exploration cache for one project: what dex has learned about the
+    warehouse, used to inform proposals against the dbt project. Not canonical."""
 
     schema_version: int = CACHE_SCHEMA_VERSION
     datasets: list[Dataset] = Field(default_factory=list)
     relationships: list[Relationship] = Field(default_factory=list)
     provenance: CacheProvenance = Field(default_factory=CacheProvenance)
-
-
-# --- .dex/ persistence -------------------------------------------------------
-#
-# Layout (all non-secret, committed to the user's repo):
-#   .dex/config.yml     non-secret config (see config.py)
-#   .dex/cache.json     the current DexCache (exploration artifacts)
-#   .dex/snapshot.json  the maintain baseline (see maintain/snapshot.py)
-#   .dex/drift.json     the last drift-detection report (see maintain/drift.py)
-
-DEX_DIR = ".dex"
-CACHE_FILE = "cache.json"
-SNAPSHOT_FILE = "snapshot.json"
-DRIFT_FILE = "drift.json"
-QUERIES_FILE = "queries.jsonl"
-SPEND_FILE = "spend.jsonl"
-
-
-class DexStore:
-    """Reads and writes the `.dex/` cache for a given repo root.
-
-    State is on disk, so the CLI subcommands stay stateless and the agent
-    orchestrates multi-step flows by re-reading the cache and the dbt project
-    between calls.
-    """
-
-    def __init__(self, repo_root: Path | str = "."):
-        self.root = Path(repo_root)
-        self.dex_dir = self.root / DEX_DIR
-
-    def exists(self) -> bool:
-        return self.dex_dir.is_dir()
-
-    def load_cache(self) -> DexCache | None:
-        path = self.dex_dir / CACHE_FILE
-        if not path.is_file():
-            return None
-        return DexCache.model_validate_json(path.read_text(encoding="utf-8"))
-
-    def save_cache(self, cache: DexCache, *, now: datetime | None = None) -> Path:
-        if now is not None:
-            cache.provenance.updated_at = now.isoformat()
-        self.dex_dir.mkdir(parents=True, exist_ok=True)
-        path = self.dex_dir / CACHE_FILE
-        path.write_text(cache.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        return path
-
-    def load_snapshot(self) -> Snapshot | None:
-        from .maintain.snapshot import Snapshot
-
-        path = self.dex_dir / SNAPSHOT_FILE
-        if not path.is_file():
-            return None
-        return Snapshot.model_validate_json(path.read_text(encoding="utf-8"))
-
-    def save_snapshot(self, snapshot: Snapshot) -> Path:
-        self.dex_dir.mkdir(parents=True, exist_ok=True)
-        path = self.dex_dir / SNAPSHOT_FILE
-        path.write_text(snapshot.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        return path
-
-    def load_drift(self) -> DriftReport | None:
-        from .maintain.drift import DriftReport
-
-        path = self.dex_dir / DRIFT_FILE
-        if not path.is_file():
-            return None
-        return DriftReport.model_validate_json(path.read_text(encoding="utf-8"))
-
-    def save_drift(self, report: DriftReport) -> Path:
-        self.dex_dir.mkdir(parents=True, exist_ok=True)
-        path = self.dex_dir / DRIFT_FILE
-        path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
-        return path
-
-    def append_query_log(self, entry: dict) -> Path:
-        """Append one `explore query` decision to `.dex/queries.jsonl`.
-
-        Refusals are logged too: the log is the audit trail and the product
-        signal for which probe shapes recur often enough to deserve promotion
-        to a named command. SQL text only, never result values.
-        """
-
-        self.dex_dir.mkdir(parents=True, exist_ok=True)
-        path = self.dex_dir / QUERIES_FILE
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry) + "\n")
-        return path
-
-    def append_spend_log(self, entry: dict) -> Path:
-        """Append one billed-command record to `.dex/spend.jsonl`.
-
-        The ledger is the audit trail for warehouse spend and the substrate for
-        the cumulative session budget: byte counts, job ids, and statement
-        hashes only, never SQL values or credentials.
-        """
-
-        self.dex_dir.mkdir(parents=True, exist_ok=True)
-        path = self.dex_dir / SPEND_FILE
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry) + "\n")
-        return path
-
-    def spend_since(
-        self,
-        cutoff_iso: str,
-        *,
-        field: str = "billed_bytes",
-        connector: str | None = None,
-    ) -> float:
-        """Total ``field`` recorded at or after ``cutoff_iso`` (ISO-8601).
-
-        ``field`` and ``connector`` keep paradigms separate: a session budget in
-        bytes must never absorb a seconds entry from another connector sharing
-        the ledger, so callers sum their own connector's own unit.
-
-        String comparison is correct here because every `at` stamp is written
-        by dex in the same UTC ISO format. Malformed lines are skipped rather
-        than poisoning the budget check.
-        """
-
-        path = self.dex_dir / SPEND_FILE
-        if not path.is_file():
-            return 0.0
-        total = 0.0
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if connector is not None and entry.get("connector") != connector:
-                continue
-            at = entry.get("at")
-            billed = entry.get(field)
-            if (
-                isinstance(at, str)
-                and at >= cutoff_iso
-                and isinstance(billed, (int, float))
-            ):
-                total += float(billed)
-        return total

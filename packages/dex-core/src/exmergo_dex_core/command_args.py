@@ -16,10 +16,10 @@ from pathlib import Path
 
 from . import envelope as env
 from .adapters.base import Adapter
-from .cache import DEX_DIR
 from .config import CONFIG_FILE
 from .connect import open_adapter
 from .guards.cost_guard import ConfirmationRequiredError, CostGate
+from .storage import DEX_DIR, Store
 
 
 def _resolve_dex_root(start: Path) -> Path | None:
@@ -62,7 +62,16 @@ def repo_root(args: argparse.Namespace) -> str:
     return str(resolved) if resolved is not None else raw
 
 
-def open_from_args(args: argparse.Namespace) -> Adapter:
+def open_from_args(args: argparse.Namespace, store: Store) -> Adapter:
+    """Open the adapter this command runs against.
+
+    ``store`` backs the cost gate: the session budget is settled against the spend
+    ledger, and every billed statement is recorded back into it. ``repo_root``
+    stays separate because it locates filesystem-only things (the config file, a
+    DuckDB path, the credential files a connector discovers), which no backend
+    choice moves.
+    """
+
     group = getattr(args, "group", None)
     subcommand = getattr(args, "subcommand", None)
     command = " ".join(part for part in (group, subcommand) if part) or None
@@ -73,6 +82,7 @@ def open_from_args(args: argparse.Namespace) -> Adapter:
         datasets=getattr(args, "dataset", None),
         scopes=getattr(args, "scope", None),
         repo_root=repo_root(args),
+        store=store,
         budget=getattr(args, "budget", None),
         confirmed=getattr(args, "confirm", False),
         command=command,
