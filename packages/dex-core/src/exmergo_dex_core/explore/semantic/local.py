@@ -22,8 +22,9 @@ from pathlib import Path
 from ... import command_args
 from ... import envelope as env
 from ...adapters import get_dialect
-from ...cache import DexStore, match_identifier
+from ...cache import match_identifier
 from ...config import QueryLimits, pii_override_paths
+from ...storage import Store
 from . import (
     PII_BLOCK_CONFIDENCE,
     DimensionInfo,
@@ -99,19 +100,19 @@ class LocalMetricFlowBackend:
         args,
         connector: str,
         limits: QueryLimits,
-        repo_root: str | Path = ".",
+        store: Store,
     ) -> None:
         self._project = project
         self._config = config
         self._args = args
         self._connector = connector
         self._limits = limits
-        self._repo_root = repo_root
+        self._store = store
         self._mf_engine = None
         self._dim_columns: dict[str, tuple[str, str]] | None = None
 
     @classmethod
-    def from_args(cls, args, config, repo_root: str) -> LocalMetricFlowBackend:
+    def from_args(cls, args, config, store: Store) -> LocalMetricFlowBackend:
         connector = getattr(args, "connector", None) or getattr(
             config, "connector", "duckdb"
         )
@@ -122,7 +123,7 @@ class LocalMetricFlowBackend:
             args,
             connector,
             limits,
-            repo_root,
+            store,
         )
 
     # ---- discovery ---------------------------------------------------------
@@ -250,7 +251,7 @@ class LocalMetricFlowBackend:
         except NotSelectOnlyError as exc:
             return env.error(f"rendered metric SQL was not read-only: {exc}")
 
-        adapter = command_args.open_from_args(self._args)
+        adapter = command_args.open_from_args(self._args, self._store)
         try:
             estimate_fn = getattr(adapter, "query_estimate", None)
             estimate = estimate_fn(sql) if estimate_fn else 0.0
@@ -281,7 +282,7 @@ class LocalMetricFlowBackend:
             adapter.close()
 
     def _load_cache(self):
-        """The ``.dex/`` cache with config PII overrides applied in memory, or None.
+        """The exploration cache with config PII overrides applied in memory, or None.
 
         Absence is not fatal here (unlike ``explore query``, whose whole policy is
         the cache): the metric query still has the name heuristic and the semantic
@@ -290,7 +291,7 @@ class LocalMetricFlowBackend:
         """
 
         try:
-            cache = DexStore(self._repo_root).load_cache()
+            cache = self._store.load_cache()
         except Exception:
             return None
         if cache is None:
