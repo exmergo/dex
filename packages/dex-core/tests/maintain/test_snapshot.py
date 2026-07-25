@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.cache import DexStore
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def test_snapshot_pins_cache_and_fingerprints_layers(maintain_repo):
@@ -24,7 +24,7 @@ def test_snapshot_pins_cache_and_fingerprints_layers(maintain_repo):
     assert data["semantic_layer"]["metric_count"] == 2
     assert "commit .dex/snapshot.json" in data["hint"]
 
-    snap = DexStore(maintain_repo.root).load_snapshot()
+    snap = FilesystemStore(maintain_repo.root).load_snapshot()
     identifiers = {d.identifier for d in snap.warehouse.datasets}
     assert identifiers == {
         "warehouse.main.customers",
@@ -76,7 +76,7 @@ def test_snapshot_without_cache_is_metadata_only(dex, tmp_path: Path):
     assert "metadata-only" in warnings
     assert "no dbt project" in warnings
 
-    snap = DexStore(root).load_snapshot()
+    snap = FilesystemStore(root).load_snapshot()
     assert snap.warehouse_from == "metadata"
     items = snap.warehouse.datasets[0]
     assert items.row_count == 2
@@ -86,7 +86,7 @@ def test_snapshot_without_cache_is_metadata_only(dex, tmp_path: Path):
 
 
 def test_snapshot_recaptures_on_connector_mismatch(maintain_repo):
-    store = DexStore(maintain_repo.root)
+    store = FilesystemStore(maintain_repo.root)
     cache = store.load_cache()
     cache.provenance.connector = "bigquery"
     store.save_cache(cache)

@@ -14,7 +14,7 @@ pytest.importorskip("google.cloud.bigquery")
 
 from exmergo_dex_core import command_args
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexStore
+from exmergo_dex_core.cache import ColumnProfile, Dataset
 from exmergo_dex_core.config import BigQueryTarget
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import (
@@ -24,6 +24,7 @@ from exmergo_dex_core.guards.cost_guard import (
 )
 from exmergo_dex_core.maintain import commands as maintain_cmds
 from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+from exmergo_dex_core.storage import FilesystemStore
 
 MB = 1024 * 1024
 
@@ -66,7 +67,7 @@ def _args(tmp_path: Path, subcommand: str, **extra) -> argparse.Namespace:
 @pytest.fixture
 def route_adapter(monkeypatch):
     def install(fake_client, record=None):
-        def opener(args):
+        def opener(args, store):
             return _adapter(
                 fake_client,
                 confirmed=getattr(args, "confirm", False),
@@ -99,7 +100,7 @@ def _seed_snapshot(tmp_path: Path, *, extra_baseline_column: bool = False) -> No
     if extra_baseline_column:
         columns.append(ColumnProfile(name="phone", data_type="STRING"))
     now = datetime.now(UTC).isoformat()
-    DexStore(tmp_path).save_snapshot(
+    FilesystemStore(tmp_path).save_snapshot(
         Snapshot(
             created_at=now,
             connector="bigquery",
@@ -127,14 +128,18 @@ def test_schema_and_volume_run_free_on_bigquery(
     _seed_snapshot(tmp_path, extra_baseline_column=True)
     route_adapter(fake_bq_client)
 
-    envelope = maintain_cmds.cmd_schema(_args(tmp_path, "schema"))
+    envelope = maintain_cmds.cmd_schema(
+        _args(tmp_path, "schema"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "ok"
     dropped = [f for f in envelope.data["findings"] if f["code"] == "column_dropped"]
     assert dropped and dropped[0]["column"] == "phone"
     # Structural detection is metadata-only: not even a dry-run job was issued.
     assert fake_bq_client.query_calls == []
 
-    envelope = maintain_cmds.cmd_volume(_args(tmp_path, "volume"))
+    envelope = maintain_cmds.cmd_volume(
+        _args(tmp_path, "volume"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "ok"
     assert fake_bq_client.query_calls == []
 
@@ -145,7 +150,9 @@ def test_unconfirmed_grain_returns_the_dry_run_estimate(
     _seed_snapshot(tmp_path)
     route_adapter(fake_bq_client)
 
-    envelope = maintain_cmds.cmd_grain(_args(tmp_path, "grain"))
+    envelope = maintain_cmds.cmd_grain(
+        _args(tmp_path, "grain"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
     # The single-table distinct-count scan floors to the per-query minimum.
@@ -164,7 +171,8 @@ def test_confirmed_grain_scans_within_budget_and_ledgers(
     route_adapter(fake_bq_client, record=entries.append)
 
     envelope = maintain_cmds.cmd_grain(
-        _args(tmp_path, "grain", confirm=True, budget=float(100 * MB))
+        _args(tmp_path, "grain", confirm=True, budget=float(100 * MB)),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     finding = envelope.data["findings"][0]
@@ -184,7 +192,9 @@ def test_confirmed_grain_without_a_budget_is_refused(
     _seed_snapshot(tmp_path)
     route_adapter(fake_bq_client)
     with pytest.raises(CeilingRequiredError):
-        maintain_cmds.cmd_grain(_args(tmp_path, "grain", confirm=True))
+        maintain_cmds.cmd_grain(
+            _args(tmp_path, "grain", confirm=True), FilesystemStore(tmp_path)
+        )
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -194,7 +204,10 @@ def test_over_ceiling_grain_cannot_be_confirmed_through(
     _seed_snapshot(tmp_path)
     route_adapter(fake_bq_client)
     with pytest.raises(OverCeilingError):
-        maintain_cmds.cmd_grain(_args(tmp_path, "grain", confirm=True, budget=1_000.0))
+        maintain_cmds.cmd_grain(
+            _args(tmp_path, "grain", confirm=True, budget=1_000.0),
+            FilesystemStore(tmp_path),
+        )
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -202,7 +215,9 @@ def test_unconfirmed_check_is_two_phase(fake_bq_client, route_adapter, tmp_path)
     _seed_snapshot(tmp_path, extra_baseline_column=True)
     route_adapter(fake_bq_client)
 
-    envelope = maintain_cmds.cmd_check(_args(tmp_path, "check"))
+    envelope = maintain_cmds.cmd_check(
+        _args(tmp_path, "check"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "needs_confirmation"
     # Phase one is complete and returned: the free axes' findings ride along
     # with the estimate for the scanning axes.
@@ -213,7 +228,7 @@ def test_unconfirmed_check_is_two_phase(fake_bq_client, route_adapter, tmp_path)
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
     # The free axes are already persisted for reconcile; grain waits.
-    report = DexStore(tmp_path).load_drift()
+    report = FilesystemStore(tmp_path).load_drift()
     assert "schema" in report.axes and "grain" not in report.axes
 
 
@@ -225,11 +240,12 @@ def test_confirmed_check_completes_the_scanning_axes(
     route_adapter(fake_bq_client)
 
     envelope = maintain_cmds.cmd_check(
-        _args(tmp_path, "check", confirm=True, budget=float(100 * MB))
+        _args(tmp_path, "check", confirm=True, budget=float(100 * MB)),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     assert envelope.data["axes"]["grain"] == 0
-    report = DexStore(tmp_path).load_drift()
+    report = FilesystemStore(tmp_path).load_drift()
     assert {"schema", "volume", "grain"} <= set(report.axes)
 
 
@@ -257,7 +273,7 @@ def _seed_two_keyed_tables(tmp_path: Path) -> None:
             profiled_at=now,
         )
 
-    DexStore(tmp_path).save_snapshot(
+    FilesystemStore(tmp_path).save_snapshot(
         Snapshot(
             created_at=now,
             connector="bigquery",
@@ -283,7 +299,9 @@ def test_check_fanout_estimate_reflects_per_query_floor(
     _seed_two_keyed_tables(tmp_path)
     route_adapter(fake_bq_client)
 
-    unconfirmed = maintain_cmds.cmd_check(_args(tmp_path, "check"))
+    unconfirmed = maintain_cmds.cmd_check(
+        _args(tmp_path, "check"), FilesystemStore(tmp_path)
+    )
     assert unconfirmed.status.value == "needs_confirmation"
     assert unconfirmed.data["estimated_bytes"] == 2 * 10 * MB
 
@@ -295,6 +313,7 @@ def test_check_fanout_estimate_reflects_per_query_floor(
             "check",
             confirm=True,
             budget=float(unconfirmed.data["estimated_bytes"]),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert confirmed.status.value == "ok"

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exmergo_dex_core.cache import DexStore
+from exmergo_dex_core.storage import FilesystemStore
 
 from .conftest import SEMANTIC_YAML
 
@@ -62,7 +62,7 @@ def test_check_sweeps_all_axes_and_ranks_by_blast_radius(maintain_repo):
     assert severities == sorted(severities, key=["high", "medium", "low"].index)
     assert "reconcile" in payload["data"]["hint"]
 
-    report = DexStore(maintain_repo.root).load_drift()
+    report = FilesystemStore(maintain_repo.root).load_drift()
     assert set(report.axes) == {"schema", "volume", "grain", "semantic"}
 
 

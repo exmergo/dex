@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exmergo_dex_core.cache import DexStore
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def _by_code(payload: dict) -> dict[str, list[dict]]:
@@ -63,7 +63,7 @@ def test_induced_column_drift_is_detected_and_traced(maintain_repo):
     assert severities == sorted(severities, key=["high", "medium", "low"].index)
 
     # The report is persisted for reconcile.
-    report = DexStore(maintain_repo.root).load_drift()
+    report = FilesystemStore(maintain_repo.root).load_drift()
     assert {f.code for f in report.axes["schema"].findings} >= {
         "column_added",
         "column_dropped",

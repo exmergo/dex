@@ -32,6 +32,7 @@ from exmergo_dex_core.explore.semantic import (
     screen_dimension_refs,
 )
 from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+from exmergo_dex_core.storage import MemoryStore
 
 
 class _Args:
@@ -129,18 +130,29 @@ def test_resolve_backend_selection(monkeypatch):
     monkeypatch.setattr(
         local_mod.LocalMetricFlowBackend,
         "from_args",
-        classmethod(lambda cls, args, config, root: "LOCAL"),
+        classmethod(lambda cls, args, config, store: "LOCAL"),
     )
     cfg = DexConfig()
-    assert sem.resolve_backend(_Args(api=True, local=False), cfg, ".") == "HOSTED"
-    assert sem.resolve_backend(_Args(api=False, local=True), cfg, ".") == "LOCAL"
+    assert (
+        sem.resolve_backend(_Args(api=True, local=False), cfg, ".", MemoryStore())
+        == "HOSTED"
+    )
+    assert (
+        sem.resolve_backend(_Args(api=False, local=True), cfg, ".", MemoryStore())
+        == "LOCAL"
+    )
     # default (no flag) follows config; a bare project defaults to local
-    assert sem.resolve_backend(_Args(api=False, local=False), cfg, ".") == "LOCAL"
+    assert (
+        sem.resolve_backend(_Args(api=False, local=False), cfg, ".", MemoryStore())
+        == "LOCAL"
+    )
     cfg_cloud = DexConfig(semantic={"backend": "dbt_cloud"})
-    hosted = sem.resolve_backend(_Args(api=False, local=False), cfg_cloud, ".")
+    hosted = sem.resolve_backend(
+        _Args(api=False, local=False), cfg_cloud, ".", MemoryStore()
+    )
     assert hosted == "HOSTED"
     with pytest.raises(sem.SemanticBackendError):
-        sem.resolve_backend(_Args(api=True, local=True), cfg, ".")
+        sem.resolve_backend(_Args(api=True, local=True), cfg, ".", MemoryStore())
 
 
 # ---- hosted backend (fake transport) ----------------------------------------
@@ -242,7 +254,7 @@ def _write_manifest(tmp_path: Path) -> Path:
 
 def test_local_list_reads_manifest(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _write_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _write_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     catalog = backend.list_definitions()
     assert catalog.backend == "local"
@@ -253,14 +265,18 @@ def test_local_list_reads_manifest(tmp_path: Path):
 
 
 def test_local_list_missing_manifest_errors(tmp_path: Path):
-    backend = LocalMetricFlowBackend(tmp_path, None, None, "duckdb", QueryLimits())
+    backend = LocalMetricFlowBackend(
+        tmp_path, None, None, "duckdb", QueryLimits(), MemoryStore()
+    )
     with pytest.raises(sem.SemanticBackendError):
         backend.list_definitions()
 
 
 def test_local_query_pii_gate_blocks_before_render(tmp_path: Path):
     # No manifest and no metricflow needed: the PII gate runs before rendering.
-    backend = LocalMetricFlowBackend(tmp_path, None, None, "duckdb", QueryLimits())
+    backend = LocalMetricFlowBackend(
+        tmp_path, None, None, "duckdb", QueryLimits(), MemoryStore()
+    )
     envelope = backend.query(
         SemanticQuery(metrics=["orders"], group_by=["customer__email"])
     )
@@ -310,7 +326,7 @@ def test_local_cache_pii_flag_blocks_a_clean_named_dimension(tmp_path: Path):
     # `order__contact` reads innocuous by name; the cache says its physical column
     # is flagged email. Evidence must block what the heuristic would have allowed.
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     cache = _cache_with(
         [
@@ -329,7 +345,7 @@ def test_local_cache_pii_flag_blocks_a_clean_named_dimension(tmp_path: Path):
 
 def test_local_cache_clears_a_profiled_unflagged_column(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     cache = _cache_with([ColumnProfile(name="contact_col", data_type="VARCHAR")])
     assert backend._cache_pii_lookup(cache)("order__contact") == {"pii": False}
@@ -337,7 +353,7 @@ def test_local_cache_clears_a_profiled_unflagged_column(tmp_path: Path):
 
 def test_local_cache_lookup_is_silent_on_unknown_dimensions(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     lookup = backend._cache_pii_lookup(_cache_with([]))
     # Not in the manifest at all, and a column the cache never profiled: both must
@@ -348,7 +364,7 @@ def test_local_cache_lookup_is_silent_on_unknown_dimensions(tmp_path: Path):
 
 def test_namespace_precheck_refuses_a_foreign_relation(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
     sql = "SELECT status FROM other_db.main.orders"
@@ -361,7 +377,7 @@ def test_namespace_precheck_accepts_a_suffix_match(tmp_path: Path):
     # The cache is connector-normalized, so a legitimate spelling that resolves by
     # suffix must pass rather than being rejected on an exact string compare.
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
     for sql in ("SELECT status FROM main.orders", "SELECT status FROM orders"):
@@ -371,7 +387,7 @@ def test_namespace_precheck_accepts_a_suffix_match(tmp_path: Path):
 def test_namespace_precheck_noops_without_an_inventory(tmp_path: Path):
     # No `explore map` yet: nothing to check against, so metric queries still run.
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits()
+        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
     )
     sql = "SELECT status FROM anything.at.all"
     assert backend._namespace_mismatch(sql, None, "duckdb") is None

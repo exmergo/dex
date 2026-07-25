@@ -12,6 +12,7 @@ import pytest
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DbtProjectError, contained_path
+from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit, PlanError
 from exmergo_dex_core.transform.plans import plan as make_plan
 from exmergo_dex_core.transform.scaffold import MACRO_ASSETS, macro_edit
@@ -242,7 +243,13 @@ def test_kind_and_surface_must_agree(dbt_project_dir: Path, tmp_path: Path):
         new_content="{% macro x() %}select 1{% endmacro %}",
     )
     with pytest.raises(PlanError, match="macro paths"):
-        make_plan("bad", [macro_in_models], dbt_project_dir, tmp_path)
+        make_plan(
+            "bad",
+            [macro_in_models],
+            dbt_project_dir,
+            tmp_path,
+            store=FilesystemStore(tmp_path),
+        )
 
     model_in_macros = PlanEdit(
         path="macros/x.sql",
@@ -250,7 +257,13 @@ def test_kind_and_surface_must_agree(dbt_project_dir: Path, tmp_path: Path):
         new_content="select 1",
     )
     with pytest.raises(PlanError, match="macro_sql"):
-        make_plan("bad", [model_in_macros], dbt_project_dir, tmp_path)
+        make_plan(
+            "bad",
+            [model_in_macros],
+            dbt_project_dir,
+            tmp_path,
+            store=FilesystemStore(tmp_path),
+        )
 
 
 def test_macro_validation_refuses_non_macro_content():

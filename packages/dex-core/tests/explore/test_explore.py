@@ -13,10 +13,11 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import Dataset, DexCache, DexStore
+from exmergo_dex_core.cache import Dataset, DexCache
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.explore.commands import _merged_hints
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def _run(argv: list[str], capsys) -> dict:
@@ -184,7 +185,7 @@ def test_relationships_reuses_fresh_cached_profiles(
         str(repo),
     ]
     _run(argv, capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
 
     payload = _run(argv, capsys)
@@ -236,7 +237,7 @@ def test_map_writes_cache_and_preserves_created_at(
     assert first["data"]["object_count"] == 2
     assert first["data"]["pii_column_count"] >= 1
 
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     cache1 = store.load_cache()
     assert cache1 is not None
     created = cache1.provenance.created_at
@@ -318,7 +319,7 @@ def test_map_carries_forward_prior_profiles(
         str(repo),
     ]
     _run([*argv, "--full"], capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
     assert all(first_stamps.values()), "a full map stamps every profile"
 
@@ -444,7 +445,7 @@ def test_map_reuses_fresh_cached_profiles(
         "--full",
     ]
     _run(argv, capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
 
     payload = _run(argv, capsys)
@@ -479,7 +480,7 @@ def test_map_reprofiles_only_the_schema_changed_object(
         "--full",
     ]
     _run(argv, capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     first_stamps = {d.identifier: d.profiled_at for d in store.load_cache().datasets}
 
     conn = duckdb.connect(str(many_tables_duckdb))
@@ -659,7 +660,7 @@ def test_map_declared_grain_overrides_heuristic(tmp_path: Path, capsys):
         ],
         capsys,
     )
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     (orders,) = [d for d in cache.datasets if d.identifier.endswith(".orders")]
     # The heuristic would pick the id-shaped key; the declared primary entity wins.
     assert orders.grain == ["order_code"]
@@ -681,7 +682,7 @@ def test_map_notes_declared_unique_contradiction(tmp_path: Path, capsys):
         ],
         capsys,
     )
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     (orders,) = [d for d in cache.datasets if d.identifier.endswith(".orders")]
     assert any(
         "status is declared unique" in n and "duplicates" in n
@@ -724,7 +725,7 @@ def test_exploration_starts_bare_and_discovers_the_project(tmp_path: Path, capsy
     assert any("--use-project" in n for n in notes)
     # The empty-declared note adapts: the project exists, it just was not used.
     assert not any("no dbt project" in n for n in notes)
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     (orders,) = [d for d in cache.datasets if d.identifier.endswith(".orders")]
     assert orders.grain == ["id"]
     assert not any("declared" in n for n in orders.data_quality)

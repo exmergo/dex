@@ -730,7 +730,7 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
-    monkeypatch.setattr(command_args, "open_from_args", lambda args: adapter)
+    monkeypatch.setattr(command_args, "open_from_args", lambda args, store: adapter)
     monkeypatch.setattr(
         build_module,
         "compile_estimate",
@@ -846,7 +846,7 @@ def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
 
     monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
 
-    def boom(args):
+    def boom(args, store):
         raise RuntimeError("no application default credentials")
 
     monkeypatch.setattr(command_args, "open_from_args", boom)

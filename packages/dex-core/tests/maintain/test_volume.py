@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exmergo_dex_core.cache import DexStore
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def test_clean_warehouse_reports_no_volume_drift(maintain_repo):
@@ -51,7 +51,7 @@ def test_axis_results_merge_in_drift_json(maintain_repo):
     maintain_repo.dex("maintain", "schema")
     maintain_repo.dex("maintain", "volume")
 
-    report = DexStore(maintain_repo.root).load_drift()
+    report = FilesystemStore(maintain_repo.root).load_drift()
     assert set(report.axes) == {"schema", "volume"}
     assert report.axes["schema"].findings and report.axes["volume"].findings
 
@@ -66,5 +66,5 @@ def test_axis_results_merge_in_drift_json(maintain_repo):
     maintain_repo.snapshot()
     _rc, payload = maintain_repo.dex("maintain", "volume")
     assert payload["data"]["finding_count"] == 0
-    report = DexStore(maintain_repo.root).load_drift()
+    report = FilesystemStore(maintain_repo.root).load_drift()
     assert set(report.axes) == {"volume"}
