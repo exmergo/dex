@@ -9,6 +9,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`.dex/` state now lives behind an injectable storage seam** ([#137]). All
+  persistence used to run through two concrete, filesystem-bound classes that
+  every call site constructed for itself from a repo root, so there was no way to
+  substitute a non-filesystem backend. There is now a `Store` protocol in a new
+  `exmergo_dex_core.storage` package, with two implementations: `FilesystemStore`
+  (plain files under `.dex/`, byte for byte what shipped before, and still what
+  the CLI uses) and `MemoryStore` (in-process, retains everything for the process
+  lifetime, writes nothing to disk). The backend is chosen once, at the CLI entry
+  point, and passed to every command. This is internal plumbing: the command
+  surface, every envelope field, and all user-visible behavior are unchanged. The
+  dbt project remains the source of truth and stays a git-reviewable filesystem
+  artifact regardless of backend; only the non-canonical scratch cache moves.
+  Internally, `DexStore` and `PlanStore` are replaced by the single
+  `FilesystemStore`, and the envelope's `cache_path`, `snapshot_path`,
+  `drift_path`, and `plan_path` now carry a backend-supplied locator string
+  (an absolute path, as before, on the filesystem backend).
+
 ### Fixed
 
 - **`explore profile` now honors the same fresh-profile reuse as `explore map`
