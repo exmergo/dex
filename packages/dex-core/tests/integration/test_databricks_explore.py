@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, DexStore
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+from exmergo_dex_core.storage import FilesystemStore
 
 from .conftest import DBX_MAX_SECONDS
 from .test_databricks_connect import SAMPLE_SCOPE, run_cli, seed_repo
@@ -115,7 +116,7 @@ def test_firewalled_query_round_trip(
     seed_repo(tmp_path, dbx_warehouse, dbx_scratch_catalog)
     # The firewall's PII policy is computed from the cache; seed it directly
     # (the cache is a non-canonical artifact) so this test scans once, not twice.
-    DexStore(tmp_path).save_cache(
+    FilesystemStore(tmp_path).save_cache(
         DexCache(
             datasets=[
                 Dataset(
@@ -156,7 +157,7 @@ def test_lateral_view_explode_runs_live(
     # the 5-row region sample: each region row fans out to the two keys of a
     # literal JSON object through an allowlisted function.
     seed_repo(tmp_path, dbx_warehouse, dbx_scratch_catalog)
-    DexStore(tmp_path).save_cache(
+    FilesystemStore(tmp_path).save_cache(
         DexCache(
             datasets=[
                 Dataset(

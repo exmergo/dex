@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, DexStore
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+from exmergo_dex_core.storage import FilesystemStore
 
 from .conftest import SF_MAX_SECONDS
 from .test_snowflake_connect import SAMPLE_SCOPE, run_cli, seed_repo
@@ -127,7 +128,7 @@ def test_firewalled_query_round_trip(
     seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
     # The firewall's PII policy is computed from the cache; seed it directly
     # (the cache is a non-canonical artifact) so this test scans once, not twice.
-    DexStore(tmp_path).save_cache(
+    FilesystemStore(tmp_path).save_cache(
         DexCache(
             datasets=[
                 Dataset(
@@ -169,7 +170,7 @@ def test_flatten_of_a_parsed_json_literal_runs_live(
     # table is read; a VARIANT column works the same way (the unit suite
     # covers taint inheritance).
     seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
-    DexStore(tmp_path).save_cache(DexCache(datasets=[]))
+    FilesystemStore(tmp_path).save_cache(DexCache(datasets=[]))
     rc, envelope = run_cli(
         [
             "--repo-root",

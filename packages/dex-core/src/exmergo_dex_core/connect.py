@@ -36,7 +36,6 @@ import yaml
 
 from .adapters import get_adapter
 from .adapters.base import scope_within
-from .cache import DexStore
 from .config import (
     BigQueryTarget,
     DatabricksTarget,
@@ -48,6 +47,7 @@ from .config import (
 )
 from .envelope import Paradigm
 from .guards.cost_guard import CostGate
+from .storage import Store
 
 
 class CredentialDiscoveryError(Exception):
@@ -88,6 +88,7 @@ def open_adapter(
     datasets: list[str] | None = None,
     scopes: list[str] | None = None,
     repo_root: str | Path = ".",
+    store: Store | None = None,
     budget: float | None = None,
     confirmed: bool = False,
     command: str | None = None,
@@ -100,7 +101,9 @@ def open_adapter(
     vocabulary; ``project``/``datasets`` are BigQuery's older spelling of the
     same idea. None of them are written back to config.
     ``budget``/``confirmed`` feed the cost gate on billed connectors and are
-    ignored by free ones; ``command`` labels ledger entries.
+    ignored by free ones; ``command`` labels ledger entries. ``store`` is where the
+    gate settles the session budget and records spend; it is required on a billed
+    connector and unused by a free one, so a DuckDB read needs no store at all.
     """
 
     loaded = load_config(repo_root)
@@ -144,6 +147,7 @@ def open_adapter(
         return _open_bigquery(
             config,
             repo_root,
+            store=_require_store(store, connector),
             budget=budget,
             confirmed=confirmed,
             command=command,
@@ -158,6 +162,7 @@ def open_adapter(
         return _open_snowflake(
             config,
             repo_root,
+            store=_require_store(store, connector),
             budget=budget,
             confirmed=confirmed,
             command=command,
@@ -168,6 +173,7 @@ def open_adapter(
         return _open_databricks(
             config,
             repo_root,
+            store=_require_store(store, connector),
             budget=budget,
             confirmed=confirmed,
             command=command,
@@ -178,6 +184,7 @@ def open_adapter(
         return _open_postgres(
             config,
             repo_root,
+            store=_require_store(store, connector),
             budget=budget,
             confirmed=confirmed,
             command=command,
@@ -188,6 +195,7 @@ def open_adapter(
         return _open_redshift(
             config,
             repo_root,
+            store=_require_store(store, connector),
             budget=budget,
             confirmed=confirmed,
             command=command,
@@ -195,6 +203,25 @@ def open_adapter(
         )
 
     return get_adapter(connector)
+
+
+def _require_store(store: Store | None, connector: str) -> Store:
+    """The store a billed connector's cost gate cannot do without.
+
+    The gate settles the cumulative session budget against the spend ledger and
+    records every billed statement back into it, so opening a metered connection
+    with nowhere to read or write that ledger would silently run unbudgeted. Free
+    connectors (DuckDB) have no gate and need no store.
+    """
+
+    if store is None:
+        raise ValueError(
+            f"opening '{connector}' needs a store: its cost gate settles the "
+            "session budget against the spend ledger and records spend back into "
+            "it. Pass store= (the CLI passes the filesystem store it built from "
+            "--repo-root)"
+        )
+    return store
 
 
 def assert_scope_vocabulary(
@@ -287,6 +314,7 @@ def _open_bigquery(
     config: DexConfig,
     repo_root: str | Path,
     *,
+    store: Store,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -311,7 +339,6 @@ def _open_bigquery(
             "`gcloud auth application-default login`)"
         )
 
-    store = DexStore(repo_root)
     utc_midnight = (
         datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     )
@@ -340,6 +367,7 @@ def _open_snowflake(
     config: DexConfig,
     repo_root: str | Path,
     *,
+    store: Store,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -363,7 +391,6 @@ def _open_snowflake(
     params.setdefault("client_session_keep_alive", False)
     connection = snowflake.connector.connect(**params)
 
-    store = DexStore(repo_root)
     utc_midnight = (
         datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     )
@@ -596,6 +623,7 @@ def _open_databricks(
     config: DexConfig,
     repo_root: str | Path,
     *,
+    store: Store,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -630,7 +658,6 @@ def _open_databricks(
             user_agent_entry="dex",
         )
 
-    store = DexStore(repo_root)
     utc_midnight = (
         datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     )
@@ -826,6 +853,7 @@ def _open_postgres(
     config: DexConfig,
     repo_root: str | Path,
     *,
+    store: Store,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -849,7 +877,6 @@ def _open_postgres(
     # read-only before any statement runs.
     connection = psycopg.connect(**params, autocommit=True, application_name="dex")
 
-    store = DexStore(repo_root)
     utc_midnight = (
         datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     )
@@ -1092,6 +1119,7 @@ def _open_redshift(
     config: DexConfig,
     repo_root: str | Path,
     *,
+    store: Store,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -1117,7 +1145,6 @@ def _open_redshift(
     # on first contact, and a slow resume can reset the startup handshake.
     connection = _connect_redshift(redshift_connector, params)
 
-    store = DexStore(repo_root)
     utc_midnight = (
         datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     )

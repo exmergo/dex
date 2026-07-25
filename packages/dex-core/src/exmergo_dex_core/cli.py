@@ -3,8 +3,12 @@
 SKILL.md / AGENTS.md tell the agent which subcommand to run; a thin PEP 723
 wrapper runs it via ``uv run``; this module prints exactly one sanitized JSON
 envelope to stdout and nothing else. Subcommands are stateless (state lives in the
-dbt project, which is the source of truth, plus the ``.dex/`` cache), so the agent
-orchestrates multi-step flows.
+dbt project, which is the source of truth, plus the scratch state the store holds),
+so the agent orchestrates multi-step flows.
+
+This is also where the storage backend is chosen: ``main`` builds one
+``FilesystemStore`` from the resolved repo root and hands it to every command, so
+no command decides for itself where state lands.
 
 ``connect test``, the ``explore`` group, the authoring surface (``transform``,
 ``semantic``), and the ``maintain`` group are live. ``viz preview`` returns a
@@ -18,6 +22,7 @@ import argparse
 import sys
 
 from . import envelope as env
+from .storage import FilesystemStore, Store
 
 # The full command surface. Group -> its subcommands.
 COMMAND_SURFACE: dict[str, list[str]] = {
@@ -206,10 +211,10 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _connect_test(args: argparse.Namespace) -> env.Envelope:
+def _connect_test(args: argparse.Namespace, store: Store) -> env.Envelope:
     from .command_args import open_from_args
 
-    adapter = open_from_args(args)
+    adapter = open_from_args(args, store)
     try:
         # A free probe on every connector, but the envelope's cost paradigm
         # reflects the connector so the agent knows what later commands bill in.
@@ -220,13 +225,13 @@ def _connect_test(args: argparse.Namespace) -> env.Envelope:
         adapter.close()
 
 
-def dispatch(args: argparse.Namespace) -> env.Envelope:
+def dispatch(args: argparse.Namespace, store: Store) -> env.Envelope:
     command = args.group + (
         f" {args.subcommand}" if getattr(args, "subcommand", None) else ""
     )
 
     if args.group == "connect" and args.subcommand == "test":
-        return _connect_test(args)
+        return _connect_test(args, store)
 
     if args.group == "explore":
         from .explore import commands as explore_cmds
@@ -240,7 +245,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             "cluster": explore_cmds.cmd_cluster,
             "semantic": explore_cmds.cmd_semantic,
         }
-        return handlers[args.subcommand](args)
+        return handlers[args.subcommand](args, store)
 
     # The transform skill fronts the authoring surface (transform, semantic);
     # they share one plan store and one write path, so one command module serves
@@ -271,7 +276,7 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
         }
         handler = handlers.get(args.subcommand)
         if handler is not None:
-            return handler(args)
+            return handler(args, store)
 
     if (args.group, args.subcommand) in transform_surface:
         from .transform import commands as transform_cmds
@@ -288,17 +293,23 @@ def dispatch(args: argparse.Namespace) -> env.Envelope:
             ("semantic", "update"): transform_cmds.cmd_semantic_update,
             ("semantic", "plan"): transform_cmds.cmd_semantic_plan,
         }
-        return handlers[(args.group, args.subcommand)](args)
+        return handlers[(args.group, args.subcommand)](args, store)
 
     # Everything else is scaffolded against the contract but not yet built.
     return env.not_implemented(command)
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .command_args import repo_root
+
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # The CLI's backend choice, made once: state on disk under `.dex/` is what
+    # lets the subcommands stay stateless across process invocations, and what
+    # carries the cumulative session budget from one command to the next.
+    store = FilesystemStore(repo_root(args))
     try:
-        envelope = dispatch(args)
+        envelope = dispatch(args, store)
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
         # loudly in tests and CI rather than shipping a leak.

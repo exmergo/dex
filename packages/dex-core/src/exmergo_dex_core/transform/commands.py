@@ -21,9 +21,10 @@ import yaml
 from .. import command_args
 from .. import envelope as env
 from ..dbt_project import ApplyResult, EditOp
+from ..storage import Store
 from . import plans as plans_mod
 from . import semantic as semantic_mod
-from .plans import EditKind, PlanEdit, PlanStore
+from .plans import EditKind, PlanEdit
 
 # What actually caps a dbt statement server-side, per compute-time connector:
 # a per-connector fact, kept out of the shared build arm so the next connector
@@ -40,7 +41,7 @@ _DEFAULT_COMPUTE_TIME_CAP_NOTE = (
 )
 
 
-def cmd_init(args: argparse.Namespace) -> env.Envelope:
+def cmd_init(args: argparse.Namespace, store: Store) -> env.Envelope:
     from ..config import DexConfig, load_config
     from . import init as init_mod
 
@@ -79,7 +80,7 @@ def cmd_init(args: argparse.Namespace) -> env.Envelope:
     from . import dev_target
 
     fresh = load_config(repo_root) or DexConfig()
-    preflight = dev_target.content_check(fresh, repo_root, layered=layered)
+    preflight = dev_target.content_check(fresh, repo_root, layered=layered, store=store)
 
     return env.ok(
         {
@@ -96,7 +97,7 @@ def cmd_init(args: argparse.Namespace) -> env.Envelope:
     )
 
 
-def cmd_plan(args: argparse.Namespace) -> env.Envelope:
+def cmd_plan(args: argparse.Namespace, store: Store) -> env.Envelope:
     intent = getattr(args, "argument", None) or ""
     edits = _edits_from_payload(getattr(args, "edits_file", None))
 
@@ -104,10 +105,7 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
     if scaffold_tables:
         from . import scaffold as scaffold_mod
 
-        edits = (
-            scaffold_mod.scaffold_edits(scaffold_tables, command_args.repo_root(args))
-            + edits
-        )
+        edits = scaffold_mod.scaffold_edits(scaffold_tables, store) + edits
 
     if not edits:
         return env.error(
@@ -153,13 +151,13 @@ def cmd_plan(args: argparse.Namespace) -> env.Envelope:
         elif parse_result["messages"]:
             parse_notes = [f"dbt: {m}" for m in parse_result["messages"]]
 
-    envelope = _make_plan(args, intent, edits)
+    envelope = _make_plan(args, store, intent, edits)
     if parse_notes and envelope.status is env.Status.OK:
         envelope.warnings.extend(parse_notes)
     return envelope
 
 
-def cmd_macro(args: argparse.Namespace) -> env.Envelope:
+def cmd_macro(args: argparse.Namespace, store: Store) -> env.Envelope:
     """List the shipped macros, or plan scaffolding one into the project."""
 
     from ..dbt_project import load as load_project
@@ -217,31 +215,31 @@ def cmd_macro(args: argparse.Namespace) -> env.Envelope:
             warnings=parse_result["messages"][1:],
         )
 
-    envelope = _make_plan(args, f"scaffold macro {name}", [edit])
+    envelope = _make_plan(args, store, f"scaffold macro {name}", [edit])
     envelope.warnings.extend(warnings)
     return envelope
 
 
-def cmd_apply(args: argparse.Namespace) -> env.Envelope:
+def cmd_apply(args: argparse.Namespace, store: Store) -> env.Envelope:
     plan_id = getattr(args, "argument", None)
     if not plan_id:
         # No id means the latest unapplied plan of any kind: apply does not
         # dispatch on kind, a plan is a plan (a semantic plan applies the same
         # way a model plan does).
-        latest = PlanStore(command_args.repo_root(args)).latest(None)
+        latest = store.latest_plan(None)
         if latest is None:
             return env.error(
                 "no unapplied plan found; run `transform plan` or `semantic "
                 "define|update|plan` first, or pass a plan id"
             )
         plan_id = latest.plan_id
-    return _apply_plan(args, plan_id)
+    return _apply_plan(args, store, plan_id)
 
 
-def cmd_plans(args: argparse.Namespace) -> env.Envelope:
+def cmd_plans(args: argparse.Namespace, store: Store) -> env.Envelope:
     """List stored plans (pending and applied), newest first."""
 
-    plans = PlanStore(command_args.repo_root(args)).list_all()
+    plans = store.list_plans()
     return env.ok(
         {
             "plans": [
@@ -261,7 +259,7 @@ def cmd_plans(args: argparse.Namespace) -> env.Envelope:
     )
 
 
-def cmd_build(args: argparse.Namespace) -> env.Envelope:
+def cmd_build(args: argparse.Namespace, store: Store) -> env.Envelope:
     from ..config import DexConfig, load_config
     from ..envelope import Paradigm
     from ..guards.cost_guard import ConfirmationRequiredError
@@ -292,7 +290,9 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
-    dev_check = lambda: dev_target.check(project, target, effective, repo_root)  # noqa: E731
+    dev_check = lambda: dev_target.check(  # noqa: E731
+        project, target, effective, repo_root, store=store
+    )
 
     # Free/local (DuckDB): nothing bills, so there is nothing to price. The engine
     # runs the dev-target check and the confirm handshake itself, as before.
@@ -310,7 +310,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
             )
         except ConfirmationRequiredError as exc:
             return _confirmation_needed(target, exc.cost)
-        return _shape_build_result(summary, cost, paradigm, connector, repo_root)
+        return _shape_build_result(summary, cost, paradigm, connector, store)
 
     # Billed connectors get a real upfront estimate. The order mirrors the
     # documented gate: the dev-target check runs first (free, and it must refuse a
@@ -326,7 +326,7 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
     # per-statement cap still bind.
     dev_warnings = dev_check()
     estimate, per_node, price_notes, adapter = _price_build(
-        args, project, target, select
+        args, store, project, target, select
     )
     try:
         if estimate is not None:
@@ -366,12 +366,12 @@ def cmd_build(args: argparse.Namespace) -> env.Envelope:
         cost,
         paradigm,
         connector,
-        repo_root,
+        store,
         extra_notes=[*price_notes, *dev_warnings],
     )
 
 
-def cmd_deps(args: argparse.Namespace) -> env.Envelope:
+def cmd_deps(args: argparse.Namespace, store: Store) -> env.Envelope:
     from .build import deps as run_deps
     from .build import has_package_spec
 
@@ -397,36 +397,35 @@ def cmd_deps(args: argparse.Namespace) -> env.Envelope:
     )
 
 
-def cmd_semantic_define(args: argparse.Namespace) -> env.Envelope:
-    return _semantic_plan(args, mode="define")
+def cmd_semantic_define(args: argparse.Namespace, store: Store) -> env.Envelope:
+    return _semantic_plan(args, store, mode="define")
 
 
-def cmd_semantic_update(args: argparse.Namespace) -> env.Envelope:
-    return _semantic_plan(args, mode="update")
+def cmd_semantic_update(args: argparse.Namespace, store: Store) -> env.Envelope:
+    return _semantic_plan(args, store, mode="update")
 
 
-def cmd_semantic_plan(args: argparse.Namespace) -> env.Envelope:
+def cmd_semantic_plan(args: argparse.Namespace, store: Store) -> env.Envelope:
     """Mixed-intent semantic authoring: one payload may evolve existing
     definitions and add the new ones they depend on; each name is classified
     as defined or updated instead of the whole payload being refused."""
 
-    return _semantic_plan(args, mode="plan")
+    return _semantic_plan(args, store, mode="plan")
 
 
 # --- helpers -----------------------------------------------------------------
 
 
-def _record_build_spend(repo_root, connector: str, billed: float, field: str) -> None:
-    """Account a billed dbt build in the `.dex/spend.jsonl` ledger, so builds
-    draw against the same session budget as explore scans. ``field`` carries
-    the connector's unit (bytes or seconds), matching what its cost gate
-    records."""
+def _record_build_spend(
+    store: Store, connector: str, billed: float, field: str
+) -> None:
+    """Account a billed dbt build in the spend ledger, so builds draw against the
+    same session budget as explore scans. ``field`` carries the connector's unit
+    (bytes or seconds), matching what its cost gate records."""
 
     from datetime import UTC, datetime
 
-    from ..cache import DexStore
-
-    DexStore(repo_root).append_spend_log(
+    store.append_spend_log(
         {
             "at": datetime.now(UTC).isoformat(),
             "connector": connector,
@@ -438,7 +437,9 @@ def _record_build_spend(repo_root, connector: str, billed: float, field: str) ->
     )
 
 
-def _price_build(args: argparse.Namespace, project, target: str, select: str | None):
+def _price_build(
+    args: argparse.Namespace, store: Store, project, target: str, select: str | None
+):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
     Returns ``(estimate, per_node, notes, adapter)``. ``estimate`` is ``None``
@@ -453,7 +454,7 @@ def _price_build(args: argparse.Namespace, project, target: str, select: str | N
 
     adapter = None
     try:
-        adapter = command_args.open_from_args(args)
+        adapter = command_args.open_from_args(args, store)
         # dbt compile refuses to run with declared-but-uninstalled packages, and
         # deps writes only dbt_packages/ (never the warehouse), so installing it
         # here during the free preflight is consistent and idempotent on the build.
@@ -485,7 +486,7 @@ def _confirmation_needed(target: str, cost, notes=()) -> env.Envelope:
 
 
 def _shape_build_result(
-    summary: dict, cost, paradigm, connector: str, repo_root, extra_notes=()
+    summary: dict, cost, paradigm, connector: str, store: Store, extra_notes=()
 ) -> env.Envelope:
     """Shape a finished dbt run into the sanitized envelope, per paradigm.
 
@@ -506,7 +507,7 @@ def _shape_build_result(
         ]
         billed = summary.get("bytes_billed")
         if billed:
-            _record_build_spend(repo_root, connector, billed, "billed_bytes")
+            _record_build_spend(store, connector, billed, "billed_bytes")
     elif paradigm is Paradigm.COMPUTE_TIME:
         cap_note = _COMPUTE_TIME_CAP_NOTES.get(
             connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
@@ -519,7 +520,7 @@ def _shape_build_result(
         )
         if seconds:
             summary["seconds_billed"] = seconds
-            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
+            _record_build_spend(store, connector, seconds, "billed_seconds")
     elif paradigm is Paradigm.DB_LOAD:
         notes = [
             "each statement was capped server-side by a statement_timeout set to "
@@ -533,7 +534,7 @@ def _shape_build_result(
         )
         if seconds:
             summary["seconds_billed"] = seconds
-            _record_build_spend(repo_root, connector, seconds, "billed_seconds")
+            _record_build_spend(store, connector, seconds, "billed_seconds")
     if summary["success"]:
         return env.ok(summary, cost=cost, warnings=[*notes, *messages])
     # Agents triage from `errors` first, so the first real dbt message rides there;
@@ -557,18 +558,20 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
 
 
 def _make_plan(
-    args: argparse.Namespace, intent: str, edits: list[PlanEdit]
+    args: argparse.Namespace, store: Store, intent: str, edits: list[PlanEdit]
 ) -> env.Envelope:
     repo_root = command_args.repo_root(args)
     project = command_args.project_dir(args)
-    plan, diffs, warnings = plans_mod.plan(intent, edits, project, repo_root)
+    plan, diffs, warnings = plans_mod.plan(
+        intent, edits, project, repo_root, store=store
+    )
     return env.ok(
         {
             "plan_id": plan.plan_id,
             "intent": plan.intent,
             "edit_count": len(plan.edits),
             "paths": [e.path for e in plan.edits],
-            "plan_path": str(PlanStore(repo_root).path_for(plan.plan_id)),
+            "plan_path": store.plan_locator(plan.plan_id),
             "next": f"review the diffs, then `transform apply {plan.plan_id}`",
         },
         diffs=diffs,
@@ -576,10 +579,10 @@ def _make_plan(
     )
 
 
-def _apply_plan(args: argparse.Namespace, plan_id: str) -> env.Envelope:
+def _apply_plan(args: argparse.Namespace, store: Store, plan_id: str) -> env.Envelope:
     confirmed = bool(getattr(args, "confirm", False))
     result: ApplyResult = plans_mod.apply(
-        plan_id, command_args.repo_root(args), confirmed=confirmed
+        plan_id, command_args.repo_root(args), store=store, confirmed=confirmed
     )
     if result.conflicts and not result.written:
         return env.needs_confirmation(
@@ -604,7 +607,7 @@ def _apply_plan(args: argparse.Namespace, plan_id: str) -> env.Envelope:
     )
 
 
-def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
+def _semantic_plan(args: argparse.Namespace, store: Store, mode: str) -> env.Envelope:
     intent = getattr(args, "argument", None) or ""
     edits = _edits_from_payload(
         getattr(args, "edits_file", None), default_kind=EditKind.SEMANTIC_YML
@@ -666,7 +669,7 @@ def _semantic_plan(args: argparse.Namespace, mode: str) -> env.Envelope:
             # build` (where they also poison the failure-error channel, #50).
             parse_deprecations = [f"dbt: {m}" for m in parse_result["messages"]]
 
-    envelope = _make_plan(args, intent, edits)
+    envelope = _make_plan(args, store, intent, edits)
     if envelope.status is env.Status.OK:
         plan_id = envelope.data["plan_id"]
         envelope.data["next"] = f"review the diffs, then `transform apply {plan_id}`"

@@ -17,7 +17,6 @@ from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
     DexCache,
-    DexStore,
     Relationship,
     RelationshipKind,
 )
@@ -39,6 +38,7 @@ from exmergo_dex_core.explore.relationships import (
     verify_relationships,
 )
 from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def _col(
@@ -492,7 +492,7 @@ def test_relationships_folds_mirrored_lineage_and_persists_folded_set(
     # One real foreign key survives instead of the inflated cross-schema fan-out.
     assert len(data["relationships"]) == 1
 
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     assert len(cache.relationships) == 1
     envelope_edge = data["relationships"][0]
     assert (cache.relationships[0].from_dataset, cache.relationships[0].to_dataset) == (
@@ -786,7 +786,7 @@ def test_relationships_persists_datasets_and_relationships(
     assert payload["data"]["cache_path"].endswith("cache.json")
     assert payload["data"]["updated_at"]
 
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     names = {d.identifier.split(".")[-1] for d in cache.datasets}
     assert names == {"RAW_HOSTS", "RAW_LISTINGS", "RAW_REVIEWS"}
     assert all(d.columns for d in cache.datasets)

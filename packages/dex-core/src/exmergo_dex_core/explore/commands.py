@@ -1,11 +1,12 @@
 """Explore command orchestrators.
 
-Each ``cmd_*`` opens the adapter, drives the explore engine, and shapes the result
-into the sanitized envelope. Keeping this here (not in ``cli.py``) keeps dispatch
-thin and keeps ``map``'s composition (it runs inventory, profile, and relationships
-together) out of the CLI layer. These are the only explore commands that hold an
-adapter; ``map``, ``profile``, and ``relationships`` all persist what they learned,
-and only to the ``.dex/`` cache, so a scan is never paid for twice.
+Each ``cmd_*`` receives the injected store, opens the adapter, drives the explore
+engine, and shapes the result into the sanitized envelope. Keeping this here (not in
+``cli.py``) keeps dispatch thin and keeps ``map``'s composition (it runs inventory,
+profile, and relationships together) out of the CLI layer. These are the only
+explore commands that hold an adapter; ``map``, ``profile``, and ``relationships``
+all persist what they learned, and only to the exploration cache, so a scan is never
+paid for twice.
 """
 
 from __future__ import annotations
@@ -23,10 +24,8 @@ from .. import envelope as env
 from ..adapters import get_dialect
 from ..adapters.base import Adapter, ObjectMeta, QueryResult
 from ..cache import (
-    CACHE_FILE,
     Dataset,
     DexCache,
-    DexStore,
     Relationship,
     RelationshipKind,
     match_identifier,
@@ -46,6 +45,7 @@ from ..guards.query_firewall import (
     inspect_query,
 )
 from ..progress import ProgressReporter
+from ..storage import Document, Store
 from . import cluster as cluster_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
@@ -184,8 +184,8 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
     )
 
 
-def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
-    adapter = command_args.open_from_args(args)
+def cmd_inventory(args: argparse.Namespace, store: Store) -> env.Envelope:
+    adapter = command_args.open_from_args(args, store)
     try:
         # Inventory is metadata-only on every connector (free API calls on
         # BigQuery), so it never needs the confirm handshake.
@@ -223,16 +223,15 @@ def cmd_inventory(args: argparse.Namespace) -> env.Envelope:
     )
 
 
-def cmd_profile(args: argparse.Namespace) -> env.Envelope:
+def cmd_profile(args: argparse.Namespace, store: Store) -> env.Envelope:
     repo_root = command_args.repo_root(args)
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
     override_paths = pii_override_paths(config.pii_overrides)
     blob_paths = blob_override_paths(config.blob_overrides)
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
-    store = DexStore(repo_root)
     now = datetime.now(UTC)
     prior = store.load_cache()
     accumulated: list[Dataset] = []
@@ -320,7 +319,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     # profiled are merged; the reused already live in the cache untouched. Prior
     # relationships are preserved because profile runs no inference pass.
     cache, stats = _merge_profiles(prior, profiled, connector, now)
-    path = store.save_cache(cache, now=now)
+    locator = store.save_cache(cache, now=now)
 
     notes = [_persist_note(stats, len(profiled), keeps_relationships=True)]
     notes.extend(_override_notes(datasets))
@@ -336,7 +335,7 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
             "datasets": [d.model_dump(mode="json") for d in datasets],
             "profiled_count": len(profiled),
             "cache_hit_count": len(fresh_reused),
-            "cache_path": str(path),
+            "cache_path": locator,
             "updated_at": now.isoformat(),
             "notes": notes,
         }
@@ -345,16 +344,15 @@ def cmd_profile(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
+def cmd_relationships(args: argparse.Namespace, store: Store) -> env.Envelope:
     verify = getattr(args, "verify", False)
     repo_root = command_args.repo_root(args)
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
-    store = DexStore(repo_root)
     now = datetime.now(UTC)
     prior = store.load_cache()
     accumulated: list[Dataset] = []
@@ -545,7 +543,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     # endpoint outside that (a narrower --scope/--dataset than a prior run) is
     # carried forward above rather than dropped, same as the profiles are.
     cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
-    path = store.save_cache(cache, now=now)
+    locator = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
     envelope.data.update(
@@ -556,7 +554,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
             "profiled_count": len(profiled),
             "cache_hit_count": len(fresh_reused),
             "carried_relationship_count": carried_relationships,
-            "cache_path": str(path),
+            "cache_path": locator,
             "updated_at": now.isoformat(),
             # Merge, not overwrite: a verify checkpoint envelope may already
             # carry notes from the adapter's estimate description.
@@ -566,7 +564,7 @@ def cmd_relationships(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_query(args: argparse.Namespace) -> env.Envelope:
+def cmd_query(args: argparse.Namespace, store: Store) -> env.Envelope:
     """Run one agent-authored SELECT through the query firewall.
 
     The cache gate comes first: the PII policy is computed from `.dex/` flags,
@@ -575,7 +573,6 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
     """
 
     repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     cache = store.load_cache()
     at = datetime.now(UTC).isoformat()
     if cache is None:
@@ -598,7 +595,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
         )
         return env.error(f"query refused: {exc}")
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     try:
         query_estimate = getattr(adapter, "query_estimate", None)
         estimate = query_estimate(inspected.sql) if query_estimate else 0.0
@@ -652,7 +649,7 @@ def cmd_query(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
+def cmd_semantic(args: argparse.Namespace, store: Store) -> env.Envelope:
     """`explore semantic list|query`: discover and query the dbt semantic layer.
 
     Backend resolution and the two guard postures (local: dex renders and executes
@@ -666,7 +663,7 @@ def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
     root = command_args.repo_root(args)
     config = load_config(root) or DexConfig()
     try:
-        backend = resolve_backend(args, config, root)
+        backend = resolve_backend(args, config, root, store)
         if getattr(args, "mode", None) == "list":
             return env.ok(backend.list_definitions().to_data())
         metrics = getattr(args, "metric", None) or []
@@ -688,17 +685,16 @@ def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
         return env.error(str(exc))
 
 
-def cmd_map(args: argparse.Namespace) -> env.Envelope:
+def cmd_map(args: argparse.Namespace, store: Store) -> env.Envelope:
     repo_root = command_args.repo_root(args)
     config = load_config(repo_root) or DexConfig()
     defs = _project_definitions(args, config)
     hints = _merged_hints(config.ranking_hints, defs.metric_models)
     full = getattr(args, "full", False)
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
-    store = DexStore(repo_root)
     now = datetime.now(UTC)
     prior = store.load_cache()
     accumulated: list[Dataset] = []
@@ -853,7 +849,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
         if prior and prior.provenance.created_at
         else now.isoformat()
     )
-    path = store.save_cache(cache, now=now)
+    locator = store.save_cache(cache, now=now)
 
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
@@ -922,7 +918,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
     envelope.data.update(
         {
-            "cache_path": str(path),
+            "cache_path": locator,
             "object_count": len(metas),
             "profiled_count": len(profiled),
             "cache_hit_count": len(fresh_reused),
@@ -945,7 +941,7 @@ def cmd_map(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
+def cmd_cluster(args: argparse.Namespace, store: Store) -> env.Envelope:
     """k-means clustering over a bounded sample of one object's numeric columns.
 
     Cache-gated like `explore query`: profiling is what tells us which columns
@@ -957,7 +953,6 @@ def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
     """
 
     repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     cache = store.load_cache()
     if cache is None:
         return env.error(
@@ -998,7 +993,7 @@ def cmd_cluster(args: argparse.Namespace) -> env.Envelope:
 
     k = getattr(args, "k", None)
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     try:
         sample_sql, sample_method = cluster_mod.build_sample_sql(
             dataset.identifier,
@@ -1671,7 +1666,7 @@ def _compose_datasets(
 # Sentinel: preserve the prior cache's relationships (profile has no inference
 # pass, so it has no business touching them).
 def _profile_checkpointer(
-    store: DexStore,
+    store: Store,
     prior: DexCache | None,
     connector: str,
     now: datetime,
@@ -1696,7 +1691,7 @@ def _profile_checkpointer(
 
 
 def _over_ceiling_error(
-    store: DexStore, accumulated: list[Dataset], selected: int
+    store: Store, accumulated: list[Dataset], selected: int
 ) -> env.Envelope:
     """The partial-completion error envelope for a mid-run budget exhaustion.
 
@@ -1710,10 +1705,10 @@ def _over_ceiling_error(
             "profiling; no partial profiles were saved — raise --budget or narrow "
             "scope, then re-run"
         )
-    cache_path = store.dex_dir / CACHE_FILE
+    cache_locator = store.locator(Document.CACHE)
     return env.error(
         f"budget exhausted after profiling {n} of {selected} object(s); partial "
-        f"profiles saved to {cache_path} — raise --budget or narrow scope, then "
+        f"profiles saved to {cache_locator} — raise --budget or narrow scope, then "
         "re-run"
     )
 

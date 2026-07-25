@@ -21,11 +21,11 @@ from google.cloud import bigquery
 
 from exmergo_dex_core import command_args
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
-from exmergo_dex_core.cache import DexStore
 from exmergo_dex_core.config import BigQueryTarget
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.explore import commands as explore_cmds
 from exmergo_dex_core.guards.cost_guard import CostGate, OverCeilingError
+from exmergo_dex_core.storage import FilesystemStore
 
 MB = 1024 * 1024
 
@@ -87,7 +87,7 @@ def two_table_client():
 def _install(
     monkeypatch, client, *, confirmed=True, budget=float(100 * MB), record=None
 ):
-    def opener(args):
+    def opener(args, store):
         gate = CostGate(
             paradigm=Paradigm.BYTES_SCANNED,
             ceiling=budget,
@@ -156,7 +156,9 @@ def test_map_mid_run_exhaustion_saves_partial_cache(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 2)  # object 1 completes, object 2 trips the gate
 
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
 
     assert envelope.status.value == "error"
     message = envelope.errors[0]
@@ -165,7 +167,7 @@ def test_map_mid_run_exhaustion_saves_partial_cache(
     # Spend was stamped after the adapter closed (the finally ran).
     assert "spend" in envelope.data
 
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache is not None
     assert len(cache.datasets) == 1
     # The paid-for profile is real: columns are present on the checkpointed object.
@@ -179,12 +181,13 @@ def test_relationships_mid_run_exhaustion_saves_partial_cache(
     _raise_on_nth_object(monkeypatch, 2)
 
     envelope = explore_cmds.cmd_relationships(
-        _args(tmp_path, subcommand="relationships")
+        _args(tmp_path, subcommand="relationships"),
+        FilesystemStore(tmp_path),
     )
 
     assert envelope.status.value == "error"
     assert "1 of 2" in envelope.errors[0]
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache is not None and len(cache.datasets) == 1
     assert cache.datasets[0].columns
 
@@ -196,12 +199,13 @@ def test_profile_mid_run_exhaustion_saves_partial_cache(
     _raise_on_nth_object(monkeypatch, 2)
 
     envelope = explore_cmds.cmd_profile(
-        _args(tmp_path, subcommand="profile", objects=["customers", "orders"])
+        _args(tmp_path, subcommand="profile", objects=["customers", "orders"]),
+        FilesystemStore(tmp_path),
     )
 
     assert envelope.status.value == "error"
     assert "1 of 2" in envelope.errors[0]
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache is not None and len(cache.datasets) == 1
     assert cache.datasets[0].columns
 
@@ -215,7 +219,9 @@ def test_map_first_object_failure_saves_nothing(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 1)  # the first object trips the gate
 
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
 
     assert envelope.status.value == "error"
     message = envelope.errors[0]
@@ -231,7 +237,8 @@ def test_profile_first_object_failure_saves_nothing(
     _raise_on_nth_object(monkeypatch, 1)
 
     envelope = explore_cmds.cmd_profile(
-        _args(tmp_path, subcommand="profile", objects=["customers", "orders"])
+        _args(tmp_path, subcommand="profile", objects=["customers", "orders"]),
+        FilesystemStore(tmp_path),
     )
 
     assert envelope.status.value == "error"
@@ -247,10 +254,12 @@ def test_successful_map_overwrites_checkpoints_with_composed_cache(
 ):
     _install(monkeypatch, two_table_client)  # no wrap: the run completes
 
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
 
     assert envelope.status.value == "ok"
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache is not None
     assert len(cache.datasets) == 2
     # Ranking and relationship inference ran: signals a checkpoint never carries.
@@ -266,13 +275,13 @@ def test_duckdb_map_does_not_checkpoint(airbnb_duckdb, monkeypatch, tmp_path):
     authoritative save at the end, exactly as before this change."""
 
     saves: list[int] = []
-    original = DexStore.save_cache
+    original = FilesystemStore.save_cache
 
     def counting_save(self, cache, *, now=None):
         saves.append(len(cache.datasets))
         return original(self, cache, now=now)
 
-    monkeypatch.setattr(DexStore, "save_cache", counting_save)
+    monkeypatch.setattr(FilesystemStore, "save_cache", counting_save)
 
     from exmergo_dex_core.cli import main
 

@@ -17,7 +17,6 @@ from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
     DexCache,
-    DexStore,
     PIICategory,
     Relationship,
 )
@@ -25,6 +24,7 @@ from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.explore.profile import detect_pii, is_min_max_safe, profile
 from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def _run(argv: list[str], capsys) -> dict:
@@ -707,7 +707,7 @@ def test_profile_writes_cache_when_none_exists(
     assert any("created .dex/cache.json" in n for n in payload["data"]["notes"])
     assert any("explore map" in n for n in payload["data"]["notes"])
 
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     assert [d.identifier.split(".")[-1] for d in cache.datasets] == ["RAW_HOSTS"]
     assert cache.datasets[0].columns, "the firewall needs columns to allow queries"
     assert cache.relationships == []
@@ -721,7 +721,7 @@ def test_profile_merges_into_existing_map_preserving_relationships_and_rank(
     repo = tmp_path / "repo"
     repo.mkdir()
     _map(airbnb_duckdb, repo, capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     before = store.load_cache()
     rels_before = [r.model_dump() for r in before.relationships]
     assert rels_before, "the airbnb fixture has inferable joins"
@@ -753,7 +753,7 @@ def test_profile_refresh_forces_reprofile_updates_profiled_at(
     repo = tmp_path / "repo"
     repo.mkdir()
     _map(airbnb_duckdb, repo, capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     before = store.load_cache()
     old = _dataset(before, "RAW_HOSTS")
     reviews_stamp = _dataset(before, "RAW_REVIEWS").profiled_at
@@ -778,7 +778,7 @@ def test_profile_reuses_fresh_cached_profile(
     repo = tmp_path / "repo"
     repo.mkdir()
     _map(airbnb_duckdb, repo, capsys)
-    store = DexStore(repo)
+    store = FilesystemStore(repo)
     stamp_before = _dataset(store.load_cache(), "RAW_HOSTS").profiled_at
 
     payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
@@ -842,7 +842,7 @@ def test_profile_inserts_new_dataset(airbnb_duckdb: Path, tmp_path: Path, capsys
     _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
     payload = _profile(["RAW_LISTINGS"], airbnb_duckdb, repo, capsys)
 
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     names = {d.identifier.split(".")[-1] for d in cache.datasets}
     assert names == {"RAW_HOSTS", "RAW_LISTINGS"}
     assert _dataset(cache, "RAW_LISTINGS").rank_score is None
@@ -873,10 +873,10 @@ def test_profile_connector_mismatch_replaces_cache(
     )
     seeded.provenance.connector = "bigquery"
     seeded.provenance.created_at = "2020-01-01T00:00:00+00:00"
-    DexStore(repo).save_cache(seeded)
+    FilesystemStore(repo).save_cache(seeded)
 
     payload = _profile(["RAW_HOSTS"], airbnb_duckdb, repo, capsys)
-    cache = DexStore(repo).load_cache()
+    cache = FilesystemStore(repo).load_cache()
     assert cache.provenance.connector == "duckdb"
     assert [d.identifier.split(".")[-1] for d in cache.datasets] == ["RAW_HOSTS"]
     assert cache.relationships == []

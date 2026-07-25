@@ -265,7 +265,7 @@ def cap_columnar(
     }
 
 
-def resolve_backend(args, config, repo_root: str) -> SemanticBackend:
+def resolve_backend(args, config, repo_root: str, store) -> SemanticBackend:
     """The ambient backend resolution: ``--api``/``--local`` override the
     ``.dex/config.yml`` ``semantic.backend`` default. Raises
     :class:`SemanticBackendError` (never a bare import error) when the chosen
@@ -291,7 +291,7 @@ def resolve_backend(args, config, repo_root: str) -> SemanticBackend:
     if backend == "local":
         from .local import LocalMetricFlowBackend
 
-        return LocalMetricFlowBackend.from_args(args, config, repo_root)
+        return LocalMetricFlowBackend.from_args(args, config, store)
     raise SemanticBackendError(
         f"unknown semantic backend '{backend}'; use 'local' or 'dbt_cloud' "
         "(or pass --local / --api)"

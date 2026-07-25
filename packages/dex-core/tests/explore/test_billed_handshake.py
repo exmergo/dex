@@ -15,11 +15,12 @@ pytest.importorskip("google.cloud.bigquery")
 
 from exmergo_dex_core import command_args
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, DexStore, PIIFlag
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import BigQueryTarget
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.explore import commands as explore_cmds
 from exmergo_dex_core.guards.cost_guard import CostGate
+from exmergo_dex_core.storage import FilesystemStore
 
 MB = 1024 * 1024
 
@@ -98,7 +99,7 @@ def route_adapter(monkeypatch):
     confirm/budget flags off the args namespace the way connect.py would."""
 
     def install(fake_client, record=None):
-        def opener(args):
+        def opener(args, store):
             return _adapter(
                 fake_client,
                 confirmed=getattr(args, "confirm", False),
@@ -116,7 +117,8 @@ def test_unconfirmed_profile_returns_needs_confirmation(
 ):
     route_adapter(fake_bq_client)
     envelope = explore_cmds.cmd_profile(
-        _args(tmp_path, subcommand="profile", objects=["customers"])
+        _args(tmp_path, subcommand="profile", objects=["customers"]),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
@@ -143,7 +145,8 @@ def test_confirmed_profile_runs_and_stamps_spend(
             objects=["customers"],
             confirm=True,
             budget=float(100 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     assert envelope.data["datasets"][0]["identifier"] == "test-proj.shop.customers"
@@ -159,7 +162,9 @@ def test_unconfirmed_map_estimates_selected_objects(
     fake_bq_client, route_adapter, tmp_path
 ):
     route_adapter(fake_bq_client)
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "needs_confirmation"
     # customers and events each floor to the per-query minimum plus a floor
     # per possible escalation query (30 MB apiece); logs.requests needs a
@@ -209,7 +214,7 @@ def _seed_bq_map_cache(tmp_path: Path, *, identifiers: set[str]) -> None:
         ]
     )
     cache.provenance.connector = "bigquery"
-    DexStore(tmp_path).save_cache(cache)
+    FilesystemStore(tmp_path).save_cache(cache)
 
 
 def test_unconfirmed_map_excludes_fresh_cached_objects(
@@ -220,7 +225,9 @@ def test_unconfirmed_map_excludes_fresh_cached_objects(
 
     _seed_bq_map_cache(tmp_path, identifiers={"test-proj.shop.customers"})
     route_adapter(fake_bq_client)
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "needs_confirmation"
     # Only events is priced now (customers is fresh-cached, requests is
     # partition-filtered to zero), so the estimate halves versus the no-cache run.
@@ -243,7 +250,9 @@ def test_fully_fresh_map_needs_no_confirmation(fake_bq_client, route_adapter, tm
         },
     )
     route_adapter(fake_bq_client)
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
     assert envelope.status.value == "ok"
     assert envelope.data["profiled_count"] == 0
     assert envelope.data["cache_hit_count"] == 3
@@ -267,7 +276,7 @@ def test_scoped_map_carries_forward_out_of_scope_dataset_profiles(
         },
     )
 
-    def scoped_opener(args):
+    def scoped_opener(args, store):
         gate = CostGate(
             paradigm=Paradigm.BYTES_SCANNED,
             ceiling=getattr(args, "budget", None),
@@ -288,7 +297,9 @@ def test_scoped_map_carries_forward_out_of_scope_dataset_profiles(
         )
 
     monkeypatch.setattr(command_args, "open_from_args", scoped_opener)
-    envelope = explore_cmds.cmd_map(_args(tmp_path, subcommand="map"))
+    envelope = explore_cmds.cmd_map(
+        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
+    )
 
     assert envelope.status.value == "ok"
     assert envelope.data["out_of_scope_carried_count"] == 2
@@ -296,7 +307,7 @@ def test_scoped_map_carries_forward_out_of_scope_dataset_profiles(
         "outside this run's --scope/--dataset" in note
         for note in envelope.data["notes"]
     )
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     identifiers = {d.identifier for d in cache.datasets}
     assert identifiers == {
         "test-proj.shop.customers",
@@ -310,14 +321,15 @@ def test_unconfirmed_relationships_recommends_map(
 ):
     route_adapter(fake_bq_client)
     envelope = explore_cmds.cmd_relationships(
-        _args(tmp_path, subcommand="relationships")
+        _args(tmp_path, subcommand="relationships"),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "needs_confirmation"
     assert any("explore map" in note for note in envelope.data["notes"])
 
 
 def _seed_query_cache(tmp_path: Path) -> None:
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     store.save_cache(
         DexCache(
             datasets=[
@@ -347,7 +359,8 @@ def test_unconfirmed_query_returns_estimate_and_logs(
             tmp_path,
             subcommand="query",
             sql="SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "needs_confirmation"
     # Single-table query, floored to the per-query billing minimum.
@@ -357,7 +370,7 @@ def test_unconfirmed_query_returns_estimate_and_logs(
 
 
 def _seed_cluster_cache(tmp_path: Path) -> None:
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     store.save_cache(
         DexCache(
             datasets=[
@@ -385,7 +398,8 @@ def test_unconfirmed_cluster_returns_needs_confirmation(
     _seed_cluster_cache(tmp_path)
     route_adapter(fake_bq_client)
     envelope = explore_cmds.cmd_cluster(
-        _args(tmp_path, subcommand="cluster", object="customers")
+        _args(tmp_path, subcommand="cluster", object="customers"),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
@@ -409,7 +423,8 @@ def test_confirmed_query_runs_through_the_firewall(
             sql="SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
             confirm=True,
             budget=float(100 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     assert envelope.data["cells"] == [[100]]
@@ -493,12 +508,13 @@ def test_verify_within_budget_runs_in_one_pass(fk_bq_client, route_adapter, tmp_
             verify=True,
             confirm=True,
             budget=float(100 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     assert "phase" not in envelope.data
     assert _probe_executed(fk_bq_client)
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache.relationships and cache.relationships[0].verified
 
 
@@ -522,7 +538,8 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
             verify=True,
             confirm=True,
             budget=float(60 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.data["phase"] == "verify"
@@ -540,7 +557,7 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     # relationship are in the cache, and the summary rides along.
     assert envelope.data["relationship_count"] == 1
     assert Path(envelope.data["cache_path"]).exists()
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache.relationships and not cache.relationships[0].verified
     assert any("unverified" in note for note in envelope.data["notes"])
 
@@ -557,7 +574,8 @@ def test_relationships_verify_beyond_budget_checkpoints(
             verify=True,
             confirm=True,
             budget=float(60 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.data["phase"] == "verify"
@@ -566,7 +584,7 @@ def test_relationships_verify_beyond_budget_checkpoints(
     assert not any(
         "verified" in note and "overlap" in note for note in envelope.data["notes"]
     )
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache.relationships and not cache.relationships[0].verified
 
 
@@ -584,7 +602,8 @@ def test_verify_with_no_candidates_skips_the_checkpoint(
             verify=True,
             confirm=True,
             budget=float(100 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     assert "phase" not in envelope.data
@@ -611,11 +630,12 @@ def test_mid_verify_budget_exhaustion_degrades_to_a_warning(
             verify=True,
             confirm=True,
             budget=float(100 * MB),
-        )
+        ),
+        FilesystemStore(tmp_path),
     )
     assert envelope.status.value == "ok"
     assert any("1 of 1" in w and "budget exhausted" in w for w in envelope.warnings)
-    cache = DexStore(tmp_path).load_cache()
+    cache = FilesystemStore(tmp_path).load_cache()
     assert cache.relationships
 
 

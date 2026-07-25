@@ -303,6 +303,7 @@ def test_plan_without_content_is_a_clean_error(
 # parse-gated path.
 
 from exmergo_dex_core import transform  # noqa: E402
+from exmergo_dex_core.storage import FilesystemStore  # noqa: E402
 
 
 def _cfg_edit(path: str, content: str, kind) -> transform.PlanEdit:
@@ -319,7 +320,11 @@ def test_project_yml_edit_pins_the_existing_file(dbt_project_dir: Path):
         transform.EditKind.PROJECT_YML,
     )
     plan, diffs, _warnings = transform.plan(
-        "tune project", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+        "tune project",
+        [edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
     )
     assert diffs[0]["op"] == "update"
     assert plan.edits[0].old_content_hash is not None
@@ -331,7 +336,11 @@ def test_project_yml_kind_must_target_dbt_project(dbt_project_dir: Path):
     )
     with pytest.raises(transform.PlanError):
         transform.plan(
-            "misaimed", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+            "misaimed",
+            [edit],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=FilesystemStore(dbt_project_dir.parent),
         )
 
 
@@ -339,7 +348,11 @@ def test_config_file_reached_by_the_wrong_kind_is_refused(dbt_project_dir: Path)
     edit = _cfg_edit("dbt_project.yml", "select 1\n", transform.EditKind.MODEL_SQL)
     with pytest.raises(transform.PlanError):
         transform.plan(
-            "wrong kind", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+            "wrong kind",
+            [edit],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=FilesystemStore(dbt_project_dir.parent),
         )
 
 
@@ -365,6 +378,7 @@ def test_profiles_yml_refuses_a_secret_already_on_disk(dbt_project_dir: Path):
             [edit],
             dbt_project_dir,
             repo_root=dbt_project_dir.parent,
+            store=FilesystemStore(dbt_project_dir.parent),
         )
     assert "hunter2" not in str(exc.value)
     assert "password" in str(exc.value)
@@ -377,7 +391,11 @@ def test_project_yml_dropping_a_model_path_warns(dbt_project_dir: Path):
         transform.EditKind.PROJECT_YML,
     )
     _plan, _diffs, warnings = transform.plan(
-        "restructure", [edit], dbt_project_dir, repo_root=dbt_project_dir.parent
+        "restructure",
+        [edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
     )
     assert any("model-paths drops" in w and "models" in w for w in warnings)
 

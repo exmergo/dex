@@ -21,6 +21,7 @@ from exmergo_dex_core.guards.cost_guard import (
     CostGate,
     OverCeilingError,
 )
+from exmergo_dex_core.storage import FilesystemStore
 
 MB = 1024 * 1024
 
@@ -759,6 +760,7 @@ def test_project_and_dataset_flags_override_the_config_target(tmp_path, monkeypa
         project="cli-proj",
         datasets=["ds_a", "ds_b"],
         repo_root=tmp_path,  # no .dex/config.yml here
+        store=FilesystemStore(tmp_path),
     )
     assert captured["name"] == "bigquery"
     assert captured["project"] == "cli-proj"

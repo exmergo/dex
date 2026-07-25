@@ -8,9 +8,10 @@ import json
 from pathlib import Path
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import QUERIES_FILE, DexStore
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, QueryLimits, save_config
+from exmergo_dex_core.storage import FilesystemStore
+from exmergo_dex_core.storage.filesystem import QUERIES_FILE
 
 
 def _run(argv: list[str], capsys, *, expect_error: bool = False) -> dict:
@@ -374,7 +375,7 @@ def test_override_unblocks_at_query_time_without_reprofiling(
 
 
 def test_query_log_helper_appends(tmp_path: Path):
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     store.append_query_log({"at": "t1", "sql": "SELECT 1", "decision": "allowed"})
     store.append_query_log({"at": "t2", "sql": "SELECT 2", "decision": "refused"})
     lines = (tmp_path / ".dex" / QUERIES_FILE).read_text().splitlines()

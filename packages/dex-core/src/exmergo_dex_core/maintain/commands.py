@@ -1,10 +1,10 @@
 """Maintain command orchestrators.
 
-Each ``cmd_*`` loads the baseline and the project, drives the drift engine, and
-shapes the result into the sanitized envelope. Only this layer opens adapters or
-touches ``.dex/``; the detectors in ``drift.py`` stay pure comparisons so they
-are testable without a warehouse. Detection commands write their findings to
-``.dex/drift.json`` so the stateless ``reconcile`` has a report to read.
+Each ``cmd_*`` receives the injected store, loads the baseline and the project,
+drives the drift engine, and shapes the result into the sanitized envelope. Only
+this layer opens adapters or reaches the store; the detectors in ``drift.py`` stay
+pure comparisons so they are testable without a warehouse. Detection commands save
+their findings as a drift report so the stateless ``reconcile`` has one to read.
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from datetime import UTC, datetime
 
 from .. import command_args
 from .. import envelope as env
-from ..cache import DexStore
 from ..config import DexConfig, load_config, pii_override_paths
 from ..dbt_project import DbtProjectError
 from ..dbt_project import load as load_project
+from ..storage import Document, Store
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
 
@@ -33,9 +33,8 @@ _NO_SNAPSHOT_ERROR = (
 )
 
 
-def cmd_snapshot(args: argparse.Namespace) -> env.Envelope:
+def cmd_snapshot(args: argparse.Namespace, store: Store) -> env.Envelope:
     repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     config = load_config(repo_root) or DexConfig()
     warnings: list[str] = []
 
@@ -58,7 +57,7 @@ def cmd_snapshot(args: argparse.Namespace) -> env.Envelope:
     else:
         # No cache to pin: capture directly. Metadata is free on every
         # connector, so this path needs no confirm handshake.
-        adapter = command_args.open_from_args(args)
+        adapter = command_args.open_from_args(args, store)
         try:
             warehouse = snapshot_mod.warehouse_from_metadata(adapter)
             connector = adapter.name
@@ -93,11 +92,11 @@ def cmd_snapshot(args: argparse.Namespace) -> env.Envelope:
         transform_layer=transform_layer,
         semantic_layer=semantic_layer,
     )
-    path = store.save_snapshot(snap)
+    locator = store.save_snapshot(snap)
 
     return env.ok(
         {
-            "snapshot_path": str(path),
+            "snapshot_path": locator,
             "baseline": {
                 "from": warehouse_from,
                 "dataset_count": len(warehouse.datasets),
@@ -130,28 +129,27 @@ def cmd_snapshot(args: argparse.Namespace) -> env.Envelope:
     )
 
 
-def cmd_schema(args: argparse.Namespace) -> env.Envelope:
-    return _detect_free_axis(args, "schema", drift_mod.schema_drift)
+def cmd_schema(args: argparse.Namespace, store: Store) -> env.Envelope:
+    return _detect_free_axis(args, store, "schema", drift_mod.schema_drift)
 
 
-def cmd_volume(args: argparse.Namespace) -> env.Envelope:
-    return _detect_free_axis(args, "volume", drift_mod.volume_drift)
+def cmd_volume(args: argparse.Namespace, store: Store) -> env.Envelope:
+    return _detect_free_axis(args, store, "volume", drift_mod.volume_drift)
 
 
-def cmd_grain(args: argparse.Namespace) -> env.Envelope:
+def cmd_grain(args: argparse.Namespace, store: Store) -> env.Envelope:
     """Grain drift scans (exact distinct counts, overlap probes), so on a billed
     connector it goes through the confirm handshake with a dry-run estimate of
     exactly the statements it would run. Free connectors run immediately."""
 
     repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     snap = store.load_snapshot()
     if snap is None:
         return env.error(_NO_SNAPSHOT_ERROR)
     config = load_config(repo_root) or DexConfig()
     scope_names = list(getattr(args, "objects", []) or [])
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     try:
         connector = adapter.name
         scope = None
@@ -190,14 +188,12 @@ def cmd_grain(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
+def cmd_semantic(args: argparse.Namespace, store: Store) -> env.Envelope:
     """The semantic axis is two-phase on billed connectors: definition and
     reference checks are free and run immediately; the dimension-cardinality
     scan waits behind the handshake, and an unconfirmed call still returns the
     complete free findings alongside the estimate."""
 
-    repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     snap = store.load_snapshot()
     if snap is None:
         return env.error(_NO_SNAPSHOT_ERROR)
@@ -216,7 +212,7 @@ def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
     current_semantic = snapshot_mod.semantic_layer(view)
     scope_names = list(getattr(args, "objects", []) or [])
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     try:
         connector = adapter.name
         current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
@@ -267,14 +263,13 @@ def cmd_semantic(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_check(args: argparse.Namespace) -> env.Envelope:
+def cmd_check(args: argparse.Namespace, store: Store) -> env.Envelope:
     """The everyday sweep, two-phase by construction: the free axes (schema,
     volume, semantic references) always run and their findings always return;
     the scanning axes (grain, cardinality) run immediately on free connectors
     and behind one combined estimate on billed ones."""
 
     repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     snap = store.load_snapshot()
     if snap is None:
         return env.error(_NO_SNAPSHOT_ERROR)
@@ -291,7 +286,7 @@ def cmd_check(args: argparse.Namespace) -> env.Envelope:
         project_available = False
         warnings.append(f"semantic axis skipped (no dbt project: {exc})")
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     try:
         connector = adapter.name
         current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
@@ -372,7 +367,7 @@ def cmd_check(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def cmd_reconcile(args: argparse.Namespace) -> env.Envelope:
+def cmd_reconcile(args: argparse.Namespace, store: Store) -> env.Envelope:
     """Propose the dbt edits that reconcile detected drift, as a stored plan of
     reviewable diffs. Reads the last `.dex/drift.json`, never re-scans, and
     writes nothing to the project: applying is `transform apply <plan-id>`, so
@@ -382,7 +377,6 @@ def cmd_reconcile(args: argparse.Namespace) -> env.Envelope:
     from . import reconcile as reconcile_mod
 
     repo_root = command_args.repo_root(args)
-    store = DexStore(repo_root)
     snap = store.load_snapshot()
     if snap is None:
         return env.error(_NO_SNAPSHOT_ERROR)
@@ -447,7 +441,7 @@ def cmd_reconcile(args: argparse.Namespace) -> env.Envelope:
             f"maintain reconcile {drift_class}" if drift_class else "maintain reconcile"
         )
         plan, diffs, plan_warnings = plans_mod.plan(
-            intent, edits, project_dir=view.root, repo_root=repo_root
+            intent, edits, project_dir=view.root, repo_root=repo_root, store=store
         )
         envelope.diffs = diffs
         envelope.warnings.extend(plan_warnings)
@@ -465,16 +459,17 @@ def cmd_reconcile(args: argparse.Namespace) -> env.Envelope:
     return envelope
 
 
-def _detect_free_axis(args: argparse.Namespace, axis: str, detector) -> env.Envelope:
+def _detect_free_axis(
+    args: argparse.Namespace, store: Store, axis: str, detector
+) -> env.Envelope:
     """One metadata-only detector: free on every connector, so no handshake.
     The cost stamp still reflects the connector's paradigm for the agent."""
 
-    store = DexStore(command_args.repo_root(args))
     snap = store.load_snapshot()
     if snap is None:
         return env.error(_NO_SNAPSHOT_ERROR)
 
-    adapter = command_args.open_from_args(args)
+    adapter = command_args.open_from_args(args, store)
     try:
         current = snapshot_mod.warehouse_from_metadata(adapter).datasets
         gate = getattr(adapter, "cost_gate", None)
@@ -514,12 +509,12 @@ def _resolve_scope(
 
 
 def _record_axes(
-    store: DexStore,
+    store: Store,
     snap: snapshot_mod.Snapshot,
     connector: str | None,
     results: dict[str, tuple[list[drift_mod.DriftFinding], list[str]]],
 ) -> None:
-    """Merge this run's axes into `.dex/drift.json`. Axes merge across runs so
+    """Merge this run's axes into the stored drift report. Axes merge across runs so
     a focused detector refreshes only itself, but never across baselines:
     findings measured against an older snapshot are dropped wholesale."""
 
@@ -539,7 +534,7 @@ def _record_axes(
 def _findings_data(
     by_axis: dict[str, list[drift_mod.DriftFinding]],
     snap: snapshot_mod.Snapshot,
-    store: DexStore,
+    store: Store,
 ) -> dict:
     findings = drift_mod.rank_findings(
         [finding for axis_findings in by_axis.values() for finding in axis_findings]
@@ -553,7 +548,7 @@ def _findings_data(
             "snapshot_created_at": snap.created_at,
             "from": snap.warehouse_from,
         },
-        "drift_path": str(store.dex_dir / "drift.json"),
+        "drift_path": store.locator(Document.DRIFT),
     }
     if findings:
         data["hint"] = (
@@ -618,7 +613,7 @@ def _semantic_scope(
     return [finding for finding in findings if in_scope(finding)]
 
 
-def _staleness_warnings(store: DexStore, snap: snapshot_mod.Snapshot) -> list[str]:
+def _staleness_warnings(store: Store, snap: snapshot_mod.Snapshot) -> list[str]:
     warnings: list[str] = []
     cache = store.load_cache()
     if (

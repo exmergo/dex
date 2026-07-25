@@ -29,7 +29,6 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from ..cache import DEX_DIR
 from ..config import (
     CONFIG_FILE,
     BigQueryTarget,
@@ -42,6 +41,7 @@ from ..config import (
 )
 from ..dbt_project import PROFILES_FILE, PROJECT_FILE, discover_projects
 from ..diffs import file_diff
+from ..storage import DEX_DIR
 
 VALID_CONNECTORS = (
     "duckdb",

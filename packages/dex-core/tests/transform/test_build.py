@@ -730,7 +730,7 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
-    monkeypatch.setattr(command_args, "open_from_args", lambda args: adapter)
+    monkeypatch.setattr(command_args, "open_from_args", lambda args, store: adapter)
     monkeypatch.setattr(
         build_module,
         "compile_estimate",
@@ -846,7 +846,7 @@ def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
 
     monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
 
-    def boom(args):
+    def boom(args, store):
         raise RuntimeError("no application default credentials")
 
     monkeypatch.setattr(command_args, "open_from_args", boom)
@@ -1058,6 +1058,58 @@ def test_dev_target_check_runs_before_the_cost_gate(
     assert rc == 1
     assert envelope["status"] == "error"
     assert "seed" in envelope["errors"][0]
+
+
+def test_build_hands_the_dev_target_preflight_a_store_for_a_billed_connector(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The dev-target preflight degrades to a note when it cannot open, and a
+    billed connector will not open without a store for its cost gate. A caller
+    that forgets one therefore loses the refusal that stops a doomed build, and
+    loses it quietly, so the handoff is pinned rather than inferred."""
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: bigquery\nbigquery:\n  project: dex-test\n  dev_dataset: dbt_dev\n",
+        encoding="utf-8",
+    )
+
+    probed: list[str] = []
+    stores: list[object] = []
+
+    class _Probe:
+        project = "dex-test"
+        name = "bigquery"
+
+        def missing_dev_namespaces(self, dataset):
+            probed.append(dataset)
+            return []
+
+        def close(self):
+            pass
+
+    def opener(*, store=None, **_kwargs):
+        # Stands in for connect._require_store, so a missing store fails the
+        # test the same way it failed in production.
+        if store is None:
+            raise ValueError("opening 'bigquery' needs a store")
+        stores.append(store)
+        return _Probe()
+
+    import exmergo_dex_core.command_args as command_args_mod
+    import exmergo_dex_core.connect as connect_mod
+
+    monkeypatch.setattr(connect_mod, "open_adapter", opener)
+    monkeypatch.setattr(command_args_mod, "open_adapter", opener)
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    monkeypatch.setattr(build_module, "compile_estimate", lambda *a, **k: (1.0, {}, []))
+
+    _run(
+        ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"], capsys
+    )
+
+    assert stores, "the dev-target preflight opened no connection"
+    assert probed == ["dbt_dev"]
 
 
 def test_prod_refusal_still_beats_the_dev_target_check(

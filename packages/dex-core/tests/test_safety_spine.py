@@ -16,6 +16,7 @@ import pytest
 from exmergo_dex_core import envelope as env
 from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, PIIFlag
+from exmergo_dex_core.storage import FilesystemStore, MemoryStore
 
 # --- Family 1: read-only against data; SELECT-only; prod-target refused -------
 
@@ -361,7 +362,11 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
         )
     ]
     _plan, diffs, _warnings = transform.plan(
-        "add stg_new", edits, dbt_project_dir, repo_root=dbt_project_dir.parent
+        "add stg_new",
+        edits,
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
     )
     # Planning returns reviewable diffs and touches nothing in the project.
     assert diffs and diffs[0]["unified"]
@@ -394,6 +399,7 @@ def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: P
             [proposed_secret],
             dbt_project_dir,
             repo_root=dbt_project_dir.parent,
+            store=FilesystemStore(dbt_project_dir.parent),
         )
     assert "s3cr3t-proposed" not in str(proposed_exc.value)
 
@@ -415,6 +421,7 @@ def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: P
             [clean_proposal],
             dbt_project_dir,
             repo_root=dbt_project_dir.parent,
+            store=FilesystemStore(dbt_project_dir.parent),
         )
     assert "s3cr3t-on-disk" not in str(current_exc.value)
 
@@ -431,12 +438,20 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
         )
     ]
     planned, _diffs, _warnings = transform.plan(
-        "trim stg_customers", edits, dbt_project_dir, repo_root=dbt_project_dir.parent
+        "trim stg_customers",
+        edits,
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
     )
     # A human edits the file after the plan was made; their edit is authoritative.
     model.write_text("select 99 as id -- hand-tuned\n", encoding="utf-8")
 
-    result = transform.apply(planned.plan_id, dbt_project_dir.parent)
+    result = transform.apply(
+        planned.plan_id,
+        dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
     assert result.written == []
     assert result.conflicts
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
@@ -456,12 +471,20 @@ def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):
         )
     ]
     planned, _diffs, _warnings = transform.plan(
-        "drop stg_customers", edits, dbt_project_dir, repo_root=dbt_project_dir.parent
+        "drop stg_customers",
+        edits,
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
     )
     # A human edits the file after the delete was planned.
     model.write_text("select 99 as id -- keep me\n", encoding="utf-8")
 
-    result = transform.apply(planned.plan_id, dbt_project_dir.parent)
+    result = transform.apply(
+        planned.plan_id,
+        dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
     assert result.written == []
     assert result.conflicts
     # The file is still there: an unconfirmed delete against a diverged file is
@@ -770,6 +793,100 @@ def test_init_content_preflight_is_free_and_never_gates(tmp_path: Path, monkeypa
     env.emit(env.ok({}, warnings=warnings))
 
 
+def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
+    duckdb_file: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The store is the only thing standing between the engine and the user's disk.
+
+    An in-process caller asked for no persistence, so a full flow (profile, then a
+    query that reads the profile back) must leave the tree exactly as it found it:
+    no `.dex/` directory, no stray file anywhere, not even in the working directory
+    a relative path would resolve against.
+    """
+
+    import argparse
+
+    from exmergo_dex_core.cli import dispatch
+
+    repo = duckdb_file.parent
+    monkeypatch.chdir(repo)
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(p.relative_to(repo)): p.read_bytes()
+            for p in sorted(repo.rglob("*"))
+            if p.is_file()
+        }
+
+    before = snapshot()
+    store = MemoryStore()
+
+    def _args(subcommand: str, **extra) -> argparse.Namespace:
+        base = {
+            "group": "explore",
+            "subcommand": subcommand,
+            "connector": "duckdb",
+            "path": str(duckdb_file),
+            "repo_root": str(repo),
+            "confirm": False,
+            "budget": None,
+        }
+        base.update(extra)
+        return argparse.Namespace(**base)
+
+    profiled = dispatch(_args("profile", objects=["customers"]), store)
+    assert profiled.status is env.Status.OK, profiled.errors
+    # Real work happened, so the silence below is not the silence of a no-op.
+    assert profiled.data["profiled_count"] == 1
+    # The locator is honest about there being no file to open.
+    assert profiled.data["cache_path"] == "memory:cache"
+
+    # The second step proves retention, not just silence: the query firewall
+    # derives its PII policy from the cache the first step stored, so a store that
+    # dropped writes would fail here rather than pass quietly.
+    queried = dispatch(_args("query", sql="select count(*) as n from customers"), store)
+    assert queried.status is env.Status.OK, queried.errors
+    assert queried.data["row_count"] == 1
+
+    assert snapshot() == before
+    assert not (repo / ".dex").exists()
+
+
+def test_an_in_memory_session_budget_still_binds(fake_bq_client):
+    """A backend that forgets across processes must not forget within one.
+
+    MemoryStore's ledger lives for the process, so the daily session ceiling
+    resets with the next one (right for a library call, wrong for the CLI, which
+    is why the CLI keeps the filesystem store). Within one process, though, the
+    cumulative ceiling has to bind exactly as it does on disk.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import CostGate, OverCeilingError
+
+    store = MemoryStore()
+    cutoff = "2026-07-03T00:00:00+00:00"
+    store.append_spend_log(
+        {
+            "at": "2026-07-03T09:00:00+00:00",
+            "connector": "bigquery",
+            "billed_bytes": 900,
+        }
+    )
+    gate = CostGate(
+        paradigm=env.Paradigm.BYTES_SCANNED,
+        ceiling=10_000,
+        session_ceiling=1_000,
+        session_spent=store.spend_since(cutoff, connector="bigquery"),
+        confirmed=True,
+        connector="bigquery",
+        record=store.append_spend_log,
+    )
+    # 900 already spent against a 1_000 session ceiling: the per-command ceiling
+    # would allow this, the session ceiling must not.
+    with pytest.raises(OverCeilingError):
+        gate.preflight_command(500)
+
+
 # --- Family 5: credentials and raw rows never enter stdout data ---------------
 
 
@@ -953,8 +1070,8 @@ def test_init_bigquery_profile_is_dev_only_with_no_secrets(tmp_path: Path):
     import yaml
 
     from exmergo_dex_core import transform
-    from exmergo_dex_core.cache import DEX_DIR
     from exmergo_dex_core.config import CONFIG_FILE
+    from exmergo_dex_core.storage import DEX_DIR
 
     (tmp_path / DEX_DIR).mkdir()
     (tmp_path / DEX_DIR / CONFIG_FILE).write_text(
@@ -994,9 +1111,9 @@ def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_cl
     # Family 5: the audit trail is byte counts and statement hashes only.
     import json
 
-    from exmergo_dex_core.cache import DexStore
+    from exmergo_dex_core.storage import FilesystemStore
 
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
     adapter = _bq_adapter(fake_bq_client)
     adapter.cost_gate._record = store.append_spend_log
@@ -1317,9 +1434,9 @@ def test_snowflake_spend_ledger_holds_no_sql_or_values(
     # Family 5: the audit trail is second counts and statement hashes only.
     import json
 
-    from exmergo_dex_core.cache import DexStore
+    from exmergo_dex_core.storage import FilesystemStore
 
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     fake_sf_connection.row_resolver = lambda sql: [{"n": 1}]
     adapter = _sf_adapter(fake_sf_connection)
     adapter.cost_gate._record = store.append_spend_log
@@ -1338,9 +1455,9 @@ def test_snowflake_spend_ledger_holds_no_sql_or_values(
 def test_ledgers_never_mix_paradigms(tmp_path: Path):
     # Family 2 (cross-connector): a bytes session budget must not absorb a
     # seconds entry and vice versa; each connector sums only its own unit.
-    from exmergo_dex_core.cache import DexStore
+    from exmergo_dex_core.storage import FilesystemStore
 
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     store.append_spend_log(
         {
             "at": "2026-07-05T00:00:01+00:00",
@@ -1591,9 +1708,9 @@ def test_databricks_spend_ledger_holds_no_sql_or_values(
     # Family 5: the audit trail is second counts and statement hashes only.
     import json
 
-    from exmergo_dex_core.cache import DexStore
+    from exmergo_dex_core.storage import FilesystemStore
 
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     fake_databricks.connection.row_resolver = lambda sql: [{"n": 1}]
     adapter = _dbx_adapter(fake_databricks)
     adapter.cost_gate._record = store.append_spend_log
@@ -1820,9 +1937,9 @@ def test_postgres_spend_ledger_holds_no_sql_or_values(
     # Family 5: the audit trail is second counts and statement hashes only.
     import json
 
-    from exmergo_dex_core.cache import DexStore
+    from exmergo_dex_core.storage import FilesystemStore
 
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     fake_pg_connection.row_resolver = lambda sql: [{"n": 1}]
     adapter = _pg_adapter(fake_pg_connection)
     adapter.cost_gate._record = store.append_spend_log
@@ -2028,8 +2145,8 @@ def test_init_redshift_profile_is_dev_only_with_no_secrets(tmp_path: Path, monke
     import yaml
 
     from exmergo_dex_core import transform
-    from exmergo_dex_core.cache import DEX_DIR
     from exmergo_dex_core.config import CONFIG_FILE
+    from exmergo_dex_core.storage import DEX_DIR
 
     class _Client:
         def get_workgroup(self, workgroupName):  # noqa: N803 (boto3's spelling)
@@ -2108,9 +2225,9 @@ def test_redshift_spend_ledger_holds_no_sql_or_values(
     # Family 5: the audit trail is second counts and statement hashes only.
     import json
 
-    from exmergo_dex_core.cache import DexStore
+    from exmergo_dex_core.storage import FilesystemStore
 
-    store = DexStore(tmp_path)
+    store = FilesystemStore(tmp_path)
     fake_redshift_connection.row_resolver = lambda sql: [{"n": 1}]
     adapter = _redshift_adapter(fake_redshift_connection)
     adapter.cost_gate._record = store.append_spend_log
@@ -2410,7 +2527,9 @@ def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
             )
         ]
     )
-    backend = LocalMetricFlowBackend(project, None, None, "duckdb", QueryLimits())
+    backend = LocalMetricFlowBackend(
+        project, None, None, "duckdb", QueryLimits(), MemoryStore()
+    )
     lookup = backend._cache_pii_lookup(cache)
     assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
 
@@ -2423,7 +2542,9 @@ def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Pa
     from exmergo_dex_core.config import QueryLimits
     from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
 
-    backend = LocalMetricFlowBackend(tmp_path, None, None, "duckdb", QueryLimits())
+    backend = LocalMetricFlowBackend(
+        tmp_path, None, None, "duckdb", QueryLimits(), MemoryStore()
+    )
     cache = DexCache(
         datasets=[
             Dataset(
