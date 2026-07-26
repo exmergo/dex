@@ -11,42 +11,83 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [1.4.1] - 2026-07-26
 
+### Added
+
+- **`maintain check` classifies orphaned warehouse relations** ([#146]). A model
+  that is renamed or removed leaves its old relation behind in the warehouse, since
+  dbt never drops it, so the leftover table was either invisible to drift detection
+  or misreported as an unrelated finding. A new `orphan_relation` finding fires when
+  a relation was model-backed or source-backed at the last snapshot, no longer is,
+  and is still present in the warehouse. `maintain reconcile` proposes the matching
+  `DROP TABLE` as an advisory statement for a human to run, never executing it, and
+  `explore map --use-project` down-ranks and badges orphans so they stop surfacing
+  as top objects. Detection and advice only: the drop itself stays manual.
+
+### Changed
+
+- **The hosted semantic layer is a genuinely standalone install: no warehouse
+  client, no dbt-core, no SQL parser.** `[semantic-api]` used to require a dialect
+  engine it could never use, because dbt Cloud renders and executes the query
+  server-side and dex never sees a statement to validate. The coupling was one
+  float: the PII block threshold lived in the query firewall, so reading it pulled
+  in a SQL parser. The threshold now lives with the guards' shared policy, where
+  every surface that gates on PII can read it without paying for a parser, and the
+  `explore semantic` handlers moved out of the explore command module (which
+  imports the firewall for the commands that do parse SQL) into the semantic
+  package. `DexEngine.semantic_list` and `semantic_query` route there too, so a
+  host serving metric queries with a `SemanticSource` and nothing on the filesystem
+  needs only this extra, which is what the documentation already promised.
+
+  A command that does parse SQL, run on an install that named no connector, now
+  refuses and names the extra to install. There is deliberately no weaker fallback
+  check: a query dex cannot parse is a query it cannot promise is read-only, so
+  refusing is the only safe answer. `explore semantic list --local`, documented as
+  a read-view needing no extra, works on a bare install for the first time.
+
 ### Fixed
 
-- **Every install now declares the dialect engine it actually imports.** sqlglot
-  was pinned inside each of the six connector extras, but the guards that parse
-  SQL (the query firewall and the SELECT-only assertion) are cross-cutting and
-  eagerly imported, so any install that picked no connector extra failed on an
-  import the metadata never promised. `[semantic-api]`, documented as a
-  pure-remote install needing nothing but an httpx client, could not import the
-  hosted dbt Cloud backend at all; `[cluster]` on its own and a bare install
-  running the read-only `explore semantic list --local` failed the same way. The
-  CLI caught the `ModuleNotFoundError` and reported it inside an error envelope,
-  so it read as a broken environment rather than a packaging bug. sqlglot is now
-  a base dependency, declared once: it is connector-agnostic, pure Python with no
-  dependencies of its own, and required by the guards on every surface. Importing
-  the package still pulls in no sqlglot, so per-command CLI latency is unchanged.
+- **Extras no longer under-declare what the code imports, and the sqlglot bound no
+  longer lags what the code needs.** sqlglot was pinned inside each of the six
+  connector extras, so any install that picked no connector failed on an import the
+  metadata never promised: `[semantic-api]` could not import the hosted dbt Cloud
+  backend at all, and `[cluster]` alone and a bare install failed the same way. The
+  CLI caught the `ModuleNotFoundError` and reported it inside an error envelope, so
+  it read as a broken environment rather than a packaging bug. Compounding it, the
+  declared floor was `>=25` while the firewall's unnest allowlist referenced
+  expression classes that only exist from 28.6 (`exp.JSONKeys`), so an environment
+  whose resolver settled on an older sqlglot satisfied the metadata and then failed
+  on an `AttributeError` at import.
+
+  sqlglot is now declared exactly once, in a `[sql]` extra that every extra
+  reaching a warehouse self-references, and bounded at both ends: `>=28.6,<31`.
+  There is a ceiling because the firewall matches expression classes by name at
+  module scope and sqlglot majors have already broken this code twice (the `Union`
+  to `SetOperation` and `from` to `from_` renames both needed accommodating), so an
+  open bound let a future release break every new install on something no test here
+  could anticipate. Two guards keep the pair honest: a packaging test installs the
+  wheel at exactly the declared floor and imports the guards, and a new advisory
+  `sqlglot-canary` CI job runs the guards and the safety spine against the newest
+  sqlglot on every push, so a breaking release surfaces on our side first and
+  raising the ceiling is a deliberate act taken on evidence.
 
 - **`[all]` now installs every optional capability, not just every connector.**
   The extra covered the six connectors and stopped there, so an install documented
   as everything silently omitted both semantic-layer backends (`[semantic]`,
   `[semantic-api]`) and clustering (`[cluster]`), and a user who asked for all of
-  it still got `not_implemented`-shaped failures on `explore semantic` and
-  `explore cluster`. It self-references the other extras, so their requirement
-  lists stay defined once, and a packaging test now asserts the reference list
-  covers every declared extra except `dev` (contributor tooling, not a
-  capability), then installs it and imports every client, dbt adapter, and
-  semantic backend to prove they co-resolve. `[all]` is correspondingly the
-  heaviest install available; the light default and the `[duckdb]` on-ramp are
-  unchanged.
+  it still got failures telling them to install an extra they had already named. It
+  self-references the other extras, so their requirement lists stay defined once,
+  and a packaging test now asserts the reference list covers every declared extra
+  except `dev` (contributor tooling, not a capability), then installs it and imports
+  every client, dbt adapter, and semantic backend to prove they co-resolve. `[all]`
+  is correspondingly the heaviest install available; the light default and the
+  `[duckdb]` on-ramp are unchanged.
 
-- **The declared sqlglot floor matches what the code needs.** The bound was
-  `>=25` while the firewall's unnest allowlist referenced expression classes at
-  module scope that only exist from 28.6 (`exp.JSONKeys`), so any environment
-  whose resolver settled on an older sqlglot, satisfying the declared bound, hit
-  an `AttributeError` on import. The floor is now `>=28.6`, and a packaging test
-  installs the wheel at exactly the declared floor and imports the guards, so a
-  newly referenced expression class cannot silently outrun the bound again.
+- **Windows path separators no longer break model-name parsing** ([#146]). The
+  project file index keyed its entries with OS-native separators, while every
+  consumer of those keys splits on `/`: the transform layer's model-name parsing,
+  scaffolded model paths, and the relation names the orphan classification above
+  depends on. On Windows they all quietly found nothing rather than failing loudly.
+  Keys are now posix-separated regardless of platform.
 
 ## [1.4.0] - 2026-07-26
 
