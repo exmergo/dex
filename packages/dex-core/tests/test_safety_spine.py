@@ -9,6 +9,7 @@ logic arrives.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -2754,3 +2755,129 @@ def test_api_pii_stays_flagged_and_never_surfaced(duckdb_file: Path):
         engine.map()
         with pytest.raises(QueryRefusedError):
             engine.query("select email from customers")
+
+
+# --- A host-supplied connection buys identity, never a guard --------------------
+#
+# The seam that lets a host open the connection is the one place where an
+# integrator could plausibly expect to hand dex a fully built adapter, cost gate
+# included. It cannot, and these are the reasons why, asserted rather than argued.
+# A host that fumbled `session_spent`, or passed 0.0, would silently disarm the
+# cumulative ceiling in exactly the deployment where a runaway agent loop is most
+# expensive, so dex keeps building the gate from its own store on both paths.
+
+
+def _host_connected_engine(fake_pg_connection, store, **kwargs) -> DexEngine:
+    """A billed engine whose connection came from outside, gated for real.
+
+    Postgres because its fake is connection-shaped, so what is injected here is
+    the same kind of object a host would hand over. The gate is built by
+    connect.py from ``store``, not by this helper, so what is under test is the
+    real wiring rather than a hand-rolled stand-in.
+    """
+
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import PostgresTarget
+
+    config = DexConfig(connector="postgres", postgres=PostgresTarget(schemas=["shop"]))
+    return DexEngine(
+        config=config,
+        store=store,
+        connection=ConnectionSource(connect=lambda: fake_pg_connection),
+        **kwargs,
+    )
+
+
+def test_the_session_ceiling_binds_on_a_host_supplied_connection(fake_pg_connection):
+    # Family 2, at the connection seam. This is the property the whole design
+    # rests on: the host owns authentication, dex still owns the brake. Spend
+    # already in the ledger is settled against the ceiling even though dex never
+    # opened the connection that would do the spending.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    store = MemoryStore()
+    store.append_spend_log(
+        {
+            "at": datetime.now(UTC).isoformat(),
+            "connector": "postgres",
+            "billed_seconds": 1_000.0,
+        }
+    )
+    # The per-command budget would allow this comfortably; the session budget is
+    # already spent, and it is the tighter of the two that has to bind.
+    engine = _host_connected_engine(
+        fake_pg_connection,
+        store,
+        confirmed=True,
+        budget=10_000.0,
+    )
+    engine.config.budget.session_ceiling = 1_000.0
+
+    with engine as eng, pytest.raises(OverCeilingError):
+        eng.profile("shop.customers")
+
+    # And nothing ran: the refusal landed before any statement, not after.
+    assert fake_pg_connection.data_statements == []
+
+
+def test_a_host_supplied_connection_still_needs_a_store(fake_pg_connection):
+    # Family 2: supplying a connection makes identity the host's. It does not
+    # make the budget the host's, so a billed connector with nowhere to settle
+    # the session ledger is refused rather than opened unbudgeted.
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import PostgresTarget
+
+    config = DexConfig(connector="postgres", postgres=PostgresTarget())
+    engine = DexEngine(
+        config=config,
+        connection=ConnectionSource(connect=lambda: fake_pg_connection),
+    )
+    engine.store = None  # a host that wired its own store badly
+
+    with pytest.raises(ValueError, match="needs a store"):
+        engine._adapter("explore profile")
+
+
+def test_a_host_supplied_connection_cannot_widen_a_committed_scope(
+    fake_pg_connection,
+):
+    # Family 2: the committed source allowlist is a cost boundary, and owning the
+    # credential does not move it. A host narrows inside what the config commits,
+    # exactly as a --scope flag does, and reaching outside is refused.
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import PostgresTarget
+    from exmergo_dex_core.connect import ScopeError
+
+    config = DexConfig(connector="postgres", postgres=PostgresTarget(schemas=["shop"]))
+    source = ConnectionSource(connect=lambda: fake_pg_connection)
+
+    with DexEngine(
+        config=config, store=MemoryStore(), connection=source, scopes=["shop"]
+    ) as eng:
+        assert eng.connect_test().capabilities["schema_count"] >= 1
+
+    with (
+        DexEngine(
+            config=config,
+            store=MemoryStore(),
+            connection=source,
+            scopes=["somewhere_else"],
+        ) as eng,
+        pytest.raises(ScopeError, match="never widens"),
+    ):
+        eng.connect_test()
+
+
+def test_duckdb_cannot_be_reached_through_an_injected_connection(duckdb_file: Path):
+    # Family 1: DuckDB is opened read-only by dex itself, and that is what makes
+    # the read-only guarantee enforceable on a local file. An injected handle
+    # could have been opened writable, so the seam refuses the connector outright
+    # rather than trusting a caller's word about a file it did not open.
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import DuckDBTarget
+
+    config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=str(duckdb_file)))
+    writable = ConnectionSource(connect=lambda: pytest.fail("never called"))
+
+    with pytest.raises(ValueError, match="read-only"):
+        DexEngine(config=config, connection=writable)._adapter("explore inventory")
