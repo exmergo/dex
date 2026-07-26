@@ -24,7 +24,7 @@ from ... import envelope as env
 from ...adapters import get_dialect
 from ...cache import match_identifier
 from ...config import QueryLimits, pii_override_paths
-from ...storage import Store
+from ..results import SemanticQueryResult
 from . import (
     PII_BLOCK_CONFIDENCE,
     DimensionInfo,
@@ -33,6 +33,7 @@ from . import (
     SemanticBackendError,
     SemanticCatalog,
     SemanticQuery,
+    SemanticQueryRefusedError,
     cap_columnar,
     requested_dimension_refs,
     screen_dimension_refs,
@@ -96,35 +97,29 @@ class LocalMetricFlowBackend:
     def __init__(
         self,
         project: Path,
-        config,
-        args,
+        engine,
         connector: str,
         limits: QueryLimits,
-        store: Store,
     ) -> None:
         self._project = project
-        self._config = config
-        self._args = args
+        # The dex engine, not an adapter: the connection is opened through it on
+        # the one billed path below, so this backend never becomes a second place
+        # that discovers credentials or builds a cost gate. Named `_dex` because
+        # "engine" already means the MetricFlow one throughout this module.
+        self._dex = engine
+        self._config = engine.config
+        self._store = engine.store
         self._connector = connector
         self._limits = limits
-        self._store = store
         self._mf_engine = None
         self._dim_columns: dict[str, tuple[str, str]] | None = None
 
     @classmethod
-    def from_args(cls, args, config, store: Store) -> LocalMetricFlowBackend:
-        connector = getattr(args, "connector", None) or getattr(
-            config, "connector", "duckdb"
-        )
+    def from_engine(cls, engine) -> LocalMetricFlowBackend:
+        config = engine.config
+        connector = engine.connector or getattr(config, "connector", "duckdb")
         limits = getattr(config, "query", None) or QueryLimits()
-        return cls(
-            command_args.project_dir(args),
-            config,
-            args,
-            connector,
-            limits,
-            store,
-        )
+        return cls(engine.project_dir(), engine, connector, limits)
 
     # ---- discovery ---------------------------------------------------------
 
@@ -207,9 +202,9 @@ class LocalMetricFlowBackend:
 
     # ---- query -------------------------------------------------------------
 
-    def query(self, q: SemanticQuery) -> env.Envelope:
+    def query(self, q: SemanticQuery) -> SemanticQueryResult:
         if not q.metrics:
-            return env.error("a metric query needs at least one --metric")
+            raise SemanticBackendError("a metric query needs at least one --metric")
 
         cache = self._load_cache()
 
@@ -220,20 +215,20 @@ class LocalMetricFlowBackend:
         )
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
-            return env.error(
+            raise SemanticQueryRefusedError(
                 f"refused: grouping or filtering by {named} would surface PII. "
                 "PII is flagged, never surfaced; query a non-PII dimension instead."
             )
 
         try:
             sql = self._render(q)
-        except SemanticBackendError as exc:  # missing extra or uncompiled manifest
-            return env.error(str(exc))
+        except SemanticBackendError:  # missing extra or uncompiled manifest
+            raise
         except Exception as exc:  # a MetricFlow resolution error (unknown metric,
             # unresolvable dimension) is the query's fault, not a crash: surface it.
-            return env.error(
+            raise SemanticBackendError(
                 f"could not resolve the metric query: {env.redact(str(exc))}"
-            )
+            ) from exc
 
         from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
 
@@ -244,42 +239,35 @@ class LocalMetricFlowBackend:
         # letting the warehouse answer with a table-not-found after a billed job.
         mismatch = self._namespace_mismatch(sql, cache, dialect)
         if mismatch is not None:
-            return env.error(mismatch)
+            raise SemanticBackendError(mismatch)
 
         try:
             assert_select_only(sql, dialect=dialect)
         except NotSelectOnlyError as exc:
-            return env.error(f"rendered metric SQL was not read-only: {exc}")
+            raise SemanticQueryRefusedError(
+                f"rendered metric SQL was not read-only: {exc}"
+            ) from exc
 
-        adapter = command_args.open_from_args(self._args, self._store)
-        try:
-            estimate_fn = getattr(adapter, "query_estimate", None)
-            estimate = estimate_fn(sql) if estimate_fn else 0.0
-            unconfirmed = command_args.billed_handshake(
-                "explore semantic query", adapter, estimate
-            )
-            if unconfirmed is not None:
-                return unconfirmed
-            result = adapter.run_query(
-                sql,
-                max_rows=self._limits.max_rows,
-                timeout_seconds=self._limits.timeout_seconds,
-            )
-            data = cap_columnar(
-                result.columns,
-                result.types,
-                result.cells,
-                max_rows=self._limits.max_rows,
-                max_cell_chars=self._limits.max_cell_chars,
-                max_payload_bytes=self._limits.max_payload_bytes,
-                truncated_by_source=result.truncated,
-            )
-            data["backend"] = self.name
-            envelope = env.ok(data)
-            command_args.stamp_spend(envelope, adapter)
-            return envelope
-        finally:
-            adapter.close()
+        adapter = self._dex._adapter("explore semantic query")
+        estimate_fn = getattr(adapter, "query_estimate", None)
+        estimate = estimate_fn(sql) if estimate_fn else 0.0
+        command_args.billed_handshake("explore semantic query", adapter, estimate)
+        result = adapter.run_query(
+            sql,
+            max_rows=self._limits.max_rows,
+            timeout_seconds=self._limits.timeout_seconds,
+        )
+        capped = cap_columnar(
+            result.columns,
+            result.types,
+            result.cells,
+            max_rows=self._limits.max_rows,
+            max_cell_chars=self._limits.max_cell_chars,
+            max_payload_bytes=self._limits.max_payload_bytes,
+            truncated_by_source=result.truncated,
+        )
+        record = SemanticQueryResult.from_capped(capped, backend=self.name)
+        return command_args.stamp_spend(record, adapter)
 
     def _load_cache(self):
         """The exploration cache with config PII overrides applied in memory, or None.
@@ -436,7 +424,7 @@ class LocalMetricFlowBackend:
             order_by_names=q.order_by or None,
             limit=q.limit,
         )
-        return self._engine().explain(request).sql_statement.sql
+        return self._metricflow_engine().explain(request).sql_statement.sql
 
     def _group_by_names(self, q: SemanticQuery) -> list[str]:
         # MetricFlow spells a time grain into the token (metric_time__month); a
@@ -449,7 +437,7 @@ class LocalMetricFlowBackend:
                 names.append(tok)
         return names
 
-    def _engine(self):
+    def _metricflow_engine(self):
         if self._mf_engine is not None:
             return self._mf_engine
         try:

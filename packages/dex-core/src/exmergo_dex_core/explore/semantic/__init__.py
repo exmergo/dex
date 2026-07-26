@@ -98,15 +98,34 @@ class SemanticCatalog:
 
 
 class SemanticBackendError(Exception):
-    """A backend cannot be constructed or reached: a missing extra, missing hosted
-    coordinates, missing credentials, or a missing local project. The message names
-    the fix; the command turns it into a clean ``env.error`` (never a stack trace)."""
+    """A backend cannot be constructed, reached, or asked what was asked of it: a
+    missing extra, missing hosted coordinates, missing credentials, a missing local
+    project, an unresolvable metric. The message names the fix; the caller turns it
+    into a clean error (never a stack trace)."""
+
+
+class SemanticQueryRefusedError(SemanticBackendError):
+    """The query was understood and deliberately not run.
+
+    A subclass so a single ``except SemanticBackendError`` still catches it, while
+    a caller that cares can tell "dex said no" apart from "the backend broke".
+    Today that means a PII request-gate refusal or rendered SQL that was not
+    read-only, both of which are policy, not failure.
+    """
 
 
 class SemanticBackend(Protocol):
-    """The seam both backends satisfy. ``query`` returns a full envelope rather
-    than raw rows because the two paths differ in cost surfacing and warnings, and
-    each owns its own posture."""
+    """The seam both backends satisfy.
+
+    ``query`` returns a ``SemanticQueryResult``, not an envelope: the two paths
+    genuinely differ in cost surfacing and warnings, and each owns its own
+    posture, but a posture is data on the result (a cost paradigm, a warning),
+    not a transport object. Backends that built their own envelopes made the
+    engine impossible to call from anything but a CLI.
+
+    A backend that cannot answer raises :class:`SemanticBackendError`; the caller
+    turns that into a clean error rather than a stack trace.
+    """
 
     name: str
 
@@ -265,33 +284,33 @@ def cap_columnar(
     }
 
 
-def resolve_backend(args, config, repo_root: str, store) -> SemanticBackend:
-    """The ambient backend resolution: ``--api``/``--local`` override the
+def resolve_backend(
+    engine, *, api: bool = False, local: bool = False
+) -> SemanticBackend:
+    """The ambient backend resolution: ``api``/``local`` override the
     ``.dex/config.yml`` ``semantic.backend`` default. Raises
     :class:`SemanticBackendError` (never a bare import error) when the chosen
     backend's extra, config, or credentials are missing."""
 
-    want_api = bool(getattr(args, "api", False))
-    want_local = bool(getattr(args, "local", False))
-    if want_api and want_local:
+    if api and local:
         raise SemanticBackendError("choose one of --local or --api, not both")
 
-    if want_api:
+    if api:
         backend = "dbt_cloud"
-    elif want_local:
+    elif local:
         backend = "local"
     else:
-        configured = getattr(getattr(config, "semantic", None), "backend", None)
+        configured = getattr(getattr(engine.config, "semantic", None), "backend", None)
         backend = (configured or "local").strip().lower()
 
     if backend in {"dbt_cloud", "api", "cloud"}:
         from .hosted import HostedDbtCloudBackend
 
-        return HostedDbtCloudBackend.from_config(args, config)
+        return HostedDbtCloudBackend.from_config(engine.config)
     if backend == "local":
         from .local import LocalMetricFlowBackend
 
-        return LocalMetricFlowBackend.from_args(args, config, store)
+        return LocalMetricFlowBackend.from_engine(engine)
     raise SemanticBackendError(
         f"unknown semantic backend '{backend}'; use 'local' or 'dbt_cloud' "
         "(or pass --local / --api)"
