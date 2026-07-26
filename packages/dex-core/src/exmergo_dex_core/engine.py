@@ -24,7 +24,9 @@ reconcile baseline, the ledgers, and the transform plans. Delete all of it and
 nothing canonical is lost. ``repo_root`` locates the things that are files by
 nature and stay git-reviewable: the dbt project, ``profiles.yml``, a DuckDB file,
 the credential files a connector discovers. A backend choice moves the first and
-never the second.
+never the second. A host that would rather not have credentials discovered from
+its filesystem at all can supply the connection instead; see ``connection=`` and
+:class:`~.connect.ConnectionSource`.
 
 **One engine, one principal.** See the class docstring.
 """
@@ -36,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
 from .config import DexConfig, load_config
+from .connect import ConnectionSource
 from .results import ConnectResult
 from .storage import FilesystemStore, MemoryStore, Store
 
@@ -89,12 +92,27 @@ class DexEngine:
     software. :meth:`from_repo` is the constructor that does read from disk, and
     it says so in its name.
 
+    **Supplying a connection supplies identity.** By default dex discovers the
+    credential from process-ambient state, which is right for one person at a
+    terminal and cannot express per-end-user access control in a process serving
+    several: ambient is process-wide. Pass ``connection=`` (a
+    :class:`~.connect.ConnectionSource`) and the host owns authentication, so dex
+    knows the principal only as what ``capabilities()`` reports. Two things do not
+    move with it. dex still builds the cost gate from ``store``, so the per-command
+    ceiling and the cumulative session ceiling bind exactly as they do on a
+    discovered connection; handing that to an integrator would let a fumbled
+    ``session_spent`` silently disarm the brake in the deployment where a runaway
+    agent loop is most expensive. And dex closes nothing it reached through the
+    source, since the caller that opened a connection is the one still holding it.
+
     The connection opens lazily on first use and is held until :meth:`close`,
     because re-opening a Snowflake or Databricks session per call is expensive
     and can wake a warehouse. Holding it is not an invitation to share the
-    engine; see above. Each call still gets its own cost gate, because a gate is
-    per-command state: it accumulates what one command charged, remembers whether
-    that command was confirmed, and labels that command's ledger entries.
+    engine; see above. With ``connection=`` that invariant sharpens rather than
+    changes: an engine outliving a request now outlives a credential too. Each
+    call still gets its own cost gate, because a gate is per-command state: it
+    accumulates what one command charged, remembers whether that command was
+    confirmed, and labels that command's ledger entries.
 
     ``scopes`` narrows the source allowlist and belongs to the engine rather than
     to a call, for the same reason the cache does: it is part of what this
@@ -115,6 +133,7 @@ class DexEngine:
         datasets: list[str] | None = None,
         budget: float | None = None,
         confirmed: bool = False,
+        connection: ConnectionSource | None = None,
     ) -> None:
         # Two config attributes, deliberately. `config` is what commands read and
         # is always a real object; `_declared` records whether one was actually
@@ -131,6 +150,9 @@ class DexEngine:
         self.scopes = scopes
         self.project = project
         self.datasets = datasets
+        # Held, not consumed: the same source opens the held connection and the
+        # transform preflight's separate one, so both run as the same principal.
+        self.connection = connection
         # Session defaults for the confirm handshake. Per-call arguments override
         # them; a confirmed engine confirms every call it makes, which is the
         # reason to prefer confirming the call.
@@ -167,7 +189,8 @@ class DexEngine:
 
         Everything that touches a warehouse comes through here, which is what
         makes the connection seam a single place to reason about: one point where
-        credentials are discovered, one point where the cost gate is attached.
+        the credential is established, discovered or host-supplied, and one point
+        where the cost gate is attached.
 
         The gate is rebuilt per call even though the connection is not, because
         the two have different lifetimes. Reusing a gate across commands would
@@ -198,6 +221,7 @@ class DexEngine:
                 budget=budget,
                 confirmed=confirmed,
                 command=command,
+                connection=self.connection,
             )
             return self._adapter_instance
 

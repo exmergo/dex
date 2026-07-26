@@ -16,10 +16,23 @@ The command contract in :mod:`exmergo_dex_core.cli` is the other surface, and it
 is the first consumer of the first: every agent surface (SKILL.md, AGENTS.md) is
 a thin wrapper over it, and it runs the same code a library call does.
 
+A process serving more than one end user supplies the connection too, so each
+request reaches the warehouse as its own principal rather than as the container:
+
+    from exmergo_dex_core import ConnectionSource, DexEngine
+
+    with DexEngine(
+        connector="snowflake",
+        config=cfg,
+        store=store,
+        connection=ConnectionSource(connect=lambda: user_conn),
+    ) as eng:
+        ...
+
 Read :class:`DexEngine`'s docstring before wiring this into a service. One engine
-belongs to one principal and one session, and an engine given an explicit config
-never reads one from disk; both matter the moment a process serves more than one
-user.
+belongs to one principal and one session, an engine given an explicit config never
+reads one from disk, and supplying a connection supplies identity but never the
+cost guard; all three matter the moment a process serves more than one user.
 """
 
 from __future__ import annotations
@@ -40,6 +53,7 @@ _EXPORTS = {
     "ColumnProfile": "cache",
     "ConfirmationRequest": "results",
     "ConfirmationRequiredError": "guards.cost_guard",
+    "ConnectionSource": "connect",
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
     "Dataset": "cache",
@@ -62,6 +76,7 @@ _EXPORTS = {
 if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .cache import ColumnProfile, Dataset, DexCache, Relationship
     from .config import DexConfig
+    from .connect import ConnectionSource
     from .engine import DexEngine
     from .envelope import Cost, Paradigm
     from .guards.cost_guard import (
@@ -95,6 +110,7 @@ __all__ = [
     "ColumnProfile",
     "ConfirmationRequest",
     "ConfirmationRequiredError",
+    "ConnectionSource",
     "Cost",
     "CostGuardError",
     "Dataset",
