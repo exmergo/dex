@@ -9,6 +9,53 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A public Python API: `from exmergo_dex_core import DexEngine`** ([#138]). The
+  engine had no library contract, so consuming it from another Python project
+  meant fabricating argparse namespaces or shelling out and parsing stdout JSON,
+  and doing either materialized a `.dex/` directory in the host project as an
+  unrequested side effect. `DexEngine` owns a connection, a configuration, and a
+  store, and exposes one method per subcommand:
+
+  ```python
+  from exmergo_dex_core import DexEngine
+
+  with DexEngine(connector="duckdb", path="shop.duckdb") as eng:
+      mapped = eng.map()
+      rows = eng.query("select status, count(*) from orders group by status")
+  ```
+
+  Methods return domain objects and result records carrying the counts, notes,
+  warnings, and diffs that explain them; the stdout envelope stays at the CLI
+  boundary. The default store keeps state in the process, so importing the
+  package writes nothing; `DexEngine.from_repo(repo_root)` opts in to a project on
+  disk. A `DexConfig` can be passed directly, with no `.dex/config.yml` present
+  anywhere, and an engine given one reads no config file at all, so a process
+  serving more than one principal cannot inherit a stray config from its
+  filesystem. Confirmation and budget refusals become exceptions
+  (`ConfirmationRequiredError` carrying the estimate and the payload needed to
+  re-issue, `OverCeilingError`, `CeilingRequiredError`), except for the
+  two-phase commands, where the ask rides back on the result alongside the work
+  already paid for. `DexConfig`, `DexCache`, `Dataset`, `Snapshot`, `Store`,
+  `MemoryStore`, and `FilesystemStore` are exported alongside it.
+
+  The CLI is now the API's first consumer rather than a parallel
+  implementation: it parses arguments, builds an engine, and wraps the result.
+  User-visible CLI behavior is unchanged.
+
+- **A runnable library example, and tests that install the package to run it**
+  ([#138]). `packages/dex-core/examples/quickstart.py` walks the whole flow in
+  one file: map a warehouse, read the inferred joins off the returned cache,
+  see a column flagged as PII, ask a question, and watch the query firewall
+  refuse one that would have projected the PII. It creates its own throwaway
+  DuckDB file, so it runs anywhere. A new packaging suite builds a wheel,
+  installs it into an isolated environment, and runs that example against it,
+  which is the first coverage of what a consumer actually gets rather than what
+  the source tree happens to provide: a bare install imports, no connector
+  client is pulled in at import, the `dex` console script still prints exactly
+  one envelope, and the documented example cannot rot.
+
 ### Changed
 
 - **`.dex/` state now lives behind an injectable storage seam** ([#137]). All
@@ -27,6 +74,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `FilesystemStore`, and the envelope's `cache_path`, `snapshot_path`,
   `drift_path`, and `plan_path` now carry a backend-supplied locator string
   (an absolute path, as before, on the filesystem backend).
+
+- **Cache and baseline refusals no longer name a file** ([#138]). Messages like
+  "no .dex/cache.json in this repo" were correct only for the filesystem
+  backend, which was the only one a user could reach until the API landed. They
+  now name the state and keep the actionable half ("no exploration cache yet;
+  run `explore map` first"), so the same refusal reads correctly whatever backs
+  the store. The commands that report where something was written still report a
+  real location, supplied by the backend.
 
 ### Fixed
 
