@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-07-26
+
 ### Fixed
 
 - **Every install now declares the dialect engine it actually imports.** sqlglot
