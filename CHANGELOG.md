@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-26
+
 ### Added
 
 - **A public Python API: `from exmergo_dex_core import DexEngine`** ([#138]). The
@@ -43,6 +45,82 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   The CLI is now the API's first consumer rather than a parallel
   implementation: it parses arguments, builds an engine, and wraps the result.
   User-visible CLI behavior is unchanged.
+
+- **A host can supply the warehouse connection: `ConnectionSource`** ([#142]).
+  Credentials were resolved only from process-ambient state (Application Default
+  Credentials, `~/.databrickscfg`, `connections.toml`, the `PG*` environment, the
+  AWS credential chain). That is exactly right for a CLI one person runs, and it
+  is why dex needs no credential configuration of its own, but ambient is
+  process-wide: a container serving several end users could only reach the
+  warehouse under one shared identity, so per-end-user access control was not
+  expressible whatever it did with the store or the config. `DexEngine` now takes
+  a `connection=`, and the connector's own discovery is skipped:
+
+  ```python
+  from exmergo_dex_core import ConnectionSource, DexEngine
+
+  with DexEngine(
+      connector="snowflake",
+      config=cfg,
+      store=store,
+      connection=ConnectionSource(connect=lambda: user_conn),
+  ) as eng:
+      eng.inventory()
+  ```
+
+  It carries a zero-argument factory rather than a live connection, so a free
+  metadata command never opens a billed session; on Databricks it carries the
+  Unity Catalog client alongside it, because metadata and billed SQL are two
+  different doors there. On BigQuery it carries a credential, whose principal
+  class dex derives from the credential itself rather than taking the host's word
+  for it, so `capabilities()` stays truthful about what the process is connected
+  as. Supported on all five warehouse connectors and refused on DuckDB, whose
+  target is a local file dex opens read-only itself.
+
+  The host owns authentication and therefore identity. It does not own the
+  guards: dex still builds the cost gate from the injected store, so the
+  per-command ceiling and the cumulative session ceiling bind on an injected
+  connection exactly as on a discovered one, scope still narrows inward only, and
+  reads stay read-only. dex also closes nothing it reached through the source,
+  since the caller that opened a connection is the one still holding it. No
+  credential is stored, cached, or refreshed anywhere, and `.dex/` stays
+  secret-free. CLI behavior is unchanged: it passes no connection and every
+  connector discovers credentials exactly as before.
+
+- **The hosted semantic layer's token is injectable too: `SemanticSource`**
+  ([#142]). The dbt Cloud Semantic Layer is a sixth credential path, and it was
+  the one the connection seam above did not cover: the token came from
+  `DBT_SL_TOKEN`, then `~/.dbt/dbt_cloud.yml`, and the backend read the process
+  environment directly, so it was not reachable through any argument a caller
+  could pass. Being process-global made it worse than merely absent, since the
+  only way to vary it per request was to mutate the environment and race one
+  user's token against another's.
+
+  ```python
+  from exmergo_dex_core import DexConfig, DexEngine, SemanticSource
+
+  config = DexConfig(
+      semantic={"backend": "dbt_cloud", "host": host, "environment_id": env_id}
+  )
+  with DexEngine(
+      config=config, semantic_source=SemanticSource(token=lambda: token_for(user))
+  ) as eng:
+      catalog = eng.semantic_list()
+  ```
+
+  It carries a callable rather than a string, so a rotating token is re-read
+  without rebuilding the engine, and it runs once per semantic command rather than
+  once per HTTP call, because one metric query can poll dbt Cloud many times while
+  it runs. The non-secret coordinates stay in the `semantic` config block, which
+  is committed and already injectable; the token never goes there. When a source is
+  supplied nothing ambient is consulted, including the environment's coordinates,
+  so a single stray `DBT_SL_HOST` cannot redirect every tenant's metric query at
+  once. This makes the hosted metric surface reachable with nothing on the
+  filesystem: no dbt project, no store, no connector, no credential file. Supplying
+  the token buys identity and not policy: the PII dimension gate still refuses the
+  same dimensions, and the hosted path's cost posture is unchanged, since dbt Cloud
+  owns that warehouse connection and executes server-side. A source passed to the
+  local backend is refused rather than ignored, because it has no meaning there.
 
 - **A runnable library example, and tests that install the package to run it**
   ([#138]). `packages/dex-core/examples/quickstart.py` walks the whole flow in
@@ -85,6 +163,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **A project-less deployment gets a real refusal from `explore semantic`**
+  ([#142]). The local backend is the default, so a caller with no dbt project on
+  disk landed there without asking to, and the failure surfaced as a bare
+  `ValueError` about a missing repo root, from a frame that names neither the
+  backend that needed the project nor the alternative. `resolve_backend` documents
+  that it raises `SemanticBackendError` and nothing else; it now does, and the
+  message names the choice: set `semantic.backend: dbt_cloud`, which needs no
+  project and no local credential.
+
 - **The `transform` dev-target preflight reaches billed connectors again**
   ([#137]). The storage seam gave `open_adapter` a required store on metered
   connectors, but the two preflight call sites in `transform/dev_target.py` still
@@ -96,6 +183,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   now receive the store the command already holds. The degradation was silent by
   design, because a connection dex cannot open must never break a build dbt could
   have run, so there are now tests that fail if either caller stops passing it.
+
+- **The `transform` dev-target preflight no longer re-reads config from disk**
+  ([#142]). The same two call sites passed no configuration either, so they
+  resolved one by walking up from the working directory even when the caller had
+  supplied a `DexConfig` outright. An engine given an explicit config is promised
+  that no file is read, precisely so a process serving several principals cannot
+  inherit a stray `.dex/config.yml` from its filesystem, and the preflight was
+  the one place that promise did not hold. Both sites now probe against the
+  configuration and the connection the command itself is using, so the check and
+  the build it precedes cannot disagree about the target or the principal.
 
 - **`explore profile` now honors the same fresh-profile reuse as `explore map`
   and `explore relationships`** ([#128]). Profiling a table whose cached profile

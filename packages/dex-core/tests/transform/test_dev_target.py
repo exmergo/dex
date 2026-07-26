@@ -1146,3 +1146,100 @@ def test_content_check_degrades_to_a_note_when_no_connection_opens():
     assert len(warnings) == 1
     assert "could not check the dev namespaces" in warnings[0]
     assert "RuntimeError" in warnings[0]
+
+
+# --- what reaches the probe connection ---------------------------------------------
+#
+# Both probes below open a connection of their own, separate from any the caller
+# holds. Everything the open needs has to be handed over explicitly, and the
+# degradation path swallows the evidence when it is not: #137 gave `open_adapter`
+# a required store, missed exactly these two sites, and the whole preflight was
+# dead on every billed connector while the suite stayed green. So the assertion
+# is on the call itself, not on the outcome.
+
+
+def _spy_open(monkeypatch, adapter=None):
+    """Record the kwargs each probe open is made with."""
+
+    calls: list[dict] = []
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        if adapter is None:
+            raise RuntimeError("no connection discovered")
+        return adapter
+
+    monkeypatch.setattr("exmergo_dex_core.connect.open_adapter", spy)
+    return calls
+
+
+def test_the_build_preflight_probes_as_the_caller(dbt_project_dir: Path, monkeypatch):
+    """A host that supplied its own principal has the dev target checked as that
+    principal, and against the config it passed rather than whatever file happens
+    to sit above the working directory."""
+
+    from exmergo_dex_core.connect import ConnectionSource
+    from exmergo_dex_core.storage import MemoryStore
+
+    _snowflake_profile(dbt_project_dir)
+    calls = _spy_open(monkeypatch)
+    config = _snowflake_config()
+    store = MemoryStore()
+    source = ConnectionSource(connect=lambda: object())
+
+    dev_target.check(
+        dbt_project_dir, "dev", config, ".", store=store, connection=source
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["connection"] is source
+    assert calls[0]["config"] is config
+    assert calls[0]["store"] is store
+
+
+def test_the_init_content_check_probes_as_the_caller(
+    dbt_project_dir: Path, monkeypatch
+):
+    """The same wiring on the other probe. It degrades over a different question
+    (a name collision rather than an unbuildable target), which is why the two
+    notes are worded differently and why both are worth pinning."""
+
+    from exmergo_dex_core.connect import ConnectionSource
+    from exmergo_dex_core.storage import MemoryStore
+
+    calls = _spy_open(monkeypatch)
+    config = _snowflake_config()
+    store = MemoryStore()
+    source = ConnectionSource(connect=lambda: object())
+
+    warnings = dev_target.content_check(config, ".", store=store, connection=source)
+
+    assert len(calls) == 1
+    assert calls[0]["connection"] is source
+    assert calls[0]["config"] is config
+    assert calls[0]["store"] is store
+    assert "could not check the dev namespaces" in warnings[0]
+
+
+def test_an_explicit_config_reaches_the_probe_instead_of_one_on_disk(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The rule an explicit config carries everywhere else: pass one and no file
+    is read. A probe that re-read from disk would let a stray config above the
+    working directory decide what a host's build is checked against, which is a
+    wrong-target bug that presents as a passing preflight."""
+
+    planted = tmp_path / ".dex"
+    planted.mkdir()
+    (planted / "config.yml").write_text(
+        "connector: snowflake\nsnowflake:\n  dev_database: SOMEONE_ELSE\n",
+        encoding="utf-8",
+    )
+    _snowflake_profile(dbt_project_dir)
+    calls = _spy_open(monkeypatch)
+    config = _snowflake_config()
+
+    dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+
+    assert calls[0]["config"] is config
+    assert calls[0]["config"].snowflake.dev_database == "DBT_DEV"

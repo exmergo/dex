@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
@@ -129,7 +130,7 @@ def test_resolve_backend_selection(monkeypatch):
     monkeypatch.setattr(
         hosted_mod.HostedDbtCloudBackend,
         "from_config",
-        classmethod(lambda cls, config: "HOSTED"),
+        classmethod(lambda cls, config, source=None: "HOSTED"),
     )
     monkeypatch.setattr(
         local_mod.LocalMetricFlowBackend,
@@ -424,3 +425,248 @@ def test_local_render_reaches_the_metricflow_engine(tmp_path: Path):
     # And the dex engine is still reachable under its own name, for the one
     # billed path that needs a connection.
     assert backend._dex.store is backend._store
+
+
+# ---- the injected token: reaching the layer as this request's principal -------
+#
+# The hosted backend used to read its token from `os.environ` and nowhere else,
+# which is process-global. A host serving several end users could only make that
+# work by mutating the environment per request, racing one user's token against
+# another's, so per-end-user access control was not expressible on this surface at
+# all. Every test here unsets the ambient sources, because one that merely passes a
+# token would still pass if discovery had quietly answered instead.
+
+
+@pytest.fixture
+def no_ambient_token(monkeypatch, tmp_path):
+    """No token discoverable anywhere: not the environment, not a home-dir file."""
+
+    monkeypatch.delenv("DBT_SL_TOKEN", raising=False)
+    monkeypatch.delenv("DBT_SL_HOST", raising=False)
+    monkeypatch.delenv("DBT_SL_ENV_ID", raising=False)
+    # _dbt_cloud_service_token honors this, so the ~/.dbt fallback finds nothing.
+    monkeypatch.setenv("DBT_CLOUD_CONFIG_DIR", str(tmp_path / "empty"))
+
+
+def _hosted_config(**overrides) -> DexConfig:
+    fields = {
+        "backend": "dbt_cloud",
+        "host": "sl.cloud.getdbt.com",
+        "environment_id": "42",
+    }
+    fields.update(overrides)
+    return DexConfig(semantic=fields)
+
+
+class _RecordingClient:
+    """Stands in for `httpx.Client`, capturing what actually went on the wire.
+
+    Patched at the httpx seam rather than at `_post`, because the claim under test
+    is that the injected token is what authenticates the request, and the
+    Authorization header is built inside `_post`.
+    """
+
+    posted: ClassVar[list[dict]] = []
+
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+    def post(self, url, *, headers, json):
+        _RecordingClient.posted.append({"url": url, "headers": headers, "body": json})
+        return _RecordingResponse()
+
+
+class _RecordingResponse:
+    status_code = 200
+
+    @staticmethod
+    def json() -> dict:
+        return {"data": {"metrics": []}}
+
+
+@pytest.fixture
+def recording_httpx(monkeypatch):
+    pytest.importorskip("httpx")
+    import httpx
+
+    _RecordingClient.posted = []
+    monkeypatch.setattr(httpx, "Client", _RecordingClient)
+    return _RecordingClient
+
+
+def test_an_injected_token_authenticates_the_request(no_ambient_token, recording_httpx):
+    """The whole point: the token a host holds per end user is what reaches dbt
+    Cloud, with nothing ambient available to answer instead."""
+
+    from exmergo_dex_core import SemanticSource
+
+    engine = _engine(
+        _hosted_config(), semantic_source=SemanticSource(token=lambda: "tok-user-1")
+    )
+    backend = sem.resolve_backend(engine)
+    backend.list_definitions()
+
+    assert recording_httpx.posted, "the backend never posted"
+    assert recording_httpx.posted[0]["headers"]["Authorization"] == "Bearer tok-user-1"
+    assert recording_httpx.posted[0]["url"] == "https://sl.cloud.getdbt.com/api/graphql"
+
+
+def test_two_engines_hold_different_tokens_concurrently(
+    no_ambient_token, recording_httpx
+):
+    """The property the process-global environment could not provide, and the
+    reason this seam exists rather than a documented `os.environ` convention: two
+    requests in one process reach the layer as two different principals."""
+
+    from exmergo_dex_core import SemanticSource
+
+    first = _engine(
+        _hosted_config(), semantic_source=SemanticSource(token=lambda: "tok-alice")
+    )
+    second = _engine(
+        _hosted_config(environment_id="99"),
+        semantic_source=SemanticSource(token=lambda: "tok-bob"),
+    )
+    # Interleaved rather than sequential, which is the shape a web app actually has.
+    alice, bob = sem.resolve_backend(first), sem.resolve_backend(second)
+    bob.list_definitions()
+    alice.list_definitions()
+
+    sent = [p["headers"]["Authorization"] for p in recording_httpx.posted]
+    assert sent == ["Bearer tok-bob", "Bearer tok-alice"]
+    assert alice._env == "42" and bob._env == "99"
+
+
+def test_the_token_callable_runs_once_per_command_not_once_per_request(
+    no_ambient_token, recording_httpx
+):
+    """A single metric query polls dbt Cloud until the result is ready, so a token
+    read per HTTP call would charge a host dozens of datastore reads for one
+    question. Read once, when the backend is built."""
+
+    from exmergo_dex_core import SemanticSource
+
+    reads: list[int] = []
+
+    def token() -> str:
+        reads.append(1)
+        return "tok-once"
+
+    engine = _engine(_hosted_config(), semantic_source=SemanticSource(token=token))
+    backend = sem.resolve_backend(engine)
+    backend.list_definitions()
+    backend.list_definitions()
+
+    assert len(recording_httpx.posted) == 2
+    assert reads == [1]
+
+
+def test_an_injected_token_ignores_the_ambient_environment(
+    recording_httpx, monkeypatch
+):
+    """A host holding one config per end user has already chosen the deployment. A
+    single process-wide DBT_SL_HOST outranking it would redirect every tenant's
+    metric query at once, which is a wrong-deployment bug that looks like working
+    software."""
+
+    from exmergo_dex_core import SemanticSource
+
+    monkeypatch.setenv("DBT_SL_HOST", "someone-elses.cloud.getdbt.com")
+    monkeypatch.setenv("DBT_SL_ENV_ID", "666")
+    monkeypatch.setenv("DBT_SL_TOKEN", "ambient-token-must-not-win")
+
+    engine = _engine(
+        _hosted_config(), semantic_source=SemanticSource(token=lambda: "tok-user-1")
+    )
+    sem.resolve_backend(engine).list_definitions()
+
+    posted = recording_httpx.posted[0]
+    assert posted["url"] == "https://sl.cloud.getdbt.com/api/graphql"
+    assert posted["headers"]["Authorization"] == "Bearer tok-user-1"
+    assert "666" not in posted["body"]["query"]
+
+
+def test_a_source_returning_nothing_is_refused_not_fallen_back_from(no_ambient_token):
+    """Falling back to an ambient token here would reach the layer as the process
+    instead of as this request's principal, which is the failure the seam exists to
+    prevent, so an empty token is a refusal."""
+
+    from exmergo_dex_core import SemanticSource
+
+    engine = _engine(_hosted_config(), semantic_source=SemanticSource(token=lambda: ""))
+    with pytest.raises(sem.SemanticBackendError, match="returned no token"):
+        sem.resolve_backend(engine)
+
+
+def test_missing_hosted_coordinates_name_the_config_not_the_environment(
+    no_ambient_token,
+):
+    """The fix a host has is editing the object it passed, so telling it to export
+    a variable would be wrong advice."""
+
+    from exmergo_dex_core import SemanticSource
+
+    engine = _engine(
+        DexConfig(semantic={"backend": "dbt_cloud"}),
+        semantic_source=SemanticSource(token=lambda: "tok"),
+    )
+    with pytest.raises(sem.SemanticBackendError) as exc:
+        sem.resolve_backend(engine)
+    message = str(exc.value)
+    assert "DexConfig you passed" in message
+    assert "export" not in message
+
+
+def test_a_semantic_source_on_the_local_backend_is_refused():
+    """Honored or named in an error, never accepted and dropped. A host that
+    believes it supplied this request's principal, and in fact ran under whatever
+    the process could discover, has lost the access control it came here for."""
+
+    from exmergo_dex_core import SemanticSource
+
+    engine = _engine(semantic_source=SemanticSource(token=lambda: "tok"))
+    with pytest.raises(sem.SemanticBackendError, match="has no meaning for the local"):
+        sem.resolve_backend(engine, local=True)
+
+
+def test_a_project_less_deployment_is_told_to_use_the_hosted_backend():
+    """The local backend is the default, so a deployment with no dbt project lands
+    here without asking to. It used to surface a bare ValueError from
+    require_repo_root, which names neither the backend that needed the project nor
+    the choice available, and which `resolve_backend` promises not to raise."""
+
+    engine = _engine()  # no repo_root: nothing on disk
+    with pytest.raises(sem.SemanticBackendError) as exc:
+        sem.resolve_backend(engine, local=True)
+    message = str(exc.value)
+    assert "needs a dbt project on disk" in message
+    assert "semantic.backend: dbt_cloud" in message
+
+
+def test_the_hosted_surface_needs_nothing_on_the_filesystem(
+    no_ambient_token, recording_httpx, tmp_path, monkeypatch
+):
+    """The composition claim, asserted as a byte snapshot: config injected, token
+    injected, no repo root, no store selected, no connector. A metric catalog comes
+    back and the working tree is untouched."""
+
+    from exmergo_dex_core import DexEngine, SemanticSource
+
+    monkeypatch.chdir(tmp_path)
+    before = {p.name for p in tmp_path.rglob("*")}
+
+    with DexEngine(
+        config=_hosted_config(),
+        semantic_source=SemanticSource(token=lambda: "tok"),
+    ) as eng:
+        result = eng.semantic_list()
+
+    assert result.catalog is not None
+    assert {p.name for p in tmp_path.rglob("*")} == before
+    assert not (tmp_path / ".dex").exists()

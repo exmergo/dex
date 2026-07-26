@@ -215,9 +215,12 @@ def test_two_engines_in_one_process_share_nothing(duckdb_file: Path):
 def test_the_engine_is_the_only_thing_that_opens_a_connection():
     """One adapter funnel, asserted structurally.
 
-    Credential discovery and the cost gate meet in exactly one place, which is
-    what makes both reviewable. A second opener would be a second place to get
-    either wrong, and it would be easy to add without noticing.
+    Establishing the credential and building the cost gate meet in exactly one
+    place, which is what makes both reviewable. A second opener would be a second
+    place to get either wrong, and it would be easy to add without noticing. It
+    matters more now that a host can supply the connection: an opener that did not
+    thread it through would silently reach the warehouse as the container instead
+    of as the end user, and nothing in the output would say so.
     """
 
     callers = sorted(
@@ -227,7 +230,9 @@ def test_the_engine_is_the_only_thing_that_opens_a_connection():
     )
     # connect.py defines it; engine.py is the funnel; dev_target.py runs the
     # free preflight probes, which are pre-connection by nature (they answer
-    # "can this target be built into at all", before an engine would be useful).
+    # "can this target be built into at all", before an engine would be useful)
+    # and take the same config and connection the caller holds, so the probe and
+    # the command it precedes run as one principal.
     assert callers == ["connect.py", "engine.py", "transform/dev_target.py"]
 
 
@@ -367,6 +372,351 @@ def test_an_unconfirmed_billed_call_raises_and_spends_nothing(
     assert "--confirm" in request.data["hint"]
     # Nothing executed: only free metadata and dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+# --- the connection seam: who the process is connected as -------------------------
+#
+# Ambient credential discovery is right for one person at a terminal and cannot
+# express per-end-user access control in a process serving several, because
+# ambient is process-wide. A host supplies the connection instead. Every test here
+# blocks discovery outright, because one that merely passes a connection would
+# still pass if discovery had quietly run anyway.
+
+
+def _no_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every ambient credential chain raise.
+
+    This is what makes the tests below mean anything: the assertion is not "an
+    injected connection works" but "an injected connection is the only thing that
+    worked", which is exactly the claim a multi-tenant host is relying on.
+    """
+
+    import exmergo_dex_core.connect as connect_mod
+
+    def unreachable(*_args, **_kwargs):
+        raise AssertionError("ambient credential discovery ran")
+
+    for name in (
+        "_default_credentials",
+        "resolve_snowflake_connection",
+        "resolve_databricks_connection",
+        "resolve_postgres_connection",
+        "resolve_redshift_connection",
+    ):
+        monkeypatch.setattr(connect_mod, name, unreachable)
+
+
+def _pg_engine(connection, store=None, **kwargs) -> DexEngine:
+    from exmergo_dex_core.config import PostgresTarget
+
+    config = DexConfig(connector="postgres", postgres=PostgresTarget(schemas=["shop"]))
+    return DexEngine(
+        config=config,
+        store=MemoryStore() if store is None else store,
+        connection=connection,
+        **kwargs,
+    )
+
+
+def _bq_credential_engine(fake_bq_client, monkeypatch, **kwargs) -> DexEngine:
+    """An engine whose BigQuery credential comes from a host, not from ADC.
+
+    BigQuery is the connector that takes a *credential* rather than a connection,
+    and the adapter turns it into a client. Substituting ``bigquery.Client`` is
+    therefore the honest fake: it stands in for the client that credential would
+    have produced, and everything from connect.py down runs for real.
+    """
+
+    from google.cloud import bigquery
+
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import BigQueryTarget
+
+    _no_discovery(monkeypatch)
+
+    class HostCredential:
+        pass
+
+    HostCredential.__module__ = "google.oauth2.service_account"
+    supplied: list[object] = []
+
+    def client(*, project, credentials=None, **_kw):
+        supplied.append(credentials)
+        return fake_bq_client
+
+    monkeypatch.setattr(bigquery, "Client", client)
+    config = DexConfig(
+        connector="bigquery",
+        bigquery=BigQueryTarget(project="test-proj", datasets=["shop"]),
+    )
+    engine = DexEngine(
+        config=config,
+        store=MemoryStore(),
+        connection=ConnectionSource(connect=HostCredential),
+        **kwargs,
+    )
+    engine.supplied_credentials = supplied
+    return engine
+
+
+def test_a_host_supplied_connection_drives_a_full_flow(
+    fake_bq_client, monkeypatch: pytest.MonkeyPatch
+):
+    """The whole point of the seam, end to end with no ambient credential.
+
+    A host that authenticated its own end user hands dex the credential, and
+    everything downstream (inventory, profiling, the firewall, the cache) runs
+    against it. Discovery is rigged to raise, so this cannot pass by accident:
+    without the host's credential there is no way to reach the warehouse at all.
+    """
+
+    pytest.importorskip("google.cloud.bigquery")
+
+    fake_bq_client.row_resolver = _aggregate_resolver
+    engine = _bq_credential_engine(
+        fake_bq_client, monkeypatch, confirmed=True, budget=float(500 * 1024 * 1024)
+    )
+    with engine as eng:
+        profiled = eng.profile("customers")
+        rows = eng.query("select count(*) as n from customers")
+
+    assert profiled.profiled_count == 1
+    assert rows.row_count == 1
+    # It really was the host's credential that opened the client, not a
+    # discovered one that happened to be lying around.
+    assert type(engine.supplied_credentials[0]).__name__ == "HostCredential"
+
+
+def _aggregate_resolver(sql: str):
+    """Aggregate rows for a profiling pass, keyed by the aliases the engine
+    builds. A superset: each connector's plan reads the aliases it asked for and
+    ignores the rest, so one resolver serves every fake here."""
+
+    values: dict[str, object] = {"n_total": 100}
+    for i in range(10):
+        values[f"nn_{i}"] = 100
+        values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"mn_{i}"] = 1
+        values[f"mx_{i}"] = 100
+        values[f"d_{i}"] = 100
+    return [values]
+
+
+def test_the_factory_is_called_once_and_only_when_something_connects(
+    fake_pg_connection, monkeypatch: pytest.MonkeyPatch
+):
+    """Lazily, then held. Constructing an engine per request is the documented
+    usage, so construction itself must not reach the host's credential; and the
+    held connection means a request pays for one session, not one per call."""
+
+    from exmergo_dex_core import ConnectionSource
+
+    _no_discovery(monkeypatch)
+    calls = []
+
+    def connect():
+        calls.append(1)
+        return fake_pg_connection
+
+    engine = _pg_engine(ConnectionSource(connect=connect))
+    assert calls == []  # constructing an engine connects to nothing
+    with engine as eng:
+        eng.connect_test()
+        eng.inventory()
+    assert calls == [1]
+
+
+def test_an_injected_connection_is_not_closed_but_a_discovered_one_is(
+    fake_pg_connection, monkeypatch: pytest.MonkeyPatch
+):
+    """dex closes only what it opened.
+
+    Both halves are asserted, or the first passes vacuously: a `close()` that
+    never closed anything would satisfy "the injected one stayed open" while
+    leaking every connection dex opens for itself.
+    """
+
+    import psycopg
+
+    import exmergo_dex_core.connect as connect_mod
+    from exmergo_dex_core import ConnectionSource
+
+    _no_discovery(monkeypatch)
+    with _pg_engine(ConnectionSource(connect=lambda: fake_pg_connection)) as eng:
+        eng.connect_test()
+    assert fake_pg_connection.closed is False
+
+    # The same fake, reached the way discovery reaches a real connection: dex
+    # built what it holds, so dex closes it.
+    monkeypatch.setattr(
+        connect_mod,
+        "resolve_postgres_connection",
+        lambda *_a, **_kw: ({}, "environment:password"),
+    )
+    monkeypatch.setattr(psycopg, "connect", lambda **_kw: fake_pg_connection)
+    with _pg_engine(None) as eng:
+        eng.connect_test()
+    assert fake_pg_connection.closed is True
+
+
+def test_capabilities_stays_truthful_about_an_injected_connection(
+    fake_pg_connection, monkeypatch: pytest.MonkeyPatch
+):
+    """An agent reads `capabilities()` to reason about what it is connected as, so
+    an injected connection must not quietly report itself as `unknown`. The
+    default says host_supplied; a host that knows the credential kind refines it,
+    and neither spelling can carry a credential value."""
+
+    from exmergo_dex_core import ConnectionSource
+
+    _no_discovery(monkeypatch)
+    with _pg_engine(ConnectionSource(connect=lambda: fake_pg_connection)) as eng:
+        assert eng.connect_test().capabilities["auth_method"] == "host_supplied"
+
+    source = ConnectionSource(
+        connect=lambda: fake_pg_connection, auth_method="host_supplied:oauth_user"
+    )
+    with _pg_engine(source) as eng:
+        caps = eng.connect_test().capabilities
+    assert caps["auth_method"] == "host_supplied:oauth_user"
+
+
+def test_a_free_databricks_command_never_calls_the_host_factory(
+    fake_databricks, monkeypatch: pytest.MonkeyPatch
+):
+    """Databricks has two clients, and the split is what keeps free paths free.
+
+    Metadata rides the Unity Catalog REST client; the factory opens a SQL session,
+    which lands on the warehouse and can wake it. An injected source must preserve
+    that, or a host pays for a command that reads nothing.
+    """
+
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import DatabricksTarget
+
+    _no_discovery(monkeypatch)
+    config = DexConfig(
+        connector="databricks",
+        databricks=DatabricksTarget(warehouse="fake-wh", catalogs=["shop"]),
+    )
+    source = ConnectionSource(
+        connect=fake_databricks.sql_connect, workspace=fake_databricks.workspace
+    )
+    with DexEngine(config=config, store=MemoryStore(), connection=source) as eng:
+        eng.connect_test()
+        eng.inventory()
+
+    assert fake_databricks.connect_count == 0
+
+
+def test_a_session_opened_from_a_host_factory_is_still_the_hosts(
+    fake_databricks, monkeypatch: pytest.MonkeyPatch
+):
+    """The case the rule is easiest to get wrong.
+
+    dex calls the host's factory, so the session it holds is one dex obtained but
+    did not create. Closing it would reach into a pool or a per-request handle the
+    host still owns. The adapter releases its reference either way, so a later
+    command opens a fresh session rather than reusing one it stopped tracking.
+    """
+
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import DatabricksTarget
+
+    _no_discovery(monkeypatch)
+    fake_databricks.workspace.warehouse.state = "RUNNING"
+    fake_databricks.connection.startup_pending = False
+    config = DexConfig(
+        connector="databricks",
+        databricks=DatabricksTarget(warehouse="fake-wh", catalogs=["shop"]),
+    )
+    fake_databricks.connection.row_resolver = _aggregate_resolver
+    source = ConnectionSource(
+        connect=fake_databricks.sql_connect, workspace=fake_databricks.workspace
+    )
+    with DexEngine(
+        config=config,
+        store=MemoryStore(),
+        connection=source,
+        confirmed=True,
+        budget=10_000.0,
+    ) as eng:
+        eng.profile("shop.core.customers")
+
+    assert fake_databricks.connect_count == 1  # the billed path did open one
+    assert fake_databricks.connection.closed is False
+
+
+def test_a_bigquery_principal_type_is_derived_not_asserted(
+    fake_bq_client, monkeypatch: pytest.MonkeyPatch
+):
+    """BigQuery injects a credential rather than a connection, and classifies it
+    the same way on both paths. Derived from the credential's own type, so a host
+    cannot claim to be a service account it is not, and an omitted principal_type
+    still reports something true."""
+
+    from exmergo_dex_core.connect import gcp_principal_type
+
+    # The classification itself, pinned against each module the chain looks for,
+    # so it holds without the BigQuery extra installed.
+    class Credential:
+        pass
+
+    for module, expected in (
+        ("google.auth.impersonated_credentials", "impersonated_service_account"),
+        ("google.auth.external_account", "external_account"),
+        ("google.oauth2.service_account", "service_account"),
+        ("google.auth.compute_engine.credentials", "metadata"),
+        ("google.oauth2.credentials", "user"),
+    ):
+        Credential.__module__ = module
+        assert gcp_principal_type(Credential()) == expected
+
+    # And the same classification reached through the real wiring: the helper
+    # supplies a credential whose module says service_account, and nothing in
+    # between is allowed to downgrade that to "unknown".
+    pytest.importorskip("google.cloud.bigquery")
+    with _bq_credential_engine(fake_bq_client, monkeypatch) as eng:
+        caps = eng.connect_test().capabilities
+
+    assert caps["principal_type"] == "service_account"
+
+
+def test_a_connection_is_refused_where_it_cannot_be_honored():
+    """Accepted-and-ignored is the failure this seam cannot afford: a host that
+    believes it supplied a principal, and in fact reached the warehouse as the
+    container, has lost exactly the access control it came here for and nothing
+    in the output would say so."""
+
+    from exmergo_dex_core import ConnectionSource
+    from exmergo_dex_core.config import DatabricksTarget, DuckDBTarget
+
+    source = ConnectionSource(connect=lambda: object())
+
+    # DuckDB is a local file dex opens read-only itself; an injected handle could
+    # be writable, so the read-only guarantee would become unenforceable.
+    config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path="x.duckdb"))
+    with pytest.raises(ValueError, match="does not apply to the duckdb connector"):
+        DexEngine(config=config, connection=source)._adapter()
+
+    # Databricks needs both clients: without the REST one there is no free
+    # metadata path at all.
+    config = DexConfig(connector="databricks", databricks=DatabricksTarget())
+    with pytest.raises(ValueError, match="needs workspace="):
+        DexEngine(config=config, store=MemoryStore(), connection=source)._adapter()
+
+    # And a workspace anywhere else would be silently dropped.
+    config = DexConfig(connector="postgres")
+    workspace_elsewhere = ConnectionSource(connect=lambda: object(), workspace=object())
+    with pytest.raises(ValueError, match="Databricks vocabulary"):
+        DexEngine(
+            config=config, store=MemoryStore(), connection=workspace_elsewhere
+        )._adapter()
+
+    # As would a principal_type on a connector that reports no such field.
+    claimed = ConnectionSource(connect=lambda: object(), principal_type="user")
+    with pytest.raises(ValueError, match="BigQuery vocabulary"):
+        DexEngine(config=config, store=MemoryStore(), connection=claimed)._adapter()
 
 
 # --- the export surface ----------------------------------------------------------

@@ -16,10 +16,27 @@ The command contract in :mod:`exmergo_dex_core.cli` is the other surface, and it
 is the first consumer of the first: every agent surface (SKILL.md, AGENTS.md) is
 a thin wrapper over it, and it runs the same code a library call does.
 
+A process serving more than one end user supplies the connection too, so each
+request reaches the warehouse as its own principal rather than as the container:
+
+    from exmergo_dex_core import ConnectionSource, DexEngine
+
+    with DexEngine(
+        connector="snowflake",
+        config=cfg,
+        store=store,
+        connection=ConnectionSource(connect=lambda: user_conn),
+    ) as eng:
+        ...
+
+A hosted dbt Cloud Semantic Layer has a credential of its own, supplied the same
+way with :class:`SemanticSource`. That surface needs nothing on the filesystem: no
+project, no store, no connector.
+
 Read :class:`DexEngine`'s docstring before wiring this into a service. One engine
-belongs to one principal and one session, and an engine given an explicit config
-never reads one from disk; both matter the moment a process serves more than one
-user.
+belongs to one principal and one session, an engine given an explicit config never
+reads one from disk, and supplying a credential supplies identity but never the
+cost guard; all three matter the moment a process serves more than one user.
 """
 
 from __future__ import annotations
@@ -40,6 +57,7 @@ _EXPORTS = {
     "ColumnProfile": "cache",
     "ConfirmationRequest": "results",
     "ConfirmationRequiredError": "guards.cost_guard",
+    "ConnectionSource": "connect",
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
     "Dataset": "cache",
@@ -54,6 +72,7 @@ _EXPORTS = {
     "QueryRefusedError": "guards.query_firewall",
     "Relationship": "cache",
     "Result": "results",
+    "SemanticSource": "connect",
     "Snapshot": "maintain.snapshot",
     "Store": "storage",
     "to_envelope": "results",
@@ -62,6 +81,7 @@ _EXPORTS = {
 if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .cache import ColumnProfile, Dataset, DexCache, Relationship
     from .config import DexConfig
+    from .connect import ConnectionSource, SemanticSource
     from .engine import DexEngine
     from .envelope import Cost, Paradigm
     from .guards.cost_guard import (
@@ -95,6 +115,7 @@ __all__ = [
     "ColumnProfile",
     "ConfirmationRequest",
     "ConfirmationRequiredError",
+    "ConnectionSource",
     "Cost",
     "CostGuardError",
     "Dataset",
@@ -109,6 +130,7 @@ __all__ = [
     "QueryRefusedError",
     "Relationship",
     "Result",
+    "SemanticSource",
     "Snapshot",
     "Store",
     "__version__",

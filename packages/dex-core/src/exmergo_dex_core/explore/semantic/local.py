@@ -116,10 +116,27 @@ class LocalMetricFlowBackend:
 
     @classmethod
     def from_engine(cls, engine) -> LocalMetricFlowBackend:
+        from ...dbt_project import DbtProjectError
+
         config = engine.config
         connector = engine.connector or getattr(config, "connector", "duckdb")
         limits = getattr(config, "query", None) or QueryLimits()
-        return cls(engine.project_dir(), engine, connector, limits)
+        try:
+            project = engine.project_dir()
+        except (ValueError, DbtProjectError) as exc:
+            # This backend is the default, so a deployment with no dbt project on
+            # disk lands here without asking to. It used to surface the raw refusal
+            # from `require_repo_root`, which is a bare ValueError and says nothing
+            # about the backend that actually needs the project, so a host embedding
+            # the engine got a stack trace where `resolve_backend` promises a
+            # SemanticBackendError. Name the choice instead.
+            raise SemanticBackendError(
+                f"the local semantic backend needs a dbt project on disk ({exc}). "
+                "A deployment without one queries a hosted dbt Cloud Semantic Layer "
+                "instead: set `semantic.backend: dbt_cloud` in config (or pass "
+                "--api), which needs no project and no local credential"
+            ) from exc
+        return cls(project, engine, connector, limits)
 
     # ---- discovery ---------------------------------------------------------
 

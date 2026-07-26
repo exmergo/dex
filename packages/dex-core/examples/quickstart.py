@@ -84,9 +84,12 @@ def main() -> None:
                     )
 
         # 4. Ask a question. The query firewall checks it against what profiling
-        #    learned, and results come back columnar and row-capped.
+        #    learned, and results come back columnar and row-capped. Ordering is
+        #    the query's job, not the engine's: a bare GROUP BY returns groups in
+        #    whatever order the aggregate produced them, which varies run to run.
         result = dex.query(
-            "select region, count(*) as customers from customers group by region"
+            "select region, count(*) as customers from customers "
+            "group by region order by region"
         )
         print(f"query -> {result.columns}: {result.cells}")
 

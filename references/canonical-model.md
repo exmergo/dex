@@ -69,6 +69,14 @@ implement the protocol over its own session store or database. The dbt project i
 unaffected by any of this: it is the source of truth and stays a git-reviewable
 filesystem artifact, which is why `repo_root` remains separate from the store.
 
+Credentials are in neither place. dex discovers them at connection time and never
+stores, caches, or refreshes one, in any backend. A host serving more than one end
+user can supply them itself, the warehouse connection and a hosted semantic layer
+token alike, so each request reaches its target as its own principal instead of as
+the process; that moves who the caller is, and nothing else. The cost gate is still
+built by the engine from the store, the source allowlist still only narrows, and no
+credential becomes persistent state.
+
 ## The extension seam (more formats later)
 
 Supporting more model formats over time does not require a neutral internal model.

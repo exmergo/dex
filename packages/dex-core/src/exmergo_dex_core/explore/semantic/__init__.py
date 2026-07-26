@@ -289,8 +289,9 @@ def resolve_backend(
 ) -> SemanticBackend:
     """The ambient backend resolution: ``api``/``local`` override the
     ``.dex/config.yml`` ``semantic.backend`` default. Raises
-    :class:`SemanticBackendError` (never a bare import error) when the chosen
-    backend's extra, config, or credentials are missing."""
+    :class:`SemanticBackendError` (never a bare import error, and never a bare
+    ``ValueError`` from a missing project) when the chosen backend's extra,
+    config, or credentials are missing."""
 
     if api and local:
         raise SemanticBackendError("choose one of --local or --api, not both")
@@ -303,11 +304,24 @@ def resolve_backend(
         configured = getattr(getattr(engine.config, "semantic", None), "backend", None)
         backend = (configured or "local").strip().lower()
 
+    source = getattr(engine, "semantic_source", None)
     if backend in {"dbt_cloud", "api", "cloud"}:
         from .hosted import HostedDbtCloudBackend
 
-        return HostedDbtCloudBackend.from_config(engine.config)
+        return HostedDbtCloudBackend.from_config(engine.config, source)
     if backend == "local":
+        if source is not None:
+            # Honored or named in an error, never accepted and dropped. A host that
+            # believes it supplied this request's principal, and in fact reached
+            # the warehouse under whatever the process could discover, has lost the
+            # access control it came here for with nothing in the output saying so.
+            raise SemanticBackendError(
+                "a semantic source supplies a hosted dbt Cloud token and has no "
+                "meaning for the local backend, which renders metric SQL and runs "
+                "it through this engine's own connector. Select the hosted backend "
+                "(semantic.backend: dbt_cloud, or --api), or drop the source and "
+                "let the connector's credential govern"
+            )
         from .local import LocalMetricFlowBackend
 
         return LocalMetricFlowBackend.from_engine(engine)

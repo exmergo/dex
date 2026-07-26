@@ -129,7 +129,11 @@ def init_project(
 
     fresh = load_config(repo_root) or DexConfig()
     preflight = dev_target.content_check(
-        fresh, repo_root, layered=layered_schemas, store=engine.store
+        fresh,
+        repo_root,
+        layered=layered_schemas,
+        store=engine.store,
+        connection=engine.connection,
     )
 
     return InitResult(
@@ -432,7 +436,12 @@ def build(
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
     dev_check = lambda: dev_target.check(  # noqa: E731
-        project, target, effective, repo_root, store=store
+        project,
+        target,
+        effective,
+        repo_root,
+        store=store,
+        connection=engine.connection,
     )
 
     # Free/local (DuckDB): nothing bills, so there is nothing to price. The

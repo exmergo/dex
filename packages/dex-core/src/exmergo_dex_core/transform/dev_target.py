@@ -31,7 +31,9 @@ legitimate thing to have, and dex proposes rather than imposes.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
@@ -46,6 +48,9 @@ from ..dbt_project import (
 )
 from ..dbt_project import load as load_project
 from ..storage import DEX_DIR, Store
+
+if TYPE_CHECKING:
+    from ..connect import ConnectionSource
 
 
 class DevTargetError(Exception):
@@ -88,6 +93,7 @@ def check(
     repo_root: Path | str = ".",
     *,
     store: Store | None = None,
+    connection: ConnectionSource | None = None,
 ) -> list[str]:
     """Refuse a dev target that has drifted or does not exist. Returns warnings.
 
@@ -96,16 +102,21 @@ def check(
     absence of evidence stays absence of evidence, and dbt's own error remains
     the backstop.
 
-    ``store`` reaches the probe connection. Every probe below is free, but a
-    billed connector cannot be opened without somewhere for its cost gate to
-    settle the session budget, so omitting it on one degrades the whole
-    preflight to a note instead of running it.
+    ``store`` and ``connection`` reach the probe connection, which is a second one
+    alongside any the caller already holds. See :func:`preflight_opener` for why
+    each matters; omitting either degrades the whole preflight to a note rather
+    than running it.
     """
 
     project = Path(project_dir)
     profile = target_identifiers(project, target)
     _assert_no_drift(project, target, config, profile, repo_root)
-    return _assert_namespace_exists(project, target, config, repo_root, store)
+    return _assert_namespace_exists(
+        project,
+        target,
+        config,
+        preflight_opener(repo_root, store, config, connection),
+    )
 
 
 def _assert_no_drift(
@@ -161,8 +172,7 @@ def _assert_namespace_exists(
     project: Path,
     target: str,
     config: DexConfig,
-    repo_root: Path | str,
-    store: Store | None,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
 ) -> list[str]:
     """What dbt cannot create for itself is fatal; what it can create is not.
 
@@ -180,42 +190,76 @@ def _assert_namespace_exists(
     if config.connector == "duckdb":
         return _duckdb_namespace(project, target)
     if config.connector == "snowflake":
-        return _snowflake_namespace(project, config, repo_root, store)
+        return _snowflake_namespace(project, config, open_probe)
     if config.connector == "databricks":
-        return _databricks_namespace(project, config, repo_root, store)
+        return _databricks_namespace(project, config, open_probe)
     if config.connector == "bigquery":
-        return _bigquery_namespace(project, config, repo_root, store)
+        return _bigquery_namespace(project, config, open_probe)
     if config.connector == "postgres":
-        return _postgres_namespace(project, target, config, repo_root, store)
+        return _postgres_namespace(project, target, config, open_probe)
     if config.connector == "redshift":
-        return _redshift_namespace(project, target, config, repo_root, store)
+        return _redshift_namespace(project, target, config, open_probe)
     return []
 
 
-def _open_for_preflight(connector: str, repo_root: Path | str, store: Store | None):
-    """The adapter, or the note to degrade to.
+#: How an unopenable probe reads when the caller is checking whether the dev
+#: target can be built into at all. ``content_check`` degrades over a different
+#: question and passes its own.
+_UNREACHABLE = (
+    "could not preflight the dev database ({kind}: {detail}); dbt will report "
+    "any problem with it"
+)
 
-    dex discovers its own connection (a connections file, the environment) while
-    dbt reads ``profiles.yml``, and the two can legitimately differ, so a
-    connection dex cannot open is reported rather than raised: the preflight must
-    never be the thing that breaks a build dbt could have run. The exception class
-    rides along, because silently degrading is how a real defect in the preflight
-    would go unnoticed for a long time.
 
-    A billed connector will not open without a ``store`` for its cost gate, so a
-    caller that has one must pass it: the probes here are free, but the gate is
-    built before anyone knows that.
+def preflight_opener(
+    repo_root: Path | str,
+    store: Store | None,
+    config: DexConfig | None = None,
+    connection: ConnectionSource | None = None,
+    *,
+    note: str = _UNREACHABLE,
+) -> Callable[[str], tuple[object | None, str]]:
+    """Build the probe opener: connector name in, ``(adapter, note)`` out.
+
+    One callable rather than four arguments drilled through every namespace check
+    (functional DI: opening a probe is behavior with no lifecycle of its own).
+    Everything the open needs is captured once, here, where a caller holds it all,
+    so a check below asks only for the connector it is checking. ``note`` is the
+    ``{kind}``/``{detail}`` template the caller degrades to, because what an
+    unreachable connection means depends on the question being asked.
+
+    A connection dex cannot open is reported rather than raised. dex resolves its
+    own connection while dbt reads ``profiles.yml``, and the two can legitimately
+    differ, so the preflight must never be the thing that breaks a build dbt could
+    have run. The exception class rides along, because silently degrading is how a
+    real defect in the preflight would go unnoticed for a long time, and once did.
+
+    Four things reach the open, and omitting any of them degrades the whole
+    preflight to a note rather than failing loudly. ``store`` because a billed
+    connector will not open without somewhere for its cost gate to settle the
+    session budget, even though every probe here is free. ``config`` because the
+    caller's configuration is authoritative, and re-reading it from disk would let
+    a stray file above the working directory decide what a host's build preflights
+    against. ``connection`` because a host that supplies its own principal should
+    have the dev target checked as that principal, not as the container.
     """
 
-    from ..connect import open_adapter
+    def open_probe(connector: str) -> tuple[object | None, str]:
+        from ..connect import open_adapter
 
-    try:
-        return open_adapter(connector=connector, repo_root=repo_root, store=store), None
-    except Exception as exc:
-        return None, (
-            "could not preflight the dev database "
-            f"({type(exc).__name__}: {exc}); dbt will report any problem with it"
-        )
+        try:
+            adapter = open_adapter(
+                connector=connector,
+                repo_root=repo_root,
+                store=store,
+                config=config,
+                connection=connection,
+            )
+        except Exception as exc:
+            return None, note.format(kind=type(exc).__name__, detail=exc)
+        return adapter, ""
+
+    return open_probe
 
 
 def _duckdb_namespace(project: Path, target: str) -> list[str]:
@@ -241,7 +285,9 @@ def _duckdb_namespace(project: Path, target: str) -> list[str]:
 
 
 def _snowflake_namespace(
-    project: Path, config: DexConfig, repo_root: Path | str, store: Store | None
+    project: Path,
+    config: DexConfig,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
 ) -> list[str]:
     """Free: SHOW only, no warehouse, so this costs nothing on a billed connector.
 
@@ -257,7 +303,7 @@ def _snowflake_namespace(
     if target is None or not target.dev_database:
         return []
 
-    adapter, note = _open_for_preflight("snowflake", repo_root, store)
+    adapter, note = open_probe("snowflake")
     if adapter is None:
         return [note]
     try:
@@ -279,7 +325,9 @@ def _snowflake_namespace(
 
 
 def _databricks_namespace(
-    project: Path, config: DexConfig, repo_root: Path | str, store: Store | None
+    project: Path,
+    config: DexConfig,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
 ) -> list[str]:
     """Free: Unity Catalog REST only, so the billed SQL warehouse is never woken.
 
@@ -303,7 +351,7 @@ def _databricks_namespace(
     from .init import _DEFAULT_DBX_DEV_SCHEMA
 
     schema = target.dev_schema or _DEFAULT_DBX_DEV_SCHEMA
-    adapter, note = _open_for_preflight("databricks", repo_root, store)
+    adapter, note = open_probe("databricks")
     if adapter is None:
         return [note]
     try:
@@ -342,7 +390,9 @@ def _databricks_namespace(
 
 
 def _bigquery_namespace(
-    project: Path, config: DexConfig, repo_root: Path | str, store: Store | None
+    project: Path,
+    config: DexConfig,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
 ) -> list[str]:
     """Free: a metadata GET, no query, so nothing is billed on a bytes-billed
     connector.
@@ -368,7 +418,7 @@ def _bigquery_namespace(
         return []
 
     dataset = target.dev_dataset
-    adapter, note = _open_for_preflight("bigquery", repo_root, store)
+    adapter, note = open_probe("bigquery")
     if adapter is None:
         return [note]
     try:
@@ -397,8 +447,7 @@ def _postgres_namespace(
     project: Path,
     target: str,
     config: DexConfig,
-    repo_root: Path | str,
-    store: Store | None,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
 ) -> list[str]:
     """Free: catalog lookups and privilege predicates, no scan.
 
@@ -426,7 +475,7 @@ def _postgres_namespace(
         # role to ask a privilege question about, so there is nothing to check.
         return []
 
-    adapter, note = _open_for_preflight("postgres", repo_root, store)
+    adapter, note = open_probe("postgres")
     if adapter is None:
         return [note]
     try:
@@ -463,8 +512,7 @@ def _redshift_namespace(
     project: Path,
     target: str,
     config: DexConfig,
-    repo_root: Path | str,
-    store: Store | None,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
 ) -> list[str]:
     """Cheap: catalog lookups and privilege predicates, no scan.
 
@@ -492,7 +540,7 @@ def _redshift_namespace(
         # privilege question about.
         return []
 
-    adapter, note = _open_for_preflight("redshift", repo_root, store)
+    adapter, note = open_probe("redshift")
     if adapter is None:
         return [note]
     try:
@@ -537,6 +585,7 @@ def content_check(
     *,
     layered: bool = False,
     store: Store | None = None,
+    connection: ConnectionSource | None = None,
 ) -> list[str]:
     """Warn when a namespace the new project will build into already holds
     tables or views.
@@ -548,9 +597,8 @@ def content_check(
     preflight) and advisory by design: existing content is a warning, never a
     refusal, and a connection dex cannot open degrades to a note, because init
     is credential-optional and must stay that way. That degradation is why
-    ``store`` matters: the probes are free, but a billed connector will not open
-    without somewhere for its cost gate to settle the session budget, so a
-    caller that omits it silently gets the note instead of the check.
+    ``store`` and ``connection`` matter: see :func:`preflight_opener`, and note
+    that a caller who omits one silently gets the note instead of the check.
 
     DuckDB's base namespace is deliberately not checked: the dev target is the
     same file as the source warehouse, so "the namespace holds objects" is true
@@ -606,16 +654,15 @@ def content_check(
     if not probes:
         return []
 
-    from ..connect import open_adapter
-
     degraded = (
         "could not check the dev namespaces for existing content ({kind}: "
         "{detail}); a name collision would surface on the first build instead"
     )
-    try:
-        adapter = open_adapter(connector=connector, repo_root=repo_root, store=store)
-    except Exception as exc:
-        return [degraded.format(kind=type(exc).__name__, detail=exc)]
+    adapter, note = preflight_opener(
+        repo_root, store, config, connection, note=degraded
+    )(connector)
+    if adapter is None:
+        return [note]
 
     warnings: list[str] = []
     try:

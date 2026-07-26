@@ -127,8 +127,9 @@ Credentials, Snowflake via a discovered `connections.toml` entry,
 environment, or dbt profile, Databricks via the SDK's unified chain, Redshift
 via the AWS credential chain (a pinned Serverless workgroup mints IAM
 temporary database credentials) or the `REDSHIFT_*` environment, Postgres via
-`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile;
-never a pasted key or token), and result values appear only in
+`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile, and
+the hosted semantic layer via `DBT_SL_TOKEN` or `~/.dbt/dbt_cloud.yml`; never a
+pasted key or token), and result values appear only in
 `explore query`'s columnar payload after the query firewall has cleared
 them.
 

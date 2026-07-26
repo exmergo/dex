@@ -152,6 +152,12 @@ class DatabricksAdapter:
     discovered SDK config. Credentials live only inside this process and are
     never surfaced. ``clock`` is injectable so the fake can simulate statement
     duration; it is what actual billed seconds are measured with.
+
+    ``owns_connection`` is False when both came from outside dex (a host supplying
+    its own principal). Then :meth:`close` releases the memoized session without
+    closing it: the factory is the host's, so what the factory returns is the
+    host's too, and a host that hands back a pooled or per-request connection must
+    not have it closed underneath. The workspace client is never closed either way.
     """
 
     name = "databricks"
@@ -169,9 +175,11 @@ class DatabricksAdapter:
         auth_method: str = "unknown",
         scope_origin: str | None = None,
         clock: Callable[[], float] = time.monotonic,
+        owns_connection: bool = True,
     ):
         self._workspace = workspace
         self._sql_connect = sql_connect
+        self._owns_connection = owns_connection
         self.cost_gate = cost_gate
         self.target = target or DatabricksTarget()
         self.host = host
@@ -1160,9 +1168,13 @@ class DatabricksAdapter:
 
     def close(self) -> None:
         if self._conn is not None:
-            close = getattr(self._conn, "close", None)
-            if close is not None:
-                close()
+            # The session is released either way, so a later command opens a fresh
+            # one rather than reusing a handle this adapter no longer tracks. It is
+            # only actually closed when dex built the factory that produced it.
+            if self._owns_connection:
+                close = getattr(self._conn, "close", None)
+                if close is not None:
+                    close()
             self._conn = None
 
 
