@@ -127,4 +127,5 @@ markers = [
   "databricks: Databricks-specific integration tests",
   "postgres: PostgreSQL-specific integration tests",
   "redshift: Redshift-specific integration tests",
+  "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]
