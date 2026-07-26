@@ -94,6 +94,36 @@ def test_new_table_is_reported_added(maintain_repo):
     assert by_code["table_added"][0]["severity"] == "low"
 
 
+def test_orphan_relation_is_flagged_when_model_removed(maintain_repo):
+    maintain_repo.snapshot()
+    (maintain_repo.project_dir / "models" / "staging" / "stg_orders.sql").unlink()
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    orphan = by_code["orphan_relation"][0]
+    assert orphan["identifier"] == "warehouse.main.stg_orders"
+    assert orphan["severity"] == "medium"
+    assert "DROP TABLE" in orphan["data"]["drop_statement"]
+    # It already existed at snapshot time, so it must never double-report as
+    # table_added, and the physical table is untouched, so never table_dropped.
+    assert "table_added" not in by_code
+    assert "table_dropped" not in by_code
+
+
+def test_orphan_relation_not_reported_for_never_backed_table(maintain_repo):
+    """A table with no baseline backing (never in transform_layer.models or
+    .sources) keeps today's table_added behavior -- orphan_relation is
+    strictly for identifiers backed at the baseline."""
+
+    maintain_repo.snapshot()
+    maintain_repo.sql("CREATE TABLE payments (id INTEGER, amount DOUBLE)")
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    assert by_code["table_added"][0]["identifier"] == "warehouse.main.payments"
+    assert "orphan_relation" not in by_code
+
+
 def test_scope_filters_findings_to_named_objects(maintain_repo):
     maintain_repo.snapshot()
     maintain_repo.sql(

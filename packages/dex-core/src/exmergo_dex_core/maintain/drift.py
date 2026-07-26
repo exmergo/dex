@@ -115,9 +115,18 @@ def resolve_scope(names: list[str], identifiers: Iterable[str]) -> set[str]:
 
 
 def schema_drift(
-    current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
+    current: list[Dataset],
+    snap: Snapshot,
+    scope: set[str] | None = None,
+    current_transform: TransformLayer | None = None,
 ) -> list[DriftFinding]:
-    """Structural drift: metadata only, free on every connector."""
+    """Structural drift: metadata only, free on every connector.
+
+    ``current_transform`` (the live project's fingerprint, not the baseline's)
+    enables ``orphan_relation``: a table present at the baseline and now, that
+    the baseline's project built or sourced but the live project no longer
+    does. Without it (no project available), that check is skipped.
+    """
 
     baseline = {d.identifier: d for d in snap.warehouse.datasets}
     now = {d.identifier: d for d in current}
@@ -149,9 +158,30 @@ def schema_drift(
         if scoped(identifier)
     )
 
+    baseline_backed = _backed_tables(snap.transform_layer)
+    current_backed = _backed_tables(current_transform)
+
     for identifier in sorted(baseline.keys() & now.keys()):
         if not scoped(identifier):
             continue
+        if snap.transform_layer is not None and current_transform is not None:
+            table = identifier.rsplit(".", 1)[-1].lower()
+            if table in baseline_backed and table not in current_backed:
+                findings.append(
+                    DriftFinding(
+                        axis="schema",
+                        code="orphan_relation",
+                        identifier=identifier,
+                        severity="medium",
+                        detail=(
+                            f"{identifier} was built by the dbt project at the "
+                            "last snapshot but no model or source currently "
+                            "backs it; the warehouse still holds it as residue "
+                            "of a rename or removal"
+                        ),
+                        data={"drop_statement": f"DROP TABLE {identifier};"},
+                    )
+                )
         old_cols = {c.name: c for c in baseline[identifier].columns}
         new_cols = {c.name: c for c in now[identifier].columns}
         added = sorted(new_cols.keys() - old_cols.keys())
@@ -941,6 +971,21 @@ def _distinct_combination_stand_in(
     import sqlglot
 
     return sqlglot.transpile(sql, read="duckdb", write=dialect)[0]
+
+
+def _backed_tables(transform: TransformLayer | None) -> set[str]:
+    """Table-name suffixes (lowered) this transform layer claims: a model's
+    own name (it *is* the relation), or a declared ``source()`` table. Reads
+    ``.sources`` directly rather than going through ``_models_by_table``'s
+    regex-derived ``model_sources``, so a declared source with no model
+    currently calling ``source()`` on it still counts as known to the
+    project (the same data ``dangling_source`` already reads)."""
+
+    if transform is None:
+        return set()
+    names = {model.lower() for model in transform.models}
+    names.update(source.table.lower() for source in transform.sources)
+    return names
 
 
 def _models_by_table(transform: TransformLayer) -> dict[str, set[str]]:

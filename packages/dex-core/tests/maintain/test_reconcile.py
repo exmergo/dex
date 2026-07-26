@@ -270,3 +270,19 @@ def test_dropped_source_reconcile_is_advisory_when_no_scaffold(maintain_repo):
     assert all(p["kind"] == "advisory" for p in payload["data"]["proposals"])
     codes = {p["finding_code"] for p in payload["data"]["proposals"]}
     assert "dangling_source" in codes or "table_dropped" in codes
+
+
+def test_orphan_relation_reconcile_is_advisory_with_drop_statement(maintain_repo):
+    maintain_repo.snapshot()
+    (maintain_repo.project_dir / "models" / "staging" / "stg_orders.sql").unlink()
+    maintain_repo.dex("maintain", "schema")
+
+    rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+    assert rc == 0 and payload["status"] == "ok"
+    by_axis = _proposals_by_axis(payload)
+    orphan_proposals = [
+        p for p in by_axis["schema"] if p["finding_code"] == "orphan_relation"
+    ]
+    assert orphan_proposals and all(p["kind"] == "advisory" for p in orphan_proposals)
+    assert "DROP TABLE" in orphan_proposals[0]["action"]
+    assert "warehouse.main.stg_orders" in orphan_proposals[0]["action"]

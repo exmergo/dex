@@ -32,16 +32,24 @@ _NAME_PENALTY = re.compile(
 # meaningful, too wide to be a modeled table) and are damped.
 _SHAPE_IDEAL = (2, 60)
 
+# An orphan relation (no current dbt model/source backs it, though the project
+# builds/sources others in its schema) is down-ranked, not hidden: it can still
+# be worth surfacing for cleanup.
+_ORPHAN_PENALTY = 0.5
+
 
 def rank(
     objects: list[ObjectMeta],
     relationships: list[Relationship] | None = None,
     ranking_hints: list[str] | None = None,
+    orphaned: set[str] | None = None,
 ) -> dict[str, float]:
     """Map identifier -> rank_score in [0, 1]. Pure; no I/O."""
 
     if not objects:
         return {}
+
+    orphan_set = {i.lower() for i in (orphaned or [])}
 
     degree = _connectivity_degree(relationships or [])
     max_degree = max(degree.values(), default=0)
@@ -64,13 +72,15 @@ def rank(
         connectivity = (
             degree.get(obj.identifier, 0) / max_degree if max_degree > 0 else 0.0
         )
-        scores[obj.identifier] = round(
+        score = (
             _W_SIZE * size
             + _W_CONNECTIVITY * connectivity
             + _W_NAMING * _naming_score(obj.name, hints)
-            + _W_SHAPE * _shape_score(obj.column_count),
-            4,
+            + _W_SHAPE * _shape_score(obj.column_count)
         )
+        if obj.identifier.lower() in orphan_set:
+            score *= _ORPHAN_PENALTY
+        scores[obj.identifier] = round(score, 4)
     return scores
 
 

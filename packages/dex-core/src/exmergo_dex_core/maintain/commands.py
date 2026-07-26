@@ -151,9 +151,50 @@ def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
-    """Source columns and tables added, dropped, retyped, or renamed."""
+    """Source columns and tables added, dropped, retyped, or renamed.
 
-    return _detect_free_axis(engine, "schema", drift_mod.schema_drift, objects)
+    Unlike ``volume_drift``, this loads the live project (degrading quietly,
+    never raising, when none is available) so ``orphan_relation`` can compare
+    the baseline's project fingerprint against the current one; that need is
+    schema-only, so this has its own body instead of going through
+    ``_detect_free_axis``.
+    """
+
+    store = engine.store
+    snap = store.load_snapshot()
+    if snap is None:
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+
+    warnings: list[str] = []
+    current_transform = None
+    try:
+        view = load_project(engine.project_dir())
+        current_transform = snapshot_mod.transform_layer(view)
+    except (DbtProjectError, ValueError) as exc:
+        warnings.append(
+            f"orphan-relation classification skipped (no dbt project: {exc})"
+        )
+
+    adapter = engine._adapter("maintain schema")
+    current = snapshot_mod.warehouse_from_metadata(adapter).datasets
+    cost = command_args.preflight_cost(adapter)
+    connector = adapter.name
+
+    scope_names = list(objects or [])
+    scope = _resolve_scope(scope_names, current, snap)
+    findings = drift_mod.schema_drift(current, snap, scope, current_transform)
+    drift_mod.annotate_impacts(findings, snap)
+    ranked = drift_mod.rank_findings(findings)
+
+    _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
+    result = _drift_result(
+        {"schema": ranked},
+        snap,
+        store,
+        warnings=warnings + _staleness_warnings(store, snap),
+    )
+    result.cost = cost
+    return result
 
 
 def volume_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
@@ -334,7 +375,9 @@ def check(engine: DexEngine) -> DriftResult:
     adapter = engine._adapter("maintain check")
     connector = adapter.name
     current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
-    schema_findings = drift_mod.schema_drift(current_datasets, snap)
+    schema_findings = drift_mod.schema_drift(
+        current_datasets, snap, current_transform=current_transform
+    )
     volume_findings = drift_mod.volume_drift(current_datasets, snap)
     semantic_findings = (
         drift_mod.semantic_free_drift(
