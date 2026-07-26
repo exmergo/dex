@@ -6,9 +6,11 @@ envelope to stdout and nothing else. Subcommands are stateless (state lives in t
 dbt project, which is the source of truth, plus the scratch state the store holds),
 so the agent orchestrates multi-step flows.
 
-This is also where the storage backend is chosen: ``main`` builds one
-``FilesystemStore`` from the resolved repo root and hands it to every command, so
-no command decides for itself where state lands.
+The CLI is the first consumer of :class:`~.engine.Engine` rather than a parallel
+implementation of it: ``main`` parses arguments, builds one engine from the
+resolved repo root (filesystem store, config read from ``.dex/``), and every
+command runs against that engine and hands back a result the shim wraps in an
+envelope. Dogfooding the API this way is what stops the two surfaces drifting.
 
 ``connect test``, the ``explore`` group, the authoring surface (``transform``,
 ``semantic``), and the ``maintain`` group are live. ``viz preview`` returns a
@@ -21,8 +23,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import command_args
 from . import envelope as env
-from .storage import FilesystemStore, Store
+from .engine import Engine
+from .guards.cost_guard import ConfirmationRequiredError
+from .results import BudgetExhaustedError
 
 # The full command surface. Group -> its subcommands.
 COMMAND_SURFACE: dict[str, list[str]] = {
@@ -211,27 +216,34 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _connect_test(args: argparse.Namespace, store: Store) -> env.Envelope:
-    from .command_args import open_from_args
+def dispatch(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+    """Route one parsed command to its handler and return exactly one envelope.
 
-    adapter = open_from_args(args, store)
+    Total by construction: the two refusals the engine raises rather than returns
+    (an unmet confirmation, a mid-run budget exhaustion) are transport concerns
+    at this boundary and become envelopes here, so no handler has to know about
+    them and every path out of dispatch is an envelope.
+    """
+
     try:
-        # A free probe on every connector, but the envelope's cost paradigm
-        # reflects the connector so the agent knows what later commands bill in.
-        gate = getattr(adapter, "cost_gate", None)
-        cost = gate.cost() if gate is not None else env.Cost()
-        return env.ok(adapter.capabilities(), cost=cost)
-    finally:
-        adapter.close()
+        return _run(args, engine)
+    except ConfirmationRequiredError as exc:
+        return env.needs_confirmation(
+            exc.request.data, cost=exc.request.cost, warnings=exc.request.warnings
+        )
+    except BudgetExhaustedError as exc:
+        # Partial completion: an error, but one that reports what the attempt
+        # actually cost, because that is what a caller needs to size the re-run.
+        return env.error(
+            env.redact(str(exc)), data={"spend": exc.spend} if exc.spend else {}
+        )
 
 
-def dispatch(args: argparse.Namespace, store: Store) -> env.Envelope:
-    command = args.group + (
-        f" {args.subcommand}" if getattr(args, "subcommand", None) else ""
-    )
-
+def _run(args: argparse.Namespace, engine: Engine) -> env.Envelope:
     if args.group == "connect" and args.subcommand == "test":
-        return _connect_test(args, store)
+        from .results import to_envelope
+
+        return to_envelope(engine.connect_test())
 
     if args.group == "explore":
         from .explore import commands as explore_cmds
@@ -245,23 +257,8 @@ def dispatch(args: argparse.Namespace, store: Store) -> env.Envelope:
             "cluster": explore_cmds.cmd_cluster,
             "semantic": explore_cmds.cmd_semantic,
         }
-        return handlers[args.subcommand](args, store)
+        return handlers[args.subcommand](args, engine)
 
-    # The transform skill fronts the authoring surface (transform, semantic);
-    # they share one plan store and one write path, so one command module serves
-    # them all. `viz preview` stays a stub until the Viz integration lands.
-    transform_surface = {
-        ("transform", "init"),
-        ("transform", "plan"),
-        ("transform", "apply"),
-        ("transform", "build"),
-        ("transform", "deps"),
-        ("transform", "plans"),
-        ("transform", "macro"),
-        ("semantic", "define"),
-        ("semantic", "update"),
-        ("semantic", "plan"),
-    }
     if args.group == "maintain":
         from .maintain import commands as maintain_cmds
 
@@ -274,29 +271,34 @@ def dispatch(args: argparse.Namespace, store: Store) -> env.Envelope:
             "semantic": maintain_cmds.cmd_semantic,
             "reconcile": maintain_cmds.cmd_reconcile,
         }
-        handler = handlers.get(args.subcommand)
-        if handler is not None:
-            return handler(args, store)
+        return handlers[args.subcommand](args, engine)
 
-    if (args.group, args.subcommand) in transform_surface:
+    # The transform skill fronts the authoring surface (transform, semantic);
+    # they share one plan store and one write path, so one command module serves
+    # them all. Handlers are named rather than referenced so the surface is
+    # listed once and the module is still imported only on a hit: it pulls the
+    # dbt reader and the dialect engine, which live behind a connector extra, so
+    # importing it for a command that never needed it breaks a lighter install.
+    authoring = {
+        ("transform", "init"): "cmd_init",
+        ("transform", "plan"): "cmd_plan",
+        ("transform", "apply"): "cmd_apply",
+        ("transform", "build"): "cmd_build",
+        ("transform", "deps"): "cmd_deps",
+        ("transform", "plans"): "cmd_plans",
+        ("transform", "macro"): "cmd_macro",
+        ("semantic", "define"): "cmd_semantic_define",
+        ("semantic", "update"): "cmd_semantic_update",
+        ("semantic", "plan"): "cmd_semantic_plan",
+    }
+    handler = authoring.get((args.group, args.subcommand))
+    if handler is not None:
         from .transform import commands as transform_cmds
 
-        handlers = {
-            ("transform", "init"): transform_cmds.cmd_init,
-            ("transform", "plan"): transform_cmds.cmd_plan,
-            ("transform", "apply"): transform_cmds.cmd_apply,
-            ("transform", "build"): transform_cmds.cmd_build,
-            ("transform", "deps"): transform_cmds.cmd_deps,
-            ("transform", "plans"): transform_cmds.cmd_plans,
-            ("transform", "macro"): transform_cmds.cmd_macro,
-            ("semantic", "define"): transform_cmds.cmd_semantic_define,
-            ("semantic", "update"): transform_cmds.cmd_semantic_update,
-            ("semantic", "plan"): transform_cmds.cmd_semantic_plan,
-        }
-        return handlers[(args.group, args.subcommand)](args, store)
+        return getattr(transform_cmds, handler)(args, engine)
 
     # Everything else is scaffolded against the contract but not yet built.
-    return env.not_implemented(command)
+    return env.not_implemented(command_args.command_name(args))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -304,12 +306,25 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
-    # The CLI's backend choice, made once: state on disk under `.dex/` is what
-    # lets the subcommands stay stateless across process invocations, and what
-    # carries the cumulative session budget from one command to the next.
-    store = FilesystemStore(repo_root(args))
+    # One engine per process, built from the resolved repo root. That choice of
+    # backend is what lets the subcommands stay stateless across invocations:
+    # `.dex/` on disk is how the exploration cache and the cumulative session
+    # budget survive from one command to the next.
+    engine = Engine.from_repo(
+        repo_root(args),
+        connector=getattr(args, "connector", None),
+        path=getattr(args, "path", None),
+        project=getattr(args, "project", None),
+        datasets=getattr(args, "dataset", None),
+        scopes=getattr(args, "scope", None),
+        budget=getattr(args, "budget", None),
+        confirmed=getattr(args, "confirm", False),
+    )
     try:
-        envelope = dispatch(args, store)
+        try:
+            envelope = dispatch(args, engine)
+        finally:
+            engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
         # loudly in tests and CI rather than shipping a leak.
