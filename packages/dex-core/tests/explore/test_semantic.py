@@ -24,7 +24,7 @@ from exmergo_dex_core.cache import (
     PIIFlag,
 )
 from exmergo_dex_core.config import DexConfig, QueryLimits
-from exmergo_dex_core.engine import Engine
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.explore import semantic as sem
 from exmergo_dex_core.explore.semantic import (
     SemanticQuery,
@@ -37,11 +37,11 @@ from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import MemoryStore
 
 
-def _engine(config: DexConfig | None = None, **kwargs) -> Engine:
+def _engine(config: DexConfig | None = None, **kwargs) -> DexEngine:
     """A real engine, never opened. The backends read config and store off it and
     route their one billed path through it, so a stand-in would test the stand-in."""
 
-    return Engine(config=config or DexConfig(), store=MemoryStore(), **kwargs)
+    return DexEngine(config=config or DexConfig(), store=MemoryStore(), **kwargs)
 
 
 # ---- the shared abstraction -------------------------------------------------
@@ -393,7 +393,7 @@ def test_local_render_reaches_the_metricflow_engine(tmp_path: Path):
     """`_render` must resolve the MetricFlow engine, not the dex engine.
 
     The backend holds both, and for a while it held them under the same name, so
-    rendering called the dex `Engine` object. Nothing caught it because every
+    rendering called the dex `DexEngine` object. Nothing caught it because every
     other local-backend test stops at the PII gate, which runs before rendering.
     This one goes through `_render` with the MetricFlow side faked, so the two
     engines can never collide again unnoticed.

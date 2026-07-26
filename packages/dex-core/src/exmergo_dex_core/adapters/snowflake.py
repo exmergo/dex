@@ -996,7 +996,7 @@ class SnowflakeAdapter:
             )
         cursor = self._conn.cursor()
         if not self._session_prepared:
-            # Engine-built session statements, not agent SQL: the warehouse
+            # DexEngine-built session statements, not agent SQL: the warehouse
             # name comes from validated SHOW output and the tag is a constant.
             cursor.execute(f"USE WAREHOUSE {_quote_ident(info['name'])}")
             cursor.execute("ALTER SESSION SET QUERY_TAG = 'dex'")

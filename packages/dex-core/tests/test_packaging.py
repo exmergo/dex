@@ -87,11 +87,13 @@ def test_a_bare_install_imports_and_exposes_the_api(wheel: str):
     done = _run_isolated(
         wheel,
         "import exmergo_dex_core as dex;"
-        "print(dex.Engine.__name__, dex.DexConfig.__name__, dex.MemoryStore.__name__);"
+        """print(
+            dex.DexEngine.__name__, dex.DexConfig.__name__, dex.MemoryStore.__name__
+        );"""
         "print(dex.__version__)",
     )
     assert done.returncode == 0, done.stderr
-    assert "Engine DexConfig MemoryStore" in done.stdout
+    assert "DexEngine DexConfig MemoryStore" in done.stdout
 
 
 def test_importing_the_package_pulls_in_no_connector_client(wheel: str):

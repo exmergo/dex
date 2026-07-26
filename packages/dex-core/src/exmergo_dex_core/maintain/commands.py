@@ -1,6 +1,6 @@
 """Maintain orchestration, in two layers.
 
-The lower layer is the run functions: they take an :class:`~..engine.Engine`,
+The lower layer is the run functions: they take an :class:`~..engine.DexEngine`,
 load the baseline and the project, drive the drift engine, and return a record
 from :mod:`.results`. The upper layer is the ``cmd_*`` shims: argparse in,
 envelope out.
@@ -28,7 +28,7 @@ from . import snapshot as snapshot_mod
 from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
 
 if TYPE_CHECKING:
-    from ..engine import Engine
+    from ..engine import DexEngine
 
 _SNAPSHOT_HINT = (
     "commit .dex/snapshot.json like a lockfile, and re-run `maintain snapshot` "
@@ -51,7 +51,7 @@ class NoBaselineError(Exception):
     """
 
 
-def snapshot(engine: Engine) -> SnapshotResult:
+def snapshot(engine: DexEngine) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
     Prefers the exploration cache, which carries the grain and cardinality
@@ -146,31 +146,31 @@ def snapshot(engine: Engine) -> SnapshotResult:
     )
 
 
-def cmd_snapshot(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(snapshot(engine), hints={"hint": _SNAPSHOT_HINT})
 
 
-def schema_drift(engine: Engine, objects: list[str] | None = None) -> DriftResult:
+def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """Source columns and tables added, dropped, retyped, or renamed."""
 
     return _detect_free_axis(engine, "schema", drift_mod.schema_drift, objects)
 
 
-def volume_drift(engine: Engine, objects: list[str] | None = None) -> DriftResult:
+def volume_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """A row count that collapsed, a table that emptied, a load that half-failed."""
 
     return _detect_free_axis(engine, "volume", drift_mod.volume_drift, objects)
 
 
-def cmd_schema(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_schema(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(schema_drift(engine, getattr(args, "objects", None)))
 
 
-def cmd_volume(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_volume(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(volume_drift(engine, getattr(args, "objects", None)))
 
 
-def grain_drift(engine: Engine, objects: list[str] | None = None) -> DriftResult:
+def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """A key that lost uniqueness, a changed row-per-entity cardinality, fanout.
 
     This axis scans (exact distinct counts, overlap probes), so on a billed
@@ -221,11 +221,11 @@ def grain_drift(engine: Engine, objects: list[str] | None = None) -> DriftResult
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_grain(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(grain_drift(engine, getattr(args, "objects", None)))
 
 
-def semantic_drift(engine: Engine, objects: list[str] | None = None) -> DriftResult:
+def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """Definitions that no longer match: dangling references, new categoricals.
 
     Two-phase on billed connectors: definition and reference checks are free and
@@ -301,11 +301,11 @@ def semantic_drift(engine: Engine, objects: list[str] | None = None) -> DriftRes
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_semantic(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(semantic_drift(engine, getattr(args, "objects", None)))
 
 
-def check(engine: Engine) -> DriftResult:
+def check(engine: DexEngine) -> DriftResult:
     """The everyday sweep across every axis.
 
     Two-phase by construction: the free axes (schema, volume, semantic
@@ -404,11 +404,11 @@ def check(engine: Engine) -> DriftResult:
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_check(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_check(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(check(engine))
 
 
-def reconcile(engine: Engine, drift_class: str | None = None) -> ReconcileResult:
+def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileResult:
     """Propose the dbt edits that reconcile detected drift.
 
     Reads the last drift report, never re-scans, and writes nothing to the
@@ -478,7 +478,7 @@ def reconcile(engine: Engine, drift_class: str | None = None) -> ReconcileResult
     return result
 
 
-def cmd_reconcile(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     drift_class = getattr(args, "drift_class", None)
     try:
         result = reconcile(engine, drift_class)
@@ -502,7 +502,7 @@ def cmd_reconcile(args: argparse.Namespace, engine: Engine) -> env.Envelope:
 
 
 def _detect_free_axis(
-    engine: Engine, axis: str, detector, objects: list[str] | None
+    engine: DexEngine, axis: str, detector, objects: list[str] | None
 ) -> DriftResult:
     """One metadata-only detector: free on every connector, so no handshake.
     The cost stamp still reflects the connector's paradigm for the caller."""

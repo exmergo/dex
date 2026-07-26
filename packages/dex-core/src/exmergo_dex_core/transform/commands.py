@@ -1,6 +1,6 @@
 """Transform orchestration, in two layers.
 
-The lower layer is the run functions: they take an :class:`~..engine.Engine`,
+The lower layer is the run functions: they take an :class:`~..engine.DexEngine`,
 resolve the dbt project, drive the plan/apply/build engine, and return a record
 from :mod:`.results`. The upper layer is the ``cmd_*`` shims: argparse in,
 envelope out. The transform skill fronts both authoring CLI groups (``transform``
@@ -46,7 +46,7 @@ from .results import (
 )
 
 if TYPE_CHECKING:
-    from ..engine import Engine
+    from ..engine import DexEngine
 
 # What actually caps a dbt statement server-side, per compute-time connector:
 # a per-connector fact, kept out of the shared build arm so the next connector
@@ -77,7 +77,7 @@ class BuildFailedError(Exception):
 
 
 def init_project(
-    engine: Engine,
+    engine: DexEngine,
     name: str,
     *,
     connector: str | None = None,
@@ -143,7 +143,7 @@ def init_project(
     )
 
 
-def cmd_init(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_init(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         result = init_project(
             engine,
@@ -164,7 +164,7 @@ def cmd_init(args: argparse.Namespace, engine: Engine) -> env.Envelope:
 
 
 def plan(
-    engine: Engine,
+    engine: DexEngine,
     intent: str,
     *,
     edits: list[PlanEdit] | None = None,
@@ -227,7 +227,7 @@ def plan(
     return result
 
 
-def cmd_plan(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         result = plan(
             engine,
@@ -242,7 +242,7 @@ def cmd_plan(args: argparse.Namespace, engine: Engine) -> env.Envelope:
         return env.error(str(exc))
 
 
-def macro(engine: Engine, name: str | None = None) -> MacroListResult | MacroResult:
+def macro(engine: DexEngine, name: str | None = None) -> MacroListResult | MacroResult:
     """List the shipped macros, or plan scaffolding one into the project."""
 
     from ..dbt_project import load as load_project
@@ -295,7 +295,7 @@ def macro(engine: Engine, name: str | None = None) -> MacroListResult | MacroRes
     return MacroResult(**planned.model_dump(), macro=name, path=edit.path)
 
 
-def cmd_macro(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_macro(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         result = macro(engine, getattr(args, "argument", None))
     except DbtParseError as exc:
@@ -309,7 +309,7 @@ def cmd_macro(args: argparse.Namespace, engine: Engine) -> env.Envelope:
     return to_envelope(result, hints=_plan_hint(result))
 
 
-def apply(engine: Engine, plan_id: str | None = None) -> ApplyResult:
+def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
     """Write a stored plan's edits into the dbt project.
 
     A file that changed after the plan was made is a conflict, not an overwrite:
@@ -362,14 +362,14 @@ def apply(engine: Engine, plan_id: str | None = None) -> ApplyResult:
     )
 
 
-def cmd_apply(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_apply(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(apply(engine, getattr(args, "argument", None)))
     except ValueError as exc:
         return env.error(str(exc))
 
 
-def plans(engine: Engine) -> PlanListResult:
+def plans(engine: DexEngine) -> PlanListResult:
     """Stored plans (pending and applied), newest first."""
 
     return PlanListResult(
@@ -388,12 +388,12 @@ def plans(engine: Engine) -> PlanListResult:
     )
 
 
-def cmd_plans(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_plans(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(plans(engine))
 
 
 def build(
-    engine: Engine, *, target: str | None = None, select: str | None = None
+    engine: DexEngine, *, target: str | None = None, select: str | None = None
 ) -> BuildResult:
     """Run ``dbt build`` against the dev target, cost-surfaced first.
 
@@ -496,7 +496,7 @@ def build(
     )
 
 
-def cmd_build(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(
             build(
@@ -514,7 +514,7 @@ def cmd_build(args: argparse.Namespace, engine: Engine) -> env.Envelope:
         )
 
 
-def deps(engine: Engine) -> DepsResult:
+def deps(engine: DexEngine) -> DepsResult:
     """Install the project's dbt package dependencies. Writes only
     ``dbt_packages/``, never the warehouse, so it needs no handshake."""
 
@@ -542,7 +542,7 @@ def deps(engine: Engine) -> DepsResult:
     )
 
 
-def cmd_deps(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_deps(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(deps(engine))
     except BuildFailedError as exc:
@@ -550,7 +550,7 @@ def cmd_deps(args: argparse.Namespace, engine: Engine) -> env.Envelope:
 
 
 def semantic_define(
-    engine: Engine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
 ) -> PlanResult:
     """Author new semantic definitions (entities, dimensions, measures, metrics).
 
@@ -562,7 +562,7 @@ def semantic_define(
 
 
 def semantic_update(
-    engine: Engine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
 ) -> PlanResult:
     """Evolve existing semantic definitions.
 
@@ -574,7 +574,7 @@ def semantic_update(
 
 
 def semantic_plan(
-    engine: Engine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
 ) -> PlanResult:
     """Mixed-intent semantic authoring: one payload may evolve existing
     definitions and add the new ones they depend on; each name is classified
@@ -593,20 +593,20 @@ _SEMANTIC_AUTHORING = {
 }
 
 
-def cmd_semantic_define(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_semantic_define(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _semantic_envelope(args, engine, "define")
 
 
-def cmd_semantic_update(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_semantic_update(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _semantic_envelope(args, engine, "update")
 
 
-def cmd_semantic_plan(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_semantic_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _semantic_envelope(args, engine, "plan")
 
 
 def _semantic_envelope(
-    args: argparse.Namespace, engine: Engine, mode: str
+    args: argparse.Namespace, engine: DexEngine, mode: str
 ) -> env.Envelope:
     try:
         result = _SEMANTIC_AUTHORING[mode](
@@ -665,7 +665,7 @@ def _record_build_spend(
     )
 
 
-def _price_build(engine: Engine, project, target: str, select: str | None):
+def _price_build(engine: DexEngine, project, target: str, select: str | None):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
     Returns ``(estimate, per_node, notes, adapter)``. ``estimate`` is ``None``
@@ -789,7 +789,7 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
     return f"{prefix}: {messages[0]}" if messages else prefix
 
 
-def _make_plan(engine: Engine, intent: str, edits: list[PlanEdit]) -> PlanResult:
+def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
     repo_root = engine.require_repo_root("storing a transform plan")
     stored, diffs, warnings = plans_mod.plan(
         intent, edits, engine.project_dir(), repo_root, store=engine.store
@@ -805,7 +805,7 @@ def _make_plan(engine: Engine, intent: str, edits: list[PlanEdit]) -> PlanResult
 
 
 def _semantic_plan(
-    engine: Engine,
+    engine: DexEngine,
     intent: str,
     edits: list[PlanEdit],
     *,

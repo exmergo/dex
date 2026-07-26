@@ -1,4 +1,4 @@
-"""The public Engine API: what a library caller gets, and what it must never do.
+"""The public DexEngine API: what a library caller gets, and what it must never do.
 
 Most of this file is about the second half. An engine is the first surface that
 lets a host process serve more than one principal, and the failure mode there is
@@ -17,7 +17,7 @@ import pytest
 from exmergo_dex_core import (
     ConfirmationRequiredError,
     DexConfig,
-    Engine,
+    DexEngine,
     FilesystemStore,
     MemoryStore,
 )
@@ -53,7 +53,7 @@ def test_the_public_import_works_and_defaults_to_writing_nothing(
         }
 
     before = snapshot()
-    with Engine(connector="duckdb", path=str(duckdb_file)) as eng:
+    with DexEngine(connector="duckdb", path=str(duckdb_file)) as eng:
         assert isinstance(eng.store, MemoryStore)
         profiled = eng.profile("customers")
         rows = eng.query("select count(*) as n from customers")
@@ -68,7 +68,7 @@ def test_methods_return_domain_objects_never_envelopes(duckdb_file: Path):
     """Type-level, not shape-level: an envelope leaking through the API would
     make every consumer parse transport it never asked for."""
 
-    with Engine(connector="duckdb", path=str(duckdb_file)) as eng:
+    with DexEngine(connector="duckdb", path=str(duckdb_file)) as eng:
         profiled = eng.profile("customers")
         mapped = eng.map()
         rows = eng.query("select 1 as n")
@@ -108,7 +108,7 @@ def test_a_dex_config_object_drives_a_full_flow_with_no_config_file(
     dependency is removed while another quietly remains."""
 
     config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=str(duckdb_file)))
-    with Engine(config=config) as eng:
+    with DexEngine(config=config) as eng:
         mapped = eng.map()
         rows = eng.query("select count(*) as n from orders")
 
@@ -118,7 +118,7 @@ def test_a_dex_config_object_drives_a_full_flow_with_no_config_file(
 
 
 def test_close_is_idempotent_and_the_context_manager_closes(duckdb_file: Path):
-    eng = Engine(connector="duckdb", path=str(duckdb_file))
+    eng = DexEngine(connector="duckdb", path=str(duckdb_file))
     with eng:
         eng.inventory()
         adapter = eng._adapter_instance
@@ -134,7 +134,7 @@ def test_no_connector_anywhere_refuses_instead_of_defaulting():
     """No silent connector default, in the API's own vocabulary. Defaulting to
     duckdb here would connect a caller to a target they never named."""
 
-    with Engine() as eng, pytest.raises(ValueError, match="no connector selected"):
+    with DexEngine() as eng, pytest.raises(ValueError, match="no connector selected"):
         eng.inventory()
 
 
@@ -143,7 +143,7 @@ def test_commands_needing_the_project_refuse_without_a_repo_root():
     read or write it say which operation needed a root rather than failing with
     a bare None several frames down."""
 
-    with Engine(config=DexConfig()) as eng:
+    with DexEngine(config=DexConfig()) as eng:
         with pytest.raises(ValueError, match="scaffolding a dbt project"):
             eng.init_project("analytics", connector="duckdb")
         with pytest.raises(ValueError, match="locating the dbt project"):
@@ -179,7 +179,7 @@ def test_an_explicit_config_never_reads_one_from_disk(
     monkeypatch.chdir(workdir)
 
     config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=str(duckdb_file)))
-    with Engine(config=config, repo_root=str(workdir)) as eng:
+    with DexEngine(config=config, repo_root=str(workdir)) as eng:
         result = eng.inventory()
         # The planted connector never governed: a bigquery engine could not have
         # listed these objects, and the planted ceiling of 1 would have refused.
@@ -200,8 +200,8 @@ def test_two_engines_in_one_process_share_nothing(duckdb_file: Path):
     shared one is both a disclosure and the wrong authorization surface.
     """
 
-    first = Engine(connector="duckdb", path=str(duckdb_file))
-    second = Engine(connector="duckdb", path=str(duckdb_file))
+    first = DexEngine(connector="duckdb", path=str(duckdb_file))
+    second = DexEngine(connector="duckdb", path=str(duckdb_file))
     with first, second:
         first.profile("customers")
         assert second.store.load_cache() is None
@@ -280,7 +280,7 @@ def test_each_call_gets_its_own_cost_gate(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(connect_mod, "open_adapter", opener)
 
     config = DexConfig(connector="bigquery", bigquery=BigQueryTarget(project="p"))
-    eng = Engine(
+    eng = DexEngine(
         config=config,
         store=FilesystemStore(tmp_path),
         confirmed=True,
@@ -309,7 +309,7 @@ def test_a_per_call_confirmation_overrides_the_engine_default(
     CLI runs one command per process, but a caller must be able to confirm one
     call without confirming everything after it."""
 
-    eng = Engine(
+    eng = DexEngine(
         connector="duckdb", path=str(duckdb_file), store=FilesystemStore(tmp_path)
     )
     with eng:
@@ -356,7 +356,7 @@ def test_an_unconfirmed_billed_call_raises_and_spends_nothing(
     monkeypatch.setattr(connect_mod, "open_adapter", opener)
 
     with (
-        Engine(config=config, store=store) as eng,
+        DexEngine(config=config, store=store) as eng,
         pytest.raises(ConfirmationRequiredError) as caught,
     ):
         eng.profile("customers")

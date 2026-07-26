@@ -1,14 +1,14 @@
 """The programmatic API: one object that owns a connection, a config, and a store.
 
-``Engine`` is what a Python caller uses instead of shelling out to the CLI and
+``DexEngine`` is what a Python caller uses instead of shelling out to the CLI and
 parsing stdout. It returns domain objects and :class:`~.results.Result` records;
 the :class:`~.envelope.Envelope` never crosses this boundary. The CLI is the
 first consumer of this API rather than a parallel implementation of it, which is
 what keeps the two from drifting.
 
-    from exmergo_dex_core import Engine
+    from exmergo_dex_core import DexEngine
 
-    with Engine(connector="duckdb", path="shop.duckdb") as eng:
+    with DexEngine(connector="duckdb", path="shop.duckdb") as eng:
         mapped = eng.map()
         rows = eng.query("select status, count(*) from orders group by status")
 
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     )
 
 
-class Engine:
+class DexEngine:
     """A connection, a configuration, and a place to keep scratch state.
 
     **Scope one engine to one principal and one session.** Never process-lived,
@@ -139,7 +139,7 @@ class Engine:
         self._adapter_instance: Adapter | None = None
 
     @classmethod
-    def from_repo(cls, repo_root: str | Path, **overrides: Any) -> Engine:
+    def from_repo(cls, repo_root: str | Path, **overrides: Any) -> DexEngine:
         """Build from a project on disk: filesystem store, config from ``.dex/``.
 
         The CLI's constructor, and the only path that reads configuration from
@@ -263,7 +263,7 @@ class Engine:
             raise ValueError(
                 f"{what} needs a repo root: the dbt project is a git-reviewable "
                 "filesystem artifact, so build the engine with "
-                "Engine.from_repo(repo_root) or pass repo_root="
+                "DexEngine.from_repo(repo_root) or pass repo_root="
             )
         return self.repo_root
 
@@ -511,7 +511,7 @@ class Engine:
         if adapter is not None:
             adapter.close()
 
-    def __enter__(self) -> Engine:
+    def __enter__(self) -> DexEngine:
         return self
 
     def __exit__(self, *exc: object) -> None:

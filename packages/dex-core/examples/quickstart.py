@@ -4,7 +4,7 @@
     python quickstart.py
 
 Everything below runs against a throwaway DuckDB file this script creates, so it
-is safe to run anywhere. Point `Engine` at your own warehouse by changing the
+is safe to run anywhere. Point `DexEngine` at your own warehouse by changing the
 connector and config; nothing else in the flow changes.
 
 Run by `tests/test_packaging.py` against a freshly built wheel, so if this stops
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import duckdb
 
-from exmergo_dex_core import Engine, QueryRefusedError
+from exmergo_dex_core import DexEngine, QueryRefusedError
 
 
 def make_warehouse(directory: Path) -> Path:
@@ -49,7 +49,7 @@ def main() -> None:
     # No store passed, so state lives in this process and nothing is written to
     # disk. Pass store=FilesystemStore(repo_root) to keep a .dex/ cache between
     # runs, which is what the CLI does.
-    with Engine(connector="duckdb", path=str(warehouse)) as dex:
+    with DexEngine(connector="duckdb", path=str(warehouse)) as dex:
         # 1. Map the warehouse: inventory, profiling, and join inference in one
         #    pass. On a big warehouse this profiles the top-ranked tables only.
         mapped = dex.map()

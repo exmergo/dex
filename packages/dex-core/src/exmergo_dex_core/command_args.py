@@ -5,7 +5,7 @@ only the CLI asks. The second is the cost-before-spend handshake every billed
 command goes through, shared here so explore, transform, and maintain cannot
 drift apart on the one thing that governs spend.
 
-Nothing here opens a connection. That is :meth:`Engine._adapter`, and it is the
+Nothing here opens a connection. That is :meth:`DexEngine._adapter`, and it is the
 only opener, so credential discovery and the cost gate have exactly one seam.
 """
 

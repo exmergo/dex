@@ -22,7 +22,7 @@ from google.cloud import bigquery
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.cli import dispatch
 from exmergo_dex_core.config import BigQueryTarget, DexConfig
-from exmergo_dex_core.engine import Engine
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import CostGate, OverCeilingError
 from exmergo_dex_core.storage import FilesystemStore
@@ -109,7 +109,7 @@ def _install(
             principal_type="user",
         )
 
-    monkeypatch.setattr(Engine, "_adapter", opener)
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
 
 
 def _raise_on_nth_object(monkeypatch, n: int):
@@ -156,7 +156,7 @@ def _dispatch(tmp_path: Path, **extra):
     becomes an error envelope at this boundary."""
 
     args = _args(tmp_path, **extra)
-    engine = Engine(
+    engine = DexEngine(
         connector="bigquery",
         repo_root=str(tmp_path),
         store=FilesystemStore(tmp_path),

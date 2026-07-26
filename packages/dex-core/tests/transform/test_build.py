@@ -700,7 +700,7 @@ def _install_fake_pricing(
     fake adapter, whose ``.closed`` records that ``cmd_build`` closed it.
     """
 
-    from exmergo_dex_core.engine import Engine
+    from exmergo_dex_core.engine import DexEngine
     from exmergo_dex_core.guards.cost_guard import CostGate
     from exmergo_dex_core.transform import dev_target
 
@@ -730,7 +730,7 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
-    monkeypatch.setattr(Engine, "_adapter", lambda self, command=None, **kw: adapter)
+    monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
     monkeypatch.setattr(
         build_module,
         "compile_estimate",
@@ -841,7 +841,7 @@ def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
     connection dex cannot open must not break a build dbt could run: pricing
     degrades to no estimate with a note, and the gate still binds."""
 
-    from exmergo_dex_core.engine import Engine
+    from exmergo_dex_core.engine import DexEngine
     from exmergo_dex_core.transform import dev_target
 
     monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
@@ -849,7 +849,7 @@ def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
     def boom(self, command=None, **_kw):
         raise RuntimeError("no application default credentials")
 
-    monkeypatch.setattr(Engine, "_adapter", boom)
+    monkeypatch.setattr(DexEngine, "_adapter", boom)
     rc, envelope = _run(
         [
             "--repo-root",

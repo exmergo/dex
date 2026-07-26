@@ -16,7 +16,7 @@ from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset
 from exmergo_dex_core.cli import dispatch
 from exmergo_dex_core.config import BigQueryTarget, DexConfig
-from exmergo_dex_core.engine import Engine
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import (
     CeilingRequiredError,
@@ -78,13 +78,13 @@ def route_adapter(monkeypatch):
                 record=record,
             )
 
-        monkeypatch.setattr(Engine, "_adapter", opener)
+        monkeypatch.setattr(DexEngine, "_adapter", opener)
 
     return install
 
 
-def _engine(tmp_path: Path, **extra) -> Engine:
-    return Engine(
+def _engine(tmp_path: Path, **extra) -> DexEngine:
+    return DexEngine(
         connector="bigquery",
         repo_root=str(tmp_path),
         store=FilesystemStore(tmp_path),

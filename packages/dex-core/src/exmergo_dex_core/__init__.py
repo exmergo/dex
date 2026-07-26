@@ -1,22 +1,22 @@
 """exmergo-dex-core: the portable analytics-engineering engine behind dex.
 
-Two surfaces over one engine. :class:`Engine` is the programmatic API:
+Two surfaces over one engine. :class:`DexEngine` is the programmatic API:
 
-    from exmergo_dex_core import Engine
+    from exmergo_dex_core import DexEngine
 
-    with Engine(connector="duckdb", path="shop.duckdb") as eng:
+    with DexEngine(connector="duckdb", path="shop.duckdb") as eng:
         mapped = eng.map()
         rows = eng.query("select status, count(*) from orders group by status")
 
 Nothing above touches disk: the default store keeps state in the process, so
 importing this package cannot leave a ``.dex/`` directory in a consumer's repo.
-:meth:`Engine.from_repo` is the opt-in to a project on disk.
+:meth:`DexEngine.from_repo` is the opt-in to a project on disk.
 
 The command contract in :mod:`exmergo_dex_core.cli` is the other surface, and it
 is the first consumer of the first: every agent surface (SKILL.md, AGENTS.md) is
 a thin wrapper over it, and it runs the same code a library call does.
 
-Read :class:`Engine`'s docstring before wiring this into a service. One engine
+Read :class:`DexEngine`'s docstring before wiring this into a service. One engine
 belongs to one principal and one session, and an engine given an explicit config
 never reads one from disk; both matter the moment a process serves more than one
 user.
@@ -46,7 +46,7 @@ _EXPORTS = {
     "DexCache": "cache",
     "DexConfig": "config",
     "Document": "storage",
-    "Engine": "engine",
+    "DexEngine": "engine",
     "FilesystemStore": "storage",
     "MemoryStore": "storage",
     "OverCeilingError": "guards.cost_guard",
@@ -62,7 +62,7 @@ _EXPORTS = {
 if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .cache import ColumnProfile, Dataset, DexCache, Relationship
     from .config import DexConfig
-    from .engine import Engine
+    from .engine import DexEngine
     from .envelope import Cost, Paradigm
     from .guards.cost_guard import (
         CeilingRequiredError,
@@ -100,8 +100,8 @@ __all__ = [
     "Dataset",
     "DexCache",
     "DexConfig",
+    "DexEngine",
     "Document",
-    "Engine",
     "FilesystemStore",
     "MemoryStore",
     "OverCeilingError",

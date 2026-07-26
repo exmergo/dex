@@ -1,9 +1,9 @@
 """Explore orchestration, in two layers.
 
 The lower layer is the run functions (``inventory``, ``profile``, ``map``, and so
-on): they take an :class:`~..engine.Engine` and plain arguments, drive the explore
+on): they take an :class:`~..engine.DexEngine` and plain arguments, drive the explore
 engine, and return a record from :mod:`.results`. They are what
-``Engine.profile()`` and friends call, so a library caller and the CLI execute
+``DexEngine.profile()`` and friends call, so a library caller and the CLI execute
 exactly the same code.
 
 The upper layer is the ``cmd_*`` shims: argparse in, envelope out, nothing else.
@@ -75,7 +75,7 @@ from .results import (
 )
 
 if TYPE_CHECKING:
-    from ..engine import Engine
+    from ..engine import DexEngine
 
 # Below this many objects, profile everything: enumeration is cheap and complete.
 # Above it, profile only the top-ranked unless --full is passed.
@@ -219,7 +219,7 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
     )
 
 
-def inventory(engine: Engine, *, rank: bool = False) -> InventoryResult:
+def inventory(engine: DexEngine, *, rank: bool = False) -> InventoryResult:
     """Every object the connection can see, metadata only.
 
     Free on every connector (catalog reads, not scans), so it never needs the
@@ -256,12 +256,12 @@ def inventory(engine: Engine, *, rank: bool = False) -> InventoryResult:
     )
 
 
-def cmd_inventory(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_inventory(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(inventory(engine, rank=getattr(args, "rank", False)))
 
 
 def profile(
-    engine: Engine,
+    engine: DexEngine,
     objects: list[str],
     *,
     refresh: bool = False,
@@ -385,7 +385,7 @@ def profile(
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_profile(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(
         profile(
             engine,
@@ -397,7 +397,7 @@ def cmd_profile(args: argparse.Namespace, engine: Engine) -> env.Envelope:
 
 
 def relationships(
-    engine: Engine,
+    engine: DexEngine,
     *,
     verify: bool = False,
     refresh: bool = False,
@@ -619,7 +619,7 @@ def relationships(
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_relationships(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(
         relationships(
             engine,
@@ -630,7 +630,7 @@ def cmd_relationships(args: argparse.Namespace, engine: Engine) -> env.Envelope:
     )
 
 
-def query(engine: Engine, sql: str) -> QueryResult:
+def query(engine: DexEngine, sql: str) -> QueryResult:
     """Run one caller-authored SELECT through the query firewall.
 
     The cache gate comes first and is not a formality: the PII policy the
@@ -721,14 +721,14 @@ def query(engine: Engine, sql: str) -> QueryResult:
     return record
 
 
-def cmd_query(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(query(engine, args.sql))
     except QueryRefusedError as exc:
         return env.error(f"query refused: {exc}")
 
 
-def semantic_list(engine: Engine, *, api: bool = False, local: bool = False):
+def semantic_list(engine: DexEngine, *, api: bool = False, local: bool = False):
     """The metrics, dimensions, and entities the semantic layer exposes."""
 
     from .semantic import resolve_backend
@@ -739,7 +739,7 @@ def semantic_list(engine: Engine, *, api: bool = False, local: bool = False):
 
 
 def semantic_query(
-    engine: Engine,
+    engine: DexEngine,
     metrics: list[str],
     *,
     group_by: list[str] | None = None,
@@ -777,7 +777,7 @@ def semantic_query(
     )
 
 
-def cmd_semantic(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     """`explore semantic list|query`: discover and query the dbt semantic layer.
 
     Backend resolution and the two guard postures live in the
@@ -810,7 +810,7 @@ def cmd_semantic(args: argparse.Namespace, engine: Engine) -> env.Envelope:
 
 
 def map(
-    engine: Engine,
+    engine: DexEngine,
     *,
     full: bool = False,
     verify: bool = False,
@@ -1074,7 +1074,7 @@ def map(
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_map(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_map(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(
         map(
             engine,
@@ -1087,7 +1087,7 @@ def cmd_map(args: argparse.Namespace, engine: Engine) -> env.Envelope:
 
 
 def cluster(
-    engine: Engine,
+    engine: DexEngine,
     obj: str,
     *,
     features: list[str] | None = None,
@@ -1192,7 +1192,7 @@ def cluster(
     return command_args.stamp_spend(result, adapter)
 
 
-def cmd_cluster(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(
             cluster(
@@ -1435,7 +1435,7 @@ def _shape_query_payload(
 
 
 def _project_definitions(
-    engine: Engine, use_project: bool
+    engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
     """The dbt project's declared definitions, honoring the config pin.
 

@@ -16,7 +16,7 @@ pytest.importorskip("google.cloud.bigquery")
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import BigQueryTarget, DexConfig
-from exmergo_dex_core.engine import Engine
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.explore import commands as explore_cmds
 from exmergo_dex_core.guards.cost_guard import CostGate
@@ -98,7 +98,7 @@ def route_adapter(monkeypatch):
     """Route the engine's one adapter funnel at a prebuilt adapter, reading the
     confirm/budget settings off the engine the way connect.py would off config.
 
-    Patching ``Engine._adapter`` rather than ``connect.open_adapter`` is
+    Patching ``DexEngine._adapter`` rather than ``connect.open_adapter`` is
     deliberate: it is the seam every command actually goes through, so a command
     that grew a second way to open a connection would fail here.
     """
@@ -112,13 +112,13 @@ def route_adapter(monkeypatch):
                 record=record,
             )
 
-        monkeypatch.setattr(Engine, "_adapter", opener)
+        monkeypatch.setattr(DexEngine, "_adapter", opener)
 
     return install
 
 
-def _engine(tmp_path: Path, **extra) -> Engine:
-    return Engine(
+def _engine(tmp_path: Path, **extra) -> DexEngine:
+    return DexEngine(
         connector="bigquery",
         repo_root=str(tmp_path),
         store=FilesystemStore(tmp_path),
@@ -309,7 +309,7 @@ def test_scoped_map_carries_forward_out_of_scope_dataset_profiles(
             principal_type="user",
         )
 
-    monkeypatch.setattr(Engine, "_adapter", scoped_opener)
+    monkeypatch.setattr(DexEngine, "_adapter", scoped_opener)
     envelope = _dispatch(tmp_path, subcommand="map")
 
     assert envelope.status.value == "ok"

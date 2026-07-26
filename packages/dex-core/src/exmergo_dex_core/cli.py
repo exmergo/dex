@@ -6,7 +6,7 @@ envelope to stdout and nothing else. Subcommands are stateless (state lives in t
 dbt project, which is the source of truth, plus the scratch state the store holds),
 so the agent orchestrates multi-step flows.
 
-The CLI is the first consumer of :class:`~.engine.Engine` rather than a parallel
+The CLI is the first consumer of :class:`~.engine.DexEngine` rather than a parallel
 implementation of it: ``main`` parses arguments, builds one engine from the
 resolved repo root (filesystem store, config read from ``.dex/``), and every
 command runs against that engine and hands back a result the shim wraps in an
@@ -25,7 +25,7 @@ import sys
 
 from . import command_args
 from . import envelope as env
-from .engine import Engine
+from .engine import DexEngine
 from .guards.cost_guard import ConfirmationRequiredError
 from .results import BudgetExhaustedError
 
@@ -216,7 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def dispatch(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     """Route one parsed command to its handler and return exactly one envelope.
 
     Total by construction: the two refusals the engine raises rather than returns
@@ -239,7 +239,7 @@ def dispatch(args: argparse.Namespace, engine: Engine) -> env.Envelope:
         )
 
 
-def _run(args: argparse.Namespace, engine: Engine) -> env.Envelope:
+def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     if args.group == "connect" and args.subcommand == "test":
         from .results import to_envelope
 
@@ -310,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     # backend is what lets the subcommands stay stateless across invocations:
     # `.dex/` on disk is how the exploration cache and the cumulative session
     # budget survive from one command to the next.
-    engine = Engine.from_repo(
+    engine = DexEngine.from_repo(
         repo_root(args),
         connector=getattr(args, "connector", None),
         path=getattr(args, "path", None),

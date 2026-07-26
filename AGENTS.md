@@ -170,7 +170,7 @@ them.
 
 ## Where things live
 
-- Engine: `packages/dex-core/` (PyPI: `exmergo-dex-core`, Apache-2.0).
+- DexEngine: `packages/dex-core/` (PyPI: `exmergo-dex-core`, Apache-2.0).
 - Connector and methodology notes: `references/`.
 - The contract in full: `references/command-contract.md`.
 - The source of truth (dbt) and `.dex/` cache: `references/canonical-model.md`.

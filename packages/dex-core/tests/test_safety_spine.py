@@ -17,15 +17,15 @@ from exmergo_dex_core import envelope as env
 from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, PIIFlag
 from exmergo_dex_core.config import DexConfig
-from exmergo_dex_core.engine import Engine
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import FilesystemStore, MemoryStore
 
 
-def _memory_engine(**kwargs) -> Engine:
+def _memory_engine(**kwargs) -> DexEngine:
     """An engine that touches no disk, for the units that need one to exist."""
 
-    return Engine(config=DexConfig(), store=MemoryStore(), **kwargs)
+    return DexEngine(config=DexConfig(), store=MemoryStore(), **kwargs)
 
 
 # --- Family 1: read-only against data; SELECT-only; prod-target refused -------
@@ -814,7 +814,7 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
     a relative path would resolve against.
     """
 
-    from exmergo_dex_core import Engine
+    from exmergo_dex_core import DexEngine
 
     repo = duckdb_file.parent
     monkeypatch.chdir(repo)
@@ -831,7 +831,7 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
     # The public API with its defaults, which is the shape that matters: a
     # consumer who imports this package and calls it must not acquire a `.dex/`
     # directory as a side effect of doing so.
-    with Engine(connector="duckdb", path=str(duckdb_file)) as eng:
+    with DexEngine(connector="duckdb", path=str(duckdb_file)) as eng:
         profiled = eng.profile("customers")
         # Real work happened, so the silence below is not the silence of a no-op.
         assert profiled.profiled_count == 1
@@ -2578,7 +2578,7 @@ def test_hosted_semantic_pii_dimension_refused_not_surfaced():
 # of a house is not a guard, so the load-bearing ones are re-asserted through it.
 
 
-def _billed_engine(fake_bq_client, tmp_path: Path, **kwargs) -> Engine:
+def _billed_engine(fake_bq_client, tmp_path: Path, **kwargs) -> DexEngine:
     """An engine whose one connection is the BigQuery fake, gated for real.
 
     The gate is built by ``connect.new_cost_gate``, not hand-rolled, so what is
@@ -2608,7 +2608,7 @@ def _billed_engine(fake_bq_client, tmp_path: Path, **kwargs) -> Engine:
             principal_type="user",
         )
 
-    engine = Engine(config=config, store=store, **kwargs)
+    engine = DexEngine(config=config, store=store, **kwargs)
     engine._open_for_test = opener
     return engine
 
@@ -2750,7 +2750,7 @@ def test_api_pii_stays_flagged_and_never_surfaced(duckdb_file: Path):
     # door the query came in through.
     from exmergo_dex_core import QueryRefusedError
 
-    with Engine(connector="duckdb", path=str(duckdb_file)) as engine:
+    with DexEngine(connector="duckdb", path=str(duckdb_file)) as engine:
         engine.map()
         with pytest.raises(QueryRefusedError):
             engine.query("select email from customers")

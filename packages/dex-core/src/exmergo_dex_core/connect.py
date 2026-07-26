@@ -119,7 +119,7 @@ def no_connector_selected(repo_root: str | Path | None) -> ValueError:
         return ValueError(
             "no connector selected: pass connector= (with path= for duckdb) or a "
             "config= that declares one, or build from a project on disk with "
-            "Engine.from_repo(repo_root)"
+            "DexEngine.from_repo(repo_root)"
         )
     return ValueError(
         f"no .dex/config.yml found searching from '{repo_root}' up to the git "
