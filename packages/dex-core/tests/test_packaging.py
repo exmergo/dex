@@ -129,7 +129,10 @@ def test_the_quickstart_example_runs_against_the_installed_package(wheel: str):
     assert "mapped 2 objects, 1 relationship(s)" in out
     assert "join: shop.main.orders.customer_id -> shop.main.customers.id" in out
     assert "PII: shop.main.customers.email is email" in out
-    assert "[['US', 1], ['EU', 2]]" in out
+    # Exact cells, which is only stable because the example's query orders its
+    # groups. A bare GROUP BY returns them in whatever order the hash aggregate
+    # produced, so this assertion used to fail roughly one run in fifty.
+    assert "[['EU', 2], ['US', 1]]" in out
     assert "refused, as designed" in out
     # PII stayed flagged and never surfaced, all the way out to stdout.
     assert "@example.com" not in out
