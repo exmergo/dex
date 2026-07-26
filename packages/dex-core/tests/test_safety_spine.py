@@ -16,7 +16,17 @@ import pytest
 from exmergo_dex_core import envelope as env
 from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, PIIFlag
+from exmergo_dex_core.config import DexConfig
+from exmergo_dex_core.engine import Engine
+from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import FilesystemStore, MemoryStore
+
+
+def _memory_engine(**kwargs) -> Engine:
+    """An engine that touches no disk, for the units that need one to exist."""
+
+    return Engine(config=DexConfig(), store=MemoryStore(), **kwargs)
+
 
 # --- Family 1: read-only against data; SELECT-only; prod-target refused -------
 
@@ -804,9 +814,7 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
     a relative path would resolve against.
     """
 
-    import argparse
-
-    from exmergo_dex_core.cli import dispatch
+    from exmergo_dex_core import Engine
 
     repo = duckdb_file.parent
     monkeypatch.chdir(repo)
@@ -819,34 +827,22 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
         }
 
     before = snapshot()
-    store = MemoryStore()
 
-    def _args(subcommand: str, **extra) -> argparse.Namespace:
-        base = {
-            "group": "explore",
-            "subcommand": subcommand,
-            "connector": "duckdb",
-            "path": str(duckdb_file),
-            "repo_root": str(repo),
-            "confirm": False,
-            "budget": None,
-        }
-        base.update(extra)
-        return argparse.Namespace(**base)
+    # The public API with its defaults, which is the shape that matters: a
+    # consumer who imports this package and calls it must not acquire a `.dex/`
+    # directory as a side effect of doing so.
+    with Engine(connector="duckdb", path=str(duckdb_file)) as eng:
+        profiled = eng.profile("customers")
+        # Real work happened, so the silence below is not the silence of a no-op.
+        assert profiled.profiled_count == 1
+        # The locator is honest about there being no file to open.
+        assert profiled.cache_path == "memory:cache"
 
-    profiled = dispatch(_args("profile", objects=["customers"]), store)
-    assert profiled.status is env.Status.OK, profiled.errors
-    # Real work happened, so the silence below is not the silence of a no-op.
-    assert profiled.data["profiled_count"] == 1
-    # The locator is honest about there being no file to open.
-    assert profiled.data["cache_path"] == "memory:cache"
-
-    # The second step proves retention, not just silence: the query firewall
-    # derives its PII policy from the cache the first step stored, so a store that
-    # dropped writes would fail here rather than pass quietly.
-    queried = dispatch(_args("query", sql="select count(*) as n from customers"), store)
-    assert queried.status is env.Status.OK, queried.errors
-    assert queried.data["row_count"] == 1
+        # The second step proves retention, not just silence: the query firewall
+        # derives its PII policy from the cache the first step stored, so a store
+        # that dropped writes would fail here rather than pass quietly.
+        queried = eng.query("select count(*) as n from customers")
+        assert queried.row_count == 1
 
     assert snapshot() == before
     assert not (repo / ".dex").exists()
@@ -2457,13 +2453,16 @@ def test_hosted_semantic_is_warn_only_never_silently_priced():
     backend = FakeHostedBackend(
         result=table_json_result(["sessions"], ["string"], [[5.0]])
     )
-    envelope = backend.query(SemanticQuery(metrics=["sessions"]))
-    # ok WITHOUT any --confirm (dex governs nothing on this path)...
-    assert envelope.status == env.Status.OK
+    result = backend.query(SemanticQuery(metrics=["sessions"]))
+    # answered WITHOUT any confirmation (dex governs nothing on this path)...
+    assert result.row_count == 1
     # ...but it never pretends to have priced or bounded the spend...
-    assert envelope.cost.paradigm == env.Paradigm.HOSTED
-    assert envelope.cost.estimate is None and envelope.cost.ceiling is None
-    # ...and it says so, loudly, on every result.
+    assert result.cost.paradigm == env.Paradigm.HOSTED
+    assert result.cost.estimate is None and result.cost.ceiling is None
+    # ...and it says so, loudly, on every result, all the way to stdout.
+    assert any("cost guard unavailable" in w for w in result.warnings)
+    envelope = to_envelope(result)
+    assert envelope.status == env.Status.OK
     assert any("cost guard unavailable" in w for w in envelope.warnings)
 
 
@@ -2527,9 +2526,7 @@ def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
             )
         ]
     )
-    backend = LocalMetricFlowBackend(
-        project, None, None, "duckdb", QueryLimits(), MemoryStore()
-    )
+    backend = LocalMetricFlowBackend(project, _memory_engine(), "duckdb", QueryLimits())
     lookup = backend._cache_pii_lookup(cache)
     assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
 
@@ -2543,7 +2540,7 @@ def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Pa
     from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
 
     backend = LocalMetricFlowBackend(
-        tmp_path, None, None, "duckdb", QueryLimits(), MemoryStore()
+        tmp_path, _memory_engine(), "duckdb", QueryLimits()
     )
     cache = DexCache(
         datasets=[
@@ -2562,13 +2559,198 @@ def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Pa
 def test_hosted_semantic_pii_dimension_refused_not_surfaced():
     from fakes.semantic import FakeHostedBackend
 
-    from exmergo_dex_core.explore.semantic import SemanticQuery
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+    )
 
     backend = FakeHostedBackend()
-    envelope = backend.query(
-        SemanticQuery(metrics=["sessions"], group_by=["user__email"])
-    )
-    assert envelope.status == env.Status.ERROR
-    assert "PII" in envelope.errors[0]
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
     # refused before the query was ever submitted for execution
     assert not any("createQuery" in posted for posted in backend.posted)
+
+
+# --- The programmatic API is bound by the same spine as the CLI ----------------
+#
+# Every guard above was written when the only way in was a subcommand. The engine
+# is a second door into the same house, and a guard that only holds on one side
+# of a house is not a guard, so the load-bearing ones are re-asserted through it.
+
+
+def _billed_engine(fake_bq_client, tmp_path: Path, **kwargs) -> Engine:
+    """An engine whose one connection is the BigQuery fake, gated for real.
+
+    The gate is built by ``connect.new_cost_gate``, not hand-rolled, so what is
+    under test is the wiring the engine actually uses.
+    """
+
+    from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+    from exmergo_dex_core.config import BigQueryTarget
+    from exmergo_dex_core.connect import new_cost_gate
+
+    config = DexConfig(connector="bigquery", bigquery=BigQueryTarget(project="p"))
+    store = FilesystemStore(tmp_path)
+
+    def opener(**opened):
+        return BigQueryAdapter(
+            project="test-proj",
+            cost_gate=new_cost_gate(
+                "bigquery",
+                config,
+                store,
+                budget=opened.get("budget"),
+                confirmed=opened.get("confirmed", False),
+                command=opened.get("command"),
+            ),
+            target=BigQueryTarget(),
+            client=fake_bq_client,
+            principal_type="user",
+        )
+
+    engine = Engine(config=config, store=store, **kwargs)
+    engine._open_for_test = opener
+    return engine
+
+
+@pytest.fixture
+def api_engine(fake_bq_client, tmp_path, monkeypatch):
+    """Engines built by ``_billed_engine``, with the real opener replaced."""
+
+    import exmergo_dex_core.connect as connect_mod
+
+    def build(**kwargs):
+        engine = _billed_engine(fake_bq_client, tmp_path, **kwargs)
+        monkeypatch.setattr(connect_mod, "open_adapter", engine._open_for_test)
+        return engine
+
+    return build
+
+
+def test_api_confirmation_binds_and_spends_nothing(api_engine, fake_bq_client):
+    # Family 2, through the API: cost is surfaced before any spend, and the
+    # refusal carries what a caller needs to re-issue rather than a bare error.
+    from exmergo_dex_core import ConfirmationRequiredError
+
+    with api_engine() as engine, pytest.raises(ConfirmationRequiredError) as caught:
+        engine.profile("customers")
+
+    assert caught.value.request.cost.estimate > 0
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_api_over_ceiling_cannot_be_confirmed_through(api_engine, fake_bq_client):
+    # Family 2, through the API: confirmation is not an override. An estimate
+    # past the ceiling refuses first, however confirmed the caller is.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    with (
+        api_engine(confirmed=True, budget=1_000.0) as engine,
+        pytest.raises(OverCeilingError),
+    ):
+        engine.profile("customers")
+
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_api_no_ceiling_is_refused_even_when_confirmed(api_engine, fake_bq_client):
+    # Family 2, through the API: nothing billed executes unbudgeted.
+    from exmergo_dex_core.guards.cost_guard import CeilingRequiredError
+
+    with api_engine(confirmed=True) as engine, pytest.raises(CeilingRequiredError):
+        engine.profile("customers")
+
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+@pytest.fixture
+def fk_bq_client():
+    """A fake warehouse where inference finds a candidate join to probe: orders
+    carries a customer_id foreign key into customers, whose id the resolver
+    reports as unique. The shared fixture has no such join, and without one the
+    verify phase has nothing to price and never checkpoints."""
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    def table(table_id, fields):
+        return FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id=table_id,
+            schema=[bigquery.SchemaField(*f) for f in fields],
+            num_rows=100,
+            num_bytes=5_000,
+        )
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            table("customers", [("id", "INTEGER"), ("email", "STRING")]),
+            table(
+                "orders",
+                [("id", "INTEGER"), ("customer_id", "INTEGER"), ("total", "NUMERIC")],
+            ),
+        ],
+    )
+    # A near-unique column that escalates without fully proving uniqueness
+    # (d_0 of 99, not 100) leaves the composite-key probe un-short-circuited, so
+    # both escalations the estimate reserved for actually run and get charged.
+    # That is what leaves no headroom for the verify probe below.
+    values = {"n_total": 100, "nonnull_fk": 100, "orphans": 0}
+    for i in range(10):
+        values |= {
+            f"nn_{i}": 100,
+            f"nd_{i}": 100 if i == 0 else 40,
+            f"mn_{i}": 1,
+            f"mx_{i}": 100,
+            f"d_{i}": 99 if i == 0 else 40,
+        }
+    client.row_resolver = lambda sql: [values]
+    return client
+
+
+def test_api_verify_checkpoint_keeps_what_it_already_paid_for(
+    fk_bq_client, tmp_path, monkeypatch
+):
+    """Family 2 + 4: the mid-command checkpoint must not discard paid-for work.
+
+    ``relationships(verify=True)`` profiles everything, then prices the overlap
+    probes once inference knows what to probe. When that second phase does not
+    fit the confirmed budget it comes back as a request on the result, not as an
+    exception, because the profiles above it have already been billed and
+    throwing them away would charge the user twice for one scan.
+    """
+
+    import exmergo_dex_core.connect as connect_mod
+
+    engine = _billed_engine(
+        fk_bq_client, tmp_path, confirmed=True, budget=float(60 * 1024 * 1024)
+    )
+    monkeypatch.setattr(connect_mod, "open_adapter", engine._open_for_test)
+    with engine:
+        result = engine.relationships(verify=True)
+
+    # The ask is present and priced...
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.data["phase"] == "verify"
+    # ...no probe ran...
+    assert not any(
+        not c.dry_run and "nonnull_fk" in c.sql for c in fk_bq_client.query_calls
+    )
+    # ...and the work already paid for is on the result and in the store, not lost.
+    assert result.relationships and not result.relationships[0].verified
+    cached = FilesystemStore(tmp_path).load_cache()
+    assert cached is not None and cached.datasets
+    assert any("saved unverified" in note for note in result.notes)
+
+
+def test_api_pii_stays_flagged_and_never_surfaced(duckdb_file: Path):
+    # Family 3, through the API: the firewall's verdict does not depend on which
+    # door the query came in through.
+    from exmergo_dex_core import QueryRefusedError
+
+    with Engine(connector="duckdb", path=str(duckdb_file)) as engine:
+        engine.map()
+        with pytest.raises(QueryRefusedError):
+            engine.query("select email from customers")
