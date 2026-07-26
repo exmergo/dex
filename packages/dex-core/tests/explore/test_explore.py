@@ -663,9 +663,7 @@ def _orphan_repo(tmp_path: Path) -> tuple[Path, Path]:
         'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
         encoding="utf-8",
     )
-    (repo / "models" / "stg_orders.sql").write_text(
-        "select * from x", encoding="utf-8"
-    )
+    (repo / "models" / "stg_orders.sql").write_text("select * from x", encoding="utf-8")
     return db, repo
 
 
