@@ -28,7 +28,9 @@ from typing import Any, Protocol
 
 # The confidence at or above which a name-detected PII category refuses a query,
 # shared with the query firewall so the two surfaces block at the same threshold.
-from ...guards.query_firewall import PII_BLOCK_CONFIDENCE
+# Imported from the guards package, not from the firewall: this package must stay
+# importable without a dialect engine, because the hosted backend parses no SQL.
+from ...guards import PII_BLOCK_CONFIDENCE
 from ..profile import detect_pii
 
 

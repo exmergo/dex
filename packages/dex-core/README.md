@@ -27,8 +27,19 @@ exmergo-dex-core[bigquery]
 exmergo-dex-core[databricks]
 exmergo-dex-core[redshift]
 exmergo-dex-core[postgres]
-exmergo-dex-core[all]          # every connector at once
+exmergo-dex-core[all]          # every optional capability at once
 ```
+
+Two capabilities sit behind their own extras rather than a connector's:
+`[semantic]` and `[semantic-api]` for the local and hosted semantic-layer query
+backends, and `[cluster]` for `explore cluster`. `[all]` covers all of these too.
+
+`[semantic-api]` is the one extra that stands completely alone: dbt Cloud owns the
+warehouse connection and executes server-side, so a deployment that only queries a
+hosted semantic layer needs no connector, no dbt-core, and no SQL parser. Every
+other command validates SQL before running it, which is why the connector extras
+carry the dialect engine; run one without a connector installed and dex refuses
+with the install to use rather than guessing.
 
 ## Two surfaces, one engine
 

@@ -142,6 +142,29 @@ def test_query_firewall_refuses_writes_pragmas_and_multistatement():
             inspect_query(bad, cache, QueryLimits())
 
 
+def test_an_install_that_cannot_validate_sql_refuses_rather_than_degrading():
+    # The dialect engine ships with the connector extras, not the base install, so
+    # an install that cannot parse SQL is reachable. The only safe answer is to
+    # refuse: a query dex cannot parse is a query it cannot promise is read-only,
+    # so there must be no weaker fallback path (a regex screen, a warn-and-run)
+    # that would let an unvalidated statement reach a warehouse. This pins the
+    # refusal itself; `tests/guards/test_dialect.py` covers the mechanics.
+    import sys
+
+    from exmergo_dex_core.guards import dialect
+
+    original = sys.modules.get("sqlglot")
+    sys.modules["sqlglot"] = None  # type: ignore[assignment]
+    try:
+        with pytest.raises(dialect.DialectDependencyError):
+            dialect.ensure_available()
+    finally:
+        if original is None:
+            del sys.modules["sqlglot"]
+        else:
+            sys.modules["sqlglot"] = original
+
+
 def test_prod_target_execution_is_refused():
     from exmergo_dex_core import transform
 
@@ -284,11 +307,25 @@ def test_firewall_block_threshold_is_a_hard_coded_engine_constant():
     # never be able to widen the PII boundary. Its value is load-bearing (every
     # base confidence in the detector sits at or above it, so nothing unblocks
     # without value-shape evidence), so the number itself is pinned here.
+    #
+    # It is asserted at the guards package, which is where the policy lives, and
+    # the firewall reads it from there. That indirection is what keeps the PII
+    # gate on a SQL-free surface (the hosted semantic layer screens dimension
+    # names) from dragging in a SQL parser: every gate still blocks at one number,
+    # but only the surfaces that actually parse SQL depend on the parser.
     from exmergo_dex_core.config import DexConfig
-    from exmergo_dex_core.guards.query_firewall import PII_BLOCK_CONFIDENCE
+    from exmergo_dex_core.guards import PII_BLOCK_CONFIDENCE
 
     assert PII_BLOCK_CONFIDENCE == 0.5
     assert not any("threshold" in name for name in DexConfig.model_fields)
+
+    # One threshold, not a copy per surface: the firewall and the semantic PII
+    # gate must read the same number, or they can drift apart silently.
+    from exmergo_dex_core.explore import semantic
+    from exmergo_dex_core.guards import query_firewall
+
+    assert query_firewall.PII_BLOCK_CONFIDENCE == PII_BLOCK_CONFIDENCE
+    assert semantic.PII_BLOCK_CONFIDENCE == PII_BLOCK_CONFIDENCE
 
 
 def test_firewall_threshold_boundary_and_warning_carry_no_values():

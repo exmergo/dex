@@ -70,8 +70,6 @@ from .results import (
     QueryResult,
     RankedObject,
     RelationshipsResult,
-    SemanticListResult,
-    SemanticQueryResult,
 )
 
 if TYPE_CHECKING:
@@ -726,87 +724,6 @@ def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return to_envelope(query(engine, args.sql))
     except QueryRefusedError as exc:
         return env.error(f"query refused: {exc}")
-
-
-def semantic_list(engine: DexEngine, *, api: bool = False, local: bool = False):
-    """The metrics, dimensions, and entities the semantic layer exposes."""
-
-    from .semantic import resolve_backend
-
-    backend = resolve_backend(engine, api=api, local=local)
-    catalog = backend.list_definitions()
-    return SemanticListResult(catalog=catalog, notes=list(catalog.notes))
-
-
-def semantic_query(
-    engine: DexEngine,
-    metrics: list[str],
-    *,
-    group_by: list[str] | None = None,
-    where: list[str] | None = None,
-    order_by: list[str] | None = None,
-    grain: str | None = None,
-    limit: int | None = None,
-    api: bool = False,
-    local: bool = False,
-) -> SemanticQueryResult:
-    """Run one governed metric query against the dbt semantic layer.
-
-    Which backend answers decides who governs spend: local renders the metric
-    SQL and executes it under dex's cost guard, while dbt Cloud executes
-    server-side where that guard is structurally unavailable.
-    """
-
-    from .semantic import SemanticBackendError, SemanticQuery, resolve_backend
-
-    if not metrics:
-        raise SemanticBackendError(
-            "a metric query needs at least one metric (discover them with "
-            "`explore semantic list`)"
-        )
-    backend = resolve_backend(engine, api=api, local=local)
-    return backend.query(
-        SemanticQuery(
-            metrics=metrics,
-            group_by=group_by or [],
-            where=where or [],
-            order_by=order_by or [],
-            grain=grain,
-            limit=limit,
-        )
-    )
-
-
-def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    """`explore semantic list|query`: discover and query the dbt semantic layer.
-
-    Backend resolution and the two guard postures live in the
-    ``explore.semantic`` package; this shim resolves the mode and turns any
-    backend refusal into a clean envelope rather than a stack trace.
-    """
-
-    from .semantic import SemanticBackendError
-
-    api = bool(getattr(args, "api", False))
-    local = bool(getattr(args, "local", False))
-    try:
-        if getattr(args, "mode", None) == "list":
-            return to_envelope(semantic_list(engine, api=api, local=local))
-        return to_envelope(
-            semantic_query(
-                engine,
-                getattr(args, "metric", None) or [],
-                group_by=getattr(args, "group_by", None),
-                where=getattr(args, "where", None),
-                order_by=getattr(args, "order_by", None),
-                grain=getattr(args, "grain", None),
-                limit=getattr(args, "limit", None),
-                api=api,
-                local=local,
-            )
-        )
-    except SemanticBackendError as exc:
-        return env.error(str(exc))
 
 
 def map(

@@ -793,8 +793,11 @@ all = [
     { name = "dbt-snowflake" },
     { name = "duckdb" },
     { name = "google-cloud-bigquery" },
+    { name = "httpx" },
+    { name = "metricflow" },
     { name = "psycopg", extra = ["binary"] },
     { name = "redshift-connector" },
+    { name = "scikit-learn" },
     { name = "snowflake-connector-python" },
     { name = "sqlglot" },
 ]
@@ -816,6 +819,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "scikit-learn" },
+    { name = "sqlglot" },
 ]
 duckdb = [
     { name = "dbt-duckdb" },
@@ -845,6 +849,9 @@ snowflake = [
     { name = "snowflake-connector-python" },
     { name = "sqlglot" },
 ]
+sql = [
+    { name = "sqlglot" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -870,7 +877,9 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1" },
     { name = "google-cloud-bigquery", marker = "extra == 'all'", specifier = ">=3" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3" },
+    { name = "httpx", marker = "extra == 'all'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'semantic-api'", specifier = ">=0.27" },
+    { name = "metricflow", marker = "extra == 'all'", specifier = ">=0.211,<0.212" },
     { name = "metricflow", marker = "extra == 'semantic'", specifier = ">=0.211,<0.212" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3" },
@@ -880,20 +889,23 @@ requires-dist = [
     { name = "redshift-connector", marker = "extra == 'all'", specifier = ">=2.1" },
     { name = "redshift-connector", marker = "extra == 'redshift'", specifier = ">=2.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.19" },
+    { name = "scikit-learn", marker = "extra == 'all'", specifier = ">=1.4" },
     { name = "scikit-learn", marker = "extra == 'cluster'", specifier = ">=1.4" },
     { name = "scikit-learn", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "snowflake-connector-python", marker = "extra == 'all'", specifier = ">=3.17" },
     { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3.17" },
-    { name = "sqlglot", marker = "extra == 'all'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'bigquery'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'databricks'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'duckdb'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'postgres'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'redshift'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'semantic'", specifier = ">=25" },
-    { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=25" },
+    { name = "sqlglot", marker = "extra == 'all'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'bigquery'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'databricks'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'dev'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'duckdb'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'postgres'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'redshift'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'semantic'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=28.6,<31" },
 ]
-provides-extras = ["all", "bigquery", "cluster", "databricks", "dev", "duckdb", "postgres", "redshift", "semantic", "semantic-api", "snowflake"]
+provides-extras = ["all", "bigquery", "cluster", "databricks", "dev", "duckdb", "postgres", "redshift", "semantic", "semantic-api", "snowflake", "sql"]
 
 [[package]]
 name = "fastjsonschema"

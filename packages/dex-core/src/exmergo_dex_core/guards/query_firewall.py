@@ -47,6 +47,7 @@ from sqlglot import expressions as exp
 
 from ..cache import CACHE_SCHEMA_VERSION, Dataset, DexCache, match_identifier
 from ..config import QueryLimits
+from . import PII_BLOCK_CONFIDENCE
 from .sql_guard import NotSelectOnlyError, assert_select_only
 
 
@@ -54,14 +55,6 @@ class QueryRefusedError(Exception):
     """Raised when a query violates the firewall policy. The message always
     names the offending construct and the fix, so a refusal costs the agent one
     rewrite, not a debugging session."""
-
-
-# A flag at or above this confidence blocks projection; below it, the query runs
-# and the envelope carries a warning naming the column, category, and number.
-# Hard-coded engine policy, uniform across categories: a configurable threshold
-# would let a one-line config edit quietly widen the PII boundary. At today's
-# base confidences everything blocks; only evidence-de-rated flags fall below.
-PII_BLOCK_CONFIDENCE = 0.5
 
 
 @dataclass(frozen=True)

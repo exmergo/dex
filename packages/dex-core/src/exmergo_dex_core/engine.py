@@ -387,12 +387,18 @@ class DexEngine:
 
         return explore.cluster(self, obj, features=features, k=k)
 
+    # The two semantic methods import from `explore.semantic.commands`, not from
+    # `explore.commands`: on the hosted backend dbt Cloud renders and executes the
+    # SQL, so this is the one guarded surface that needs no dialect engine and no
+    # warehouse client. Together with a `SemanticSource`, that is what lets a host
+    # serve metric queries with nothing on the filesystem and only [semantic-api]
+    # installed. Reaching through the heavier module would quietly require both.
     def semantic_list(
         self, *, api: bool = False, local: bool = False
     ) -> SemanticListResult:
-        from .explore import commands as explore
+        from .explore.semantic import commands as semantic_cmds
 
-        return explore.semantic_list(self, api=api, local=local)
+        return semantic_cmds.semantic_list(self, api=api, local=local)
 
     def semantic_query(
         self,
@@ -405,9 +411,9 @@ class DexEngine:
         api: bool = False,
         local: bool = False,
     ) -> SemanticQueryResult:
-        from .explore import commands as explore
+        from .explore.semantic import commands as semantic_cmds
 
-        return explore.semantic_query(
+        return semantic_cmds.semantic_query(
             self,
             list(metrics),
             group_by=group_by,

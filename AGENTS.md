@@ -33,7 +33,7 @@ uv run scripts/run.py <subcommand> [flags]
 
 Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
-`[postgres]`, `[redshift]`, or `[all]` for every connector at once. The shipped wrapper pins
+`[postgres]`, `[redshift]`, or `[all]` for every optional capability at once. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
 connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
 found by walking up from the run directory to the git root, then DuckDB), so a
