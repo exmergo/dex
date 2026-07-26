@@ -22,62 +22,83 @@ keywords = [
   "agent",
 ]
 
-# Base dependencies are connector-agnostic: the canonical model (pydantic),
-# config parsing (pyyaml), and the dialect engine (sqlglot). Connector client
-# libraries live behind the extras below, so the zero-credential DuckDB on-ramp
-# never pulls the cloud client stack.
-#
-# sqlglot is base, not per-connector, because the guards are cross-cutting: the
-# query firewall and the SELECT-only assertion parse SQL on every guarded surface,
-# and they are imported eagerly by design (a safety check that loads lazily is one
-# that can be missing when it matters). It used to be duplicated across every
-# connector extra, which made a sqlglot-free install (`[semantic-api]`, `[cluster]`,
-# or a bare install running the read-only `explore semantic list --local`) fail on
-# an import the metadata never declared.
-#
-# The floor is 28.6 because the firewall's unnest allowlist references sqlglot
-# expression classes at module scope, and `exp.JSONKeys` (Snowflake/Databricks/
-# DuckDB key enumeration) first exists there. Bump this floor whenever a newly
-# referenced expression class raises the real minimum, or the failure lands on the
-# user as an AttributeError at import.
+# Base dependencies are the canonical model (pydantic) and config parsing (pyyaml):
+# what every surface needs regardless of what it talks to. Connector clients and
+# the dialect engine live behind the extras below, so the zero-credential DuckDB
+# on-ramp never pulls the cloud client stack, and a deployment that queries a
+# hosted semantic layer over HTTP pulls neither.
 dependencies = [
   "pydantic>=2",
   "pyyaml>=6",
-  "sqlglot>=28.6",
 ]
 
 [project.scripts]
 dex = "exmergo_dex_core.cli:main"
 
 [project.optional-dependencies]
+# The dialect engine behind the guards. Not a user-facing choice: every extra that
+# reaches a warehouse self-references it, so installing a connector always brings
+# it. It exists as its own extra so the floor and the ceiling are declared in one
+# place; duplicating the pin across the connector extras is what once let the
+# declared floor (>=25) drift years behind what the code needed (>=28.6), and the
+# resulting AttributeError landed on users at import.
+#
+# The floor is 28.6 because the query firewall's unnest allowlist references
+# sqlglot expression classes at module scope, and `exp.JSONKeys` (Snowflake,
+# Databricks, and DuckDB key enumeration) first exists there. Raise it whenever a
+# newly referenced class raises the real minimum.
+#
+# There is a ceiling for the same reason there is a floor: those references are
+# version-sensitive, and sqlglot majors have already broken this code twice (the
+# `Union` to `SetOperation` rename, which `_QUERY_ROOTS` still accommodates, and
+# the `from` to `from_` arg-key rename, which `_resolve_sources` still handles).
+# Without a ceiling a future major renames a class and every new install breaks on
+# something we could not have known about. The `sqlglot-canary` CI job runs the
+# guards against the newest release on every push, so raising this ceiling is a
+# deliberate act taken on evidence rather than a surprise.
+#
+# Absent it, the guarded commands refuse with an actionable message naming the
+# connector extra to install (see `guards/dialect.py`); they never silently fall
+# back to a weaker check.
+sql = ["sqlglot>=28.6,<31"]
 # The DuckDB on-ramp and the full local ETM loop: the duckdb client and
 # dbt-duckdb (which pulls dbt-core). All three skills install this one
 # extra, and transform/maintain author and build a dbt project against a DuckDB
 # dev target, so dbt-duckdb belongs here. (This makes the on-ramp heavier than a
 # pure explore-only install would need; a separate lighter explore extra can be
 # split out later if that tradeoff matters.)
-duckdb = ["duckdb>=1", "dbt-duckdb>=1.9"]
+duckdb = ["duckdb>=1", "dbt-duckdb>=1.9", "exmergo-dex-core[sql]"]
 # 3.17 is the floor for workload-identity auth (the keyless CI path). Like
 # [duckdb], the extra carries the dbt adapter so transform can build against a
 # Snowflake dev target with one install.
-snowflake = ["snowflake-connector-python>=3.17", "dbt-snowflake>=1.9"]
+snowflake = ["snowflake-connector-python>=3.17", "dbt-snowflake>=1.9", "exmergo-dex-core[sql]"]
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a BigQuery dev target with one install.
-bigquery = ["google-cloud-bigquery>=3", "dbt-bigquery>=1.9"]
+bigquery = ["google-cloud-bigquery>=3", "dbt-bigquery>=1.9", "exmergo-dex-core[sql]"]
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a Databricks dev target with one install. The SDK
 # rides alongside the SQL driver: free Unity Catalog metadata and warehouse facts
 # come from the REST API, so nothing billable is touched until a statement runs.
-databricks = ["databricks-sql-connector>=3", "databricks-sdk>=0.30", "dbt-databricks>=1.9"]
+databricks = [
+  "databricks-sql-connector>=3",
+  "databricks-sdk>=0.30",
+  "dbt-databricks>=1.9",
+  "exmergo-dex-core[sql]",
+]
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a Postgres dev schema with one install.
-postgres = ["psycopg[binary]>=3", "dbt-postgres>=1.9"]
+postgres = ["psycopg[binary]>=3", "dbt-postgres>=1.9", "exmergo-dex-core[sql]"]
 # Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
 # transform can build against a Redshift dev schema with one install. boto3
 # rides alongside the driver: Serverless workgroup facts (endpoint, base
 # capacity) come from the control plane, and the driver mints IAM temporary
 # database credentials through the same chain.
-redshift = ["redshift-connector>=2.1", "boto3>=1.34", "dbt-redshift>=1.9"]
+redshift = [
+  "redshift-connector>=2.1",
+  "boto3>=1.34",
+  "dbt-redshift>=1.9",
+  "exmergo-dex-core[sql]",
+]
 # The local semantic-layer query backend (`explore semantic query --local`):
 # MetricFlow renders metric SQL via explain(), and dex executes it through its own
 # connector and cost guard. Just the metricflow library (not dbt-metricflow, whose
@@ -85,7 +106,7 @@ redshift = ["redshift-connector>=2.1", "boto3>=1.34", "dbt-redshift>=1.9"]
 # is the floor that resolves against a released dbt-semantic-interfaces (0.209 pins
 # a prerelease). `explore semantic list --local` is a pure manifest read-view and
 # needs none of this.
-semantic = ["metricflow>=0.211,<0.212"]
+semantic = ["metricflow>=0.211,<0.212", "exmergo-dex-core[sql]"]
 # The hosted dbt Cloud Semantic Layer backend (`explore semantic --api`): a thin
 # GraphQL client over httpx, nothing else. No warehouse client and no dbt-core:
 # dbt Cloud owns the warehouse connection and executes server-side, so a
@@ -107,9 +128,13 @@ cluster = ["scikit-learn>=1.4"]
 # capability. This is the heaviest install there is (six dbt adapters, MetricFlow,
 # and scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
 all = [
-  "exmergo-dex-core[bigquery,cluster,databricks,duckdb,postgres,redshift,semantic,semantic-api,snowflake]",
+  "exmergo-dex-core[bigquery,cluster,databricks,duckdb,postgres,redshift,semantic,semantic-api,snowflake,sql]",
 ]
-dev = ["pytest>=8", "ruff==0.15.19", "scikit-learn>=1.4"]
+# Contributor tooling, plus the optional libraries the suite exercises directly
+# (the clustering tests need scikit-learn, the firewall tests need the dialect
+# engine), so `uv sync --extra dev` runs the whole suite without also picking a
+# connector.
+dev = ["pytest>=8", "ruff==0.15.19", "scikit-learn>=1.4", "exmergo-dex-core[sql]"]
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"

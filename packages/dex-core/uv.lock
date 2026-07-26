@@ -778,7 +778,6 @@ source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
-    { name = "sqlglot" },
 ]
 
 [package.optional-dependencies]
@@ -800,10 +799,12 @@ all = [
     { name = "redshift-connector" },
     { name = "scikit-learn" },
     { name = "snowflake-connector-python" },
+    { name = "sqlglot" },
 ]
 bigquery = [
     { name = "dbt-bigquery" },
     { name = "google-cloud-bigquery" },
+    { name = "sqlglot" },
 ]
 cluster = [
     { name = "scikit-learn" },
@@ -812,27 +813,33 @@ databricks = [
     { name = "databricks-sdk" },
     { name = "databricks-sql-connector" },
     { name = "dbt-databricks" },
+    { name = "sqlglot" },
 ]
 dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "scikit-learn" },
+    { name = "sqlglot" },
 ]
 duckdb = [
     { name = "dbt-duckdb" },
     { name = "duckdb" },
+    { name = "sqlglot" },
 ]
 postgres = [
     { name = "dbt-postgres" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "sqlglot" },
 ]
 redshift = [
     { name = "boto3" },
     { name = "dbt-redshift" },
     { name = "redshift-connector" },
+    { name = "sqlglot" },
 ]
 semantic = [
     { name = "metricflow" },
+    { name = "sqlglot" },
 ]
 semantic-api = [
     { name = "httpx" },
@@ -840,6 +847,10 @@ semantic-api = [
 snowflake = [
     { name = "dbt-snowflake" },
     { name = "snowflake-connector-python" },
+    { name = "sqlglot" },
+]
+sql = [
+    { name = "sqlglot" },
 ]
 
 [package.metadata]
@@ -883,9 +894,18 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "snowflake-connector-python", marker = "extra == 'all'", specifier = ">=3.17" },
     { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3.17" },
-    { name = "sqlglot", specifier = ">=28.6" },
+    { name = "sqlglot", marker = "extra == 'all'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'bigquery'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'databricks'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'dev'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'duckdb'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'postgres'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'redshift'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'semantic'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=28.6,<31" },
 ]
-provides-extras = ["all", "bigquery", "cluster", "databricks", "dev", "duckdb", "postgres", "redshift", "semantic", "semantic-api", "snowflake"]
+provides-extras = ["all", "bigquery", "cluster", "databricks", "dev", "duckdb", "postgres", "redshift", "semantic", "semantic-api", "snowflake", "sql"]
 
 [[package]]
 name = "fastjsonschema"
