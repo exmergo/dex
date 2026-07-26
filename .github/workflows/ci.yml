@@ -56,9 +56,19 @@ jobs:
   # The query firewall matches sqlglot expression classes by name at module scope,
   # so a sqlglot major that renames one breaks every install that resolves it. The
   # declared dependency is therefore capped, and this job is how the cap stays
-  # honest: it installs the newest sqlglot over the cap and runs the guards against
-  # it, so a breaking release surfaces here on the next push instead of on a user's
-  # machine after we raise the ceiling blind.
+  # honest: it installs the newest sqlglot over the cap and re-runs the suite
+  # against it, so a breaking release surfaces here on the next push instead of on
+  # a user's machine after we raise the ceiling blind.
+  #
+  # Deliberately a mirror of the `tests` job rather than a narrower selection: the
+  # firewall is not the only dialect-dependent code (relationship probes and drift
+  # checks transpile per connector), and this job is only informative if a red run
+  # means "the new sqlglot broke something" rather than "the canary environment was
+  # missing something". Two safety-spine tests import boto3 and httpx unguarded and
+  # get them transitively from the [redshift] and [databricks] extras, so a narrower
+  # sync fails for reasons that have nothing to do with sqlglot. Packaging tests are
+  # excluded because they resolve sqlglot inside isolated installs from the declared
+  # cap, so they would report on the capped version and not the one under test.
   #
   # Advisory by design (continue-on-error): it reports on code we do not control,
   # so a red canary is a signal to investigate upstream, never a reason to block a
@@ -74,8 +84,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Sync (duckdb + dev extras)
-        run: uv sync --extra duckdb --extra dev
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra dev
       # A direct install into the synced environment, which is what lets it ignore
       # the ceiling the project declares. `uv sync` would resolve back to the cap.
       - name: Install the newest sqlglot over the declared ceiling
@@ -84,10 +94,10 @@ jobs:
       # report a green canary that tested nothing, which would be worse than having
       # no canary at all. The version is echoed in the same step for that reason:
       # the log has to show which sqlglot actually ran.
-      - name: Guards and the safety spine against the newest sqlglot
+      - name: Suite against the newest sqlglot
         run: |
           uv run --no-sync python -c "import sqlglot; print('testing sqlglot', sqlglot.__version__)"
-          uv run --no-sync pytest -q tests/guards tests/test_safety_spine.py
+          uv run --no-sync pytest -q -m "not packaging"
 
   # The Tier-2 eval harness scoring core (triggering, output-quality, uplift math),
   # exercised with fake backends: deterministic, free, no model in the loop. The
