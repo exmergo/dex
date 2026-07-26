@@ -216,7 +216,10 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
         for path in sorted(base.rglob("*")):
             if path.suffix not in {".sql", ".yml", ".yaml"} or not path.is_file():
                 continue
-            rel = str(path.relative_to(root))
+            # Posix-separated regardless of OS: every consumer of `files` keys
+            # (transform_layer's model-name parsing, scaffolded model paths,
+            # this module's own backed_relation_names) assumes "/".
+            rel = path.relative_to(root).as_posix()
             content = path.read_text(encoding="utf-8")
             files[rel] = SourceFile(
                 path=rel, content=content, sha256=content_hash(content)
@@ -579,6 +582,32 @@ def yaml_documents(view: DbtProjectView) -> list[tuple[dict[str, Any], str]]:
     return documents
 
 
+def backed_relation_names(view: DbtProjectView) -> set[str]:
+    """Bare table names (lowered) this project currently builds or sources,
+    from files and YAML only -- no compiled manifest required, unlike
+    ``model_relations`` (empty without one, see ``_declared_from_yaml``).
+
+    Explore uses this (not ``maintain``'s ``transform_layer``/``drift.py``
+    logic, which computes the same thing) to keep from importing ``maintain``,
+    which already imports ``explore.relationships`` -- the reverse edge would
+    risk a cycle.
+    """
+
+    names = {
+        path.rsplit("/", 1)[-1][: -len(".sql")].lower()
+        for path in view.files
+        if path.endswith(".sql")
+    }
+    for parsed, _path in yaml_documents(view):
+        for src in parsed.get("sources") or []:
+            if not isinstance(src, dict):
+                continue
+            for table in src.get("tables") or []:
+                if isinstance(table, dict) and table.get("name"):
+                    names.add(str(table["name"]).lower())
+    return names
+
+
 def semantic_yaml_entries(
     view: DbtProjectView,
 ) -> list[tuple[str, dict[str, Any], str]]:
@@ -697,8 +726,12 @@ class ProjectDefinitions(BaseModel):
     exact, ``"yaml"`` resolves by name). ``model_relations`` maps referable
     names (model names and ``source.table``) to quote-stripped physical
     relations. ``primary_entities`` maps model names to their declared grain
-    column; ``metric_models`` lists models reachable from any metric. ``notes``
-    are analyst-readable caveats for the caller's envelope.
+    column; ``metric_models`` lists models reachable from any metric.
+    ``built_relation_names`` is bare table names (lowered) the project builds
+    or sources, from files/YAML alone (populated even with no compiled
+    manifest, unlike ``model_relations``) -- explore's orphan-relation
+    down-ranking reads this. ``notes`` are analyst-readable caveats for the
+    caller's envelope.
     """
 
     present: bool = False
@@ -712,6 +745,7 @@ class ProjectDefinitions(BaseModel):
     model_relations: dict[str, str] = Field(default_factory=dict)
     primary_entities: dict[str, str] = Field(default_factory=dict)
     metric_models: list[str] = Field(default_factory=list)
+    built_relation_names: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -757,6 +791,7 @@ def definitions(
         )
 
     defs = ProjectDefinitions(present=True, project_dir=str(project))
+    defs.built_relation_names = sorted(backed_relation_names(view))
 
     nodes = (view.manifest or {}).get("nodes")
     if isinstance(nodes, dict) and nodes:
