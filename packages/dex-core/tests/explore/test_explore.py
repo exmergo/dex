@@ -684,7 +684,9 @@ def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
         capsys,
     )
     cache = FilesystemStore(repo).load_cache()
-    orphan = next(d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders"))
+    orphan = next(
+        d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders")
+    )
     backed = next(d for d in cache.datasets if d.identifier.endswith(".stg_orders"))
     assert any("orphaned residue" in n for n in orphan.data_quality)
     assert orphan.rank_score < backed.rank_score
