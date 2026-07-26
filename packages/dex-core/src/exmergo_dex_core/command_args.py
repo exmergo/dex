@@ -1,11 +1,12 @@
 """Argument-to-engine bridges and plumbing shared by the command orchestrators.
 
-These adapt an ``argparse.Namespace`` into the inputs the engine speaks (an open
-adapter, a repo root, a project directory) and carry the cost-before-spend
-handshake every billed command goes through. They live at the command layer,
-deliberately not in the engine core, so the engines never depend on argparse,
-and every ``cmd_*`` module (explore, transform, maintain) shares one handshake
-instead of re-deriving it.
+Two jobs. The first is resolving where a CLI run is rooted, which is a question
+only the CLI asks. The second is the cost-before-spend handshake every billed
+command goes through, shared here so explore, transform, and maintain cannot
+drift apart on the one thing that governs spend.
+
+Nothing here opens a connection. That is :meth:`DexEngine._adapter`, and it is the
+only opener, so credential discovery and the cost gate have exactly one seam.
 """
 
 from __future__ import annotations
@@ -14,12 +15,12 @@ import argparse
 import math
 from pathlib import Path
 
-from . import envelope as env
 from .adapters.base import Adapter
 from .config import CONFIG_FILE
-from .connect import open_adapter
+from .envelope import Cost
 from .guards.cost_guard import ConfirmationRequiredError, CostGate
-from .storage import DEX_DIR, Store
+from .results import ConfirmationRequest, Result
+from .storage import DEX_DIR
 
 
 def _resolve_dex_root(start: Path) -> Path | None:
@@ -62,31 +63,12 @@ def repo_root(args: argparse.Namespace) -> str:
     return str(resolved) if resolved is not None else raw
 
 
-def open_from_args(args: argparse.Namespace, store: Store) -> Adapter:
-    """Open the adapter this command runs against.
-
-    ``store`` backs the cost gate: the session budget is settled against the spend
-    ledger, and every billed statement is recorded back into it. ``repo_root``
-    stays separate because it locates filesystem-only things (the config file, a
-    DuckDB path, the credential files a connector discovers), which no backend
-    choice moves.
-    """
+def command_name(args: argparse.Namespace) -> str:
+    """The subcommand as the contract spells it, for ledger entries and payloads."""
 
     group = getattr(args, "group", None)
     subcommand = getattr(args, "subcommand", None)
-    command = " ".join(part for part in (group, subcommand) if part) or None
-    return open_adapter(
-        connector=getattr(args, "connector", None),
-        path=getattr(args, "path", None),
-        project=getattr(args, "project", None),
-        datasets=getattr(args, "dataset", None),
-        scopes=getattr(args, "scope", None),
-        repo_root=repo_root(args),
-        store=store,
-        budget=getattr(args, "budget", None),
-        confirmed=getattr(args, "confirm", False),
-        command=command,
-    )
+    return " ".join(part for part in (group, subcommand) if part)
 
 
 def cost_gate(adapter: Adapter) -> CostGate | None:
@@ -96,6 +78,19 @@ def cost_gate(adapter: Adapter) -> CostGate | None:
     return getattr(adapter, "cost_gate", None)
 
 
+def preflight_cost(adapter: Adapter) -> Cost:
+    """The cost to report for a command that never priced anything.
+
+    The free metadata commands (``inventory``, ``connect test``, the free drift
+    axes) still report a cost, because its paradigm tells a caller what the
+    *next* command will bill in. On a free connector there is no gate and the
+    answer is the free/local default.
+    """
+
+    gate = cost_gate(adapter)
+    return gate.cost() if gate is not None else Cost()
+
+
 def billed_handshake(
     command: str,
     adapter: Adapter,
@@ -103,19 +98,24 @@ def billed_handshake(
     *,
     per_table: dict[str, float] | None = None,
     notes: list[str] | None = None,
-) -> env.Envelope | None:
+) -> None:
     """The cost-before-spend handshake on billed connectors.
 
     The estimate comes from free dry-runs, so the unconfirmed pass spends
-    nothing: it either passes the gate (confirmed, within budget) or returns
-    the ``needs_confirmation`` envelope for the agent to surface and re-issue
-    with ``--confirm --budget``. Over-ceiling and no-ceiling refusals propagate
-    as errors (confirmation cannot override them).
+    nothing: it either passes the gate (confirmed, within budget) or raises
+    :class:`~.results.ConfirmationRequired` carrying the payload the caller
+    surfaces before re-issuing confirmed. Raising rather than returning is what
+    lets the same handshake serve an API, where a transport object would be
+    meaningless. Over-ceiling and no-ceiling refusals propagate as their own
+    errors, because confirmation cannot override either.
+
+    Free connectors have no gate, so this is a no-op on them and their commands
+    stay confirmation-free.
     """
 
     gate = cost_gate(adapter)
     if gate is None:
-        return None
+        return
     try:
         gate.preflight_command(estimate)
     except ConfirmationRequiredError as exc:
@@ -141,7 +141,31 @@ def billed_handshake(
         if notes:
             data.setdefault("notes", [])
             data["notes"] = [*data["notes"], *notes]
-        return env.needs_confirmation(data, cost=exc.cost)
+        exc.request = ConfirmationRequest(cost=exc.cost, data=data)
+        raise
+
+
+def confirmation_request(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    **kwargs,
+) -> ConfirmationRequest | None:
+    """The confirm handshake as a returned request rather than a raise.
+
+    The third spelling of one handshake, beside :func:`billed_handshake` (which
+    raises) and :func:`verify_handshake` (which prices a mid-command phase).
+    Raise-versus-return is a property of the caller's situation, not of the
+    gate: a command whose free half has already produced real findings cannot
+    let this raise, because discarding them to ask about the billed half would
+    make the caller pay attention twice for one answer. That is ``maintain
+    check`` and ``maintain semantic``, whose free axes always complete.
+    """
+
+    try:
+        billed_handshake(command, adapter, estimate, **kwargs)
+    except ConfirmationRequiredError as exc:
+        return exc.request
     return None
 
 
@@ -152,15 +176,20 @@ def verify_handshake(
     *,
     candidate_count: int,
     object_count: int,
-) -> env.Envelope | None:
+) -> ConfirmationRequest | None:
     """The mid-command checkpoint for the verify phase on billed connectors.
 
     Verify probes can only be priced after profiling finds the candidate
     relationships, so this runs after inference on an already-confirmed
     command: the probes are dry-run priced (free), and only when that estimate
     does not fit what remains of the confirmed budget does it return the
-    ``needs_confirmation`` envelope — otherwise the confirmed budget already
-    covers verify and the command proceeds in one pass.
+    request, which the caller carries on its result as
+    ``pending_confirmation``. Otherwise the confirmed budget already covers
+    verify and the command proceeds in one pass.
+
+    A request rather than a raise, unlike :func:`billed_handshake`, because the
+    profiles and unverified relationships up to this point are already paid for.
+    Raising would discard them and bill the user twice for the same scan.
     """
 
     gate = cost_gate(adapter)
@@ -191,8 +220,8 @@ def verify_handshake(
                     f"{object_count} object(s); verifying them all is estimated "
                     f"at {estimate:.0f} {gate.paradigm.value} beyond what "
                     "remains of the confirmed budget. Profiles and unverified "
-                    "relationships are saved to .dex/cache.json; re-run the "
-                    "same command with --confirm --budget "
+                    "relationships are already saved to the exploration cache; "
+                    "re-run the same command with --confirm --budget "
                     f"{math.ceil(exc.cost.estimate)} to profile and verify in "
                     "one pass (a re-run re-profiles first)"
                 ),
@@ -209,38 +238,27 @@ def verify_handshake(
                 "alone will not unlock this, raise the session budget in "
                 ".dex/config.yml instead",
             ]
-        return env.needs_confirmation(data, cost=exc.cost)
+        return ConfirmationRequest(cost=exc.cost, data=data)
     return None
 
 
-def stamp_spend(envelope: env.Envelope, adapter: Adapter) -> env.Envelope:
-    """Stamp the preflight cost and the actual spend onto an OK envelope. The
-    ``cost`` field stays a preflight estimate by contract; actual billed bytes
-    live in ``data.spend``. An envelope already carrying a cost (a phase
-    checkpoint) keeps it; only the spend summary is refreshed."""
+def stamp_spend(result: Result, adapter: Adapter) -> Result:
+    """Stamp the preflight cost and the actual spend onto a result.
+
+    ``cost`` stays a preflight estimate by contract; actual billed bytes or
+    seconds land in ``spend``, which the shim surfaces under ``data.spend``. A
+    result already carrying a cost (a phase checkpoint priced its own ask) keeps
+    it; only the spend summary is refreshed. Free connectors have no gate and so
+    report no spend at all, rather than a row of zeroes.
+    """
 
     gate = cost_gate(adapter)
     if gate is not None:
-        if envelope.cost.estimate is None:
-            envelope.cost = gate.cost()
+        if result.cost.estimate is None:
+            result.cost = gate.cost()
         spend = gate.spend_summary()
         display = getattr(adapter, "spend_display", None)
         if display is not None:
             spend.update(display())
-        envelope.data["spend"] = spend
-    return envelope
-
-
-def project_dir(args: argparse.Namespace) -> Path:
-    """The dbt project directory: the config pin wins, discovery is the default."""
-
-    from .config import load_config
-    from .dbt_project import find_project
-
-    root = repo_root(args)
-    config = load_config(root)
-    # Absolute so downstream dbt subprocess calls (which pin cwd to this dir)
-    # never re-resolve a relative --project-dir against it and double the path.
-    if config and config.dbt_project_dir:
-        return (Path(root) / config.dbt_project_dir).resolve()
-    return find_project(root).resolve()
+        result.spend = spend
+    return result

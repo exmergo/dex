@@ -1,9 +1,12 @@
-"""Maintain command orchestrators.
+"""Maintain orchestration, in two layers.
 
-Each ``cmd_*`` receives the injected store, loads the baseline and the project,
-drives the drift engine, and shapes the result into the sanitized envelope. Only
-this layer opens adapters or reaches the store; the detectors in ``drift.py`` stay
-pure comparisons so they are testable without a warehouse. Detection commands save
+The lower layer is the run functions: they take an :class:`~..engine.DexEngine`,
+load the baseline and the project, drive the drift engine, and return a record
+from :mod:`.results`. The upper layer is the ``cmd_*`` shims: argparse in,
+envelope out.
+
+Only this layer reaches the store; the detectors in ``drift.py`` stay pure
+comparisons so they are testable without a warehouse. Detection commands save
 their findings as a drift report so the stateless ``reconcile`` has one to read.
 """
 
@@ -11,15 +14,21 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from .. import command_args
 from .. import envelope as env
-from ..config import DexConfig, load_config, pii_override_paths
+from ..config import pii_override_paths
 from ..dbt_project import DbtProjectError
 from ..dbt_project import load as load_project
+from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, Store
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
+from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
+
+if TYPE_CHECKING:
+    from ..engine import DexEngine
 
 _SNAPSHOT_HINT = (
     "commit .dex/snapshot.json like a lockfile, and re-run `maintain snapshot` "
@@ -28,22 +37,39 @@ _SNAPSHOT_HINT = (
 )
 
 _NO_SNAPSHOT_ERROR = (
-    "no .dex/snapshot.json baseline; run `maintain snapshot` first (ideally "
-    "right after a known-good build)"
+    "no drift baseline yet; run `maintain snapshot` first (ideally right after "
+    "a known-good build)"
 )
 
 
-def cmd_snapshot(args: argparse.Namespace, store: Store) -> env.Envelope:
-    repo_root = command_args.repo_root(args)
-    config = load_config(repo_root) or DexConfig()
+class NoBaselineError(Exception):
+    """A detector was asked to measure drift with nothing to measure against.
+
+    Named for the state rather than for a missing file: on the filesystem
+    backend the baseline is `.dex/snapshot.json`, elsewhere it is a row, and the
+    fix is the same either way.
+    """
+
+
+def snapshot(engine: DexEngine) -> SnapshotResult:
+    """Capture the known-good baseline every drift axis is measured against.
+
+    Prefers the exploration cache, which carries the grain and cardinality
+    signals metadata alone cannot see; falls back to a metadata-only capture
+    (free on every connector, so no handshake) and says so, because a
+    metadata-only baseline silently disarms two of the four axes.
+    """
+
+    store = engine.store
+    config = engine.config
     warnings: list[str] = []
 
     cache = store.load_cache()
-    requested = getattr(args, "connector", None) or config.connector
+    requested = engine.connector or config.connector
     usable = cache is not None and bool(cache.datasets)
     if usable and cache.provenance.connector not in (None, requested):
         warnings.append(
-            f"the .dex cache was mapped on '{cache.provenance.connector}' but "
+            f"the exploration cache was mapped on '{cache.provenance.connector}' but "
             f"the active connector is '{requested}'; capturing a fresh "
             "metadata-only baseline instead"
         )
@@ -57,27 +83,24 @@ def cmd_snapshot(args: argparse.Namespace, store: Store) -> env.Envelope:
     else:
         # No cache to pin: capture directly. Metadata is free on every
         # connector, so this path needs no confirm handshake.
-        adapter = command_args.open_from_args(args, store)
-        try:
-            warehouse = snapshot_mod.warehouse_from_metadata(adapter)
-            connector = adapter.name
-        finally:
-            adapter.close()
+        adapter = engine._adapter("maintain snapshot")
+        warehouse = snapshot_mod.warehouse_from_metadata(adapter)
+        connector = adapter.name
         warehouse_from = "metadata"
         cache_updated_at = None
         if cache is None or not cache.datasets:
             warnings.append(
-                "no .dex/cache.json to pin, so this baseline is metadata-only "
+                "no exploration cache to pin, so this baseline is metadata-only "
                 "(schema and volume axes); run `explore map` and re-snapshot "
                 "to give the grain and cardinality axes a baseline"
             )
 
     transform_layer = semantic_layer = None
     try:
-        view = load_project(command_args.project_dir(args))
+        view = load_project(engine.project_dir())
         transform_layer = snapshot_mod.transform_layer(view)
         semantic_layer = snapshot_mod.semantic_layer(view)
-    except DbtProjectError as exc:
+    except (DbtProjectError, ValueError) as exc:
         warnings.append(
             f"no dbt project fingerprinted ({exc}); the semantic axis and "
             "reconcile need one"
@@ -94,113 +117,131 @@ def cmd_snapshot(args: argparse.Namespace, store: Store) -> env.Envelope:
     )
     locator = store.save_snapshot(snap)
 
-    return env.ok(
-        {
-            "snapshot_path": locator,
-            "baseline": {
-                "from": warehouse_from,
-                "dataset_count": len(warehouse.datasets),
-                "relationship_count": len(warehouse.relationships),
-                "grain_baseline_count": sum(
-                    1 for d in warehouse.datasets if d.candidate_keys
-                ),
-                "cache_updated_at": cache_updated_at,
-            },
-            "transform_layer": (
-                {
-                    "file_count": len(transform_layer.files),
-                    "model_count": len(transform_layer.models),
-                    "source_count": len(transform_layer.sources),
-                }
-                if transform_layer is not None
-                else None
-            ),
-            "semantic_layer": (
-                {
-                    "semantic_model_count": len(semantic_layer.semantic_models),
-                    "metric_count": len(semantic_layer.metrics),
-                }
-                if semantic_layer is not None
-                else None
-            ),
-            "hint": _SNAPSHOT_HINT,
-        },
+    return SnapshotResult(
+        snapshot=snap,
+        snapshot_path=locator,
+        warehouse_from=warehouse_from,
+        dataset_count=len(warehouse.datasets),
+        relationship_count=len(warehouse.relationships),
+        grain_baseline_count=sum(1 for d in warehouse.datasets if d.candidate_keys),
+        cache_updated_at=cache_updated_at,
+        transform_layer=(
+            LayerFingerprint(
+                file_count=len(transform_layer.files),
+                model_count=len(transform_layer.models),
+                source_count=len(transform_layer.sources),
+            )
+            if transform_layer is not None
+            else None
+        ),
+        semantic_layer=(
+            LayerFingerprint(
+                semantic_model_count=len(semantic_layer.semantic_models),
+                metric_count=len(semantic_layer.metrics),
+            )
+            if semantic_layer is not None
+            else None
+        ),
         warnings=warnings,
     )
 
 
-def cmd_schema(args: argparse.Namespace, store: Store) -> env.Envelope:
-    return _detect_free_axis(args, store, "schema", drift_mod.schema_drift)
+def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(snapshot(engine), hints={"hint": _SNAPSHOT_HINT})
 
 
-def cmd_volume(args: argparse.Namespace, store: Store) -> env.Envelope:
-    return _detect_free_axis(args, store, "volume", drift_mod.volume_drift)
+def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
+    """Source columns and tables added, dropped, retyped, or renamed."""
+
+    return _detect_free_axis(engine, "schema", drift_mod.schema_drift, objects)
 
 
-def cmd_grain(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """Grain drift scans (exact distinct counts, overlap probes), so on a billed
+def volume_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
+    """A row count that collapsed, a table that emptied, a load that half-failed."""
+
+    return _detect_free_axis(engine, "volume", drift_mod.volume_drift, objects)
+
+
+def cmd_schema(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return _drift_envelope(schema_drift(engine, getattr(args, "objects", None)))
+
+
+def cmd_volume(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return _drift_envelope(volume_drift(engine, getattr(args, "objects", None)))
+
+
+def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
+    """A key that lost uniqueness, a changed row-per-entity cardinality, fanout.
+
+    This axis scans (exact distinct counts, overlap probes), so on a billed
     connector it goes through the confirm handshake with a dry-run estimate of
-    exactly the statements it would run. Free connectors run immediately."""
+    exactly the statements it would run. Free connectors run immediately.
+    """
 
-    repo_root = command_args.repo_root(args)
+    store = engine.store
     snap = store.load_snapshot()
     if snap is None:
-        return env.error(_NO_SNAPSHOT_ERROR)
-    config = load_config(repo_root) or DexConfig()
-    scope_names = list(getattr(args, "objects", []) or [])
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    scope_names = list(objects or [])
 
-    adapter = command_args.open_from_args(args, store)
-    try:
-        connector = adapter.name
-        scope = None
-        if scope_names:
-            identifiers = {m.identifier for m in adapter.list_objects()} | {
-                d.identifier for d in snap.warehouse.datasets
-            }
-            scope = drift_mod.resolve_scope(scope_names, identifiers)
-        plan = drift_mod.grain_plan(adapter, snap, scope)
-        if plan.key_checks or plan.fanout_pairs or plan.composite_checks:
-            estimate, per_table = drift_mod.grain_estimate(adapter, plan)
-            unconfirmed = command_args.billed_handshake(
-                "maintain grain", adapter, estimate, per_table=per_table
-            )
-            if unconfirmed is not None:
-                return unconfirmed
-        findings = drift_mod.grain_drift(
-            adapter, plan, timeout_seconds=config.query.timeout_seconds
+    adapter = engine._adapter("maintain grain")
+    connector = adapter.name
+    # Guarded rather than passed straight through: `list_objects` is a metadata
+    # round trip, and an unscoped run has no use for it.
+    scope = (
+        _resolve_scope(scope_names, adapter.list_objects(), snap)
+        if scope_names
+        else None
+    )
+    plan = drift_mod.grain_plan(adapter, snap, scope)
+    if plan.key_checks or plan.fanout_pairs or plan.composite_checks:
+        estimate, per_table = drift_mod.grain_estimate(adapter, plan)
+        command_args.billed_handshake(
+            "maintain grain", adapter, estimate, per_table=per_table
         )
-        noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
-            dataset.identifier for dataset, _combos, _rows in plan.composite_checks
-        }
-        notes = _adapter_notes(adapter, sorted(noted))
-        envelope = env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
+    findings = drift_mod.grain_drift(
+        adapter, plan, timeout_seconds=engine.config.query.timeout_seconds
+    )
+    noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
+        dataset.identifier for dataset, _combos, _rows in plan.composite_checks
+    }
+    notes = _adapter_notes(adapter, sorted(noted))
 
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
     _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
-    envelope.data.update(_findings_data({"grain": ranked}, snap, store))
-    envelope.warnings = (
-        _grain_baseline_warnings(snap) + _staleness_warnings(store, snap) + notes
+    result = _drift_result(
+        {"grain": ranked},
+        snap,
+        store,
+        warnings=_grain_baseline_warnings(snap)
+        + _staleness_warnings(store, snap)
+        + notes,
     )
-    return envelope
+    return command_args.stamp_spend(result, adapter)
 
 
-def cmd_semantic(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """The semantic axis is two-phase on billed connectors: definition and
-    reference checks are free and run immediately; the dimension-cardinality
-    scan waits behind the handshake, and an unconfirmed call still returns the
-    complete free findings alongside the estimate."""
+def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return _drift_envelope(grain_drift(engine, getattr(args, "objects", None)))
 
+
+def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
+    """Definitions that no longer match: dangling references, new categoricals.
+
+    Two-phase on billed connectors: definition and reference checks are free and
+    run immediately; the dimension-cardinality scan waits behind the handshake,
+    and an unconfirmed call still returns the complete free findings alongside
+    the estimate rather than throwing away work that cost nothing but is real.
+    """
+
+    store = engine.store
     snap = store.load_snapshot()
     if snap is None:
-        return env.error(_NO_SNAPSHOT_ERROR)
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
     try:
-        view = load_project(command_args.project_dir(args))
-    except DbtProjectError as exc:
-        return env.error(f"the semantic axis needs a dbt project: {exc}")
+        view = load_project(engine.project_dir())
+    except (DbtProjectError, ValueError) as exc:
+        raise DbtProjectError(f"the semantic axis needs a dbt project: {exc}") from exc
 
     warnings: list[str] = []
     if snap.semantic_layer is None:
@@ -210,148 +251,143 @@ def cmd_semantic(args: argparse.Namespace, store: Store) -> env.Envelope:
         )
     current_transform = snapshot_mod.transform_layer(view)
     current_semantic = snapshot_mod.semantic_layer(view)
-    scope_names = list(getattr(args, "objects", []) or [])
+    scope_names = list(objects or [])
 
-    adapter = command_args.open_from_args(args, store)
-    try:
-        connector = adapter.name
-        current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
-        free_findings = _semantic_scope(
-            drift_mod.semantic_free_drift(
-                current_transform, current_semantic, current_datasets, snap
-            ),
-            scope_names,
+    adapter = engine._adapter("maintain semantic")
+    connector = adapter.name
+    current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
+    free_findings = _semantic_scope(
+        drift_mod.semantic_free_drift(
+            current_transform, current_semantic, current_datasets, snap
+        ),
+        scope_names,
+    )
+    checks = drift_mod.cardinality_plan(current_semantic, snap)
+    pending: ConfirmationRequest | None = None
+    billed_findings: list[drift_mod.DriftFinding] = []
+    if checks:
+        estimate, per_table = drift_mod.cardinality_estimate(adapter, checks)
+        pending = command_args.confirmation_request(
+            "maintain semantic",
+            adapter,
+            estimate,
+            per_table=per_table,
+            notes=[
+                "the definition and reference checks are free and already "
+                "complete (their findings are included in this envelope); "
+                "the estimate covers only the dimension-cardinality scan"
+            ],
         )
-        checks = drift_mod.cardinality_plan(current_semantic, snap)
-        if checks:
-            estimate, per_table = drift_mod.cardinality_estimate(adapter, checks)
-            unconfirmed = command_args.billed_handshake(
-                "maintain semantic",
-                adapter,
-                estimate,
-                per_table=per_table,
-                notes=[
-                    "the definition and reference checks are free and already "
-                    "complete (their findings are included in this envelope); "
-                    "the estimate covers only the dimension-cardinality scan"
-                ],
-            )
-            if unconfirmed is not None:
-                ranked = drift_mod.rank_findings(free_findings)
-                _record_axes(
-                    store, snap, connector, {"semantic": (ranked, scope_names)}
-                )
-                unconfirmed.data["findings"] = [
-                    f.model_dump(mode="json") for f in ranked
-                ]
-                unconfirmed.data["free_finding_count"] = len(ranked)
-                unconfirmed.warnings = warnings
-                return unconfirmed
+    if pending is None:
         billed_findings = _semantic_scope(
             drift_mod.cardinality_drift(adapter, checks, current_semantic),
             scope_names,
         )
-        envelope = env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
 
     ranked = drift_mod.rank_findings(free_findings + billed_findings)
     _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
-    envelope.data.update(_findings_data({"semantic": ranked}, snap, store))
-    envelope.warnings = warnings + _staleness_warnings(store, snap)
-    return envelope
+    if pending is not None:
+        # The free half is complete and real, so it returns alongside the ask
+        # for the scanning half rather than being discarded and re-derived.
+        result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
+        result.pending_confirmation = pending
+        return result
+    result = _drift_result(
+        {"semantic": ranked},
+        snap,
+        store,
+        warnings=warnings + _staleness_warnings(store, snap),
+    )
+    return command_args.stamp_spend(result, adapter)
 
 
-def cmd_check(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """The everyday sweep, two-phase by construction: the free axes (schema,
-    volume, semantic references) always run and their findings always return;
-    the scanning axes (grain, cardinality) run immediately on free connectors
-    and behind one combined estimate on billed ones."""
+def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return _drift_envelope(semantic_drift(engine, getattr(args, "objects", None)))
 
-    repo_root = command_args.repo_root(args)
+
+def check(engine: DexEngine) -> DriftResult:
+    """The everyday sweep across every axis.
+
+    Two-phase by construction: the free axes (schema, volume, semantic
+    references) always run and their findings always return; the scanning axes
+    (grain, cardinality) run immediately on free connectors and behind one
+    combined estimate on billed ones.
+    """
+
+    store = engine.store
     snap = store.load_snapshot()
     if snap is None:
-        return env.error(_NO_SNAPSHOT_ERROR)
-    config = load_config(repo_root) or DexConfig()
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    config = engine.config
 
     warnings = _grain_baseline_warnings(snap)
     current_transform = current_semantic = None
     project_available = True
     try:
-        view = load_project(command_args.project_dir(args))
+        view = load_project(engine.project_dir())
         current_transform = snapshot_mod.transform_layer(view)
         current_semantic = snapshot_mod.semantic_layer(view)
-    except DbtProjectError as exc:
+    except (DbtProjectError, ValueError) as exc:
         project_available = False
         warnings.append(f"semantic axis skipped (no dbt project: {exc})")
 
-    adapter = command_args.open_from_args(args, store)
-    try:
-        connector = adapter.name
-        current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
-        schema_findings = drift_mod.schema_drift(current_datasets, snap)
-        volume_findings = drift_mod.volume_drift(current_datasets, snap)
-        semantic_findings = (
-            drift_mod.semantic_free_drift(
-                current_transform, current_semantic, current_datasets, snap
-            )
-            if project_available
-            else []
+    adapter = engine._adapter("maintain check")
+    connector = adapter.name
+    current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
+    schema_findings = drift_mod.schema_drift(current_datasets, snap)
+    volume_findings = drift_mod.volume_drift(current_datasets, snap)
+    semantic_findings = (
+        drift_mod.semantic_free_drift(
+            current_transform, current_semantic, current_datasets, snap
+        )
+        if project_available
+        else []
+    )
+
+    plan = drift_mod.grain_plan(adapter, snap)
+    checks = drift_mod.cardinality_plan(current_semantic, snap)
+    scans_needed = bool(
+        plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
+    )
+    pending: ConfirmationRequest | None = None
+    if scans_needed and command_args.cost_gate(adapter) is not None:
+        grain_total, grain_per = drift_mod.grain_estimate(adapter, plan)
+        card_total, card_per = drift_mod.cardinality_estimate(adapter, checks)
+        per_table = dict(grain_per)
+        for identifier, estimate in card_per.items():
+            per_table[identifier] = per_table.get(identifier, 0.0) + estimate
+        pending = command_args.confirmation_request(
+            "maintain check",
+            adapter,
+            grain_total + card_total,
+            per_table=per_table,
+            notes=[
+                "the schema, volume, and semantic reference checks are free "
+                "and already complete (their findings are included in this "
+                "envelope); the estimate covers the grain and "
+                "dimension-cardinality scans"
+            ],
         )
 
-        plan = drift_mod.grain_plan(adapter, snap)
-        checks = drift_mod.cardinality_plan(current_semantic, snap)
-        scans_needed = bool(
-            plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
-        )
-        if scans_needed and command_args.cost_gate(adapter) is not None:
-            grain_total, grain_per = drift_mod.grain_estimate(adapter, plan)
-            card_total, card_per = drift_mod.cardinality_estimate(adapter, checks)
-            per_table = dict(grain_per)
-            for identifier, estimate in card_per.items():
-                per_table[identifier] = per_table.get(identifier, 0.0) + estimate
-            unconfirmed = command_args.billed_handshake(
-                "maintain check",
-                adapter,
-                grain_total + card_total,
-                per_table=per_table,
-                notes=[
-                    "the schema, volume, and semantic reference checks are free "
-                    "and already complete (their findings are included in this "
-                    "envelope); the estimate covers the grain and "
-                    "dimension-cardinality scans"
-                ],
-            )
-            if unconfirmed is not None:
-                drift_mod.annotate_impacts(schema_findings + volume_findings, snap)
-                free_by_axis = {
-                    "schema": drift_mod.rank_findings(schema_findings),
-                    "volume": drift_mod.rank_findings(volume_findings),
-                }
-                if project_available:
-                    free_by_axis["semantic"] = drift_mod.rank_findings(
-                        semantic_findings
-                    )
-                _record_axes(
-                    store,
-                    snap,
-                    connector,
-                    {axis: (f, []) for axis, f in free_by_axis.items()},
-                )
-                unconfirmed.data.update(_findings_data(free_by_axis, snap, store))
-                unconfirmed.warnings = warnings
-                return unconfirmed
-        grain_findings = drift_mod.grain_drift(
-            adapter, plan, timeout_seconds=config.query.timeout_seconds
-        )
-        semantic_findings = semantic_findings + drift_mod.cardinality_drift(
-            adapter, checks, current_semantic
-        )
-        envelope = env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
+    if pending is not None:
+        drift_mod.annotate_impacts(schema_findings + volume_findings, snap)
+        by_axis = {
+            "schema": drift_mod.rank_findings(schema_findings),
+            "volume": drift_mod.rank_findings(volume_findings),
+        }
+        if project_available:
+            by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
+        _record_axes(store, snap, connector, {a: (f, []) for a, f in by_axis.items()})
+        result = _drift_result(by_axis, snap, store, warnings=warnings)
+        result.pending_confirmation = pending
+        return result
+
+    grain_findings = drift_mod.grain_drift(
+        adapter, plan, timeout_seconds=config.query.timeout_seconds
+    )
+    semantic_findings = semantic_findings + drift_mod.cardinality_drift(
+        adapter, checks, current_semantic
+    )
 
     drift_mod.annotate_impacts(schema_findings + volume_findings + grain_findings, snap)
     by_axis = {
@@ -361,29 +397,36 @@ def cmd_check(args: argparse.Namespace, store: Store) -> env.Envelope:
     }
     if project_available:
         by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-    _record_axes(store, snap, connector, {axis: (f, []) for axis, f in by_axis.items()})
-    envelope.data.update(_findings_data(by_axis, snap, store))
-    envelope.warnings = warnings + _staleness_warnings(store, snap)
-    return envelope
+    _record_axes(store, snap, connector, {a: (f, []) for a, f in by_axis.items()})
+    result = _drift_result(
+        by_axis, snap, store, warnings=warnings + _staleness_warnings(store, snap)
+    )
+    return command_args.stamp_spend(result, adapter)
 
 
-def cmd_reconcile(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """Propose the dbt edits that reconcile detected drift, as a stored plan of
-    reviewable diffs. Reads the last `.dex/drift.json`, never re-scans, and
-    writes nothing to the project: applying is `transform apply <plan-id>`, so
-    the human-edit conflict handshake is inherited unchanged."""
+def cmd_check(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return _drift_envelope(check(engine))
+
+
+def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileResult:
+    """Propose the dbt edits that reconcile detected drift.
+
+    Reads the last drift report, never re-scans, and writes nothing to the
+    project: applying is ``transform apply <plan-id>``, so the human-edit
+    conflict handshake is inherited unchanged.
+    """
 
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
-    repo_root = command_args.repo_root(args)
+    store = engine.store
     snap = store.load_snapshot()
     if snap is None:
-        return env.error(_NO_SNAPSHOT_ERROR)
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
     report = store.load_drift()
     if report is None:
-        return env.error(
-            "no .dex/drift.json; run `maintain check` (or a focused detector) "
+        raise NoBaselineError(
+            "no drift report yet; run `maintain check` (or a focused detector) "
             "first so reconcile has detected drift to propose fixes for"
         )
 
@@ -395,47 +438,33 @@ def cmd_reconcile(args: argparse.Namespace, store: Store) -> env.Envelope:
             "current baseline"
         )
 
-    drift_class = getattr(args, "drift_class", None)
-    findings = [
-        finding
-        for axis, result in report.axes.items()
-        if drift_class is None or axis == drift_class
-        for finding in result.findings
-    ]
-    findings = drift_mod.rank_findings(findings)
+    findings = drift_mod.rank_findings(
+        [
+            finding
+            for axis, result in report.axes.items()
+            if drift_class is None or axis == drift_class
+            for finding in result.findings
+        ]
+    )
     if not findings:
-        scope = f" for the '{drift_class}' axis" if drift_class else ""
-        return env.ok(
-            {
-                "proposals": [],
-                "proposal_count": 0,
-                "hint": f"no drift{scope} to reconcile",
-            },
-            warnings=warnings,
-        )
+        return ReconcileResult(warnings=warnings)
 
     try:
-        view = load_project(command_args.project_dir(args))
-    except DbtProjectError as exc:
-        return env.error(f"reconcile edits a dbt project: {exc}")
+        view = load_project(engine.project_dir())
+    except (DbtProjectError, ValueError) as exc:
+        raise DbtProjectError(f"reconcile edits a dbt project: {exc}") from exc
 
-    config = load_config(repo_root) or DexConfig()
+    repo_root = engine.require_repo_root("reconciling a dbt project")
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
         store.load_cache(),
         view,
-        pii_overrides=pii_override_paths(config.pii_overrides),
+        pii_overrides=pii_override_paths(engine.config.pii_overrides),
     )
     warnings.extend(build_warnings)
 
-    data: dict = {
-        "proposals": [p.model_dump(mode="json") for p in proposals],
-        "proposal_count": len(proposals),
-        "mechanical_count": sum(1 for p in proposals if p.kind == "mechanical"),
-        "advisory_count": sum(1 for p in proposals if p.kind == "advisory"),
-    }
-    envelope = env.ok(data, warnings=warnings)
+    result = ReconcileResult(proposals=proposals, warnings=warnings)
     if edits:
         intent = (
             f"maintain reconcile {drift_class}" if drift_class else "maintain reconcile"
@@ -443,53 +472,78 @@ def cmd_reconcile(args: argparse.Namespace, store: Store) -> env.Envelope:
         plan, diffs, plan_warnings = plans_mod.plan(
             intent, edits, project_dir=view.root, repo_root=repo_root, store=store
         )
-        envelope.diffs = diffs
-        envelope.warnings.extend(plan_warnings)
-        envelope.data["plan_id"] = plan.plan_id
-        envelope.data["hint"] = (
-            f"review the diffs, then apply with `transform apply {plan.plan_id}` "
+        result.diffs = diffs
+        result.warnings.extend(plan_warnings)
+        result.plan_id = plan.plan_id
+    return result
+
+
+def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    drift_class = getattr(args, "drift_class", None)
+    try:
+        result = reconcile(engine, drift_class)
+    except (NoBaselineError, DbtProjectError) as exc:
+        return env.error(str(exc))
+    if not result.proposals:
+        scope = f" for the '{drift_class}' axis" if drift_class else ""
+        return to_envelope(result, hints={"hint": f"no drift{scope} to reconcile"})
+    if result.plan_id is not None:
+        hint = (
+            f"review the diffs, then apply with `transform apply {result.plan_id}` "
             "(human edits since detection surface as a conflict, never a silent "
             "overwrite)"
         )
     else:
-        envelope.data["hint"] = (
+        hint = (
             "every proposal is advisory (a decision for you); nothing to apply, "
             "act on the actions above"
         )
-    return envelope
+    return to_envelope(result, hints={"hint": hint})
 
 
 def _detect_free_axis(
-    args: argparse.Namespace, store: Store, axis: str, detector
-) -> env.Envelope:
+    engine: DexEngine, axis: str, detector, objects: list[str] | None
+) -> DriftResult:
     """One metadata-only detector: free on every connector, so no handshake.
-    The cost stamp still reflects the connector's paradigm for the agent."""
+    The cost stamp still reflects the connector's paradigm for the caller."""
 
+    store = engine.store
     snap = store.load_snapshot()
     if snap is None:
-        return env.error(_NO_SNAPSHOT_ERROR)
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
 
-    adapter = command_args.open_from_args(args, store)
-    try:
-        current = snapshot_mod.warehouse_from_metadata(adapter).datasets
-        gate = getattr(adapter, "cost_gate", None)
-        cost = gate.cost() if gate is not None else env.Cost()
-        connector = adapter.name
-    finally:
-        adapter.close()
+    adapter = engine._adapter(f"maintain {axis}")
+    current = snapshot_mod.warehouse_from_metadata(adapter).datasets
+    cost = command_args.preflight_cost(adapter)
+    connector = adapter.name
 
-    scope_names = list(getattr(args, "objects", []) or [])
+    scope_names = list(objects or [])
     scope = _resolve_scope(scope_names, current, snap)
     findings = detector(current, snap, scope)
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
     _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
-    return env.ok(
-        _findings_data({axis: ranked}, snap, store),
-        cost=cost,
-        warnings=_staleness_warnings(store, snap),
+    result = _drift_result(
+        {axis: ranked}, snap, store, warnings=_staleness_warnings(store, snap)
     )
+    result.cost = cost
+    return result
+
+
+def _drift_envelope(result: DriftResult) -> env.Envelope:
+    """The one CLI-shaped extra a drift result earns: what to run next, and only
+    when there is something to run it for."""
+
+    hints = (
+        {
+            "hint": "run `maintain reconcile [<class>]` for proposed fixes as "
+            "reviewable diffs"
+        }
+        if result.findings
+        else None
+    )
+    return to_envelope(result, hints=hints)
 
 
 # --- shared plumbing -----------------------------------------------------------
@@ -531,30 +585,23 @@ def _record_axes(
     store.save_drift(report)
 
 
-def _findings_data(
+def _drift_result(
     by_axis: dict[str, list[drift_mod.DriftFinding]],
     snap: snapshot_mod.Snapshot,
     store: Store,
-) -> dict:
-    findings = drift_mod.rank_findings(
-        [finding for axis_findings in by_axis.values() for finding in axis_findings]
+    *,
+    warnings: list[str],
+) -> DriftResult:
+    return DriftResult(
+        findings=drift_mod.rank_findings(
+            [finding for findings in by_axis.values() for finding in findings]
+        ),
+        by_axis={axis: len(findings) for axis, findings in by_axis.items()},
+        snapshot_created_at=snap.created_at,
+        warehouse_from=snap.warehouse_from,
+        drift_path=store.locator(Document.DRIFT),
+        warnings=warnings,
     )
-    data = {
-        "findings": [f.model_dump(mode="json") for f in findings],
-        "finding_count": len(findings),
-        "axes_run": sorted(by_axis),
-        "axes": {axis: len(axis_findings) for axis, axis_findings in by_axis.items()},
-        "baseline": {
-            "snapshot_created_at": snap.created_at,
-            "from": snap.warehouse_from,
-        },
-        "drift_path": store.locator(Document.DRIFT),
-    }
-    if findings:
-        data["hint"] = (
-            "run `maintain reconcile [<class>]` for proposed fixes as reviewable diffs"
-        )
-    return data
 
 
 def _grain_baseline_warnings(snap: snapshot_mod.Snapshot) -> list[str]:
@@ -622,7 +669,7 @@ def _staleness_warnings(store: Store, snap: snapshot_mod.Snapshot) -> list[str]:
         and cache.provenance.updated_at > snap.created_at
     ):
         warnings.append(
-            "the .dex cache is newer than the snapshot baseline; if the current "
+            "the exploration cache is newer than the drift baseline; if the current "
             "state is known-good, re-run `maintain snapshot` so drift is not "
             "measured against a stale baseline"
         )

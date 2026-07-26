@@ -30,7 +30,7 @@ body:
         - Model
         - Reconcile
         - Connectors
-        - Engine / command contract
+        - DexEngine / command contract
         - Evals / benchmarks
         - Other
     validations:

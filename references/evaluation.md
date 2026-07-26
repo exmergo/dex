@@ -20,7 +20,7 @@ fraction of the warehouse spend and turns).
 
 ## Tier 1: unit tests (`packages/dex-core/tests/`)
 
-Deterministic, fast, pytest, free on DuckDB. Engine correctness plus the five
+Deterministic, fast, pytest, free on DuckDB. DexEngine correctness plus the five
 safety-critical assertion families, which are release blockers regardless of any
 benchmark score:
 

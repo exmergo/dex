@@ -467,7 +467,7 @@ def _resolve_dataset(
     matches = match_identifier(dotted, list(known))
     if not matches:
         raise QueryRefusedError(
-            f"'{dotted}' is not in the .dex cache; run `explore map` (or "
+            f"'{dotted}' is not in the exploration cache; run `explore map` (or "
             f"`explore profile {dotted}`) first so its columns and PII flags "
             "are known"
         )

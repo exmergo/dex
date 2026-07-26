@@ -24,6 +24,7 @@ from typing import Any
 
 from ... import envelope as env
 from ...config import QueryLimits
+from ..results import SemanticQueryResult
 from . import (
     DimensionInfo,
     EntityInfo,
@@ -31,6 +32,7 @@ from . import (
     SemanticBackendError,
     SemanticCatalog,
     SemanticQuery,
+    SemanticQueryRefusedError,
     cap_columnar,
     requested_dimension_refs,
     screen_dimension_refs,
@@ -107,7 +109,7 @@ class HostedDbtCloudBackend:
         self._timeout = timeout
 
     @classmethod
-    def from_config(cls, args, config) -> HostedDbtCloudBackend:
+    def from_config(cls, config) -> HostedDbtCloudBackend:
         try:
             import httpx  # noqa: F401
         except ImportError as exc:
@@ -200,27 +202,26 @@ class HostedDbtCloudBackend:
 
     # ---- query -------------------------------------------------------------
 
-    def query(self, q: SemanticQuery) -> env.Envelope:
+    def query(self, q: SemanticQuery) -> SemanticQueryResult:
         refs = requested_dimension_refs(q)
         blocked = screen_dimension_refs(refs, meta_lookup=self._meta_lookup(q.metrics))
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
-            return env.error(
+            raise SemanticQueryRefusedError(
                 f"refused: grouping or filtering by {named} would surface PII from "
                 "the semantic layer. PII is flagged, never surfaced; query a "
                 "non-PII dimension instead."
             )
 
-        try:
-            query_id = self._create_query(q)
-            json_result = self._await_result(query_id)
-        except SemanticBackendError as exc:
-            return env.error(str(exc))
-        data = self._shape(json_result)
-        data["backend"] = self.name
-        data["query_id"] = query_id
-        return env.ok(
-            data,
+        query_id = self._create_query(q)
+        json_result = self._await_result(query_id)
+        # A hosted cost is a paradigm and nothing else: dbt Cloud ran the query
+        # under its own warehouse connection, so there is no estimate dex could
+        # honestly report and no ceiling it could have enforced.
+        return SemanticQueryResult.from_capped(
+            self._shape(json_result),
+            backend=self.name,
+            query_id=query_id,
             cost=env.Cost(paradigm=env.Paradigm.HOSTED),
             warnings=[_HOSTED_COST_WARNING],
         )

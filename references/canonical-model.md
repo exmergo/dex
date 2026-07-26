@@ -60,6 +60,15 @@ Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the 
 project and the warehouse. The cache types live in `cache.py`; secrets never live
 here. PII is recorded as `(column, category, confidence)` with no example values.
 
+The layout above is the CLI's choice, not the engine's. Where this state lands is
+a backend behind the `Store` protocol, injected at the entry point: the CLI picks
+the filesystem so subcommands stay stateless across processes and the session
+budget carries from one command to the next, while an in-process library caller
+gets an in-memory store by default and writes nothing at all. A host can
+implement the protocol over its own session store or database. The dbt project is
+unaffected by any of this: it is the source of truth and stays a git-reviewable
+filesystem artifact, which is why `repo_root` remains separate from the store.
+
 ## The extension seam (more formats later)
 
 Supporting more model formats over time does not require a neutral internal model.

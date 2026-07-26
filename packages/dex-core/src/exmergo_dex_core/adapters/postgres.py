@@ -926,7 +926,7 @@ class PostgresAdapter:
                 timeout_ms = wall_ms
                 budget_bound = False
         if timeout_ms is not None:
-            # Engine-built session statement, not agent SQL: the value is a
+            # dex-built session statement, not agent SQL: the value is a
             # computed integer of milliseconds.
             cursor.execute(f"SET statement_timeout = {timeout_ms}")
         return cursor, budget_bound
@@ -951,7 +951,7 @@ class PostgresAdapter:
 
     def _ensure_session(self) -> None:
         """Session preparation, once per command: reads stay reads even if a
-        later statement tried otherwise. Engine-built constants, not agent
+        later statement tried otherwise. dex-built constants, not agent
         SQL."""
 
         if self._session_prepared:

@@ -30,7 +30,54 @@ exmergo-dex-core[postgres]
 exmergo-dex-core[all]          # every connector at once
 ```
 
-## The command contract
+## Two surfaces, one engine
+
+### The Python API
+
+```python
+from exmergo_dex_core import DexEngine
+
+with DexEngine(connector="duckdb", path="shop.duckdb") as eng:
+    mapped = eng.map()
+    rows = eng.query("select status, count(*) from orders group by status")
+```
+
+Methods return domain objects (`DexCache`, `Dataset`, `Snapshot`) and result
+records carrying the counts, notes, and warnings that explain them. The stdout
+envelope never crosses this boundary.
+
+Nothing above touches disk. The default store keeps state in the process, so
+importing this package cannot leave a `.dex/` directory in a consumer's repo;
+pass `store=` for anything durable, or use `DexEngine.from_repo(repo_root)` to get
+the CLI's behavior (filesystem store, config read from `.dex/config.yml`). The
+`Store` protocol is public, so a host can back state with its own session store
+or database instead.
+
+[`examples/quickstart.py`](examples/quickstart.py) is the whole flow in one
+runnable file: map a warehouse, read the inferred joins, see PII flagged, ask a
+question, and watch the firewall refuse one it should. It builds its own
+throwaway DuckDB file, so it runs anywhere:
+
+```
+pip install "exmergo-dex-core[duckdb]"
+python quickstart.py
+```
+
+The test suite runs that file against a freshly built wheel, so the usage
+documented here is the usage that is verified.
+
+Every guarantee below holds here too, because it is the same code. An
+unconfirmed billed call raises `ConfirmationRequiredError` carrying the estimate
+and the payload needed to re-issue; an over-ceiling one raises `OverCeilingError`
+and cannot be confirmed through.
+
+Two rules matter the moment a process serves more than one user, and both are in
+`DexEngine`'s docstring: scope one engine to one principal and one session, and know
+that an engine given an explicit `config=` never reads one from disk (so a stray
+`.dex/config.yml` above the working directory cannot silently supply someone
+else's connector, budget, or PII overrides).
+
+### The command contract
 
 Every subcommand prints exactly one sanitized JSON envelope to stdout and nothing
 else; nothing reaches agent context except through that envelope. Credentials
@@ -42,14 +89,17 @@ subcommands are stateless and the agent orchestrates multi-step flows.
 dex connect test --path data.duckdb
 ```
 
-See [`references/command-contract.md`](../../references/command-contract.md) for
-the full surface and the envelope spec.
+The CLI is the API's first consumer rather than a parallel implementation: it
+parses arguments, builds an engine, and wraps the result it gets back. See
+[`references/command-contract.md`](../../references/command-contract.md) for the
+full surface and the envelope spec.
 
 ## Status
 
 Early and under active development; open issues on [GitHub](https://github.com/exmergo/dex)! Today the engine
 runs Explore, Transform, and Maintain end to end on every connector: DuckDB,
-BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres.
+BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres, through either
+the command contract or the Python API.
 
 ### Commands
 

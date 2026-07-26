@@ -116,7 +116,7 @@ def test_query_on_unprofiled_table_after_profile_is_refused(
         expect_error=True,
     )
     message = payload["errors"][0]
-    assert "not in the .dex cache" in message
+    assert "not in the exploration cache" in message
     assert "explore profile" in message
 
 

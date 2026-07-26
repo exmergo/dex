@@ -24,6 +24,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from ..envelope import Cost, Paradigm
+from ..results import ConfirmationRequest
 
 
 class CostGuardError(Exception):
@@ -39,10 +40,18 @@ class CeilingRequiredError(CostGuardError):
 
 
 class ConfirmationRequiredError(CostGuardError):
-    """The command would spend but was not confirmed.
+    """The command would spend but was not confirmed, so nothing ran.
 
-    Carries the preflight :class:`Cost` so the command layer can surface it in a
-    ``needs_confirmation`` envelope for the agent to re-issue with ``--confirm``.
+    Raised by the gate with just the preflight :class:`Cost`, which is all the
+    gate knows. The command layer catches it, attaches ``request`` (the
+    agent-facing payload: the estimate in the connector's own unit, the
+    per-table breakdown, the hint naming what to re-issue with), and re-raises
+    the same exception. One class for one event, enriched as it travels: a
+    second class at the command layer would mean two things to catch and two
+    things to confuse.
+
+    Not to be confused with :class:`OverCeilingError` or
+    :class:`CeilingRequiredError`: confirmation cannot override either.
     """
 
     def __init__(self, cost: Cost):
@@ -51,6 +60,25 @@ class ConfirmationRequiredError(CostGuardError):
             "billed connectors) after reviewing the cost estimate"
         )
         self.cost = cost
+        # Starts as just the cost, which is all the gate knows; the command layer
+        # replaces it with the full agent-facing payload on the way out. Never
+        # None, so a caller can always read it.
+        self.request = ConfirmationRequest(cost=cost)
+
+
+def ledger_field(paradigm: Paradigm) -> str:
+    """The ledger key actual spend is recorded under, per paradigm.
+
+    Module level because the session-budget read has to name the same key the
+    write will use, and that read happens while building the gate, before there
+    is a gate to ask.
+    """
+
+    return (
+        "billed_seconds"
+        if paradigm in (Paradigm.COMPUTE_TIME, Paradigm.DB_LOAD)
+        else "billed_bytes"
+    )
 
 
 def preflight(
@@ -220,11 +248,7 @@ class CostGate:
         """The ledger key actual spend is recorded under. Paradigm-specific so
         a bytes total and a seconds total can never silently sum together."""
 
-        return (
-            "billed_seconds"
-            if self.paradigm in (Paradigm.COMPUTE_TIME, Paradigm.DB_LOAD)
-            else "billed_bytes"
-        )
+        return ledger_field(self.paradigm)
 
     def record_billed(
         self, billed: float, *, job_id: str | None = None, statement: str = ""

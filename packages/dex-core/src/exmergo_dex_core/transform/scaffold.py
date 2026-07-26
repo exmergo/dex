@@ -52,7 +52,7 @@ def scaffold_edits(tables: list[str], store: Store) -> list[PlanEdit]:
     cache = store.load_cache()
     if cache is None:
         raise ScaffoldError(
-            "no .dex/cache.json; run `explore map` first so the scaffold has "
+            "no exploration cache yet; run `explore map` first so the scaffold has "
             "profiles and PII flags to build from"
         )
 

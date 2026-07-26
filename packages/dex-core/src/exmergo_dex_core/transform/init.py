@@ -2,7 +2,7 @@
 
 Bootstrap is engine work, not agent freehand, because the generated
 ``profiles.yml`` is safety-relevant: it defines the build targets, and the
-dev-target-only invariant depends on its shape. Engine-owned init guarantees a
+dev-target-only invariant depends on its shape. dex-owned init guarantees a
 single ``dev`` default, never a prod-named target, and never a persisted secret,
 identically on every agent surface.
 

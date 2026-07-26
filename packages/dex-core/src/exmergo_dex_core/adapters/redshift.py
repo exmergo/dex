@@ -1018,7 +1018,7 @@ class RedshiftAdapter:
                 timeout_ms = wall_ms
                 budget_bound = False
         if timeout_ms is not None:
-            # Engine-built session statement, not agent SQL: the value is a
+            # dex-built session statement, not agent SQL: the value is a
             # computed integer of milliseconds.
             cursor.execute(f"SET statement_timeout = {timeout_ms}")
         return cursor, budget_bound
@@ -1064,7 +1064,7 @@ class RedshiftAdapter:
 
     def _ensure_session(self) -> None:
         """Session preparation, once per command: a best-effort read-only mode
-        and the attribution tag. Engine-built constants, not agent SQL. Both
+        and the attribution tag. dex-built constants, not agent SQL. Both
         are tolerated when Redshift declines them (the SELECT-only guard and
         grants still enforce read-only; ``capabilities`` reports the truth).
         """

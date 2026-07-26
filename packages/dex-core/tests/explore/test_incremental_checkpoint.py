@@ -19,11 +19,11 @@ pytest.importorskip("google.cloud.bigquery")
 
 from google.cloud import bigquery
 
-from exmergo_dex_core import command_args
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
-from exmergo_dex_core.config import BigQueryTarget
+from exmergo_dex_core.cli import dispatch
+from exmergo_dex_core.config import BigQueryTarget, DexConfig
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm
-from exmergo_dex_core.explore import commands as explore_cmds
 from exmergo_dex_core.guards.cost_guard import CostGate, OverCeilingError
 from exmergo_dex_core.storage import FilesystemStore
 
@@ -87,7 +87,10 @@ def two_table_client():
 def _install(
     monkeypatch, client, *, confirmed=True, budget=float(100 * MB), record=None
 ):
-    def opener(args, store):
+    # The per-call budget/confirmed overrides the engine would apply are absorbed
+    # and ignored: these tests pin one gate so the ceiling crossing is the only
+    # variable, and gate lifetime is pinned in test_engine.py instead.
+    def opener(self, command=None, **_call_overrides):
         gate = CostGate(
             paradigm=Paradigm.BYTES_SCANNED,
             ceiling=budget,
@@ -106,7 +109,7 @@ def _install(
             principal_type="user",
         )
 
-    monkeypatch.setattr(command_args, "open_from_args", opener)
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
 
 
 def _raise_on_nth_object(monkeypatch, n: int):
@@ -147,6 +150,23 @@ def _args(tmp_path: Path, **extra) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
+def _dispatch(tmp_path: Path, **extra):
+    """One command through the real router. Dispatch, not the handler directly,
+    because a mid-run budget exhaustion is an exception on the engine and only
+    becomes an error envelope at this boundary."""
+
+    args = _args(tmp_path, **extra)
+    engine = DexEngine(
+        connector="bigquery",
+        repo_root=str(tmp_path),
+        store=FilesystemStore(tmp_path),
+        config=DexConfig(connector="bigquery"),
+        confirmed=args.confirm,
+        budget=args.budget,
+    )
+    return dispatch(args, engine)
+
+
 # --- 1. mid-run budget exhaustion leaves a partial cache ---------------------
 
 
@@ -156,9 +176,7 @@ def test_map_mid_run_exhaustion_saves_partial_cache(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 2)  # object 1 completes, object 2 trips the gate
 
-    envelope = explore_cmds.cmd_map(
-        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
-    )
+    envelope = _dispatch(tmp_path, subcommand="map")
 
     assert envelope.status.value == "error"
     message = envelope.errors[0]
@@ -180,10 +198,7 @@ def test_relationships_mid_run_exhaustion_saves_partial_cache(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 2)
 
-    envelope = explore_cmds.cmd_relationships(
-        _args(tmp_path, subcommand="relationships"),
-        FilesystemStore(tmp_path),
-    )
+    envelope = _dispatch(tmp_path, subcommand="relationships")
 
     assert envelope.status.value == "error"
     assert "1 of 2" in envelope.errors[0]
@@ -198,9 +213,8 @@ def test_profile_mid_run_exhaustion_saves_partial_cache(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 2)
 
-    envelope = explore_cmds.cmd_profile(
-        _args(tmp_path, subcommand="profile", objects=["customers", "orders"]),
-        FilesystemStore(tmp_path),
+    envelope = _dispatch(
+        tmp_path, subcommand="profile", objects=["customers", "orders"]
     )
 
     assert envelope.status.value == "error"
@@ -219,9 +233,7 @@ def test_map_first_object_failure_saves_nothing(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 1)  # the first object trips the gate
 
-    envelope = explore_cmds.cmd_map(
-        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
-    )
+    envelope = _dispatch(tmp_path, subcommand="map")
 
     assert envelope.status.value == "error"
     message = envelope.errors[0]
@@ -236,9 +248,8 @@ def test_profile_first_object_failure_saves_nothing(
     _install(monkeypatch, two_table_client)
     _raise_on_nth_object(monkeypatch, 1)
 
-    envelope = explore_cmds.cmd_profile(
-        _args(tmp_path, subcommand="profile", objects=["customers", "orders"]),
-        FilesystemStore(tmp_path),
+    envelope = _dispatch(
+        tmp_path, subcommand="profile", objects=["customers", "orders"]
     )
 
     assert envelope.status.value == "error"
@@ -254,9 +265,7 @@ def test_successful_map_overwrites_checkpoints_with_composed_cache(
 ):
     _install(monkeypatch, two_table_client)  # no wrap: the run completes
 
-    envelope = explore_cmds.cmd_map(
-        _args(tmp_path, subcommand="map"), FilesystemStore(tmp_path)
-    )
+    envelope = _dispatch(tmp_path, subcommand="map")
 
     assert envelope.status.value == "ok"
     cache = FilesystemStore(tmp_path).load_cache()

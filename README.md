@@ -143,6 +143,32 @@ or
 uv add exmergo-dex-core
 ```
 
+### Use it as a library
+
+The engine has a programmatic API, so you can drive the same loop from Python
+instead of shelling out to the CLI and parsing JSON:
+
+```python
+from exmergo_dex_core import DexEngine
+
+with DexEngine(connector="duckdb", path="shop.duckdb") as eng:
+    mapped = eng.map()                  # a DexCache, not a JSON blob
+    rows = eng.query("select status, count(*) from orders group by status")
+
+print(mapped.relationship_count, rows.cells)
+```
+
+Methods return domain objects and result records, never the CLI's stdout
+envelope. Nothing above writes to disk: the default store keeps state in the
+process, so importing the package cannot leave a `.dex/` directory in your repo.
+`DexEngine.from_repo("path/to/repo")` opts in to a project on disk, which is exactly
+what the CLI itself does.
+
+Every guarantee the CLI makes holds here too, because it is the same code: reads
+are read-only, cost is surfaced before any spend (an unconfirmed billed call
+raises `ConfirmationRequiredError` carrying the estimate), and PII stays flagged
+rather than surfaced.
+
 More info in the package's [`README.md`](packages/dex-core/README.md)
 
 ## Agent References

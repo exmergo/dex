@@ -1,12 +1,17 @@
-"""Explore command orchestrators.
+"""Explore orchestration, in two layers.
 
-Each ``cmd_*`` receives the injected store, opens the adapter, drives the explore
-engine, and shapes the result into the sanitized envelope. Keeping this here (not in
-``cli.py``) keeps dispatch thin and keeps ``map``'s composition (it runs inventory,
-profile, and relationships together) out of the CLI layer. These are the only
-explore commands that hold an adapter; ``map``, ``profile``, and ``relationships``
-all persist what they learned, and only to the exploration cache, so a scan is never
-paid for twice.
+The lower layer is the run functions (``inventory``, ``profile``, ``map``, and so
+on): they take an :class:`~..engine.DexEngine` and plain arguments, drive the explore
+engine, and return a record from :mod:`.results`. They are what
+``DexEngine.profile()`` and friends call, so a library caller and the CLI execute
+exactly the same code.
+
+The upper layer is the ``cmd_*`` shims: argparse in, envelope out, nothing else.
+Keeping ``map``'s composition (it runs inventory, profile, and relationships
+together) down here rather than in ``cli.py`` is what keeps dispatch thin.
+
+``map``, ``profile``, and ``relationships`` all persist what they learned, and
+only to the exploration cache, so a scan is never paid for twice.
 """
 
 from __future__ import annotations
@@ -18,11 +23,16 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
-from ..adapters.base import Adapter, ObjectMeta, QueryResult
+from ..adapters.base import Adapter, ObjectMeta
+
+# Aliased: `QueryResult` here is the explore record, and the adapter's
+# same-named row carrier is only a type hint on one shaping helper.
+from ..adapters.base import QueryResult as AdapterQueryResult  # noqa: F401
 from ..cache import (
     Dataset,
     DexCache,
@@ -35,26 +45,51 @@ from ..config import (
     PIIOverride,
     QueryLimits,
     blob_override_paths,
-    load_config,
     pii_override_paths,
 )
-from ..guards.cost_guard import OverCeilingError
+from ..guards.cost_guard import ConfirmationRequiredError, OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
     inspect_query,
 )
 from ..progress import ProgressReporter
+from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..storage import Document, Store
 from . import cluster as cluster_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
 from . import relationships as rel_mod
+from .results import (
+    ClusterResult,
+    InventoryEntry,
+    InventoryResult,
+    MapResult,
+    ProfileResult,
+    QueryResult,
+    RankedObject,
+    RelationshipsResult,
+    SemanticListResult,
+    SemanticQueryResult,
+)
+
+if TYPE_CHECKING:
+    from ..engine import DexEngine
 
 # Below this many objects, profile everything: enumeration is cheap and complete.
 # Above it, profile only the top-ranked unless --full is passed.
 _AUTO_PROFILE_ALL = 50
+
+
+class CacheRequiredError(Exception):
+    """A command needs profiled objects and the exploration cache has none.
+
+    The message names the command that fills the gap rather than a filename,
+    because where the cache lives is the store's business: on the filesystem
+    backend it is a file, in a hosted deployment it is a row, and the fix
+    ("run `explore map` first") is the same either way.
+    """
 
 
 def _override_notes(datasets: list[Dataset]) -> list[str]:
@@ -184,128 +219,136 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
     )
 
 
-def cmd_inventory(args: argparse.Namespace, store: Store) -> env.Envelope:
-    adapter = command_args.open_from_args(args, store)
-    try:
-        # Inventory is metadata-only on every connector (free API calls on
-        # BigQuery), so it never needs the confirm handshake.
-        metas = inventory_mod.inventory(adapter)
-        gate = command_args.cost_gate(adapter)
-        cost = gate.cost() if gate is not None else env.Cost()
-    finally:
-        adapter.close()
+def inventory(engine: DexEngine, *, rank: bool = False) -> InventoryResult:
+    """Every object the connection can see, metadata only.
 
-    ranked = getattr(args, "rank", False)
-    if ranked:
-        # Honor the same configured ranking_hints as `map`; without them, an
-        # inventory --rank would silently ignore the user's bias. Connectivity is
-        # absent here by design (no relationship pass), so only naming/size/shape
-        # signals contribute.
-        config = load_config(command_args.repo_root(args)) or DexConfig()
-        scores = rank_mod.rank(metas, None, config.ranking_hints)
+    Free on every connector (catalog reads, not scans), so it never needs the
+    confirm handshake and is the cheapest way to find out what is out there.
+    ``rank`` orders by the same signals ``map`` uses, minus connectivity: there
+    is no relationship pass here, so only naming, size, and shape contribute.
+    """
+
+    adapter = engine._adapter("explore inventory")
+    metas = inventory_mod.inventory(adapter)
+    cost = command_args.preflight_cost(adapter)
+
+    if rank:
+        # Honor the same configured ranking_hints as `map`; without them, a
+        # ranked inventory would silently ignore the user's bias.
+        scores = rank_mod.rank(metas, None, engine.config.ranking_hints)
         metas = sorted(metas, key=lambda m: scores.get(m.identifier, 0.0), reverse=True)
     else:
         scores = {}
 
-    objects = [
-        {
-            "identifier": m.identifier,
-            "object_type": m.object_type,
-            "row_estimate": m.row_count,
-            "column_count": m.column_count,
-            "rank_score": scores.get(m.identifier) if ranked else None,
-        }
-        for m in metas
-    ]
-    return env.ok(
-        {"object_count": len(objects), "objects": objects, "ranked": ranked},
+    return InventoryResult(
+        objects=[
+            InventoryEntry(
+                identifier=m.identifier,
+                object_type=m.object_type,
+                row_estimate=m.row_count,
+                column_count=m.column_count,
+                rank_score=scores.get(m.identifier) if rank else None,
+            )
+            for m in metas
+        ],
+        ranked=rank,
         cost=cost,
     )
 
 
-def cmd_profile(args: argparse.Namespace, store: Store) -> env.Envelope:
-    repo_root = command_args.repo_root(args)
-    config = load_config(repo_root) or DexConfig()
-    defs = _project_definitions(args, config)
+def cmd_inventory(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(inventory(engine, rank=getattr(args, "rank", False)))
+
+
+def profile(
+    engine: DexEngine,
+    objects: list[str],
+    *,
+    refresh: bool = False,
+    use_project: bool = False,
+) -> ProfileResult:
+    """Profile the named objects, reusing fresh cached profiles where they exist.
+
+    Raises :class:`~..results.ConfirmationRequired` on a billed connector before
+    anything is scanned. ``refresh`` forces a re-scan of objects the cache would
+    otherwise serve; ``use_project`` folds the dbt project's declared joins,
+    grain, and metric lineage into the result.
+    """
+
+    store = engine.store
+    config = engine.config
+    defs = _project_definitions(engine, use_project)
     override_paths = pii_override_paths(config.pii_overrides)
     blob_paths = blob_override_paths(config.blob_overrides)
-    adapter = command_args.open_from_args(args, store)
+    adapter = engine._adapter("explore profile")
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
-    try:
-        identifiers = _resolve_identifiers(adapter, args.objects)
-        connector = adapter.name
-        # Skip re-scanning a requested object whose cached profile is still fresh
-        # (same connector, schema unchanged, within the freshness window); only
-        # the stale remainder is estimated, confirmed, and profiled below. A
-        # profile written seconds earlier by `explore map` is served free, the
-        # same reuse `map` and `relationships` already honor (issue #128).
-        stale, fresh_reused = _split_fresh_stale(
-            identifiers,
-            prior,
-            connector,
+
+    identifiers = _resolve_identifiers(adapter, objects)
+    connector = adapter.name
+    # Skip re-scanning a requested object whose cached profile is still fresh
+    # (same connector, schema unchanged, within the freshness window); only the
+    # stale remainder is estimated, confirmed, and profiled below. A profile
+    # written seconds earlier by `explore map` is served free, the same reuse
+    # `map` and `relationships` already honor.
+    stale, fresh_reused = _split_fresh_stale(
+        identifiers,
+        prior,
+        connector,
+        adapter,
+        timedelta(hours=config.profile_freshness_hours),
+        now,
+        refresh=refresh,
+    )
+    estimate, per_table = _profile_estimate(adapter, stale, include_blobs=blob_paths)
+    handshake_notes = None
+    if fresh_reused:
+        handshake_notes = [
+            f"{len(fresh_reused)} object(s) excluded from this estimate as "
+            "fresh-cached (schema unchanged, profiled within the freshness "
+            "window); pass --refresh to re-profile them"
+        ]
+    profiled: list[Dataset] = []
+    # Nothing stale means nothing to price or confirm: skip the handshake and
+    # the scan entirely, and serve the cached profiles wholesale.
+    if stale:
+        command_args.billed_handshake(
+            "explore profile",
             adapter,
-            timedelta(hours=config.profile_freshness_hours),
-            now,
-            refresh=getattr(args, "refresh", False),
+            estimate,
+            per_table=per_table,
+            notes=handshake_notes,
         )
-        estimate, per_table = _profile_estimate(
-            adapter, stale, include_blobs=blob_paths
-        )
-        handshake_notes = None
-        if fresh_reused:
-            handshake_notes = [
-                f"{len(fresh_reused)} object(s) excluded from this estimate as "
-                "fresh-cached (schema unchanged, profiled within the freshness "
-                "window); pass --refresh to re-profile them"
-            ]
-        profiled: list[Dataset] = []
-        # Nothing stale means nothing to price or confirm: skip the handshake and
-        # the scan entirely, and serve the cached profiles wholesale.
-        if stale:
-            unconfirmed = command_args.billed_handshake(
-                "explore profile",
-                adapter,
-                estimate,
-                per_table=per_table,
-                notes=handshake_notes,
+        # Checkpoint per object only on billed connectors: DuckDB can never
+        # exhaust budget and its re-runs are free, so the extra full-file
+        # writes (and O(n^2) serialization on large warehouses) are scoped
+        # precisely to the population the bug affects.
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, connector, now
             )
-            if unconfirmed is not None:
-                return unconfirmed
-            # Checkpoint per object only on billed connectors: DuckDB can never
-            # exhaust budget and its re-runs are free, so the extra full-file
-            # writes (and O(n^2) serialization on large warehouses) are scoped
-            # precisely to the population the bug affects.
-            checkpoint = None
-            if command_args.cost_gate(adapter) is not None:
-                checkpoint, accumulated = _profile_checkpointer(
-                    store, prior, connector, now
-                )
-            profile_reporter = _reporter(len(stale), "profiled", "objects")
-            try:
-                profiled = profile_mod.profile(
-                    adapter,
-                    stale,
-                    progress=profile_reporter,
-                    on_complete=checkpoint,
-                    pii_overrides=override_paths,
-                    include_blobs=blob_paths,
-                )
-                profile_reporter.done()
-            except OverCeilingError:
-                over_ceiling = True
-        envelope = env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
+        profile_reporter = _reporter(len(stale), "profiled", "objects")
+        try:
+            profiled = profile_mod.profile(
+                adapter,
+                stale,
+                progress=profile_reporter,
+                on_complete=checkpoint,
+                pii_overrides=override_paths,
+                include_blobs=blob_paths,
+            )
+            profile_reporter.done()
+        except OverCeilingError:
+            over_ceiling = True
+
     if over_ceiling:
-        envelope = _over_ceiling_error(store, accumulated, len(stale))
-        command_args.stamp_spend(envelope, adapter)
-        return envelope
+        raise _budget_exhausted(store, adapter, accumulated, len(stale))
+
     # Only the freshly profiled need annotation; the fresh-cached already carry
     # their candidate_keys and grain from the cache write that stored them.
     _annotate_grain(profiled, defs)
@@ -330,159 +373,174 @@ def cmd_profile(args: argparse.Namespace, store: Store) -> env.Envelope:
             f"unchanged, profiled within {window:g}h); pass --refresh to force "
             "re-profiling"
         )
-    envelope.data.update(
-        {
-            "datasets": [d.model_dump(mode="json") for d in datasets],
-            "profiled_count": len(profiled),
-            "cache_hit_count": len(fresh_reused),
-            "cache_path": locator,
-            "updated_at": now.isoformat(),
-            "notes": notes,
-        }
+    result = ProfileResult(
+        datasets=datasets,
+        profiled_count=len(profiled),
+        cache_hit_count=len(fresh_reused),
+        cache_path=locator,
+        updated_at=now.isoformat(),
+        notes=notes,
+        warnings=_override_mismatches(datasets, config.pii_overrides),
     )
-    envelope.warnings.extend(_override_mismatches(datasets, config.pii_overrides))
-    return envelope
+    return command_args.stamp_spend(result, adapter)
 
 
-def cmd_relationships(args: argparse.Namespace, store: Store) -> env.Envelope:
-    verify = getattr(args, "verify", False)
-    repo_root = command_args.repo_root(args)
-    config = load_config(repo_root) or DexConfig()
-    defs = _project_definitions(args, config)
+def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(
+        profile(
+            engine,
+            args.objects,
+            refresh=getattr(args, "refresh", False),
+            use_project=getattr(args, "use_project", False),
+        )
+    )
 
-    adapter = command_args.open_from_args(args, store)
+
+def relationships(
+    engine: DexEngine,
+    *,
+    verify: bool = False,
+    refresh: bool = False,
+    use_project: bool = False,
+) -> RelationshipsResult:
+    """Infer joins across every object in scope, optionally probing them.
+
+    Inference needs uniqueness signals, so this profiles the full inventory
+    first; on a metered connector ``map`` (top-ranked objects only) is usually
+    the cheaper way in. With ``verify``, candidate joins are probed for real
+    overlap, priced only after inference knows what the candidates are, which is
+    why that phase can come back as ``pending_confirmation`` rather than raising.
+    """
+
+    store = engine.store
+    config = engine.config
+    defs = _project_definitions(engine, use_project)
+
+    adapter = engine._adapter("explore relationships")
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
-    verify_pending: env.Envelope | None = None
+    verify_pending: ConfirmationRequest | None = None
     verify_warning: str | None = None
-    try:
-        # Relationship inference needs uniqueness signals, so profile every object
-        # first (free and local on DuckDB), then infer across the full set.
-        metas = inventory_mod.inventory(adapter)
-        connector = adapter.name
-        # Skip re-scanning objects whose cached profile is still fresh (same
-        # connector, schema unchanged, within the freshness window); only the
-        # stale remainder is estimated, confirmed, and profiled below.
-        stale, fresh_reused = _split_fresh_stale(
-            [m.identifier for m in metas],
-            prior,
-            connector,
+    warnings: list[str] = []
+
+    # Relationship inference needs uniqueness signals, so profile every object
+    # first (free and local on DuckDB), then infer across the full set.
+    metas = inventory_mod.inventory(adapter)
+    connector = adapter.name
+    # Skip re-scanning objects whose cached profile is still fresh (same
+    # connector, schema unchanged, within the freshness window); only the stale
+    # remainder is estimated, confirmed, and profiled below.
+    stale, fresh_reused = _split_fresh_stale(
+        [m.identifier for m in metas],
+        prior,
+        connector,
+        adapter,
+        timedelta(hours=config.profile_freshness_hours),
+        now,
+        refresh=refresh,
+    )
+    blob_paths = blob_override_paths(config.blob_overrides)
+    estimate, per_table = _profile_estimate(adapter, stale, include_blobs=blob_paths)
+    handshake_notes = [
+        "relationship inference profiles every object; on a metered "
+        "connector `explore map` (top-ranked objects only) is usually the "
+        "cheaper way in"
+    ]
+    if verify:
+        handshake_notes.append(
+            "--verify overlap probes depend on what inference finds; they "
+            "are priced after profiling, and if their estimate exceeds "
+            "what remains of this budget a second confirmation checkpoint "
+            "appears before any probe runs"
+        )
+    if fresh_reused:
+        handshake_notes.append(
+            f"{len(fresh_reused)} object(s) excluded from this estimate as "
+            "fresh-cached (schema unchanged, profiled within the freshness "
+            "window); pass --refresh to re-profile them"
+        )
+    profiled: list[Dataset] = []
+    # Nothing stale means nothing to price or confirm: skip the handshake and
+    # the scan entirely, and reuse the cached profiles wholesale.
+    if stale:
+        command_args.billed_handshake(
+            "explore relationships",
             adapter,
-            timedelta(hours=config.profile_freshness_hours),
-            now,
-            refresh=getattr(args, "refresh", False),
+            estimate,
+            per_table=per_table,
+            notes=handshake_notes,
         )
-        blob_paths = blob_override_paths(config.blob_overrides)
-        estimate, per_table = _profile_estimate(
-            adapter, stale, include_blobs=blob_paths
-        )
-        handshake_notes = [
-            "relationship inference profiles every object; on a metered "
-            "connector `explore map` (top-ranked objects only) is usually the "
-            "cheaper way in"
-        ]
-        if verify:
-            handshake_notes.append(
-                "--verify overlap probes depend on what inference finds; they "
-                "are priced after profiling, and if their estimate exceeds "
-                "what remains of this budget a second confirmation checkpoint "
-                "appears before any probe runs"
+
+        # Billed-connector-gated per-object checkpointing (see profile).
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, connector, now
             )
-        if fresh_reused:
-            handshake_notes.append(
-                f"{len(fresh_reused)} object(s) excluded from this estimate as "
-                "fresh-cached (schema unchanged, profiled within the freshness "
-                "window); pass --refresh to re-profile them"
-            )
-        profiled: list[Dataset] = []
-        # Nothing stale means nothing to price or confirm: skip the handshake and
-        # the scan entirely, and reuse the cached profiles wholesale.
-        if stale:
-            unconfirmed = command_args.billed_handshake(
-                "explore relationships",
+
+        profile_reporter = _reporter(len(stale), "profiled", "objects")
+        try:
+            profiled = profile_mod.profile(
                 adapter,
-                estimate,
-                per_table=per_table,
-                notes=handshake_notes,
+                stale,
+                progress=profile_reporter,
+                on_complete=checkpoint,
+                pii_overrides=pii_override_paths(config.pii_overrides),
+                include_blobs=blob_paths,
             )
-            if unconfirmed is not None:
-                return unconfirmed
+            profile_reporter.done()
+        except OverCeilingError:
+            over_ceiling = True
 
-            # Billed-connector-gated per-object checkpointing (see cmd_profile).
-            checkpoint = None
-            if command_args.cost_gate(adapter) is not None:
-                checkpoint, accumulated = _profile_checkpointer(
-                    store, prior, connector, now
-                )
-
-            profile_reporter = _reporter(len(stale), "profiled", "objects")
-            try:
-                profiled = profile_mod.profile(
-                    adapter,
-                    stale,
-                    progress=profile_reporter,
-                    on_complete=checkpoint,
-                    pii_overrides=pii_override_paths(config.pii_overrides),
-                    include_blobs=blob_paths,
-                )
-                profile_reporter.done()
-            except OverCeilingError:
-                over_ceiling = True
-
-        # Freshly profiled plus fresh-cached: the full inventory, whether scanned
-        # this run or reused. Inference and merge fold by identifier over the union.
-        datasets = profiled + list(fresh_reused.values())
-        if not over_ceiling:
-            suppressed: list[rel_mod.SuppressedMatch] = []
-            inferred = rel_mod.infer_relationships(datasets, suppressed=suppressed)
-            if verify:
-                probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
-                verify_pending = command_args.verify_handshake(
-                    "explore relationships",
-                    adapter,
-                    probe_cost,
-                    candidate_count=candidates,
-                    object_count=objects,
-                )
-                if verify_pending is None:
-                    verify_reporter = _reporter(len(inferred), "verified", "joins")
-                    try:
-                        rel_mod.verify_relationships(
-                            adapter,
-                            inferred,
-                            timeout_seconds=config.query.timeout_seconds,
-                            progress=verify_reporter,
-                        )
-                        verify_reporter.done()
-                    except OverCeilingError:
-                        # Estimate drift mid-loop; the relationship set itself
-                        # is complete, so finish with a warning (see cmd_map).
-                        done = sum(1 for r in inferred if r.verified)
-                        verify_warning = (
-                            f"budget exhausted after verifying {done} of "
-                            f"{len(inferred)} candidate join(s); verified "
-                            "results are saved; raise --budget and re-run to "
-                            "finish verification"
-                        )
-        envelope = verify_pending or env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
     if over_ceiling:
-        envelope = _over_ceiling_error(store, accumulated, len(stale))
-        command_args.stamp_spend(envelope, adapter)
-        return envelope
+        raise _budget_exhausted(store, adapter, accumulated, len(stale))
+
+    # Freshly profiled plus fresh-cached: the full inventory, whether scanned
+    # this run or reused. Inference and merge fold by identifier over the union.
+    datasets = profiled + list(fresh_reused.values())
+    suppressed: list[rel_mod.SuppressedMatch] = []
+    inferred = rel_mod.infer_relationships(datasets, suppressed=suppressed)
+    if verify:
+        probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
+        verify_pending = command_args.verify_handshake(
+            "explore relationships",
+            adapter,
+            probe_cost,
+            candidate_count=candidates,
+            object_count=objects,
+        )
+        if verify_pending is None:
+            verify_reporter = _reporter(len(inferred), "verified", "joins")
+            try:
+                rel_mod.verify_relationships(
+                    adapter,
+                    inferred,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
+                )
+                verify_reporter.done()
+            except OverCeilingError:
+                # Estimate drift mid-loop; the relationship set itself is
+                # complete, so finish with a warning (see map).
+                done = sum(1 for r in inferred if r.verified)
+                verify_warning = (
+                    f"budget exhausted after verifying {done} of "
+                    f"{len(inferred)} candidate join(s); verified "
+                    "results are saved; raise --budget and re-run to "
+                    "finish verification"
+                )
+
     # Annotate before persisting so cached datasets carry candidate_keys and
     # grain, the same shape a `map`-written cache has. Only the freshly profiled
     # need it; the fresh-cached already carry theirs from the cache write.
     _annotate_grain(profiled, defs)
 
     # Fold same-lineage duplicates before the merge, as `map` does, so the folded
-    # set flows into both the cache and the envelope. Relationships profiles the
+    # set flows into both the cache and the result. Relationships profiles the
     # full inventory, so it is even more likely than map to pull a dev/replica
     # schema into scope alongside its source.
     inferred, folded_edges, mirrored_objects = rel_mod.fold_replica_relationships(
@@ -522,7 +580,7 @@ def cmd_relationships(args: argparse.Namespace, store: Store) -> env.Envelope:
             "(see hint)"
         )
     if verify_warning:
-        envelope.warnings.append(verify_warning)
+        warnings.append(verify_warning)
     if folded_edges > 0:
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
@@ -546,61 +604,71 @@ def cmd_relationships(args: argparse.Namespace, store: Store) -> env.Envelope:
     locator = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
-    envelope.data.update(
-        {
-            "relationships": [r.model_dump(mode="json") for r in rels],
-            "declared_count": len(declared),
-            "inferred_count": len(rels) - len(declared),
-            "profiled_count": len(profiled),
-            "cache_hit_count": len(fresh_reused),
-            "carried_relationship_count": carried_relationships,
-            "cache_path": locator,
-            "updated_at": now.isoformat(),
-            # Merge, not overwrite: a verify checkpoint envelope may already
-            # carry notes from the adapter's estimate description.
-            "notes": [*envelope.data.get("notes", []), *notes],
-        }
+    result = RelationshipsResult(
+        relationships=rels,
+        declared_count=len(declared),
+        profiled_count=len(profiled),
+        cache_hit_count=len(fresh_reused),
+        carried_relationship_count=carried_relationships,
+        cache_path=locator,
+        updated_at=now.isoformat(),
+        notes=notes,
+        warnings=warnings,
+        pending_confirmation=verify_pending,
     )
-    return envelope
+    return command_args.stamp_spend(result, adapter)
 
 
-def cmd_query(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """Run one agent-authored SELECT through the query firewall.
+def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(
+        relationships(
+            engine,
+            verify=getattr(args, "verify", False),
+            refresh=getattr(args, "refresh", False),
+            use_project=getattr(args, "use_project", False),
+        )
+    )
 
-    The cache gate comes first: the PII policy is computed from `.dex/` flags,
-    so probing requires profiling. Every decision, allowed or refused, lands in
-    `.dex/queries.jsonl`.
+
+def query(engine: DexEngine, sql: str) -> QueryResult:
+    """Run one caller-authored SELECT through the query firewall.
+
+    The cache gate comes first and is not a formality: the PII policy the
+    firewall applies is computed from what profiling flagged, so a query cannot
+    be adjudicated against a warehouse nobody has profiled. Every decision,
+    allowed or refused, lands in the query ledger.
     """
 
-    repo_root = command_args.repo_root(args)
+    store = engine.store
+    config = engine.config
     cache = store.load_cache()
     at = datetime.now(UTC).isoformat()
     if cache is None:
-        return env.error(
-            "no .dex/cache.json in this repo; run `explore map` first so the "
-            "query firewall knows the schema and the PII flags"
+        raise CacheRequiredError(
+            "no exploration cache yet; run `explore map` first so the query "
+            "firewall knows the schema and the PII flags"
         )
 
-    config = load_config(repo_root) or DexConfig()
     limits = config.query
     cache = _mask_overridden(cache, pii_override_paths(config.pii_overrides))
     # The firewall parses in the active connector's dialect, so BigQuery SQL
     # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
-    dialect = get_dialect(getattr(args, "connector", None) or config.connector)
+    dialect = get_dialect(engine.connector or config.connector)
     try:
-        inspected = inspect_query(args.sql, cache, limits, dialect=dialect)
+        inspected = inspect_query(sql, cache, limits, dialect=dialect)
     except QueryRefusedError as exc:
         store.append_query_log(
-            {"at": at, "sql": args.sql, "decision": "refused", "reason": str(exc)}
+            {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
         )
-        return env.error(f"query refused: {exc}")
+        raise
 
-    adapter = command_args.open_from_args(args, store)
+    adapter = engine._adapter("explore query")
     try:
         query_estimate = getattr(adapter, "query_estimate", None)
         estimate = query_estimate(inspected.sql) if query_estimate else 0.0
-        unconfirmed = command_args.billed_handshake("explore query", adapter, estimate)
-        if unconfirmed is not None:
+        try:
+            command_args.billed_handshake("explore query", adapter, estimate)
+        except ConfirmationRequiredError:
             store.append_query_log(
                 {
                     "at": at,
@@ -609,14 +677,14 @@ def cmd_query(args: argparse.Namespace, store: Store) -> env.Envelope:
                     "estimated_bytes": estimate,
                 }
             )
-            return unconfirmed
+            raise
         result = adapter.run_query(
             inspected.sql,
             max_rows=inspected.row_cap,
             timeout_seconds=limits.timeout_seconds,
         )
-        envelope = env.ok({})
-        command_args.stamp_spend(envelope, adapter)
+    except ConfirmationRequiredError:
+        raise
     except Exception as exc:
         store.append_query_log(
             {
@@ -627,199 +695,265 @@ def cmd_query(args: argparse.Namespace, store: Store) -> env.Envelope:
             }
         )
         raise
-    finally:
-        adapter.close()
 
-    data = _shape_query_payload(result, inspected, limits)
-    envelope.data.update(data)
-    envelope.warnings.extend(inspected.warnings)
+    payload = _shape_query_payload(result, inspected, limits)
+    notes = payload.pop("notes")
+    record = QueryResult(
+        **payload,
+        notes=notes,
+        warnings=list(inspected.warnings),
+    )
+    command_args.stamp_spend(record, adapter)
+
     log_entry = {
         "at": at,
         "sql": inspected.sql,
         "decision": "allowed",
-        "tables": inspected.tables,
-        "row_count": data["row_count"],
-        "truncated": data["truncated"],
+        "tables": record.tables,
+        "row_count": record.row_count,
+        "truncated": record.truncated,
     }
     # The audit trail records which allowed queries projected sub-threshold
     # PII-flagged columns, so a later review can find every such projection.
     if inspected.warnings:
         log_entry["pii_warnings"] = inspected.warnings
     store.append_query_log(log_entry)
-    return envelope
+    return record
 
 
-def cmd_semantic(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """`explore semantic list|query`: discover and query the dbt semantic layer.
+def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        return to_envelope(query(engine, args.sql))
+    except QueryRefusedError as exc:
+        return env.error(f"query refused: {exc}")
 
-    Backend resolution and the two guard postures (local: dex renders and executes
-    under its own cost guard; hosted: dbt Cloud executes and dex only warns) live in
-    the ``explore.semantic`` package; this orchestrator just resolves the backend
-    and hands it the intent, turning any backend refusal into a clean envelope.
+
+def semantic_list(engine: DexEngine, *, api: bool = False, local: bool = False):
+    """The metrics, dimensions, and entities the semantic layer exposes."""
+
+    from .semantic import resolve_backend
+
+    backend = resolve_backend(engine, api=api, local=local)
+    catalog = backend.list_definitions()
+    return SemanticListResult(catalog=catalog, notes=list(catalog.notes))
+
+
+def semantic_query(
+    engine: DexEngine,
+    metrics: list[str],
+    *,
+    group_by: list[str] | None = None,
+    where: list[str] | None = None,
+    order_by: list[str] | None = None,
+    grain: str | None = None,
+    limit: int | None = None,
+    api: bool = False,
+    local: bool = False,
+) -> SemanticQueryResult:
+    """Run one governed metric query against the dbt semantic layer.
+
+    Which backend answers decides who governs spend: local renders the metric
+    SQL and executes it under dex's cost guard, while dbt Cloud executes
+    server-side where that guard is structurally unavailable.
     """
 
     from .semantic import SemanticBackendError, SemanticQuery, resolve_backend
 
-    root = command_args.repo_root(args)
-    config = load_config(root) or DexConfig()
-    try:
-        backend = resolve_backend(args, config, root, store)
-        if getattr(args, "mode", None) == "list":
-            return env.ok(backend.list_definitions().to_data())
-        metrics = getattr(args, "metric", None) or []
-        if not metrics:
-            return env.error(
-                "`explore semantic query` needs at least one --metric "
-                "(discover them with `explore semantic list`)"
-            )
-        query = SemanticQuery(
-            metrics=metrics,
-            group_by=getattr(args, "group_by", None) or [],
-            where=getattr(args, "where", None) or [],
-            order_by=getattr(args, "order_by", None) or [],
-            grain=getattr(args, "grain", None),
-            limit=getattr(args, "limit", None),
+    if not metrics:
+        raise SemanticBackendError(
+            "a metric query needs at least one metric (discover them with "
+            "`explore semantic list`)"
         )
-        return backend.query(query)
+    backend = resolve_backend(engine, api=api, local=local)
+    return backend.query(
+        SemanticQuery(
+            metrics=metrics,
+            group_by=group_by or [],
+            where=where or [],
+            order_by=order_by or [],
+            grain=grain,
+            limit=limit,
+        )
+    )
+
+
+def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """`explore semantic list|query`: discover and query the dbt semantic layer.
+
+    Backend resolution and the two guard postures live in the
+    ``explore.semantic`` package; this shim resolves the mode and turns any
+    backend refusal into a clean envelope rather than a stack trace.
+    """
+
+    from .semantic import SemanticBackendError
+
+    api = bool(getattr(args, "api", False))
+    local = bool(getattr(args, "local", False))
+    try:
+        if getattr(args, "mode", None) == "list":
+            return to_envelope(semantic_list(engine, api=api, local=local))
+        return to_envelope(
+            semantic_query(
+                engine,
+                getattr(args, "metric", None) or [],
+                group_by=getattr(args, "group_by", None),
+                where=getattr(args, "where", None),
+                order_by=getattr(args, "order_by", None),
+                grain=getattr(args, "grain", None),
+                limit=getattr(args, "limit", None),
+                api=api,
+                local=local,
+            )
+        )
     except SemanticBackendError as exc:
         return env.error(str(exc))
 
 
-def cmd_map(args: argparse.Namespace, store: Store) -> env.Envelope:
-    repo_root = command_args.repo_root(args)
-    config = load_config(repo_root) or DexConfig()
-    defs = _project_definitions(args, config)
-    hints = _merged_hints(config.ranking_hints, defs.metric_models)
-    full = getattr(args, "full", False)
+def map(
+    engine: DexEngine,
+    *,
+    full: bool = False,
+    verify: bool = False,
+    refresh: bool = False,
+    use_project: bool = False,
+) -> MapResult:
+    """The whole landscape in one pass: inventory, ranked profiling, and joins.
 
-    adapter = command_args.open_from_args(args, store)
+    Note this shadows the builtin ``map`` for the rest of this module, which is
+    the price of every run function being named for its subcommand. Use a
+    comprehension rather than the builtin below this line.
+
+    The default is selective: on a warehouse above the auto-profile threshold
+    only the top-ranked objects are deep-profiled and the rest stay
+    inventory-only, because profiling everything on a metered connector is how a
+    first look becomes an expensive one. ``full`` overrides that.
+    """
+
+    store = engine.store
+    config = engine.config
+    defs = _project_definitions(engine, use_project)
+    hints = _merged_hints(config.ranking_hints, defs.metric_models)
+
+    adapter = engine._adapter("explore map")
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
     prior = store.load_cache()
     accumulated: list[Dataset] = []
     over_ceiling = False
-    verify_pending: env.Envelope | None = None
+    verify_pending: ConfirmationRequest | None = None
     verify_warning: str | None = None
-    try:
-        metas = inventory_mod.inventory(adapter)
-        # First-pass rank on cheap signals (no connectivity yet) to choose what to
-        # profile; re-ranked with connectivity once relationships are known.
-        first_pass = rank_mod.rank(metas, None, hints)
-        selected = _select_for_profiling(metas, first_pass, config, full)
-        # Skip re-scanning a selected object whose cached profile is still fresh
-        # (same connector, schema unchanged, within the freshness window); only
-        # the stale remainder is estimated, confirmed, and profiled below.
-        stale, fresh_reused = _split_fresh_stale(
-            [m.identifier for m in selected],
-            prior,
-            adapter.name,
+    warnings: list[str] = []
+
+    metas = inventory_mod.inventory(adapter)
+    # First-pass rank on cheap signals (no connectivity yet) to choose what to
+    # profile; re-ranked with connectivity once relationships are known.
+    first_pass = rank_mod.rank(metas, None, hints)
+    selected = _select_for_profiling(metas, first_pass, config, full)
+    # Skip re-scanning a selected object whose cached profile is still fresh
+    # (same connector, schema unchanged, within the freshness window); only
+    # the stale remainder is estimated, confirmed, and profiled below.
+    stale, fresh_reused = _split_fresh_stale(
+        [m.identifier for m in selected],
+        prior,
+        adapter.name,
+        adapter,
+        timedelta(hours=config.profile_freshness_hours),
+        now,
+        refresh=refresh,
+    )
+    # Inventory and ranking are free, so an unconfirmed billed run repeats
+    # them on re-issue; only the profiling scans below need the handshake.
+    blob_paths = blob_override_paths(config.blob_overrides)
+    estimate, per_table = _profile_estimate(adapter, stale, include_blobs=blob_paths)
+    handshake_notes: list[str] = []
+    if verify:
+        handshake_notes.append(
+            "--verify overlap probes depend on what inference finds; they "
+            "are priced after profiling, and if their estimate exceeds "
+            "what remains of this budget a second confirmation checkpoint "
+            "appears before any probe runs"
+        )
+    if fresh_reused:
+        handshake_notes.append(
+            f"{len(fresh_reused)} object(s) excluded from this estimate as "
+            "fresh-cached (schema unchanged, profiled within the freshness "
+            "window); pass --refresh to re-profile them"
+        )
+    profiled: list[Dataset] = []
+    # Nothing stale means nothing to price or confirm: skip the handshake and
+    # the scan entirely, and reuse the cached profiles wholesale.
+    if stale:
+        command_args.billed_handshake(
+            "explore map",
             adapter,
-            timedelta(hours=config.profile_freshness_hours),
-            now,
-            refresh=getattr(args, "refresh", False),
+            estimate,
+            per_table=per_table,
+            notes=handshake_notes or None,
         )
-        # Inventory and ranking are free, so an unconfirmed billed run repeats
-        # them on re-issue; only the profiling scans below need the handshake.
-        blob_paths = blob_override_paths(config.blob_overrides)
-        estimate, per_table = _profile_estimate(
-            adapter, stale, include_blobs=blob_paths
-        )
-        handshake_notes: list[str] = []
-        if getattr(args, "verify", False):
-            handshake_notes.append(
-                "--verify overlap probes depend on what inference finds; they "
-                "are priced after profiling, and if their estimate exceeds "
-                "what remains of this budget a second confirmation checkpoint "
-                "appears before any probe runs"
+        # Billed-connector-gated per-object checkpointing (see profile).
+        checkpoint = None
+        if command_args.cost_gate(adapter) is not None:
+            checkpoint, accumulated = _profile_checkpointer(
+                store, prior, adapter.name, now
             )
-        if fresh_reused:
-            handshake_notes.append(
-                f"{len(fresh_reused)} object(s) excluded from this estimate as "
-                "fresh-cached (schema unchanged, profiled within the freshness "
-                "window); pass --refresh to re-profile them"
-            )
-        profiled: list[Dataset] = []
-        # Nothing stale means nothing to price or confirm: skip the handshake and
-        # the scan entirely, and reuse the cached profiles wholesale.
-        if stale:
-            unconfirmed = command_args.billed_handshake(
-                "explore map",
+
+        profile_reporter = _reporter(len(stale), "profiled", "objects")
+        try:
+            profiled = profile_mod.profile(
                 adapter,
-                estimate,
-                per_table=per_table,
-                notes=handshake_notes or None,
+                stale,
+                progress=profile_reporter,
+                on_complete=checkpoint,
+                pii_overrides=pii_override_paths(config.pii_overrides),
+                include_blobs=blob_paths,
             )
-            if unconfirmed is not None:
-                return unconfirmed
-            # Billed-connector-gated per-object checkpointing (see cmd_profile).
-            checkpoint = None
-            if command_args.cost_gate(adapter) is not None:
-                checkpoint, accumulated = _profile_checkpointer(
-                    store, prior, adapter.name, now
-                )
+            profile_reporter.done()
+        except OverCeilingError:
+            over_ceiling = True
 
-            profile_reporter = _reporter(len(stale), "profiled", "objects")
-            try:
-                profiled = profile_mod.profile(
-                    adapter,
-                    stale,
-                    progress=profile_reporter,
-                    on_complete=checkpoint,
-                    pii_overrides=pii_override_paths(config.pii_overrides),
-                    include_blobs=blob_paths,
-                )
-                profile_reporter.done()
-            except OverCeilingError:
-                over_ceiling = True
-
-        # Freshly profiled plus fresh-cached: the full selected set, whether
-        # scanned this run or reused. Only the freshly profiled need annotation;
-        # the reused already carry theirs from the cache write that stored them.
-        all_selected = profiled + list(fresh_reused.values())
-        if not over_ceiling:
-            _annotate_grain(profiled, defs)
-            suppressed: list[rel_mod.SuppressedMatch] = []
-            inferred = rel_mod.infer_relationships(all_selected, suppressed=suppressed)
-            if getattr(args, "verify", False):
-                probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
-                verify_pending = command_args.verify_handshake(
-                    "explore map",
-                    adapter,
-                    probe_cost,
-                    candidate_count=candidates,
-                    object_count=objects,
-                )
-                if verify_pending is None:
-                    verify_reporter = _reporter(len(inferred), "verified", "joins")
-                    try:
-                        rel_mod.verify_relationships(
-                            adapter,
-                            inferred,
-                            timeout_seconds=config.query.timeout_seconds,
-                            progress=verify_reporter,
-                        )
-                        verify_reporter.done()
-                    except OverCeilingError:
-                        # The upfront probe pricing fit, but per-statement
-                        # estimates drifted past the ceiling mid-loop. The map
-                        # itself is complete, so finish with a warning instead
-                        # of the profiling phase's partial-completion error.
-                        done = sum(1 for r in inferred if r.verified)
-                        verify_warning = (
-                            f"budget exhausted after verifying {done} of "
-                            f"{len(inferred)} candidate join(s); verified "
-                            "results are saved; raise --budget and re-run to "
-                            "finish verification"
-                        )
-        envelope = verify_pending or env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
     if over_ceiling:
-        envelope = _over_ceiling_error(store, accumulated, len(stale))
-        command_args.stamp_spend(envelope, adapter)
-        return envelope
+        raise _budget_exhausted(store, adapter, accumulated, len(stale))
+
+    # Freshly profiled plus fresh-cached: the full selected set, whether
+    # scanned this run or reused. Only the freshly profiled need annotation;
+    # the reused already carry theirs from the cache write that stored them.
+    all_selected = profiled + list(fresh_reused.values())
+    _annotate_grain(profiled, defs)
+    suppressed: list[rel_mod.SuppressedMatch] = []
+    inferred = rel_mod.infer_relationships(all_selected, suppressed=suppressed)
+    if verify:
+        probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
+        verify_pending = command_args.verify_handshake(
+            "explore map",
+            adapter,
+            probe_cost,
+            candidate_count=candidates,
+            object_count=objects,
+        )
+        if verify_pending is None:
+            verify_reporter = _reporter(len(inferred), "verified", "joins")
+            try:
+                rel_mod.verify_relationships(
+                    adapter,
+                    inferred,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
+                )
+                verify_reporter.done()
+            except OverCeilingError:
+                # The upfront probe pricing fit, but per-statement estimates
+                # drifted past the ceiling mid-loop. The map itself is
+                # complete, so finish with a warning instead of the profiling
+                # phase's partial-completion error.
+                done = sum(1 for r in inferred if r.verified)
+                verify_warning = (
+                    f"budget exhausted after verifying {done} of "
+                    f"{len(inferred)} candidate join(s); verified "
+                    "results are saved; raise --budget and re-run to "
+                    "finish verification"
+                )
+
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
     # into source, replica, and cross-dataset lookalike edges.
@@ -830,19 +964,19 @@ def cmd_map(args: argparse.Namespace, store: Store) -> env.Envelope:
     declared, declared_notes = rel_mod.declared_relationships(
         defs, [m.identifier for m in metas]
     )
-    relationships, confirmed = _merge_relationships(declared, inferred)
+    relationship_set, confirmed = _merge_relationships(declared, inferred)
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
-    relationships, carried_relationships = _carry_forward_relationships(
-        reusable, examined, relationships
+    relationship_set, carried_relationships = _carry_forward_relationships(
+        reusable, examined, relationship_set
     )
-    final_scores = rank_mod.rank(metas, relationships, hints)
+    final_scores = rank_mod.rank(metas, relationship_set, hints)
     datasets, carried, out_of_scope = _compose_datasets(
         metas, all_selected, final_scores, reusable
     )
 
-    cache = DexCache(datasets=datasets, relationships=relationships)
+    cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
     cache.provenance.created_at = (
         prior.provenance.created_at
@@ -911,141 +1045,132 @@ def cmd_map(args: argparse.Namespace, store: Store) -> env.Envelope:
             "(see hint)"
         )
     if verify_warning:
-        envelope.warnings.append(verify_warning)
+        warnings.append(verify_warning)
 
-    pii_columns = sum(1 for d in all_selected for c in d.columns if c.pii is not None)
-    quality_notes = sum(len(d.data_quality) for d in all_selected)
     top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
-    envelope.data.update(
-        {
-            "cache_path": locator,
-            "object_count": len(metas),
-            "profiled_count": len(profiled),
-            "cache_hit_count": len(fresh_reused),
-            "skipped_count": skipped,
-            "carried_forward_count": carried,
-            "out_of_scope_carried_count": out_of_scope,
-            "carried_relationship_count": carried_relationships,
-            "relationship_count": len(relationships),
-            "pii_column_count": pii_columns,
-            "data_quality_note_count": quality_notes,
-            "top_objects": [
-                {"identifier": d.identifier, "rank_score": d.rank_score} for d in top
-            ],
-            # Merge, not overwrite: a verify checkpoint envelope may already
-            # carry notes from the adapter's estimate description.
-            "notes": [*envelope.data.get("notes", []), *notes],
-            "updated_at": now.isoformat(),
-        }
+    result = MapResult(
+        cache=cache,
+        cache_path=locator,
+        object_count=len(metas),
+        profiled_count=len(profiled),
+        cache_hit_count=len(fresh_reused),
+        skipped_count=skipped,
+        carried_forward_count=carried,
+        out_of_scope_carried_count=out_of_scope,
+        carried_relationship_count=carried_relationships,
+        relationship_count=len(relationship_set),
+        pii_column_count=sum(
+            1 for d in all_selected for c in d.columns if c.pii is not None
+        ),
+        data_quality_note_count=sum(len(d.data_quality) for d in all_selected),
+        top_objects=[
+            RankedObject(identifier=d.identifier, rank_score=d.rank_score) for d in top
+        ],
+        updated_at=now.isoformat(),
+        notes=notes,
+        warnings=warnings,
+        pending_confirmation=verify_pending,
     )
-    return envelope
+    return command_args.stamp_spend(result, adapter)
 
 
-def cmd_cluster(args: argparse.Namespace, store: Store) -> env.Envelope:
-    """k-means clustering over a bounded sample of one object's numeric columns.
+def cmd_map(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(
+        map(
+            engine,
+            full=getattr(args, "full", False),
+            verify=getattr(args, "verify", False),
+            refresh=getattr(args, "refresh", False),
+            use_project=getattr(args, "use_project", False),
+        )
+    )
 
-    Cache-gated like `explore query`: profiling is what tells us which columns
-    are numeric and which are PII, so `explore map`/`profile` must have run. Only
-    the feature columns are scanned, only a bounded sample is fetched into the
-    engine for scikit-learn, and only aggregates (cluster sizes and centroids)
-    reach the envelope. The sample query goes through the same cost-before-spend
-    handshake as every other scanning command.
+
+def cluster(
+    engine: DexEngine,
+    obj: str,
+    *,
+    features: list[str] | None = None,
+    k: int | None = None,
+) -> ClusterResult:
+    """k-means over a bounded sample of one object's numeric columns.
+
+    Cache-gated like :func:`query`, and for the same reason: profiling is what
+    says which columns are numeric and which are PII. Only the feature columns
+    are scanned, only a bounded sample is fetched into the process for
+    scikit-learn, and only aggregates (cluster sizes and centroids) come back.
+    The sample query goes through the same cost-before-spend handshake as every
+    other scanning command.
     """
 
-    repo_root = command_args.repo_root(args)
+    store = engine.store
+    config = engine.config
     cache = store.load_cache()
     if cache is None:
-        return env.error(
-            "no .dex/cache.json in this repo; run `explore map` (or `explore "
-            "profile <object>`) first so clustering knows which columns are "
-            "numeric and which are PII"
+        raise CacheRequiredError(
+            "no exploration cache yet; run `explore map` (or `explore profile "
+            "<object>`) first so clustering knows which columns are numeric and "
+            "which are PII"
         )
 
     # Fail fast if the [cluster] extra is missing: no connection, no spend.
-    try:
-        cluster_mod.ensure_available()
-    except cluster_mod.ClusterDependencyError as exc:
-        return env.error(str(exc))
+    cluster_mod.ensure_available()
 
-    config = load_config(repo_root) or DexConfig()
     limits = config.cluster
-
     known = [d.identifier for d in cache.datasets if d.columns]
-    matches = match_identifier(args.object, known)
+    matches = match_identifier(obj, known)
     if not matches:
-        return env.error(
-            f"'{args.object}' is not a profiled object in the .dex cache; run "
-            f"`explore profile {args.object}` (or `explore map`) first"
+        raise CacheRequiredError(
+            f"'{obj}' is not a profiled object in the exploration cache; run "
+            f"`explore profile {obj}` (or `explore map`) first"
         )
     if len(matches) > 1:
-        return env.error(
-            f"'{args.object}' is ambiguous: {', '.join(matches)}; qualify it"
-        )
+        raise ValueError(f"'{obj}' is ambiguous: {', '.join(matches)}; qualify it")
     dataset = next(d for d in cache.datasets if d.identifier == matches[0])
 
-    requested = _split_features(getattr(args, "features", None))
-    try:
-        features, selection_notes = _select_cluster_features(
-            dataset, requested, limits.max_features, cache.relationships
-        )
-    except ValueError as exc:
-        return env.error(str(exc))
+    feature_names, selection_notes = _select_cluster_features(
+        dataset, features, limits.max_features, cache.relationships
+    )
 
-    k = getattr(args, "k", None)
+    adapter = engine._adapter("explore cluster")
+    sample_sql, sample_method = cluster_mod.build_sample_sql(
+        dataset.identifier,
+        feature_names,
+        dialect=adapter.dialect,
+        sample_rows=limits.sample_rows,
+        row_count=dataset.row_count,
+        seed=limits.sample_seed,
+    )
+    repeatable = cluster_mod.sample_is_repeatable(adapter.dialect, limits.sample_seed)
+    adapter_name = adapter.name
+    query_estimate = getattr(adapter, "query_estimate", None)
+    estimate = query_estimate(sample_sql) if query_estimate else 0.0
+    command_args.billed_handshake(
+        "explore cluster",
+        adapter,
+        estimate,
+        notes=[
+            f"clusters a sample of up to {limits.sample_rows} rows over "
+            f"{len(feature_names)} feature column(s); sampling: {sample_method}"
+        ],
+    )
+    sample = adapter.run_query(
+        sample_sql,
+        max_rows=limits.sample_rows,
+        timeout_seconds=limits.timeout_seconds,
+    )
 
-    adapter = command_args.open_from_args(args, store)
-    try:
-        sample_sql, sample_method = cluster_mod.build_sample_sql(
-            dataset.identifier,
-            features,
-            dialect=adapter.dialect,
-            sample_rows=limits.sample_rows,
-            row_count=dataset.row_count,
-            seed=limits.sample_seed,
-        )
-        repeatable = cluster_mod.sample_is_repeatable(
-            adapter.dialect, limits.sample_seed
-        )
-        adapter_name = adapter.name
-        query_estimate = getattr(adapter, "query_estimate", None)
-        estimate = query_estimate(sample_sql) if query_estimate else 0.0
-        unconfirmed = command_args.billed_handshake(
-            "explore cluster",
-            adapter,
-            estimate,
-            notes=[
-                f"clusters a sample of up to {limits.sample_rows} rows over "
-                f"{len(features)} feature column(s); sampling: {sample_method}"
-            ],
-        )
-        if unconfirmed is not None:
-            return unconfirmed
-        result = adapter.run_query(
-            sample_sql,
-            max_rows=limits.sample_rows,
-            timeout_seconds=limits.timeout_seconds,
-        )
-        envelope = env.ok({})
-        command_args.stamp_spend(envelope, adapter)
-    finally:
-        adapter.close()
-
-    try:
-        cluster_result = cluster_mod.cluster_features(
-            features,
-            result.cells,
-            k=k,
-            k_min=limits.k_min,
-            k_max=limits.k_max,
-            silhouette_sample=limits.silhouette_sample,
-            random_state=limits.random_state,
-        )
-    except cluster_mod.ClusterError as exc:
-        return env.error(str(exc))
-
-    data = cluster_result.to_data()
-    notes = [*selection_notes, *data.pop("notes", [])]
-    if result.truncated:
+    clustering = cluster_mod.cluster_features(
+        feature_names,
+        sample.cells,
+        k=k,
+        k_min=limits.k_min,
+        k_max=limits.k_max,
+        silhouette_sample=limits.silhouette_sample,
+        random_state=limits.random_state,
+    ).to_data()
+    notes = [*selection_notes, *clustering.pop("notes", [])]
+    if sample.truncated:
         notes.append(
             f"the sample hit the {limits.sample_rows}-row cap (the table has more "
             "rows); raise cluster.sample_rows in .dex/config.yml to widen it"
@@ -1056,17 +1181,34 @@ def cmd_cluster(args: argparse.Namespace, store: Store) -> env.Envelope:
             "draw different rows and reach a different k. Compare runs only with "
             "an identical sample"
         )
-    envelope.data.update(
-        {
-            "object": dataset.identifier,
-            "total_rows": dataset.row_count,
-            "sample_method": sample_method,
-            "sample_repeatable": repeatable,
-            **data,
-            "notes": notes,
-        }
+    result = ClusterResult(
+        object=dataset.identifier,
+        total_rows=dataset.row_count,
+        sample_method=sample_method,
+        sample_repeatable=repeatable,
+        clustering=clustering,
+        notes=notes,
     )
-    return envelope
+    return command_args.stamp_spend(result, adapter)
+
+
+def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        return to_envelope(
+            cluster(
+                engine,
+                args.object,
+                features=_split_features(getattr(args, "features", None)),
+                k=getattr(args, "k", None),
+            )
+        )
+    except (
+        CacheRequiredError,
+        ValueError,
+        cluster_mod.ClusterError,
+        cluster_mod.ClusterDependencyError,
+    ) as exc:
+        return env.error(str(exc))
 
 
 # --- helpers -----------------------------------------------------------------
@@ -1215,7 +1357,7 @@ def _select_cluster_features(
             )
         if not rels and (excluded_named or features):
             notes.append(
-                "no relationships in the .dex cache, so key detection fell back "
+                "no relationships in the exploration cache, so key detection fell back "
                 "to column names; run `explore relationships` (or `explore map`) "
                 "for join-based detection"
             )
@@ -1293,22 +1435,26 @@ def _shape_query_payload(
 
 
 def _project_definitions(
-    args: argparse.Namespace, config: DexConfig
+    engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
     """The dbt project's declared definitions, honoring the config pin.
 
     Exploration starts bare: warehouse observations stay independent of
     whatever repo dex happens to run from, so the declared definitions fold in
-    only when ``--use-project`` asks for them. Without the flag, a present
-    project earns a discovery note instead of influence. With it, a repo
-    without a project (or with an ambiguous choice) degrades to the empty
-    view, so explore keeps working on raw warehouses.
+    only when ``use_project`` asks for them. Without it, a present project earns
+    a discovery note instead of influence. With it, a repo without a project (or
+    with an ambiguous choice) degrades to the empty view, so explore keeps
+    working on raw warehouses, and an engine with no repo root at all does the
+    same rather than refusing.
     """
 
-    repo_root = command_args.repo_root(args)
-    if not getattr(args, "use_project", False):
+    config = engine.config
+    repo_root = engine.repo_root
+    if repo_root is None or not use_project:
         defs = dbt_project.ProjectDefinitions()
-        discovered = dbt_project.discover_projects(repo_root)
+        discovered = (
+            dbt_project.discover_projects(repo_root) if repo_root is not None else []
+        )
         if discovered:
             # project_dir marks "found but unused" so the empty-declared note
             # can say so instead of claiming there is no project.
@@ -1690,26 +1836,33 @@ def _profile_checkpointer(
     return checkpoint, accumulated
 
 
-def _over_ceiling_error(
-    store: Store, accumulated: list[Dataset], selected: int
-) -> env.Envelope:
-    """The partial-completion error envelope for a mid-run budget exhaustion.
+def _budget_exhausted(
+    store: Store, adapter: Adapter, accumulated: list[Dataset], selected: int
+) -> BudgetExhaustedError:
+    """The partial-completion refusal for a mid-run budget exhaustion.
 
     Because ``charge()`` fires before an object's ``Dataset`` is appended,
-    ``accumulated`` holds only fully-profiled objects — a truthful "N of M"."""
+    ``accumulated`` holds only fully-profiled objects, so the "N of M" is
+    truthful. The spend rides along because a caller deciding how much to raise
+    the budget by needs to know what the attempt already cost.
+    """
 
+    gate = command_args.cost_gate(adapter)
+    spend = gate.spend_summary() if gate is not None else None
     n = len(accumulated)
     if n == 0:
-        return env.error(
+        return BudgetExhaustedError(
             f"budget exhausted before the first of {selected} object(s) finished "
-            "profiling; no partial profiles were saved — raise --budget or narrow "
-            "scope, then re-run"
+            "profiling; no partial profiles were saved. Raise --budget or narrow "
+            "scope, then re-run",
+            spend=spend,
         )
     cache_locator = store.locator(Document.CACHE)
-    return env.error(
+    return BudgetExhaustedError(
         f"budget exhausted after profiling {n} of {selected} object(s); partial "
-        f"profiles saved to {cache_locator} — raise --budget or narrow scope, then "
-        "re-run"
+        f"profiles saved to {cache_locator}. Raise --budget or narrow scope, then "
+        "re-run",
+        spend=spend,
     )
 
 
@@ -1799,7 +1952,7 @@ def _persist_note(stats: dict, count: int, *, keeps_relationships: bool) -> str:
             f"({stats['refreshed']} refreshed, {stats['added']} added); {preserved}"
         )
     return (
-        f"created .dex/cache.json with {count} profiled object(s); run "
+        f"created the exploration cache with {count} profiled object(s); run "
         "`explore map` to add the full inventory and relationships"
     )
 
