@@ -78,6 +78,20 @@ discovered from `DBT_SL_TOKEN` (then `~/.dbt/dbt_cloud.yml`), held only for the
 `Authorization` header, and never written to config or an envelope. Needs the
 `[semantic-api]` extra (an httpx client, nothing heavier).
 
+A library caller can supply the token instead of having it discovered, with
+`SemanticSource` on the engine. That matters for a process serving several end
+users, where the ambient sources are process-wide and so cannot express one
+principal per request; it also makes this the one dex surface that reaches a
+warehouse with nothing on the filesystem, since it needs no project, no store, and
+no connector. When a token is supplied, nothing ambient is read, the coordinates
+included, so a stray `DBT_SL_HOST` cannot redirect the request. The CLI is
+unaffected and discovers exactly as described above.
+
+Selecting this backend is explicit: `semantic.backend` defaults to `local`, so a
+deployment with no dbt project sets `semantic.backend: dbt_cloud` in config or
+passes `--api`. Leaving the default in place there is refused with that fix named,
+rather than failing further in on a missing project.
+
 **The cost guard is unavailable on this backend, and dex says so on every
 result.** dbt Cloud owns the warehouse connection and executes the query
 server-side under its own credential, so dex cannot dry-run to estimate cost and
@@ -107,4 +121,5 @@ recovery hint before anything reaches dbt Cloud.
 | PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata plus a name heuristic |
 | Namespace mismatch | refused before spend, against the cached inventory | dbt Cloud resolves its own relations |
 | Credentials | the connector's, never in context | a dbt Cloud service token, never in context |
+| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |
