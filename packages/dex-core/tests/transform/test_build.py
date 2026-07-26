@@ -700,7 +700,7 @@ def _install_fake_pricing(
     fake adapter, whose ``.closed`` records that ``cmd_build`` closed it.
     """
 
-    from exmergo_dex_core import command_args
+    from exmergo_dex_core.engine import Engine
     from exmergo_dex_core.guards.cost_guard import CostGate
     from exmergo_dex_core.transform import dev_target
 
@@ -730,7 +730,7 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
-    monkeypatch.setattr(command_args, "open_from_args", lambda args, store: adapter)
+    monkeypatch.setattr(Engine, "_adapter", lambda self, command=None, **kw: adapter)
     monkeypatch.setattr(
         build_module,
         "compile_estimate",
@@ -841,15 +841,15 @@ def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
     connection dex cannot open must not break a build dbt could run: pricing
     degrades to no estimate with a note, and the gate still binds."""
 
-    from exmergo_dex_core import command_args
+    from exmergo_dex_core.engine import Engine
     from exmergo_dex_core.transform import dev_target
 
     monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
 
-    def boom(args, store):
+    def boom(self, command=None, **_kw):
         raise RuntimeError("no application default credentials")
 
-    monkeypatch.setattr(command_args, "open_from_args", boom)
+    monkeypatch.setattr(Engine, "_adapter", boom)
     rc, envelope = _run(
         [
             "--repo-root",
@@ -1096,11 +1096,9 @@ def test_build_hands_the_dev_target_preflight_a_store_for_a_billed_connector(
         stores.append(store)
         return _Probe()
 
-    import exmergo_dex_core.command_args as command_args_mod
     import exmergo_dex_core.connect as connect_mod
 
     monkeypatch.setattr(connect_mod, "open_adapter", opener)
-    monkeypatch.setattr(command_args_mod, "open_adapter", opener)
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
     monkeypatch.setattr(build_module, "compile_estimate", lambda *a, **k: (1.0, {}, []))
 

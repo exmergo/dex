@@ -214,7 +214,7 @@ def test_pii_refusal_without_a_twin_still_refuses_cleanly(cache: DexCache):
     ("sql", "fragment"),
     [
         ("SELECT nope FROM RAW_HOSTS", "nope"),
-        ("SELECT ID FROM missing_table", "not in the .dex cache"),
+        ("SELECT ID FROM missing_table", "not in the exploration cache"),
         ("SELECT ID FROM UNPROFILED", "not profiled"),
         ("SELECT ID FROM RAW_LISTINGS l, RAW_HOSTS h", "ambiguous"),
         ("PRAGMA database_list", "Pragma"),
@@ -541,7 +541,7 @@ UNNEST_REFUSED = [
     (
         "redshift",
         "SELECT elem FROM RAW_HOSTS r, x.ATTRS AS elem",
-        "not in the .dex cache",
+        "not in the exploration cache",
     ),
 ]
 

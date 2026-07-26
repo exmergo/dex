@@ -704,7 +704,7 @@ def test_profile_writes_cache_when_none_exists(
     assert (repo / ".dex" / "cache.json").is_file()
     assert payload["data"]["cache_path"].endswith("cache.json")
     assert payload["data"]["updated_at"]
-    assert any("created .dex/cache.json" in n for n in payload["data"]["notes"])
+    assert any("created the exploration cache" in n for n in payload["data"]["notes"])
     assert any("explore map" in n for n in payload["data"]["notes"])
 
     cache = FilesystemStore(repo).load_cache()

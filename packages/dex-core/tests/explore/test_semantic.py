@@ -24,6 +24,7 @@ from exmergo_dex_core.cache import (
     PIIFlag,
 )
 from exmergo_dex_core.config import DexConfig, QueryLimits
+from exmergo_dex_core.engine import Engine
 from exmergo_dex_core.explore import semantic as sem
 from exmergo_dex_core.explore.semantic import (
     SemanticQuery,
@@ -32,12 +33,15 @@ from exmergo_dex_core.explore.semantic import (
     screen_dimension_refs,
 )
 from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import MemoryStore
 
 
-class _Args:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+def _engine(config: DexConfig | None = None, **kwargs) -> Engine:
+    """A real engine, never opened. The backends read config and store off it and
+    route their one billed path through it, so a stand-in would test the stand-in."""
+
+    return Engine(config=config or DexConfig(), store=MemoryStore(), **kwargs)
 
 
 # ---- the shared abstraction -------------------------------------------------
@@ -125,34 +129,22 @@ def test_resolve_backend_selection(monkeypatch):
     monkeypatch.setattr(
         hosted_mod.HostedDbtCloudBackend,
         "from_config",
-        classmethod(lambda cls, args, config: "HOSTED"),
+        classmethod(lambda cls, config: "HOSTED"),
     )
     monkeypatch.setattr(
         local_mod.LocalMetricFlowBackend,
-        "from_args",
-        classmethod(lambda cls, args, config, store: "LOCAL"),
+        "from_engine",
+        classmethod(lambda cls, engine: "LOCAL"),
     )
-    cfg = DexConfig()
-    assert (
-        sem.resolve_backend(_Args(api=True, local=False), cfg, ".", MemoryStore())
-        == "HOSTED"
-    )
-    assert (
-        sem.resolve_backend(_Args(api=False, local=True), cfg, ".", MemoryStore())
-        == "LOCAL"
-    )
+    engine = _engine()
+    assert sem.resolve_backend(engine, api=True) == "HOSTED"
+    assert sem.resolve_backend(engine, local=True) == "LOCAL"
     # default (no flag) follows config; a bare project defaults to local
-    assert (
-        sem.resolve_backend(_Args(api=False, local=False), cfg, ".", MemoryStore())
-        == "LOCAL"
-    )
-    cfg_cloud = DexConfig(semantic={"backend": "dbt_cloud"})
-    hosted = sem.resolve_backend(
-        _Args(api=False, local=False), cfg_cloud, ".", MemoryStore()
-    )
-    assert hosted == "HOSTED"
+    assert sem.resolve_backend(engine) == "LOCAL"
+    cloud = _engine(DexConfig(semantic={"backend": "dbt_cloud"}))
+    assert sem.resolve_backend(cloud) == "HOSTED"
     with pytest.raises(sem.SemanticBackendError):
-        sem.resolve_backend(_Args(api=True, local=True), cfg, ".", MemoryStore())
+        sem.resolve_backend(engine, api=True, local=True)
 
 
 # ---- hosted backend (fake transport) ----------------------------------------
@@ -192,36 +184,36 @@ def test_hosted_query_is_warn_only_and_shaped():
         [["2025-01-01", 5.0], ["2025-02-01", 9.0]],
     )
     backend = FakeHostedBackend(result=result)
-    envelope = backend.query(
+    result = backend.query(
         SemanticQuery(metrics=["sessions"], group_by=["metric_time__month"], limit=5)
     )
-    assert envelope.status == env.Status.OK
     # honest posture: paradigm hosted, no estimate/ceiling, explicit warning
-    assert envelope.cost.paradigm == env.Paradigm.HOSTED
-    assert envelope.cost.estimate is None and envelope.cost.ceiling is None
-    assert any("cost guard unavailable" in w for w in envelope.warnings)
+    assert result.cost.paradigm == env.Paradigm.HOSTED
+    assert result.cost.estimate is None and result.cost.ceiling is None
+    assert any("cost guard unavailable" in w for w in result.warnings)
     # the pandas index column is dropped; shape matches explore query
+    assert result.columns == ["metric_time__month", "sessions"]
+    assert result.row_count == 2
+    assert result.query_id == "FAKE_QID"
+    # and the same shape survives the trip to stdout
+    envelope = to_envelope(result)
+    assert envelope.status == env.Status.OK
     assert envelope.data["columns"] == ["metric_time__month", "sessions"]
-    assert envelope.data["row_count"] == 2
     assert envelope.data["query_id"] == "FAKE_QID"
 
 
 def test_hosted_pii_gate_blocks_before_execution():
     backend = FakeHostedBackend()
-    envelope = backend.query(
-        SemanticQuery(metrics=["sessions"], group_by=["user__email"])
-    )
-    assert envelope.status == env.Status.ERROR
-    assert "PII" in envelope.errors[0]
+    with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
+        backend.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
     # the refusal happens before the query is submitted for execution
     assert not any("createQuery" in posted for posted in backend.posted)
 
 
 def test_hosted_failed_query_surfaces_error():
     backend = FakeHostedBackend(status="FAILED", error="bad grain")
-    envelope = backend.query(SemanticQuery(metrics=["sessions"]))
-    assert envelope.status == env.Status.ERROR
-    assert "bad grain" in envelope.errors[0]
+    with pytest.raises(sem.SemanticBackendError, match="bad grain"):
+        backend.query(SemanticQuery(metrics=["sessions"]))
 
 
 # ---- local backend read-view ------------------------------------------------
@@ -254,7 +246,7 @@ def _write_manifest(tmp_path: Path) -> Path:
 
 def test_local_list_reads_manifest(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _write_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _write_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     catalog = backend.list_definitions()
     assert catalog.backend == "local"
@@ -265,23 +257,16 @@ def test_local_list_reads_manifest(tmp_path: Path):
 
 
 def test_local_list_missing_manifest_errors(tmp_path: Path):
-    backend = LocalMetricFlowBackend(
-        tmp_path, None, None, "duckdb", QueryLimits(), MemoryStore()
-    )
+    backend = LocalMetricFlowBackend(tmp_path, _engine(), "duckdb", QueryLimits())
     with pytest.raises(sem.SemanticBackendError):
         backend.list_definitions()
 
 
 def test_local_query_pii_gate_blocks_before_render(tmp_path: Path):
     # No manifest and no metricflow needed: the PII gate runs before rendering.
-    backend = LocalMetricFlowBackend(
-        tmp_path, None, None, "duckdb", QueryLimits(), MemoryStore()
-    )
-    envelope = backend.query(
-        SemanticQuery(metrics=["orders"], group_by=["customer__email"])
-    )
-    assert envelope.status == env.Status.ERROR
-    assert "PII" in envelope.errors[0]
+    backend = LocalMetricFlowBackend(tmp_path, _engine(), "duckdb", QueryLimits())
+    with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
+        backend.query(SemanticQuery(metrics=["orders"], group_by=["customer__email"]))
 
 
 # ---- local guards: cache-backed PII + namespace pre-check -------------------
@@ -326,7 +311,7 @@ def test_local_cache_pii_flag_blocks_a_clean_named_dimension(tmp_path: Path):
     # `order__contact` reads innocuous by name; the cache says its physical column
     # is flagged email. Evidence must block what the heuristic would have allowed.
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     cache = _cache_with(
         [
@@ -345,7 +330,7 @@ def test_local_cache_pii_flag_blocks_a_clean_named_dimension(tmp_path: Path):
 
 def test_local_cache_clears_a_profiled_unflagged_column(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     cache = _cache_with([ColumnProfile(name="contact_col", data_type="VARCHAR")])
     assert backend._cache_pii_lookup(cache)("order__contact") == {"pii": False}
@@ -353,7 +338,7 @@ def test_local_cache_clears_a_profiled_unflagged_column(tmp_path: Path):
 
 def test_local_cache_lookup_is_silent_on_unknown_dimensions(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     lookup = backend._cache_pii_lookup(_cache_with([]))
     # Not in the manifest at all, and a column the cache never profiled: both must
@@ -364,7 +349,7 @@ def test_local_cache_lookup_is_silent_on_unknown_dimensions(tmp_path: Path):
 
 def test_namespace_precheck_refuses_a_foreign_relation(tmp_path: Path):
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
     sql = "SELECT status FROM other_db.main.orders"
@@ -377,7 +362,7 @@ def test_namespace_precheck_accepts_a_suffix_match(tmp_path: Path):
     # The cache is connector-normalized, so a legitimate spelling that resolves by
     # suffix must pass rather than being rejected on an exact string compare.
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
     for sql in ("SELECT status FROM main.orders", "SELECT status FROM orders"):
@@ -387,7 +372,7 @@ def test_namespace_precheck_accepts_a_suffix_match(tmp_path: Path):
 def test_namespace_precheck_noops_without_an_inventory(tmp_path: Path):
     # No `explore map` yet: nothing to check against, so metric queries still run.
     backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), None, None, "duckdb", QueryLimits(), MemoryStore()
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     sql = "SELECT status FROM anything.at.all"
     assert backend._namespace_mismatch(sql, None, "duckdb") is None
@@ -402,3 +387,40 @@ def test_token_never_reaches_the_envelope():
     # appear nowhere in the serialized envelope
     env.sanitize(envelope)
     assert SECRET_TOKEN not in json.dumps(envelope.model_dump(mode="json"))
+
+
+def test_local_render_reaches_the_metricflow_engine(tmp_path: Path):
+    """`_render` must resolve the MetricFlow engine, not the dex engine.
+
+    The backend holds both, and for a while it held them under the same name, so
+    rendering called the dex `Engine` object. Nothing caught it because every
+    other local-backend test stops at the PII gate, which runs before rendering.
+    This one goes through `_render` with the MetricFlow side faked, so the two
+    engines can never collide again unnoticed.
+    """
+
+    pytest.importorskip("metricflow")
+
+    class _Explained:
+        sql_statement = type("_Sql", (), {"sql": "select 1 as orders"})()
+
+    class _FakeMetricFlow:
+        def __init__(self):
+            self.requests = []
+
+        def explain(self, request):
+            self.requests.append(request)
+            return _Explained()
+
+    backend = LocalMetricFlowBackend(
+        _write_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    fake = _FakeMetricFlow()
+    backend._metricflow_engine = lambda: fake
+
+    sql = backend._render(SemanticQuery(metrics=["orders"], group_by=["order__status"]))
+    assert sql == "select 1 as orders"
+    assert len(fake.requests) == 1
+    # And the dex engine is still reachable under its own name, for the one
+    # billed path that needs a connection.
+    assert backend._dex.store is backend._store

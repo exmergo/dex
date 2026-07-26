@@ -43,16 +43,12 @@ def no_warehouse(request, monkeypatch):
 
 
 def _patch_open_adapter(monkeypatch, replacement):
-    # Both the source attribute and command_args' import-time binding: patching
-    # only the connect module would leak the replacement into command_args if
-    # its first import happens inside the patched window. Import order matters
-    # for the same reason: command_args must bind the real function before
-    # connect is patched, or the "original" monkeypatch restores is the fake.
-    import exmergo_dex_core.command_args as command_args_mod
+    # One seam is enough now: the engine is the only caller of open_adapter, and
+    # it resolves it off the connect module at call time, so there is no
+    # import-time binding elsewhere that could keep serving the real function.
     import exmergo_dex_core.connect as connect_mod
 
     monkeypatch.setattr(connect_mod, "open_adapter", replacement)
-    monkeypatch.setattr(command_args_mod, "open_adapter", replacement)
 
 
 def _fake_open(monkeypatch, adapter):
