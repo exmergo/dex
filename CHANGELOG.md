@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-26
+
 ### Added
 
 - **A public Python API: `from exmergo_dex_core import DexEngine`** ([#138]). The
