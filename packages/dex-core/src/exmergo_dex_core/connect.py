@@ -46,8 +46,86 @@ from .config import (
     load_config,
 )
 from .envelope import Paradigm
-from .guards.cost_guard import CostGate
+from .guards.cost_guard import CostGate, ledger_field
 from .storage import Store
+
+# What each connector bills in. Absent means free and local (DuckDB), which is
+# also what an unknown name resolves to: no gate, no ceiling, no confirmation.
+_PARADIGMS = {
+    "bigquery": Paradigm.BYTES_SCANNED,
+    "snowflake": Paradigm.COMPUTE_TIME,
+    "databricks": Paradigm.COMPUTE_TIME,
+    "redshift": Paradigm.COMPUTE_TIME,
+    "postgres": Paradigm.DB_LOAD,
+}
+
+
+def paradigm_for(connector: str | None) -> Paradigm:
+    """The cost paradigm a connector bills in, free/local when it bills nothing."""
+
+    return _PARADIGMS.get(connector or "", Paradigm.FREE_LOCAL)
+
+
+def new_cost_gate(
+    connector: str,
+    config: DexConfig,
+    store: Store,
+    *,
+    budget: float | None = None,
+    confirmed: bool = False,
+    command: str | None = None,
+) -> CostGate:
+    """A gate for one command on a billed connector.
+
+    A :class:`CostGate` is per-command state, not per-connection: it accumulates
+    the estimates a single command has charged, remembers whether that command
+    was confirmed, and labels the command's ledger entries. So a caller that
+    holds a connection across commands (the engine does) builds a fresh gate for
+    each one, which also re-settles the session budget against whatever the
+    ledger has recorded since.
+
+    Kept here, alongside credential discovery, on purpose: a host that supplies
+    its own connection must never be the thing that supplies the guard.
+    """
+
+    paradigm = paradigm_for(connector)
+    utc_midnight = (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+    return CostGate(
+        paradigm=paradigm,
+        ceiling=budget if budget is not None else config.budget.ceiling,
+        session_ceiling=config.budget.session_ceiling,
+        session_spent=store.spend_since(
+            utc_midnight, field=ledger_field(paradigm), connector=connector
+        ),
+        confirmed=confirmed,
+        connector=connector,
+        command=command,
+        record=store.append_spend_log,
+    )
+
+
+def no_connector_selected(repo_root: str | Path | None) -> ValueError:
+    """The connector-selection half of "no silent connector default".
+
+    Nothing resolved a connector and nothing explicit was passed, so there is no
+    honest choice left: defaulting to duckdb here would connect a user to a
+    target they never named. The two spellings address the two callers, a CLI run
+    from a directory and a library caller holding no repo at all.
+    """
+
+    if repo_root is None:
+        return ValueError(
+            "no connector selected: pass connector= (with path= for duckdb) or a "
+            "config= that declares one, or build from a project on disk with "
+            "Engine.from_repo(repo_root)"
+        )
+    return ValueError(
+        f"no .dex/config.yml found searching from '{repo_root}' up to the git "
+        "root: run inside your dex project, pass --repo-root, or pass "
+        "--connector/--path for an ad-hoc read"
+    )
 
 
 class CredentialDiscoveryError(Exception):
@@ -88,6 +166,7 @@ def open_adapter(
     datasets: list[str] | None = None,
     scopes: list[str] | None = None,
     repo_root: str | Path = ".",
+    config: DexConfig | None = None,
     store: Store | None = None,
     budget: float | None = None,
     confirmed: bool = False,
@@ -104,21 +183,25 @@ def open_adapter(
     ignored by free ones; ``command`` labels ledger entries. ``store`` is where the
     gate settles the session budget and records spend; it is required on a billed
     connector and unused by a free one, so a DuckDB read needs no store at all.
+
+    Passing ``config`` supplies the configuration outright and **no file is
+    read**: not the one under ``repo_root``, not one anywhere above it. A caller
+    holding a config object has already made the choice this function would
+    otherwise go looking for, and a process serving more than one principal must
+    not be able to inherit a stray config from its filesystem. ``repo_root``
+    still locates the things that are files by nature (a DuckDB path, the
+    credential files a connector discovers), which no config choice moves.
     """
 
-    loaded = load_config(repo_root)
-    if loaded is None and connector is None and path is None:
-        # No config resolved anywhere up the tree, and nothing explicit to fall
-        # back on. Refusing here (rather than defaulting to duckdb) is the
-        # connector-selection half of "no silent connector default": a run from a
-        # subdirectory with a real config higher up is fixed by the walk-up in
-        # command_args, so reaching this point means there is genuinely nothing.
-        raise ValueError(
-            f"no .dex/config.yml found searching from '{repo_root}' up to the git "
-            "root: run inside your dex project, pass --repo-root, or pass "
-            "--connector/--path for an ad-hoc read"
-        )
-    config = loaded or DexConfig()
+    if config is None:
+        loaded = load_config(repo_root)
+        if loaded is None and connector is None and path is None:
+            # No config resolved anywhere up the tree, and nothing explicit to
+            # fall back on. A run from a subdirectory with a real config higher
+            # up is fixed by the walk-up in command_args, so reaching this point
+            # means there is genuinely nothing.
+            raise no_connector_selected(repo_root)
+        config = loaded or DexConfig()
     connector = connector or config.connector
     assert_scope_vocabulary(
         connector, project=project, datasets=datasets, scopes=scopes
@@ -339,18 +422,13 @@ def _open_bigquery(
             "`gcloud auth application-default login`)"
         )
 
-    utc_midnight = (
-        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    )
-    gate = CostGate(
-        paradigm=Paradigm.BYTES_SCANNED,
-        ceiling=budget if budget is not None else config.budget.ceiling,
-        session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(utc_midnight, connector="bigquery"),
+    gate = new_cost_gate(
+        "bigquery",
+        config,
+        store,
+        budget=budget,
         confirmed=confirmed,
-        connector="bigquery",
         command=command,
-        record=store.append_spend_log,
     )
     return get_adapter(
         "bigquery",
@@ -391,20 +469,13 @@ def _open_snowflake(
     params.setdefault("client_session_keep_alive", False)
     connection = snowflake.connector.connect(**params)
 
-    utc_midnight = (
-        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    )
-    gate = CostGate(
-        paradigm=Paradigm.COMPUTE_TIME,
-        ceiling=budget if budget is not None else config.budget.ceiling,
-        session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(
-            utc_midnight, field="billed_seconds", connector="snowflake"
-        ),
+    gate = new_cost_gate(
+        "snowflake",
+        config,
+        store,
+        budget=budget,
         confirmed=confirmed,
-        connector="snowflake",
         command=command,
-        record=store.append_spend_log,
     )
     return get_adapter(
         "snowflake",
@@ -658,20 +729,13 @@ def _open_databricks(
             user_agent_entry="dex",
         )
 
-    utc_midnight = (
-        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    )
-    gate = CostGate(
-        paradigm=Paradigm.COMPUTE_TIME,
-        ceiling=budget if budget is not None else config.budget.ceiling,
-        session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(
-            utc_midnight, field="billed_seconds", connector="databricks"
-        ),
+    gate = new_cost_gate(
+        "databricks",
+        config,
+        store,
+        budget=budget,
         confirmed=confirmed,
-        connector="databricks",
         command=command,
-        record=store.append_spend_log,
     )
     return get_adapter(
         "databricks",
@@ -877,20 +941,13 @@ def _open_postgres(
     # read-only before any statement runs.
     connection = psycopg.connect(**params, autocommit=True, application_name="dex")
 
-    utc_midnight = (
-        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    )
-    gate = CostGate(
-        paradigm=Paradigm.DB_LOAD,
-        ceiling=budget if budget is not None else config.budget.ceiling,
-        session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(
-            utc_midnight, field="billed_seconds", connector="postgres"
-        ),
+    gate = new_cost_gate(
+        "postgres",
+        config,
+        store,
+        budget=budget,
         confirmed=confirmed,
-        connector="postgres",
         command=command,
-        record=store.append_spend_log,
     )
     return get_adapter(
         "postgres",
@@ -1145,20 +1202,13 @@ def _open_redshift(
     # on first contact, and a slow resume can reset the startup handshake.
     connection = _connect_redshift(redshift_connector, params)
 
-    utc_midnight = (
-        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    )
-    gate = CostGate(
-        paradigm=Paradigm.COMPUTE_TIME,
-        ceiling=budget if budget is not None else config.budget.ceiling,
-        session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(
-            utc_midnight, field="billed_seconds", connector="redshift"
-        ),
+    gate = new_cost_gate(
+        "redshift",
+        config,
+        store,
+        budget=budget,
         confirmed=confirmed,
-        connector="redshift",
         command=command,
-        record=store.append_spend_log,
     )
     return get_adapter(
         "redshift",
