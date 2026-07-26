@@ -9,6 +9,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore query` docs now say row-major, matching what `cells` actually
+  returns** ([#152]). The `explore` skill and command contract described
+  `query` results as columnar, but `cells` is a list of rows; a square-ish
+  result set could be silently misread with no error. Docs updated to say
+  row-major across `explore query` and `explore semantic query`; no behavior
+  change.
+
 ## [1.4.1] - 2026-07-26
 
 ### Added

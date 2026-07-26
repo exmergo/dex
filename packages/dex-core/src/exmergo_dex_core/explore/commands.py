@@ -1304,7 +1304,7 @@ def _shape_query_payload(
     inspected: InspectedQuery,
     limits: QueryLimits,
 ) -> dict:
-    """Cap the result for agent context: columnar cells, cell-width truncation,
+    """Cap the result for agent context: row-major cells, cell-width truncation,
     and a total payload byte cap, each announced in `notes` so a cut result is
     never mistaken for a complete one."""
 
