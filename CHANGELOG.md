@@ -9,6 +9,43 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every install now declares the dialect engine it actually imports.** sqlglot
+  was pinned inside each of the six connector extras, but the guards that parse
+  SQL (the query firewall and the SELECT-only assertion) are cross-cutting and
+  eagerly imported, so any install that picked no connector extra failed on an
+  import the metadata never promised. `[semantic-api]`, documented as a
+  pure-remote install needing nothing but an httpx client, could not import the
+  hosted dbt Cloud backend at all; `[cluster]` on its own and a bare install
+  running the read-only `explore semantic list --local` failed the same way. The
+  CLI caught the `ModuleNotFoundError` and reported it inside an error envelope,
+  so it read as a broken environment rather than a packaging bug. sqlglot is now
+  a base dependency, declared once: it is connector-agnostic, pure Python with no
+  dependencies of its own, and required by the guards on every surface. Importing
+  the package still pulls in no sqlglot, so per-command CLI latency is unchanged.
+
+- **`[all]` now installs every optional capability, not just every connector.**
+  The extra covered the six connectors and stopped there, so an install documented
+  as everything silently omitted both semantic-layer backends (`[semantic]`,
+  `[semantic-api]`) and clustering (`[cluster]`), and a user who asked for all of
+  it still got `not_implemented`-shaped failures on `explore semantic` and
+  `explore cluster`. It self-references the other extras, so their requirement
+  lists stay defined once, and a packaging test now asserts the reference list
+  covers every declared extra except `dev` (contributor tooling, not a
+  capability), then installs it and imports every client, dbt adapter, and
+  semantic backend to prove they co-resolve. `[all]` is correspondingly the
+  heaviest install available; the light default and the `[duckdb]` on-ramp are
+  unchanged.
+
+- **The declared sqlglot floor matches what the code needs.** The bound was
+  `>=25` while the firewall's unnest allowlist referenced expression classes at
+  module scope that only exist from 28.6 (`exp.JSONKeys`), so any environment
+  whose resolver settled on an older sqlglot, satisfying the declared bound, hit
+  an `AttributeError` on import. The floor is now `>=28.6`, and a packaging test
+  installs the wheel at exactly the declared floor and imports the guards, so a
+  newly referenced expression class cannot silently outrun the bound again.
+
 ## [1.4.0] - 2026-07-26
 
 ### Added

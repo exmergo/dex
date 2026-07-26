@@ -27,8 +27,12 @@ exmergo-dex-core[bigquery]
 exmergo-dex-core[databricks]
 exmergo-dex-core[redshift]
 exmergo-dex-core[postgres]
-exmergo-dex-core[all]          # every connector at once
+exmergo-dex-core[all]          # every optional capability at once
 ```
+
+Two capabilities sit behind their own extras rather than a connector's:
+`[semantic]` and `[semantic-api]` for the local and hosted semantic-layer query
+backends, and `[cluster]` for `explore cluster`. `[all]` covers all of these too.
 
 ## Two surfaces, one engine
 
