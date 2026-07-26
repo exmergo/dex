@@ -135,6 +135,10 @@ class SnowflakeAdapter:
     Credentials live only inside this process and are never surfaced.
     ``clock`` is injectable so the fake can simulate statement duration; it is
     what actual billed seconds are measured with.
+
+    ``owns_connection`` is False when the connection came from outside dex (a host
+    supplying its own principal). Then :meth:`close` leaves it open, because
+    closing a handle the caller still holds would break the caller.
     """
 
     name = "snowflake"
@@ -151,8 +155,10 @@ class SnowflakeAdapter:
         auth_method: str = "unknown",
         scope_override: list[str] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        owns_connection: bool = True,
     ):
         self._conn = connection
+        self._owns_connection = owns_connection
         self.cost_gate = cost_gate
         self.target = target or SnowflakeTarget()
         self.account = account
@@ -1076,6 +1082,9 @@ class SnowflakeAdapter:
         return ".".join(_quote_ident(p) for p in self._split(identifier))
 
     def close(self) -> None:
+        # A host-supplied connection stays open: dex closes only what it opened.
+        if not self._owns_connection:
+            return
         close = getattr(self._conn, "close", None)
         if close is not None:
             close()
