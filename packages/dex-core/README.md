@@ -71,11 +71,65 @@ unconfirmed billed call raises `ConfirmationRequiredError` carrying the estimate
 and the payload needed to re-issue; an over-ceiling one raises `OverCeilingError`
 and cannot be confirmed through.
 
-Two rules matter the moment a process serves more than one user, and both are in
-`DexEngine`'s docstring: scope one engine to one principal and one session, and know
-that an engine given an explicit `config=` never reads one from disk (so a stray
-`.dex/config.yml` above the working directory cannot silently supply someone
-else's connector, budget, or PII overrides).
+Three rules matter the moment a process serves more than one user, and all three
+are in `DexEngine`'s docstring: scope one engine to one principal and one session,
+know that an engine given an explicit `config=` never reads one from disk (so a
+stray `.dex/config.yml` above the working directory cannot silently supply someone
+else's connector, budget, or PII overrides), and supply the connection when the
+request's identity is not the container's.
+
+That last one is what makes per-end-user access control expressible. By default
+dex discovers the credential from process-ambient state, which is right for one
+person at a terminal and process-wide everywhere else. Pass a `ConnectionSource`
+and the host owns authentication:
+
+```python
+from exmergo_dex_core import ConnectionSource, DexEngine
+
+with DexEngine(
+    connector="snowflake",
+    config=cfg,
+    store=store,
+    connection=ConnectionSource(connect=lambda: user_conn),
+) as eng:
+    eng.inventory()
+```
+
+It is a zero-argument factory rather than a live connection, so a free metadata
+command never opens a billed session. Two things stay dex's. The cost gate is
+still built here from your `store`, so the per-command ceiling and the cumulative
+session ceiling bind exactly as they do on a discovered connection; handing that
+to an integrator would let a fumbled figure disarm the brake in the deployment
+where a runaway agent loop costs the most. And dex closes nothing it reached
+through the source, because the caller that opened a connection is the one still
+holding it. Nothing is persisted either way: dex never stores, caches, or
+refreshes a credential.
+
+A hosted dbt Cloud Semantic Layer is a second service with its own credential, so
+it has its own parameter. Non-secret coordinates go in the config, where they can
+be committed; the service token never can, so it arrives separately:
+
+```python
+from exmergo_dex_core import DexConfig, DexEngine, SemanticSource
+
+config = DexConfig(
+    semantic={"backend": "dbt_cloud", "host": host, "environment_id": env_id}
+)
+
+with DexEngine(
+    config=config,
+    semantic_source=SemanticSource(token=lambda: token_for(user)),
+) as eng:
+    catalog = eng.semantic_list()
+    result = eng.semantic_query("revenue", group_by=["metric_time__month"])
+```
+
+That is the one surface needing nothing on the filesystem at all: no dbt project,
+no store, no connector, no credential file. The token callable runs once per
+semantic command rather than once per HTTP request, so a metric query that polls
+dbt Cloud while it runs costs you one token read. Note that dbt Cloud owns the
+warehouse connection on this path and executes server-side, so dex's cost guard
+cannot apply and every hosted result says so; the PII dimension gate still does.
 
 ### The command contract
 
@@ -136,6 +190,13 @@ scanning axes (grain, dimension cardinality) take the `--confirm --budget`
 handshake, so `check` is two-phase.
 
 ### Connectors
+
+Every connector below discovers its own credentials and never asks for a key or a
+password, which is the right default for a CLI one person runs. A process serving
+several end users supplies the connection instead (see the Python API above), and
+dex still builds the cost gate, narrows scope inward only, and keeps the session
+read-only. The connector extra is required either way, since each adapter reads
+its driver's error types to translate refusals.
 
 BigQuery: connects through Application Default Credentials
 (`gcloud auth application-default login`; dex discovers credentials, it never

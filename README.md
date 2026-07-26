@@ -169,6 +169,12 @@ are read-only, cost is surfaced before any spend (an unconfirmed billed call
 raises `ConfirmationRequiredError` carrying the estimate), and PII stays flagged
 rather than surfaced.
 
+A process serving more than one end user can pass a `ConnectionSource` so each
+request reaches the warehouse as its own principal rather than as the container,
+and a `SemanticSource` to do the same for a hosted dbt Cloud Semantic Layer token.
+The host owns authentication; dex still builds the cost gate from your store, so
+the session budget binds either way.
+
 More info in the package's [`README.md`](packages/dex-core/README.md)
 
 ## Agent References
