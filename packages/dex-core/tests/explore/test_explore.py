@@ -646,6 +646,50 @@ def _semantic_repo(tmp_path: Path) -> tuple[Path, Path]:
     return db, repo
 
 
+def _orphan_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A warehouse with a staging model's built table (stg_orders) plus a
+    same-schema leftover (stg_legacy_orders) no model or source claims."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE stg_orders (id INTEGER)")
+    conn.execute("CREATE TABLE stg_legacy_orders (id INTEGER)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "stg_orders.sql").write_text("select * from x", encoding="utf-8")
+    return db, repo
+
+
+def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
+    db, repo = _orphan_repo(tmp_path)
+    _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    cache = FilesystemStore(repo).load_cache()
+    orphan = next(
+        d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders")
+    )
+    backed = next(d for d in cache.datasets if d.identifier.endswith(".stg_orders"))
+    assert any("orphaned residue" in n for n in orphan.data_quality)
+    assert orphan.rank_score < backed.rank_score
+
+
 def test_map_declared_grain_overrides_heuristic(tmp_path: Path, capsys):
     db, repo = _semantic_repo(tmp_path)
     _run(

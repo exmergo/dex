@@ -846,9 +846,10 @@ def map(
     warnings: list[str] = []
 
     metas = inventory_mod.inventory(adapter)
+    orphaned = _orphan_candidates(metas, defs)
     # First-pass rank on cheap signals (no connectivity yet) to choose what to
     # profile; re-ranked with connectivity once relationships are known.
-    first_pass = rank_mod.rank(metas, None, hints)
+    first_pass = rank_mod.rank(metas, None, hints, orphaned)
     selected = _select_for_profiling(metas, first_pass, config, full)
     # Skip re-scanning a selected object whose cached profile is still fresh
     # (same connector, schema unchanged, within the freshness window); only
@@ -919,7 +920,7 @@ def map(
     # scanned this run or reused. Only the freshly profiled need annotation;
     # the reused already carry theirs from the cache write that stored them.
     all_selected = profiled + list(fresh_reused.values())
-    _annotate_grain(profiled, defs)
+    _annotate_grain(profiled, defs, orphaned=orphaned)
     suppressed: list[rel_mod.SuppressedMatch] = []
     inferred = rel_mod.infer_relationships(all_selected, suppressed=suppressed)
     if verify:
@@ -971,7 +972,7 @@ def map(
     relationship_set, carried_relationships = _carry_forward_relationships(
         reusable, examined, relationship_set
     )
-    final_scores = rank_mod.rank(metas, relationship_set, hints)
+    final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
     datasets, carried, out_of_scope = _compose_datasets(
         metas, all_selected, final_scores, reusable
     )
@@ -1531,6 +1532,35 @@ def _carry_forward_relationships(
     return relationships + carried, len(carried)
 
 
+def _orphan_candidates(
+    metas: list[ObjectMeta], defs: dbt_project.ProjectDefinitions
+) -> set[str]:
+    """Identifiers no current model/source builds or sources, restricted to
+    schemas the project *does* build/source at least one other object into --
+    that schema-membership check stands in for maintain's baseline-vs-current
+    comparison, which explore has no snapshot to perform, so a raw, never
+    dbt-modeled schema is never miscast as full of orphans."""
+
+    if not defs.present or not defs.built_relation_names:
+        return set()
+    backed = {name.lower() for name in defs.built_relation_names}
+    owned_schemas = {
+        meta.identifier.rpartition(".")[0].lower()
+        for meta in metas
+        if "." in meta.identifier
+        and meta.identifier.rpartition(".")[2].lower() in backed
+    }
+    if not owned_schemas:
+        return set()
+    return {
+        meta.identifier
+        for meta in metas
+        if "." in meta.identifier
+        and meta.identifier.rpartition(".")[0].lower() in owned_schemas
+        and meta.identifier.rpartition(".")[2].lower() not in backed
+    }
+
+
 def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
     """User-configured ranking hints plus the models metric definitions ground
     in. User hints come first and are never displaced; metric-backed models are
@@ -1546,7 +1576,10 @@ def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
 
 
 def _annotate_grain(
-    datasets: list[Dataset], defs: dbt_project.ProjectDefinitions | None = None
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None = None,
+    *,
+    orphaned: set[str] | None = None,
 ) -> None:
     """Attach the interpretation layer to raw profiles: candidate keys, the likely
     grain, and the data-quality warnings an analyst would write (non-unique own
@@ -1558,6 +1591,7 @@ def _annotate_grain(
     disagreement), and a profiled column contradicting its declared ``unique``
     test gets a data-quality note. ``candidate_keys`` stays measurement-only:
     an unmeasured declared key is a claim, and the cache is a drift baseline.
+    ``orphaned`` (map only) badges a relation no current model/source builds.
     """
 
     declared_grain: dict[str, str] = {}
@@ -1583,6 +1617,12 @@ def _annotate_grain(
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
         ds.data_quality.extend(rel_mod.data_quality_notes(ds))
+        if orphaned and ds.identifier in orphaned:
+            ds.data_quality.append(
+                "no current dbt model or source builds this relation, though "
+                "the project builds/sources others in this schema; likely "
+                "orphaned residue of a rename or removal"
+            )
 
         grain_column = declared_grain.get(ds.identifier.lower())
         if grain_column is not None:

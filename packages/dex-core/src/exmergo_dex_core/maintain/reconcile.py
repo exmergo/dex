@@ -144,6 +144,22 @@ def build(
 
 
 def _advisory(finding: DriftFinding, view: DbtProjectView) -> Proposal:
+    if finding.code == "orphan_relation":
+        drop_statement = finding.data.get(
+            "drop_statement", f"DROP TABLE {finding.identifier};"
+        )
+        return Proposal(
+            axis=finding.axis,
+            kind="advisory",
+            finding_code=finding.code,
+            identifier=finding.identifier,
+            column=finding.column,
+            action=(
+                "no dbt model or source declares this relation anymore; once "
+                "you've confirmed nothing reads it, drop it by hand (dex "
+                f"never executes this): {drop_statement}"
+            ),
+        )
     actions = {
         "table_added": (
             "a new table appeared; scaffold a staging model with "
