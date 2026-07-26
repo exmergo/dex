@@ -105,12 +105,22 @@ def _project_metadata() -> dict:
 
 
 def _declared_sqlglot_floor() -> str:
-    """The `sqlglot>=X` floor the package metadata declares."""
+    """The floor from the one place sqlglot is pinned, the `[sql]` extra.
 
-    pins = [d for d in _project_metadata()["dependencies"] if d.startswith("sqlglot")]
-    assert len(pins) == 1, f"expected exactly one base sqlglot pin, got {pins}"
-    floor = pins[0].removeprefix("sqlglot>=")
-    assert floor != pins[0], f"expected a >= floor, got {pins[0]}"
+    Also asserts the pin is bounded at both ends. The ceiling is not decoration:
+    the firewall matches sqlglot expression classes by name at module scope, so an
+    open upper bound means a future major can break every new install on something
+    no test here could have seen. If this assertion ever fails, read the `[sql]`
+    comment in pyproject.toml before deleting it.
+    """
+
+    extras = _project_metadata()["optional-dependencies"]
+    pins = [d for d in extras["sql"] if d.startswith("sqlglot")]
+    assert len(pins) == 1, f"expected exactly one sqlglot pin in [sql], got {pins}"
+    floor, _, ceiling = pins[0].removeprefix("sqlglot>=").partition(",")
+    assert floor and ceiling.startswith("<"), (
+        f"expected a floor and a ceiling, got {pins[0]}"
+    )
     return floor
 
 
@@ -148,27 +158,42 @@ def test_importing_the_package_pulls_in_no_connector_client(wheel: str):
     assert done.stdout.strip() == "[]"
 
 
-def test_the_guards_import_with_no_extras_at_all(wheel: str):
-    """The guards parse SQL and are imported eagerly, so the dialect engine is a
-    base dependency, not a per-connector one.
+def test_an_install_that_cannot_parse_sql_refuses_and_names_the_fix(wheel: str):
+    """A guarded command on an install with no connector extra must refuse with the
+    install to run, not die on an import.
 
-    While sqlglot was duplicated across the connector extras, every install that
-    picked no connector (`[semantic-api]`, `[cluster]`, or a bare install running
-    the read-only `explore semantic list --local`) died on an import the metadata
-    never declared. The failure was invisible because the CLI catches it and
-    reports `No module named 'sqlglot'` in an error envelope, which reads like a
-    broken environment rather than a packaging bug.
+    Absent the dialect engine dex cannot promise a query is read-only, so refusing
+    is the only safe answer and there is deliberately no weaker fallback. What is
+    tested here is that the refusal is *usable*: the earlier failure surfaced as
+    `No module named 'sqlglot'` inside an error envelope, which reads as a broken
+    environment rather than a missing extra, and cost a consumer a day of
+    diagnosis. The message has to name the extra instead.
     """
 
+    import json
+
+    done = _run_isolated(
+        wheel, "from exmergo_dex_core.cli import main;main(['explore', 'inventory'])"
+    )
+    envelope = json.loads(done.stdout)
+    assert envelope["status"] == "error", done.stdout
+    message = envelope["errors"][0]
+    assert "sqlglot" in message and "exmergo-dex-core[duckdb]" in message, message
+    assert "No module named" not in message, (
+        f"the refusal must name the extra, not the missing module: {message}"
+    )
+
+    # And the guard is reached before anything is opened or priced, so asking is
+    # free: `ensure_available` must not need the thing whose absence it reports.
     done = _run_isolated(
         wheel,
-        "from exmergo_dex_core.guards import query_firewall, sql_guard;"
-        "import exmergo_dex_core.explore.commands;"
-        "import exmergo_dex_core.explore.semantic;"
-        "print(query_firewall.PII_BLOCK_CONFIDENCE, sql_guard.__name__)",
+        "from exmergo_dex_core.guards.dialect import ensure_available,"
+        " DialectDependencyError;"
+        "\ntry: ensure_available(); print('unexpectedly available')"
+        "\nexcept DialectDependencyError: print('refused cleanly')",
     )
     assert done.returncode == 0, done.stderr
-    assert "0.5" in done.stdout
+    assert "refused cleanly" in done.stdout
 
 
 def test_the_declared_sqlglot_floor_is_high_enough_for_the_guards(wheel: str):
@@ -179,6 +204,10 @@ def test_the_declared_sqlglot_floor_is_high_enough_for_the_guards(wheel: str):
     `AttributeError` on import for any user whose resolver picks an older sqlglot.
     A `>=` bound that the code has outgrown is the same bug as an undeclared
     dependency, and neither shows up when tests run against the newest release.
+
+    The companion risk, a *ceiling* the code has outgrown, cannot be tested here
+    because the breaking release does not exist yet. The `sqlglot-canary` CI job
+    covers that direction by running the guards against the newest sqlglot.
     """
 
     done = _run_isolated(
@@ -187,6 +216,7 @@ def test_the_declared_sqlglot_floor_is_high_enough_for_the_guards(wheel: str):
         "from exmergo_dex_core.guards import query_firewall, sql_guard;"
         "import exmergo_dex_core.explore.commands, exmergo_dex_core.maintain.drift;"
         "print(sqlglot.__version__)",
+        extras=["duckdb"],
         pins=[f"sqlglot=={_declared_sqlglot_floor()}"],
     )
     assert done.returncode == 0, done.stderr
@@ -195,22 +225,32 @@ def test_the_declared_sqlglot_floor_is_high_enough_for_the_guards(wheel: str):
 
 def test_the_hosted_semantic_backend_needs_only_its_own_extra(wheel: str):
     """`[semantic-api]` is the whole install for a pure-remote user: dbt Cloud owns
-    the warehouse connection, so there is no local project, no connector client,
-    and no dbt-core. Reaching the CLI with only that extra has to end in a real
-    envelope (here: the missing coordinates it cannot invent), never an import
-    error for something the extra does not name."""
+    the warehouse connection and executes server-side, so there is no local
+    project, no warehouse client, no dbt-core, and no SQL for dex to parse.
+
+    The first assertion is that sqlglot is genuinely absent. Without it the rest of
+    this test passes for the wrong reason the moment anything puts a dialect engine
+    back in this environment, which is exactly the regression that shipped once
+    already.
+    """
 
     import json
 
     done = _run_isolated(
         wheel,
         "from exmergo_dex_core.explore.semantic.hosted import HostedDbtCloudBackend;"
-        "print(HostedDbtCloudBackend.__name__)",
+        "\ntry: import sqlglot; raise SystemExit('sqlglot must not be installed here')"
+        "\nexcept ImportError: pass"
+        "\nprint(HostedDbtCloudBackend.__name__)",
         extras=["semantic-api"],
     )
     assert done.returncode == 0, done.stderr
     assert "HostedDbtCloudBackend" in done.stdout
 
+    # Both entry points, because they route differently: the CLI through its own
+    # dispatch, the library through DexEngine. Each must reach the backend and come
+    # back with the real refusal (coordinates it cannot invent), never an
+    # ImportError for something this extra does not name.
     done = _run_isolated(
         wheel,
         "from exmergo_dex_core.cli import main;main(['explore', 'semantic', '--api'])",
@@ -219,6 +259,18 @@ def test_the_hosted_semantic_backend_needs_only_its_own_extra(wheel: str):
     envelope = json.loads(done.stdout)
     assert envelope["status"] == "error", done.stdout
     assert "environment id" in envelope["errors"][0]
+
+    done = _run_isolated(
+        wheel,
+        "from exmergo_dex_core import DexEngine, DexConfig;"
+        "from exmergo_dex_core.explore.semantic import SemanticBackendError;"
+        "eng = DexEngine(config=DexConfig(connector='duckdb'));"
+        "\ntry: eng.semantic_list(api=True); print('unexpectedly succeeded')"
+        "\nexcept SemanticBackendError as exc: print('refused:', exc)",
+        extras=["semantic-api"],
+    )
+    assert done.returncode == 0, done.stderr
+    assert "environment id" in done.stdout, done.stdout
 
 
 def test_the_all_extra_installs_every_optional_capability(wheel: str):
@@ -252,6 +304,7 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
         wheel,
         "import duckdb, google.cloud.bigquery, snowflake.connector, psycopg;"
         "import redshift_connector, databricks.sql, sklearn, httpx, metricflow;"
+        "import sqlglot;"
         "import dbt.adapters.duckdb, dbt.adapters.bigquery, dbt.adapters.snowflake;"
         "import dbt.adapters.postgres, dbt.adapters.redshift, dbt.adapters.databricks;"
         "from exmergo_dex_core.explore.semantic.hosted import HostedDbtCloudBackend;"
@@ -261,6 +314,30 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     )
     assert done.returncode == 0, done.stderr
     assert "every capability imported" in done.stdout
+
+
+def test_the_local_semantic_read_view_needs_no_connector_extra(wheel: str):
+    """`explore semantic list --local` is a read of the compiled manifest, so it is
+    documented as needing no extra, and it has to actually hold.
+
+    It shares a command module with the hosted backend for that reason. Reaching it
+    must produce the refusal that belongs to the missing *project* (there is no
+    manifest in a temp directory), not a refusal about a missing dialect engine or
+    connector client, which is what a shared module with the rest of explore would
+    have produced.
+    """
+
+    import json
+
+    done = _run_isolated(
+        wheel,
+        "from exmergo_dex_core.cli import main;"
+        "main(['explore', 'semantic', '--local'])",
+    )
+    envelope = json.loads(done.stdout)
+    assert envelope["status"] == "error", done.stdout
+    message = envelope["errors"][0]
+    assert "sqlglot" not in message and "No module named" not in message, message
 
 
 def test_the_quickstart_example_runs_against_the_installed_package(wheel: str):
