@@ -27,6 +27,8 @@ from . import command_args
 from . import envelope as env
 from .engine import DexEngine
 from .guards.cost_guard import ConfirmationRequiredError
+from .guards.dialect import DialectDependencyError
+from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
 
 # The full command surface. Group -> its subcommands.
@@ -219,14 +221,18 @@ def _build_parser() -> argparse.ArgumentParser:
 def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     """Route one parsed command to its handler and return exactly one envelope.
 
-    Total by construction: the two refusals the engine raises rather than returns
-    (an unmet confirmation, a mid-run budget exhaustion) are transport concerns
-    at this boundary and become envelopes here, so no handler has to know about
-    them and every path out of dispatch is an envelope.
+    Total by construction: the refusals the engine raises rather than returns (an
+    unmet confirmation, a mid-run budget exhaustion, an install that cannot parse
+    SQL) are transport concerns at this boundary and become envelopes here, so no
+    handler has to know about them and every path out of dispatch is an envelope.
     """
 
     try:
         return _run(args, engine)
+    except DialectDependencyError as exc:
+        # A missing extra, caught before the command imported anything that needed
+        # it, so nothing has been opened or priced. The message names the install.
+        return env.error(str(exc))
     except ConfirmationRequiredError as exc:
         return env.needs_confirmation(
             exc.request.data, cost=exc.request.cost, warnings=exc.request.warnings
@@ -246,6 +252,19 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return to_envelope(engine.connect_test())
 
     if args.group == "explore":
+        # `explore semantic` is routed before the rest of the group and from a
+        # different module on purpose: on the hosted backend dbt Cloud renders and
+        # executes the SQL, so the command needs no dialect engine, and a
+        # pure-remote install ([semantic-api], no connector) must be able to reach
+        # it. Importing the module below would pull the query firewall and defeat
+        # that. `--local` lands here too: `list` is a manifest read-view, and a
+        # local `query` reaches the dialect engine through MetricFlow's own path.
+        if args.subcommand == "semantic":
+            from .explore.semantic.commands import cmd_semantic
+
+            return cmd_semantic(args, engine)
+
+        ensure_dialect_available()
         from .explore import commands as explore_cmds
 
         handlers = {
@@ -255,11 +274,11 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "map": explore_cmds.cmd_map,
             "query": explore_cmds.cmd_query,
             "cluster": explore_cmds.cmd_cluster,
-            "semantic": explore_cmds.cmd_semantic,
         }
         return handlers[args.subcommand](args, engine)
 
     if args.group == "maintain":
+        ensure_dialect_available()
         from .maintain import commands as maintain_cmds
 
         handlers = {
@@ -293,6 +312,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     }
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
+        ensure_dialect_available()
         from .transform import commands as transform_cmds
 
         return getattr(transform_cmds, handler)(args, engine)
