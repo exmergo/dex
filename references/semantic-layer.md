@@ -76,7 +76,11 @@ an environment id, and a service token. dex talks to the dbt Cloud Semantic Laye
 GraphQL API (`createQuery` then poll then read the result). The token is
 discovered from `DBT_SL_TOKEN` (then `~/.dbt/dbt_cloud.yml`), held only for the
 `Authorization` header, and never written to config or an envelope. Needs the
-`[semantic-api]` extra (an httpx client, nothing heavier).
+`[semantic-api]` extra, which is an httpx client and nothing heavier: no warehouse
+client, no dbt-core, and no SQL parser, because dbt Cloud renders and executes the
+query and dex never sees a statement to validate. That makes this the one surface a
+pure-remote deployment can run on its own, and the packaging suite holds it to that
+by installing the extra alone and asserting the parser is absent.
 
 A library caller can supply the token instead of having it discovered, with
 `SemanticSource` on the engine. That matters for a process serving several end
