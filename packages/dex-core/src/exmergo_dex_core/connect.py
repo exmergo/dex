@@ -116,6 +116,35 @@ class ConnectionSource:
     workspace: Any | None = None
 
 
+@dataclass(frozen=True)
+class SemanticSource:
+    """What a host supplies in place of Semantic Layer token discovery.
+
+    The sibling of :class:`ConnectionSource`, for the sixth credential path: the
+    hosted dbt Cloud Semantic Layer. Kept separate rather than folded in, because
+    the two reach different services and can carry different principals (a
+    Semantic Layer service token is not the credential a warehouse read uses),
+    and because ``ConnectionSource`` is validated against a connector name, which
+    the semantic layer is orthogonal to.
+
+    The split between this and ``DexConfig.semantic`` is the same one the
+    warehouse path draws. Non-secret coordinates (``host``, ``environment_id``)
+    live in config, which is committed and injectable; the token is a secret and
+    never belongs in a file under version control, so it arrives here.
+
+    A callable rather than a string, so a rotating token is re-read without
+    rebuilding the engine. It is called once per semantic command, not once per
+    HTTP request: a single metric query can poll dbt Cloud dozens of times, and a
+    host fetching its token from a datastore should not pay for each poll.
+
+    Nothing here is persisted, cached, or refreshed by dex.
+    """
+
+    #: Zero-argument, returning the dbt Cloud Semantic Layer service token. Held
+    #: only for the Authorization header, never logged, never put in an envelope.
+    token: Callable[[], str]
+
+
 # Connectors whose adapters take an already-built connection or credential, and so
 # can be opened from a host-supplied one. DuckDB is deliberately absent: its target
 # is a local file dex opens read-only itself, and accepting an outside handle would
@@ -1828,6 +1857,7 @@ def _project_from_dbt_profiles(repo_root: str | Path) -> str | None:
 def resolve_semantic_layer_connection(
     semantic: object | None,
     env: dict | os._Environ,
+    source: SemanticSource | None = None,
 ) -> tuple[str, str, str, str]:
     """Resolve the hosted dbt Cloud Semantic Layer coordinates and token.
 
@@ -1837,9 +1867,38 @@ def resolve_semantic_layer_connection(
     config: ``DBT_SL_TOKEN`` first, then a ``token-value`` in
     ``~/.dbt/dbt_cloud.yml``. Returns ``(host, environment_id, token,
     credential_kind)``; the token value is never logged and ``credential_kind``
-    (``"service_token"``) is the only class safe to surface. Every failure names
-    the fix, never a value.
+    is the only class safe to surface. Every failure names the fix, never a value.
+
+    Passing ``source`` supplies the token outright and **nothing ambient is
+    read**: not ``DBT_SL_TOKEN``, not ``~/.dbt/dbt_cloud.yml``, and not the
+    environment's coordinates either. That last part matters more than it looks. A
+    host holding one config per end user has already chosen which deployment this
+    request is for, and letting a single process-wide ``DBT_SL_HOST`` outrank it
+    would redirect every tenant's metric query at once, which is a
+    wrong-deployment bug that presents as working software.
     """
+
+    if source is not None:
+        host = getattr(semantic, "host", None)
+        env_id = getattr(semantic, "environment_id", None)
+        if not host or not env_id:
+            raise CredentialDiscoveryError(
+                "the hosted semantic layer needs a host and environment id; set "
+                "them under `semantic:` on the DexConfig you passed (host, "
+                "environment_id). Both are shown in the dbt Cloud Semantic Layer "
+                "panel and neither is secret, so they belong in config next to the "
+                "connector rather than beside the token"
+            )
+        token = source.token()
+        if not token:
+            raise CredentialDiscoveryError(
+                "the supplied semantic source returned no token; its `token` "
+                "callable must return a dbt Cloud 'Semantic Layer Only' service "
+                "token (dex never falls back to an ambient one once a source is "
+                "supplied, because that would reach the layer as the process "
+                "rather than as this request's principal)"
+            )
+        return str(host), str(env_id), str(token), "host_supplied"
 
     host = env.get("DBT_SL_HOST") or getattr(semantic, "host", None)
     env_id = env.get("DBT_SL_ENV_ID") or getattr(semantic, "environment_id", None)

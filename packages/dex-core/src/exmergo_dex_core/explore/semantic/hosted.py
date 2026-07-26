@@ -109,7 +109,14 @@ class HostedDbtCloudBackend:
         self._timeout = timeout
 
     @classmethod
-    def from_config(cls, config) -> HostedDbtCloudBackend:
+    def from_config(cls, config, source=None) -> HostedDbtCloudBackend:
+        """Build from a config, and from a host-supplied token when there is one.
+
+        ``source`` is a :class:`~...connect.SemanticSource`. Its callable runs
+        exactly once, here, so a metric query that polls dbt Cloud dozens of times
+        costs the host one token read rather than dozens.
+        """
+
         try:
             import httpx  # noqa: F401
         except ImportError as exc:
@@ -122,7 +129,7 @@ class HostedDbtCloudBackend:
         semantic = getattr(config, "semantic", None)
         try:
             host, env_id, token, _kind = resolve_semantic_layer_connection(
-                semantic, os.environ
+                semantic, os.environ, source
             )
         except CredentialDiscoveryError as exc:
             raise SemanticBackendError(str(exc)) from exc

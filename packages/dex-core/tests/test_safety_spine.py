@@ -2572,6 +2572,65 @@ def test_hosted_semantic_pii_dimension_refused_not_surfaced():
     assert not any("createQuery" in posted for posted in backend.posted)
 
 
+def test_hosted_semantic_pii_gate_still_binds_on_an_injected_token(monkeypatch):
+    # Family 3, at the semantic credential seam. Supplying the token makes identity
+    # the host's; it does not make the PII policy the host's. The gate has to refuse
+    # the same dimension whether the token was discovered or handed over, or a host
+    # would buy itself an unscreened path by supplying its own credential.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core import SemanticSource
+    from exmergo_dex_core.config import SemanticConfig
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+        resolve_backend,
+    )
+
+    monkeypatch.delenv("DBT_SL_TOKEN", raising=False)
+    config = DexConfig(
+        semantic=SemanticConfig(
+            backend="dbt_cloud", host="sl.example.com", environment_id="7"
+        )
+    )
+    engine = DexEngine(
+        config=config,
+        store=MemoryStore(),
+        semantic_source=SemanticSource(token=lambda: "host-token"),
+    )
+    # The real resolution path builds the real backend from the injected token; the
+    # fake only stands in for the transport, so the gate under test is the shipped one.
+    built = resolve_backend(engine)
+    assert built._token == "host-token"  # noqa: S105 (a test fixture, not a secret)
+
+    probe = FakeHostedBackend()
+    monkeypatch.setattr(probe, "_token", built._token)
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        probe.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
+    assert not any("createQuery" in posted for posted in probe.posted)
+
+
+def test_a_host_supplied_semantic_token_never_crosses_the_boundary(monkeypatch):
+    # Family 5, at the semantic credential seam: an injected token is a secret like
+    # any other, so it must not reach an envelope. The sanitizer would hard-fail on a
+    # secret-shaped key, and the value must not appear even under an innocent one.
+    import json
+
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery
+
+    injected = "dbts_INJECTED_token_must_not_leak"
+    backend = FakeHostedBackend(
+        result=table_json_result(["sessions"], ["string"], [[5.0]])
+    )
+    monkeypatch.setattr(backend, "_token", injected)
+    result = backend.query(SemanticQuery(metrics=["sessions"]))
+    envelope = to_envelope(result)
+    env.sanitize(envelope)
+    assert injected not in json.dumps(envelope.model_dump(mode="json"))
+
+
 # --- The programmatic API is bound by the same spine as the CLI ----------------
 #
 # Every guard above was written when the only way in was a subcommand. The engine

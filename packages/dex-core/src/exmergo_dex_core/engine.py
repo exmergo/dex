@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
 from .config import DexConfig, load_config
-from .connect import ConnectionSource
+from .connect import ConnectionSource, SemanticSource
 from .results import ConnectResult
 from .storage import FilesystemStore, MemoryStore, Store
 
@@ -105,6 +105,14 @@ class DexEngine:
     agent loop is most expensive. And dex closes nothing it reached through the
     source, since the caller that opened a connection is the one still holding it.
 
+    The semantic layer is a second service with a credential of its own, so it has
+    its own parameter: ``semantic_source=`` (a
+    :class:`~.connect.SemanticSource`) supplies the hosted dbt Cloud Semantic Layer
+    token. A deployment may use one, the other, or both, and a hosted metric query
+    is the one surface that needs nothing on the filesystem at all: no project, no
+    store, no connector. Note the cost posture there is not dex's to set, because
+    dbt Cloud owns that warehouse connection and executes server-side.
+
     The connection opens lazily on first use and is held until :meth:`close`,
     because re-opening a Snowflake or Databricks session per call is expensive
     and can wake a warehouse. Holding it is not an invitation to share the
@@ -134,6 +142,7 @@ class DexEngine:
         budget: float | None = None,
         confirmed: bool = False,
         connection: ConnectionSource | None = None,
+        semantic_source: SemanticSource | None = None,
     ) -> None:
         # Two config attributes, deliberately. `config` is what commands read and
         # is always a real object; `_declared` records whether one was actually
@@ -153,6 +162,11 @@ class DexEngine:
         # Held, not consumed: the same source opens the held connection and the
         # transform preflight's separate one, so both run as the same principal.
         self.connection = connection
+        # The semantic layer is a second service with its own credential, so it
+        # gets its own source: a hosted dbt Cloud token is not what a warehouse
+        # read authenticates with, and a deployment may well use one and not the
+        # other. Read once per semantic command, never held.
+        self.semantic_source = semantic_source
         # Session defaults for the confirm handshake. Per-call arguments override
         # them; a confirmed engine confirms every call it makes, which is the
         # reason to prefer confirming the call.
