@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] DexEngine Tests pass (`uv run pytest` in `packages/dex-core`)
+- [ ] Tests pass (`uv run pytest` in `packages/dex-core`)
 - [ ] Eval scoring-core tests pass (`uvx pytest evals`)
 - [ ] If a safety path is touched, the spine still holds: read-only against data,
       cost-guarded, PII flagged not surfaced, propose-don't-impose

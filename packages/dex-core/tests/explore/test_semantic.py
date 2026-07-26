@@ -393,7 +393,7 @@ def test_local_render_reaches_the_metricflow_engine(tmp_path: Path):
     """`_render` must resolve the MetricFlow engine, not the dex engine.
 
     The backend holds both, and for a while it held them under the same name, so
-    rendering called the dex `DexEngine` object. Nothing caught it because every
+    rendering called the `DexEngine` object. Nothing caught it because every
     other local-backend test stops at the PII gate, which runs before rendering.
     This one goes through `_render` with the MetricFlow side faked, so the two
     engines can never collide again unnoticed.

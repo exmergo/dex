@@ -30,7 +30,7 @@ from sqlglot import exp
 _MIN_SAMPLE_PERCENT = 0.01
 
 # Below this share of the sample, a cluster is an outlier pocket rather than a
-# segment. DexEngine-fixed, not configurable: it decides only what the notes say,
+# segment. dex-fixed, not configurable: it decides only what the notes say,
 # never what the clustering does, so there is nothing here for a caller to tune.
 _DEGENERATE_CLUSTER_FRACTION = 0.01
 
