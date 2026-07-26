@@ -29,8 +29,11 @@ import os
 import re
 import time
 import tomllib
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -64,6 +67,105 @@ def paradigm_for(connector: str | None) -> Paradigm:
     """The cost paradigm a connector bills in, free/local when it bills nothing."""
 
     return _PARADIGMS.get(connector or "", Paradigm.FREE_LOCAL)
+
+
+@dataclass(frozen=True)
+class ConnectionSource:
+    """What a host supplies in place of dex's own credential discovery.
+
+    Discovery reads process-ambient state (Application Default Credentials,
+    ``~/.databrickscfg``, ``os.environ``, ``connections.toml``, the AWS chain),
+    which is exactly right for one person at a terminal and unusable in a process
+    serving several end users: ambient is process-wide, so a connection cannot be
+    opened as a *particular* principal. Supplying this record moves that one step
+    to the host.
+
+    A zero-argument factory rather than a live connection, matching the shape the
+    Databricks path already used internally: it is the only shape under which a
+    free metadata command can avoid touching the warehouse at all, because dex
+    calls the factory on the first billed statement and not before.
+
+    **Supplying a connection supplies identity.** dex no longer knows who the
+    principal is beyond what this record says, so ``auth_method`` and (on
+    BigQuery) ``principal_type`` are what keep ``capabilities()`` honest for the
+    agent reading it. It does not make the budget the host's: the cost gate is
+    still built here from the injected store, and the session ceiling still binds.
+
+    **dex closes nothing it reaches through this record.** A host that opened a
+    connection closes it. The factory is called at most once per engine, so a host
+    that mints a fresh connection per call must retain what it returns if it
+    intends to close it.
+
+    Nothing here is persisted, cached, or refreshed. ``.dex/`` stays secret-free.
+    """
+
+    #: Zero-argument, returning the connection this connector's adapter takes. On
+    #: BigQuery it returns credentials instead, from which dex builds the client
+    #: it then owns and closes, because that is the shape the adapter takes.
+    connect: Callable[[], Any]
+    #: The coarse credential class ``capabilities()`` surfaces. Refine it
+    #: ("host_supplied:oauth_user") when the host knows what it handed over and
+    #: wants the report to say so; never put a credential value in it.
+    auth_method: str = "host_supplied"
+    #: BigQuery only, and normally omitted: dex classifies the supplied credential
+    #: exactly as it classifies a discovered one, which is more trustworthy than
+    #: letting a host assert its own principal class.
+    principal_type: str | None = None
+    #: Databricks only, and required there: the Unity Catalog REST client serving
+    #: every free metadata path. Databricks has two clients, not one.
+    workspace: Any | None = None
+
+
+# Connectors whose adapters take an already-built connection or credential, and so
+# can be opened from a host-supplied one. DuckDB is deliberately absent: its target
+# is a local file dex opens read-only itself, and accepting an outside handle would
+# mean trusting that it is read-only.
+_INJECTABLE = frozenset({"bigquery", "snowflake", "databricks", "postgres", "redshift"})
+
+
+def assert_connection_source(
+    connector: str | None, connection: ConnectionSource | None
+) -> None:
+    """Refuse a connection this connector cannot honor.
+
+    Same rule as :func:`assert_scope_vocabulary`, for the same reason:
+    accepted-and-ignored is strictly worse than rejected. A host that believes it
+    supplied a principal, and in fact reached the warehouse under the process's
+    ambient identity, has lost exactly the access control it came here for, and
+    nothing in the output would say so.
+    """
+
+    if connection is None:
+        return
+    if connector == "duckdb":
+        raise ValueError(
+            "connection= does not apply to the duckdb connector: the target is a "
+            "single local file, which dex opens read-only itself (an injected "
+            "handle could be writable). Select it with path= instead"
+        )
+    if connector not in _INJECTABLE:
+        raise ValueError(
+            f"connection= is not supported for connector '{connector}': pass one "
+            f"of {', '.join(sorted(_INJECTABLE))}"
+        )
+    if connector == "databricks":
+        if connection.workspace is None:
+            raise ValueError(
+                "an injected databricks connection needs workspace= too: the "
+                "Unity Catalog REST client serves every free metadata path, and "
+                "connect= opens the billed SQL session only. Pass "
+                "ConnectionSource(connect=..., workspace=WorkspaceClient(...))"
+            )
+    elif connection.workspace is not None:
+        raise ValueError(
+            f"workspace= is Databricks vocabulary and has no meaning for the "
+            f"{connector} connector; pass the connection itself as connect="
+        )
+    if connection.principal_type is not None and connector != "bigquery":
+        raise ValueError(
+            f"principal_type= is BigQuery vocabulary and has no meaning for the "
+            f"{connector} connector; describe the credential in auth_method="
+        )
 
 
 def new_cost_gate(
@@ -171,6 +273,7 @@ def open_adapter(
     budget: float | None = None,
     confirmed: bool = False,
     command: str | None = None,
+    connection: ConnectionSource | None = None,
 ):
     """Resolve the connection target and return an open, read-only adapter.
 
@@ -191,6 +294,14 @@ def open_adapter(
     not be able to inherit a stray config from its filesystem. ``repo_root``
     still locates the things that are files by nature (a DuckDB path, the
     credential files a connector discovers), which no config choice moves.
+
+    Passing ``connection`` supplies the credential outright and **no discovery
+    runs**: the ambient chain for that connector is skipped entirely. It is the
+    host's identity from there on, so the non-secret facts that identify the target
+    (a Snowflake ``account``, a Databricks ``host``) come from ``config`` rather
+    than from the connection, and the coarse credential class comes from the
+    record. The gate is still built here either way, which is the point: identity
+    becomes the host's, the guards do not. See :class:`ConnectionSource`.
     """
 
     if config is None:
@@ -206,6 +317,7 @@ def open_adapter(
     assert_scope_vocabulary(
         connector, project=project, datasets=datasets, scopes=scopes
     )
+    assert_connection_source(connector, connection)
 
     if connector == "duckdb":
         if path:
@@ -239,6 +351,7 @@ def open_adapter(
             # Both flags scope BigQuery, and the refusal has to name the one the
             # user actually typed.
             scope_flag=("--dataset" if datasets else "--scope" if scopes else None),
+            connection=connection,
         )
 
     if connector == "snowflake":
@@ -250,6 +363,7 @@ def open_adapter(
             confirmed=confirmed,
             command=command,
             scope_override=scopes,
+            connection=connection,
         )
 
     if connector == "databricks":
@@ -261,6 +375,7 @@ def open_adapter(
             confirmed=confirmed,
             command=command,
             scope_override=scopes,
+            connection=connection,
         )
 
     if connector == "postgres":
@@ -272,6 +387,7 @@ def open_adapter(
             confirmed=confirmed,
             command=command,
             scope_override=scopes,
+            connection=connection,
         )
 
     if connector == "redshift":
@@ -283,6 +399,7 @@ def open_adapter(
             confirmed=confirmed,
             command=command,
             scope_override=scopes,
+            connection=connection,
         )
 
     return get_adapter(connector)
@@ -404,6 +521,7 @@ def _open_bigquery(
     project_override: str | None = None,
     dataset_override: list[str] | None = None,
     scope_flag: str | None = None,
+    connection: ConnectionSource | None = None,
 ):
     target = config.bigquery or BigQueryTarget()
     target = narrow_target(target, "bigquery", dataset_override)
@@ -411,13 +529,27 @@ def _open_bigquery(
         # A command-line override of the committed target, applied in memory
         # only: a smoke test should not silently rewrite .dex/config.yml.
         target = target.model_copy(update={"project": project_override})
-    credentials, adc_project, principal_type = _default_credentials()
+    if connection is not None:
+        # A host supplies the credential, not a client: the adapter builds the
+        # client, so BigQuery is the one connector where what dex holds afterwards
+        # is dex's to close. There is no ADC project to fall back on, so the
+        # resolution chain below has one fewer link.
+        credentials = connection.connect()
+        adc_project = None
+        principal_type = connection.principal_type or gcp_principal_type(credentials)
+    else:
+        credentials, adc_project, principal_type = _default_credentials()
     project = resolve_bigquery_project(
         target, os.environ, adc_project, repo_root=repo_root
     )
     if not project:
+        # The fix differs by caller: a host holding a config object edits the
+        # object, and telling it to run a gcloud command would be wrong advice.
         raise CredentialDiscoveryError(
-            "no GCP project resolved; set bigquery.project in .dex/config.yml "
+            "no GCP project resolved; set bigquery.project on the DexConfig you "
+            "passed (or GOOGLE_CLOUD_PROJECT in the environment)"
+            if connection is not None
+            else "no GCP project resolved; set bigquery.project in .dex/config.yml "
             "or run `gcloud config set project <id>` (then refresh ADC with "
             "`gcloud auth application-default login`)"
         )
@@ -450,24 +582,37 @@ def _open_snowflake(
     confirmed: bool,
     command: str | None,
     scope_override: list[str] | None = None,
+    connection: ConnectionSource | None = None,
 ):
     target = config.snowflake or SnowflakeTarget()
-    params, method = resolve_snowflake_connection(target, os.environ, repo_root)
 
-    try:
-        import snowflake.connector
-    except ImportError as exc:
-        raise CredentialDiscoveryError(
-            "the Snowflake client is not installed; install the connector "
-            "extra: exmergo-dex-core[snowflake]"
-        ) from exc
+    if connection is not None:
+        # The host owns the session, so the session settings below are the host's
+        # too: a warehouse pinned on its connection, and its own keep-alive choice.
+        # The warehouse guard still holds regardless, because the adapter
+        # re-asserts the configured pin before anything billed runs. The account is
+        # a non-secret fact, so it comes from config rather than from the handle.
+        conn = connection.connect()
+        account = target.account
+        method = connection.auth_method
+    else:
+        params, method = resolve_snowflake_connection(target, os.environ, repo_root)
 
-    # The pinned warehouse rides on the session so free paths and dbt agree,
-    # but the adapter re-asserts the pin before anything billed regardless.
-    if target.warehouse:
-        params.setdefault("warehouse", target.warehouse)
-    params.setdefault("client_session_keep_alive", False)
-    connection = snowflake.connector.connect(**params)
+        try:
+            import snowflake.connector
+        except ImportError as exc:
+            raise CredentialDiscoveryError(
+                "the Snowflake client is not installed; install the connector "
+                "extra: exmergo-dex-core[snowflake]"
+            ) from exc
+
+        # The pinned warehouse rides on the session so free paths and dbt agree,
+        # but the adapter re-asserts the pin before anything billed regardless.
+        if target.warehouse:
+            params.setdefault("warehouse", target.warehouse)
+        params.setdefault("client_session_keep_alive", False)
+        conn = snowflake.connector.connect(**params)
+        account = str(params.get("account") or "") or None
 
     gate = new_cost_gate(
         "snowflake",
@@ -479,10 +624,11 @@ def _open_snowflake(
     )
     return get_adapter(
         "snowflake",
-        connection=connection,
+        connection=conn,
+        owns_connection=connection is None,
         cost_gate=gate,
         target=target,
-        account=str(params.get("account") or "") or None,
+        account=account,
         auth_method=method,
         # Not folded into the target: a bare `--scope TPCH_SF1` is a schema name
         # that only the account can resolve to a database, so the adapter has to
@@ -699,35 +845,51 @@ def _open_databricks(
     confirmed: bool,
     command: str | None,
     scope_override: list[str] | None = None,
+    connection: ConnectionSource | None = None,
 ):
     target = config.databricks or DatabricksTarget()
     target = narrow_target(target, "databricks", scope_override)
 
-    try:
-        from databricks.sdk import WorkspaceClient
-    except ImportError as exc:
-        raise CredentialDiscoveryError(
-            "the Databricks client is not installed; install the connector "
-            "extra: exmergo-dex-core[databricks]"
-        ) from exc
+    if connection is not None:
+        # Databricks needs two clients, and the split is the whole reason the free
+        # paths are free: `workspace` is the Unity Catalog REST door that serves all
+        # metadata, and `connect` opens the billed SQL session, which lands on the
+        # warehouse and can wake it. The adapter calls the factory on the first
+        # billed statement and never before, so an injected source keeps that
+        # property. The host is a non-secret fact, so it comes from config.
+        workspace = connection.workspace
+        sql_connect = connection.connect
+        host = _databricks_hostname(target.host) if target.host else None
+        method = connection.auth_method
+    else:
+        try:
+            from databricks.sdk import WorkspaceClient
+        except ImportError as exc:
+            raise CredentialDiscoveryError(
+                "the Databricks client is not installed; install the connector "
+                "extra: exmergo-dex-core[databricks]"
+            ) from exc
 
-    sdk_config, method = resolve_databricks_connection(target, os.environ, repo_root)
-    workspace = WorkspaceClient(config=sdk_config)
-
-    def sql_connect():
-        # Built lazily by the adapter on the first billed statement only:
-        # opening a SQL session lands on the warehouse and can wake it, so the
-        # free metadata paths must never construct this connection.
-        from databricks import sql as dbsql
-
-        from .adapters.databricks import warehouse_http_path
-
-        return dbsql.connect(
-            server_hostname=_databricks_hostname(sdk_config.host),
-            http_path=warehouse_http_path(str(target.warehouse)),
-            credentials_provider=lambda: sdk_config.authenticate,
-            user_agent_entry="dex",
+        sdk_config, method = resolve_databricks_connection(
+            target, os.environ, repo_root
         )
+        workspace = WorkspaceClient(config=sdk_config)
+        host = _databricks_hostname(sdk_config.host)
+
+        def sql_connect():
+            # Built lazily by the adapter on the first billed statement only:
+            # opening a SQL session lands on the warehouse and can wake it, so the
+            # free metadata paths must never construct this connection.
+            from databricks import sql as dbsql
+
+            from .adapters.databricks import warehouse_http_path
+
+            return dbsql.connect(
+                server_hostname=_databricks_hostname(sdk_config.host),
+                http_path=warehouse_http_path(str(target.warehouse)),
+                credentials_provider=lambda: sdk_config.authenticate,
+                user_agent_entry="dex",
+            )
 
     gate = new_cost_gate(
         "databricks",
@@ -741,9 +903,10 @@ def _open_databricks(
         "databricks",
         workspace=workspace,
         sql_connect=sql_connect,
+        owns_connection=connection is None,
         cost_gate=gate,
         target=target,
-        host=_databricks_hostname(sdk_config.host),
+        host=host,
         auth_method=method,
         scope_origin=scope_origin("databricks", "--scope" if scope_override else None),
     )
@@ -922,24 +1085,35 @@ def _open_postgres(
     confirmed: bool,
     command: str | None,
     scope_override: list[str] | None = None,
+    connection: ConnectionSource | None = None,
 ):
     target = config.postgres or PostgresTarget()
     target = narrow_target(target, "postgres", scope_override)
-    params, method = resolve_postgres_connection(target, os.environ, repo_root)
 
-    try:
-        import psycopg
-    except ImportError as exc:
-        raise CredentialDiscoveryError(
-            "the Postgres client is not installed; install the connector "
-            "extra: exmergo-dex-core[postgres]"
-        ) from exc
+    if connection is not None:
+        # autocommit and application_name are session settings on a connection the
+        # host built, so they are the host's to set; an injected session without
+        # autocommit risks idle-in-transaction on what is often a production
+        # primary. The read-only guard does not depend on either: the adapter sets
+        # the session read-only itself before any statement runs.
+        conn = connection.connect()
+        method = connection.auth_method
+    else:
+        params, method = resolve_postgres_connection(target, os.environ, repo_root)
 
-    # autocommit keeps the session out of idle-in-transaction (which blocks
-    # vacuum on a production primary); application_name is the attribution
-    # tag, the QUERY_TAG analogue. The adapter additionally sets the session
-    # read-only before any statement runs.
-    connection = psycopg.connect(**params, autocommit=True, application_name="dex")
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise CredentialDiscoveryError(
+                "the Postgres client is not installed; install the connector "
+                "extra: exmergo-dex-core[postgres]"
+            ) from exc
+
+        # autocommit keeps the session out of idle-in-transaction (which blocks
+        # vacuum on a production primary); application_name is the attribution
+        # tag, the QUERY_TAG analogue. The adapter additionally sets the session
+        # read-only before any statement runs.
+        conn = psycopg.connect(**params, autocommit=True, application_name="dex")
 
     gate = new_cost_gate(
         "postgres",
@@ -951,7 +1125,8 @@ def _open_postgres(
     )
     return get_adapter(
         "postgres",
-        connection=connection,
+        connection=conn,
+        owns_connection=connection is None,
         cost_gate=gate,
         target=target,
         auth_method=method,
@@ -1181,26 +1356,40 @@ def _open_redshift(
     confirmed: bool,
     command: str | None,
     scope_override: list[str] | None = None,
+    connection: ConnectionSource | None = None,
 ):
     target = config.redshift or RedshiftTarget()
     target = narrow_target(target, "redshift", scope_override)
-    params, method, compute = resolve_redshift_connection(target, os.environ, repo_root)
 
-    try:
-        import redshift_connector
-    except ImportError as exc:
-        raise CredentialDiscoveryError(
-            "the Redshift client is not installed; install the connector "
-            "extra: exmergo-dex-core[redshift]"
-        ) from exc
+    if connection is not None:
+        # The control-plane facts (Serverless workgroup, base RPU capacity) are
+        # discovered through boto3 alongside the credential, so a host-supplied
+        # connection arrives without them. The adapter already treats absent compute
+        # as "translation degrades, gating holds": budgets stay in seconds and every
+        # statement is still server-capped, only the RPU-hour display is lost.
+        conn = connection.connect()
+        method = connection.auth_method
+        compute = None
+    else:
+        params, method, compute = resolve_redshift_connection(
+            target, os.environ, repo_root
+        )
 
-    # application_name is the attribution tag (SYS_CONNECTION_LOG); the
-    # adapter additionally sets query_group and a best-effort session
-    # read-only mode before any statement runs. autocommit keeps session SETs
-    # (statement_timeout) outside any transaction the driver would otherwise
-    # open. The connect itself is retried: an idle Serverless workgroup resumes
-    # on first contact, and a slow resume can reset the startup handshake.
-    connection = _connect_redshift(redshift_connector, params)
+        try:
+            import redshift_connector
+        except ImportError as exc:
+            raise CredentialDiscoveryError(
+                "the Redshift client is not installed; install the connector "
+                "extra: exmergo-dex-core[redshift]"
+            ) from exc
+
+        # application_name is the attribution tag (SYS_CONNECTION_LOG); the
+        # adapter additionally sets query_group and a best-effort session
+        # read-only mode before any statement runs. autocommit keeps session SETs
+        # (statement_timeout) outside any transaction the driver would otherwise
+        # open. The connect itself is retried: an idle Serverless workgroup resumes
+        # on first contact, and a slow resume can reset the startup handshake.
+        conn = _connect_redshift(redshift_connector, params)
 
     gate = new_cost_gate(
         "redshift",
@@ -1212,7 +1401,8 @@ def _open_redshift(
     )
     return get_adapter(
         "redshift",
-        connection=connection,
+        connection=conn,
+        owns_connection=connection is None,
         cost_gate=gate,
         target=target,
         compute=compute,
@@ -1537,6 +1727,29 @@ def _redshift_from_dbt_profiles(
     return None
 
 
+def gcp_principal_type(credentials: Any) -> str:
+    """Classify a Google credential coarsely: user / service_account /
+    impersonated_service_account / external_account / metadata.
+
+    Derived from the credential's own type rather than asserted by whoever
+    supplied it, which is what makes it trustworthy on both paths: a
+    host-supplied credential is classified exactly as a discovered one, and a
+    host cannot claim to be a service account it is not. The class is safe to
+    surface in ``capabilities()``; the principal's identity never is.
+    """
+
+    module = type(credentials).__module__
+    if "impersonated" in module:
+        return "impersonated_service_account"
+    if "external_account" in module:
+        return "external_account"
+    if "service_account" in module:
+        return "service_account"
+    if "compute_engine" in module:
+        return "metadata"
+    return "user"
+
+
 def _default_credentials():
     """Discover Application Default Credentials, never prompting.
 
@@ -1564,18 +1777,7 @@ def _default_credentials():
             "GOOGLE_APPLICATION_CREDENTIALS at a service-account file) and retry"
         ) from exc
 
-    module = type(credentials).__module__
-    if "impersonated" in module:
-        principal_type = "impersonated_service_account"
-    elif "external_account" in module:
-        principal_type = "external_account"
-    elif "service_account" in module:
-        principal_type = "service_account"
-    elif "compute_engine" in module:
-        principal_type = "metadata"
-    else:
-        principal_type = "user"
-    return credentials, adc_project, principal_type
+    return credentials, adc_project, gcp_principal_type(credentials)
 
 
 def resolve_bigquery_project(
