@@ -53,44 +53,88 @@ from typing import TYPE_CHECKING
 # latency on every invocation.
 _EXPORTS = {
     "BudgetExhaustedError": "results",
+    "CacheRequiredError": "explore.commands",
     "CeilingRequiredError": "guards.cost_guard",
+    "ClusterDependencyError": "explore.cluster",
+    "ClusterError": "explore.cluster",
     "ColumnProfile": "cache",
+    "ConfigurationError": "errors",
     "ConfirmationRequest": "results",
     "ConfirmationRequiredError": "guards.cost_guard",
     "ConnectionSource": "connect",
+    "ConnectorError": "errors",
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
+    "CredentialDiscoveryError": "connect",
     "Dataset": "cache",
     "DexCache": "cache",
     "DexConfig": "config",
-    "Document": "storage",
     "DexEngine": "engine",
+    "DexError": "errors",
+    "DialectDependencyError": "guards.dialect",
+    "Document": "storage",
+    "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "MaintainStore": "storage",
     "MemoryStore": "storage",
+    "NoBaselineError": "maintain.commands",
+    "NoConnectorSelectedError": "errors",
     "OverCeilingError": "guards.cost_guard",
     "Paradigm": "envelope",
+    "PlanError": "transform.plans",
+    "PlanNotFoundError": "transform.plans",
+    "PrerequisiteError": "errors",
     "QueryRefusedError": "guards.query_firewall",
     "Relationship": "cache",
+    "RepoRootRequiredError": "errors",
+    "RequestError": "errors",
     "Result": "results",
+    "ScopeError": "connect",
+    "SemanticBackendError": "explore.semantic",
+    "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
     "Snapshot": "maintain.snapshot",
     "Store": "storage",
+    "StoreRequiredError": "errors",
     "to_envelope": "results",
 }
 
 if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .cache import ColumnProfile, Dataset, DexCache, Relationship
     from .config import DexConfig
-    from .connect import ConnectionSource, SemanticSource
+    from .connect import (
+        ConnectionSource,
+        CredentialDiscoveryError,
+        ScopeError,
+        SemanticSource,
+    )
     from .engine import DexEngine
     from .envelope import Cost, Paradigm
+    from .errors import (
+        ConfigurationError,
+        ConnectorError,
+        DexError,
+        NoConnectorSelectedError,
+        PrerequisiteError,
+        RepoRootRequiredError,
+        RequestError,
+        StoreRequiredError,
+    )
+    from .explore.cluster import ClusterDependencyError, ClusterError
+    from .explore.commands import CacheRequiredError
+    from .explore.semantic import (
+        SemanticBackendError,
+        SemanticQueryRefusedError,
+    )
     from .guards.cost_guard import (
         CeilingRequiredError,
         ConfirmationRequiredError,
         CostGuardError,
         OverCeilingError,
     )
+    from .guards.dialect import DialectDependencyError
     from .guards.query_firewall import QueryRefusedError
+    from .maintain.commands import NoBaselineError
     from .maintain.snapshot import Snapshot
     from .results import (
         BudgetExhaustedError,
@@ -98,7 +142,15 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         Result,
         to_envelope,
     )
-    from .storage import Document, FilesystemStore, MemoryStore, Store
+    from .storage import (
+        Document,
+        ExploreStore,
+        FilesystemStore,
+        MaintainStore,
+        MemoryStore,
+        Store,
+    )
+    from .transform.plans import PlanError, PlanNotFoundError
 
 try:
     __version__ = version("exmergo-dex-core")
@@ -111,28 +163,49 @@ except PackageNotFoundError:
 # test_engine.py` asserts the two stay in step and that every name resolves.
 __all__ = [
     "BudgetExhaustedError",
+    "CacheRequiredError",
     "CeilingRequiredError",
+    "ClusterDependencyError",
+    "ClusterError",
     "ColumnProfile",
+    "ConfigurationError",
     "ConfirmationRequest",
     "ConfirmationRequiredError",
     "ConnectionSource",
+    "ConnectorError",
     "Cost",
     "CostGuardError",
+    "CredentialDiscoveryError",
     "Dataset",
     "DexCache",
     "DexConfig",
     "DexEngine",
+    "DexError",
+    "DialectDependencyError",
     "Document",
+    "ExploreStore",
     "FilesystemStore",
+    "MaintainStore",
     "MemoryStore",
+    "NoBaselineError",
+    "NoConnectorSelectedError",
     "OverCeilingError",
     "Paradigm",
+    "PlanError",
+    "PlanNotFoundError",
+    "PrerequisiteError",
     "QueryRefusedError",
     "Relationship",
+    "RepoRootRequiredError",
+    "RequestError",
     "Result",
+    "ScopeError",
+    "SemanticBackendError",
+    "SemanticQueryRefusedError",
     "SemanticSource",
     "Snapshot",
     "Store",
+    "StoreRequiredError",
     "__version__",
     "to_envelope",
 ]

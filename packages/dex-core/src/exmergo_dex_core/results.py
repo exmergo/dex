@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import envelope as env
 from .envelope import Cost
+from .errors import DexError
 
 
 class ConfirmationRequest(BaseModel):
@@ -44,7 +45,7 @@ class ConfirmationRequest(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-class BudgetExhaustedError(Exception):
+class BudgetExhaustedError(DexError):
     """The ceiling was reached partway through, and the run stopped there.
 
     Not the same as refusing up front: work was done and paid for, so the message

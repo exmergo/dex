@@ -33,6 +33,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from .diffs import file_diff
+from .errors import DexError
 
 PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
@@ -57,7 +58,7 @@ _ALLOWED_ROOT_FILES = frozenset(
 )
 
 
-class DbtProjectError(Exception):
+class DbtProjectError(DexError):
     pass
 
 
