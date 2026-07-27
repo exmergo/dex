@@ -32,6 +32,7 @@ from typing import Any
 
 from ..config import SnowflakeTarget
 from ..envelope import Paradigm
+from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -122,7 +123,7 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     return f"RLIKE({qcol}, '{pattern}')"
 
 
-class SnowflakeConnectionError(Exception):
+class SnowflakeConnectionError(ConnectorError):
     """Raised when the pinned warehouse (or a queried object) cannot be
     resolved. The message always names the fix, never a credential."""
 

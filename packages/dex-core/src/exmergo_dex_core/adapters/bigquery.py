@@ -20,6 +20,7 @@ from typing import Any
 
 from ..config import BigQueryTarget
 from ..envelope import Paradigm
+from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -60,7 +61,7 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     return f"REGEXP_CONTAINS({qcol}, r'{pattern}')"
 
 
-class BigQueryConnectionError(Exception):
+class BigQueryConnectionError(ConnectorError):
     """Raised when a source scope (or the dev project) cannot be resolved. The
     message always names the fix, never a credential."""
 
