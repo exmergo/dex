@@ -287,8 +287,9 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     version conflict between them can surface at all.
 
     `dev` and `conformance` are excluded deliberately: contributor tooling, not
-    capabilities. `conformance` carries a test runner for people implementing a
-    storage backend, and nobody installing "everything dex can do" wants pytest.
+    capabilities. `storage-conformance` carries a test runner for people
+    implementing a storage backend, and nobody installing "everything dex can do"
+    wants pytest.
     """
 
     extras = _project_metadata()["optional-dependencies"]
@@ -296,7 +297,7 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     referenced = set(
         extras["all"][0].removeprefix("exmergo-dex-core[").removesuffix("]").split(",")
     )
-    tooling = {"all", "conformance", "dev"}
+    tooling = {"all", "dev", "storage-conformance"}
     assert referenced == set(extras) - tooling, (
         f"[all] does not cover {sorted(set(extras) - tooling - referenced)}"
     )
@@ -504,7 +505,7 @@ def test_a_backend_outside_the_distribution_passes_the_shipped_contract(
             "--isolated",
             "--no-project",
             "--with",
-            f"exmergo-dex-core[conformance] @ {wheel}",
+            f"exmergo-dex-core[storage-conformance] @ {wheel}",
             "pytest",
             "-q",
             str(suite),

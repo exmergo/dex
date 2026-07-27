@@ -231,7 +231,7 @@ Implement the tier your host actually uses (`ExploreStore` is six methods;
 `MaintainStore` and `Store` add to it), then prove it with the suite dex ships:
 
 ```
-pip install "exmergo-dex-core[conformance]"
+pip install "exmergo-dex-core[storage-conformance]"
 ```
 
 ```python

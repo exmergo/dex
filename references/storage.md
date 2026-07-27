@@ -163,7 +163,7 @@ The contract ships as an executable suite. Install it and subclass the class for
 your tier:
 
 ```
-pip install "exmergo-dex-core[conformance]"
+pip install "exmergo-dex-core[storage-conformance]"
 ```
 
 ```python

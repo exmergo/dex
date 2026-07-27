@@ -30,7 +30,8 @@ business.
 
 This module imports pytest, so it is deliberately not imported by
 ``exmergo_dex_core.storage``: a bare ``import exmergo_dex_core`` must not require
-a test framework. Install the ``[conformance]`` extra to get pytest alongside it.
+a test framework. Install the ``[storage-conformance]`` extra to get pytest
+alongside it.
 """
 
 from __future__ import annotations
