@@ -29,6 +29,7 @@ from .. import command_args
 from .. import envelope as env
 from ..dbt_project import ApplyResult as PlanApplyResult
 from ..dbt_project import EditOp
+from ..errors import DexError
 from ..results import to_envelope
 from ..storage import Store
 from . import plans as plans_mod
@@ -63,7 +64,7 @@ _DEFAULT_COMPUTE_TIME_CAP_NOTE = (
 )
 
 
-class BuildFailedError(Exception):
+class BuildFailedError(DexError):
     """A dbt run that started and did not succeed.
 
     Carries the run summary and the cost, because a failed build still consumed
@@ -321,7 +322,7 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
     nothing written until the caller confirms deliberately.
     """
 
-    store = engine.store
+    store = engine.require_full_store("applying a plan")
     if not plan_id:
         # No id means the latest unapplied plan of any kind: apply does not
         # dispatch on kind, a plan is a plan (a semantic plan applies the same
@@ -387,7 +388,7 @@ def plans(engine: DexEngine) -> PlanListResult:
                 "applied_at": p.applied_at,
                 "pending": p.applied_at is None,
             }
-            for p in engine.store.list_plans()
+            for p in engine.require_full_store("listing plans").list_plans()
         ]
     )
 
@@ -636,7 +637,7 @@ def _semantic_envelope(
 # --- helpers -----------------------------------------------------------------
 
 
-class DbtParseError(Exception):
+class DbtParseError(DexError):
     """dbt's own parser refused the authored edits, so nothing was stored.
 
     The authoritative gate: dex's checks are precise and dbt's is final, and a
@@ -801,13 +802,19 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
 def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
     repo_root = engine.require_repo_root("storing a transform plan")
     stored, diffs, warnings = plans_mod.plan(
-        intent, edits, engine.project_dir(), repo_root, store=engine.store
+        intent,
+        edits,
+        engine.project_dir(),
+        repo_root,
+        store=engine.require_full_store("storing a semantic plan"),
     )
     return PlanResult(
         plan_id=stored.plan_id,
         intent=stored.intent,
         paths=[e.path for e in stored.edits],
-        plan_path=engine.store.plan_locator(stored.plan_id),
+        plan_path=engine.require_full_store("locating a plan").plan_locator(
+            stored.plan_id
+        ),
         diffs=diffs,
         warnings=warnings,
     )

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import yaml
 
+from ..errors import DexError
 from ..guards.sql_guard import assert_select_only
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
     from .plans import PlanEdit
 
 
-class EditValidationError(Exception):
+class EditValidationError(DexError):
     pass
 
 
