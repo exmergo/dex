@@ -24,10 +24,11 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from ..envelope import Cost, Paradigm
+from ..errors import DexError
 from ..results import ConfirmationRequest
 
 
-class CostGuardError(Exception):
+class CostGuardError(DexError):
     """Base for every cost-guard refusal."""
 
 
