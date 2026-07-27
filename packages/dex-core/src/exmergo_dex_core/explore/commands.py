@@ -47,6 +47,7 @@ from ..config import (
     blob_override_paths,
     pii_override_paths,
 )
+from ..errors import PrerequisiteError, RequestError
 from ..guards.cost_guard import ConfirmationRequiredError, OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
@@ -55,7 +56,7 @@ from ..guards.query_firewall import (
 )
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
-from ..storage import Document, Store
+from ..storage import Document, ExploreStore
 from . import cluster as cluster_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
@@ -80,7 +81,7 @@ if TYPE_CHECKING:
 _AUTO_PROFILE_ALL = 50
 
 
-class CacheRequiredError(Exception):
+class CacheRequiredError(PrerequisiteError):
     """A command needs profiled objects and the exploration cache has none.
 
     The message names the command that fills the gap rather than a filename,
@@ -1043,7 +1044,7 @@ def cluster(
             f"`explore profile {obj}` (or `explore map`) first"
         )
     if len(matches) > 1:
-        raise ValueError(f"'{obj}' is ambiguous: {', '.join(matches)}; qualify it")
+        raise RequestError(f"'{obj}' is ambiguous: {', '.join(matches)}; qualify it")
     dataset = next(d for d in cache.datasets if d.identifier == matches[0])
 
     feature_names, selection_notes = _select_cluster_features(
@@ -1215,12 +1216,12 @@ def _select_cluster_features(
         for name in requested:
             col = by_lower.get(name.lower())
             if col is None:
-                raise ValueError(
+                raise RequestError(
                     f"column '{name}' is not among the profiled columns of "
                     f"{dataset.identifier}"
                 )
             if not profile_mod.is_numeric_type(col.data_type):
-                raise ValueError(
+                raise RequestError(
                     f"column '{name}' is {col.data_type}, not numeric; k-means "
                     "clusters numeric features only"
                 )
@@ -1291,7 +1292,7 @@ def _select_cluster_features(
         )
     if len(features) < 2:
         why = f" ({'; '.join(notes)})" if notes else ""
-        raise ValueError(
+        raise RequestError(
             f"found {len(features)} usable numeric feature column(s) for "
             f"{dataset.identifier}; k-means needs at least 2. Pass --features to "
             f"choose columns, or profile a table with more numeric columns{why}"
@@ -1769,7 +1770,7 @@ def _compose_datasets(
 # Sentinel: preserve the prior cache's relationships (profile has no inference
 # pass, so it has no business touching them).
 def _profile_checkpointer(
-    store: Store,
+    store: ExploreStore,
     prior: DexCache | None,
     connector: str,
     now: datetime,
@@ -1794,7 +1795,7 @@ def _profile_checkpointer(
 
 
 def _budget_exhausted(
-    store: Store, adapter: Adapter, accumulated: list[Dataset], selected: int
+    store: ExploreStore, adapter: Adapter, accumulated: list[Dataset], selected: int
 ) -> BudgetExhaustedError:
     """The partial-completion refusal for a mid-run budget exhaustion.
 
@@ -1929,8 +1930,10 @@ def _resolve_identifiers(adapter: Adapter, requested: list[str]) -> list[str]:
     for name in (n for n in names if n):
         unique = match_identifier(name, known)
         if not unique:
-            raise ValueError(f"no object named '{name}' in this connection")
+            raise RequestError(f"no object named '{name}' in this connection")
         if len(unique) > 1:
-            raise ValueError(f"'{name}' is ambiguous: {', '.join(unique)}; qualify it")
+            raise RequestError(
+                f"'{name}' is ambiguous: {', '.join(unique)}; qualify it"
+            )
         resolved.append(unique[0])
     return resolved

@@ -26,6 +26,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
+from ...errors import DexError
+
 # The confidence at or above which a name-detected PII category refuses a query,
 # shared with the query firewall so the two surfaces block at the same threshold.
 # Imported from the guards package, not from the firewall: this package must stay
@@ -99,7 +101,7 @@ class SemanticCatalog:
         }
 
 
-class SemanticBackendError(Exception):
+class SemanticBackendError(DexError):
     """A backend cannot be constructed, reached, or asked what was asked of it: a
     missing extra, missing hosted coordinates, missing credentials, a missing local
     project, an unresolvable metric. The message names the fix; the caller turns it
