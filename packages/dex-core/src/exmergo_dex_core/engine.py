@@ -39,8 +39,9 @@ from typing import TYPE_CHECKING, Any
 from . import command_args, connect
 from .config import DexConfig, load_config
 from .connect import ConnectionSource, SemanticSource
+from .errors import RepoRootRequiredError, StoreRequiredError
 from .results import ConnectResult
-from .storage import FilesystemStore, MemoryStore, Store
+from .storage import ExploreStore, FilesystemStore, MemoryStore, Store
 
 if TYPE_CHECKING:
     from .adapters.base import Adapter
@@ -134,7 +135,7 @@ class DexEngine:
         connector: str | None = None,
         path: str | None = None,
         config: DexConfig | None = None,
-        store: Store | None = None,
+        store: ExploreStore | None = None,
         repo_root: str | Path | None = None,
         scopes: list[str] | None = None,
         project: str | None = None,
@@ -152,7 +153,7 @@ class DexEngine:
         # that exists, never a fallback for one that does not.
         self._declared = config
         self.config: DexConfig = config if config is not None else DexConfig()
-        self.store: Store = store if store is not None else MemoryStore()
+        self.store: ExploreStore = store if store is not None else MemoryStore()
         self.repo_root: str | None = None if repo_root is None else str(repo_root)
         self.connector = connector
         self.path = path
@@ -298,12 +299,44 @@ class DexEngine:
         """
 
         if self.repo_root is None:
-            raise ValueError(
+            raise RepoRootRequiredError(
                 f"{what} needs a repo root: the dbt project is a git-reviewable "
                 "filesystem artifact, so build the engine with "
                 "DexEngine.from_repo(repo_root) or pass repo_root="
             )
         return self.repo_root
+
+    def require_full_store(self, what: str) -> Store:
+        """The store the transform surface needs, or a refusal naming what needed it.
+
+        The storage contract is tiered: a host that only explores implements
+        :class:`~.storage.ExploreStore` and stops there, which is a complete
+        implementation of a declared contract rather than a partial one. The plan
+        members it leaves out are exactly what transform stores its reviewable
+        diffs in, so this is the one boundary where the wider tier is required and
+        the one place the difference is worth a runtime check.
+        """
+
+        store = self.store
+        if not isinstance(store, Store):
+            missing = sorted(
+                name
+                for name in (
+                    "save_plan",
+                    "load_plan",
+                    "list_plans",
+                    "latest_plan",
+                    "plan_locator",
+                )
+                if not hasattr(store, name)
+            )
+            raise StoreRequiredError(
+                f"{what} needs a full store and this one implements the explore "
+                f"tier only (missing: {', '.join(missing)}). Transform keeps its "
+                "plans in the store, so a backend serving transform has to "
+                "implement exmergo_dex_core.storage.Store, not just ExploreStore"
+            )
+        return store
 
     # --- connect --------------------------------------------------------------
 

@@ -21,8 +21,9 @@ from .. import envelope as env
 from ..config import pii_override_paths
 from ..dbt_project import DbtProjectError
 from ..dbt_project import load as load_project
+from ..errors import PrerequisiteError
 from ..results import ConfirmationRequest, to_envelope
-from ..storage import Document, Store
+from ..storage import Document, MaintainStore
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
 from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
@@ -42,7 +43,7 @@ _NO_SNAPSHOT_ERROR = (
 )
 
 
-class NoBaselineError(Exception):
+class NoBaselineError(PrerequisiteError):
     """A detector was asked to measure drift with nothing to measure against.
 
     Named for the state rather than for a missing file: on the filesystem
@@ -606,7 +607,7 @@ def _resolve_scope(
 
 
 def _record_axes(
-    store: Store,
+    store: MaintainStore,
     snap: snapshot_mod.Snapshot,
     connector: str | None,
     results: dict[str, tuple[list[drift_mod.DriftFinding], list[str]]],
@@ -631,7 +632,7 @@ def _record_axes(
 def _drift_result(
     by_axis: dict[str, list[drift_mod.DriftFinding]],
     snap: snapshot_mod.Snapshot,
-    store: Store,
+    store: MaintainStore,
     *,
     warnings: list[str],
 ) -> DriftResult:
@@ -703,7 +704,7 @@ def _semantic_scope(
     return [finding for finding in findings if in_scope(finding)]
 
 
-def _staleness_warnings(store: Store, snap: snapshot_mod.Snapshot) -> list[str]:
+def _staleness_warnings(store: MaintainStore, snap: snapshot_mod.Snapshot) -> list[str]:
     warnings: list[str] = []
     cache = store.load_cache()
     if (
