@@ -9,6 +9,112 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **The storage seam is a public extension point: a shipped conformance suite, a
+  tiered protocol, and a typed package** ([#144]). `.dex/` state has lived behind
+  a `Store` protocol since the storage seam landed, but the seam was only usable
+  by someone willing to read the engine's source and infer several contracts that
+  existed nowhere but its tests. It is now implementable from what is published.
+
+  The protocol is three nested tiers, so a backend implements what its host
+  actually uses instead of stubbing what it does not. `ExploreStore` is six
+  members (the exploration cache, the two ledgers, locators) and covers a host
+  that explores, profiles, and queries; `MaintainStore` adds the reconcile
+  baseline and the drift report; `Store` adds the five transform plan members and
+  is unchanged in shape, so existing annotations and backends keep working. The
+  transform surface is the one place the widest tier is required, and it now
+  refuses an explore-only store by naming the tier and the missing members rather
+  than failing on a missing attribute several frames down.
+
+  `exmergo_dex_core.storage.conformance` ships the contract as an executable
+  suite. A backend outside this distribution installs `[storage-conformance]`, subclasses
+  the class matching its tier, supplies a `make_store(key)` factory, and runs
+  every assertion dex holds its own backends to, isolation across keys included.
+  A packaging test proves this end to end: it builds the wheel, installs it in an
+  environment with no access to this source tree, writes a backend there against
+  the published protocol alone, and runs the shipped suite at it.
+
+  The package now ships a `py.typed` marker. The seam is enforced entirely by
+  structural typing, so without it a downstream type checker treated the whole
+  package as untyped and verified nothing about a candidate backend.
+
+  Six behavioral contracts that previously existed only inside the test tree are
+  written onto the protocol members they govern: documents do not alias the
+  caller's object in either direction, `save_cache` stamps the caller's object as
+  well as the stored copy, documents round-trip as pydantic models, a corrupt
+  document raises while a corrupt ledger line is skipped, a stored
+  `schema_version` is not the store's to police, and the ledger read-then-write is
+  not atomic at the protocol level (the session ceiling binds exactly under
+  serialized commands, and the overshoot under concurrency is bounded by the sum
+  of the concurrent estimates). `save_cache` is now explicitly a whole-document
+  atomic write: cache membership decides what a query may name, so a backend with
+  a document size cap chunks internally rather than getting a per-dataset seam
+  that would let a reader observe half a cache.
+
+  A seventh contract, reported from the field: **the spend ledger is scoped to the
+  store instance**, so store granularity is ceiling granularity. One principal
+  spanning two stores has two independent session ceilings and nothing bounds
+  their sum. The existing docstring was specific about `field` and `connector`
+  keeping paradigms apart, which read as the complete set of scoping rules, and
+  the store axis was the one it omitted. It errs permissive and nothing warns, so
+  a host federating state per user should key stores exactly as it keys
+  principals.
+
+  Every assertion in the shipped contract now carries a message naming the rule it
+  enforces. In-repo a bare comparison was fine because a failure sent you to the
+  source; as the artifact an outside implementer debugs against, the assertion
+  text is the documentation. The no-aliasing and clock-stamping rules matter most
+  there, since both fail silently and late and present as data corruption rather
+  than as a protocol violation.
+
+  New reference page `references/storage.md` covers the tiers, those contracts,
+  which calls need nothing on the filesystem, and how a backend is selected.
+
+### Changed
+
+- **Every refusal dex raises deliberately is catchable as one type** ([#144]).
+  The CLI renders refusals into an error envelope behind a catch-all, so it never
+  needed a hierarchy; a library consumer cannot do that, and catching `Exception`
+  at an API boundary swallows real bugs alongside deliberate refusals. All of
+  them now descend from `DexError`, with `ConfigurationError` for an engine built
+  without something it needs and `RequestError` for a call that named something
+  unusable. `NoConnectorSelectedError`, `RepoRootRequiredError`, and
+  `StoreRequiredError` replace the bare `ValueError`s that the public API raised
+  for the three refusals a host hits most.
+
+  **Nothing breaks for an existing consumer.** Both families also inherit
+  `ValueError`, which is what those refusals raised before they were typed, so
+  code written against the previous API keeps catching what it caught.
+
+  Two families name the distinctions a host actually branches on.
+  **`PrerequisiteError`** covers refusals where the engine is fine, the call is
+  fine, and some state does not exist yet that a named command creates:
+  `CacheRequiredError` and `NoBaselineError`. It is the one family a caller can
+  resolve automatically, by running the command the message names and retrying.
+  **`ConnectorError`** covers a warehouse connection that could not be
+  established, so a host writes one `except` instead of importing a name per
+  connector. `CredentialDiscoveryError` is deliberately outside it: a credential
+  that was never configured will not appear on a retry.
+
+  **Eleven refusals that were typed but not importable are now exported**:
+  `PrerequisiteError`, `CacheRequiredError`, `NoBaselineError`, `ConnectorError`,
+  `CredentialDiscoveryError`, `ScopeError`, `ClusterError`,
+  `ClusterDependencyError`, `DialectDependencyError`, `PlanError`, and
+  `PlanNotFoundError`. Being a distinct class is not enough on its own: with no
+  importable name, a consumer branches by matching on message prose, and prose is
+  not an interface anyone owes stability on, so rewording an error silently
+  changes which branch a caller takes. `PlanNotFoundError` is the sharpest case,
+  because `Store.load_plan` is documented as raising it and a third-party backend
+  could not satisfy that contract without importing from a private module. A test
+  now asserts every refusal reachable from the public API is importable, with an
+  explicit internal set, so the next one added forces a decision.
+
+  `SemanticBackendError` and `SemanticQueryRefusedError` are now exported from the
+  package root. They are the documented catch for the hosted semantic-layer path
+  and previously required importing from `exmergo_dex_core.explore.semantic`, a
+  module layout that was never public surface.
+
 ## [1.4.1] - 2026-07-26
 
 ### Added
