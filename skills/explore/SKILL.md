@@ -62,7 +62,7 @@ Subcommands, in the usual order:
    profiles the same way.
 6. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
    don't cover: you write the SQL, the engine's query firewall refuses or bounds
-   it. Requires the `.dex/` cache (run `map` first). Results come back columnar
+   it. Requires the `.dex/` cache (run `map` first). Results come back row-major
    and capped; a refusal names the offending column and the fix, so one rewrite
    is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
    writing a probe: it maps common questions to effective probe shapes.

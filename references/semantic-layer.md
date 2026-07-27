@@ -12,7 +12,7 @@ difference between them is load-bearing, so it is spelled out here.
   metrics (name, type, label, description, and the dimensions each can be grouped
   by), dimensions, and entities. This is the discovery surface an agent reads to
   decide what to query.
-- `explore semantic query` runs a metric query and returns a capped, columnar
+- `explore semantic query` runs a metric query and returns a capped, row-major
   result, the same envelope shape as `explore query`. It takes `--metric <m>`
   (repeatable), and optionally `--group-by <entity__dim>` (repeatable),
   `--where "<jinja>"`, `--order-by <c>`, `--grain <g>`, and `--limit N`.
