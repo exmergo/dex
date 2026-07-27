@@ -34,6 +34,7 @@ from typing import Any
 
 from ..config import DatabricksTarget
 from ..envelope import Paradigm
+from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -137,7 +138,7 @@ def warehouse_id_of(value: str) -> str:
     return value.strip().rstrip("/").rsplit("/", 1)[-1]
 
 
-class DatabricksConnectionError(Exception):
+class DatabricksConnectionError(ConnectorError):
     """Raised when the pinned warehouse (or a queried object) cannot be
     resolved. The message always names the fix, never a credential."""
 

@@ -37,6 +37,7 @@ from ..dbt_project import (
 )
 from ..dbt_project import load as load_project
 from ..envelope import Cost, Paradigm, redact
+from ..errors import DexError
 from ..guards.cost_guard import preflight
 
 # Names that mean production no matter what the config says. The build target
@@ -56,11 +57,11 @@ _MESSAGE_CAP = 20
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 
-class ProdTargetRefusedError(Exception):
+class ProdTargetRefusedError(DexError):
     pass
 
 
-class DbtRunError(Exception):
+class DbtRunError(DexError):
     pass
 
 

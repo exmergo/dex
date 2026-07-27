@@ -45,6 +45,7 @@ from typing import Any
 
 from ..config import RedshiftTarget
 from ..envelope import Paradigm
+from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -146,7 +147,7 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     return f"{qcol} ~ '{pattern}'"
 
 
-class RedshiftConnectionError(Exception):
+class RedshiftConnectionError(ConnectorError):
     """Raised when a queried object cannot be resolved in the configured
     scope. The message always names the fix, never a credential."""
 

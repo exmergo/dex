@@ -20,6 +20,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .errors import DexError
+
 
 class Status(str, Enum):
     OK = "ok"
@@ -93,7 +95,7 @@ _SECRET_KEY_PATTERNS = (
 _RAW_ROW_KEY_PATTERNS = ("rows", "records", "sample_rows", "raw", "preview_rows")
 
 
-class SanitizationError(Exception):
+class SanitizationError(DexError):
     """Raised when an envelope payload would leak secrets or raw rows.
 
     This is intentionally a hard failure rather than a silent scrub: a leak is a

@@ -47,13 +47,14 @@ from ..dbt_project import (
     target_role,
 )
 from ..dbt_project import load as load_project
-from ..storage import DEX_DIR, Store
+from ..errors import DexError
+from ..storage import DEX_DIR, ExploreStore
 
 if TYPE_CHECKING:
     from ..connect import ConnectionSource
 
 
-class DevTargetError(Exception):
+class DevTargetError(DexError):
     """Raised when the dev target cannot be built against. The message always
     names both of the values that disagree, or the statement that fixes it."""
 
@@ -92,7 +93,7 @@ def check(
     config: DexConfig,
     repo_root: Path | str = ".",
     *,
-    store: Store | None = None,
+    store: ExploreStore | None = None,
     connection: ConnectionSource | None = None,
 ) -> list[str]:
     """Refuse a dev target that has drifted or does not exist. Returns warnings.
@@ -213,7 +214,7 @@ _UNREACHABLE = (
 
 def preflight_opener(
     repo_root: Path | str,
-    store: Store | None,
+    store: ExploreStore | None,
     config: DexConfig | None = None,
     connection: ConnectionSource | None = None,
     *,
@@ -584,7 +585,7 @@ def content_check(
     repo_root: Path | str = ".",
     *,
     layered: bool = False,
-    store: Store | None = None,
+    store: ExploreStore | None = None,
     connection: ConnectionSource | None = None,
 ) -> list[str]:
     """Warn when a namespace the new project will build into already holds

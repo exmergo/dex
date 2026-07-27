@@ -120,6 +120,13 @@ semantic-api = ["httpx>=0.27"]
 # when it sees an `explore cluster` invocation. Connector-agnostic (clustering
 # runs on the feature sample in-process, whatever warehouse it came from).
 cluster = ["scikit-learn>=1.4"]
+# The storage conformance contract (`exmergo_dex_core.storage.conformance`), for
+# anyone implementing a `Store` backend outside this distribution: it is the
+# executable copy of the rules stated on the protocol, and it needs a test runner
+# to execute them. Named for what it is conformance *to*, matching every other
+# extra here: an install line has to answer "conformance to what?" on its own.
+# Contributor tooling rather than a capability, which is why [all] omits it.
+storage-conformance = ["pytest>=8"]
 # One command for users who want every optional capability at once: every
 # connector, both semantic-layer backends, and clustering. Self-references the
 # other extras so their requirement lists stay defined in exactly one place, which
@@ -134,7 +141,7 @@ all = [
 # (the clustering tests need scikit-learn, the firewall tests need the dialect
 # engine), so `uv sync --extra dev` runs the whole suite without also picking a
 # connector.
-dev = ["pytest>=8", "ruff==0.15.19", "scikit-learn>=1.4", "exmergo-dex-core[sql]"]
+dev = ["ruff==0.15.19", "scikit-learn>=1.4", "exmergo-dex-core[sql,storage-conformance]"]
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"

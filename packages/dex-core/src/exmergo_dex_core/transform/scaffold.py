@@ -22,7 +22,8 @@ from importlib import resources
 
 from ..cache import Dataset
 from ..dbt_project import DbtProjectView
-from ..storage import Store
+from ..errors import DexError
+from ..storage import ExploreStore
 from .plans import EditKind, PlanEdit
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
@@ -42,11 +43,11 @@ MACRO_ASSETS: dict[str, str] = {
 }
 
 
-class ScaffoldError(Exception):
+class ScaffoldError(DexError):
     pass
 
 
-def scaffold_edits(tables: list[str], store: Store) -> list[PlanEdit]:
+def scaffold_edits(tables: list[str], store: ExploreStore) -> list[PlanEdit]:
     """Build the plan edits that scaffold staging models for the named tables."""
 
     cache = store.load_cache()

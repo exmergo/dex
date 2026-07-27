@@ -37,13 +37,14 @@ from ..dbt_project import (
     load as load_project,
 )
 from ..diffs import file_diff
+from ..errors import DexError
 from .validate import find_inlined_secret, validate_edit
 
 if TYPE_CHECKING:
     from ..storage import Store
 
 
-class PlanError(Exception):
+class PlanError(DexError):
     pass
 
 

@@ -41,6 +41,7 @@ from ..config import (
 )
 from ..dbt_project import PROFILES_FILE, PROJECT_FILE, discover_projects
 from ..diffs import file_diff
+from ..errors import DexError
 from ..storage import DEX_DIR
 
 VALID_CONNECTORS = (
@@ -53,7 +54,7 @@ VALID_CONNECTORS = (
 )
 
 
-class InitError(Exception):
+class InitError(DexError):
     pass
 
 

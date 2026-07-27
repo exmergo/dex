@@ -47,11 +47,12 @@ from sqlglot import expressions as exp
 
 from ..cache import CACHE_SCHEMA_VERSION, Dataset, DexCache, match_identifier
 from ..config import QueryLimits
+from ..errors import DexError
 from . import PII_BLOCK_CONFIDENCE
 from .sql_guard import NotSelectOnlyError, assert_select_only
 
 
-class QueryRefusedError(Exception):
+class QueryRefusedError(DexError):
     """Raised when a query violates the firewall policy. The message always
     names the offending construct and the fix, so a refusal costs the agent one
     rewrite, not a debugging session."""

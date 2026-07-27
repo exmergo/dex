@@ -49,8 +49,14 @@ from .config import (
     load_config,
 )
 from .envelope import Paradigm
+from .errors import (
+    ConfigurationError,
+    DexError,
+    NoConnectorSelectedError,
+    StoreRequiredError,
+)
 from .guards.cost_guard import CostGate, ledger_field
-from .storage import Store
+from .storage import ExploreStore
 
 # What each connector bills in. Absent means free and local (DuckDB), which is
 # also what an unknown name resolves to: no gate, no ceiling, no confirmation.
@@ -167,31 +173,31 @@ def assert_connection_source(
     if connection is None:
         return
     if connector == "duckdb":
-        raise ValueError(
+        raise ConfigurationError(
             "connection= does not apply to the duckdb connector: the target is a "
             "single local file, which dex opens read-only itself (an injected "
             "handle could be writable). Select it with path= instead"
         )
     if connector not in _INJECTABLE:
-        raise ValueError(
+        raise ConfigurationError(
             f"connection= is not supported for connector '{connector}': pass one "
             f"of {', '.join(sorted(_INJECTABLE))}"
         )
     if connector == "databricks":
         if connection.workspace is None:
-            raise ValueError(
+            raise ConfigurationError(
                 "an injected databricks connection needs workspace= too: the "
                 "Unity Catalog REST client serves every free metadata path, and "
                 "connect= opens the billed SQL session only. Pass "
                 "ConnectionSource(connect=..., workspace=WorkspaceClient(...))"
             )
     elif connection.workspace is not None:
-        raise ValueError(
+        raise ConfigurationError(
             f"workspace= is Databricks vocabulary and has no meaning for the "
             f"{connector} connector; pass the connection itself as connect="
         )
     if connection.principal_type is not None and connector != "bigquery":
-        raise ValueError(
+        raise ConfigurationError(
             f"principal_type= is BigQuery vocabulary and has no meaning for the "
             f"{connector} connector; describe the credential in auth_method="
         )
@@ -200,7 +206,7 @@ def assert_connection_source(
 def new_cost_gate(
     connector: str,
     config: DexConfig,
-    store: Store,
+    store: ExploreStore,
     *,
     budget: float | None = None,
     confirmed: bool = False,
@@ -237,7 +243,7 @@ def new_cost_gate(
     )
 
 
-def no_connector_selected(repo_root: str | Path | None) -> ValueError:
+def no_connector_selected(repo_root: str | Path | None) -> NoConnectorSelectedError:
     """The connector-selection half of "no silent connector default".
 
     Nothing resolved a connector and nothing explicit was passed, so there is no
@@ -247,24 +253,24 @@ def no_connector_selected(repo_root: str | Path | None) -> ValueError:
     """
 
     if repo_root is None:
-        return ValueError(
+        return NoConnectorSelectedError(
             "no connector selected: pass connector= (with path= for duckdb) or a "
             "config= that declares one, or build from a project on disk with "
             "DexEngine.from_repo(repo_root)"
         )
-    return ValueError(
+    return NoConnectorSelectedError(
         f"no .dex/config.yml found searching from '{repo_root}' up to the git "
         "root: run inside your dex project, pass --repo-root, or pass "
         "--connector/--path for an ad-hoc read"
     )
 
 
-class CredentialDiscoveryError(Exception):
+class CredentialDiscoveryError(DexError):
     """Raised when a cloud connection cannot be discovered. The message always
     names the command or config that fixes it, never a credential value."""
 
 
-class ScopeError(Exception):
+class ScopeError(ConfigurationError):
     """Raised when a source scope is not one this connector can honor: a flag it
     does not speak, or an entry outside the committed allowlist. The message
     always names the offending entry and the vocabulary that would work."""
@@ -298,7 +304,7 @@ def open_adapter(
     scopes: list[str] | None = None,
     repo_root: str | Path = ".",
     config: DexConfig | None = None,
-    store: Store | None = None,
+    store: ExploreStore | None = None,
     budget: float | None = None,
     confirmed: bool = False,
     command: str | None = None,
@@ -362,7 +368,7 @@ def open_adapter(
         else:
             resolved = None
         if not resolved:
-            raise ValueError(
+            raise ConfigurationError(
                 "no DuckDB path: pass --path or set duckdb.path in .dex/config.yml"
             )
         return get_adapter("duckdb", path=resolved)
@@ -434,7 +440,7 @@ def open_adapter(
     return get_adapter(connector)
 
 
-def _require_store(store: Store | None, connector: str) -> Store:
+def _require_store(store: ExploreStore | None, connector: str) -> ExploreStore:
     """The store a billed connector's cost gate cannot do without.
 
     The gate settles the cumulative session budget against the spend ledger and
@@ -444,7 +450,7 @@ def _require_store(store: Store | None, connector: str) -> Store:
     """
 
     if store is None:
-        raise ValueError(
+        raise StoreRequiredError(
             f"opening '{connector}' needs a store: its cost gate settles the "
             "session budget against the spend ledger and records spend back into "
             "it. Pass store= (the CLI passes the filesystem store it built from "
@@ -543,7 +549,7 @@ def _open_bigquery(
     config: DexConfig,
     repo_root: str | Path,
     *,
-    store: Store,
+    store: ExploreStore,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -606,7 +612,7 @@ def _open_snowflake(
     config: DexConfig,
     repo_root: str | Path,
     *,
-    store: Store,
+    store: ExploreStore,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -869,7 +875,7 @@ def _open_databricks(
     config: DexConfig,
     repo_root: str | Path,
     *,
-    store: Store,
+    store: ExploreStore,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -1109,7 +1115,7 @@ def _open_postgres(
     config: DexConfig,
     repo_root: str | Path,
     *,
-    store: Store,
+    store: ExploreStore,
     budget: float | None,
     confirmed: bool,
     command: str | None,
@@ -1380,7 +1386,7 @@ def _open_redshift(
     config: DexConfig,
     repo_root: str | Path,
     *,
-    store: Store,
+    store: ExploreStore,
     budget: float | None,
     confirmed: bool,
     command: str | None,

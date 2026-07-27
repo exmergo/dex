@@ -14,8 +14,10 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import expressions as exp
 
+from ..errors import DexError
 
-class NotSelectOnlyError(Exception):
+
+class NotSelectOnlyError(DexError):
     """Raised when SQL is not a single read-only SELECT statement."""
 
 

@@ -13,6 +13,18 @@ under `.dex/`, persistence is git, not a service), while an in-process library
 caller can select :class:`~.memory.MemoryStore` and write nothing at all.
 
 Secrets never live in any backend.
+
+**Writing your own backend.** The contract is three nested protocols, so a host
+implements only the tier it uses (see below), and every rule it has to satisfy is
+stated on the member it governs rather than left for a reader to infer from the
+two shipped backends. :mod:`~.conformance` ships the executable copy of those
+rules: subclass ``StoreContract``, hand it a factory, and the whole contract runs
+against your backend. ``references/storage.md`` is the prose version.
+
+The protocol is **synchronous**. A backend whose client is async wraps it (run the
+coroutine to completion inside the method) rather than the protocol growing an
+async variant: every caller in the engine is synchronous, and a second async
+surface would double the contract for no caller that exists.
 """
 
 from __future__ import annotations
@@ -29,7 +41,12 @@ if TYPE_CHECKING:
 
 
 class Document(str, Enum):
-    """The addressable pieces of `.dex/` state, for locator lookups."""
+    """The addressable pieces of `.dex/` state, for locator lookups.
+
+    One enum across all three tiers rather than one per tier: which documents a
+    backend actually stores follows from the tier it implements, and an
+    explore-only backend is simply never asked for ``SNAPSHOT`` or ``DRIFT``.
+    """
 
     CACHE = "cache"
     SNAPSHOT = "snapshot"
@@ -39,8 +56,12 @@ class Document(str, Enum):
 
 
 @runtime_checkable
-class Store(Protocol):
-    """Behavioral contract for a `.dex/` state backend.
+class ExploreStore(Protocol):
+    """The state an exploring, profiling, querying host needs, and nothing more.
+
+    The narrowest useful tier, and the one a host embedding dex for read-only
+    sense-making should implement. It carries the exploration cache and the two
+    ledgers; it does not carry the reconcile baseline or the transform plans.
 
     Backend state lives inside the store instance (class DI): it holds the
     connection, directory, or dictionaries the documents live in, so no caller
@@ -51,26 +72,62 @@ class Store(Protocol):
     where the document went, for the envelope field an agent surfaces to a human.
     It is deliberately not a ``Path``, so a backend with no filesystem is
     representable.
+
+    Three rules hold across every member here, because the shipped backends both
+    honor them and a backend that does not will diverge in ways that surface much
+    later as a data bug rather than an error:
+
+    **Documents do not alias the caller's object.** What a caller saves and what
+    a later ``load_*`` returns must be independent objects, in both directions.
+    :class:`~.filesystem.FilesystemStore` gets this for free by serializing;
+    :class:`~.memory.MemoryStore` deep-copies on the way in and on the way out
+    specifically to match it. A backend holding a live in-process reference lets
+    a mutation after a save silently rewrite history.
+
+    **Documents are pydantic models.** They round-trip through
+    ``model_validate_json`` and ``model_dump_json``. A backend that stores its own
+    hand-rolled dict shape instead will diverge on the first schema change; use
+    the model's own serialization and store the result.
+
+    **A stored ``schema_version`` is not the store's to police.** Documents carry
+    one and the engine reads it (the query firewall degrades on an old cache);
+    a backend loads what it was given and lets the engine decide.
     """
 
     # --- documents ------------------------------------------------------------
 
     def load_cache(self) -> DexCache | None:
-        """The stored exploration cache, or None when nothing has been stored."""
+        """The stored exploration cache, or None when nothing has been stored.
+
+        Raises rather than returning None when what is stored cannot be parsed: a
+        corrupt cache is a different situation from an absent one, and silently
+        treating the first as the second would re-profile a warehouse (and bill
+        for it) as if nothing had ever been explored.
+        """
         ...
 
     def save_cache(self, cache: DexCache, *, now: datetime | None = None) -> str:
         """Store the cache, stamping ``provenance.updated_at`` when ``now`` is
-        given. Returns the locator."""
+        given. Returns the locator.
+
+        Two contracts here that a backend has to honor deliberately.
+
+        **The stamp lands on the caller's object too**, not only on the stored
+        copy. The command layer reports the timestamp it just persisted, so a
+        backend that stamps only what it writes makes the reported time and the
+        stored time disagree.
+
+        **This is a whole-document write, and it is atomic from the caller's
+        view.** The query firewall resolves every table and column reference
+        against the cache, so cache membership decides what a query may name and
+        under whose PII policy; a half-written cache is a security-relevant state
+        rather than merely an inconsistent one. A backend whose store caps
+        document size (a document database typically does) chunks internally and
+        presents one logical document. It does not get a per-dataset seam to
+        write through, because that seam is exactly what would let a reader
+        observe half a cache.
+        """
         ...
-
-    def load_snapshot(self) -> Snapshot | None: ...
-
-    def save_snapshot(self, snapshot: Snapshot) -> str: ...
-
-    def load_drift(self) -> DriftReport | None: ...
-
-    def save_drift(self, report: DriftReport) -> str: ...
 
     # --- ledgers --------------------------------------------------------------
 
@@ -80,6 +137,9 @@ class Store(Protocol):
         Refusals are logged too: the ledger is the audit trail and the product
         signal for which probe shapes recur often enough to deserve promotion to
         a named command. SQL text only, never result values.
+
+        The stored entry does not alias the caller's dict, for the same reason
+        documents do not.
         """
         ...
 
@@ -103,11 +163,77 @@ class Store(Protocol):
 
         ``field`` and ``connector`` keep paradigms separate: a session budget in
         bytes must never absorb a seconds entry from another connector sharing
-        the ledger, so callers sum their own connector's own unit.
+        the ledger, so callers sum their own connector's own unit. Use
+        :func:`spend_total` rather than reimplementing the arithmetic, so every
+        backend answers the budget question identically.
+
+        **Those two are not the whole scoping story, and the third axis is the
+        store itself.** The ledger is scoped to the store instance, so store
+        granularity is ceiling granularity: one principal spanning two stores has
+        two independent ceilings and nothing bounds their sum. Nothing warns about
+        it and it errs permissive, so a host federating state per user should key
+        stores exactly as it keys principals, and a host that splits stores for
+        another reason (one per repo root, say) should know it has split the
+        budget too.
+
+        A malformed ledger entry is skipped rather than raised on. This is the
+        opposite policy from :meth:`load_cache`, deliberately: an unreadable
+        cache means dex does not know what it may query, while an unreadable
+        ledger line means one spend record is lost, and refusing to run every
+        subsequent billed command because of one bad line is the worse failure.
+
+        **Concurrency.** The cost gate calls this and then calls
+        :meth:`append_spend_log`, and that read-then-write is not atomic at the
+        protocol level. The cumulative session ceiling therefore binds exactly
+        when commands are serialized, which is the CLI's one-command-per-process
+        shape, and under genuinely concurrent commands the overshoot is bounded
+        by the sum of the concurrent estimates. A backend that can make the pair
+        atomic for one key (a transaction, a conditional write) should, and a
+        multi-tenant backend serving concurrent requests per tenant is where that
+        stops being optional. The protocol does not grow a member for it, because
+        an optional member no implementer can rely on is worse than a stated
+        bound.
         """
         ...
 
-    # --- plans ----------------------------------------------------------------
+    # --- locators -------------------------------------------------------------
+
+    def locator(self, document: Document) -> str:
+        """Where ``document`` lives, whether or not it has been stored yet. For
+        the callers that report a location without writing one (a drift path in a
+        detector envelope, a partial-write path in a budget-exhaustion error)."""
+        ...
+
+
+@runtime_checkable
+class MaintainStore(ExploreStore, Protocol):
+    """Adds the drift-detection state: the baseline and the last report.
+
+    A host that reconciles a dbt project against a warehouse needs this tier. The
+    snapshot is the known-good baseline every drift axis compares against, so a
+    backend that cannot retain it across requests cannot support `maintain`.
+    """
+
+    def load_snapshot(self) -> Snapshot | None: ...
+
+    def save_snapshot(self, snapshot: Snapshot) -> str: ...
+
+    def load_drift(self) -> DriftReport | None: ...
+
+    def save_drift(self, report: DriftReport) -> str: ...
+
+
+@runtime_checkable
+class Store(MaintainStore, Protocol):
+    """The full contract: everything above, plus the transform plan store.
+
+    The name every internal annotation used before the tiers existed, kept so a
+    backend implementing all sixteen members is still just a ``Store``. The five
+    plan members are the transform surface's alone; nothing in explore or
+    maintain calls them, which is why a host that only explores can stop at
+    :class:`ExploreStore` and still satisfy a declared contract rather than
+    shipping five methods that raise.
+    """
 
     def save_plan(self, plan: TransformPlan) -> str: ...
 
@@ -121,14 +247,6 @@ class Store(Protocol):
 
     def latest_plan(self, kind: EditKind | None = None) -> TransformPlan | None:
         """The most recent unapplied plan, optionally only-of-``kind`` edits."""
-        ...
-
-    # --- locators -------------------------------------------------------------
-
-    def locator(self, document: Document) -> str:
-        """Where ``document`` lives, whether or not it has been stored yet. For
-        the callers that report a location without writing one (a drift path in a
-        detector envelope, a partial-write path in a budget-exhaustion error)."""
         ...
 
     def plan_locator(self, plan_id: str) -> str: ...

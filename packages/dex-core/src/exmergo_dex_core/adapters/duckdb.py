@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 
 from ..envelope import Paradigm
+from ..errors import ConnectorError
 from ..guards.sql_guard import assert_select_only
 from .base import (
     ColumnAggregate,
@@ -45,7 +46,7 @@ _COLUMN_BATCH = 50
 _NESTED_TYPE_PREFIXES = ("STRUCT", "MAP", "LIST", "UNION")
 
 
-class DuckDBReadOnlyError(Exception):
+class DuckDBReadOnlyError(ConnectorError):
     """Raised when a DuckDB path cannot be opened read-only.
 
     A read-only open is non-negotiable: rather than silently falling back to a

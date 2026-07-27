@@ -13,8 +13,10 @@ it is separate from the guards that use it.
 
 from __future__ import annotations
 
+from ..errors import DexError
 
-class DialectDependencyError(Exception):
+
+class DialectDependencyError(DexError):
     """The dialect engine (sqlglot, carried by every connector extra) is missing.
 
     Surfaced as a clean error envelope naming the install to fix, never as a

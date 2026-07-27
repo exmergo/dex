@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 
 from sqlglot import exp
 
+from ..errors import DexError
+
 # Percent-sampling dialects need a floor so a tiny fraction on a huge table does
 # not round to zero percent (which reads the whole table on some engines).
 _MIN_SAMPLE_PERCENT = 0.01
@@ -35,12 +37,12 @@ _MIN_SAMPLE_PERCENT = 0.01
 _DEGENERATE_CLUSTER_FRACTION = 0.01
 
 
-class ClusterError(Exception):
+class ClusterError(DexError):
     """A clustering request that cannot be satisfied (too few rows, too few
     usable features, k out of range). Surfaced as a clean error envelope."""
 
 
-class ClusterDependencyError(Exception):
+class ClusterDependencyError(ClusterError):
     """scikit-learn (the ``[cluster]`` extra) is not installed."""
 
 

@@ -286,7 +286,10 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     dbt adapters and MetricFlow in one environment, it is also the only place a
     version conflict between them can surface at all.
 
-    `dev` is excluded deliberately: contributor tooling, not a capability.
+    `dev` and `conformance` are excluded deliberately: contributor tooling, not
+    capabilities. `storage-conformance` carries a test runner for people
+    implementing a storage backend, and nobody installing "everything dex can do"
+    wants pytest.
     """
 
     extras = _project_metadata()["optional-dependencies"]
@@ -294,8 +297,9 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     referenced = set(
         extras["all"][0].removeprefix("exmergo-dex-core[").removesuffix("]").split(",")
     )
-    assert referenced == set(extras) - {"all", "dev"}, (
-        f"[all] does not cover {sorted(set(extras) - {'all', 'dev'} - referenced)}"
+    tooling = {"all", "dev", "storage-conformance"}
+    assert referenced == set(extras) - tooling, (
+        f"[all] does not cover {sorted(set(extras) - tooling - referenced)}"
     )
 
     # Every client the extras exist to deliver, plus each dbt adapter, since a
@@ -400,3 +404,115 @@ def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
     envelope = json.loads(done.stdout)
     assert envelope["status"] == "not_implemented"
     assert envelope["data"]["command"] == "viz preview"
+
+
+def test_the_wheel_ships_the_typed_marker(wheel: str):
+    """`py.typed` is what makes the storage protocol checkable by anyone else.
+
+    The seam is enforced entirely by structural typing: a backend "implements"
+    `Store` by having the right methods with the right signatures, and nothing at
+    runtime re-checks that. Without this marker a downstream type checker treats
+    the whole package as untyped and silently verifies nothing, so an implementer
+    gets no signal at all until something fails in production.
+    """
+
+    import zipfile
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    assert "exmergo_dex_core/py.typed" in names, (
+        "py.typed is not in the wheel, so the storage seam is unverifiable "
+        f"downstream: {sorted(n for n in names if n.count('/') <= 1)[:15]}"
+    )
+
+
+OUTSIDE_BACKEND = '''
+import json
+
+from exmergo_dex_core.cache import DexCache
+from exmergo_dex_core.storage import Document, ExploreStore, spend_total
+from exmergo_dex_core.storage.conformance import ExploreStoreContract
+
+
+class TinyStore:
+    """A backend written against the published protocol and nothing else."""
+
+    _state: dict = {}
+
+    def __init__(self, key):
+        self.key = key
+        self._docs = self._state.setdefault(key, {})
+
+    def load_cache(self):
+        raw = self._docs.get("cache")
+        return None if raw is None else DexCache.model_validate_json(raw)
+
+    def save_cache(self, cache, *, now=None):
+        if now is not None:
+            cache.provenance.updated_at = now.isoformat()
+        self._docs["cache"] = cache.model_dump_json()
+        return self.locator(Document.CACHE)
+
+    def append_query_log(self, entry):
+        self._docs.setdefault("q", []).append(json.dumps(entry))
+
+    def append_spend_log(self, entry):
+        self._docs.setdefault("s", []).append(json.dumps(entry))
+
+    def spend_since(self, cutoff_iso, *, field="billed_bytes", connector=None):
+        entries = [json.loads(r) for r in self._docs.setdefault("s", [])]
+        return spend_total(entries, cutoff_iso, field=field, connector=connector)
+
+    def locator(self, document):
+        return "tiny://" + self.key + "/" + document.value
+
+
+def test_the_published_protocol_is_satisfied():
+    assert isinstance(TinyStore("k"), ExploreStore)
+
+
+class TestTinyStore(ExploreStoreContract):
+    def make_store(self, key):
+        TinyStore._state.pop(key, None)
+        return TinyStore(key)
+'''
+
+
+def test_a_backend_outside_the_distribution_passes_the_shipped_contract(
+    wheel: str, tmp_path: Path
+):
+    """A storage backend implemented by someone who cannot see this source tree.
+
+    Everything else about the storage contract is tested from inside this repo,
+    against backends written by the same person as the protocol, importing from a
+    source tree. None of that shows whether anyone else can do it. So: build the
+    wheel, install it somewhere isolated from this repo, write a backend there
+    against the published protocol alone, and run the conformance suite dex ships
+    at that backend.
+
+    If this passes, an outside contributor can implement a storage backend from
+    what is published, which is the entire point of publishing it. If it fails,
+    they cannot, whatever the in-repo tests say.
+    """
+
+    suite = tmp_path / "test_outside_backend.py"
+    suite.write_text(OUTSIDE_BACKEND.lstrip(), encoding="utf-8")
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            f"exmergo-dex-core[storage-conformance] @ {wheel}",
+            "pytest",
+            "-q",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
