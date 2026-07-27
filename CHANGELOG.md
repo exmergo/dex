@@ -9,6 +9,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every refusal dex raises deliberately is catchable as one type** ([#144]).
+  The CLI renders refusals into an error envelope behind a catch-all, so it never
+  needed a hierarchy; a library consumer cannot do that, and catching `Exception`
+  at an API boundary swallows real bugs alongside deliberate refusals. All of
+  them now descend from `DexError`, with `ConfigurationError` for an engine built
+  without something it needs and `RequestError` for a call that named something
+  unusable. `NoConnectorSelectedError`, `RepoRootRequiredError`, and
+  `StoreRequiredError` replace the bare `ValueError`s that the public API raised
+  for the three refusals a host hits most.
+
+  **Nothing breaks for an existing consumer.** Both families also inherit
+  `ValueError`, which is what those refusals raised before they were typed, so
+  code written against the previous API keeps catching what it caught.
+
+  Two families name the distinctions a host actually branches on.
+  **`PrerequisiteError`** covers refusals where the engine is fine, the call is
+  fine, and some state does not exist yet that a named command creates:
+  `CacheRequiredError` and `NoBaselineError`. It is the one family a caller can
+  resolve automatically, by running the command the message names and retrying.
+  **`ConnectorError`** covers a warehouse connection that could not be
+  established, so a host writes one `except` instead of importing a name per
+  connector. `CredentialDiscoveryError` is deliberately outside it: a credential
+  that was never configured will not appear on a retry.
+
+  **Eleven refusals that were typed but not importable are now exported**:
+  `PrerequisiteError`, `CacheRequiredError`, `NoBaselineError`, `ConnectorError`,
+  `CredentialDiscoveryError`, `ScopeError`, `ClusterError`,
+  `ClusterDependencyError`, `DialectDependencyError`, `PlanError`, and
+  `PlanNotFoundError`. Being a distinct class is not enough on its own: with no
+  importable name, a consumer branches by matching on message prose, and prose is
+  not an interface anyone owes stability on, so rewording an error silently
+  changes which branch a caller takes. `PlanNotFoundError` is the sharpest case,
+  because `Store.load_plan` is documented as raising it and a third-party backend
+  could not satisfy that contract without importing from a private module. A test
+  now asserts every refusal reachable from the public API is importable, with an
+  explicit internal set, so the next one added forces a decision.
+
+  `SemanticBackendError` and `SemanticQueryRefusedError` are now exported from the
+  package root. They are the documented catch for the hosted semantic-layer path
+  and previously required importing from `exmergo_dex_core.explore.semantic`, a
+  module layout that was never public surface.
+
 ### Added
 
 - **The storage seam is a public extension point: a shipped conformance suite, a
@@ -71,49 +115,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   New reference page `references/storage.md` covers the tiers, those contracts,
   which calls need nothing on the filesystem, and how a backend is selected.
 
-### Changed
+### Fixed
 
-- **Every refusal dex raises deliberately is catchable as one type** ([#144]).
-  The CLI renders refusals into an error envelope behind a catch-all, so it never
-  needed a hierarchy; a library consumer cannot do that, and catching `Exception`
-  at an API boundary swallows real bugs alongside deliberate refusals. All of
-  them now descend from `DexError`, with `ConfigurationError` for an engine built
-  without something it needs and `RequestError` for a call that named something
-  unusable. `NoConnectorSelectedError`, `RepoRootRequiredError`, and
-  `StoreRequiredError` replace the bare `ValueError`s that the public API raised
-  for the three refusals a host hits most.
-
-  **Nothing breaks for an existing consumer.** Both families also inherit
-  `ValueError`, which is what those refusals raised before they were typed, so
-  code written against the previous API keeps catching what it caught.
-
-  Two families name the distinctions a host actually branches on.
-  **`PrerequisiteError`** covers refusals where the engine is fine, the call is
-  fine, and some state does not exist yet that a named command creates:
-  `CacheRequiredError` and `NoBaselineError`. It is the one family a caller can
-  resolve automatically, by running the command the message names and retrying.
-  **`ConnectorError`** covers a warehouse connection that could not be
-  established, so a host writes one `except` instead of importing a name per
-  connector. `CredentialDiscoveryError` is deliberately outside it: a credential
-  that was never configured will not appear on a retry.
-
-  **Eleven refusals that were typed but not importable are now exported**:
-  `PrerequisiteError`, `CacheRequiredError`, `NoBaselineError`, `ConnectorError`,
-  `CredentialDiscoveryError`, `ScopeError`, `ClusterError`,
-  `ClusterDependencyError`, `DialectDependencyError`, `PlanError`, and
-  `PlanNotFoundError`. Being a distinct class is not enough on its own: with no
-  importable name, a consumer branches by matching on message prose, and prose is
-  not an interface anyone owes stability on, so rewording an error silently
-  changes which branch a caller takes. `PlanNotFoundError` is the sharpest case,
-  because `Store.load_plan` is documented as raising it and a third-party backend
-  could not satisfy that contract without importing from a private module. A test
-  now asserts every refusal reachable from the public API is importable, with an
-  explicit internal set, so the next one added forces a decision.
-
-  `SemanticBackendError` and `SemanticQueryRefusedError` are now exported from the
-  package root. They are the documented catch for the hosted semantic-layer path
-  and previously required importing from `exmergo_dex_core.explore.semantic`, a
-  module layout that was never public surface.
+- **`explore query` docs now say row-major, matching what `cells` actually
+  returns** ([#152]). The `explore` skill and command contract described
+  `query` results as columnar, but `cells` is a list of rows; a square-ish
+  result set could be silently misread with no error. Docs updated to say
+  row-major across `explore query` and `explore semantic query`; no behavior
+  change.
 
 ## [1.4.1] - 2026-07-26
 

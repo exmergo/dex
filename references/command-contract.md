@@ -318,7 +318,7 @@ only refuses or bounds. The gate, in order:
    query that projected sub-threshold flagged columns records those warnings
    under `pii_warnings`, so the audit trail keeps every such projection findable.
 
-Results are columnar (`columns`, `cells` as a list of lists, `row_count`,
+Results are row-major (`columns`, `cells` as a list of lists, `row_count`,
 `truncated`, `notes`), which is cheaper in tokens than records and keeps the
 envelope sanitizer's list-of-dicts raw-row rule intact as a backstop.
 
