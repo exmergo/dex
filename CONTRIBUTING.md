@@ -220,6 +220,38 @@ installed) with `python -m evals skills/<skill>`. If a future backend needs a
 real Python dependency, promote `evals/` to its own uv project at that point and
 not before. See `evals/README.md` for the rationale and full usage.
 
+## Writing a storage backend
+
+`.dex/` state lives behind a `Store` protocol, and the contract is public so a
+backend does not have to live in this repository. The usual reason to write one is
+a process serving several end users, which needs state federated per user in its
+own datastore rather than in one repo directory.
+
+Implement the tier your host actually uses (`ExploreStore` is six methods;
+`MaintainStore` and `Store` add to it), then prove it with the suite dex ships:
+
+```
+pip install "exmergo-dex-core[conformance]"
+```
+
+```python
+from exmergo_dex_core.storage.conformance import ExploreStoreContract
+
+
+class TestMyStore(ExploreStoreContract):
+    def make_store(self, key):
+        return MyStore(tenant=key)
+```
+
+pytest collects the inherited tests and runs the whole contract against your
+backend, isolation assertions included. `references/storage.md` covers the tiers,
+the contracts that are not obvious from the signatures, and which calls need
+nothing on the filesystem.
+
+Backends contributed here run the same suite: see
+`packages/dex-core/tests/storage/test_parity.py`, which is deliberately the same
+three lines a third party writes.
+
 ## Linting and formatting (Ruff)
 
 We use [Ruff](https://docs.astral.sh/ruff/) as both the linter and the
