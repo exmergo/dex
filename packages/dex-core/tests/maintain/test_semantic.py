@@ -6,7 +6,18 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from exmergo_dex_core.maintain.drift import CardinalityCheck, cardinality_drift
+from exmergo_dex_core.cache import ColumnProfile, Dataset
+from exmergo_dex_core.maintain.drift import (
+    CardinalityCheck,
+    cardinality_drift,
+    cardinality_plan,
+)
+from exmergo_dex_core.maintain.snapshot import (
+    SemanticLayer,
+    SemanticModelDef,
+    Snapshot,
+    WarehouseBaseline,
+)
 
 from .conftest import SEMANTIC_YAML
 
@@ -203,6 +214,84 @@ def test_new_categorical_value_is_a_cardinality_delta_never_a_value(maintain_rep
     # never reaches the envelope (or `.dex/`); naming it is a job for a
     # firewalled `explore query` if the user asks.
     assert "refunded" not in json.dumps(payload)
+
+
+def _snapshot_with_two_semantic_models() -> tuple[Snapshot, SemanticLayer]:
+    """Two unrelated models, each with one categorical dimension carrying a
+    distinct-count baseline: the minimum shape `cardinality_plan` needs."""
+
+    warehouse = WarehouseBaseline(
+        datasets=[
+            Dataset(
+                identifier="db.main.orders",
+                columns=[
+                    ColumnProfile(
+                        name="status",
+                        data_type="VARCHAR",
+                        distinct_count=5,
+                        distinct_count_exact=True,
+                    )
+                ],
+            ),
+            Dataset(
+                identifier="db.main.customers",
+                columns=[
+                    ColumnProfile(
+                        name="region",
+                        data_type="VARCHAR",
+                        distinct_count=4,
+                        distinct_count_exact=True,
+                    )
+                ],
+            ),
+        ]
+    )
+    semantic = SemanticLayer(
+        semantic_models=[
+            SemanticModelDef(
+                name="orders",
+                path="orders.yml",
+                content_sha256="a",
+                model_ref="orders",
+                categorical_dimensions={"status": "status"},
+            ),
+            SemanticModelDef(
+                name="customers",
+                path="customers.yml",
+                content_sha256="b",
+                model_ref="customers",
+                categorical_dimensions={"region": "region"},
+            ),
+        ]
+    )
+    snap = Snapshot(
+        created_at="2024-01-01T00:00:00", warehouse=warehouse, semantic_layer=semantic
+    )
+    return snap, semantic
+
+
+def test_cardinality_plan_unscoped_covers_every_semantic_model():
+    snap, semantic = _snapshot_with_two_semantic_models()
+    checks = cardinality_plan(semantic, snap)
+    assert {c.identifier for c in checks} == {"db.main.orders", "db.main.customers"}
+
+
+def test_cardinality_plan_scope_narrows_to_the_named_identifier():
+    """#115: the paid axis must actually skip the unscoped checks, not just
+    filter the findings they would have produced."""
+
+    snap, semantic = _snapshot_with_two_semantic_models()
+    checks = cardinality_plan(semantic, snap, {"orders"})
+    assert {c.identifier for c in checks} == {"db.main.orders"}
+
+
+def test_cardinality_plan_scope_matches_dimension_name_too():
+    """Scope vocabulary matches _semantic_scope's: a dimension name narrows
+    the plan just like a table name does."""
+
+    snap, semantic = _snapshot_with_two_semantic_models()
+    checks = cardinality_plan(semantic, snap, {"region"})
+    assert {c.identifier for c in checks} == {"db.main.customers"}
 
 
 def test_semantic_needs_a_dbt_project(maintain_repo):

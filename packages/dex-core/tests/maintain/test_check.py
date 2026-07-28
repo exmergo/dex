@@ -75,6 +75,35 @@ def test_check_warns_when_cache_outruns_snapshot(maintain_repo):
     assert any("re-run `maintain snapshot`" in w for w in payload["warnings"])
 
 
+def test_scope_narrows_every_axis_including_the_paid_ones(maintain_repo):
+    """#115: an unscoped check's grain/cardinality estimate covers everything;
+    a scoped one should price and report only the named object(s), across
+    every axis, not just the free ones."""
+
+    maintain_repo.snapshot()
+    # Grain drift on customers; semantic cardinality drift on stg_orders. Two
+    # unrelated tables, so scoping to one must exclude the other's findings.
+    maintain_repo.sql("INSERT INTO customers SELECT * FROM customers WHERE id <= 5")
+    maintain_repo.sql(
+        "INSERT INTO stg_orders VALUES (999, 1, 5.0, 'refunded', DATE '2024-03-01')"
+    )
+
+    rc, payload = maintain_repo.dex("maintain", "check", "customers")
+    assert rc == 0 and payload["status"] == "ok"
+    axes = payload["data"]["axes"]
+    assert axes["schema"] == 0
+    assert axes["semantic"] == 0
+    assert axes["grain"] >= 1
+
+    codes = {f["code"] for f in payload["data"]["findings"]}
+    assert "key_lost_uniqueness" in codes
+    assert "dimension_cardinality_changed" not in codes
+
+    report = FilesystemStore(maintain_repo.root).load_drift()
+    assert report.axes["grain"].scope == ["customers"]
+    assert report.axes["semantic"].scope == ["customers"]
+
+
 def test_check_without_project_skips_semantic_with_warning(dex, tmp_path):
     import duckdb
 
