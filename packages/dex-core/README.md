@@ -60,9 +60,12 @@ envelope never crosses this boundary.
 Nothing above touches disk. The default store keeps state in the process, so
 importing this package cannot leave a `.dex/` directory in a consumer's repo;
 pass `store=` for anything durable, or use `DexEngine.from_repo(repo_root)` to get
-the CLI's behavior (filesystem store, config read from `.dex/config.yml`). The
-`Store` protocol is public, so a host can back state with its own session store
-or database instead.
+the CLI's behavior (config read from `.dex/config.yml`, and the backend that
+config selects, which defaults to plain files under `.dex/`). The `Store` protocol
+is public, so a host can back state with its own session store or database
+instead, and a backend published as its own package is selectable by name from
+`cache.backend` without a change to dex. See
+[`references/storage.md`](../../references/storage.md).
 
 [`examples/quickstart.py`](examples/quickstart.py) is the whole flow in one
 runnable file: map a warehouse, read the inferred joins, see PII flagged, ask a
