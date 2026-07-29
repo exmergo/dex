@@ -21,6 +21,13 @@ two shipped backends. :mod:`~.conformance` ships the executable copy of those
 rules: subclass ``StoreContract``, hand it a factory, and the whole contract runs
 against your backend. ``references/storage.md`` is the prose version.
 
+**Constructing one is a separate contract**, :class:`StoreFactory` over a
+:class:`StoreContext`, and it is optional. A host that passes its own instance to
+the engine never needs it; it exists so a backend can also be *named* somewhere
+and built by dex. Keeping it off the store protocols is what preserves the
+property that makes this seam cheap to implement: a class with the right methods
+is a store, with no base class to inherit and no registration step.
+
 The protocol is **synchronous**. A backend whose client is async wraps it (run the
 coroutine to completion inside the method) rather than the protocol growing an
 async variant: every caller in the engine is synchronous, and a second async
@@ -29,9 +36,11 @@ surface would double the contract for no caller that exists.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from ..cache import DexCache
@@ -250,6 +259,64 @@ class Store(MaintainStore, Protocol):
         ...
 
     def plan_locator(self, plan_id: str) -> str: ...
+
+
+@dataclass(frozen=True)
+class StoreContext:
+    """Everything a backend gets to build itself from when dex constructs it.
+
+    Two fields, because the backends disagree about what they are keyed by and
+    the disagreement is not resolvable by picking a winner. ``FilesystemStore``
+    takes a path, ``MemoryStore`` takes nothing, and a tenant-keyed backend
+    serving several end users has no repository at all. A construction contract
+    shaped around the path-shaped ones would leave the last group unbuildable,
+    which is the group this seam exists for.
+
+    ``repo_root`` is the directory dex was pointed at, or ``None`` when there is
+    no repository in the picture. It is not the place scratch state has to land:
+    a backend is free to ignore it, and most non-filesystem ones will.
+
+    ``options`` is the backend's own non-secret coordinates, passed through
+    verbatim from wherever the backend was named. dex does not interpret it, so
+    the keys are the backend's to define and the backend's to validate: refuse an
+    option you cannot honor rather than accepting and ignoring it, because a
+    silently dropped setting is indistinguishable from a working one until
+    something is stored in the wrong place.
+
+    **No secret ever arrives here.** A backend named in ``.dex/config.yml`` is
+    named in a committed file, so a password, key, token, or connection string in
+    ``options`` would be a credential in version control. Read the credential the
+    way the rest of the engine does, from the environment at construction time,
+    or skip this contract entirely and hand the engine a store you built yourself
+    (``DexEngine(store=...)``), which is the right shape for a host that already
+    holds per-request credentials.
+    """
+
+    repo_root: str | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class StoreFactory(Protocol):
+    """Anything that turns a :class:`StoreContext` into a store.
+
+    One call, one argument, so the shapes a backend author would reach for all
+    qualify without adapters: a module-level function, a class whose ``__init__``
+    takes the context, or a classmethod such as
+    :meth:`~.filesystem.FilesystemStore.from_context`.
+
+    The returned store need only satisfy the tier its host uses; a factory
+    building an :class:`ExploreStore` is a complete factory.
+
+    **Do not validate a factory with ``isinstance``.** This protocol is
+    ``runtime_checkable`` for symmetry with the store tiers, but a callable
+    protocol can only check that ``__call__`` exists, which every callable
+    satisfies. What is worth checking is the store that comes back, and the tiers
+    are genuinely ``isinstance``-checkable, so build first and check the result
+    against the tier the caller needs.
+    """
+
+    def __call__(self, context: StoreContext) -> ExploreStore: ...
 
 
 def spend_total(
