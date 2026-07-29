@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from exmergo_dex_core import ConfigurationError
 from exmergo_dex_core.cache import Dataset, DexCache
-from exmergo_dex_core.storage import Document, MemoryStore
+from exmergo_dex_core.storage import Document, MemoryStore, StoreContext
 
 
 def test_nothing_reaches_the_filesystem(tmp_path: Path, monkeypatch):
@@ -51,6 +54,18 @@ def test_a_loaded_document_is_a_copy_the_caller_can_mutate_freely():
     reloaded = store.load_cache()
     assert reloaded is not None
     assert [d.identifier for d in reloaded.datasets] == ["db.main.orders"]
+
+
+def test_from_context_ignores_a_repo_root_but_refuses_options(tmp_path: Path):
+    # A repo root is present in every context dex builds, and carrying one is not a
+    # request to use it; an option this backend has no meaning for is a mistake.
+    built = MemoryStore.from_context(StoreContext(repo_root=str(tmp_path)))
+    built.save_cache(DexCache(datasets=[Dataset(identifier="db.main.orders")]))
+    assert list(tmp_path.rglob("*")) == []
+
+    with pytest.raises(ConfigurationError) as refusal:
+        MemoryStore.from_context(StoreContext(options={"tenant": "acme"}))
+    assert "tenant" in str(refusal.value)
 
 
 def test_locators_name_the_backend_rather_than_a_path():

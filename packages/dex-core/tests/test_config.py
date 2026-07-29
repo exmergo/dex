@@ -8,6 +8,7 @@ import pytest
 
 from exmergo_dex_core.config import (
     BlobOverride,
+    CacheConfig,
     DexConfig,
     PIIOverride,
     blob_override_paths,
@@ -138,3 +139,32 @@ def test_config_without_blob_overrides_stays_clean(tmp_path: Path):
     text = (tmp_path / ".dex" / "config.yml").read_text()
     assert "blob_overrides" not in text
     assert load_config(tmp_path).blob_overrides == []
+
+
+def test_the_cache_block_round_trips_and_defaults_to_the_filesystem(tmp_path: Path):
+    # The default is what every existing repo depends on: a config that says
+    # nothing about the cache keeps writing loose JSON under `.dex/`.
+    assert DexConfig().cache.backend == "filesystem"
+    assert DexConfig().cache.options == {}
+
+    config = DexConfig(
+        cache=CacheConfig(
+            backend="mypkg.stores:my_store",
+            options={"tenant": "acme", "project": "shop"},
+        )
+    )
+    save_config(config, tmp_path)
+    loaded = load_config(tmp_path)
+    assert loaded is not None
+    assert loaded.cache.backend == "mypkg.stores:my_store"
+    # Options reach the backend verbatim, so they have to survive the YAML round
+    # trip untouched rather than being coerced into a model dex defines.
+    assert loaded.cache.options == {"tenant": "acme", "project": "shop"}
+
+
+def test_an_unset_cache_block_is_not_written_into_the_committed_file(tmp_path: Path):
+    # The committed file stays a record of explicit choices, so a repo that never
+    # chose a backend does not grow a line claiming it chose the default.
+    save_config(DexConfig(connector="duckdb"), tmp_path)
+    raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    assert "cache" not in raw

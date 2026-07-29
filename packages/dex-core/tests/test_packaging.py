@@ -430,8 +430,16 @@ OUTSIDE_BACKEND = '''
 import json
 
 from exmergo_dex_core.cache import DexCache
-from exmergo_dex_core.storage import Document, ExploreStore, spend_total
-from exmergo_dex_core.storage.conformance import ExploreStoreContract
+from exmergo_dex_core.storage import (
+    Document,
+    ExploreStore,
+    StoreContext,
+    spend_total,
+)
+from exmergo_dex_core.storage.conformance import (
+    ExploreStoreContract,
+    StoreFactoryContract,
+)
 
 
 class TinyStore:
@@ -467,6 +475,17 @@ class TinyStore:
         return "tiny://" + self.key + "/" + document.value
 
 
+def tiny_store_factory(context):
+    """How this backend would be named in configuration: keyed by its own
+    coordinate, with no repo root anywhere."""
+
+    tenant = context.options.get("tenant")
+    if not tenant:
+        raise ValueError("this backend needs cache.options.tenant")
+    TinyStore._state.pop(tenant, None)
+    return TinyStore(tenant)
+
+
 def test_the_published_protocol_is_satisfied():
     assert isinstance(TinyStore("k"), ExploreStore)
 
@@ -475,6 +494,16 @@ class TestTinyStore(ExploreStoreContract):
     def make_store(self, key):
         TinyStore._state.pop(key, None)
         return TinyStore(key)
+
+
+class TestTinyStoreConstruction(StoreFactoryContract, ExploreStoreContract):
+    """The whole contract, run through the construction seam from outside."""
+
+    def build(self, context):
+        return tiny_store_factory(context)
+
+    def context_for(self, key):
+        return StoreContext(options={"tenant": key})
 '''
 
 
@@ -489,6 +518,11 @@ def test_a_backend_outside_the_distribution_passes_the_shipped_contract(
     wheel, install it somewhere isolated from this repo, write a backend there
     against the published protocol alone, and run the conformance suite dex ships
     at that backend.
+
+    That covers construction as well as behavior, and it has to: a construction
+    contract that only works from inside this repo has not been tested. The
+    backend defined there is built the way configuration would build it, through a
+    factory and a `StoreContext` carrying no repo root at all.
 
     If this passes, an outside contributor can implement a storage backend from
     what is published, which is the entire point of publishing it. If it fails,
@@ -516,3 +550,126 @@ def test_a_backend_outside_the_distribution_passes_the_shipped_contract(
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "passed" in done.stdout
+
+
+# A whole distribution, because an entry point only exists once something is
+# installed: a source tree cannot register one, so this is the only way to test
+# the registration path honestly.
+PLUGIN_PYPROJECT = """
+[project]
+name = "dex-acme-store"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.entry-points."exmergo_dex_core.stores"]
+acme = "dex_acme_store:acme_store"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/dex_acme_store.py"]
+sources = ["src"]
+"""
+
+PLUGIN_MODULE = '''
+"""A storage backend published as its own package, selectable by short name."""
+
+import json
+
+from exmergo_dex_core.cache import DexCache
+from exmergo_dex_core.storage import Document, spend_total
+
+
+class AcmeStore:
+    _state: dict = {}
+
+    def __init__(self, tenant):
+        self.tenant = tenant
+        self._docs = self._state.setdefault(tenant, {})
+
+    def load_cache(self):
+        raw = self._docs.get("cache")
+        return None if raw is None else DexCache.model_validate_json(raw)
+
+    def save_cache(self, cache, *, now=None):
+        if now is not None:
+            cache.provenance.updated_at = now.isoformat()
+        self._docs["cache"] = cache.model_dump_json()
+        return self.locator(Document.CACHE)
+
+    def append_query_log(self, entry):
+        self._docs.setdefault("q", []).append(json.dumps(entry))
+
+    def append_spend_log(self, entry):
+        self._docs.setdefault("s", []).append(json.dumps(entry))
+
+    def spend_since(self, cutoff_iso, *, field="billed_bytes", connector=None):
+        entries = [json.loads(r) for r in self._docs.setdefault("s", [])]
+        return spend_total(entries, cutoff_iso, field=field, connector=connector)
+
+    def locator(self, document):
+        return "acme://" + self.tenant + "/" + document.value
+
+
+def acme_store(context):
+    tenant = context.options.get("tenant")
+    if not tenant:
+        raise ValueError("this backend needs cache.options.tenant")
+    return AcmeStore(str(tenant))
+'''
+
+
+def test_an_entry_point_registration_selects_a_backend_dex_does_not_ship(
+    wheel: str, tmp_path: Path
+):
+    """The registration path, proved against two installed distributions.
+
+    A dotted path needs no packaging and is tested from the source tree. An entry
+    point cannot be: the group is metadata a *built and installed* distribution
+    carries, so a test that fakes it proves only that the code reads what the test
+    handed it. This builds a second wheel that registers `acme` under
+    `exmergo_dex_core.stores`, installs it beside dex with no access to this repo,
+    and selects the backend by that short name.
+    """
+
+    plugin = tmp_path / "plugin"
+    (plugin / "src").mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(PLUGIN_PYPROJECT.lstrip(), encoding="utf-8")
+    (plugin / "src" / "dex_acme_store.py").write_text(
+        PLUGIN_MODULE.lstrip(), encoding="utf-8"
+    )
+
+    out = tmp_path / "dist"
+    subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [_uv(), "build", "--wheel", "--out-dir", str(out), str(plugin)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    built = list(out.glob("*.whl"))
+    assert len(built) == 1, built
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            wheel,
+            "--with",
+            str(built[0]),
+            "python",
+            "-c",
+            "from exmergo_dex_core.storage import build_store, StoreContext, Document;"
+            'store = build_store("acme", StoreContext(options={"tenant": "acme-inc"}));'
+            'print("resolved", type(store).__name__, store.locator(Document.CACHE))',
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "resolved AcmeStore acme://acme-inc/cache" in done.stdout

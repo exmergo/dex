@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import (
+    ConfigurationError,
     ConfirmationRequiredError,
     DexConfig,
     DexEngine,
@@ -22,7 +23,7 @@ from exmergo_dex_core import (
     MemoryStore,
 )
 from exmergo_dex_core.cache import DexCache
-from exmergo_dex_core.config import DuckDBTarget
+from exmergo_dex_core.config import CacheConfig, DuckDBTarget, save_config
 from exmergo_dex_core.envelope import Envelope
 from exmergo_dex_core.explore.results import MapResult, ProfileResult, QueryResult
 
@@ -148,6 +149,107 @@ def test_commands_needing_the_project_refuse_without_a_repo_root():
             eng.init_project("analytics", connector="duckdb")
         with pytest.raises(ValueError, match="locating the dbt project"):
             eng.project_dir()
+
+
+# --- selecting the store from configuration ---------------------------------------
+
+
+def test_from_repo_still_builds_the_filesystem_backend_by_default(tmp_path: Path):
+    """The default is what every existing repo depends on, so it is asserted
+    rather than assumed: selecting nothing keeps writing loose JSON under
+    `.dex/`, and the selector is invisible to anyone who never sets it."""
+
+    with DexEngine.from_repo(tmp_path) as eng:
+        assert isinstance(eng.store, FilesystemStore)
+        assert eng.store.root == Path(tmp_path)
+
+
+def test_a_configured_backend_outside_the_package_is_what_from_repo_builds(
+    tmp_path: Path,
+):
+    from .fakes.stores import TenantStore
+
+    TenantStore.reset()
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            cache=CacheConfig(
+                backend="tests.fakes.stores:tenant_store",
+                options={"tenant": "acme"},
+            ),
+        ),
+        tmp_path,
+    )
+    with DexEngine.from_repo(tmp_path) as eng:
+        assert isinstance(eng.store, TenantStore)
+        assert eng.store.tenant == "acme"
+    # And nothing was written to the repo, because this backend is not the
+    # filesystem one; the selection actually took effect.
+    assert not (tmp_path / ".dex" / "cache.json").exists()
+    TenantStore.reset()
+
+
+def test_an_explicit_store_wins_over_the_configured_one(tmp_path: Path):
+    # A caller holding an instance has already made the decision configuration
+    # exists to make for the callers who have not.
+    save_config(
+        DexConfig(cache=CacheConfig(backend="tests.fakes.stores:tenant_store")),
+        tmp_path,
+    )
+    with DexEngine.from_repo(tmp_path, store=MemoryStore()) as eng:
+        assert isinstance(eng.store, MemoryStore)
+
+
+def test_the_cache_backend_override_beats_the_configured_name(tmp_path: Path):
+    from .fakes.stores import TenantStore
+
+    TenantStore.reset()
+    selected = "tests.fakes.stores:tenant_store"
+    save_config(
+        DexConfig(cache=CacheConfig(backend=selected, options={"tenant": "acme"})),
+        tmp_path,
+    )
+    # Overriding back to the shipped backend for one run is the whole reason this
+    # flag exists, and it has to work on a repo that configures a custom one.
+    with DexEngine.from_repo(tmp_path, cache_backend="filesystem") as eng:
+        assert isinstance(eng.store, FilesystemStore)
+    # Naming the configured backend explicitly keeps its options, so the override
+    # is not a way to accidentally drop them.
+    with DexEngine.from_repo(tmp_path, cache_backend=selected) as eng:
+        assert isinstance(eng.store, TenantStore)
+        assert eng.store.tenant == "acme"
+    TenantStore.reset()
+
+
+def test_the_override_does_not_hand_one_backends_options_to_another(tmp_path: Path):
+    """Options are not namespaced by backend, so carrying them across an override
+    would give a backend coordinates written for a different one. The shipped
+    backends refuse an option they would have ignored, so this would present as a
+    refusal for a flag that ought to be the simplest thing in the tool."""
+
+    save_config(
+        DexConfig(
+            cache=CacheConfig(
+                backend="tests.fakes.stores:tenant_store", options={"tenant": "acme"}
+            )
+        ),
+        tmp_path,
+    )
+    with DexEngine.from_repo(tmp_path, cache_backend="filesystem") as eng:
+        assert isinstance(eng.store, FilesystemStore)
+
+
+def test_a_repo_with_no_config_at_all_still_gets_the_default_backend(tmp_path: Path):
+    # load_config returns None outside a project, and the store has to be built
+    # anyway: commands that need no warehouse still work there.
+    with DexEngine.from_repo(tmp_path / "not-a-project") as eng:
+        assert isinstance(eng.store, FilesystemStore)
+
+
+def test_an_unusable_backend_refuses_at_construction_naming_the_fix(tmp_path: Path):
+    save_config(DexConfig(cache=CacheConfig(backend="nonsense")), tmp_path)
+    with pytest.raises(ConfigurationError, match="unknown cache backend"):
+        DexEngine.from_repo(tmp_path)
 
 
 # --- tenancy: one engine, one principal ------------------------------------------

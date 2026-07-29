@@ -133,3 +133,114 @@ def test_scope_is_accepted_on_every_subcommand():
                 argv.append("select 1")
             args = parser.parse_args(argv)
             assert args.scope == ["raw"], f"{group} {sub} dropped --scope"
+
+
+# --- selecting the storage backend ------------------------------------------------
+
+
+def test_a_configured_backend_carries_state_from_one_command_to_the_next(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """The point of a CLI selector: a backend dex does not ship, driving a real
+    multi-step flow.
+
+    The two commands are the whole test. `explore query` resolves every table
+    reference against the cache `explore map` wrote, so the second one can only
+    succeed if state actually reached the selected backend and came back out of
+    it. A backend that quietly did nothing would fail here and nowhere else.
+    """
+
+    from exmergo_dex_core.config import CacheConfig, DexConfig, save_config
+
+    from .fakes.stores import TenantStore
+
+    TenantStore.reset()
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            cache=CacheConfig(
+                backend="tests.fakes.stores:tenant_store",
+                options={"tenant": "acme"},
+            ),
+        ),
+        tmp_path,
+    )
+    base = ["--repo-root", str(tmp_path), "--path", str(duckdb_file)]
+
+    assert main([*base, "explore", "map"]) == 0
+    mapped = json.loads(capsys.readouterr().out)
+    assert mapped["status"] == "ok"
+    # The locator an agent surfaces is the selected backend's, not a path.
+    assert mapped["data"]["cache_path"].startswith("tenant://acme/")
+
+    assert main([*base, "explore", "query", "select count(*) as n from customers"]) == 0
+    queried = json.loads(capsys.readouterr().out)
+    assert queried["status"] == "ok"
+    assert queried["data"]["cells"] == [[2]]
+
+    # And the filesystem backend was genuinely not used: only the config file the
+    # test wrote is under `.dex/`.
+    assert [p.name for p in (tmp_path / ".dex").iterdir()] == ["config.yml"]
+    TenantStore.reset()
+
+
+def test_the_cache_backend_flag_overrides_the_configured_name(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    from .fakes.stores import TenantStore
+
+    TenantStore.reset()
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--path",
+            str(duckdb_file),
+            "--cache-backend",
+            "tests.fakes.stores:ContextBuiltStore",
+            "explore",
+            "map",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    # No config file at all, so options carry no tenant and the class-shaped
+    # factory raises on the missing key: what matters here is that the flag was
+    # honored rather than ignored, and that it failed as one envelope.
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "failed to build" in payload["errors"][0]
+    TenantStore.reset()
+
+
+def test_selecting_the_memory_backend_refuses_by_naming_the_process_boundary(
+    tmp_path: Path, capsys
+):
+    """A `MemoryStore` behind the CLI would drop the cache between commands and
+    make the tool look broken. The refusal has to explain that rather than let
+    someone debug it."""
+
+    rc = main(
+        ["--repo-root", str(tmp_path), "--cache-backend", "memory", "connect", "test"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "its own process" in payload["errors"][0]
+
+
+def test_an_unresolvable_backend_still_emits_exactly_one_envelope(
+    tmp_path: Path, capsys
+):
+    """The engine is built before any command runs, and it can refuse. Every agent
+    wrapper reads exactly one envelope from stdout, so a refusal there has to be
+    rendered like any other rather than escaping as a traceback."""
+
+    rc = main(
+        ["--repo-root", str(tmp_path), "--cache-backend", "nope", "connect", "test"]
+    )
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1
+    payload = json.loads(out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "unknown cache backend" in payload["errors"][0]
