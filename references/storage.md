@@ -99,6 +99,83 @@ Use `spend_total` rather than reimplementing the ledger arithmetic. It is export
 for exactly this reason: every backend then answers the session-budget question
 identically, which is a property you want in a guard.
 
+## Constructing one
+
+The section above is the whole contract if your host builds the store itself. If
+you also want your backend **named** in configuration and built by dex (see
+[Selecting a backend](#selecting-a-backend)), there is a second contract, and it is
+deliberately separate from `Store`.
+
+It is separate because the shipped backends disagree about what they are built
+from, and the disagreement does not resolve by picking a winner:
+
+| Backend | Built from |
+|---|---|
+| `FilesystemStore` | a repo root |
+| `MemoryStore` | nothing |
+| a tenant-keyed backend | a tenant id, with no repository at all |
+
+So construction takes one argument, a `StoreContext`, and a factory is anything
+callable that turns one into a store:
+
+```python
+@dataclass(frozen=True)
+class StoreContext:
+    repo_root: str | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
+```
+
+`repo_root` is the directory dex was pointed at, or `None` when there is no
+repository in the picture. Your backend is free to ignore it, and a tenant-keyed
+one will. `options` is your own non-secret coordinates, passed through verbatim;
+dex does not interpret it, so the keys are yours to define and yours to validate.
+
+Three shapes qualify, so you can use whichever your backend already has:
+
+```python
+# a function
+def my_store(context: StoreContext) -> MyStore:
+    tenant = context.options.get("tenant")
+    if not tenant:
+        raise ConfigurationError("this backend needs cache.options.tenant")
+    return MyStore(tenant=str(tenant))
+
+
+# a class whose __init__ takes the context
+class MyStore:
+    def __init__(self, context: StoreContext): ...
+
+
+# a classmethod, which is how the shipped backends do it
+FilesystemStore.from_context
+MemoryStore.from_context
+```
+
+Two obligations come with it.
+
+**Refuse an option you cannot honor.** Accepted-and-ignored is worse than
+rejected, because the caller believes a setting took effect and nothing in the
+output says otherwise. Both shipped backends refuse an unknown option rather than
+dropping it, and `FilesystemStore.from_context` refuses a context with no repo
+root rather than falling back to the working directory, which would write one
+project's exploration cache into wherever the process happened to start. Raise
+`ConfigurationError` so a host catches your refusal with the same `except` it
+already uses for dex's.
+
+**No secret ever reaches a `StoreContext`.** `.dex/config.yml` is committed, so a
+password, key, token, or connection string in `options` is a credential in version
+control. Read your credential the way the rest of the engine does, from the
+environment at construction time. If your credentials arrive per request rather
+than per process, skip this contract entirely and hand the engine a store you
+built yourself: `DexEngine(store=...)` is the right shape for that, and it always
+wins over anything named in configuration.
+
+One note if you are writing the code that resolves a name: `StoreFactory` is
+`runtime_checkable` for symmetry with the store tiers, but a callable protocol can
+only check that `__call__` exists, which every callable satisfies. Build the store
+and check the result against the tier you need. The tiers are genuinely
+`isinstance`-checkable; the factory is not.
+
 ## The contracts that are not obvious from the signatures
 
 Each of these is stated on the protocol member it governs in `storage/base.py`,
@@ -183,6 +260,30 @@ Whether the key is a directory, a tenant id, or a table prefix is your business.
 Two tenants leaking into each other is the failure this seam exists to prevent, so
 those assertions are the ones worth reading if any fail.
 
+**If your backend is meant to be named in configuration**, mix in
+`StoreFactoryContract` as well. It routes `make_store` through your own factory, so
+everything above then runs against stores built the way dex builds them:
+
+```python
+from exmergo_dex_core.storage import Store, StoreContext
+from exmergo_dex_core.storage.conformance import StoreContract, StoreFactoryContract
+
+
+class TestMyStore(StoreFactoryContract, StoreContract):
+    tier = Store
+
+    def build(self, context):
+        return my_store(context)
+
+    def context_for(self, key):
+        return StoreContext(options={"tenant": key})
+```
+
+This is why construction is not a second, unchecked obligation: with it, "the
+conformance suite is green" still means your backend is both correct and
+constructable. Without it, the suite proves behavior only, and a backend can pass
+every assertion here and still fail the moment configuration names it.
+
 ## Which calls need nothing on the filesystem
 
 A host with no project on disk can run the whole explore surface: `inventory`,
@@ -198,13 +299,73 @@ message naming what needed the root rather than inventing one.
 
 ## Selecting a backend
 
-Today a backend is passed to the engine directly, `DexEngine(store=...)`, which is
-the library path and the only path. There is no way to select one from the CLI.
+Two ways in. A library caller passes an instance, `DexEngine(store=...)`, and that
+always wins: a caller holding a store has already made the decision configuration
+exists to make for the callers who have not. Everyone else names one in
+`.dex/config.yml`:
 
-The decided direction, when a CLI selector arrives: it is an **open registry**, not
-a closed enum. A `cache.backend` setting will accept the names dex ships plus
-either a dotted `module:ClassName` path or a name registered through an
-`exmergo_dex_core.stores` entry-point group, so a backend published as its own
-package is selectable without a change to dex. Recording it here because the
-alternative, a closed set of shipped names, would make out-of-tree backends
-library-only permanently and opening it later would be a config-schema change.
+```yaml
+cache:
+  backend: mypkg.stores:my_store
+  options:
+    tenant: acme
+```
+
+`options` reaches your factory verbatim, and `repo_root` carries whatever directory
+dex was pointed at. `--cache-backend` overrides the name for one run, the way
+`--connector` overrides the configured connector; naming a different backend that
+way leaves `options` behind, since one backend's coordinates are not another's and
+the usual reason to reach for the flag is falling back to `filesystem` for a single
+command.
+
+It is an **open registry**, not a closed enum, so a backend published as its own
+package is selectable without a change to dex. Three kinds of name resolve, in this
+order:
+
+| Name | Example | For |
+|---|---|---|
+| shipped | `filesystem` | dex's own backends, and never shadowable by anything installed |
+| dotted path | `mypkg.stores:my_store` | a factory reachable by import, with no packaging work |
+| entry point | `acme` | a name an installed distribution registered under `exmergo_dex_core.stores` |
+
+The entry point is what makes a published backend feel like a shipped one:
+
+```toml
+# in your own pyproject.toml
+[project.entry-points."exmergo_dex_core.stores"]
+acme = "dex_acme_store:acme_store"
+```
+
+Install it beside dex and `backend: acme` resolves. A shipped name always wins over
+a registration, so installing a package can never silently move where an existing
+repo's state lands.
+
+`memory` is deliberately not selectable. Each CLI command runs as its own process,
+so a `MemoryStore` would drop the cache between `explore map` and `explore query`,
+and the second command would refuse with "run `explore map` first" having just run
+it. That reads as a broken tool rather than a chosen backend, so the refusal
+explains the process boundary instead. It remains the default for a library caller,
+where one process holds the engine.
+
+Every failure here refuses with a `ConfigurationError` naming the fix: an unknown
+name lists what exists and both open forms, a dotted path that will not import says
+so and points at the environment, and a factory that builds something which is not
+a store names the members it is missing. The tier check is on the constructed store
+rather than on the factory, because a callable protocol can only verify `__call__`
+exists.
+
+### Two rejected alternatives
+
+Recorded so they are not re-argued.
+
+**Always pass `repo_root`.** It builds both shipped backends and would build an
+opt-in SQLite file, and it cannot build a tenant-keyed backend at all. That is the
+class of backend this seam was made public for, and widening a released config
+schema afterwards costs a deprecation.
+
+**Require a `from_config` classmethod on the store.** It puts an obligation on the
+structural protocol, which is what makes "no base class to inherit and no
+registration step" true, and it hands every backend author dex's whole
+configuration model to bind against. The factory contract keeps the two concerns
+apart: a store is still just a class with the right methods, and construction is a
+separate thing you implement only if you want it.
