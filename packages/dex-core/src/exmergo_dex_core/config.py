@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -367,6 +368,40 @@ class SemanticConfig(BaseModel):
     environment_id: str | None = None
 
 
+class CacheConfig(BaseModel):
+    """Where dex keeps its scratch state, and how to reach it.
+
+    Scratch state only: the exploration cache, the reconcile baseline, the last
+    drift report, the two ledgers, and the stored transform plans. The dbt project
+    is the source of truth, it is a git-reviewable filesystem artifact by design,
+    and no setting here moves it.
+
+    ``backend`` is an open registry rather than a closed set. It accepts a name
+    dex ships (``filesystem``, the default, which writes the loose JSON under
+    `.dex/` that a reviewer reads in a pull request), a dotted
+    ``mypkg.stores:my_store`` path, or a name an installed distribution registered
+    under the ``exmergo_dex_core.stores`` entry-point group. A backend published
+    as its own package is therefore selectable without a change to dex.
+    ``--cache-backend`` overrides it for one run, the way ``--connector``
+    overrides the configured connector. Naming a *different* backend that way
+    leaves ``options`` behind, because they are not namespaced by backend and one
+    backend's coordinates are not another's.
+
+    ``options`` reaches the selected backend's factory verbatim: dex does not
+    interpret it, so the keys belong to the backend and the backend validates
+    them. See ``references/storage.md``.
+
+    **Credentials are never here.** This file is committed, so a password, key,
+    token, or connection string among the options would be a secret in version
+    control. A backend needing one reads it at runtime the way ``connect.py``
+    does, or the host builds the store itself and passes it to ``DexEngine``,
+    which always wins over anything named here.
+    """
+
+    backend: str = "filesystem"
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -392,6 +427,10 @@ class DexConfig(BaseModel):
     # hosted dbt Cloud deployment). Defaults to local; a bare project queries the
     # dbt project it lives in.
     semantic: SemanticConfig = Field(default_factory=SemanticConfig)
+    # Where the non-canonical `.dex/` scratch state lives. Defaults to the loose
+    # JSON under `.dex/`, so a repo that selects nothing behaves exactly as it did
+    # before this setting existed.
+    cache: CacheConfig = Field(default_factory=CacheConfig)
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
     query: QueryLimits = Field(default_factory=QueryLimits)
