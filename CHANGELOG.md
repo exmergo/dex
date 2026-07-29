@@ -111,6 +111,17 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   construct a tenant-keyed backend at all, and requiring a `from_config`
   classmethod, which puts the obligation back on the protocol.
 
+### Fixed
+
+- **`maintain snapshot` told every host to commit a file it may not have**
+  ([#157]). The hint was a fixed string: "commit `.dex/snapshot.json` like a
+  lockfile". A backend that keeps the baseline as a row or a document has no such
+  file, so the advice named something that does not exist, while the
+  `snapshot_path` beside it correctly reported that backend's own locator. The
+  half that holds everywhere, re-pinning after each known-good build, is now what
+  a backend dex does not ship gets; the git half is added only when the baseline
+  really is a file in the repo. Nothing changes for the filesystem backend.
+
 ## [1.4.2] - 2026-07-28
 
 ### Changed
