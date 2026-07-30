@@ -854,6 +854,7 @@ sql = [
 ]
 storage-conformance = [
     { name = "pytest" },
+    { name = "sqlglot" },
 ]
 
 [package.metadata]
@@ -908,6 +909,7 @@ requires-dist = [
     { name = "sqlglot", marker = "extra == 'semantic'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'snowflake'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'storage-conformance'", specifier = ">=28.6,<31" },
 ]
 provides-extras = ["all", "bigquery", "cluster", "databricks", "dev", "duckdb", "postgres", "redshift", "semantic", "semantic-api", "snowflake", "sql", "storage-conformance"]
 

@@ -28,6 +28,11 @@ in one process must not be able to see each other's cache, ledgers, or plans.
 Whether ``key`` is a directory, a tenant id, or a table prefix is the backend's
 business.
 
+**The suite never hands the same key to two assertions**, so a backend whose
+instances share state per key, which is every durable one, starts each assertion on
+a clean slate and needs no reset hook. See :meth:`ExploreStoreContract.make_store`
+for the whole of what that guarantees and what it does not.
+
 **If your backend is meant to be named in configuration rather than handed to the
 engine as an instance**, mix :class:`StoreFactoryContract` in as well. It routes
 ``make_store`` through your own factory, so every assertion above then runs
@@ -36,14 +41,18 @@ meaning the backend is both correct and constructable rather than only the first
 
 This module imports pytest, so it is deliberately not imported by
 ``exmergo_dex_core.storage``: a bare ``import exmergo_dex_core`` must not require
-a test framework. Install the ``[storage-conformance]`` extra to get pytest
-alongside it.
+a test framework. Install the ``[storage-conformance]`` extra to get what running
+the suite needs: pytest, and the dialect engine the plan-tier assertions reach
+through :func:`a_plan`. The explore tier needs only pytest, and a packaging test
+keeps it that way.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import count
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -58,6 +67,14 @@ __all__ = [
     "StoreContract",
     "StoreFactoryContract",
 ]
+
+#: Unique per process, so two runs of the suite against one durable backend do not
+#: land in the same namespace. A counter alone would be enough for a backend that
+#: only outlives an assertion; a backend that outlives the *process*, which is the
+#: interesting case, would inherit the previous run's writes from a key it could
+#: predict. Also keeps parallel workers apart, since each is its own process.
+_RUN_ID = uuid4().hex[:8]
+_KEY_SEQUENCE = count()
 
 
 def a_cache(identifier: str = "db.main.orders") -> DexCache:
@@ -125,7 +142,54 @@ def a_plan(plan_id: str, created_at: str, *, kind: Any | None = None) -> Any:
     )
 
 
-class ExploreStoreContract:
+class _KeyedContract:
+    """Gives every assertion its own keyspace, for both contract families.
+
+    A durable backend is one where two instances built from the same key see the
+    same state. That is not an implementation detail to be worked around, it is the
+    defining property of every hosted backend and the reason the seam exists. So the
+    suite cannot reuse a key: driving 34 assertions through one literal made each
+    inherit the previous one's writes, and the resulting failures ("a cache that was
+    just saved must load back") read as bugs in the backend rather than as pollution
+    from the harness.
+
+    Namespacing here rather than asking implementers for a reset hook keeps the
+    integration at one method, and costs a backend that *does* reset per call
+    nothing at all: it simply receives different strings.
+    """
+
+    #: Replaced per assertion by the autouse fixture below. The class-level default
+    #: keeps a contract instantiated by hand, outside pytest, usable; the meta-tests
+    #: in this repository's suite drive the assertions that way to check their
+    #: failure messages.
+    _namespace: str = _RUN_ID
+
+    @pytest.fixture(autouse=True)
+    def _namespaced_keys(self) -> None:
+        self._namespace = f"{_RUN_ID}-{next(_KEY_SEQUENCE):02d}"
+
+    def key_for(self, label: str) -> str:
+        """The key this assertion uses for ``label``, unique to it and to this run.
+
+        ``label`` survives into the key so a backend that files state under it (a
+        directory, a table prefix) stays readable while you are debugging a failure.
+        """
+
+        return f"{label}-{self._namespace}"
+
+    def store_for(self, label: str) -> Any:
+        return self.make_store(self.key_for(label))
+
+    # Declared so `store_for` has something to call and a type checker can see it.
+    # Both families override it: the tier contracts document it as the one hook an
+    # implementer provides, `StoreFactoryContract` routes it through the factory.
+    def make_store(self, key: str) -> Any:  # pragma: no cover - always overridden
+        raise NotImplementedError(
+            "a conformance subclass must implement make_store(key) -> Store"
+        )
+
+
+class ExploreStoreContract(_KeyedContract):
     """What every backend owes, whatever tier it implements.
 
     The exploration cache, the two ledgers, and the locators: the state an
@@ -141,6 +205,21 @@ class ExploreStoreContract:
         as a directory name, a database backend as a tenant identifier. It is
         called more than once per test class, so it must be cheap and must not
         assume it is building the only store in the process.
+
+        **The suite never reuses a key**, within a run or across runs. Every
+        assertion gets its own, so you do not need a reset hook, a truncate step, or
+        a fixture of your own to keep one assertion's writes out of the next.
+
+        What that leaves you free to do is the point: two calls with the *same* key
+        may return two views of one shared state. That is what a durable backend is,
+        and what a hosted deployment depends on. The suite requires the opposite only
+        for two *different* keys, which is what the isolation assertions check; it
+        assumes nothing at all about the same key twice.
+
+        Nothing is cleaned up when the run ends. A durable backend therefore
+        accumulates one namespace per run, which is yours to prune; the suite cannot
+        do it without a teardown hook that would be a second thing to implement, and
+        get wrong, for a guarantee it does not need.
         """
 
         raise NotImplementedError(
@@ -148,8 +227,10 @@ class ExploreStoreContract:
         )
 
     @pytest.fixture
-    def store(self) -> Any:
-        return self.make_store("primary")
+    def store(self, _namespaced_keys: None) -> Any:
+        # Depends on the keyspace rather than trusting autouse ordering: this is the
+        # fixture whose key must be namespaced, so the dependency is stated.
+        return self.store_for("primary")
 
     # --- documents ------------------------------------------------------------
 
@@ -374,7 +455,7 @@ class ExploreStoreContract:
     # --- isolation ------------------------------------------------------------
 
     def test_two_keys_do_not_share_a_cache(self, store):
-        one, two = self.make_store("tenant-one"), self.make_store("tenant-two")
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
         one.save_cache(a_cache("db.one.orders"))
         # The firewall resolves every table reference against the cache, so a
         # cache leaking across keys is a leak of what the other tenant may query,
@@ -394,7 +475,7 @@ class ExploreStoreContract:
         )
 
     def test_two_keys_do_not_share_a_spend_ledger(self, store):
-        one, two = self.make_store("tenant-one"), self.make_store("tenant-two")
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
         one.append_spend_log({"at": "2026-07-03T10:00:00+00:00", "billed_bytes": 500})
         # A shared ledger would charge one tenant's spend against another's
         # session ceiling, which reads as a budget bug and is a tenancy bug.
@@ -465,7 +546,7 @@ class MaintainStoreContract(ExploreStoreContract):
         )
 
     def test_two_keys_do_not_share_a_snapshot(self, store):
-        one, two = self.make_store("tenant-one"), self.make_store("tenant-two")
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
         one.save_snapshot(a_snapshot())
         assert two.load_snapshot() is None, (
             "two keys share a snapshot, so one tenant's drift baseline is another's. "
@@ -577,7 +658,7 @@ class StoreContract(MaintainStoreContract):
         )
 
     def test_two_keys_do_not_share_plans(self, store):
-        one, two = self.make_store("tenant-one"), self.make_store("tenant-two")
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
         one.save_plan(a_plan("pabc", "2026-07-03T10:00:00+00:00"))
         assert two.list_plans() == [], (
             "two keys share the plan store, so one tenant can read and apply "
@@ -585,7 +666,7 @@ class StoreContract(MaintainStoreContract):
         )
 
 
-class StoreFactoryContract:
+class StoreFactoryContract(_KeyedContract):
     """The construction half, for a backend dex builds rather than receives.
 
     Mix it in front of the contract for your tier, and the whole behavioral suite
@@ -638,7 +719,7 @@ class StoreFactoryContract:
         return self.build(self.context_for(key))
 
     def test_the_factory_builds_a_store_of_the_declared_tier(self):
-        built = self.build(self.context_for("primary"))
+        built = self.build(self.context_for(self.key_for("primary")))
         assert isinstance(built, self.tier), (
             f"the factory returned {type(built).__name__}, which does not satisfy "
             f"{self.tier.__name__}. A backend that passes the behavioral suite and "
@@ -651,8 +732,11 @@ class StoreFactoryContract:
         # The same property the keyed isolation assertions cover, checked at the
         # construction seam: a factory that ignores its context builds one shared
         # store for every tenant, and every later isolation guarantee is void.
-        one = self.build(self.context_for("tenant-one"))
-        two = self.build(self.context_for("tenant-two"))
+        #
+        # Through build() rather than store_for(), so what is under test is named
+        # even where the two are the same call.
+        one = self.build(self.context_for(self.key_for("tenant-one")))
+        two = self.build(self.context_for(self.key_for("tenant-two")))
         one.save_cache(a_cache("db.one.orders"))
         assert two.load_cache() is None, (
             "two contexts built stores that share a cache. The factory is probably "

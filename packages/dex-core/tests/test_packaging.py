@@ -286,8 +286,8 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     dbt adapters and MetricFlow in one environment, it is also the only place a
     version conflict between them can surface at all.
 
-    `dev` and `conformance` are excluded deliberately: contributor tooling, not
-    capabilities. `storage-conformance` carries a test runner for people
+    `dev` and `storage-conformance` are excluded deliberately: contributor tooling,
+    not capabilities. `storage-conformance` carries a test runner for people
     implementing a storage backend, and nobody installing "everything dex can do"
     wants pytest.
     """
@@ -426,24 +426,158 @@ def test_the_wheel_ships_the_typed_marker(wheel: str):
     )
 
 
-OUTSIDE_BACKEND = '''
+# A full-tier backend, and a durable one: two instances built from the same key
+# share state, with nothing anywhere resetting it. Both properties are deliberate
+# and both were once absent, which is how a released version shipped a suite that
+# no full-tier or hosted implementer could get green.
+OUTSIDE_FULL_BACKEND = '''
 import json
 
 from exmergo_dex_core.cache import DexCache
 from exmergo_dex_core.storage import (
     Document,
-    ExploreStore,
+    Store,
     StoreContext,
     spend_total,
 )
 from exmergo_dex_core.storage.conformance import (
-    ExploreStoreContract,
+    StoreContract,
     StoreFactoryContract,
 )
+from exmergo_dex_core.transform.plans import PlanNotFoundError, TransformPlan
 
 
 class TinyStore:
-    """A backend written against the published protocol and nothing else."""
+    """A full `Store` backend written against the published protocol and nothing
+    else, keyed by tenant and durable: state lives in a process-wide registry, so
+    two instances built from one key see the same documents. That is what a hosted
+    backend does between requests, and nothing here resets it."""
+
+    _state: dict = {}
+
+    def __init__(self, key):
+        self.key = key
+        self._docs = self._state.setdefault(key, {})
+
+    def load_cache(self):
+        raw = self._docs.get("cache")
+        return None if raw is None else DexCache.model_validate_json(raw)
+
+    def save_cache(self, cache, *, now=None):
+        if now is not None:
+            cache.provenance.updated_at = now.isoformat()
+        self._docs["cache"] = cache.model_dump_json()
+        return self.locator(Document.CACHE)
+
+    def load_snapshot(self):
+        from exmergo_dex_core.maintain.snapshot import Snapshot
+
+        raw = self._docs.get("snapshot")
+        return None if raw is None else Snapshot.model_validate_json(raw)
+
+    def save_snapshot(self, snapshot):
+        self._docs["snapshot"] = snapshot.model_dump_json()
+        return self.locator(Document.SNAPSHOT)
+
+    def load_drift(self):
+        from exmergo_dex_core.maintain.drift import DriftReport
+
+        raw = self._docs.get("drift")
+        return None if raw is None else DriftReport.model_validate_json(raw)
+
+    def save_drift(self, report):
+        self._docs["drift"] = report.model_dump_json()
+        return self.locator(Document.DRIFT)
+
+    def append_query_log(self, entry):
+        self._docs.setdefault("q", []).append(json.dumps(entry))
+
+    def append_spend_log(self, entry):
+        self._docs.setdefault("s", []).append(json.dumps(entry))
+
+    def spend_since(self, cutoff_iso, *, field="billed_bytes", connector=None):
+        entries = [json.loads(r) for r in self._docs.setdefault("s", [])]
+        return spend_total(entries, cutoff_iso, field=field, connector=connector)
+
+    def _plans(self):
+        return self._docs.setdefault("plans", {})
+
+    def save_plan(self, plan):
+        self._plans()[plan.plan_id] = plan.model_dump_json()
+        return self.plan_locator(plan.plan_id)
+
+    def load_plan(self, plan_id):
+        raw = self._plans().get(plan_id)
+        if raw is None:
+            raise PlanNotFoundError("no plan " + plan_id + " for " + self.key)
+        return TransformPlan.model_validate_json(raw)
+
+    def list_plans(self):
+        plans = [TransformPlan.model_validate_json(r) for r in self._plans().values()]
+        return sorted(plans, key=lambda p: p.created_at, reverse=True)
+
+    def latest_plan(self, kind=None):
+        candidates = [
+            p
+            for p in self.list_plans()
+            if p.applied_at is None
+            and (kind is None or all(e.kind is kind for e in p.edits))
+        ]
+        return max(candidates, key=lambda p: p.created_at, default=None)
+
+    def locator(self, document):
+        return "tiny://" + self.key + "/" + document.value
+
+    def plan_locator(self, plan_id):
+        return "tiny://" + self.key + "/plans/" + plan_id
+
+
+def tiny_store_factory(context):
+    """How this backend would be named in configuration: keyed by its own
+    coordinate, with no repo root anywhere."""
+
+    tenant = context.options.get("tenant")
+    if not tenant:
+        raise ValueError("this backend needs cache.options.tenant")
+    return TinyStore(tenant)
+
+
+def test_the_published_protocol_is_satisfied():
+    assert isinstance(TinyStore("k"), Store)
+
+
+class TestTinyStore(StoreContract):
+    def make_store(self, key):
+        return TinyStore(key)
+
+
+class TestTinyStoreConstruction(StoreFactoryContract, StoreContract):
+    """The whole contract, run through the construction seam from outside."""
+
+    tier = Store
+
+    def build(self, context):
+        return tiny_store_factory(context)
+
+    def context_for(self, key):
+        return StoreContext(options={"tenant": key})
+'''
+
+
+# The narrow tier as its own file, because the point of the run below is an
+# environment with no dialect engine in it: a module importing the plan model at
+# top level, as the full-tier backend legitimately does, would not even collect
+# there. This is what an explore-only implementer actually writes.
+OUTSIDE_EXPLORE_BACKEND = '''
+import json
+
+from exmergo_dex_core.cache import DexCache
+from exmergo_dex_core.storage import Document, ExploreStore, Store, spend_total
+from exmergo_dex_core.storage.conformance import ExploreStoreContract
+
+
+class TinyExploreStore:
+    """The narrow tier, written from `ExploreStore` alone, and durable per key."""
 
     _state: dict = {}
 
@@ -472,38 +606,17 @@ class TinyStore:
         return spend_total(entries, cutoff_iso, field=field, connector=connector)
 
     def locator(self, document):
-        return "tiny://" + self.key + "/" + document.value
+        return "tiny-explore://" + self.key + "/" + document.value
 
 
-def tiny_store_factory(context):
-    """How this backend would be named in configuration: keyed by its own
-    coordinate, with no repo root anywhere."""
-
-    tenant = context.options.get("tenant")
-    if not tenant:
-        raise ValueError("this backend needs cache.options.tenant")
-    TinyStore._state.pop(tenant, None)
-    return TinyStore(tenant)
+def test_the_narrow_tier_is_complete_not_partial():
+    assert isinstance(TinyExploreStore("k"), ExploreStore)
+    assert not isinstance(TinyExploreStore("k"), Store)
 
 
-def test_the_published_protocol_is_satisfied():
-    assert isinstance(TinyStore("k"), ExploreStore)
-
-
-class TestTinyStore(ExploreStoreContract):
+class TestTinyExploreStore(ExploreStoreContract):
     def make_store(self, key):
-        TinyStore._state.pop(key, None)
-        return TinyStore(key)
-
-
-class TestTinyStoreConstruction(StoreFactoryContract, ExploreStoreContract):
-    """The whole contract, run through the construction seam from outside."""
-
-    def build(self, context):
-        return tiny_store_factory(context)
-
-    def context_for(self, key):
-        return StoreContext(options={"tenant": key})
+        return TinyExploreStore(key)
 '''
 
 
@@ -524,13 +637,20 @@ def test_a_backend_outside_the_distribution_passes_the_shipped_contract(
     backend defined there is built the way configuration would build it, through a
     factory and a `StoreContext` carrying no repo root at all.
 
+    It is the **full** tier, and durable, because the two ways this has actually
+    broken both needed exactly that to show up. The plan assertions reach the
+    dialect engine, so an extra shipping only pytest failed all ten of them; and a
+    backend that shares state per key inherits the previous assertion's writes
+    unless the suite hands out a fresh key each time. An explore-tier backend that
+    resets itself, which is what this test used to define, demonstrates neither.
+
     If this passes, an outside contributor can implement a storage backend from
     what is published, which is the entire point of publishing it. If it fails,
     they cannot, whatever the in-repo tests say.
     """
 
     suite = tmp_path / "test_outside_backend.py"
-    suite.write_text(OUTSIDE_BACKEND.lstrip(), encoding="utf-8")
+    suite.write_text(OUTSIDE_FULL_BACKEND.lstrip(), encoding="utf-8")
 
     done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
         [
@@ -540,6 +660,71 @@ def test_a_backend_outside_the_distribution_passes_the_shipped_contract(
             "--no-project",
             "--with",
             f"exmergo-dex-core[storage-conformance] @ {wheel}",
+            "pytest",
+            "-q",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
+
+
+def test_the_explore_tier_contract_runs_with_no_dialect_engine(
+    wheel: str, tmp_path: Path
+):
+    """The narrow tier, in an environment that cannot parse SQL.
+
+    `[storage-conformance]` brings the dialect engine because the plan assertions
+    need it, and that is what makes this test necessary rather than redundant: with
+    the extra installed, nothing else would notice if `a_plan` stopped importing
+    lazily and every explore-tier implementer suddenly needed sqlglot to run a suite
+    that never touches a plan. So this installs the bare wheel plus a test runner,
+    nothing more, and runs an explore-tier backend against it.
+
+    The first assertion is that sqlglot is genuinely absent, for the same reason the
+    hosted-semantic test makes it: without it the rest of this passes for the wrong
+    reason the moment anything puts a dialect engine back in the environment.
+    """
+
+    suite = tmp_path / "test_outside_explore_backend.py"
+    suite.write_text(OUTSIDE_EXPLORE_BACKEND.lstrip(), encoding="utf-8")
+    spec = f"exmergo-dex-core @ {wheel}"
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "--with",
+            "pytest>=8",
+            "python",
+            "-c",
+            "\ntry: import sqlglot; raise SystemExit('sqlglot must not be here')"
+            "\nexcept ImportError: print('absent')",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "absent" in done.stdout
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "--with",
+            "pytest>=8",
             "pytest",
             "-q",
             str(suite),

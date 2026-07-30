@@ -260,6 +260,28 @@ Whether the key is a directory, a tenant id, or a table prefix is your business.
 Two tenants leaking into each other is the failure this seam exists to prevent, so
 those assertions are the ones worth reading if any fail.
 
+The extra brings pytest and the dialect engine, because the plan-tier assertions
+build a `TransformPlan` and that reaches the SQL guard. Implementing only
+`ExploreStore` needs neither the plans nor the engine, and that install stays
+viable: nothing in the narrow tier touches SQL.
+
+### What the suite guarantees about the key
+
+**It never hands the same key to two assertions**, within a run or across runs. So
+you need no reset hook, no truncate step, and no fixture of your own to keep one
+assertion's writes out of the next.
+
+That matters because of what it leaves you free to do. Two calls to `make_store`
+with the *same* key may return two views of one shared state, which is exactly what
+a durable backend is and what a hosted deployment depends on. The contract
+constrains you in one direction only: two *different* keys must share nothing. It
+says nothing about the same key twice, and the suite never depends on an answer.
+
+Nothing is cleaned up when the run ends, so a durable backend accumulates one
+namespace per run. Pruning them is yours; the alternative was a teardown hook, which
+is a second thing to implement and get wrong for a guarantee the suite does not
+need.
+
 **If your backend is meant to be named in configuration**, mix in
 `StoreFactoryContract` as well. It routes `make_store` through your own factory, so
 everything above then runs against stores built the way dex builds them:

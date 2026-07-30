@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-07-28
+
 ### Added
 
 - **A storage backend dex does not ship can be selected from configuration**
@@ -181,6 +183,36 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   identifier, column, dimension, or semantic model name, the same vocabulary the
   reported findings already matched against) now filters before estimation and
   execution, so a narrower run is priced and billed for less.
+
+- **The shipped conformance suite could not be run by two of the backends it was
+  written for** ([#174]). Both defects were in how the suite is packaged and how it
+  drives a backend, not in the storage contract, so nothing changes about what a
+  store owes its callers. Both were reported by an implementer running a full-tier,
+  tenant-keyed backend against 1.4.2 from outside this repository, and both surfaced
+  as assertion failures attributed to that backend rather than as anything naming
+  the suite.
+
+  `[storage-conformance]` shipped only pytest, while the ten plan assertions build a
+  `TransformPlan`, which reaches the SQL guard and so the dialect engine. Anyone
+  implementing the full `Store` tier got ten failures on a clean install. The extra
+  now self-references `[sql]`, the same treatment every connector extra already had.
+  The explore tier still installs and runs with no dialect engine, and a packaging
+  test now holds that line rather than leaving it to `a_plan`'s lazy import alone.
+
+  The suite also drove all 34 assertions through one key and never reset, so a
+  backend where two instances built from one key see the same state, which is the
+  defining property of every durable backend, inherited the previous assertion's
+  writes and failed nine of them. Every assertion now gets its own key, unique to
+  the run, so a durable backend passes unmodified with no reset hook and no fixture
+  of its own. A backend that resets on every call is unaffected: it receives
+  different strings and nothing else changes. `make_store` now documents what the
+  suite guarantees about key reuse and, just as importantly, what it does not
+  require, since the old contract was silent in both directions.
+
+  Neither gap was visible in-repo, because every backend the contract had ever run
+  against reset itself. There is now an in-repo backend that does not, and the
+  out-of-tree packaging test exercises the full tier instead of only the explore
+  tier.
 
 ## [1.4.2] - 2026-07-28
 

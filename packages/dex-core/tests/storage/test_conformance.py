@@ -48,6 +48,7 @@ from exmergo_dex_core.storage.conformance import (
     ExploreStoreContract,
     StoreContract,
     StoreFactoryContract,
+    a_cache,
 )
 from exmergo_dex_core.transform.plans import PlanNotFoundError, TransformPlan
 
@@ -169,6 +170,26 @@ class DocumentStore:
         return f"docstore://{self.tenant}/plans/{plan_id}"
 
 
+class DurableDocumentStore(DocumentStore):
+    """The same backend, never reset: the shape every hosted deployment has.
+
+    One difference from :class:`DocumentStore`, and it is the entire point: this
+    registry is deliberately left out of ``_clean_registries``, so what one
+    assertion writes under a key is still there for the next one. That is what a
+    Postgres-backed or document-database-backed store does between requests, and
+    the suite has to accommodate it without asking for a reset hook.
+
+    It exists because the reset is what hid the defect. Every backend the contract
+    was ever run against reset itself (this module through the autouse fixture, the
+    out-of-tree backend by popping its own state), so a suite that drove all 34
+    assertions through one literal key looked correct here and gave a real
+    implementer nine failures phrased as bugs in their own backend. If key reuse
+    ever comes back, this class fails and the shipped backends do not.
+    """
+
+    _registry: ClassVar[dict[str, dict[str, object]]] = {}
+
+
 class ExploreOnlyStore:
     """The narrow tier, with the five plan members genuinely absent.
 
@@ -250,6 +271,10 @@ class ContextKeyedExploreStore(ExploreOnlyStore):
 
 @pytest.fixture(autouse=True)
 def _clean_registries():
+    # DurableDocumentStore is deliberately absent, and must stay absent: resetting
+    # it would turn the one backend here that models a hosted deployment back into
+    # one that quietly starts clean, which is exactly how the key-reuse defect went
+    # unnoticed. The hand-written flow tests below keep the reset they do want.
     DocumentStore.reset()
     ExploreOnlyStore.reset()
     yield
@@ -297,6 +322,56 @@ class TestContextKeyedExploreStoreConstruction(
 
     def context_for(self, key: str) -> StoreContext:
         return StoreContext(options={"tenant": key})
+
+
+# --- the same contract, run against a backend that never resets ----------------
+#
+# The contract classes above all get a clean registry per assertion from
+# _clean_registries. These two do not, so they are the only in-repo run that proves
+# what a hosted implementer actually needs: that the suite hands out a fresh key per
+# assertion, and that a backend sharing state across instances built from one key
+# therefore passes without a reset hook or a fixture of its own.
+
+
+class TestDurableDocumentStoreConformance(StoreContract):
+    def make_store(self, key: str) -> DurableDocumentStore:
+        return DurableDocumentStore(tenant=key)
+
+
+class TestDurableDocumentStoreConstruction(StoreFactoryContract, StoreContract):
+    """And through the construction seam, which is where key reuse bit hardest.
+
+    `test_two_contexts_build_stores_that_share_nothing` asserts a freshly built
+    store has no cache. Under a shared literal key an earlier assertion had already
+    put one there, so this composition passed only on the order pytest happened to
+    collect it in.
+    """
+
+    tier = Store
+
+    def build(self, context: StoreContext) -> DurableDocumentStore:
+        # No refusal path here: what a factory owes a context missing its
+        # coordinate is document_store_factory's job and is tested against it.
+        return DurableDocumentStore(tenant=str(context.options["tenant"]))
+
+    def context_for(self, key: str) -> StoreContext:
+        return StoreContext(options={"tenant": key})
+
+
+def test_the_durable_backend_really_does_share_state_across_instances():
+    """Guards the guard.
+
+    Everything the two classes above prove rests on this backend being durable. If
+    it ever starts resetting (added to `_clean_registries`, or given per-instance
+    state), those runs keep passing while testing nothing about a hosted backend,
+    which is the failure mode this whole change exists to close.
+    """
+
+    DurableDocumentStore("durability-check").save_cache(a_cache())
+    assert DurableDocumentStore("durability-check").load_cache() is not None, (
+        "DurableDocumentStore stopped sharing state per key, so the conformance "
+        "runs above no longer cover a backend that outlives one assertion"
+    )
 
 
 # --- the tiers are what they claim to be --------------------------------------
