@@ -126,14 +126,23 @@ cluster = ["scikit-learn>=1.4"]
 # to execute them. Named for what it is conformance *to*, matching every other
 # extra here: an install line has to answer "conformance to what?" on its own.
 # Contributor tooling rather than a capability, which is why [all] omits it.
-storage-conformance = ["pytest>=8"]
+#
+# It self-references [sql] for the same reason the connector extras do. The plan
+# tier's assertions build a `TransformPlan`, which reaches the SQL guard and so the
+# dialect engine, so an implementer of the full `Store` tier cannot run the suite
+# without it. Shipping only pytest sent them ten failures that read as bugs in their
+# own backend. The explore tier still runs without a dialect engine (`a_plan`
+# imports lazily and a packaging test installs no extra at all), so this is a floor
+# raised for the wider tiers rather than a new requirement on the narrow one.
+storage-conformance = ["pytest>=8", "exmergo-dex-core[sql]"]
 # One command for users who want every optional capability at once: every
 # connector, both semantic-layer backends, and clustering. Self-references the
 # other extras so their requirement lists stay defined in exactly one place, which
 # does mean this reference list is the part that rots, so a test asserts it covers
-# every extra. Excludes only dev, which is contributor tooling rather than a
-# capability. This is the heaviest install there is (six dbt adapters, MetricFlow,
-# and scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
+# every extra. Excludes dev and storage-conformance, both contributor tooling rather
+# than a capability: nobody installing "everything dex can do" wants a test runner.
+# This is the heaviest install there is (six dbt adapters, MetricFlow, and
+# scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
 all = [
   "exmergo-dex-core[bigquery,cluster,databricks,duckdb,postgres,redshift,semantic,semantic-api,snowflake,sql]",
 ]

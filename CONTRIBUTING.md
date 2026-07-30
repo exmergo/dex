@@ -244,9 +244,11 @@ class TestMyStore(ExploreStoreContract):
 ```
 
 pytest collects the inherited tests and runs the whole contract against your
-backend, isolation assertions included. `references/storage.md` covers the tiers,
-the contracts that are not obvious from the signatures, and which calls need
-nothing on the filesystem.
+backend, isolation assertions included. Every assertion gets its own key, so a
+backend whose instances share state per key, which is every durable one, needs no
+reset hook to keep one assertion's writes out of the next.
+`references/storage.md` covers the tiers, the contracts that are not obvious from
+the signatures, and which calls need nothing on the filesystem.
 
 Backends contributed here run the same suite: see
 `packages/dex-core/tests/storage/test_parity.py`, which is deliberately the same
