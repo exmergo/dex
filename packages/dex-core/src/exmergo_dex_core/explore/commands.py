@@ -1060,23 +1060,37 @@ def cluster(
         row_count=dataset.row_count,
         seed=limits.sample_seed,
     )
+    null_count_sql = cluster_mod.build_null_count_sql(
+        dataset.identifier,
+        feature_names,
+        dialect=adapter.dialect,
+        sample_rows=limits.sample_rows,
+        row_count=dataset.row_count,
+        seed=limits.sample_seed,
+    )
     repeatable = cluster_mod.sample_is_repeatable(adapter.dialect, limits.sample_seed)
     adapter_name = adapter.name
     query_estimate = getattr(adapter, "query_estimate", None)
-    estimate = query_estimate(sample_sql) if query_estimate else 0.0
+    sample_estimate = query_estimate(sample_sql) if query_estimate else 0.0
+    null_count_estimate = query_estimate(null_count_sql) if query_estimate else 0.0
     command_args.billed_handshake(
         "explore cluster",
         adapter,
-        estimate,
+        sample_estimate + null_count_estimate,
         notes=[
             f"clusters a sample of up to {limits.sample_rows} rows over "
-            f"{len(feature_names)} feature column(s); sampling: {sample_method}"
+            f"{len(feature_names)} feature column(s); sampling: {sample_method}; "
+            "a companion count query measures how many rows the null filter "
+            "excludes, over the same table and sample scope"
         ],
     )
     sample = adapter.run_query(
         sample_sql,
         max_rows=limits.sample_rows,
         timeout_seconds=limits.timeout_seconds,
+    )
+    null_counts = adapter.run_query(
+        null_count_sql, max_rows=1, timeout_seconds=limits.timeout_seconds
     )
 
     clustering = cluster_mod.cluster_features(
@@ -1100,15 +1114,53 @@ def cluster(
             "draw different rows and reach a different k. Compare runs only with "
             "an identical sample"
         )
+    dropped_null_rows, drop_note = _null_drop_note(feature_names, null_counts.cells)
+    if drop_note:
+        notes.append(drop_note)
     result = ClusterResult(
         object=dataset.identifier,
         total_rows=dataset.row_count,
+        dropped_null_rows=dropped_null_rows,
         sample_method=sample_method,
         sample_repeatable=repeatable,
         clustering=clustering,
         notes=notes,
     )
     return command_args.stamp_spend(result, adapter)
+
+
+def _null_drop_note(
+    feature_names: list[str], cells: list[list]
+) -> tuple[int | None, str | None]:
+    """Turn the null-count query's one row into a count and, when anything was
+    actually dropped, an attributed note (which feature(s) caused it) plus the
+    reminder that ``total_rows`` is cache-derived, not this run's live count --
+    the only two numbers a reader could otherwise subtract come from different
+    moments."""
+
+    if not cells:
+        return None, None
+    sampled, dropped, *per_feature = cells[0]
+    dropped = int(dropped or 0)
+    if dropped == 0:
+        return 0, None
+    sampled = int(sampled or 0)
+    contributors = sorted(
+        (
+            (name, int(count or 0))
+            for name, count in zip(feature_names, per_feature, strict=True)
+            if count
+        ),
+        key=lambda kv: -kv[1],
+    )
+    breakdown = ", ".join(f"{name}: {count}" for name, count in contributors)
+    fraction = f" ({dropped / sampled:.1%})" if sampled else ""
+    return dropped, (
+        f"the null filter excluded {dropped} row(s){fraction} of this scan's "
+        f"scope, missing at least one feature; by column: {breakdown}. "
+        "total_rows above is cache-derived (from the last explore map/profile), "
+        "a different moment than this live count"
+    )
 
 
 def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
