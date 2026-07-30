@@ -148,16 +148,27 @@ _SHAPE_REFERENCE_CONFIDENCE = 0.3
 
 # Shape-rule thresholds. A column where half the values look like "Given
 # Surname" is treated as person names. The reference verdict requires person
-# shape to be essentially absent AND either a tiny closed all-caps vocabulary
+# shape to be essentially absent AND one of: a tiny closed all-caps vocabulary
 # (the R_NAME/N_NAME shape; the distinct cap keeps a large all-caps
 # customer-name column blocked, since an all-caps person name defeats the
-# person-shape check) or long multi-token labels (person names essentially
-# never average 3.5+ tokens; part and product descriptions do).
+# person-shape check), long multi-token labels (person names essentially never
+# average 3.5+ tokens; part and product descriptions do), or a closed
+# enumeration regardless of case or token count (weekday/month names, status
+# codes: neither all-caps nor multi-token, so the two rules above miss them,
+# but cardinality alone is conclusive).
 _PERSON_FRACTION_RAISE = 0.5
 _PERSON_FRACTION_ABSENT = 0.05
 _UPPER_VOCAB_FRACTION = 0.9
 _UPPER_VOCAB_MAX_DISTINCT = 32
 _LABEL_AVG_TOKENS = 3.5
+
+# A closed enumeration: distinct count small in absolute terms AND as a
+# fraction of non-null rows, so a genuinely small table of distinct people
+# (few rows, each one a different name) is not cleared by the same rule -- a
+# small table has a HIGH distinct/row fraction; an enumeration column on a
+# real fact table has a tiny one.
+_ENUM_MAX_DISTINCT = 32
+_ENUM_MAX_DISTINCT_FRACTION = 0.01
 
 # Splits camelCase boundaries so patterns written against snake_case also match
 # camelCase warehouses ("firstName" -> "first_name", "reviewerName" -> "reviewer_name").
@@ -419,7 +430,10 @@ def profile(
         for col in columns:
             agg = aggregates.get(col.name)
             pii = _refine_confidence(
-                prelim_pii[col.name], agg, generic=col.name in shape
+                prelim_pii[col.name],
+                agg,
+                generic=col.name in shape,
+                row_count=meta.row_count,
             )
             profiles.append(
                 ColumnProfile(
@@ -581,6 +595,7 @@ def _refine_confidence(
     aggregate: ColumnAggregate | None,
     *,
     generic: bool = False,
+    row_count: int | None = None,
 ) -> PIIFlag | None:
     """Nudge PII confidence using aggregate signals (never raw values).
 
@@ -589,6 +604,9 @@ def _refine_confidence(
     a de-rated flag stays recorded at reference-data confidence, and what to do
     with a weak flag is the consumer's decision (the query firewall blocks at
     its threshold; min/max suppression and dbt meta stay presence-based).
+    ``row_count`` backs the closed-enumeration shape rule; ``None`` (unknown
+    row count) simply leaves that rule unable to fire, same as any other
+    missing evidence.
     """
 
     if pii is None or aggregate is None:
@@ -609,15 +627,17 @@ def _refine_confidence(
     ):
         confidence = max(0.1, confidence - 0.3)
     if generic and pii.category is PIICategory.NAME:
-        confidence = _shape_verdict(confidence, aggregate)
+        confidence = _shape_verdict(confidence, aggregate, row_count)
     return PIIFlag(category=pii.category, confidence=round(confidence, 4))
 
 
-def _shape_verdict(confidence: float, aggregate: ColumnAggregate) -> float:
+def _shape_verdict(
+    confidence: float, aggregate: ColumnAggregate, row_count: int | None = None
+) -> float:
     """Map value-shape evidence to a generic-name confidence.
 
     Fail closed: whenever the evidence is missing or ambiguous the name-derived
-    confidence stands unchanged, which keeps the column blocked. Only the two
+    confidence stands unchanged, which keeps the column blocked. Only the
     provably non-person shapes de-rate, and a person-shaped distribution
     corroborates up to the exact-token level.
     """
@@ -640,4 +660,26 @@ def _shape_verdict(confidence: float, aggregate: ColumnAggregate) -> float:
     tokens = aggregate.avg_token_count
     if tokens is not None and tokens >= _LABEL_AVG_TOKENS:
         return _SHAPE_REFERENCE_CONFIDENCE
+    if _is_closed_enumeration(aggregate, row_count):
+        return _SHAPE_REFERENCE_CONFIDENCE
     return confidence
+
+
+def _is_closed_enumeration(aggregate: ColumnAggregate, row_count: int | None) -> bool:
+    """A small closed set of repeated values (day/month names, status codes,
+    plan tiers): distinct count small in absolute terms and, more importantly,
+    small as a fraction of non-null rows. The fraction is what keeps a
+    genuinely small table of distinct people from clearing here: few rows,
+    each a different name, is a small distinct count but a high fraction."""
+
+    distinct = aggregate.distinct_count
+    if distinct is None or distinct > _ENUM_MAX_DISTINCT or not row_count:
+        return False
+    non_null = (
+        round((1 - aggregate.null_fraction) * row_count)
+        if aggregate.null_fraction is not None
+        else row_count
+    )
+    if not non_null:
+        return False
+    return (distinct / non_null) <= _ENUM_MAX_DISTINCT_FRACTION
