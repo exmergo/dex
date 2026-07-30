@@ -203,6 +203,7 @@ def _build_parser() -> argparse.ArgumentParser:
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {
+                    "check",
                     "schema",
                     "volume",
                     "grain",

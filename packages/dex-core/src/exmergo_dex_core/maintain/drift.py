@@ -736,11 +736,21 @@ class CardinalityCheck(NamedTuple):
 
 
 def cardinality_plan(
-    current_semantic: SemanticLayer | None, snap: Snapshot
+    current_semantic: SemanticLayer | None,
+    snap: Snapshot,
+    scope: set[str] | None = None,
 ) -> list[CardinalityCheck]:
     """Which categorical dimension columns have a cardinality baseline to diff:
     the current semantic definitions intersected with the snapshot's distinct
-    counts. Only counts are ever compared; no dimension value is read."""
+    counts. Only counts are ever compared; no dimension value is read.
+
+    ``scope`` (lowered name tokens) filters *before* estimation/execution, so a
+    narrowed scan is priced and billed for less, not just reported as less: a
+    check matches when its identifier, bare table name, column, dimension, or
+    semantic model name is in scope -- the same vocabulary ``_semantic_scope``
+    already matches findings against, since a semantic finding hangs off a
+    definition name as often as a physical object.
+    """
 
     checks: list[CardinalityCheck] = []
     if current_semantic is None:
@@ -753,14 +763,19 @@ def cardinality_plan(
         matches = match_identifier(sm.model_ref, identifiers)
         if len(matches) != 1:
             continue
-        columns = {c.name: c for c in snap_by_id[matches[0]].columns}
+        identifier = matches[0]
+        columns = {c.name: c for c in snap_by_id[identifier].columns}
         for dimension, column in sm.categorical_dimensions.items():
             profile = columns.get(column)
             if profile is None or profile.distinct_count is None:
                 continue
+            if scope is not None and not _cardinality_in_scope(
+                identifier, column, dimension, sm.name, scope
+            ):
+                continue
             checks.append(
                 CardinalityCheck(
-                    identifier=matches[0],
+                    identifier=identifier,
                     column=column,
                     dimension=dimension,
                     semantic_model=sm.name,
@@ -769,6 +784,19 @@ def cardinality_plan(
                 )
             )
     return checks
+
+
+def _cardinality_in_scope(
+    identifier: str, column: str, dimension: str, semantic_model: str, scope: set[str]
+) -> bool:
+    candidates = {
+        identifier.lower(),
+        identifier.rsplit(".", 1)[-1].lower(),
+        column.lower(),
+        dimension.lower(),
+        semantic_model.lower(),
+    }
+    return bool(candidates & scope)
 
 
 def cardinality_estimate(
