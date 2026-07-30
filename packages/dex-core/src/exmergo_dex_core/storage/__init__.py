@@ -5,14 +5,30 @@
 only what its host uses; the sibling modules are the backends. Callers receive a
 store; only the entry point picks which one.
 
+It also holds the separate, optional construction contract
+(:class:`~.base.StoreFactory` over a :class:`~.base.StoreContext`), for a backend
+that is named somewhere rather than handed to the engine as an instance.
+``resolver`` is what turns such a name into a store, as an open registry: a
+shipped name, a dotted path, or an entry point an installed distribution
+registered.
+
 ``conformance`` is the executable contract, for anyone writing a backend outside
 this package. It is deliberately not imported here: it needs pytest, and a bare
 ``import exmergo_dex_core`` must not.
 """
 
-from .base import Document, ExploreStore, MaintainStore, Store, spend_total
+from .base import (
+    Document,
+    ExploreStore,
+    MaintainStore,
+    Store,
+    StoreContext,
+    StoreFactory,
+    spend_total,
+)
 from .filesystem import DEX_DIR, FilesystemStore
 from .memory import MemoryStore
+from .resolver import build_store, resolve_store_factory
 
 __all__ = [
     "DEX_DIR",
@@ -22,5 +38,9 @@ __all__ = [
     "MaintainStore",
     "MemoryStore",
     "Store",
+    "StoreContext",
+    "StoreFactory",
+    "build_store",
+    "resolve_store_factory",
     "spend_total",
 ]

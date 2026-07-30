@@ -16,6 +16,9 @@ Nothing is written to disk by that snippet: the default store is a
 :class:`~.storage.MemoryStore`, so importing this package into a project cannot
 leave a ``.dex/`` directory behind as a side effect. Pass ``store=`` for anything
 durable, and see :class:`~.storage.Store` for what a backend has to implement.
+:meth:`DexEngine.from_repo` is the other way in: it reads ``.dex/config.yml`` and
+builds whichever backend ``cache.backend`` names, which is how the CLI reaches a
+backend dex does not ship.
 
 Two boundaries are worth naming, because both are easy to blur:
 
@@ -37,11 +40,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
-from .config import DexConfig, load_config
+from .config import CacheConfig, DexConfig, load_config
 from .connect import ConnectionSource, SemanticSource
 from .errors import RepoRootRequiredError, StoreRequiredError
 from .results import ConnectResult
-from .storage import ExploreStore, FilesystemStore, MemoryStore, Store
+from .storage import ExploreStore, MemoryStore, Store, StoreContext, build_store
 
 if TYPE_CHECKING:
     from .adapters.base import Adapter
@@ -176,19 +179,45 @@ class DexEngine:
         self._adapter_instance: Adapter | None = None
 
     @classmethod
-    def from_repo(cls, repo_root: str | Path, **overrides: Any) -> DexEngine:
-        """Build from a project on disk: filesystem store, config from ``.dex/``.
+    def from_repo(
+        cls,
+        repo_root: str | Path,
+        *,
+        cache_backend: str | None = None,
+        **overrides: Any,
+    ) -> DexEngine:
+        """Build from a project on disk: config from ``.dex/``, store from config.
 
         The CLI's constructor, and the only path that reads configuration from
         the filesystem. When no config resolves, the engine stays unresolved
         rather than defaulting, so the refusal fires on first connection attempt
         instead of at construction (commands that need no warehouse still work
         outside a project).
+
+        The store is whatever ``cache.backend`` selects, defaulting to the
+        filesystem backend, so a repo that configures nothing behaves exactly as
+        it did before the setting existed. A ``store=`` passed here wins over the
+        configuration: a caller holding an instance has already made the decision
+        that configuration exists to make for the callers who are not.
+
+        ``cache_backend`` overrides the configured name for one run, and takes
+        the configured ``cache.options`` with it only when it names the backend
+        those options were written for. Options are not namespaced by backend, so
+        carrying them onto a different one would hand a backend another backend's
+        coordinates; the most useful thing this override does is fall back to the
+        filesystem backend for one command, and that would refuse outright if a
+        custom backend's options came along.
         """
 
         root = str(repo_root)
-        overrides.setdefault("store", FilesystemStore(root))
         overrides.setdefault("config", load_config(root))
+        if "store" not in overrides:
+            cache = getattr(overrides["config"], "cache", None) or CacheConfig()
+            selected = cache_backend or cache.backend
+            options = cache.options if selected == cache.backend else {}
+            overrides["store"] = build_store(
+                selected, StoreContext(repo_root=root, options=options)
+            )
         return cls(repo_root=root, **overrides)
 
     # --- the single adapter funnel ------------------------------------------

@@ -23,7 +23,7 @@ from ..dbt_project import DbtProjectError
 from ..dbt_project import load as load_project
 from ..errors import PrerequisiteError
 from ..results import ConfirmationRequest, to_envelope
-from ..storage import Document, MaintainStore
+from ..storage import Document, FilesystemStore, MaintainStore
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
 from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
@@ -32,10 +32,14 @@ if TYPE_CHECKING:
     from ..engine import DexEngine
 
 _SNAPSHOT_HINT = (
-    "commit .dex/snapshot.json like a lockfile, and re-run `maintain snapshot` "
-    "after each known-good build so drift is measured against a state someone "
-    "vouched for"
+    "re-run `maintain snapshot` after each known-good build so drift is measured "
+    "against a state someone vouched for"
 )
+
+#: Prepended when the baseline really is a file in the user's repo. Advice about
+#: git only means something there, and telling a host whose baseline is a row to
+#: commit a path would name a file it does not have.
+_REVIEWABLE_SNAPSHOT_HINT = "commit .dex/snapshot.json like a lockfile, and "
 
 _NO_SNAPSHOT_ERROR = (
     "no drift baseline yet; run `maintain snapshot` first (ideally right after "
@@ -148,7 +152,15 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
 
 
 def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return to_envelope(snapshot(engine), hints={"hint": _SNAPSHOT_HINT})
+    # Which advice is true depends on where the baseline landed, so the hint is
+    # built from the store rather than fixed. The shipped filesystem backend is
+    # the only one dex knows puts a reviewable file in the repo; a backend it
+    # does not ship gets the half that holds everywhere, which is better than
+    # confidently naming a file that does not exist. `snapshot_path` carries the
+    # real location either way.
+    reviewable = isinstance(engine.store, FilesystemStore)
+    hint = (_REVIEWABLE_SNAPSHOT_HINT if reviewable else "") + _SNAPSHOT_HINT
+    return to_envelope(snapshot(engine), hints={"hint": hint})
 
 
 def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:

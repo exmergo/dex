@@ -11,6 +11,106 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A storage backend dex does not ship can be selected from configuration**
+  ([#157]). `.dex/config.yml` gains a `cache` block, and it is the schema change
+  worth reading first:
+
+  ```yaml
+  cache:
+    backend: mypkg.stores:my_store
+    options:
+      tenant: acme
+  ```
+
+  `backend` defaults to `filesystem`, so a repo that configures nothing behaves
+  exactly as it did before the setting existed, and `options` reaches the selected
+  backend's factory verbatim. `--cache-backend` overrides the name for one run,
+  the way `--connector` overrides the configured connector. **Credentials never
+  belong in `options`**: this file is committed, so a backend needing one reads it
+  at runtime the way `connect.py` does.
+
+  It is an **open registry, not a closed enum**, which is the part that would have
+  been expensive to get wrong: a closed set of shipped names would make out-of-tree
+  backends library-only permanently, and opening it later would be a config-schema
+  change with a deprecation attached. Three kinds of name resolve, in order: a
+  shipped name (`filesystem`), a dotted `mypkg.stores:my_store` path, or a name an
+  installed distribution registered under the `exmergo_dex_core.stores`
+  entry-point group. A shipped name always wins over a registration, so installing
+  a package can never silently move where an existing repo's state lands.
+
+  Before this, a contributor could implement a backend, watch the shipped
+  conformance suite go green, and then discover the only way to use it was to stop
+  using the CLI. `DexEngine.from_repo` now builds whatever the configuration names
+  instead of hardcoding the filesystem backend; an explicitly passed `store=` still
+  wins over both, since a caller holding an instance has already made the decision.
+
+  **`memory` is deliberately not selectable.** Each CLI command runs as its own
+  process, so a `MemoryStore` would drop the cache between `explore map` and
+  `explore query`, and the second command would refuse with "run `explore map`
+  first" having just run it. That reads as a broken tool rather than a chosen
+  backend, so it refuses by explaining the process boundary. It remains the default
+  for a library caller, where one process holds the engine.
+
+  Every failure refuses with a `ConfigurationError` naming the fix: an unknown name
+  lists what exists and both open forms, a dotted path that will not import points
+  at the environment, a name resolving to something uncallable says so, and a
+  factory that builds something which is not a store names the members it lacks.
+  The tier check is on the constructed store rather than on the factory, because a
+  callable protocol can only verify that `__call__` exists.
+
+- **A storage backend can now say how it is constructed, not just how it behaves**
+  ([#156]). #144 made the seam implementable: the tiered `Store` protocol, the
+  shipped conformance suite, `py.typed`. What it left undecided was what happens
+  between "something names a backend" and "the engine holds a store", and the
+  shapes disagree: `FilesystemStore` is built from a repo root, `MemoryStore` from
+  nothing, and a backend serving several end users from a tenant id with no
+  repository anywhere in the picture. There is no single call that satisfies all
+  three, so the contract had to be chosen.
+
+  Construction is now its own small contract, deliberately separate from `Store`.
+  A `StoreContext` carries a `repo_root` (`None` when there is no repository) and
+  an `options` mapping of the backend's own non-secret coordinates, passed through
+  verbatim; a `StoreFactory` is anything callable that turns one into a store. A
+  plain function, a class whose `__init__` takes the context, and a classmethod
+  all qualify, so a backend is constructable in whatever shape it already has.
+  `FilesystemStore.from_context` and `MemoryStore.from_context` are the shipped
+  reference implementations, one path-shaped and one that needs nothing.
+
+  **`Store` stays purely structural.** Putting a construction obligation on the
+  protocol would have cost the property that makes this seam cheap to implement,
+  that a class with the right methods is a store, with no base class to inherit
+  and no registration step. A host that builds its own store and passes it to the
+  engine is untouched by any of this.
+
+  **Construction is checkable, so the conformance suite's promise stays whole.**
+  `StoreFactoryContract` composes with the contract for your tier and routes
+  `make_store` through your own factory, so every behavioral and isolation
+  assertion then runs against stores built the way dex builds them. "The suite is
+  green" therefore still means a backend is correct *and* constructable, rather
+  than quietly meaning only the first. The packaging test that installs the wheel
+  in an environment with no access to this source tree now builds its backend
+  through a factory and a context carrying no repo root, because a construction
+  contract that only works from inside this repo has not been tested.
+
+  **No secret ever reaches a `StoreContext`.** `.dex/config.yml` is committed, so
+  a password, key, token, or connection string among the options would be a
+  credential in version control. A backend reads its credential from the
+  environment at construction, exactly as the connection and semantic-layer seams
+  already do, or a host with per-request credentials skips the contract and hands
+  the engine a store it built itself.
+
+  Both shipped backends refuse an option they would otherwise have ignored, and
+  `FilesystemStore.from_context` refuses a context with no repo root rather than
+  falling back to the working directory, which would write one project's
+  exploration cache into wherever the process happened to start. Accepted-and-
+  ignored is worse than rejected: the caller believes a setting took effect and
+  nothing in the output says otherwise.
+
+  `references/storage.md` documents the contract, both shapes a factory can take,
+  and the two rejected alternatives: always passing a `repo_root`, which cannot
+  construct a tenant-keyed backend at all, and requiring a `from_config`
+  classmethod, which puts the obligation back on the protocol.
+  
 - **`maintain check` accepts the same object scope as its focused detectors**
   ([#115]). The paid grain and cardinality axes always estimated and billed for
   every configured dataset, with no way to narrow them; a session focused on one
@@ -20,8 +120,18 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   scope `maintain schema`/`volume`/`grain`/`semantic` already accept, narrowing
   every axis, including the two paid ones, to what was actually asked for.
 
+
 ### Fixed
 
+- **`maintain snapshot` told every host to commit a file it may not have**
+  ([#157]). The hint was a fixed string: "commit `.dex/snapshot.json` like a
+  lockfile". A backend that keeps the baseline as a row or a document has no such
+  file, so the advice named something that does not exist, while the
+  `snapshot_path` beside it correctly reported that backend's own locator. The
+  half that holds everywhere, re-pinning after each known-good build, is now what
+  a backend dex does not ship gets; the git half is added only when the baseline
+  really is a file in the repo. Nothing changes for the filesystem backend.
+  
 - **`maintain semantic`'s paid cardinality scan now actually narrows on scope,
   not just its reported findings** ([#115]). `cardinality_plan` built
   its scan over every semantic model's categorical dimensions regardless of the

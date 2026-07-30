@@ -6,7 +6,7 @@ implementable by someone reading only what is published. These build a backend
 that is neither a directory nor a live in-process object, and drive it the way a
 host actually would.
 
-Two shapes matter here and are not covered anywhere else:
+Three shapes matter here and are not covered anywhere else:
 
 - **A store outliving the engine that wrote it.** A request-per-engine host builds
   a fresh engine per call and keeps state in its own datastore. Today's in-memory
@@ -15,6 +15,10 @@ Two shapes matter here and are not covered anywhere else:
 - **A partial implementation that is still complete.** A host that only explores
   implements ``ExploreStore`` and stops, and that has to be a satisfied contract
   rather than five methods that raise.
+- **A backend with no repo root, built from a context.** Both shipped backends are
+  constructed from a path or from nothing, so they cannot show whether the
+  construction contract works for the backend class it was widened for: one keyed
+  by a tenant, with no repository anywhere in the picture.
 """
 
 from __future__ import annotations
@@ -26,12 +30,24 @@ from typing import ClassVar
 
 import pytest
 
-from exmergo_dex_core import DexConfig, DexEngine, StoreRequiredError
+from exmergo_dex_core import (
+    ConfigurationError,
+    DexConfig,
+    DexEngine,
+    StoreRequiredError,
+)
 from exmergo_dex_core.cache import DexCache
-from exmergo_dex_core.storage import Document, ExploreStore, Store, spend_total
+from exmergo_dex_core.storage import (
+    Document,
+    ExploreStore,
+    Store,
+    StoreContext,
+    spend_total,
+)
 from exmergo_dex_core.storage.conformance import (
     ExploreStoreContract,
     StoreContract,
+    StoreFactoryContract,
 )
 from exmergo_dex_core.transform.plans import PlanNotFoundError, TransformPlan
 
@@ -202,6 +218,36 @@ class ExploreOnlyStore:
         return f"explore-only://{self.tenant}/{document.value}"
 
 
+def document_store_factory(context: StoreContext) -> DocumentStore:
+    """The function shape of the construction contract, keyed by nothing on disk.
+
+    What a third party would publish beside the backend so it can be named in
+    configuration. It reads its own coordinate out of ``options`` and refuses when
+    it is missing, because a backend that guessed a tenant would put one tenant's
+    exploration cache under another's key.
+    """
+
+    tenant = context.options.get("tenant")
+    if not tenant:
+        raise ConfigurationError(
+            "this backend is keyed by tenant and the context carries none; set "
+            "cache.options.tenant"
+        )
+    return DocumentStore(tenant=str(tenant))
+
+
+class ContextKeyedExploreStore(ExploreOnlyStore):
+    """The class shape: a store whose ``__init__`` is itself the factory.
+
+    The second way a dotted path can resolve, and the reason the contract is a
+    callable rather than a named classmethod: a backend written this way needs no
+    adapter and no extra method to be constructable.
+    """
+
+    def __init__(self, context: StoreContext):
+        super().__init__(tenant=str(context.options["tenant"]))
+
+
 @pytest.fixture(autouse=True)
 def _clean_registries():
     DocumentStore.reset()
@@ -222,6 +268,35 @@ class TestDocumentStoreConformance(StoreContract):
 class TestExploreOnlyStoreConformance(ExploreStoreContract):
     def make_store(self, key: str) -> ExploreOnlyStore:
         return ExploreOnlyStore(tenant=key)
+
+
+# --- the same contract, run through the construction seam ----------------------
+#
+# Composing the factory contract in front re-runs every behavioral and isolation
+# assertion above against stores built the way dex would build them, which is what
+# keeps "the suite is green" meaning correct *and* constructable.
+
+
+class TestDocumentStoreConstruction(StoreFactoryContract, StoreContract):
+    tier = Store
+
+    def build(self, context: StoreContext) -> DocumentStore:
+        return document_store_factory(context)
+
+    def context_for(self, key: str) -> StoreContext:
+        # No repo root anywhere: the case the rejected `resolve(name)(repo_root)`
+        # contract could not express at all.
+        return StoreContext(options={"tenant": key})
+
+
+class TestContextKeyedExploreStoreConstruction(
+    StoreFactoryContract, ExploreStoreContract
+):
+    def build(self, context: StoreContext) -> ContextKeyedExploreStore:
+        return ContextKeyedExploreStore(context)
+
+    def context_for(self, key: str) -> StoreContext:
+        return StoreContext(options={"tenant": key})
 
 
 # --- the tiers are what they claim to be --------------------------------------
@@ -260,6 +335,45 @@ def test_a_broken_backend_fails_with_the_rule_it_broke_not_a_bare_compare():
     assert "must not alias the caller's object" in message
     # And it says what to do about it, not merely that something differed.
     assert "Serialize on write, or deep-copy" in message
+
+
+def test_a_factory_that_ignores_its_context_fails_with_the_rule_it_broke():
+    """The construction mistake that voids every isolation guarantee downstream.
+
+    A factory that drops the part of the context keying it builds one shared store
+    for every tenant. Nothing about that looks wrong at the call site, and the
+    behavioral suite passes, because each store in isolation is correct; what
+    fails is that they are all the same store. So the message has to say which
+    part of the contract broke, not merely that a cache was not None.
+    """
+
+    contract = StoreFactoryContract()
+    contract.build = lambda context: DocumentStore("always-the-same")  # type: ignore[method-assign]
+    contract.context_for = lambda key: StoreContext(options={"tenant": key})  # type: ignore[method-assign]
+
+    with pytest.raises(AssertionError) as failure:
+        contract.test_two_contexts_build_stores_that_share_nothing()
+
+    message = str(failure.value)
+    assert "ignoring the part of the context that keys it" in message
+
+
+def test_a_factory_that_undershoots_its_declared_tier_names_the_tier():
+    # The other construction failure: the backend is fine and the factory works,
+    # but it hands back a narrower store than the config selecting it expects. dex
+    # refuses at resolution, so this has to fail here rather than several commands
+    # later on a missing attribute.
+    contract = StoreFactoryContract()
+    contract.tier = Store
+    contract.build = lambda context: ExploreOnlyStore("t")  # type: ignore[method-assign]
+    contract.context_for = lambda key: StoreContext(options={"tenant": key})  # type: ignore[method-assign]
+
+    with pytest.raises(AssertionError) as failure:
+        contract.test_the_factory_builds_a_store_of_the_declared_tier()
+
+    message = str(failure.value)
+    assert "ExploreOnlyStore" in message and "Store" in message
+    assert "unusable from configuration" in message
 
 
 def test_a_full_backend_satisfies_every_tier():
@@ -331,6 +445,55 @@ def test_one_tenants_cache_is_invisible_to_another(duckdb_file: Path):
         pytest.raises(Exception),
     ):
         stranger.query("select count(*) as n from customers")
+
+
+def test_a_backend_built_from_a_context_with_no_repo_root_drives_a_flow(
+    duckdb_file: Path,
+):
+    """The acceptance case for the construction contract, end to end.
+
+    Nothing here has a repo root: the store is built from a context carrying only
+    a tenant, which is the construction a path-shaped contract cannot express. And
+    it is built twice, once per engine, so the flow only works if the second
+    construction lands on the state the first one wrote. That is the property a
+    hosted deployment needs and the reason the contract is keyed by the backend's
+    own coordinates rather than by a directory.
+    """
+
+    config = DexConfig(connector="duckdb")
+    context = StoreContext(options={"tenant": "tenant-a"})
+
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        config=config,
+        store=document_store_factory(context),
+    ) as first:
+        first.map()
+
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        config=config,
+        store=document_store_factory(context),
+    ) as second:
+        result = second.query("select count(*) as n from customers")
+
+    assert result.cells[0][0] == 2
+
+    # And a different tenant's context builds a store that has never seen it, so
+    # the firewall has nothing to resolve the table against.
+    stranger_store = document_store_factory(StoreContext(options={"tenant": "other"}))
+    assert stranger_store.load_cache() is None
+
+
+def test_a_factory_refuses_a_context_missing_the_coordinate_it_is_keyed_by():
+    # The refusal a backend owes: guessing a tenant would file one tenant's
+    # exploration cache under another's key, which is the failure the whole seam
+    # exists to prevent.
+    with pytest.raises(ConfigurationError) as refusal:
+        document_store_factory(StoreContext(repo_root="/somewhere"))
+    assert "tenant" in str(refusal.value)
 
 
 def test_an_explore_only_store_drives_a_full_explore_flow(duckdb_file: Path):

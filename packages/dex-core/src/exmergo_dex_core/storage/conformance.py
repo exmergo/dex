@@ -28,6 +28,12 @@ in one process must not be able to see each other's cache, ledgers, or plans.
 Whether ``key`` is a directory, a tenant id, or a table prefix is the backend's
 business.
 
+**If your backend is meant to be named in configuration rather than handed to the
+engine as an instance**, mix :class:`StoreFactoryContract` in as well. It routes
+``make_store`` through your own factory, so every assertion above then runs
+against a store built the way dex would build it, and "the suite is green" keeps
+meaning the backend is both correct and constructable rather than only the first.
+
 This module imports pytest, so it is deliberately not imported by
 ``exmergo_dex_core.storage``: a bare ``import exmergo_dex_core`` must not require
 a test framework. Install the ``[storage-conformance]`` extra to get pytest
@@ -44,12 +50,13 @@ import pytest
 from ..cache import CacheProvenance, Dataset, DexCache
 from ..maintain.drift import AxisResult, DriftFinding, DriftReport
 from ..maintain.snapshot import Snapshot, WarehouseBaseline
-from .base import Document
+from .base import Document, ExploreStore, StoreContext
 
 __all__ = [
     "ExploreStoreContract",
     "MaintainStoreContract",
     "StoreContract",
+    "StoreFactoryContract",
 ]
 
 
@@ -575,4 +582,81 @@ class StoreContract(MaintainStoreContract):
         assert two.list_plans() == [], (
             "two keys share the plan store, so one tenant can read and apply "
             f"another's proposed dbt changes. Got {two.list_plans()!r}"
+        )
+
+
+class StoreFactoryContract:
+    """The construction half, for a backend dex builds rather than receives.
+
+    Mix it in front of the contract for your tier, and the whole behavioral suite
+    runs against stores built the way dex builds them::
+
+        class TestMyStore(StoreFactoryContract, StoreContract):
+            tier = Store
+
+            def build(self, context):
+                return my_store_factory(context)
+
+            def context_for(self, key):
+                return StoreContext(options={"tenant": key})
+
+    Two hooks rather than one factory attribute, because a plain function assigned
+    to a class attribute binds as a method and would arrive with ``self`` in front
+    of the context, which is a confusing failure to meet on your first run.
+
+    ``context_for`` is where a backend says what it is keyed by. Build the context
+    the way a real configuration entry would produce it: a filesystem-shaped
+    backend varies ``repo_root``, a tenant-keyed one varies an entry in
+    ``options``. A ``context_for`` that returns the same context for every key
+    passes nothing meaningful, since the isolation assertions can only be as
+    honest as the contexts they are given.
+    """
+
+    #: The tier :meth:`build` promises to return. Widen it to ``MaintainStore`` or
+    #: ``Store`` alongside the matching contract class; the default is the floor
+    #: every backend meets.
+    tier: Any = ExploreStore
+
+    def build(self, context: StoreContext) -> Any:
+        """Your factory, called with a context. One line in most backends."""
+
+        raise NotImplementedError(
+            "a factory conformance subclass must implement "
+            "build(context) -> Store, calling the factory under test"
+        )
+
+    def context_for(self, key: str) -> StoreContext:
+        """The context that keys a store to ``key``, as configuration would."""
+
+        raise NotImplementedError(
+            "a factory conformance subclass must implement "
+            "context_for(key) -> StoreContext, keying the store the way a real "
+            "configuration entry would"
+        )
+
+    def make_store(self, key: str) -> Any:
+        return self.build(self.context_for(key))
+
+    def test_the_factory_builds_a_store_of_the_declared_tier(self):
+        built = self.build(self.context_for("primary"))
+        assert isinstance(built, self.tier), (
+            f"the factory returned {type(built).__name__}, which does not satisfy "
+            f"{self.tier.__name__}. A backend that passes the behavioral suite and "
+            "fails here is unusable from configuration: dex builds it, checks the "
+            "tier the command needs, and refuses. Check that build() returns the "
+            "store rather than a class, a coroutine, or a wrapper"
+        )
+
+    def test_two_contexts_build_stores_that_share_nothing(self):
+        # The same property the keyed isolation assertions cover, checked at the
+        # construction seam: a factory that ignores its context builds one shared
+        # store for every tenant, and every later isolation guarantee is void.
+        one = self.build(self.context_for("tenant-one"))
+        two = self.build(self.context_for("tenant-two"))
+        one.save_cache(a_cache("db.one.orders"))
+        assert two.load_cache() is None, (
+            "two contexts built stores that share a cache. The factory is probably "
+            "ignoring the part of the context that keys it, so every tenant it "
+            "builds lands in the same state. Check that context_for varies "
+            "something and that build reads it"
         )

@@ -110,3 +110,43 @@ def test_snapshot_file_carries_no_string_values(maintain_repo):
             if "VARCHAR" in column["data_type"].upper():
                 assert column["min_value"] is None
                 assert column["max_value"] is None
+
+
+def test_the_snapshot_hint_only_promises_git_when_the_baseline_is_a_file(
+    tmp_path: Path,
+):
+    """The hint is advice about where the baseline landed, so it has to follow the
+    backend.
+
+    Telling a host whose snapshot is a row or a document to commit
+    `.dex/snapshot.json` names a file it does not have. The half that holds
+    everywhere, re-pinning after a known-good build, is what a backend dex does
+    not ship should get; `snapshot_path` carries the real location either way.
+    The filesystem half is asserted by the first test in this file.
+    """
+
+    import argparse
+
+    from exmergo_dex_core import DexConfig, DexEngine, MemoryStore
+    from exmergo_dex_core.maintain.commands import cmd_snapshot
+
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE items (id INTEGER)")
+    conn.close()
+
+    with DexEngine(
+        connector="duckdb",
+        path=str(db_path),
+        config=DexConfig(connector="duckdb"),
+        store=MemoryStore(),
+    ) as engine:
+        envelope = cmd_snapshot(argparse.Namespace(), engine)
+
+    hint = envelope.data["hint"]
+    assert "commit" not in hint
+    assert ".dex/snapshot.json" not in hint
+    assert "re-run `maintain snapshot`" in hint
+    # And the location is still reported, just not as a path anyone can commit.
+    assert envelope.data["snapshot_path"] == "memory:snapshot"

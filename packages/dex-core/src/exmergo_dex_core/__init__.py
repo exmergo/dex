@@ -95,6 +95,8 @@ _EXPORTS = {
     "SemanticSource": "connect",
     "Snapshot": "maintain.snapshot",
     "Store": "storage",
+    "StoreContext": "storage",
+    "StoreFactory": "storage",
     "StoreRequiredError": "errors",
     "to_envelope": "results",
 }
@@ -149,6 +151,8 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         MaintainStore,
         MemoryStore,
         Store,
+        StoreContext,
+        StoreFactory,
     )
     from .transform.plans import PlanError, PlanNotFoundError
 
@@ -205,6 +209,8 @@ __all__ = [
     "SemanticSource",
     "Snapshot",
     "Store",
+    "StoreContext",
+    "StoreFactory",
     "StoreRequiredError",
     "__version__",
     "to_envelope",
