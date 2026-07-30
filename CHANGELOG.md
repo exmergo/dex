@@ -123,6 +123,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **Low-cardinality enumerations (weekday names, month names, status codes) no
+  longer keep a blocking name-only PII flag** ([#167]). A string column matching
+  the generic `*_name` pattern (`day_name`, `month_name`) starts at 0.6
+  confidence, above the query firewall's 0.5 blocking threshold; value-shape
+  profiling can already de-rate a name-only flag when the values are visibly an
+  all-caps reference vocabulary or long multi-token labels, but a closed set of
+  single-token Title Case values (`Monday`, `January`) matched neither rule, so
+  a conventional date dimension's weekday/month columns stayed blocked on every
+  fresh re-profile. Cardinality is now its own corroborating signal: a column
+  whose distinct count is small both in absolute terms and as a fraction of
+  non-null rows de-rates the same way the existing shape rules do. The fraction
+  half is the guard on the guard, verbatim from the report: a genuinely small
+  table of distinct people has a low absolute distinct count but a *high*
+  fraction (most rows are their own distinct value), so it is not cleared by
+  this rule, and a person-shaped distribution still corroborates as a real name
+  before cardinality is ever considered. The flag itself is never removed,
+  consistent with every other shape rule; only where it lands relative to the
+  blocking threshold.
+
 - **`maintain snapshot` told every host to commit a file it may not have**
   ([#157]). The hint was a fixed string: "commit `.dex/snapshot.json` like a
   lockfile". A backend that keeps the baseline as a row or a document has no such

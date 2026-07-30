@@ -105,6 +105,33 @@ def tpch_names_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def date_dim_duckdb(tmp_path: Path) -> Path:
+    """Issue #167's exact shape: a conventional date dimension, 2000 rows, with
+    `day_name` (7 distinct) and `month_name` (12 distinct) columns -- single-token
+    Title Case, so neither the all-caps nor the long-label shape rule catches
+    them, but cardinality (tiny relative to row count) is conclusive."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "date_dim.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE date_dim AS
+        SELECT
+            i AS date_key,
+            (['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday',
+              'Saturday', 'Sunday'])[(i % 7) + 1] AS day_name,
+            (['January', 'February', 'March', 'April', 'May', 'June', 'July',
+              'August', 'September', 'October', 'November', 'December'])
+              [(i % 12) + 1] AS month_name
+        FROM range(2000) t(i)
+        """
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def blob_duckdb(tmp_path: Path) -> Path:
     """A table with an informative numeric column next to a `BLOB` column
     (serialized-state shape): the profile scan-pruning gap the blob-column
