@@ -114,6 +114,17 @@ def _sample_parts(
     return "", "", "no sample clause (unrecognized dialect)"
 
 
+def _table_ref(identifier: str, dialect: str) -> str:
+    parts = identifier.split(".")
+    if len(parts) == 3:
+        table = exp.table_(parts[2], db=parts[1], catalog=parts[0])
+    elif len(parts) == 2:
+        table = exp.table_(parts[1], db=parts[0])
+    else:
+        table = exp.table_(parts[-1])
+    return table.sql(dialect=dialect, identify=True)
+
+
 def build_sample_sql(
     identifier: str,
     feature_names: list[str],
@@ -132,23 +143,20 @@ def build_sample_sql(
     result is a single SELECT of only the feature columns, so it passes
     ``guards.sql_guard.assert_select_only`` and scans no column a feature does
     not name.
+
+    This filters out any row with a null feature before it ever reaches Python
+    (right: it is why the scan stays narrow), so the rows it drops are counted
+    here, in the SQL layer, by :func:`build_null_count_sql` -- never inferred
+    downstream from cells that already excluded them.
     """
 
     if not feature_names:
         raise ClusterError("no feature columns to sample")
 
-    parts = identifier.split(".")
-    if len(parts) == 3:
-        table = exp.table_(parts[2], db=parts[1], catalog=parts[0])
-    elif len(parts) == 2:
-        table = exp.table_(parts[1], db=parts[0])
-    else:
-        table = exp.table_(parts[-1])
-
     def render(node: exp.Expression) -> str:
         return node.sql(dialect=dialect, identify=True)
 
-    table_ref = render(table)
+    table_ref = _table_ref(identifier, dialect)
     cols_sql = ", ".join(render(exp.column(name)) for name in feature_names)
     where_sql = " AND ".join(
         f"{render(exp.column(name))} IS NOT NULL" for name in feature_names
@@ -159,17 +167,66 @@ def build_sample_sql(
     return sql, method
 
 
+def build_null_count_sql(
+    identifier: str,
+    feature_names: list[str],
+    *,
+    dialect: str,
+    sample_rows: int,
+    row_count: int | None,
+    seed: int | None = None,
+) -> str:
+    """The one companion query that measures what :func:`build_sample_sql`'s
+    own ``IS NOT NULL`` filter excludes, over the same table and the same
+    sample scope (so it prices and bills at the same order of magnitude as the
+    sample fetch, not a full-table scan).
+
+    Returns one row: ``sampled`` (rows this scope drew before the null
+    filter), ``dropped`` (rows missing at least one feature), then one count
+    per feature in ``feature_names`` order (positional, like the sample
+    fetch's cells) -- which feature(s) actually caused the drop, so the
+    envelope can attribute it instead of reporting a bare count.
+    """
+
+    if not feature_names:
+        raise ClusterError("no feature columns to sample")
+
+    def render(node: exp.Expression) -> str:
+        return node.sql(dialect=dialect, identify=True)
+
+    table_ref = _table_ref(identifier, dialect)
+    cols = [render(exp.column(name)) for name in feature_names]
+    any_null = " OR ".join(f"{col} IS NULL" for col in cols)
+    per_feature = ", ".join(
+        f"SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) AS f{i}"
+        for i, col in enumerate(cols)
+    )
+    select = (
+        "COUNT(*) AS sampled, "
+        f"SUM(CASE WHEN {any_null} THEN 1 ELSE 0 END) AS dropped, {per_feature}"
+    )
+    table_suffix, tail, _method = _sample_parts(dialect, sample_rows, row_count, seed)
+    return f"SELECT {select} FROM {table_ref}{table_suffix}{tail}"  # noqa: S608
+
+
 @dataclass
 class ClusterResult:
     """The clustering summary that becomes the envelope payload: aggregates
-    only, no row ever survives here."""
+    only, no row ever survives here.
+
+    ``dropped_non_numeric_rows`` is this layer's own count: a row that arrived
+    (the SQL sample's own null filter already excludes nulls before Python
+    ever sees them) but failed float coercion. It is deliberately not named
+    ``dropped_null_rows`` -- that count belongs to the SQL layer that actually
+    drops nulls, surfaced instead on the command's top-level result.
+    """
 
     k: int
     k_selection: str  # "explicit" | "silhouette"
     features: list[str]
     standardized: bool
     n_samples: int
-    dropped_null_rows: int
+    dropped_non_numeric_rows: int
     silhouette: float | None
     inertia: float
     iterations: int
@@ -185,7 +242,7 @@ class ClusterResult:
             "features": self.features,
             "standardized": self.standardized,
             "n_samples": self.n_samples,
-            "dropped_null_rows": self.dropped_null_rows,
+            "dropped_non_numeric_rows": self.dropped_non_numeric_rows,
             "silhouette": self.silhouette,
             "inertia": self.inertia,
             "iterations": self.iterations,
@@ -393,7 +450,7 @@ def cluster_features(
         features=list(feature_names),
         standardized=True,
         n_samples=n_samples,
-        dropped_null_rows=dropped,
+        dropped_non_numeric_rows=dropped,
         silhouette=silhouette,
         inertia=round(float(model.inertia_), 4),
         iterations=int(model.n_iter_),

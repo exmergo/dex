@@ -123,6 +123,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore cluster` reported `dropped_null_rows: 0` while its own sample SQL
+  was silently dropping rows** ([#160]). `build_sample_sql` puts an
+  `IS NOT NULL` predicate for every feature column into the sample query
+  itself, so rows with any null feature are filtered by the warehouse and
+  never reach Python; the reported count only ever saw rows that arrived, so it
+  could count a non-numeric coercion failure but never a null, structurally.
+  One production run silently clustered 92% of a table (the missing 8% shared
+  a single null feature column) with no note or warning. `explore cluster` now
+  runs a companion count query, over the same table and the same sample scope
+  as the fetch, that measures exactly what the null filter excludes; a nonzero
+  count gets a notes entry attributing it to the responsible feature column(s)
+  (`"visits: 20"`, not a bare number) and flags that `total_rows` is
+  cache-derived, a different moment than this live count. The clustering
+  engine's own count (rows that arrived but failed float coercion, which is
+  what the old field actually ever measured) is renamed
+  `dropped_non_numeric_rows` so the two are never conflated again.
+
+  **Cost note**: on a billed connector, `explore cluster`'s estimate roughly
+  doubles, since two queries now price into it instead of one; each still
+  scans only the feature columns over the same sample scope, so the added cost
+  is the same order of magnitude as the sample fetch itself, not a full-table
+  scan.
 - **Low-cardinality enumerations (weekday names, month names, status codes) no
   longer keep a blocking name-only PII flag** ([#167]). A string column matching
   the generic `*_name` pattern (`day_name`, `month_name`) starts at 0.6

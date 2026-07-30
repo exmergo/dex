@@ -405,8 +405,11 @@ def test_unconfirmed_cluster_returns_needs_confirmation(
     envelope = _dispatch(tmp_path, subcommand="cluster", object="customers")
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    # The single-table feature scan floors to the per-query billing minimum.
-    assert envelope.cost.estimate == 10 * MB
+    # Two queries price into this estimate: the feature sample, and its
+    # companion null-count query (#160, so dropped_null_rows is measured, not
+    # structurally zero). Each floors independently to the per-query billing
+    # minimum.
+    assert envelope.cost.estimate == 20 * MB
     assert any("sampl" in note for note in envelope.data.get("notes", []))
     # Nothing executed: only free dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)

@@ -482,6 +482,54 @@ def test_sample_sql_skips_percent_sampling_when_row_count_unknown():
     assert_select_only(sql, dialect="bigquery")
 
 
+# --- the companion null-count query (#160: dropped_null_rows was structurally
+# near-always 0, since the sample SQL's own filter excludes nulls before
+# Python ever sees them) -----------------------------------------------------
+
+
+def test_null_count_sql_duckdb_counts_and_attributes_by_feature():
+    sql = cluster_mod.build_null_count_sql(
+        "db.main.customers",
+        ["spend", "visits"],
+        dialect="duckdb",
+        sample_rows=100,
+        row_count=1000,
+    )
+    assert "COUNT(*) AS sampled" in sql
+    assert 'SUM(CASE WHEN "spend" IS NULL THEN 1 ELSE 0 END) AS f0' in sql
+    assert 'SUM(CASE WHEN "visits" IS NULL THEN 1 ELSE 0 END) AS f1' in sql
+    assert '"spend" IS NULL OR "visits" IS NULL' in sql
+    # No null filter to attach a WHERE to: it counts what the sample's own
+    # filter would exclude, over the same scope, not a filtered subset of it.
+    assert " WHERE " not in sql
+    assert sql.rstrip().endswith("USING SAMPLE 100 ROWS")
+    assert_select_only(sql, dialect="duckdb")
+
+
+@pytest.mark.parametrize(
+    "dialect,marker",
+    [
+        ("snowflake", "SAMPLE (100 ROWS)"),
+        ("databricks", "TABLESAMPLE (100 ROWS)"),
+        ("bigquery", "TABLESAMPLE SYSTEM (10.0 PERCENT)"),
+        ("postgres", "TABLESAMPLE SYSTEM (10.0)"),
+        ("redshift", "ORDER BY RANDOM() LIMIT 100"),
+    ],
+)
+def test_null_count_sql_per_dialect_sampling(dialect: str, marker: str):
+    sql = cluster_mod.build_null_count_sql(
+        "db.sch.customers",
+        ["spend", "visits"],
+        dialect=dialect,
+        sample_rows=100,
+        row_count=1000,
+    )
+    assert marker in sql, sql
+    assert "IS NULL" in sql
+    assert " WHERE " not in sql
+    assert_select_only(sql, dialect=dialect)
+
+
 # --- a seeded sample draws the same rows twice -------------------------------
 
 
@@ -591,6 +639,65 @@ def test_a_degenerate_cluster_is_called_out(
     assert "inflates" in note
 
 
+@pytest.fixture
+def nulls_in_one_feature_duckdb(tmp_path: Path) -> Path:
+    """100 rows, two numeric features; 20 of them null in `visits` only.
+    Small enough that DuckDB's reservoir sample (n=20000 default cap) always
+    returns the whole table, so the null-count query and the fetch draw
+    identical rows -- the counts below are exact, not merely likely."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "gappy.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE customers AS
+        SELECT
+            i AS id,
+            (10.0 + (i % 5)) AS spend,
+            CASE WHEN i < 20 THEN NULL ELSE (1.0 + (i % 5)) END AS visits
+        FROM range(100) t(i)
+        """
+    )
+    conn.close()
+    return path
+
+
+@requires_sklearn
+def test_null_rows_are_reported_and_attributed_by_column(
+    nulls_in_one_feature_duckdb: Path, tmp_path: Path, capsys
+):
+    """The bug: dropped_null_rows read 0 while the sample SQL silently dropped
+    rows missing a feature. Now it must report the real count, attribute it to
+    the column that caused it, and flag total_rows as a different moment."""
+
+    repo = _mapped_repo(nulls_in_one_feature_duckdb, tmp_path, capsys)
+    payload = _cluster(nulls_in_one_feature_duckdb, repo, capsys=capsys)
+    data = payload["data"]
+
+    assert data["total_rows"] == 100
+    assert data["dropped_null_rows"] == 20
+    assert data["n_samples"] == 80
+    assert data["dropped_non_numeric_rows"] == 0
+
+    note = " ".join(data["notes"])
+    assert "excluded 20 row(s)" in note
+    assert "visits: 20" in note
+    assert "cache-derived" in note
+    assert "spend" not in note.split("by column:")[1].split(".")[0]
+
+
+@requires_sklearn
+def test_no_null_drop_note_when_nothing_is_dropped(
+    clusterable_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(clusterable_duckdb, tmp_path, capsys)
+    payload = _cluster(clusterable_duckdb, repo, capsys=capsys)
+    data = payload["data"]
+    assert data["dropped_null_rows"] == 0
+    assert "null filter excluded" not in " ".join(data["notes"])
+
+
 @requires_sklearn
 def test_even_clusters_are_not_called_degenerate(
     clusterable_duckdb: Path, tmp_path: Path, capsys
@@ -615,7 +722,7 @@ def test_cluster_features_drops_null_rows_and_counts_them():
         silhouette_sample=5000,
         random_state=0,
     )
-    assert result.dropped_null_rows == 1
+    assert result.dropped_non_numeric_rows == 1
     assert result.n_samples == 4
     assert result.k == 2
 
