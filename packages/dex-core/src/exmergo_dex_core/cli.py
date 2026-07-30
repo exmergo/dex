@@ -104,6 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=None)
     parser.add_argument("--dataset", action="append", default=None)
     parser.add_argument("--repo-root", default=".")
+    parser.add_argument("--cache-backend", default=None)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--budget", type=float, default=None)
 
@@ -326,21 +327,28 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
-    # One engine per process, built from the resolved repo root. That choice of
-    # backend is what lets the subcommands stay stateless across invocations:
-    # `.dex/` on disk is how the exploration cache and the cumulative session
-    # budget survive from one command to the next.
-    engine = DexEngine.from_repo(
-        repo_root(args),
-        connector=getattr(args, "connector", None),
-        path=getattr(args, "path", None),
-        project=getattr(args, "project", None),
-        datasets=getattr(args, "dataset", None),
-        scopes=getattr(args, "scope", None),
-        budget=getattr(args, "budget", None),
-        confirmed=getattr(args, "confirm", False),
-    )
+    # Building the engine is inside the handler, not before it: it reads the
+    # config file and constructs the configured storage backend, and both can
+    # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
+    # refusal raised here has to render as one like any other rather than as a
+    # traceback the wrapper cannot parse.
     try:
+        # One engine per process, built from the resolved repo root. The default
+        # backend is what lets the subcommands stay stateless across invocations:
+        # `.dex/` on disk is how the exploration cache and the cumulative session
+        # budget survive from one command to the next, and any backend selected
+        # here has to be durable across processes for the same reason.
+        engine = DexEngine.from_repo(
+            repo_root(args),
+            cache_backend=getattr(args, "cache_backend", None),
+            connector=getattr(args, "connector", None),
+            path=getattr(args, "path", None),
+            project=getattr(args, "project", None),
+            datasets=getattr(args, "dataset", None),
+            scopes=getattr(args, "scope", None),
+            budget=getattr(args, "budget", None),
+            confirmed=getattr(args, "confirm", False),
+        )
         try:
             envelope = dispatch(args, engine)
         finally:

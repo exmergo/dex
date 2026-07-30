@@ -175,4 +175,5 @@ them.
 - Connector and methodology notes: `references/`.
 - The contract in full: `references/command-contract.md`.
 - The source of truth (dbt) and `.dex/` cache: `references/canonical-model.md`.
-- Where `.dex/` state lives, and writing a storage backend: `references/storage.md`.
+- Where `.dex/` state lives, selecting a backend, and writing one:
+  `references/storage.md`.

@@ -21,7 +21,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from ..cache import DexCache
-from .base import Document, spend_total
+from ..errors import ConfigurationError
+from .base import Document, StoreContext, spend_total
 
 if TYPE_CHECKING:
     from ..maintain.drift import DriftReport
@@ -45,6 +46,26 @@ class MemoryStore:
         self._plans: dict[str, TransformPlan] = {}
         self._queries: list[dict] = []
         self._spend: list[dict] = []
+
+    @classmethod
+    def from_context(cls, context: StoreContext) -> MemoryStore:
+        """Build from a :class:`~.base.StoreContext`, which for this backend means
+        ignoring the repo root: the reference implementation of a store that needs
+        nothing to construct.
+
+        ``repo_root`` is ignored rather than refused, because it is present in
+        every context dex builds and carrying one is not a request to use it.
+        Options are refused, for the reason the filesystem backend refuses them.
+        """
+
+        if context.options:
+            raise ConfigurationError(
+                "the memory store takes no options and this context carries "
+                f"{', '.join(sorted(context.options))}. It holds state in process "
+                "attributes and has nothing to configure; an option it silently "
+                "ignored would look like a setting that took effect"
+            )
+        return cls()
 
     # --- documents ------------------------------------------------------------
 

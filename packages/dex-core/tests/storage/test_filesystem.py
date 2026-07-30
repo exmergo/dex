@@ -11,8 +11,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from exmergo_dex_core import ConfigurationError
 from exmergo_dex_core.cache import Dataset, DexCache
-from exmergo_dex_core.storage import Document, FilesystemStore
+from exmergo_dex_core.storage import Document, FilesystemStore, StoreContext
 from exmergo_dex_core.storage.filesystem import (
     CACHE_FILE,
     DEX_DIR,
@@ -99,6 +102,30 @@ def test_plans_live_one_file_per_plan(tmp_path: Path):
     path = tmp_path / DEX_DIR / PLANS_DIR / "pabc123.json"
     assert path.is_file()
     assert json.loads(path.read_text())["intent"] == "add a model"
+
+
+def test_from_context_keys_the_store_to_the_repo_root(tmp_path: Path):
+    store = FilesystemStore.from_context(StoreContext(repo_root=str(tmp_path)))
+    store.save_cache(DexCache(datasets=[Dataset(identifier="db.main.orders")]))
+    assert (tmp_path / DEX_DIR / CACHE_FILE).is_file()
+
+
+def test_from_context_refuses_a_context_with_no_repo_root():
+    # The dangerous fallback is defaulting to the working directory, which would
+    # write one project's cache into wherever the process happened to start.
+    with pytest.raises(ConfigurationError) as refusal:
+        FilesystemStore.from_context(StoreContext())
+    assert "repo root" in str(refusal.value)
+
+
+def test_from_context_refuses_options_it_would_have_ignored(tmp_path: Path):
+    # Accepted-and-ignored is worse than rejected: the caller believes the setting
+    # took effect and nothing in the output says otherwise.
+    with pytest.raises(ConfigurationError) as refusal:
+        FilesystemStore.from_context(
+            StoreContext(repo_root=str(tmp_path), options={"tenant": "acme"})
+        )
+    assert "tenant" in str(refusal.value)
 
 
 def test_locators_are_absolute_paths_under_the_repo_root(tmp_path: Path):

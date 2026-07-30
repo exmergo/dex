@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..cache import DexCache
-from .base import Document, spend_total
+from ..errors import ConfigurationError
+from .base import Document, StoreContext, spend_total
 
 if TYPE_CHECKING:
     from ..maintain.drift import DriftReport
@@ -58,6 +59,36 @@ class FilesystemStore:
         self.root = Path(repo_root)
         self.dex_dir = self.root / DEX_DIR
         self.plans_dir = self.dex_dir / PLANS_DIR
+
+    @classmethod
+    def from_context(cls, context: StoreContext) -> FilesystemStore:
+        """Build from a :class:`~.base.StoreContext`: the path-shaped reference
+        implementation of the construction contract.
+
+        Both refusals below are refusals rather than quiet fallbacks, the same
+        rule the connection seam applies: accepted-and-ignored is strictly worse
+        than rejected, because the caller believes a setting took effect and
+        nothing in the output says otherwise. Defaulting a missing root to the
+        working directory would be the sharpest version of that, since it would
+        write one project's exploration cache into whichever directory the
+        process happened to start in.
+        """
+
+        if context.repo_root is None:
+            raise ConfigurationError(
+                "the filesystem store keeps state in a `.dex/` directory and so "
+                "needs a repo root, and this context carries none. Point dex at a "
+                "project (DexEngine.from_repo(repo_root), or the CLI's "
+                "--repo-root), or select a backend that does not need one"
+            )
+        if context.options:
+            raise ConfigurationError(
+                "the filesystem store takes no options and this context carries "
+                f"{', '.join(sorted(context.options))}. Its only input is the repo "
+                "root; an option it silently ignored would look like a setting "
+                "that took effect"
+            )
+        return cls(context.repo_root)
 
     # --- documents ------------------------------------------------------------
 
