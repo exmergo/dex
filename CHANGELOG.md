@@ -110,8 +110,59 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   and the two rejected alternatives: always passing a `repo_root`, which cannot
   construct a tenant-keyed backend at all, and requiring a `from_config`
   classmethod, which puts the obligation back on the protocol.
+  
+- **`maintain check` accepts the same object scope as its focused detectors**
+  ([#115]). The paid grain and cardinality axes always estimated and billed for
+  every configured dataset, with no way to narrow them; a session focused on one
+  environment's marts saw its estimate dominated by dozens of irrelevant raw
+  tables, so the whole paid sweep was declined and the layer under active change
+  got no grain coverage at all. `maintain check <objects>` now resolves the same
+  scope `maintain schema`/`volume`/`grain`/`semantic` already accept, narrowing
+  every axis, including the two paid ones, to what was actually asked for.
+
 
 ### Fixed
+
+- **`explore cluster` reported `dropped_null_rows: 0` while its own sample SQL
+  was silently dropping rows** ([#160]). `build_sample_sql` puts an
+  `IS NOT NULL` predicate for every feature column into the sample query
+  itself, so rows with any null feature are filtered by the warehouse and
+  never reach Python; the reported count only ever saw rows that arrived, so it
+  could count a non-numeric coercion failure but never a null, structurally.
+  One production run silently clustered 92% of a table (the missing 8% shared
+  a single null feature column) with no note or warning. `explore cluster` now
+  runs a companion count query, over the same table and the same sample scope
+  as the fetch, that measures exactly what the null filter excludes; a nonzero
+  count gets a notes entry attributing it to the responsible feature column(s)
+  (`"visits: 20"`, not a bare number) and flags that `total_rows` is
+  cache-derived, a different moment than this live count. The clustering
+  engine's own count (rows that arrived but failed float coercion, which is
+  what the old field actually ever measured) is renamed
+  `dropped_non_numeric_rows` so the two are never conflated again.
+
+  **Cost note**: on a billed connector, `explore cluster`'s estimate roughly
+  doubles, since two queries now price into it instead of one; each still
+  scans only the feature columns over the same sample scope, so the added cost
+  is the same order of magnitude as the sample fetch itself, not a full-table
+  scan.
+- **Low-cardinality enumerations (weekday names, month names, status codes) no
+  longer keep a blocking name-only PII flag** ([#167]). A string column matching
+  the generic `*_name` pattern (`day_name`, `month_name`) starts at 0.6
+  confidence, above the query firewall's 0.5 blocking threshold; value-shape
+  profiling can already de-rate a name-only flag when the values are visibly an
+  all-caps reference vocabulary or long multi-token labels, but a closed set of
+  single-token Title Case values (`Monday`, `January`) matched neither rule, so
+  a conventional date dimension's weekday/month columns stayed blocked on every
+  fresh re-profile. Cardinality is now its own corroborating signal: a column
+  whose distinct count is small both in absolute terms and as a fraction of
+  non-null rows de-rates the same way the existing shape rules do. The fraction
+  half is the guard on the guard, verbatim from the report: a genuinely small
+  table of distinct people has a low absolute distinct count but a *high*
+  fraction (most rows are their own distinct value), so it is not cleared by
+  this rule, and a person-shaped distribution still corroborates as a real name
+  before cardinality is ever considered. The flag itself is never removed,
+  consistent with every other shape rule; only where it lands relative to the
+  blocking threshold.
 
 - **`maintain snapshot` told every host to commit a file it may not have**
   ([#157]). The hint was a fixed string: "commit `.dex/snapshot.json` like a
@@ -121,6 +172,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   half that holds everywhere, re-pinning after each known-good build, is now what
   a backend dex does not ship gets; the git half is added only when the baseline
   really is a file in the repo. Nothing changes for the filesystem backend.
+  
+- **`maintain semantic`'s paid cardinality scan now actually narrows on scope,
+  not just its reported findings** ([#115]). `cardinality_plan` built
+  its scan over every semantic model's categorical dimensions regardless of the
+  requested object scope; only the findings returned to the caller were filtered
+  afterward, so a scoped run still paid for the unscoped one. The scope (an
+  identifier, column, dimension, or semantic model name, the same vocabulary the
+  reported findings already matched against) now filters before estimation and
+  execution, so a narrower run is priced and billed for less.
 
 - **The shipped conformance suite could not be run by two of the backends it was
   written for** ([#174]). Both defects were in how the suite is packaged and how it

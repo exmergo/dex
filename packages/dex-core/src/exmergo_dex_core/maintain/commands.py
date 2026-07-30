@@ -316,7 +316,9 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
         ),
         scope_names,
     )
-    checks = drift_mod.cardinality_plan(current_semantic, snap)
+    checks = drift_mod.cardinality_plan(
+        current_semantic, snap, _semantic_names(scope_names) if scope_names else None
+    )
     pending: ConfirmationRequest | None = None
     billed_findings: list[drift_mod.DriftFinding] = []
     if checks:
@@ -359,13 +361,21 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(semantic_drift(engine, getattr(args, "objects", None)))
 
 
-def check(engine: DexEngine) -> DriftResult:
+def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """The everyday sweep across every axis.
 
     Two-phase by construction: the free axes (schema, volume, semantic
     references) always run and their findings always return; the scanning axes
     (grain, cardinality) run immediately on free connectors and behind one
     combined estimate on billed ones.
+
+    ``objects`` narrows every axis exactly like the focused detectors do:
+    schema/volume/grain resolve it against known identifiers (raising if a
+    name matches nothing), while the semantic axis matches names against
+    definitions too (a metric, dimension, or measure name, not only a table).
+    Unscoped, the paid grain/cardinality estimate covers everything the
+    baseline knows about; a narrowed run prices and bills only the scoped
+    subset, not just the reported findings.
     """
 
     store = engine.store
@@ -373,6 +383,7 @@ def check(engine: DexEngine) -> DriftResult:
     if snap is None:
         raise NoBaselineError(_NO_SNAPSHOT_ERROR)
     config = engine.config
+    scope_names = list(objects or [])
 
     warnings = _grain_baseline_warnings(snap)
     current_transform = current_semantic = None
@@ -388,20 +399,26 @@ def check(engine: DexEngine) -> DriftResult:
     adapter = engine._adapter("maintain check")
     connector = adapter.name
     current_datasets = snapshot_mod.warehouse_from_metadata(adapter).datasets
+    scope = _resolve_scope(scope_names, current_datasets, snap) if scope_names else None
+    names = _semantic_names(scope_names) if scope_names else None
+
     schema_findings = drift_mod.schema_drift(
-        current_datasets, snap, current_transform=current_transform
+        current_datasets, snap, scope, current_transform
     )
-    volume_findings = drift_mod.volume_drift(current_datasets, snap)
+    volume_findings = drift_mod.volume_drift(current_datasets, snap, scope)
     semantic_findings = (
-        drift_mod.semantic_free_drift(
-            current_transform, current_semantic, current_datasets, snap
+        _semantic_scope(
+            drift_mod.semantic_free_drift(
+                current_transform, current_semantic, current_datasets, snap
+            ),
+            scope_names,
         )
         if project_available
         else []
     )
 
-    plan = drift_mod.grain_plan(adapter, snap)
-    checks = drift_mod.cardinality_plan(current_semantic, snap)
+    plan = drift_mod.grain_plan(adapter, snap, scope)
+    checks = drift_mod.cardinality_plan(current_semantic, snap, names)
     scans_needed = bool(
         plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
     )
@@ -433,7 +450,9 @@ def check(engine: DexEngine) -> DriftResult:
         }
         if project_available:
             by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-        _record_axes(store, snap, connector, {a: (f, []) for a, f in by_axis.items()})
+        _record_axes(
+            store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
+        )
         result = _drift_result(by_axis, snap, store, warnings=warnings)
         result.pending_confirmation = pending
         return result
@@ -441,8 +460,8 @@ def check(engine: DexEngine) -> DriftResult:
     grain_findings = drift_mod.grain_drift(
         adapter, plan, timeout_seconds=config.query.timeout_seconds
     )
-    semantic_findings = semantic_findings + drift_mod.cardinality_drift(
-        adapter, checks, current_semantic
+    semantic_findings = semantic_findings + _semantic_scope(
+        drift_mod.cardinality_drift(adapter, checks, current_semantic), scope_names
     )
 
     drift_mod.annotate_impacts(schema_findings + volume_findings + grain_findings, snap)
@@ -453,7 +472,9 @@ def check(engine: DexEngine) -> DriftResult:
     }
     if project_available:
         by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-    _record_axes(store, snap, connector, {a: (f, []) for a, f in by_axis.items()})
+    _record_axes(
+        store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
+    )
     result = _drift_result(
         by_axis, snap, store, warnings=warnings + _staleness_warnings(store, snap)
     )
@@ -461,7 +482,7 @@ def check(engine: DexEngine) -> DriftResult:
 
 
 def cmd_check(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return _drift_envelope(check(engine))
+    return _drift_envelope(check(engine, getattr(args, "objects", None)))
 
 
 def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileResult:
@@ -683,6 +704,22 @@ def _adapter_notes(adapter, identifiers: list[str]) -> list[str]:
     return notes
 
 
+def _semantic_names(scope_names: list[str]) -> set[str]:
+    """Split/lower repeatable, comma-joinable scope arguments into name tokens.
+
+    Shared by ``_semantic_scope`` (filters reported findings) and
+    ``cardinality_plan``'s ``scope`` (filters *before* the paid scan runs), so
+    a name that narrows the report also narrows the bill.
+    """
+
+    return {
+        part.strip().lower()
+        for raw in scope_names
+        for part in raw.split(",")
+        if part.strip()
+    }
+
+
 def _semantic_scope(
     findings: list[drift_mod.DriftFinding], scope_names: list[str]
 ) -> list[drift_mod.DriftFinding]:
@@ -695,12 +732,7 @@ def _semantic_scope(
 
     if not scope_names:
         return findings
-    names = {
-        part.strip().lower()
-        for raw in scope_names
-        for part in raw.split(",")
-        if part.strip()
-    }
+    names = _semantic_names(scope_names)
 
     def in_scope(finding: drift_mod.DriftFinding) -> bool:
         candidates = {

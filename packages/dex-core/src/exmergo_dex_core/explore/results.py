@@ -177,13 +177,18 @@ class ClusterResult(Result):
     ``clusters`` holds sizes and centroids; no sampled row ever reaches here.
     ``sample_repeatable`` is load-bearing for interpretation: where the connector
     cannot seed its sampling, two runs draw different rows and can settle on a
-    different k, so comparing them is meaningless.
+    different k, so comparing them is meaningless. ``dropped_null_rows`` is
+    measured by the SQL layer's own null filter (a companion count query, same
+    table, same sample scope), not inferred from cells that never arrived; the
+    clustering engine's own ``dropped_non_numeric_rows`` (rows that arrived but
+    failed float coercion) lives nested in ``clustering``.
     """
 
     always_reports_notes: ClassVar[bool] = True
 
     object: str = ""
     total_rows: int | None = None
+    dropped_null_rows: int | None = None
     sample_method: str = ""
     sample_repeatable: bool = False
     clustering: dict[str, Any] = Field(default_factory=dict)
@@ -192,6 +197,7 @@ class ClusterResult(Result):
         return {
             "object": self.object,
             "total_rows": self.total_rows,
+            "dropped_null_rows": self.dropped_null_rows,
             "sample_method": self.sample_method,
             "sample_repeatable": self.sample_repeatable,
             **self.clustering,

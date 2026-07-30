@@ -211,6 +211,28 @@ def test_tpch_reference_names_derate_below_threshold_and_person_names_hold(
         assert set(col["pii"]) == {"category", "confidence"}
 
 
+def test_date_dim_enumerations_derate_below_threshold(date_dim_duckdb: Path, capsys):
+    """#167: a weekday-name/month-name column is a closed enumeration, not a
+    person, and value-shape profiling must clear it via cardinality since
+    neither the all-caps nor the long-label shape rule applies to single-token
+    Title Case values."""
+
+    payload = _run(
+        ["explore", "profile", "date_dim", "--path", str(date_dim_duckdb)], capsys
+    )
+    (dataset,) = payload["data"]["datasets"]
+    columns = {c["name"]: c for c in dataset["columns"]}
+    day_name = columns["day_name"]
+    month_name = columns["month_name"]
+
+    for col in (day_name, month_name):
+        assert col["pii"]["category"] == "name", "the flag is never removed"
+        assert col["pii"]["confidence"] < 0.5, "de-rated below the block threshold"
+    # De-rating never weakens min/max suppression: string columns stay hidden.
+    for col in (day_name, month_name):
+        assert col["min_value"] is None and col["max_value"] is None
+
+
 def test_single_first_names_keep_base_confidence(airbnb_duckdb: Path, capsys):
     """Single-token first names ('Grace', 'Alan') match no shape rule in either
     direction: ambiguity keeps the name-derived 0.6, which blocks."""
@@ -289,6 +311,43 @@ def test_shape_rules_move_generic_name_confidence(aggregate: dict, expected: flo
 
     refined = _refine_confidence(
         _generic_name_flag(), _aggregate(**aggregate), generic=True
+    )
+    assert refined.category == PIICategory.NAME, "the flag is never removed"
+    assert refined.confidence == expected
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "row_count", "expected"),
+    [
+        # Weekday names: 7 distinct over thousands of rows, single-token Title
+        # Case -- neither existing rule (all-caps, long labels) catches this,
+        # but cardinality alone is conclusive (#167).
+        ({"person_shape_fraction": 0.0, "distinct_count": 7}, 5000, 0.3),
+        # Month names: 12 distinct.
+        ({"person_shape_fraction": 0.0, "distinct_count": 12}, 5000, 0.3),
+        # The absolute cap: an enumeration this large is no longer obviously
+        # closed, so it stays blocked even at a tiny fraction.
+        ({"person_shape_fraction": 0.0, "distinct_count": 33}, 100000, 0.6),
+        # The fraction guard: a genuinely small table of distinct people has a
+        # low absolute distinct count but a HIGH fraction, not a low one, so it
+        # must not clear here.
+        ({"person_shape_fraction": 0.0, "distinct_count": 7}, 7, 0.6),
+        ({"person_shape_fraction": 0.0, "distinct_count": 7}, 50, 0.6),
+        # No row count: the rule cannot fire, same as any other missing
+        # evidence, regardless of how small the absolute distinct count is.
+        ({"person_shape_fraction": 0.0, "distinct_count": 7}, None, 0.6),
+        # Person shape still wins at low cardinality: a handful of executives
+        # repeated across a huge fact table are still real names.
+        ({"person_shape_fraction": 0.6, "distinct_count": 7}, 5000, 0.75),
+    ],
+)
+def test_low_cardinality_enumeration_derates_generic_name(
+    aggregate: dict, row_count: int | None, expected: float
+):
+    from exmergo_dex_core.explore.profile import _refine_confidence
+
+    refined = _refine_confidence(
+        _generic_name_flag(), _aggregate(**aggregate), generic=True, row_count=row_count
     )
     assert refined.category == PIICategory.NAME, "the flag is never removed"
     assert refined.confidence == expected
