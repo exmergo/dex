@@ -110,6 +110,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   and the two rejected alternatives: always passing a `repo_root`, which cannot
   construct a tenant-keyed backend at all, and requiring a `from_config`
   classmethod, which puts the obligation back on the protocol.
+  
+- **`maintain check` accepts the same object scope as its focused detectors**
+  ([#115]). The paid grain and cardinality axes always estimated and billed for
+  every configured dataset, with no way to narrow them; a session focused on one
+  environment's marts saw its estimate dominated by dozens of irrelevant raw
+  tables, so the whole paid sweep was declined and the layer under active change
+  got no grain coverage at all. `maintain check <objects>` now resolves the same
+  scope `maintain schema`/`volume`/`grain`/`semantic` already accept, narrowing
+  every axis, including the two paid ones, to what was actually asked for.
+
 
 ### Fixed
 
@@ -121,6 +131,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   half that holds everywhere, re-pinning after each known-good build, is now what
   a backend dex does not ship gets; the git half is added only when the baseline
   really is a file in the repo. Nothing changes for the filesystem backend.
+  
+- **`maintain semantic`'s paid cardinality scan now actually narrows on scope,
+  not just its reported findings** ([#115]). `cardinality_plan` built
+  its scan over every semantic model's categorical dimensions regardless of the
+  requested object scope; only the findings returned to the caller were filtered
+  afterward, so a scoped run still paid for the unscoped one. The scope (an
+  identifier, column, dimension, or semantic model name, the same vocabulary the
+  reported findings already matched against) now filters before estimation and
+  execution, so a narrower run is priced and billed for less.
 
 ## [1.4.2] - 2026-07-28
 
