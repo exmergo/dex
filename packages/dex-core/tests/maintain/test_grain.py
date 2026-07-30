@@ -316,6 +316,137 @@ def test_composite_grain_drift_end_to_end(dex, tmp_path):
     assert finding["data"]["row_count"] == 2001
 
 
+def _declared_composite_repo(root, db_path, *, declare_composite: bool) -> None:
+    """A line_items fact table (order_key, line_number, quantity), 500*4 rows,
+    plus a dbt project. ``declare_composite`` picks which #169 scenario to
+    build: the new composite declaration, or the OLD single-column mechanism
+    misapplied to one member of what is actually a composite key (the issue's
+    opening complaint) -- a regression proving that path still never reaches
+    grain_plan's single-column check set."""
+
+    (root / "models").mkdir(parents=True)
+    (root / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    if declare_composite:
+        test_block = (
+            "    tests:\n"
+            "      - unique_combination_of_columns:\n"
+            "          combination_of_columns: [order_key, line_number]\n"
+        )
+    else:
+        test_block = "    columns:\n      - name: order_key\n        tests: [unique]\n"
+    (root / "models" / "schema.yml").write_text(
+        f"version: 2\nmodels:\n  - name: line_items\n{test_block}",
+        encoding="utf-8",
+    )
+
+
+def test_declared_composite_key_drift_end_to_end(dex, tmp_path):
+    """#169: a declared composite key is elected as the grain (measurement
+    alone would also find this one, since the fixture has few candidate
+    pairs, but the point is the DECLARED path reaches maintain grain
+    correctly, not just measurement's), and a genuine later break is reported
+    as one combination-level finding -- exactly like the measurement-only
+    end-to-end test above, now driven by declaration."""
+
+    import duckdb
+
+    root = tmp_path / "composite"
+    db_path = root / "warehouse.duckdb"
+    root.mkdir()
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE line_items AS "
+        "SELECT o.range::INTEGER AS order_key, l.range::INTEGER AS line_number, "
+        "(l.range % 2)::INTEGER AS quantity "
+        "FROM range(1, 501) o, range(1, 5) l"
+    )
+    conn.close()
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {db_path}\n", encoding="utf-8"
+    )
+    _declared_composite_repo(root, db_path, declare_composite=True)
+
+    rc, _payload = dex("--repo-root", str(root), "explore", "map", "--use-project")
+    assert rc == 0
+    from exmergo_dex_core.storage import FilesystemStore
+
+    cache = FilesystemStore(root).load_cache()
+    (line_items,) = [d for d in cache.datasets if d.identifier.endswith(".line_items")]
+    assert line_items.grain == ["order_key", "line_number"]
+
+    rc, _payload = dex("--repo-root", str(root), "maintain", "snapshot")
+    assert rc == 0
+
+    conn = duckdb.connect(str(db_path))
+    conn.execute("INSERT INTO line_items VALUES (1, 1, 1)")
+    conn.close()
+
+    rc, payload = dex("--repo-root", str(root), "maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok"
+    findings = [
+        f for f in payload["data"]["findings"] if f["code"] == "key_lost_uniqueness"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["column"] == "order_key, line_number"
+    assert findings[0]["data"]["columns"] == ["order_key", "line_number"]
+
+
+def test_declaring_one_member_of_a_composite_key_never_fires_key_lost_uniqueness(
+    dex, tmp_path
+):
+    """The issue's opening complaint, pinned as a named regression: declaring
+    ONE column of what is actually a composite key as `unique` (the only thing
+    the old single-column mechanism could express) must never reach
+    grain_plan's single-column check set -- declared_keys was never wired to
+    it in the first place, so this was already safe; this test keeps it that
+    way on purpose."""
+
+    import duckdb
+
+    root = tmp_path / "composite"
+    db_path = root / "warehouse.duckdb"
+    root.mkdir()
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE line_items AS "
+        "SELECT o.range::INTEGER AS order_key, l.range::INTEGER AS line_number, "
+        "(l.range % 2)::INTEGER AS quantity "
+        "FROM range(1, 501) o, range(1, 5) l"
+    )
+    conn.close()
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {db_path}\n", encoding="utf-8"
+    )
+    _declared_composite_repo(root, db_path, declare_composite=False)
+
+    rc, _payload = dex("--repo-root", str(root), "explore", "map", "--use-project")
+    assert rc == 0
+    from exmergo_dex_core.storage import FilesystemStore
+
+    cache = FilesystemStore(root).load_cache()
+    (line_items,) = [d for d in cache.datasets if d.identifier.endswith(".line_items")]
+    # The wrong declaration was actually read (not silently ignored) and
+    # contradicted by measurement, exactly like any other declared-unique
+    # contradiction -- never mutating candidate_keys/grain.
+    assert any(
+        "order_key is declared unique" in n and "duplicates" in n
+        for n in line_items.data_quality
+    )
+    assert ["order_key"] not in line_items.candidate_keys
+
+    rc, _payload = dex("--repo-root", str(root), "maintain", "snapshot")
+    assert rc == 0
+
+    rc, payload = dex("--repo-root", str(root), "maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok"
+    assert payload["data"]["finding_count"] == 0
+
+
 def test_grain_estimate_prices_composite_checks():
     from exmergo_dex_core.maintain.drift import GrainPlan, grain_estimate
 

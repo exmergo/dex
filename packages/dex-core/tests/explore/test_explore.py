@@ -13,10 +13,11 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import Dataset, DexCache
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
-from exmergo_dex_core.explore.commands import _merged_hints
+from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
+from exmergo_dex_core.explore.commands import _annotate_grain, _merged_hints
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -735,6 +736,161 @@ def test_map_notes_declared_unique_contradiction(tmp_path: Path, capsys):
     # Measurement-only: the contradicted declared key must not appear as a
     # candidate key just because the project claims it.
     assert ["status"] not in orders.candidate_keys
+
+
+# --- declared composite keys (#169): _annotate_grain unit tests --------------
+
+
+def _col(name: str, *, is_unique: bool | None = None, null_fraction: float = 0.0):
+    return ColumnProfile(
+        name=name, data_type="INTEGER", is_unique=is_unique, null_fraction=null_fraction
+    )
+
+
+def _composite_defs(*columns: str, model: str = "line_items") -> ProjectDefinitions:
+    return ProjectDefinitions(
+        present=True,
+        declared_composite_keys=[
+            DeclaredCompositeKey(model=model, columns=list(columns), source="yaml")
+        ],
+    )
+
+
+def test_declared_composite_fills_in_when_measurement_finds_no_grain():
+    """The gap the issue reports: measurement alone has nothing (no single
+    column is unique, no composite was probed), so declaration is the only
+    route to a grain at all."""
+
+    ds = Dataset(
+        identifier="db.main.line_items",
+        columns=[_col("order_id"), _col("line_number"), _col("amount")],
+    )
+    _annotate_grain([ds], _composite_defs("order_id", "line_number"))
+    assert ds.grain == ["order_id", "line_number"]
+    # candidate_keys stays measurement-only: nothing was measured here.
+    assert ds.candidate_keys == []
+
+
+def test_declared_composite_overrides_a_measured_composite_guess():
+    ds = Dataset(
+        identifier="db.main.line_items",
+        columns=[
+            _col("order_id"),
+            _col("line_number"),
+            _col("warehouse_id"),
+            _col("bin_id"),
+        ],
+        composite_keys=[["warehouse_id", "bin_id"]],
+    )
+    _annotate_grain([ds], _composite_defs("order_id", "line_number"))
+    assert ds.grain == ["order_id", "line_number"]
+    assert any("declared composite key" in n for n in ds.data_quality)
+
+
+def test_proven_single_column_wins_over_declared_composite():
+    """The override guard: a measurement-proven single-column grain is not
+    silently discarded just because a composite is also declared."""
+
+    ds = Dataset(
+        identifier="db.main.line_items",
+        columns=[
+            _col("id", is_unique=True, null_fraction=0.0),
+            _col("order_id"),
+            _col("line_number"),
+        ],
+    )
+    _annotate_grain([ds], _composite_defs("order_id", "line_number"))
+    assert ds.grain == ["id"]
+    assert any("also declared for this table" in n for n in ds.data_quality)
+
+
+def test_declared_composite_with_missing_column_is_not_applied():
+    ds = Dataset(identifier="db.main.line_items", columns=[_col("order_id")])
+    _annotate_grain([ds], _composite_defs("order_id", "line_number"))
+    assert ds.grain is None
+    assert any("not applied" in n for n in ds.data_quality)
+
+
+def test_multiple_declared_composites_uses_first_and_notes_the_rest():
+    ds = Dataset(
+        identifier="db.main.line_items",
+        columns=[
+            _col("order_id"),
+            _col("line_number"),
+            _col("sku"),
+            _col("warehouse_id"),
+        ],
+    )
+    defs = ProjectDefinitions(
+        present=True,
+        declared_composite_keys=[
+            DeclaredCompositeKey(
+                model="line_items", columns=["order_id", "line_number"], source="yaml"
+            ),
+            DeclaredCompositeKey(
+                model="line_items", columns=["sku", "warehouse_id"], source="yaml"
+            ),
+        ],
+    )
+    _annotate_grain([ds], defs)
+    assert ds.grain == ["order_id", "line_number"]
+    assert any("2 composite keys are declared" in n for n in ds.data_quality)
+
+
+# --- declared composite keys: end-to-end plumbing -----------------------------
+
+
+def _composite_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A line_items table where no single column is unique but (order_id,
+    line_number) is, plus a schema.yml declaring exactly that combination."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute(
+        "CREATE TABLE line_items (order_id INTEGER, line_number INTEGER, amount DOUBLE)"
+    )
+    conn.execute(
+        "INSERT INTO line_items VALUES "
+        "(1, 1, 10.0), (1, 2, 20.0), (2, 1, 10.0), (2, 2, 20.0)"
+    )
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (repo / "models" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: line_items\n"
+        "    tests:\n"
+        "      - unique_combination_of_columns:\n"
+        "          combination_of_columns: [order_id, line_number]\n",
+        encoding="utf-8",
+    )
+    return db, repo
+
+
+def test_map_declared_composite_key_is_elected_as_grain(tmp_path: Path, capsys):
+    db, repo = _composite_repo(tmp_path)
+    _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    cache = FilesystemStore(repo).load_cache()
+    (line_items,) = [d for d in cache.datasets if d.identifier.endswith(".line_items")]
+    assert line_items.grain == ["order_id", "line_number"]
 
 
 def test_profile_gets_declared_grain_too(tmp_path: Path, capsys):
