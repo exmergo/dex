@@ -13,27 +13,27 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 - **A project can declare a composite grain via `unique_combination_of_columns`**
   ([#169]). `DeclaredKey.column` was a single string, so a project could only
-  ever declare that ONE column is unique -- never that a table's real key is
-  the COMBINATION of several. This wasn't merely insufficient: on a genuinely
+  ever declare that ONE column is unique, never that a table's real key is the
+  COMBINATION of several. This wasn't merely insufficient: on a genuinely
   composite-grained table, declaring one member column (the only thing the old
   format allowed) made dex hold it as a permanent contradiction, and a
   semantic model's declared primary entity could unconditionally override a
   correctly-measured composite grain with a wrong single column. Measured
   evidence from the report: 13 declared keys across a reporting layer moved 0
-  of 12 elected grains -- the channel only ever reached tables that already had
+  of 12 elected grains; the channel only ever reached tables that already had
   a correctly-measured single-column grain.
 
   A new `DeclaredCompositeKey` reads dbt's own `unique_combination_of_columns`
   test (both the dbt-core 1.9+ built-in and the `dbt_utils` macro compile to
   the same stripped-namespace test name) from the compiled manifest and from
-  raw schema YAML's model-level `tests:`/`data_tests:` block -- no new
+  raw schema YAML's model-level `tests:`/`data_tests:` block, with no new
   dex-specific schema. A resolved, column-existence-checked declared composite
   now wins over a measured or heuristic grain, *unless* the current grain is
   already a measurement-proven single column, in which case the proven single
   stays and a note records that a composite was also declared. Because the
   declared composite lands in `Dataset.grain` as a multi-column list, it flows
-  through `maintain grain`'s existing combination-check path automatically --
-  never the single-column path -- so it cannot reproduce the false
+  through `maintain grain`'s existing combination-check path automatically,
+  never the single-column path, so it cannot reproduce the false
   `key_lost_uniqueness` failure mode the old single-column declaration could.
 
 - **A storage backend dex does not ship can be selected from configuration**
