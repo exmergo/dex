@@ -20,6 +20,29 @@ def test_clean_warehouse_reports_no_drift(maintain_repo):
     assert payload["data"]["axes_run"] == ["schema"]
 
 
+def test_dropped_relation_does_not_resurrect_as_a_false_table_dropped(maintain_repo):
+    """#149: explore map's carry-forward must not resurrect a relation
+    deleted from the warehouse; maintain snapshot then correctly excludes it
+    from the baseline too, so maintain check reports no false table_dropped
+    for something the operator deliberately removed (outside dex, mirroring
+    a dbt run-operation)."""
+
+    maintain_repo.snapshot()  # baseline: customers/orders/stg_orders all present
+
+    maintain_repo.sql("DROP TABLE customers")
+
+    # Re-map: the buggy carry-forward would resurrect `customers` here.
+    rc, payload = maintain_repo.dex("explore", "map")
+    assert rc == 0 and payload["status"] == "ok"
+    assert payload["data"]["dropped_count"] == 1
+
+    maintain_repo.snapshot()  # re-pin: must not include the resurrected ghost
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    by_code = _by_code(payload)
+    assert "table_dropped" not in by_code
+
+
 def test_schema_requires_a_snapshot(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "schema")
     assert rc == 1 and payload["status"] == "error"

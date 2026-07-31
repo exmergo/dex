@@ -396,6 +396,71 @@ def test_definitions_manifest_foreign_keys_and_key_merge(dbt_project_dir: Path):
     assert defs.model_relations["stg_orders"] == "dev.main.stg_orders"
 
 
+def test_definitions_manifest_composite_unique_key(dbt_project_dir: Path):
+    """#169: a model-level unique_combination_of_columns test has no
+    column_name at all, so it must be read before (never gated behind) the
+    column_name check that every other test type shares."""
+
+    write_manifest(
+        dbt_project_dir,
+        models={"stg_customers": '"dev"."main"."stg_customers"'},
+        composite_unique_tests=[("stg_customers", ["id", "email"])],
+    )
+    defs = definitions(dbt_project_dir)
+    (composite,) = defs.declared_composite_keys
+    assert composite.model == "stg_customers"
+    assert composite.columns == ["id", "email"]
+    assert composite.relation == "dev.main.stg_customers"
+    assert composite.source == "manifest"
+    # No column_name means it must never leak into the single-column list.
+    assert defs.declared_keys == []
+
+
+def test_definitions_yaml_composite_unique_key(dbt_project_dir: Path):
+    """The model-level tests:/data_tests: block, sibling to columns:, was
+    never read at all before #169 -- a pure blind spot, not a parse failure."""
+
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    tests:\n"
+        "      - unique_combination_of_columns:\n"
+        "          combination_of_columns: [id, email]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        tests: [not_null]\n",
+        encoding="utf-8",
+    )
+    defs = definitions(dbt_project_dir)
+    assert defs.relationship_source == "yaml"
+    (composite,) = defs.declared_composite_keys
+    assert composite.model == "stg_customers"
+    assert composite.columns == ["id", "email"]
+    assert composite.source == "yaml"
+    # The column-level not_null test alongside it is unaffected.
+    (key,) = defs.declared_keys
+    assert (key.model, key.column) == ("stg_customers", "id")
+
+
+def test_definitions_yaml_namespaced_composite_unique_key(dbt_project_dir: Path):
+    """dbt_utils.unique_combination_of_columns (the pre-dbt-core-1.9 macro
+    spelling) is recognized the same as the bare built-in test name."""
+
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    tests:\n"
+        "      - dbt_utils.unique_combination_of_columns:\n"
+        "          combination_of_columns: [id, email]\n",
+        encoding="utf-8",
+    )
+    defs = definitions(dbt_project_dir)
+    (composite,) = defs.declared_composite_keys
+    assert composite.columns == ["id", "email"]
+
+
 def test_definitions_manifest_source_parent_and_backtick_quoting(
     dbt_project_dir: Path,
 ):

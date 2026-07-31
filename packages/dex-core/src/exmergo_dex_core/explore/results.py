@@ -117,6 +117,7 @@ class MapResult(Result):
     skipped_count: int = 0
     carried_forward_count: int = 0
     out_of_scope_carried_count: int = 0
+    dropped_count: int = 0
     carried_relationship_count: int = 0
     relationship_count: int = 0
     pii_column_count: int = 0
@@ -133,6 +134,7 @@ class MapResult(Result):
             "skipped_count": self.skipped_count,
             "carried_forward_count": self.carried_forward_count,
             "out_of_scope_carried_count": self.out_of_scope_carried_count,
+            "dropped_count": self.dropped_count,
             "carried_relationship_count": self.carried_relationship_count,
             "relationship_count": self.relationship_count,
             "pii_column_count": self.pii_column_count,

@@ -11,6 +11,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A project can declare a composite grain via `unique_combination_of_columns`**
+  ([#169]). `DeclaredKey.column` was a single string, so a project could only
+  ever declare that ONE column is unique, never that a table's real key is the
+  COMBINATION of several. This wasn't merely insufficient: on a genuinely
+  composite-grained table, declaring one member column (the only thing the old
+  format allowed) made dex hold it as a permanent contradiction, and a
+  semantic model's declared primary entity could unconditionally override a
+  correctly-measured composite grain with a wrong single column. Measured
+  evidence from the report: 13 declared keys across a reporting layer moved 0
+  of 12 elected grains; the channel only ever reached tables that already had
+  a correctly-measured single-column grain.
+
+  A new `DeclaredCompositeKey` reads dbt's own `unique_combination_of_columns`
+  test (both the dbt-core 1.9+ built-in and the `dbt_utils` macro compile to
+  the same stripped-namespace test name) from the compiled manifest and from
+  raw schema YAML's model-level `tests:`/`data_tests:` block, with no new
+  dex-specific schema. A resolved, column-existence-checked declared composite
+  now wins over a measured or heuristic grain, *unless* the current grain is
+  already a measurement-proven single column, in which case the proven single
+  stays and a note records that a composite was also declared. Because the
+  declared composite lands in `Dataset.grain` as a multi-column list, it flows
+  through `maintain grain`'s existing combination-check path automatically,
+  never the single-column path, so it cannot reproduce the false
+  `key_lost_uniqueness` failure mode the old single-column declaration could.
+
 - **A billed command with no cumulative ceiling now warns** ([#165]).
   `budget.ceiling` is refused when missing, because nothing runs unbudgeted, but
   `budget.session_ceiling` was simply absent and silent: `effective_ceiling()`
@@ -45,7 +70,34 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   (`bytes_billed` or `seconds_billed`, plus `session_spent_today`). A failed
   build reports it too, since dbt bills for the statements it ran before it
   stopped, and that number is what sizes the re-run.
+- **`explore map` no longer resurrects a relation deleted from the warehouse**
+  ([#149]). Carry-forward unions back any prior cached profile this run "did
+  not examine," correct when that means outside a narrower `--scope`/
+  `--dataset` (issue #111), but the same test also fired when an object was
+  simply dropped between two maps: the prior profile came back with its
+  original `profiled_at`, `maintain snapshot` pinned the ghost as a real
+  dataset, and the next `maintain check` reported it as a high-severity
+  `table_dropped` finding for something the operator deliberately removed.
+  With `orphan_relation` (#146) shipped, this actively worked against dex's
+  own remediation loop: classify an orphan, drop it, re-map, and the re-map
+  resurrected exactly what was just cleaned up.
 
+  Neither the cache nor any adapter records what scope built a prior run, so
+  "not examined" could not tell "out of scope" from "gone" apart. The fix
+  derives the schema/dataset namespaces this run's inventory actually
+  observed; an unexamined prior identifier is carried forward only when its
+  own namespace was never observed (genuinely out of scope, so #111 still
+  holds), and dropped, not carried, when the namespace was observed but the
+  object itself is missing from it. `explore map`'s envelope now reports a
+  `dropped_count` and a warning naming what was dropped. `explore
+  relationships` shares the same carry-forward function and gets the fix for
+  free; `explore profile` is unaffected, since neither does a full inventory
+  scan wide enough to know what "observed" means.
+
+  Known gap: if an entire schema is emptied out (every object in it dropped,
+  not just a few), it still looks identical to "never in scope" and
+  resurrects; narrower than the reported repro (a handful of relations gone
+  from otherwise-live schemas) and left for a future fix.
 - **A refusal no longer reports a metered connector as free** ([#162]). An
   over-ceiling refusal on BigQuery returned an envelope whose `cost.paradigm`
   said `free_local` while the error prose beside it correctly said
