@@ -970,6 +970,12 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     entry = json_mod.loads(ledger[-1])
     assert entry["command"] == "transform build"
     assert entry["billed_bytes"] == 3000
+    # The envelope and the ledger have to agree. `stamp_spend` has no call site
+    # in transform/, and a build settles outside the gate entirely (dbt runs the
+    # statements, so `record_billed` never fires), so a consumer summing
+    # `data.spend` across commands used to count every build as free.
+    assert envelope["data"]["spend"]["bytes_billed"] == entry["billed_bytes"]
+    assert envelope["data"]["spend"]["session_spent_today"] == 3000
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(
@@ -1278,3 +1284,152 @@ def test_compile_estimate_without_an_estimator_is_a_zero_with_a_note(
     assert total == 0.0
     assert per_node == {}
     assert any("no estimator" in n for n in notes)
+
+
+def test_a_failed_billed_build_still_reports_what_it_burned(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """dbt bills for the statements it ran before it stopped.
+
+    The failure envelope is built directly rather than through `to_envelope`,
+    which is what normally lifts `spend` into `data`, so this is the path most
+    likely to drop the number a caller needs to size the re-run.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    msg = "Database Error in model mart_customers: Access Denied"
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 7000},
+                },
+                {
+                    "unique_id": "model.dex_test.mart_customers",
+                    "status": "error",
+                    "execution_time": 0.1,
+                    "adapter_response": {},
+                },
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=1,
+        stdout=json.dumps({"info": {"level": "error", "msg": msg}}),
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert envelope["data"]["spend"]["bytes_billed"] == 7000
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    assert json.loads(lines[-1])["billed_bytes"] == 7000
+
+
+def test_a_billed_build_says_when_no_cumulative_cap_is_set(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The two-root field report was a `transform build` loop: seven builds, each
+    individually legal because `--budget` was passed on every call, settled
+    against a `session_ceiling` that the second root's config never declared."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    _fake_runner_factory(monkeypatch, returncode=0)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert [w for w in envelope["warnings"] if "budget.session_ceiling" in w]
+
+
+def test_a_billed_build_under_a_cumulative_cap_stays_quiet(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.config import Budget, DexConfig, save_config
+    from exmergo_dex_core.envelope import Paradigm
+
+    save_config(
+        DexConfig(connector="bigquery", budget=Budget(session_ceiling=1_000_000_000.0)),
+        tmp_path,
+    )
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    _fake_runner_factory(monkeypatch, returncode=0)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert [w for w in envelope["warnings"] if "budget.session_ceiling" in w] == []
