@@ -26,7 +26,7 @@ import sys
 from . import command_args
 from . import envelope as env
 from .engine import DexEngine
-from .guards.cost_guard import ConfirmationRequiredError
+from .guards.cost_guard import ConfirmationRequiredError, CostGuardError
 from .guards.dialect import DialectDependencyError
 from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
@@ -243,8 +243,19 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # Partial completion: an error, but one that reports what the attempt
         # actually cost, because that is what a caller needs to size the re-run.
         return env.error(
-            env.redact(str(exc)), data={"spend": exc.spend} if exc.spend else {}
+            env.redact(str(exc)),
+            data={"spend": exc.spend} if exc.spend else {},
+            cost=exc.cost or env.Cost(),
         )
+    except CostGuardError as exc:
+        # An over-ceiling or no-ceiling refusal. It carries the gate's own cost,
+        # so the refusal reports the paradigm it was denominated in and the two
+        # numbers the prose names, rather than leaving a caller to parse them
+        # back out of the message. Caught here and not left to `main`'s
+        # catch-all for the reason this function exists: a refusal that escapes
+        # arrives with no cost at all, and an empty cost block on a spend
+        # refusal reads as a claim that nothing was going to be spent.
+        return env.error(env.redact(str(exc)), cost=exc.cost or env.Cost())
 
 
 def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -325,9 +336,16 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 def main(argv: list[str] | None = None) -> int:
     from .command_args import repo_root
+    from .connect import paradigm_for
 
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # The connector in play, for envelopes that never priced anything and so
+    # never stamped a paradigm of their own. Read off the engine as soon as it
+    # exists, because `close()` runs before the handlers below and drops the
+    # adapter; a name is enough, and unlike an adapter it survives a connection
+    # that could not be opened. Stays None when nothing selected a connector.
+    paradigm: env.Paradigm | None = None
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -350,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             budget=getattr(args, "budget", None),
             confirmed=getattr(args, "confirm", False),
         )
+        paradigm = engine.paradigm
         try:
             envelope = dispatch(args, engine)
         finally:
@@ -359,7 +378,21 @@ def main(argv: list[str] | None = None) -> int:
         # loudly in tests and CI rather than shipping a leak.
         raise
     except Exception as exc:
+        # An engine that could not be built leaves the flag as the only evidence
+        # of a connector, which still beats saying nothing on a refusal a host
+        # has to decide whether to retry.
+        if paradigm is None and getattr(args, "connector", None):
+            paradigm = paradigm_for(args.connector)
         envelope = env.error(env.redact(str(exc)))
+
+    # Every command runs against a connector or against none, so every envelope
+    # can name the paradigm a later billed command would spend in. Filled only
+    # where nothing claimed one, so a deliberate label survives: `explore
+    # semantic query --api` sets `hosted` because dbt Cloud owns that spend, and
+    # a genuine "no connector resolved" stays null rather than borrowing
+    # `free_local`, which is DuckDB's answer and not a way to say nothing.
+    if envelope.cost.paradigm is None and paradigm is not None:
+        envelope.cost.paradigm = paradigm
 
     env.emit(envelope)
     return 0 if envelope.status != env.Status.ERROR else 1

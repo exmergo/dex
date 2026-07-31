@@ -33,7 +33,13 @@ class Status(str, Enum):
 
 
 class Paradigm(str, Enum):
-    """Cost paradigm of the active connector. DuckDB is free/local."""
+    """Cost paradigm of the active connector. DuckDB is free/local.
+
+    ``FREE_LOCAL`` is DuckDB's own paradigm and never a stand-in for "not
+    applicable": it is a positive claim that the connector in play bills
+    nothing. A command with no connector to describe reports no paradigm at all
+    (``Cost.paradigm is None``) rather than borrowing this one.
+    """
 
     FREE_LOCAL = "free_local"
     BYTES_SCANNED = "bytes_scanned"
@@ -52,9 +58,16 @@ class Cost(BaseModel):
     ``estimate`` and ``ceiling`` are paradigm-relative magnitudes (bytes, credits,
     DBUs, or a load score); the unit is carried by ``paradigm``. For DuckDB both
     are ``None`` because the work is free and only resource-bounded.
+
+    ``paradigm`` names **the connector this command ran against**, so a caller
+    reading a free metadata command still learns what a billed one will cost in.
+    It defaults to ``None``, meaning no connector was resolved, and that default
+    is load-bearing: a refusal built without a paradigm has to say nothing rather
+    than claim ``free_local``, which is a positive assertion a host branching on
+    this field would read as "this refusal was not about money".
     """
 
-    paradigm: Paradigm = Paradigm.FREE_LOCAL
+    paradigm: Paradigm | None = None
     estimate: float | None = None
     ceiling: float | None = None
 

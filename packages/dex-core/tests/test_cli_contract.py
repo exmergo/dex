@@ -244,3 +244,62 @@ def test_an_unresolvable_backend_still_emits_exactly_one_envelope(
     assert rc == 1
     assert payload["status"] == "error"
     assert "unknown cache backend" in payload["errors"][0]
+
+
+# --- the cost paradigm every envelope carries ------------------------------------
+#
+# `cost.paradigm` names the connector the command ran against, so a caller
+# reading a free command still learns what a billed one will cost in. It is
+# absent when nothing selected a connector. `free_local` is DuckDB's own answer
+# and never a stand-in for having nothing to say, which is the distinction a
+# host branching on this field to ask "was this refusal about money?" depends on.
+
+
+def test_a_duckdb_command_reports_free_local(duckdb_file: Path, capsys):
+    assert main(["connect", "test", "--path", str(duckdb_file)]) == 0
+    assert json.loads(capsys.readouterr().out)["cost"]["paradigm"] == "free_local"
+
+
+def test_a_repo_only_command_reports_the_configured_connector(tmp_path: Path, capsys):
+    """`transform plans` reads the plan store and touches no warehouse, but the
+    repo is configured for BigQuery, so the next billed command bills in bytes
+    and the envelope says so."""
+
+    from exmergo_dex_core.config import DexConfig, save_config
+
+    save_config(DexConfig(connector="bigquery"), tmp_path)
+    assert main(["--repo-root", str(tmp_path), "transform", "plans"]) == 0
+    assert json.loads(capsys.readouterr().out)["cost"]["paradigm"] == "bytes_scanned"
+
+
+def test_a_command_with_no_connector_claims_no_paradigm(tmp_path: Path, capsys):
+    # No config, no --connector, no --path: nothing chose a connector, so there
+    # is no paradigm to report and the envelope must not invent one.
+    assert main(["--repo-root", str(tmp_path), "connect", "test"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert payload["cost"]["paradigm"] is None
+
+
+def test_a_refusal_before_the_engine_exists_reports_the_flagged_connector(
+    tmp_path: Path, capsys
+):
+    # The store refuses while the engine is being built, so there is no engine
+    # to ask. The flag is the only evidence of a connector left, and it is still
+    # better than telling a host the failed BigQuery run was free and local.
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "--cache-backend",
+            "nope",
+            "connect",
+            "test",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["cost"]["paradigm"] == "bytes_scanned"

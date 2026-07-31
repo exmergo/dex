@@ -674,3 +674,79 @@ def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
     assert payload["status"] == "ok"
     assert payload["cost"]["paradigm"] == "free_local"
     assert "phase" not in payload["data"]
+
+
+# --- what a refusal reports ------------------------------------------------------
+#
+# A refusal is the most consequential message the cost guard emits, and it used
+# to arrive with an empty cost block whose paradigm defaulted to `free_local`: a
+# spend refusal on a metered connector positively asserting that nothing was
+# going to be spent. These pin that every cost-guard refusal carries the gate's
+# own cost, so the structured field agrees with the prose beside it.
+
+
+def test_over_ceiling_refusal_reports_the_metered_paradigm(
+    fake_bq_client, route_adapter, tmp_path
+):
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(MB),
+    )
+    assert envelope.status.value == "error"
+    assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
+    # The two numbers the prose names, structured: what was asked for and what
+    # was allowed. A caller sizes the re-run from these without parsing text.
+    assert envelope.cost.estimate == 30 * MB
+    assert envelope.cost.ceiling == MB
+    assert "exceeds the ceiling" in envelope.errors[0]
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_no_ceiling_refusal_reports_the_metered_paradigm(
+    fake_bq_client, route_adapter, tmp_path
+):
+    # Confirmed but unbudgeted: nothing executes unbudgeted, and the refusal
+    # still has to say which unit the missing budget would have been in.
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path, subcommand="profile", objects=["customers"], confirm=True
+    )
+    assert envelope.status.value == "error"
+    assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
+    assert envelope.cost.ceiling is None
+    assert "no ceiling set" in envelope.errors[0]
+
+
+def test_budget_exhaustion_carries_both_the_ceiling_and_the_spend(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """Partial completion reports what it cost *and* what it was allowed to cost.
+
+    The gap between the two is the whole message: a caller deciding how much to
+    raise the budget by needs both numbers.
+    """
+
+    from exmergo_dex_core.cli import dispatch
+    from exmergo_dex_core.explore import commands as cmds
+
+    def exhausted(args, engine):
+        adapter = engine._adapter("explore profile")
+        adapter.cost_gate.charge(4 * MB)
+        adapter.cost_gate.record_billed(5_000)
+        raise cmds._budget_exhausted(FilesystemStore(tmp_path), adapter, [], 3)
+
+    route_adapter(fake_bq_client)
+    monkeypatch.setattr(cmds, "cmd_profile", exhausted)
+    envelope = dispatch(
+        _args(tmp_path, subcommand="profile", confirm=True, budget=float(10 * MB)),
+        _engine(tmp_path, confirm=True, budget=float(10 * MB)),
+    )
+    assert envelope.status.value == "error"
+    assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
+    assert envelope.cost.estimate == 4 * MB
+    assert envelope.cost.ceiling == 10 * MB
+    assert envelope.data["spend"]["bytes_billed"] == 5_000

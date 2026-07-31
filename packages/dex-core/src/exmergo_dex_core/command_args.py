@@ -83,12 +83,13 @@ def preflight_cost(adapter: Adapter) -> Cost:
 
     The free metadata commands (``inventory``, ``connect test``, the free drift
     axes) still report a cost, because its paradigm tells a caller what the
-    *next* command will bill in. On a free connector there is no gate and the
-    answer is the free/local default.
+    *next* command will bill in. A free connector has no gate, so the paradigm
+    comes from the adapter itself rather than from a default: ``free_local`` is
+    DuckDB's own answer here, never a placeholder for not having asked.
     """
 
     gate = cost_gate(adapter)
-    return gate.cost() if gate is not None else Cost()
+    return gate.cost() if gate is not None else Cost(paradigm=adapter.paradigm)
 
 
 def billed_handshake(
