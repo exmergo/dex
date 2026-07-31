@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, Relationship
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
@@ -386,12 +386,13 @@ def test_compose_datasets_carries_forward_objects_outside_this_runs_scope():
     )
     # This run's inventory only saw the marts dataset (a narrower --scope).
     metas = [_stub_meta("db.marts.orders")]
-    datasets, carried, out_of_scope = _compose_datasets(metas, [], {}, prior)
+    datasets, carried, out_of_scope, dropped = _compose_datasets(metas, [], {}, prior)
 
     identifiers = {d.identifier for d in datasets}
     assert identifiers == {"db.shop.customers", "db.marts.orders"}
     assert carried == 1  # marts itself: in scope, not freshly profiled
     assert out_of_scope == 1  # customers: never even in this run's inventory
+    assert dropped == []
     carried_ds = next(d for d in datasets if d.identifier == "db.shop.customers")
     assert carried_ds.profiled_at == "2026-01-01T00:00:00+00:00"
     assert carried_ds.columns  # not degraded to an inventory-only stub
@@ -410,7 +411,7 @@ def test_compose_datasets_out_of_scope_dataset_keeps_its_own_rank_score():
     metas = [_stub_meta("db.marts.orders")]
     profiled = [_stub_dataset("db.marts.orders")]
 
-    datasets, _carried, out_of_scope = _compose_datasets(
+    datasets, _carried, out_of_scope, _dropped = _compose_datasets(
         metas, profiled, {"db.marts.orders": 0.5}, prior
     )
     assert out_of_scope == 1
@@ -422,10 +423,131 @@ def test_compose_datasets_without_a_prior_cache_reports_no_out_of_scope():
     from exmergo_dex_core.explore.commands import _compose_datasets
 
     metas = [_stub_meta("db.shop.customers")]
-    datasets, carried, out_of_scope = _compose_datasets(metas, [], {}, None)
+    datasets, carried, out_of_scope, dropped = _compose_datasets(metas, [], {}, None)
     assert [d.identifier for d in datasets] == ["db.shop.customers"]
     assert carried == 0
     assert out_of_scope == 0
+    assert dropped == []
+
+
+def test_compose_datasets_drops_object_gone_from_an_observed_namespace():
+    """#149: a prior dataset whose namespace this run's inventory DID look at,
+    but who is not itself in metas, is gone from the warehouse -- dropped, not
+    carried forward as a ghost that would later pin as a false table_dropped."""
+
+    from exmergo_dex_core.explore.commands import _compose_datasets
+
+    prior = DexCache(
+        datasets=[
+            _stub_dataset("db.marts.orders"),
+            _stub_dataset("db.marts.customers"),  # deleted from the warehouse
+        ]
+    )
+    # This run's inventory saw db.marts (orders survives), so the namespace
+    # was observed -- customers' absence is a deletion, not out of scope.
+    metas = [_stub_meta("db.marts.orders")]
+    datasets, _carried, out_of_scope, dropped = _compose_datasets(
+        metas, [], {}, prior, observed_namespaces={"db.marts"}
+    )
+
+    assert {d.identifier for d in datasets} == {"db.marts.orders"}
+    assert dropped == ["db.marts.customers"]
+    assert out_of_scope == 0
+
+
+def test_compose_datasets_still_carries_forward_a_truly_unscoped_namespace():
+    """The counterpart control: a prior dataset in a namespace this run's
+    inventory never touched at all stays carried forward untouched (issue
+    #111 preserved) even when observed_namespaces is passed."""
+
+    from exmergo_dex_core.explore.commands import _compose_datasets
+
+    prior = DexCache(datasets=[_stub_dataset("db.shop.customers")])
+    metas = [_stub_meta("db.marts.orders")]
+    datasets, _carried, out_of_scope, dropped = _compose_datasets(
+        metas, [], {}, prior, observed_namespaces={"db.marts"}
+    )
+
+    assert {d.identifier for d in datasets} == {
+        "db.marts.orders",
+        "db.shop.customers",
+    }
+    assert out_of_scope == 1
+    assert dropped == []
+
+
+def _stub_relationship(from_ds: str, to_ds: str) -> Relationship:
+    return Relationship(
+        from_dataset=from_ds, from_columns=["id"], to_dataset=to_ds, to_columns=["id"]
+    )
+
+
+def test_carry_forward_relationships_drops_edge_with_a_gone_endpoint():
+    """#149: an edge whose endpoint's namespace was observed this run but the
+    endpoint itself is gone from the warehouse must not resurrect either."""
+
+    from exmergo_dex_core.explore.commands import _carry_forward_relationships
+
+    prior = DexCache(
+        relationships=[_stub_relationship("db.marts.orders", "db.marts.customers")]
+    )
+    examined = {"db.marts.orders"}  # customers no longer profiled: it's gone
+    rels, carried = _carry_forward_relationships(
+        prior, examined, [], observed_namespaces={"db.marts"}
+    )
+    assert rels == []
+    assert carried == 0
+
+
+def test_map_drops_relation_deleted_from_the_warehouse_between_maps(
+    tmp_path: Path, capsys
+):
+    """#149: a relation dropped from the warehouse between two `explore map`
+    runs must not be resurrected as a carried-forward ghost -- that ghost is
+    what `maintain snapshot` would pin and `maintain check` would then report
+    as a false high-severity table_dropped for something the operator
+    deliberately removed."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA marts")
+    conn.execute("CREATE TABLE marts.orders (id INTEGER)")
+    conn.execute("CREATE TABLE marts.customers (id INTEGER)")
+    conn.close()
+
+    argv = ["explore", "map", "--path", str(path)]
+    _run(argv, capsys)
+
+    # The operator drops `customers` outside dex (a raw SQL statement,
+    # mirroring a dbt run-operation) -- `orders` in the same schema survives.
+    conn = duckdb.connect(str(path))
+    conn.execute("DROP TABLE marts.customers")
+    conn.close()
+
+    payload = _run(argv, capsys)
+    data = payload["data"]
+    assert data["dropped_count"] == 1
+    assert any("customers" in w for w in payload["warnings"])
+
+    cache = FilesystemStore(tmp_path).load_cache()
+    identifiers = {d.identifier for d in cache.datasets}
+    assert not any(i.endswith(".customers") for i in identifiers)
+    assert any(i.endswith(".orders") for i in identifiers)
+
+
+def test_carry_forward_relationships_still_carries_a_truly_unscoped_edge():
+    from exmergo_dex_core.explore.commands import _carry_forward_relationships
+
+    prior = DexCache(
+        relationships=[_stub_relationship("db.marts.orders", "db.shop.customers")]
+    )
+    examined = {"db.marts.orders"}
+    rels, carried = _carry_forward_relationships(
+        prior, examined, [], observed_namespaces={"db.marts"}
+    )
+    assert carried == 1
+    assert rels[0].to_dataset == "db.shop.customers"
 
 
 def test_map_reuses_fresh_cached_profiles(
