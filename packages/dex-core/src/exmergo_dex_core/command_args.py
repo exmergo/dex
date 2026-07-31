@@ -142,7 +142,11 @@ def billed_handshake(
         if notes:
             data.setdefault("notes", [])
             data["notes"] = [*data["notes"], *notes]
-        exc.request = ConfirmationRequest(cost=exc.cost, data=data)
+        # The handshake is where a caller picks a budget, so it is the one place
+        # a missing cumulative cap can still change what they choose.
+        exc.request = ConfirmationRequest(
+            cost=exc.cost, data=data, warnings=gate.warnings()
+        )
         raise
 
 
@@ -262,4 +266,7 @@ def stamp_spend(result: Result, adapter: Adapter) -> Result:
         if display is not None:
             spend.update(display())
         result.spend = spend
+        # Settlement is the honest moment to say what did not bind: the command
+        # has spent, and the caller is looking at the number.
+        result.warnings = [*result.warnings, *gate.warnings()]
     return result

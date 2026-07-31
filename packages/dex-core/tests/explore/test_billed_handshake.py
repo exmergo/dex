@@ -750,3 +750,76 @@ def test_budget_exhaustion_carries_both_the_ceiling_and_the_spend(
     assert envelope.cost.estimate == 4 * MB
     assert envelope.cost.ceiling == 10 * MB
     assert envelope.data["spend"]["bytes_billed"] == 5_000
+
+
+# --- the cumulative cap that was never set ---------------------------------------
+#
+# `effective_ceiling()` returns the tighter of the per-command and the remaining
+# session bound, and `None` only when neither is set. So a config with `ceiling`
+# set and `session_ceiling` unset runs every billed command with no daily cap,
+# and from outside that is indistinguishable from a cap that bound. A host
+# running a second repo root found seven builds settled against nothing, by
+# reading the ledger rather than by being told.
+
+
+def _session_warning(warnings) -> list[str]:
+    return [w for w in warnings if "budget.session_ceiling" in w]
+
+
+def test_the_handshake_says_when_no_cumulative_cap_is_set(
+    fake_bq_client, route_adapter, tmp_path
+):
+    # The handshake is where a caller picks a budget, so it is the last useful
+    # moment to say that the budget they pick bounds one command and not the day.
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(tmp_path, subcommand="profile", objects=["customers"])
+    assert envelope.status.value == "needs_confirmation"
+    assert len(_session_warning(envelope.warnings)) == 1
+
+
+def test_a_settled_billed_run_says_when_no_cumulative_cap_is_set(
+    fake_bq_client, route_adapter, tmp_path
+):
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert len(_session_warning(envelope.warnings)) == 1
+
+
+def test_a_run_under_a_cumulative_cap_stays_quiet(
+    monkeypatch, fake_bq_client, tmp_path
+):
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        adapter = _adapter(fake_bq_client, confirmed=True, budget=float(100 * MB))
+        adapter.cost_gate.session_ceiling = float(500 * MB)
+        return adapter
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    fake_bq_client.row_resolver = _aggregate_resolver
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert _session_warning(envelope.warnings) == []
+
+
+def test_duckdb_never_warns_about_a_cumulative_cap(duckdb_file: Path, capsys):
+    # Nothing bills, so there is no daily spend for a cap to bound.
+    from exmergo_dex_core.cli import main
+
+    assert main(["explore", "profile", "customers", "--path", str(duckdb_file)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert _session_warning(payload["warnings"]) == []

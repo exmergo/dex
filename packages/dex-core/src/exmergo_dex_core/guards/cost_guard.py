@@ -97,6 +97,64 @@ def ledger_field(paradigm: Paradigm) -> str:
     )
 
 
+def spend_field(paradigm: Paradigm) -> str:
+    """The envelope key actual spend is reported under, per paradigm.
+
+    Deliberately not :func:`ledger_field`'s spelling: the ledger writes
+    ``billed_bytes`` and the envelope reports ``bytes_billed``, and both are
+    load-bearing where they are. Module level for the same reason as its
+    sibling, so a settlement outside the gate reports the key the gate would.
+    """
+
+    return (
+        "seconds_billed"
+        if paradigm in (Paradigm.COMPUTE_TIME, Paradigm.DB_LOAD)
+        else "bytes_billed"
+    )
+
+
+def utc_day_start() -> str:
+    """The cutoff the cumulative session budget settles against: today, UTC.
+
+    Module level for :func:`ledger_field`'s reason, and one more: the gate reads
+    the day's spend against this cutoff while being built, and ``transform
+    build`` settles its own ledger entry outside any gate. Two spellings of
+    "today" would put two commands on different days at a UTC boundary.
+    """
+
+    return (
+        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    )
+
+
+def no_session_ceiling_warning(
+    paradigm: Paradigm, session_ceiling: float | None
+) -> list[str]:
+    """The warning a billed command carries when no cumulative cap is set.
+
+    A warning rather than a refusal, deliberately: the per-command ceiling is
+    refused when missing because nothing should run unbudgeted, but refusing the
+    cumulative one would break every existing user who never set it. The
+    asymmetry that made this worth surfacing is that both halves look equally
+    enforced from outside, so an unset ``session_ceiling`` reads as a cap that
+    bound rather than one that never existed.
+
+    Module level rather than only a :class:`CostGate` method because ``transform
+    build`` prices itself outside the gate on the degraded-pricing path and has
+    to reach the same sentence; two spellings would drift.
+    """
+
+    if paradigm is Paradigm.FREE_LOCAL or session_ceiling is not None:
+        return []
+    return [
+        "no cumulative spend ceiling: budget.session_ceiling is unset in "
+        ".dex/config.yml, so this command was bound by its own budget alone and "
+        "nothing bounds the day's total across commands. Config is read from "
+        "this repo root only, so a ceiling set in another root does not apply "
+        "here"
+    ]
+
+
 def preflight(
     estimate: float | None,
     ceiling: float | None,
@@ -270,6 +328,15 @@ class CostGate:
 
         return ledger_field(self.paradigm)
 
+    def warnings(self) -> list[str]:
+        """What the guard has to say about its own reach, for the envelope.
+
+        A guard that is narrower than it looks is worse than one that is absent,
+        so anything the caller would wrongly assume is enforced belongs here.
+        """
+
+        return no_session_ceiling_warning(self.paradigm, self.session_ceiling)
+
     def record_billed(
         self, billed: float, *, job_id: str | None = None, statement: str = ""
     ) -> None:
@@ -315,12 +382,7 @@ class CostGate:
         preflight estimate by contract). Key names deliberately avoid every
         envelope-sanitizer pattern and carry the paradigm's unit."""
 
-        key = (
-            "seconds_billed"
-            if self.paradigm in (Paradigm.COMPUTE_TIME, Paradigm.DB_LOAD)
-            else "bytes_billed"
-        )
         return {
-            key: self._billed,
+            spend_field(self.paradigm): self._billed,
             "session_spent_today": self.session_spent + self._billed,
         }

@@ -416,7 +416,10 @@ def build(
 
     from ..connect import paradigm_for
     from ..envelope import Paradigm
-    from ..guards.cost_guard import ConfirmationRequiredError
+    from ..guards.cost_guard import (
+        ConfirmationRequiredError,
+        no_session_ceiling_warning,
+    )
 
     # `from .build import ...` rather than `from . import build`: the package
     # re-exports the build *function* under the same name as the module, and the
@@ -492,8 +495,16 @@ def build(
         )
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
-        # why the confirm ask carries no number.
-        exc.request = _build_confirmation(target, exc.cost, notes=price_notes)
+        # why the confirm ask carries no number. `billed_handshake` never ran on
+        # this path, so the guard's own warnings have to be raised here instead.
+        exc.request = _build_confirmation(
+            target,
+            exc.cost,
+            notes=[
+                *price_notes,
+                *no_session_ceiling_warning(paradigm, config.budget.session_ceiling),
+            ],
+        )
         raise
 
     return _shape_build_result(
@@ -503,6 +514,7 @@ def build(
         connector,
         store,
         extra_notes=[*price_notes, *dev_warnings],
+        session_ceiling=config.budget.session_ceiling,
     )
 
 
@@ -516,9 +528,16 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             )
         )
     except BuildFailedError as exc:
+        # A failed build still bills for the statements dbt ran before it
+        # stopped, and a caller sizing the re-run needs that number more than a
+        # successful one does. `to_envelope` is what normally lifts `spend` into
+        # `data`, and this path does not go through it.
+        data = exc.result.data()
+        if exc.result.spend is not None:
+            data["spend"] = exc.result.spend
         return env.error(
             str(exc),
-            data=exc.result.data(),
+            data=data,
             cost=exc.result.cost,
             warnings=exc.result.warnings,
         )
@@ -655,14 +674,26 @@ def _plan_hint(result: PlanResult) -> dict[str, str]:
 
 
 def _record_build_spend(
-    store: Store, connector: str, billed: float, field: str
-) -> None:
-    """Account a billed dbt build in the spend ledger, so builds draw against the
-    same session budget as explore scans. ``field`` carries the connector's unit
-    (bytes or seconds), matching what its cost gate records."""
+    store: Store, connector: str, billed: float, paradigm
+) -> dict[str, float]:
+    """Account a billed dbt build in the spend ledger and report what it cost.
+
+    The paradigm names both units, so a build draws against the same session
+    budget as an explore scan and reports spend under the key every other
+    command reports it under.
+
+    Returns the summary in :meth:`CostGate.spend_summary`'s shape, because a
+    build settles outside any gate: dbt executes the statements, so
+    ``record_billed`` never fires and the gate's own total stays zero for the
+    run. The day's total is read back from the ledger this write just landed in,
+    which is the number the next command's gate will start from.
+    """
 
     from datetime import UTC, datetime
 
+    from ..guards.cost_guard import ledger_field, spend_field, utc_day_start
+
+    field = ledger_field(paradigm)
     store.append_spend_log(
         {
             "at": datetime.now(UTC).isoformat(),
@@ -673,6 +704,12 @@ def _record_build_spend(
             "statement_sha256": None,
         }
     )
+    return {
+        spend_field(paradigm): float(billed),
+        "session_spent_today": store.spend_since(
+            utc_day_start(), field=field, connector=connector
+        ),
+    }
 
 
 def _price_build(engine: DexEngine, project, target: str, select: str | None):
@@ -723,19 +760,33 @@ def _build_confirmation(target: str, cost, notes=()):
 
 
 def _shape_build_result(
-    summary: dict, cost, paradigm, connector: str, store: Store, extra_notes=()
+    summary: dict,
+    cost,
+    paradigm,
+    connector: str,
+    store: Store,
+    extra_notes=(),
+    session_ceiling: float | None = None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
     ``extra_notes`` carries anything learned before the run (a degraded-pricing
     note, dev-target warnings); the per-paradigm note explains the server-side cap
-    that binds the spend, and actual billed magnitude is recorded to the ledger.
+    that binds the spend, and actual billed magnitude is recorded to the ledger
+    *and* reported on the result, so a host summing settled spend from envelopes
+    sees builds rather than silently counting them as free.
+
+    A failed run reports its spend too: dbt bills for the statements it ran
+    before it stopped, and a caller sizing the re-run needs that number more
+    than a successful one does.
     """
 
     from ..envelope import Paradigm
+    from ..guards.cost_guard import no_session_ceiling_warning
 
     messages = summary.pop("messages", [])
     notes = [*extra_notes, *summary.pop("notes", [])]
+    spend: dict[str, float] | None = None
     if paradigm is Paradigm.BYTES_SCANNED:
         notes = [
             "each statement was capped server-side by the profile's "
@@ -744,7 +795,7 @@ def _shape_build_result(
         ]
         billed = summary.get("bytes_billed")
         if billed:
-            _record_build_spend(store, connector, billed, "billed_bytes")
+            spend = _record_build_spend(store, connector, billed, paradigm)
     elif paradigm is Paradigm.COMPUTE_TIME:
         cap_note = _COMPUTE_TIME_CAP_NOTES.get(
             connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
@@ -757,7 +808,7 @@ def _shape_build_result(
         )
         if seconds:
             summary["seconds_billed"] = seconds
-            _record_build_spend(store, connector, seconds, "billed_seconds")
+            spend = _record_build_spend(store, connector, seconds, paradigm)
     elif paradigm is Paradigm.DB_LOAD:
         notes = [
             "each statement was capped server-side by a statement_timeout set to "
@@ -771,10 +822,15 @@ def _shape_build_result(
         )
         if seconds:
             summary["seconds_billed"] = seconds
-            _record_build_spend(store, connector, seconds, "billed_seconds")
+            spend = _record_build_spend(store, connector, seconds, paradigm)
+    notes = [*notes, *no_session_ceiling_warning(paradigm, session_ceiling)]
     if summary["success"]:
         return BuildResult(
-            success=True, summary=summary, cost=cost, warnings=[*notes, *messages]
+            success=True,
+            summary=summary,
+            cost=cost,
+            spend=spend,
+            warnings=[*notes, *messages],
         )
     # Agents triage from `errors` first, so the first real dbt message rides there;
     # the rest stay in warnings.
@@ -790,6 +846,7 @@ def _shape_build_result(
             success=False,
             summary=summary,
             cost=cost,
+            spend=spend,
             warnings=[*notes, *(messages[1:] if messages else [])],
         ),
     )

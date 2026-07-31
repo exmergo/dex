@@ -352,6 +352,19 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   backstop, actual spend is reported under `data.spend`, and every billed byte
   is appended to the `.dex/spend.jsonl` ledger, against which the optional
   `budget.session_ceiling` binds cumulatively per UTC day.
+- **`data.spend` reports settled spend for every billed command**, including
+  `transform build`, and always matches what the same command appended to the
+  ledger. It carries the connector's unit (`bytes_billed` or `seconds_billed`)
+  plus `session_spent_today`, which is what the next command's cumulative
+  ceiling will start from. A failed build reports it too: dbt bills for the
+  statements it ran before it stopped.
+- **A billed command with no cumulative ceiling warns.** `budget.ceiling` is
+  *refused* when missing, because nothing runs unbudgeted;
+  `budget.session_ceiling` is only warned about, because refusing would break
+  every project that never set one. Without the warning the two are
+  indistinguishable from outside, and an unset daily cap reads as one that
+  bound. Config is read from `<repo_root>/.dex/config.yml` and does not inherit,
+  so a second repo root has its own budget or none, and the warning says so.
 - **`cost.paradigm` names the connector the command ran against**, not what the
   command happened to cost. A free metadata command on BigQuery reports
   `bytes_scanned` with a null estimate, so a caller learns what a billed command

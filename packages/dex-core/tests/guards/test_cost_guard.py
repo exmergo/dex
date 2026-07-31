@@ -200,3 +200,51 @@ def test_db_load_ledger_records_seconds():
     summary = gate.spend_summary()
     assert summary["seconds_billed"] == 3.5
     assert "bytes_billed" not in summary
+
+
+# --- what the guard says about its own reach -------------------------------------
+
+
+def test_a_billed_gate_with_no_cumulative_cap_warns():
+    """The per-command ceiling is refused when missing; the cumulative one is
+    not, and from outside the two look equally enforced.
+
+    A warning rather than a refusal, because refusing would break every
+    existing user who never set one. But silence would leave an unset daily cap
+    indistinguishable from one that bound.
+    """
+
+    warning = _gate(session_ceiling=None).warnings()
+    assert len(warning) == 1
+    assert "budget.session_ceiling" in warning[0]
+    # The compounding half of the field report: two repo roots, one budget, and
+    # no way to tell from inside the second one that it is not covered.
+    assert "this repo root only" in warning[0]
+
+
+def test_a_billed_gate_with_a_cumulative_cap_stays_quiet():
+    assert _gate(session_ceiling=10_000.0).warnings() == []
+
+
+def test_a_free_gate_never_warns_about_a_cumulative_cap():
+    # DuckDB bills nothing, so a daily spend cap is not a thing it is missing.
+    assert _gate(paradigm=Paradigm.FREE_LOCAL, session_ceiling=None).warnings() == []
+
+
+def test_the_ledger_and_envelope_spellings_stay_distinct():
+    """`billed_bytes` goes to the ledger, `bytes_billed` to the envelope.
+
+    Both are load-bearing where they are, and `transform build` settles outside
+    the gate, so the pair is derived from the paradigm in one place rather than
+    respelled at each site that needs one of them.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import ledger_field, spend_field
+
+    for paradigm, ledger, envelope in (
+        (Paradigm.BYTES_SCANNED, "billed_bytes", "bytes_billed"),
+        (Paradigm.COMPUTE_TIME, "billed_seconds", "seconds_billed"),
+        (Paradigm.DB_LOAD, "billed_seconds", "seconds_billed"),
+    ):
+        assert ledger_field(paradigm) == ledger
+        assert spend_field(paradigm) == envelope

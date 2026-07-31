@@ -9,8 +9,67 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A project can declare a composite grain via `unique_combination_of_columns`**
+  ([#169]). `DeclaredKey.column` was a single string, so a project could only
+  ever declare that ONE column is unique, never that a table's real key is the
+  COMBINATION of several. This wasn't merely insufficient: on a genuinely
+  composite-grained table, declaring one member column (the only thing the old
+  format allowed) made dex hold it as a permanent contradiction, and a
+  semantic model's declared primary entity could unconditionally override a
+  correctly-measured composite grain with a wrong single column. Measured
+  evidence from the report: 13 declared keys across a reporting layer moved 0
+  of 12 elected grains; the channel only ever reached tables that already had
+  a correctly-measured single-column grain.
+
+  A new `DeclaredCompositeKey` reads dbt's own `unique_combination_of_columns`
+  test (both the dbt-core 1.9+ built-in and the `dbt_utils` macro compile to
+  the same stripped-namespace test name) from the compiled manifest and from
+  raw schema YAML's model-level `tests:`/`data_tests:` block, with no new
+  dex-specific schema. A resolved, column-existence-checked declared composite
+  now wins over a measured or heuristic grain, *unless* the current grain is
+  already a measurement-proven single column, in which case the proven single
+  stays and a note records that a composite was also declared. Because the
+  declared composite lands in `Dataset.grain` as a multi-column list, it flows
+  through `maintain grain`'s existing combination-check path automatically,
+  never the single-column path, so it cannot reproduce the false
+  `key_lost_uniqueness` failure mode the old single-column declaration could.
+
+- **A billed command with no cumulative ceiling now warns** ([#165]).
+  `budget.ceiling` is refused when missing, because nothing runs unbudgeted, but
+  `budget.session_ceiling` was simply absent and silent: `effective_ceiling()`
+  returns the tighter of the two bounds and `None` only when *neither* is set,
+  so a config with `ceiling` and no `session_ceiling` ran every billed command
+  with no daily cap and nothing said so. From outside, an unset cumulative cap
+  and one that bound look identical.
+
+  The warning rides the confirm handshake (where a caller is choosing a budget)
+  and the settled result (where they are looking at what it cost). It stays a
+  warning rather than a refusal deliberately: refusing would break every project
+  that never set one.
+
+  It also names the compounding half. Config is read from
+  `<repo_root>/.dex/config.yml` and does not inherit, so a second repo root
+  starts with no daily cap and a `budget:` block written in one root is invisible
+  to the other. Config inheritance is **not** implemented here; the warning
+  makes its absence visible from inside the root that lacks the ceiling.
+
 ### Fixed
 
+- **`transform build` now reports `data.spend`** ([#166]). `stamp_spend` had no
+  call site in `transform/`, so `data.spend` was present for explore and
+  maintain and absent for builds while the ledger received the entry either way.
+  Any consumer summing settled spend from envelopes counted every build as free.
+
+  The fix is not the missing `stamp_spend` call it looks like: a build settles
+  outside the cost gate entirely, because dbt executes the statements and
+  `record_billed` never fires, so the gate's own total is zero for the run. The
+  spend is now assembled where the billed figure already reaches the ledger, in
+  the same shape and under the same keys every other command uses
+  (`bytes_billed` or `seconds_billed`, plus `session_spent_today`). A failed
+  build reports it too, since dbt bills for the statements it ran before it
+  stopped, and that number is what sizes the re-run.
 - **`explore map` no longer resurrects a relation deleted from the warehouse**
   ([#149]). Carry-forward unions back any prior cached profile this run "did
   not examine," correct when that means outside a narrower `--scope`/
@@ -67,31 +126,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 ## [1.4.3] - 2026-07-28
 
 ### Added
-
-- **A project can declare a composite grain via `unique_combination_of_columns`**
-  ([#169]). `DeclaredKey.column` was a single string, so a project could only
-  ever declare that ONE column is unique, never that a table's real key is the
-  COMBINATION of several. This wasn't merely insufficient: on a genuinely
-  composite-grained table, declaring one member column (the only thing the old
-  format allowed) made dex hold it as a permanent contradiction, and a
-  semantic model's declared primary entity could unconditionally override a
-  correctly-measured composite grain with a wrong single column. Measured
-  evidence from the report: 13 declared keys across a reporting layer moved 0
-  of 12 elected grains; the channel only ever reached tables that already had
-  a correctly-measured single-column grain.
-
-  A new `DeclaredCompositeKey` reads dbt's own `unique_combination_of_columns`
-  test (both the dbt-core 1.9+ built-in and the `dbt_utils` macro compile to
-  the same stripped-namespace test name) from the compiled manifest and from
-  raw schema YAML's model-level `tests:`/`data_tests:` block, with no new
-  dex-specific schema. A resolved, column-existence-checked declared composite
-  now wins over a measured or heuristic grain, *unless* the current grain is
-  already a measurement-proven single column, in which case the proven single
-  stays and a note records that a composite was also declared. Because the
-  declared composite lands in `Dataset.grain` as a multi-column list, it flows
-  through `maintain grain`'s existing combination-check path automatically,
-  never the single-column path, so it cannot reproduce the false
-  `key_lost_uniqueness` failure mode the old single-column declaration could.
 
 - **A storage backend dex does not ship can be selected from configuration**
   ([#157]). `.dex/config.yml` gains a `cache` block, and it is the schema change
