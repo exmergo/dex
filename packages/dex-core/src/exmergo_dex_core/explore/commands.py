@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
-from ..adapters.base import Adapter, ObjectMeta
+from ..adapters.base import Adapter, ObjectMeta, name_list
 
 # Aliased: `QueryResult` here is the explore record, and the adapter's
 # same-named row carrier is only a type hint on one shaping helper.
@@ -430,6 +430,11 @@ def relationships(
     # first (free and local on DuckDB), then infer across the full set.
     metas = inventory_mod.inventory(adapter)
     connector = adapter.name
+    # See map()'s identical computation: tells carry-forward "out of this
+    # run's scope" apart from "gone from the warehouse" (issue #149).
+    observed_namespaces = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
     # Skip re-scanning objects whose cached profile is still fresh (same
     # connector, schema unchanged, within the freshness window); only the stale
     # remainder is estimated, confirmed, and profiled below.
@@ -554,7 +559,9 @@ def relationships(
     # connector, same as the profiles below.
     reusable = prior if prior and prior.provenance.connector == connector else None
     examined = {d.identifier for d in datasets}
-    rels, carried_relationships = _carry_forward_relationships(reusable, examined, rels)
+    rels, carried_relationships = _carry_forward_relationships(
+        reusable, examined, rels, observed_namespaces=observed_namespaces
+    )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
     notes.extend(defs.notes)
@@ -765,6 +772,13 @@ def map(
 
     metas = inventory_mod.inventory(adapter)
     orphaned = _orphan_candidates(metas, defs)
+    # The schema/dataset namespaces this run's inventory actually saw, so
+    # carry-forward can tell "out of this run's scope" from "gone from the
+    # warehouse" (issue #149) -- an identifier whose own namespace is here but
+    # who is itself absent from metas was looked at and is not there.
+    observed_namespaces = {
+        m.identifier.rpartition(".")[0].lower() for m in metas if "." in m.identifier
+    }
     # First-pass rank on cheap signals (no connectivity yet) to choose what to
     # profile; re-ranked with connectivity once relationships are known.
     first_pass = rank_mod.rank(metas, None, hints, orphaned)
@@ -888,11 +902,15 @@ def map(
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
     relationship_set, carried_relationships = _carry_forward_relationships(
-        reusable, examined, relationship_set
+        reusable, examined, relationship_set, observed_namespaces=observed_namespaces
     )
     final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
-    datasets, carried, out_of_scope = _compose_datasets(
-        metas, all_selected, final_scores, reusable
+    datasets, carried, out_of_scope, dropped = _compose_datasets(
+        metas,
+        all_selected,
+        final_scores,
+        reusable,
+        observed_namespaces=observed_namespaces,
     )
 
     cache = DexCache(datasets=datasets, relationships=relationship_set)
@@ -951,6 +969,12 @@ def map(
             f"carried forward {carried_relationships} prior relationship(s) "
             "with an endpoint this run did not profile or reuse fresh"
         )
+    if dropped:
+        warnings.append(
+            f"{len(dropped)} object(s) no longer in the warehouse were dropped "
+            "from the cache rather than resurrected as carried-forward "
+            f"profiles: {name_list(dropped)}"
+        )
     if folded_edges > 0:
         notes.append(
             f"folded {folded_edges} same-lineage duplicate relationship(s); "
@@ -976,6 +1000,7 @@ def map(
         skipped_count=skipped,
         carried_forward_count=carried,
         out_of_scope_carried_count=out_of_scope,
+        dropped_count=len(dropped),
         carried_relationship_count=carried_relationships,
         relationship_count=len(relationship_set),
         pii_column_count=sum(
@@ -1474,6 +1499,8 @@ def _carry_forward_relationships(
     prior: DexCache | None,
     examined: set[str],
     relationships: list[Relationship],
+    *,
+    observed_namespaces: set[str] | None = None,
 ) -> tuple[list[Relationship], int]:
     """Union back in any prior relationship this run could not possibly have
     regenerated or superseded: one with an endpoint outside ``examined`` (the
@@ -1486,16 +1513,30 @@ def _carry_forward_relationships(
     datasets (issue #111). Deduped against the newly built set by the same
     edge key `_merge_relationships` uses, so an edge both runs agree on is
     never doubled.
+
+    ``observed_namespaces`` (see `_compose_datasets`) excludes an edge whose
+    endpoint is gone from the warehouse rather than merely out of scope, so a
+    deleted relation's join does not resurrect either (issue #149).
     """
 
     if prior is None or not prior.relationships:
         return relationships, 0
     existing = {_relationship_edge_key(rel) for rel in relationships}
+
+    def dropped(identifier: str) -> bool:
+        return (
+            observed_namespaces is not None
+            and identifier not in examined
+            and identifier.rpartition(".")[0].lower() in observed_namespaces
+        )
+
     carried = [
         rel
         for rel in prior.relationships
         if (rel.from_dataset not in examined or rel.to_dataset not in examined)
         and _relationship_edge_key(rel) not in existing
+        and not dropped(rel.from_dataset)
+        and not dropped(rel.to_dataset)
     ]
     if not carried:
         return relationships, 0
@@ -1763,10 +1804,13 @@ def _compose_datasets(
     profiled: list[Dataset],
     scores: dict[str, float],
     prior: DexCache | None,
-) -> tuple[list[Dataset], int, int]:
+    *,
+    observed_namespaces: set[str] | None = None,
+) -> tuple[list[Dataset], int, int, list[str]]:
     """Merge this run's profiles over the full inventory. Returns the composed
     datasets, how many prior profiles were carried forward within this run's
-    inventory, and how many were carried forward from entirely outside it.
+    inventory, how many were carried forward from entirely outside it, and
+    which prior identifiers were dropped as gone rather than carried.
 
     An object not profiled this run reuses its prior profile wholesale (columns,
     keys, grain, notes, and its original ``profiled_at``, which marks the age)
@@ -1775,13 +1819,20 @@ def _compose_datasets(
     is internally consistent with its own notes and counts. Carried profiles do
     not feed relationship inference, which runs on this run's profiles only.
 
-    A prior dataset absent from ``metas`` entirely (a ``--scope``/``--dataset``
-    narrower than what built the prior cache) is carried forward untouched,
-    rank score included: this run's inventory never saw it, so it is not
-    stale, not superseded, and not this run's to drop from the cache (issue
-    #111). Its rank score is left alone rather than reset, since a score of
-    ``None`` would rank it last for no reason connectivity or naming ever
-    said was true; it just was not part of this run's ranking pass.
+    A prior dataset absent from ``metas`` entirely is either out of this run's
+    scope or gone from the warehouse, and ``observed_namespaces`` (the
+    schema/dataset prefixes this run's inventory actually saw, lowered) is
+    what tells the two apart: if the identifier's own namespace was never
+    observed, this run's inventory never looked there at all (a
+    ``--scope``/``--dataset`` narrower than what built the prior cache), so it
+    is carried forward untouched, rank score included, same as before (issue
+    #111) -- not stale, not superseded, not this run's to drop. If its
+    namespace WAS observed but the object itself is not in ``metas``, this
+    run did look and it is not there: dropped, not carried, so a deleted
+    relation cannot resurrect itself into the next baseline as a false
+    ``table_dropped`` (issue #149). ``observed_namespaces=None`` (no scope
+    information available) preserves the pre-#149 behavior of carrying
+    everything unexamined forward.
     """
 
     by_id = {d.identifier: d for d in profiled}
@@ -1811,12 +1862,17 @@ def _compose_datasets(
         datasets.append(ds)
 
     out_of_scope = 0
+    dropped: list[str] = []
     for identifier, previous in prior_by_id.items():
         if identifier in seen:
             continue
+        namespace = identifier.rpartition(".")[0].lower()
+        if observed_namespaces is not None and namespace in observed_namespaces:
+            dropped.append(identifier)
+            continue
         datasets.append(previous.model_copy(deep=True))
         out_of_scope += 1
-    return datasets, carried, out_of_scope
+    return datasets, carried, out_of_scope, dropped
 
 
 # Sentinel: preserve the prior cache's relationships (profile has no inference

@@ -9,6 +9,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore map` no longer resurrects a relation deleted from the warehouse**
+  ([#149]). Carry-forward unions back any prior cached profile this run "did
+  not examine," correct when that means outside a narrower `--scope`/
+  `--dataset` (issue #111), but the same test also fired when an object was
+  simply dropped between two maps: the prior profile came back with its
+  original `profiled_at`, `maintain snapshot` pinned the ghost as a real
+  dataset, and the next `maintain check` reported it as a high-severity
+  `table_dropped` finding for something the operator deliberately removed.
+  With `orphan_relation` (#146) shipped, this actively worked against dex's
+  own remediation loop: classify an orphan, drop it, re-map, and the re-map
+  resurrected exactly what was just cleaned up.
+
+  Neither the cache nor any adapter records what scope built a prior run, so
+  "not examined" could not tell "out of scope" from "gone" apart. The fix
+  derives the schema/dataset namespaces this run's inventory actually
+  observed; an unexamined prior identifier is carried forward only when its
+  own namespace was never observed (genuinely out of scope, so #111 still
+  holds), and dropped, not carried, when the namespace was observed but the
+  object itself is missing from it. `explore map`'s envelope now reports a
+  `dropped_count` and a warning naming what was dropped. `explore
+  relationships` shares the same carry-forward function and gets the fix for
+  free; `explore profile` is unaffected, since neither does a full inventory
+  scan wide enough to know what "observed" means.
+
+  Known gap: if an entire schema is emptied out (every object in it dropped,
+  not just a few), it still looks identical to "never in scope" and
+  resurrects; narrower than the reported repro (a handful of relations gone
+  from otherwise-live schemas) and left for a future fix.
+
 ## [1.4.3] - 2026-07-28
 
 ### Added
