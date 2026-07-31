@@ -52,11 +52,23 @@ class BudgetExhaustedError(DexError):
     says how much finished and where it was saved, and ``spend`` carries what was
     actually billed. A caller raises the budget and re-runs; the saved partial
     profiles mean the re-run is cheaper than the first attempt.
+
+    ``cost`` is the preflight side of the same event: the paradigm and the
+    ceiling that stopped the run, which is what a caller sizes the re-run
+    against. Both, because "what it cost" and "what it was allowed to cost" are
+    different numbers here and the gap between them is the whole message.
     """
 
-    def __init__(self, message: str, *, spend: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        spend: dict[str, Any] | None = None,
+        cost: Cost | None = None,
+    ):
         super().__init__(message)
         self.spend = spend
+        self.cost = cost
 
 
 class Result(BaseModel):

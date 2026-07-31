@@ -195,6 +195,57 @@ def test_cost_guard_blocks_over_ceiling():
         cost_guard.preflight(estimate=10_000, ceiling=10)
 
 
+@pytest.mark.parametrize(
+    "paradigm",
+    [env.Paradigm.BYTES_SCANNED, env.Paradigm.COMPUTE_TIME, env.Paradigm.DB_LOAD],
+)
+def test_a_refusal_never_reports_a_metered_connector_as_free(paradigm, monkeypatch):
+    """The guard being right is not enough: the envelope has to say so.
+
+    Every other cost assertion in this family stops at the exception, which is
+    exactly how a metered over-ceiling refusal shipped for three releases
+    reporting `cost.paradigm: free_local` in the envelope beside prose that
+    named the real paradigm. `free_local` is a positive claim that the connector
+    bills nothing, so a host branching on the structured field to ask whether a
+    refusal was about money was told no. Assert it where the consumer reads it.
+    """
+
+    import argparse
+
+    from exmergo_dex_core import cli
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=paradigm,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="metered",
+    )
+
+    def refuse(estimate):
+        # The two refusals confirmation cannot override, rendered the way the
+        # CLI renders them: through dispatch, which is the only path from a
+        # raised guard error to something an agent reads.
+        def raiser(args, engine):
+            gate.preflight_command(estimate)
+            raise AssertionError("the gate admitted an unbudgeted or over-ceiling run")
+
+        monkeypatch.setattr(cli, "_run", raiser)
+        return cli.dispatch(argparse.Namespace(), None)
+
+    over_ceiling = refuse(10_000.0)
+    assert over_ceiling.status is env.Status.ERROR
+    assert over_ceiling.cost.paradigm is paradigm
+    assert over_ceiling.cost.estimate == 10_000.0 and over_ceiling.cost.ceiling == 10.0
+
+    gate.ceiling = None
+    no_ceiling = refuse(1.0)
+    assert no_ceiling.status is env.Status.ERROR
+    assert no_ceiling.cost.paradigm is paradigm
+
+
 def test_a_scope_flag_cannot_widen_the_committed_allowlist():
     """The source allowlist in .dex/config.yml is a committed cost boundary. A
     per-command flag scopes work inside it and can never reach outside it, on any

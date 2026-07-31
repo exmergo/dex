@@ -330,7 +330,11 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
 {
   "status": "ok | not_implemented | error | needs_confirmation",
   "data": {},
-  "cost": { "estimate": null, "ceiling": null, "paradigm": "free_local" },
+  "cost": {
+    "estimate": null,
+    "ceiling": null,
+    "paradigm": "bytes_scanned | compute_time | db_load | hosted | free_local | null"
+  },
   "warnings": [],
   "diffs": [],
   "errors": []
@@ -348,6 +352,14 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   backstop, actual spend is reported under `data.spend`, and every billed byte
   is appended to the `.dex/spend.jsonl` ledger, against which the optional
   `budget.session_ceiling` binds cumulatively per UTC day.
+- **`cost.paradigm` names the connector the command ran against**, not what the
+  command happened to cost. A free metadata command on BigQuery reports
+  `bytes_scanned` with a null estimate, so a caller learns what a billed command
+  will cost in before running one. `free_local` is DuckDB's own paradigm and a
+  positive claim that the connector bills nothing; when no connector was
+  resolved the field is `null` instead. A refusal carries the paradigm, the
+  estimate, and the ceiling that bound it, so "was this refused over money?" is
+  answerable from the structured fields without parsing the error prose.
 - **Diffs, not silent writes.** Proposed changes appear in `diffs`; being there
   does not apply them. The user applies through their normal review and PR flow.
 - **No secrets, no uncleared values.** `data` is scanned before printing

@@ -1859,6 +1859,7 @@ def _budget_exhausted(
 
     gate = command_args.cost_gate(adapter)
     spend = gate.spend_summary() if gate is not None else None
+    cost = gate.cost() if gate is not None else None
     n = len(accumulated)
     if n == 0:
         return BudgetExhaustedError(
@@ -1866,6 +1867,7 @@ def _budget_exhausted(
             "profiling; no partial profiles were saved. Raise --budget or narrow "
             "scope, then re-run",
             spend=spend,
+            cost=cost,
         )
     cache_locator = store.locator(Document.CACHE)
     return BudgetExhaustedError(
@@ -1873,6 +1875,7 @@ def _budget_exhausted(
         f"profiles saved to {cache_locator}. Raise --budget or narrow scope, then "
         "re-run",
         spend=spend,
+        cost=cost,
     )
 
 

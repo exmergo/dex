@@ -15,9 +15,26 @@ def test_envelope_round_trips_to_json():
     payload = json.loads(json.dumps(e.model_dump(mode="json")))
     assert payload["status"] == "ok"
     assert payload["data"] == {"hello": "world"}
-    assert payload["cost"]["paradigm"] == "free_local"
     assert payload["warnings"] == ["heads up"]
     assert payload["diffs"] == [] and payload["errors"] == []
+
+
+def test_an_unstamped_cost_claims_no_paradigm():
+    """The default has to be an absence, not `free_local`.
+
+    `free_local` is DuckDB's own paradigm, so defaulting to it makes every
+    envelope built without a cost assert that the connector bills nothing. On a
+    refusal that is the opposite of true, and it is the field a host reaches for
+    to ask whether the refusal was about money.
+    """
+
+    for envelope in (env.ok(), env.error("no"), env.needs_confirmation()):
+        assert envelope.cost.paradigm is None
+    assert json.loads(json.dumps(env.error("no").model_dump(mode="json")))["cost"] == {
+        "paradigm": None,
+        "estimate": None,
+        "ceiling": None,
+    }
 
 
 def test_not_implemented_is_a_valid_envelope():
