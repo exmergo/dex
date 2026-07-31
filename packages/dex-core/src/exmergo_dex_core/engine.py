@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 from . import command_args, connect
 from .config import CacheConfig, DexConfig, load_config
 from .connect import ConnectionSource, SemanticSource
+from .envelope import Paradigm
 from .errors import RepoRootRequiredError, StoreRequiredError
 from .results import ConnectResult
 from .storage import ExploreStore, MemoryStore, Store, StoreContext, build_store
@@ -305,6 +306,25 @@ class DexEngine:
         """
 
         return self._declared is not None
+
+    @property
+    def paradigm(self) -> Paradigm | None:
+        """The cost paradigm of the connector in play, ``None`` when nothing
+        selected one.
+
+        Resolved from the connector's name rather than from an open adapter,
+        which is what lets a refusal name the paradigm even when the refusal
+        *was* the connection failing, and after the adapter has been closed.
+
+        The three-input test is the same one :meth:`_config_for_open` refuses
+        on, and for the same reason: ``DexConfig.connector`` has a default, so
+        reading it when nothing declared a config would answer ``free_local``
+        for a project that never chose DuckDB.
+        """
+
+        if self._declared is None and self.connector is None and self.path is None:
+            return None
+        return connect.paradigm_for(self.connector or self.config.connector)
 
     def project_dir(self) -> Path:
         """The dbt project directory: the config pin wins, discovery is the default."""

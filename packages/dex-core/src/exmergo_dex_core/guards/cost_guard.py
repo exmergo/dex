@@ -29,7 +29,18 @@ from ..results import ConfirmationRequest
 
 
 class CostGuardError(DexError):
-    """Base for every cost-guard refusal."""
+    """Base for every cost-guard refusal.
+
+    Every refusal carries the :class:`Cost` it refused on, so the transport layer
+    can report the paradigm, the estimate, and the ceiling that bound rather than
+    a message the caller has to parse. One attribute on the base rather than one
+    per subclass: the boundary reads ``exc.cost`` without knowing which refusal
+    it caught.
+    """
+
+    def __init__(self, message: str, *, cost: Cost | None = None):
+        super().__init__(message)
+        self.cost = cost
 
 
 class OverCeilingError(CostGuardError):
@@ -55,12 +66,16 @@ class ConfirmationRequiredError(CostGuardError):
     :class:`CeilingRequiredError`: confirmation cannot override either.
     """
 
+    # Narrower than the base's optional: this refusal is always raised from a
+    # priced gate, so callers read `exc.cost.estimate` without a None check.
+    cost: Cost
+
     def __init__(self, cost: Cost):
         super().__init__(
             "confirmation required: re-run with --confirm (and a --budget on "
-            "billed connectors) after reviewing the cost estimate"
+            "billed connectors) after reviewing the cost estimate",
+            cost=cost,
         )
-        self.cost = cost
         # Starts as just the cost, which is all the gate knows; the command layer
         # replaces it with the full agent-facing payload on the way out. Never
         # None, so a caller can always read it.
@@ -100,12 +115,14 @@ def preflight(
     if estimate is not None and ceiling is not None and estimate > ceiling:
         raise OverCeilingError(
             f"estimated cost {estimate} exceeds the ceiling {ceiling} "
-            f"({paradigm.value}); raise the budget or narrow the work"
+            f"({paradigm.value}); raise the budget or narrow the work",
+            cost=cost,
         )
     if paradigm is not Paradigm.FREE_LOCAL and ceiling is None:
         raise CeilingRequiredError(
             f"no ceiling set for a {paradigm.value} connector; pass --budget or "
-            "set one in .dex/config.yml"
+            "set one in .dex/config.yml",
+            cost=cost,
         )
     if not confirmed:
         raise ConfirmationRequiredError(cost)
@@ -182,14 +199,16 @@ class CostGate:
         if ceiling is not None and estimate > ceiling:
             raise OverCeilingError(
                 f"estimated cost {estimate} exceeds the ceiling {ceiling} "
-                f"({self.paradigm.value}); raise the budget or narrow the work"
+                f"({self.paradigm.value}); raise the budget or narrow the work",
+                cost=cost,
             )
         if not self.confirmed:
             raise ConfirmationRequiredError(cost)
         if self.paradigm is not Paradigm.FREE_LOCAL and ceiling is None:
             raise CeilingRequiredError(
                 f"no ceiling set for a {self.paradigm.value} connector; pass "
-                "--budget or set one in .dex/config.yml"
+                "--budget or set one in .dex/config.yml",
+                cost=cost,
             )
         return cost
 
