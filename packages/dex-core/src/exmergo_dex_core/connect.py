@@ -31,7 +31,6 @@ import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +54,7 @@ from .errors import (
     NoConnectorSelectedError,
     StoreRequiredError,
 )
-from .guards.cost_guard import CostGate, ledger_field
+from .guards.cost_guard import CostGate, ledger_field, utc_day_start
 from .storage import ExploreStore
 
 # What each connector bills in. Absent means free and local (DuckDB), which is
@@ -226,15 +225,12 @@ def new_cost_gate(
     """
 
     paradigm = paradigm_for(connector)
-    utc_midnight = (
-        datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    )
     return CostGate(
         paradigm=paradigm,
         ceiling=budget if budget is not None else config.budget.ceiling,
         session_ceiling=config.budget.session_ceiling,
         session_spent=store.spend_since(
-            utc_midnight, field=ledger_field(paradigm), connector=connector
+            utc_day_start(), field=ledger_field(paradigm), connector=connector
         ),
         confirmed=confirmed,
         connector=connector,
