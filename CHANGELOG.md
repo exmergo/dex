@@ -9,7 +9,42 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A billed command with no cumulative ceiling now warns** ([#165]).
+  `budget.ceiling` is refused when missing, because nothing runs unbudgeted, but
+  `budget.session_ceiling` was simply absent and silent: `effective_ceiling()`
+  returns the tighter of the two bounds and `None` only when *neither* is set,
+  so a config with `ceiling` and no `session_ceiling` ran every billed command
+  with no daily cap and nothing said so. From outside, an unset cumulative cap
+  and one that bound look identical.
+
+  The warning rides the confirm handshake (where a caller is choosing a budget)
+  and the settled result (where they are looking at what it cost). It stays a
+  warning rather than a refusal deliberately: refusing would break every project
+  that never set one.
+
+  It also names the compounding half. Config is read from
+  `<repo_root>/.dex/config.yml` and does not inherit, so a second repo root
+  starts with no daily cap and a `budget:` block written in one root is invisible
+  to the other. Config inheritance is **not** implemented here; the warning
+  makes its absence visible from inside the root that lacks the ceiling.
+
 ### Fixed
+
+- **`transform build` now reports `data.spend`** ([#166]). `stamp_spend` had no
+  call site in `transform/`, so `data.spend` was present for explore and
+  maintain and absent for builds while the ledger received the entry either way.
+  Any consumer summing settled spend from envelopes counted every build as free.
+
+  The fix is not the missing `stamp_spend` call it looks like: a build settles
+  outside the cost gate entirely, because dbt executes the statements and
+  `record_billed` never fires, so the gate's own total is zero for the run. The
+  spend is now assembled where the billed figure already reaches the ledger, in
+  the same shape and under the same keys every other command uses
+  (`bytes_billed` or `seconds_billed`, plus `session_spent_today`). A failed
+  build reports it too, since dbt bills for the statements it ran before it
+  stopped, and that number is what sizes the re-run.
 
 - **A refusal no longer reports a metered connector as free** ([#162]). An
   over-ceiling refusal on BigQuery returned an envelope whose `cost.paradigm`
