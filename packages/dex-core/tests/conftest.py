@@ -237,6 +237,7 @@ def write_manifest(
     relationship_tests: list[tuple[str, str, str, str]] = (),
     unique_tests: list[tuple[str, str]] = (),
     not_null_tests: list[tuple[str, str]] = (),
+    composite_unique_tests: list[tuple[str, list[str]]] = (),
     generated_at: str | None = None,
 ) -> Path:
     """Write a minimal compiled manifest.json shaped like dbt's.
@@ -246,6 +247,10 @@ def write_manifest(
     ``relationship_tests`` entries are ``(model, column, to, field)`` with
     ``to`` as the literal test argument (``"ref('x')"`` / ``"source('a','b')"``).
     ``unique_tests`` / ``not_null_tests`` entries are ``(model, column)``.
+    ``composite_unique_tests`` entries are ``(model, columns)``, compiled as a
+    model-level ``unique_combination_of_columns`` test node (no ``column_name``
+    kwarg at all -- both the dbt-core built-in and the dbt_utils macro compile
+    to this same shape).
     """
 
     uid_of = {name: f"model.dex_test.{name}" for name in models}
@@ -292,6 +297,12 @@ def write_manifest(
     for i, (model, column) in enumerate(not_null_tests):
         nodes[f"test.dex_test.not_null_{i}"] = test_node(
             f"not_null__{i}", {"column_name": column}, model
+        )
+    for i, (model, columns) in enumerate(composite_unique_tests):
+        nodes[f"test.dex_test.unique_combination_of_columns_{i}"] = test_node(
+            f"unique_combination_of_columns__{i}",
+            {"combination_of_columns": list(columns)},
+            model,
         )
 
     target = project / "target"

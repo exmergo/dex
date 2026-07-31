@@ -717,6 +717,23 @@ class DeclaredKey(BaseModel):
     source: str
 
 
+class DeclaredCompositeKey(BaseModel):
+    """A model-level ``unique_combination_of_columns`` test: the columns whose
+    COMBINATION is unique, never any one of them alone.
+
+    A distinct model from ``DeclaredKey`` rather than a widened ``column``:
+    this test has no ``not_null`` variant and a different multiplicity (it is
+    the model's own claim about several columns together, not one column's own
+    test), so overloading ``column`` to sometimes hold a list would blur two
+    different concepts into one field.
+    """
+
+    model: str
+    relation: str | None = None
+    columns: list[str]
+    source: str
+
+
 class ProjectDefinitions(BaseModel):
     """What the dbt project declares, loaded once for consumers that must keep
     working without one.
@@ -728,9 +745,11 @@ class ProjectDefinitions(BaseModel):
     names (model names and ``source.table``) to quote-stripped physical
     relations. ``primary_entities`` maps model names to their declared grain
     column; ``metric_models`` lists models reachable from any metric.
-    ``built_relation_names`` is bare table names (lowered) the project builds
-    or sources, from files/YAML alone (populated even with no compiled
-    manifest, unlike ``model_relations``) -- explore's orphan-relation
+    ``declared_composite_keys`` carries model-level ``unique_combination_of_
+    columns`` tests -- a grain declaration a column-level test structurally
+    cannot express. ``built_relation_names`` is bare table names (lowered) the
+    project builds or sources, from files/YAML alone (populated even with no
+    compiled manifest, unlike ``model_relations``) -- explore's orphan-relation
     down-ranking reads this. ``notes`` are analyst-readable caveats for the
     caller's envelope.
     """
@@ -743,6 +762,7 @@ class ProjectDefinitions(BaseModel):
     semantic_source: str | None = None
     foreign_keys: list[DeclaredForeignKey] = Field(default_factory=list)
     declared_keys: list[DeclaredKey] = Field(default_factory=list)
+    declared_composite_keys: list[DeclaredCompositeKey] = Field(default_factory=list)
     model_relations: dict[str, str] = Field(default_factory=dict)
     primary_entities: dict[str, str] = Field(default_factory=dict)
     metric_models: list[str] = Field(default_factory=list)
@@ -894,6 +914,7 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
         return None
 
     keys: dict[tuple[str, str], DeclaredKey] = {}
+    composite_keys: dict[tuple[str, tuple[str, ...]], DeclaredCompositeKey] = {}
     for node in nodes.values():
         if not isinstance(node, dict) or node.get("resource_type") != "test":
             continue
@@ -902,10 +923,35 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
             continue
         kwargs = meta.get("kwargs")
         kwargs = kwargs if isinstance(kwargs, dict) else {}
+        test_name = meta.get("name")
+        # A model-level composite-unique test carries no column_name at all
+        # (dbt-core's own built-in test and the dbt_utils macro both compile
+        # to this same stripped-namespace name), so it must be checked before
+        # the column_name gate below -- placed after, it would still hit that
+        # gate's `continue` and vanish, exactly today's silent-drop bug.
+        if test_name == "unique_combination_of_columns":
+            combo = kwargs.get("combination_of_columns")
+            if (
+                isinstance(combo, list)
+                and len(combo) >= 2
+                and all(isinstance(c, str) for c in combo)
+            ):
+                child = attached_name(node)
+                if child is not None:
+                    dedup_key = (child, tuple(sorted(c.lower() for c in combo)))
+                    composite_keys.setdefault(
+                        dedup_key,
+                        DeclaredCompositeKey(
+                            model=child,
+                            relation=relations.get(child),
+                            columns=list(combo),
+                            source="manifest",
+                        ),
+                    )
+            continue
         column = kwargs.get("column_name")
         if not isinstance(column, str) or not column:
             continue
-        test_name = meta.get("name")
         if test_name == "relationships":
             to_model = _parse_relation_ref(kwargs.get("to"))
             field = kwargs.get("field")
@@ -944,6 +990,7 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
                 key.not_null = True
 
     defs.declared_keys = list(keys.values())
+    defs.declared_composite_keys = list(composite_keys.values())
     defs.model_relations.update(relations)
     defs.manifest_loaded = True
     defs.relationship_source = "manifest"
@@ -952,14 +999,49 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
 def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
     """Column-level tests straight from schema YAML: model-level names only,
     no physical resolution. Model-level relationships tests (declared under the
-    model's ``tests:`` with a ``column_name`` kwarg) are a manifest-only shape."""
+    model's ``tests:`` with a ``column_name`` kwarg) are a manifest-only shape.
+
+    A ``unique_combination_of_columns`` test is itself a model-level construct
+    (it names no single column), so it is read from the model's own ``tests:``/
+    ``data_tests:`` block -- sibling to ``columns:``, never reached by the
+    column loop below.
+    """
 
     keys: dict[tuple[str, str], DeclaredKey] = {}
+    composite_keys: dict[tuple[str, tuple[str, ...]], DeclaredCompositeKey] = {}
     for parsed, _path in yaml_documents(view):
         for entry in parsed.get("models") or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 continue
             model = entry["name"]
+            for test in entry.get("tests") or entry.get("data_tests") or []:
+                if not isinstance(test, dict):
+                    continue
+                combo_cfg = next(
+                    (
+                        cfg
+                        for name, cfg in test.items()
+                        if name == "unique_combination_of_columns"
+                        or name.endswith(".unique_combination_of_columns")
+                    ),
+                    None,
+                )
+                if combo_cfg is None:
+                    continue
+                combo_cfg = combo_cfg if isinstance(combo_cfg, dict) else {}
+                combo = combo_cfg.get("combination_of_columns")
+                if (
+                    isinstance(combo, list)
+                    and len(combo) >= 2
+                    and all(isinstance(c, str) for c in combo)
+                ):
+                    dedup_key = (model, tuple(sorted(c.lower() for c in combo)))
+                    composite_keys.setdefault(
+                        dedup_key,
+                        DeclaredCompositeKey(
+                            model=model, columns=list(combo), source="yaml"
+                        ),
+                    )
             for column in entry.get("columns") or []:
                 if not isinstance(column, dict) or not isinstance(
                     column.get("name"), str
@@ -1000,6 +1082,7 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
                             key.not_null = True
 
     defs.declared_keys = list(keys.values())
+    defs.declared_composite_keys = list(composite_keys.values())
     defs.relationship_source = "yaml"
     if defs.foreign_keys:
         defs.notes.append(

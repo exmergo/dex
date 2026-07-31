@@ -1600,14 +1600,22 @@ def _annotate_grain(
     With project definitions, the declared truth refines the heuristics: a
     semantic model's primary entity overrides the detected grain (noting any
     disagreement), and a profiled column contradicting its declared ``unique``
-    test gets a data-quality note. ``candidate_keys`` stays measurement-only:
-    an unmeasured declared key is a claim, and the cache is a drift baseline.
+    test gets a data-quality note. A declared composite key (a model-level
+    ``unique_combination_of_columns`` test -- the one grain shape measurement
+    alone can miss or a column-level test cannot express at all) overrides the
+    detected grain too, unless the detected grain is already a measurement-
+    proven single column, in which case the proven single wins and the
+    composite is only noted. ``candidate_keys`` stays measurement-only: an
+    unmeasured declared key is a claim, and the cache is a drift baseline.
     ``orphaned`` (map only) badges a relation no current model/source builds.
     """
 
     declared_grain: dict[str, str] = {}
     declared_unique: dict[str, set[str]] = {}
-    if defs is not None and (defs.primary_entities or defs.declared_keys):
+    declared_composite: dict[str, list[list[str]]] = {}
+    if defs is not None and (
+        defs.primary_entities or defs.declared_keys or defs.declared_composite_keys
+    ):
         identifiers = [d.identifier for d in datasets]
         for model, column in defs.primary_entities.items():
             ident, _ambiguous = rel_mod.resolve_declared(
@@ -1623,6 +1631,16 @@ def _annotate_grain(
             )
             if ident is not None:
                 declared_unique.setdefault(ident.lower(), set()).add(key.column.lower())
+        for composite in defs.declared_composite_keys:
+            ident, _ambiguous = rel_mod.resolve_declared(
+                composite.relation, composite.model, identifiers
+            )
+            if ident is None:
+                continue
+            bucket = declared_composite.setdefault(ident.lower(), [])
+            normalized = {c.lower() for c in composite.columns}
+            if not any({c.lower() for c in cols} == normalized for cols in bucket):
+                bucket.append(list(composite.columns))
 
     for ds in datasets:
         ds.candidate_keys = rel_mod.candidate_keys(ds)
@@ -1658,6 +1676,58 @@ def _annotate_grain(
                     f"{col.name} is declared unique in the dbt project but "
                     "profiling found duplicates"
                 )
+
+        composite_candidates = declared_composite.get(ds.identifier.lower())
+        if composite_candidates:
+            live = {c.name.lower(): c.name for c in ds.columns}
+            valid: list[list[str]] = []
+            for cols in composite_candidates:
+                resolved = [live.get(c.lower()) for c in cols]
+                if all(resolved):
+                    valid.append(resolved)
+                else:
+                    missing = [
+                        c for c, r in zip(cols, resolved, strict=True) if r is None
+                    ]
+                    ds.data_quality.append(
+                        f"declared composite key ({', '.join(cols)}) names "
+                        f"column(s) not in this profile ({', '.join(missing)}); "
+                        "not applied"
+                    )
+            if valid:
+                # detect_grain() only ever returns a single column drawn from
+                # candidate_keys()'s proven singles, EXCEPT the primary_entities
+                # override just above can also force ds.grain to an unproven
+                # single column -- this membership check catches both cases
+                # correctly: a freshly measured proven single passes it, an
+                # unproven declared one does not, and only the former should
+                # block a composite override.
+                proven_single = bool(
+                    ds.grain and len(ds.grain) == 1 and ds.grain in ds.candidate_keys
+                )
+                if proven_single:
+                    names = "; ".join(", ".join(c) for c in valid)
+                    ds.data_quality.append(
+                        f"a composite key ({names}) is also declared for this "
+                        f"table; the measured single-column grain {ds.grain[0]} "
+                        "took precedence"
+                    )
+                else:
+                    chosen = valid[0]
+                    if len(valid) > 1:
+                        others = "; ".join(", ".join(c) for c in valid[1:])
+                        ds.data_quality.append(
+                            f"{len(valid)} composite keys are declared for this "
+                            f"table; using {', '.join(chosen)} (also declared: "
+                            f"{others})"
+                        )
+                    if ds.grain and ds.grain != chosen:
+                        ds.data_quality.append(
+                            f"grain {', '.join(chosen)} comes from the project's "
+                            "declared composite key (heuristic suggested "
+                            f"{', '.join(ds.grain)})"
+                        )
+                    ds.grain = chosen
 
 
 def _relationship_notes(
