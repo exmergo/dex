@@ -9,6 +9,33 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A refusal no longer reports a metered connector as free** ([#162]). An
+  over-ceiling refusal on BigQuery returned an envelope whose `cost.paradigm`
+  said `free_local` while the error prose beside it correctly said
+  `(bytes_scanned)`. `free_local` is a positive claim that the connector bills
+  nothing, so a host branching on the structured field to ask "was this refusal
+  about money?" was told no, and a host that trusted the structured field over
+  the prose (the right instinct) got the wrong answer.
+
+  **This is a visible change to the envelope contract**, in three parts:
+
+  - `cost.paradigm` is now nullable, and `null` is what a command reports when
+    nothing selected a connector. It is no longer possible for an envelope to
+    claim `free_local` by omission.
+  - `cost.paradigm` names **the connector the command ran against**, not what
+    the command happened to cost. A repo-only command such as `transform plans`
+    in a BigQuery-configured project now reports `bytes_scanned` where it used
+    to report `free_local`. To ask whether a command actually spent anything,
+    read `data.spend` and `cost.estimate`, not the paradigm.
+  - A refusal now carries the whole cost block. An over-ceiling refusal, a
+    confirmed-but-unbudgeted refusal, and a mid-run budget exhaustion all report
+    the estimate and the ceiling that bound them alongside the paradigm, so the
+    two numbers the error prose names are readable as structured fields.
+
+  `free_local` consequently means DuckDB and nothing else.
+
 ## [1.4.3] - 2026-07-28
 
 ### Added
