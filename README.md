@@ -10,6 +10,13 @@
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Exmergo-165dfc?logo=linkedin&logoColor=white)](https://www.linkedin.com/company/exmergo/)
 [![X](https://img.shields.io/badge/Follow-%40exmergo-165dfc?logo=x&logoColor=white)](https://x.com/exmergo)
 
+## Install (Any Agent)
+
+Run this command in your terminal
+```
+npx skills add exmergo/dex
+```
+
 ## Install (Claude Code)
 
 Run these commands **inside Claude Code** one at a time
@@ -23,13 +30,6 @@ Run these commands **inside Claude Code** one at a time
 Update later with `/plugin marketplace update exmergo`. The skills appear as
 `/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
 intent.
-
-## Install (Any Agent)
-
-Run this command in your terminal
-```
-npx skills install exmergo/dex
-```
 
 ## `dex`: the agent-native analytics engineering toolkit
 

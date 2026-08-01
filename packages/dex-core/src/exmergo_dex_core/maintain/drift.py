@@ -182,6 +182,17 @@ def schema_drift(
                         data={"drop_statement": f"DROP TABLE {identifier};"},
                     )
                 )
+        if not baseline[identifier].columns:
+            # The baseline never captured this object's columns (past `explore
+            # map`'s rank cutoff, so it entered the cache as metadata only), and
+            # unknown is not empty: diffing against an empty set would report
+            # every live column as newly added. Measured on one warehouse, that
+            # was 1,548 false `column_added` from 158 unprofiled objects, which
+            # made a fresh baseline noisier than the week-stale one it replaced.
+            # Table-level findings above still stand, because identity does not
+            # need a profile; the command layer names the gap so the silence
+            # here is reported rather than merely quiet.
+            continue
         old_cols = {c.name: c for c in baseline[identifier].columns}
         new_cols = {c.name: c for c in now[identifier].columns}
         added = sorted(new_cols.keys() - old_cols.keys())

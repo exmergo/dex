@@ -87,6 +87,39 @@ class MaintainRepo:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
+    def strip_column_detail(self, *suffixes: str) -> list[str]:
+        """Reduce cached datasets to metadata alone, as the rank cutoff does.
+
+        Past 50 objects `explore map` profiles the top 25 by rank and enters the
+        rest as inventory-only entries: identifier, type, and counts, with no
+        columns. Reproducing that by building a 200-object warehouse would make
+        these tests slow and no more truthful, so this edits the cache to the
+        same shape the cutoff produces.
+        """
+
+        path = self.root / ".dex" / "cache.json"
+        cache = json.loads(path.read_text(encoding="utf-8"))
+        stripped = []
+        for dataset in cache["datasets"]:
+            if any(dataset["identifier"].endswith(s) for s in suffixes):
+                dataset["columns"] = []
+                dataset["candidate_keys"] = []
+                dataset["composite_keys"] = []
+                dataset["grain"] = None
+                dataset["profiled_at"] = None
+                stripped.append(dataset["identifier"])
+        path.write_text(json.dumps(cache), encoding="utf-8")
+        assert stripped, f"nothing matched {suffixes}"
+        return stripped
+
+    def backdate_cache(self, iso_timestamp: str) -> None:
+        """Age the cache's capture time, for the freshness tests."""
+
+        path = self.root / ".dex" / "cache.json"
+        cache = json.loads(path.read_text(encoding="utf-8"))
+        cache["provenance"]["updated_at"] = iso_timestamp
+        path.write_text(json.dumps(cache), encoding="utf-8")
+
 
 @pytest.fixture
 def dex(capsys):

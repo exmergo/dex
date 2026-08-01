@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from .. import command_args
 from .. import envelope as env
+from ..adapters.base import name_list
 from ..config import pii_override_paths
 from ..dbt_project import DbtProjectError
 from ..dbt_project import load as load_project
@@ -111,14 +112,23 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
             "reconcile need one"
         )
 
+    now = datetime.now(UTC)
     snap = snapshot_mod.Snapshot(
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=now.isoformat(),
         connector=connector,
         warehouse=warehouse,
         warehouse_from=warehouse_from,
         cache_updated_at=cache_updated_at,
         transform_layer=transform_layer,
         semantic_layer=semantic_layer,
+    )
+    # Said at the moment of pinning, not only at detection: this is the command a
+    # host wires to "accept current state", and a thin or aging cache makes that
+    # accept partial in a way nothing else surfaces. Both checks read the
+    # baseline just built, so they describe what was actually written.
+    warnings.extend(_column_detail_warnings(snap))
+    warnings.extend(
+        _cache_age_warnings(snap, config.profile_freshness_hours, now),
     )
     locator = store.save_snapshot(snap)
 
@@ -129,6 +139,8 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
         dataset_count=len(warehouse.datasets),
         relationship_count=len(warehouse.relationships),
         grain_baseline_count=sum(1 for d in warehouse.datasets if d.candidate_keys),
+        column_detail_count=len(warehouse.datasets)
+        - len(warehouse.without_column_detail()),
         cache_updated_at=cache_updated_at,
         transform_layer=(
             LayerFingerprint(
@@ -204,7 +216,9 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
         {"schema": ranked},
         snap,
         store,
-        warnings=warnings + _staleness_warnings(store, snap),
+        warnings=warnings
+        + _column_detail_warnings(snap)
+        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
     )
     result.cost = cost
     return result
@@ -269,7 +283,8 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         snap,
         store,
         warnings=_grain_baseline_warnings(snap)
-        + _staleness_warnings(store, snap)
+        + _column_detail_warnings(snap)
+        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours)
         + notes,
     )
     return command_args.stamp_spend(result, adapter)
@@ -352,7 +367,8 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
         {"semantic": ranked},
         snap,
         store,
-        warnings=warnings + _staleness_warnings(store, snap),
+        warnings=warnings
+        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -385,7 +401,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     config = engine.config
     scope_names = list(objects or [])
 
-    warnings = _grain_baseline_warnings(snap)
+    warnings = _grain_baseline_warnings(snap) + _column_detail_warnings(snap)
     current_transform = current_semantic = None
     project_available = True
     try:
@@ -476,7 +492,11 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
     )
     result = _drift_result(
-        by_axis, snap, store, warnings=warnings + _staleness_warnings(store, snap)
+        by_axis,
+        snap,
+        store,
+        warnings=warnings
+        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -602,7 +622,10 @@ def _detect_free_axis(
 
     _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
     result = _drift_result(
-        {axis: ranked}, snap, store, warnings=_staleness_warnings(store, snap)
+        {axis: ranked},
+        snap,
+        store,
+        warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours),
     )
     result.cost = cost
     return result
@@ -691,6 +714,63 @@ def _grain_baseline_warnings(snap: snapshot_mod.Snapshot) -> list[str]:
     ]
 
 
+def _column_detail_warnings(snap: snapshot_mod.Snapshot) -> list[str]:
+    """What the schema axis could not compare, and how to make it able to.
+
+    The axis reports nothing for an object the baseline holds no columns for,
+    which is right (unknown is not empty) and would otherwise be indistinguishable
+    from a clean bill. Naming the count is what keeps the silence honest.
+    """
+
+    thin = snap.warehouse.without_column_detail()
+    if not thin:
+        return []
+    return [
+        f"{len(thin)} of {len(snap.warehouse.datasets)} baseline object(s) were "
+        "pinned without column detail, so the schema axis compared no columns "
+        f"for them and the grain axis has no keys to probe: {name_list(thin)}. "
+        "Run `explore map --full` and re-run `maintain snapshot` to cover them"
+    ]
+
+
+def _cache_age_warnings(
+    snap: snapshot_mod.Snapshot, freshness_hours: float, now: datetime
+) -> list[str]:
+    """Whether the baseline's warehouse side still describes the warehouse.
+
+    Deliberately not a write-time comparison. Comparing the cache's timestamp to
+    the baseline's goes quiet the moment a re-pin makes the baseline the newer
+    file, which is the wrong moment to go quiet: the contents are still that
+    same old cache, and the caller has just been told their accept succeeded.
+    This reads the age of the contents instead (``cache_updated_at``, recorded
+    at pin time), so re-pinning cannot silence it.
+
+    ``profile_freshness_hours`` is the threshold rather than a new setting of its
+    own: it already defines how old a cached profile may be before `explore`
+    re-scans it, and a baseline pinned from profiles `explore` would refuse to
+    reuse is the same judgement applied one layer up.
+    """
+
+    if snap.warehouse_from != "cache" or not snap.cache_updated_at:
+        return []
+    try:
+        captured = datetime.fromisoformat(snap.cache_updated_at)
+    except ValueError:
+        return []
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=UTC)
+    age_hours = (now - captured).total_seconds() / 3600
+    if age_hours <= freshness_hours:
+        return []
+    return [
+        "this baseline's warehouse side was pinned from an exploration cache "
+        f"captured {age_hours:.0f}h ago ({snap.cache_updated_at}), beyond the "
+        f"{freshness_hours:g}h freshness window; anything created or changed in "
+        "the warehouse since then is not in it and will report as drift. Run "
+        "`explore map` first, then `maintain snapshot`, to pin current state"
+    ]
+
+
 def _adapter_notes(adapter, identifiers: list[str]) -> list[str]:
     """Surface the adapter's per-table notes (e.g. a skipped distinct-count
     escalation on a tight budget) so a silent skip never reads as a clean bill."""
@@ -748,7 +828,19 @@ def _semantic_scope(
     return [finding for finding in findings if in_scope(finding)]
 
 
-def _staleness_warnings(store: MaintainStore, snap: snapshot_mod.Snapshot) -> list[str]:
+def _baseline_warnings(
+    store: MaintainStore, snap: snapshot_mod.Snapshot, freshness_hours: float
+) -> list[str]:
+    """Every reason this baseline may not describe the warehouse, in one place.
+
+    A present baseline is not a valid one, and the ways it can be invalid are
+    axis-independent: it can be superseded by a newer cache, or pinned from a
+    cache that was already old. Both belong wherever a baseline is read, so this
+    is called by every detector rather than reimplemented per axis. What a thin
+    baseline cannot compare is axis-specific and stays in
+    :func:`_column_detail_warnings`.
+    """
+
     warnings: list[str] = []
     cache = store.load_cache()
     if (
@@ -756,9 +848,19 @@ def _staleness_warnings(store: MaintainStore, snap: snapshot_mod.Snapshot) -> li
         and cache.provenance.updated_at
         and cache.provenance.updated_at > snap.created_at
     ):
+        # Names both commands on purpose. `maintain snapshot` alone re-pins
+        # whatever the cache already holds, so on a warehouse past `explore
+        # map`'s rank cutoff the cheap path and the correct path diverge: it
+        # would pin the same partial coverage and leave the schema axis unable
+        # to compare most objects. The advice has to point at the one that ends
+        # with a baseline worth measuring against.
         warnings.append(
             "the exploration cache is newer than the drift baseline; if the current "
-            "state is known-good, re-run `maintain snapshot` so drift is not "
-            "measured against a stale baseline"
+            "state is known-good, re-run `explore map` (or `explore map --full` to "
+            "cover objects past the rank cutoff) and then `maintain snapshot`, so "
+            "drift is not measured against a stale baseline"
         )
+    warnings.extend(
+        _cache_age_warnings(snap, freshness_hours, datetime.now(UTC)),
+    )
     return warnings

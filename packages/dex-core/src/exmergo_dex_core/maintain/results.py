@@ -52,6 +52,11 @@ class SnapshotResult(Result):
     dataset_count: int = 0
     relationship_count: int = 0
     grain_baseline_count: int = 0
+    #: How many pinned objects carry column detail. Below ``dataset_count`` means
+    #: the rest were pinned as metadata alone, so the schema axis has no columns
+    #: to compare for them. Structural rather than prose-only because a host
+    #: automating the accept needs to gate on it.
+    column_detail_count: int = 0
     cache_updated_at: str | None = None
     transform_layer: LayerFingerprint | None = None
     semantic_layer: LayerFingerprint | None = None
@@ -64,6 +69,7 @@ class SnapshotResult(Result):
                 "dataset_count": self.dataset_count,
                 "relationship_count": self.relationship_count,
                 "grain_baseline_count": self.grain_baseline_count,
+                "column_detail_count": self.column_detail_count,
                 "cache_updated_at": self.cache_updated_at,
             },
             "transform_layer": (

@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-01
+
 ### Added
 
 - **A project can declare a composite grain via `unique_combination_of_columns`**
@@ -56,6 +58,43 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   makes its absence visible from inside the root that lacks the ceiling.
 
 ### Fixed
+
+- **A partially-profiled baseline no longer reports every unprofiled column as
+  newly added** ([#150], [#161]). `maintain snapshot` pinned the exploration
+  cache on a presence test where a validity test was needed, and both remaining
+  ways a *present* cache can be invalid flowed through it.
+
+  **Too thin.** Past 50 objects `explore map` profiles the top 25 by rank and
+  enters the rest as metadata alone. The baseline pinned that without inspecting
+  completeness, and because an object with no cached columns had an empty column
+  set, the next `maintain check` reported every column of every unprofiled object
+  as `column_added`. Measured on one warehouse: 204 objects cached, 46 with
+  column detail, **1,548 false `column_added`**, which made a fresh baseline four
+  times noisier than the week-stale one it replaced.
+
+  The fix is the encoding, not a filter: **an empty column list in a baseline
+  means *unknown*, not *empty*.** Every warehouse object has columns, so holding
+  none for one of them records an absence of evidence, never evidence of absence.
+  The schema axis now compares no columns for such an object, and says which
+  objects and how many rather than going quiet, since an axis that could not
+  compare must not look like one that compared and found nothing. Table-level
+  findings are unaffected, because identity needs no profile. `maintain snapshot`
+  warns at pin time and reports `column_detail_count` beside `dataset_count`, so
+  a host automating the accept can gate on coverage structurally.
+
+  **Too old.** The warehouse side was pinned from any usable cache with no
+  freshness test, and the staleness warning that would have flagged it compared
+  *write times*, so re-pinning made the baseline the newer file and the warning
+  vanished while its contents were still that same old cache. The signal
+  disappeared exactly when it was most needed, right after an operator was told
+  their accept succeeded. Freshness is now judged on the capture time recorded in
+  the baseline, so a re-pin cannot silence it, and the threshold is the existing
+  `profile_freshness_hours` rather than a new setting.
+
+  Also fixed: dex's own staleness warning recommended `maintain snapshot`, which
+  on a warehouse past the rank cutoff is the path that produces the thin
+  baseline. It now names `explore map --full` too. The cheap path and the correct
+  path were opposites, and the guidance pointed at the cheap one.
 
 - **`transform build` now reports `data.spend`** ([#166]). `stamp_spend` had no
   call site in `transform/`, so `data.spend` was present for explore and

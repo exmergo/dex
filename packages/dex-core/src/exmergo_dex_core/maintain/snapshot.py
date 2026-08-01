@@ -51,6 +51,26 @@ class WarehouseBaseline(BaseModel):
     datasets: list[Dataset] = Field(default_factory=list)
     relationships: list[Relationship] = Field(default_factory=list)
 
+    def without_column_detail(self) -> list[str]:
+        """Identifiers whose columns this baseline never captured.
+
+        **An empty column list means *unknown*, not *empty*.** Every warehouse
+        object has columns, so a baseline holding none for one of them recorded
+        an absence of evidence, never evidence of absence. ``explore map``
+        profiles the top-ranked objects and enters the rest as metadata alone,
+        so on a warehouse past the rank cutoff most of a pinned baseline can
+        land here.
+
+        The distinction is load-bearing for the schema axis: diffing live
+        columns against an unknown set would report every column of every
+        unprofiled object as newly added. It also bounds what the grain and
+        cardinality axes can see, since neither has keys to probe without a
+        profile. One definition, because the pin-time warning and the detector
+        have to agree on which objects are thin.
+        """
+
+        return sorted(d.identifier for d in self.datasets if not d.columns)
+
 
 class SourceTable(BaseModel):
     """One declared dbt source table: a contract the warehouse must keep honoring."""
