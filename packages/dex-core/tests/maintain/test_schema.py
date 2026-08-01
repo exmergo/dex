@@ -161,3 +161,96 @@ def test_scope_filters_findings_to_named_objects(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "schema", "no_such_table")
     assert rc == 1 and payload["status"] == "error"
     assert "no_such_table" in payload["errors"][0]
+
+
+# --- unknown columns are not absent columns --------------------------------------
+
+
+def test_a_thin_baseline_reports_no_columns_rather_than_all_of_them(maintain_repo):
+    """The measured failure: 204 objects cached, 46 with column detail, 1,548
+    false `column_added`, making a fresh baseline 4x noisier than the week-stale
+    one it replaced.
+
+    An object the baseline holds no columns for has an *unknown* column set, not
+    an empty one. Diffing live columns against empty reported every column of
+    every unprofiled object as newly added, which is a confident wrong answer
+    where silence was correct.
+    """
+
+    maintain_repo.dex("explore", "map")
+    thin = maintain_repo.strip_column_detail(".customers")
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0 and payload["status"] == "ok"
+    # customers has four columns, so the bug produced four findings here.
+    assert payload["data"]["finding_count"] == 0
+    # And the silence is reported rather than merely quiet: an axis that could
+    # not compare must not look like one that compared and found nothing.
+    coverage = [w for w in payload["warnings"] if "without column detail" in w]
+    assert len(coverage) == 1
+    assert thin[0] in coverage[0]
+    assert "explore map --full" in coverage[0]
+
+
+def test_a_thin_baseline_still_detects_table_level_drift(maintain_repo):
+    """Skipping the column comparison must not disarm the axis wholesale:
+    identity does not need a profile."""
+
+    maintain_repo.dex("explore", "map")
+    maintain_repo.strip_column_detail(".customers", ".orders", ".stg_orders")
+    maintain_repo.snapshot()
+    maintain_repo.sql("CREATE TABLE promos (id INTEGER, code VARCHAR)")
+
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0
+    codes = _by_code(payload)
+    assert [f["identifier"] for f in codes["table_added"]] == ["warehouse.main.promos"]
+    assert "column_added" not in codes
+
+
+def test_a_covered_baseline_still_reports_column_drift(maintain_repo):
+    """The regression guard on the fix: only *uncovered* objects go quiet."""
+
+    maintain_repo.dex("explore", "map")
+    maintain_repo.strip_column_detail(".customers")
+    maintain_repo.snapshot()
+    maintain_repo.sql("ALTER TABLE orders ADD COLUMN channel VARCHAR")
+    maintain_repo.sql("ALTER TABLE customers ADD COLUMN loyalty_tier VARCHAR")
+
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0
+    added = _by_code(payload)["column_added"]
+    # orders was profiled, so its new column is real drift. customers was not,
+    # so its new column is unknowable and reporting it would be a guess.
+    assert [(f["identifier"], f["column"]) for f in added] == [
+        ("warehouse.main.orders", "channel")
+    ]
+
+
+def test_a_repin_cannot_silence_the_cache_age_warning(maintain_repo):
+    """The sharpest half of the staleness bug.
+
+    The old check compared write times, so re-pinning made the baseline the
+    newer file and the warning vanished, while the baseline's contents were
+    still that same old cache. The signal disappeared at the moment it became
+    most needed, right after an operator was told their accept succeeded.
+    """
+
+    maintain_repo.backdate_cache("2020-01-01T02:00:00+00:00")
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0
+    aged = [w for w in payload["warnings"] if "captured" in w and "freshness" in w]
+    assert len(aged) == 1
+    # The write-time comparison is now quiet (the baseline IS newer), which is
+    # exactly why the contents-age check has to be a separate signal.
+    assert not [w for w in payload["warnings"] if "newer than the drift baseline" in w]
+
+
+def test_a_fresh_cache_makes_no_age_claim(maintain_repo):
+    maintain_repo.snapshot()
+    rc, payload = maintain_repo.dex("maintain", "schema")
+    assert rc == 0
+    assert not [w for w in payload["warnings"] if "freshness" in w]

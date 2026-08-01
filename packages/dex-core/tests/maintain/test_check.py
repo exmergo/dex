@@ -72,7 +72,14 @@ def test_check_warns_when_cache_outruns_snapshot(maintain_repo):
     assert payload["status"] == "ok"
 
     _rc, payload = maintain_repo.dex("maintain", "check")
-    assert any("re-run `maintain snapshot`" in w for w in payload["warnings"])
+    stale = [w for w in payload["warnings"] if "newer than the drift baseline" in w]
+    assert len(stale) == 1
+    # The advice has to name both commands. `maintain snapshot` alone re-pins
+    # whatever the cache holds, so on a warehouse past the rank cutoff following
+    # this literally is what corrupts the baseline: the cheap path and the
+    # correct path are opposites, and this warning used to point at the cheap one.
+    assert "explore map --full" in stale[0]
+    assert "maintain snapshot" in stale[0]
 
 
 def test_scope_narrows_every_axis_including_the_paid_ones(maintain_repo):

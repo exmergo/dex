@@ -150,3 +150,79 @@ def test_the_snapshot_hint_only_promises_git_when_the_baseline_is_a_file(
     assert "re-run `maintain snapshot`" in hint
     # And the location is still reported, just not as a path anyone can commit.
     assert envelope.data["snapshot_path"] == "memory:snapshot"
+
+
+# --- a present baseline is not a valid one ---------------------------------------
+#
+# `snapshot` pinned the cache on a presence test (`cache is not None and
+# bool(cache.datasets)`) where a validity test was needed. Three ways a present
+# cache can be invalid: too thin (partially profiled), too old, and full of
+# ghosts (fixed separately). The first two are pinned here, at the moment the
+# baseline is written, because `maintain snapshot` is the command a host wires to
+# "accept current state" and both make that accept silently partial.
+
+
+def test_a_thin_cache_is_pinned_but_says_so(maintain_repo):
+    """Past the rank cutoff most of a cache has no column detail, and pinning it
+    used to report a healthy object count and nothing else."""
+
+    maintain_repo.dex("explore", "map")
+    stripped = maintain_repo.strip_column_detail(".customers", ".stg_orders")
+
+    payload = maintain_repo.snapshot()
+    baseline = payload["data"]["baseline"]
+    # Still pinned: a thin baseline is better than none, and refusing here would
+    # break the ordinary large-warehouse flow.
+    assert baseline["dataset_count"] == 3
+    # The coverage is now visible structurally, not only in prose, so a host
+    # automating the accept can gate on it.
+    assert baseline["column_detail_count"] == 1
+    thin = [w for w in payload["warnings"] if "without column detail" in w]
+    assert len(thin) == 1
+    assert "explore map --full" in thin[0]
+    for identifier in stripped:
+        assert identifier in thin[0]
+
+
+def test_a_fully_profiled_cache_pins_without_a_coverage_warning(maintain_repo):
+    payload = maintain_repo.snapshot()
+    assert payload["data"]["baseline"]["column_detail_count"] == 3
+    assert not [w for w in payload["warnings"] if "without column detail" in w]
+
+
+def test_pinning_an_aging_cache_says_the_accept_is_partial(maintain_repo):
+    """The reported case: a baseline written at 16:21Z from an 02:00Z cache.
+
+    Anything created since the capture is absent from the baseline and will
+    report as drift, which is the opposite of what the operator just asked for.
+    """
+
+    maintain_repo.backdate_cache("2020-01-01T02:00:00+00:00")
+    payload = maintain_repo.snapshot()
+    aged = [w for w in payload["warnings"] if "captured" in w and "freshness" in w]
+    assert len(aged) == 1
+    assert "2020-01-01T02:00:00+00:00" in aged[0]
+    assert "explore map" in aged[0]
+
+
+def test_a_metadata_baseline_makes_no_cache_age_claim(dex, tmp_path: Path):
+    """No cache was pinned, so there is no capture time to be stale."""
+
+    root = tmp_path / "bare"
+    (root / ".dex").mkdir(parents=True)
+    db = root / "warehouse.duckdb"
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE t (id INTEGER)")
+    conn.close()
+    (root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {db}\n", encoding="utf-8"
+    )
+
+    _rc, payload = dex("--repo-root", str(root), "maintain", "snapshot")
+    assert payload["data"]["baseline"]["from"] == "metadata"
+    # A metadata capture reads live columns, so it is thin in grain terms but not
+    # in column terms, and neither the coverage nor the age warning applies.
+    assert payload["data"]["baseline"]["column_detail_count"] == 1
+    assert not [w for w in payload["warnings"] if "without column detail" in w]
+    assert not [w for w in payload["warnings"] if "freshness" in w]
