@@ -122,7 +122,7 @@ and recorded in a local spend ledger.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Microsoft Fabric**
+- Cloud warehouse: **Trino**, **ClickHouse**, **Azure Synapse**, **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 
