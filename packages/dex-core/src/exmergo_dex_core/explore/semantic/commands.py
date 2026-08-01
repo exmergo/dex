@@ -106,4 +106,4 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             )
         )
     except SemanticBackendError as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)

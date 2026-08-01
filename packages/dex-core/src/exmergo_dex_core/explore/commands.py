@@ -731,7 +731,7 @@ def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(query(engine, args.sql))
     except QueryRefusedError as exc:
-        return env.error(f"query refused: {exc}")
+        return env.error_for(exc, f"query refused: {exc}")
 
 
 def map(
@@ -1204,7 +1204,7 @@ def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         cluster_mod.ClusterError,
         cluster_mod.ClusterDependencyError,
     ) as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)
 
 
 # --- helpers -----------------------------------------------------------------

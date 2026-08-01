@@ -560,7 +560,7 @@ def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         result = reconcile(engine, drift_class)
     except (NoBaselineError, DbtProjectError) as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)
     if not result.proposals:
         scope = f" for the '{drift_class}' axis" if drift_class else ""
         return to_envelope(result, hints={"hint": f"no drift{scope} to reconcile"})

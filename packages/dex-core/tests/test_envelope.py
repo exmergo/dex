@@ -100,3 +100,83 @@ def test_emit_writes_single_json_line(capsys):
 
 def test_redact_masks_dsn_password():
     assert "hunter2" not in env.redact("postgres://user:hunter2@host:5432/db")
+
+
+# --- reason_for / error_for: a machine-readable refusal reason (#170) --------
+
+
+def test_reason_for_classifies_representative_families():
+    from exmergo_dex_core.dbt_project import DbtProjectError
+    from exmergo_dex_core.errors import ConnectorError, RequestError
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+    from exmergo_dex_core.maintain.commands import NoBaselineError
+
+    assert env.reason_for(OverCeilingError("x")) is env.Reason.GUARD
+    assert env.reason_for(NoBaselineError("x")) is env.Reason.PREREQUISITE
+    assert env.reason_for(ConnectorError("x")) is env.Reason.CONNECTION
+    assert env.reason_for(DbtProjectError("x")) is env.Reason.CONFIGURATION
+    assert env.reason_for(RequestError("x")) is env.Reason.REQUEST
+    assert env.reason_for(ValueError("x")) is env.Reason.REQUEST
+    assert env.reason_for(RuntimeError("x")) is env.Reason.INTERNAL
+
+
+def test_reason_for_execution_failure():
+    from exmergo_dex_core.transform.build import DbtRunError
+
+    assert (
+        env.reason_for(DbtRunError("dbt build failed")) is env.Reason.EXECUTION_FAILURE
+    )
+
+
+def test_reason_for_subclass_precedence():
+    """A more specific bucket must win over its parent's default, proving the
+    override ordering (not just isinstance against the wrong ancestor)."""
+
+    from exmergo_dex_core.explore.cluster import ClusterDependencyError, ClusterError
+    from exmergo_dex_core.explore.semantic import (
+        SemanticBackendError,
+        SemanticQueryRefusedError,
+    )
+
+    # SemanticQueryRefusedError IS-A SemanticBackendError, but is policy
+    # (GUARD), not a backend failure (CONFIGURATION, its parent's bucket).
+    assert env.reason_for(SemanticQueryRefusedError("x")) is env.Reason.GUARD
+    assert env.reason_for(SemanticBackendError("x")) is env.Reason.CONFIGURATION
+
+    # ClusterDependencyError IS-A ClusterError, but a missing extra is a setup
+    # step (PREREQUISITE), not the bare-input REQUEST its parent defaults to.
+    assert env.reason_for(ClusterDependencyError("x")) is env.Reason.PREREQUISITE
+    assert env.reason_for(ClusterError("x")) is env.Reason.REQUEST
+
+
+def test_error_for_defaults_message_to_str_and_derives_reason():
+    from exmergo_dex_core.errors import RequestError
+
+    envelope = env.error_for(RequestError("bad thing"))
+    assert envelope.status is env.Status.ERROR
+    assert envelope.errors == ["bad thing"]
+    assert envelope.reason is env.Reason.REQUEST
+
+
+def test_error_for_message_override():
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError
+
+    exc = QueryRefusedError("nope")
+    envelope = env.error_for(exc, f"query refused: {exc}")
+    assert envelope.errors == ["query refused: nope"]
+    assert envelope.reason is env.Reason.GUARD
+
+
+def test_error_for_passes_through_kwargs():
+    from exmergo_dex_core.errors import RequestError
+
+    envelope = env.error_for(
+        RequestError("x"), cost=env.Cost(paradigm=env.Paradigm.BYTES_SCANNED)
+    )
+    assert envelope.cost.paradigm is env.Paradigm.BYTES_SCANNED
+
+
+def test_reason_is_none_outside_error_status():
+    assert env.ok().reason is None
+    assert env.needs_confirmation().reason is None
+    assert env.not_implemented("x").reason is None

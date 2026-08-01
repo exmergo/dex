@@ -166,6 +166,8 @@ def test_cluster_without_cache_is_refused_with_the_fix(
     payload = _cluster(clusterable_duckdb, repo, capsys=capsys, expect_error=True)
     assert "explore map" in payload["errors"][0]
     assert not (repo / ".dex").exists(), "a refused gate writes nothing"
+    # #170: a machine-readable reason alongside the prose.
+    assert payload["reason"] == "prerequisite"
 
 
 def test_missing_cluster_extra_is_a_clean_error(
