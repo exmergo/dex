@@ -215,6 +215,20 @@ the warehouse and take the `--confirm --budget` handshake on billed connectors;
 `check` runs the free axes first and returns one combined estimate for the
 scanning axes.
 
+**A baseline reports its own coverage, and the axes only compare what it
+covers.** `maintain snapshot` pins the exploration cache, and a cache is thin
+whenever `explore map` stopped at its rank cutoff: past 50 objects it profiles
+the top 25 and enters the rest as metadata alone. An object the baseline holds no
+columns for has an *unknown* column set, not an empty one, so the schema axis
+compares no columns for it rather than reporting every live column as added, and
+the grain axis has no keys to probe. Both `snapshot` and the detectors warn and
+name the objects, and `snapshot` reports `column_detail_count` beside
+`dataset_count`, so partial coverage is never mistaken for a clean bill. Run
+`explore map --full` before snapshotting to cover everything. The detectors also
+warn when the baseline was pinned from a cache older than
+`profile_freshness_hours`, judged on the capture time recorded in the baseline
+rather than on which file was written last, so re-pinning cannot silence it.
+
 `explore relationships` and `explore map` accept `--verify`, which measures each
 inferred join with one aggregate overlap probe (non-null foreign keys, orphan
 count) and adjusts its confidence; the result carries `verified` and

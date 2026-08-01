@@ -26,6 +26,14 @@ mask the very drift you care about. When you accept a change as the new normal
 (re-run `explore map` first, then `maintain snapshot`); `check` warns when the
 baseline looks stale.
 
+**On a warehouse past the rank cutoff, use `explore map --full` before
+snapshotting.** Past 50 objects `explore map` profiles the top 25 by rank and
+enters the rest as metadata alone, and the baseline can only compare columns for
+objects it has columns for. Snapshotting a partial map is still valid, and the
+envelope reports `column_detail_count` against `dataset_count` plus a warning
+naming what it could not cover, so the gap is visible rather than silently
+mistaken for a clean bill.
+
 ## How to drive it
 
 ```bash
@@ -36,7 +44,10 @@ uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
   explore or transform session so later runs have a known-good reference. It pins
   the current `.dex/cache.json` (so the grain baseline is the exact-distinct
   verdicts `explore map` already computed) plus per-layer fingerprints of the dbt
-  project. Without a cache it captures a metadata-only baseline and says so.
+  project. Without a cache it captures a metadata-only baseline and says so. It
+  also warns when the cache it pinned is thin (objects without column detail) or
+  older than the profile freshness window, because either makes an "accept
+  current state" only partly true.
 - `maintain check` is the everyday entry point: it sweeps every axis and returns
   a report ranked by blast radius. Read-only.
 - `maintain schema [<objects>]` detects **structural drift**: source columns and
