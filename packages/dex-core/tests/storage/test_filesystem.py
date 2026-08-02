@@ -9,6 +9,7 @@ poisoning the session budget.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -137,3 +138,80 @@ def test_locators_are_absolute_paths_under_the_repo_root(tmp_path: Path):
     assert Path(store.plan_locator("pabc")) == (
         tmp_path / DEX_DIR / PLANS_DIR / "pabc.json"
     )
+
+
+# --- the spend lock, in the shape only this backend has -------------------------
+
+_LOCK_CHILD = """
+import sys, time
+from exmergo_dex_core.storage import FilesystemStore
+
+store = FilesystemStore(sys.argv[1])
+with store.spend_lock():
+    print("held", flush=True)
+    time.sleep(float(sys.argv[2]))
+"""
+
+
+def test_the_spend_lock_excludes_another_process(tmp_path: Path):
+    """The property the conformance contract cannot portably assert.
+
+    A `threading.Lock` satisfies every assertion the shipped contract makes and
+    would leave the CLI exactly as broken as it was, because the CLI is one
+    command per process and the ledger on disk is all two commands share. So the
+    cross-process half is pinned here, against the real file.
+    """
+
+    import subprocess
+    import sys as _sys
+
+    store = FilesystemStore(tmp_path)
+    child = subprocess.Popen(  # noqa: S603
+        [_sys.executable, "-c", _LOCK_CHILD, str(tmp_path), "0.5"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "held"
+        started = time.monotonic()
+        with store.spend_lock():
+            waited = time.monotonic() - started
+    finally:
+        child.wait(timeout=30)
+    assert waited > 0.2, (
+        f"took the lock after {waited:.3f}s while another process held it, so "
+        "two CLI commands can be admitted against the same headroom"
+    )
+
+
+def test_a_contended_lock_gives_up_rather_than_waiting_forever(tmp_path: Path):
+    import subprocess
+    import sys as _sys
+
+    store = FilesystemStore(tmp_path)
+    child = subprocess.Popen(  # noqa: S603
+        [_sys.executable, "-c", _LOCK_CHILD, str(tmp_path), "2"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "held"
+        with (
+            pytest.raises(TimeoutError) as refusal,
+            store.spend_lock(timeout=0.05),
+        ):
+            pass
+    finally:
+        child.wait(timeout=30)
+    # The builtin, not a dex type: the protocol asks for it so a backend needs no
+    # import from dex to satisfy the contract. The gate names it on the way out.
+    assert "spend lock" in str(refusal.value)
+
+
+def test_the_lock_file_sits_beside_the_ledger_it_protects(tmp_path: Path):
+    store = FilesystemStore(tmp_path)
+    with store.spend_lock():
+        pass
+    assert (tmp_path / DEX_DIR / "spend.lock").is_file()
+    # Empty, and it stays that way: the lock is the inode, not the contents.
+    assert (tmp_path / DEX_DIR / "spend.lock").read_text(encoding="utf-8") == ""

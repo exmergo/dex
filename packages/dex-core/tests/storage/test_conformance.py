@@ -24,6 +24,7 @@ Three shapes matter here and are not covered anywhere else:
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
@@ -46,6 +47,7 @@ from exmergo_dex_core.storage import (
 )
 from exmergo_dex_core.storage.conformance import (
     ExploreStoreContract,
+    SpendLockContract,
     StoreContract,
     StoreFactoryContract,
     a_cache,
@@ -449,6 +451,58 @@ def test_a_factory_that_undershoots_its_declared_tier_names_the_tier():
     message = str(failure.value)
     assert "ExploreOnlyStore" in message and "Store" in message
     assert "unusable from configuration" in message
+
+
+def test_a_lock_that_does_not_exclude_fails_with_what_it_costs():
+    """The optional capability's worst failure, and the one easiest to ship.
+
+    A `spend_lock` returning `nullcontext` satisfies the type, satisfies the
+    re-entrancy assertion, and never blocks anything. Everything downstream then
+    looks correct, because each command in isolation is correct; what fails is
+    that the ceiling stopped binding across them. So the message has to say what
+    the lock was for rather than that two threads overlapped.
+    """
+
+    from contextlib import nullcontext
+
+    class UnlockedStore(ExploreOnlyStore):
+        def spend_lock(self, *, timeout: float = 30.0):
+            return nullcontext()
+
+    contract = SpendLockContract()
+    contract.make_store = lambda key: UnlockedStore(key)  # type: ignore[method-assign]
+    contract.lock_timeout = 2.0
+
+    with pytest.raises(AssertionError) as failure:
+        contract.test_the_lock_excludes_a_second_holder(contract.make_store("broken"))
+
+    message = str(failure.value)
+    assert "does not exclude" in message
+    assert "admitted against the same headroom" in message
+
+
+def test_a_backend_wide_lock_fails_by_naming_the_scope_it_should_have():
+    """The subtler failure: a lock that works and is scoped to the whole backend.
+
+    It excludes, it is re-entrant, and it makes every tenant wait on every other
+    tenant's billed commands. No single-tenant test can see it, which is why the
+    contract carries a two-key assertion at all.
+    """
+
+    shared = threading.RLock()
+
+    class GloballyLockedStore(ExploreOnlyStore):
+        def spend_lock(self, *, timeout: float = 30.0):
+            return shared
+
+    contract = SpendLockContract()
+    contract.make_store = lambda key: GloballyLockedStore(key)  # type: ignore[method-assign]
+    contract.lock_timeout = 2.0
+
+    with pytest.raises(AssertionError) as failure:
+        contract.test_two_keys_do_not_wait_on_each_other()
+
+    assert "scoped to the backend rather than to the ledger" in str(failure.value)
 
 
 def test_a_full_backend_satisfies_every_tier():

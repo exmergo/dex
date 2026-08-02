@@ -691,6 +691,8 @@ def _install_fake_pricing(
     ceiling: float | None,
     describe=None,
     notes: list[str] = (),
+    store=None,
+    session_ceiling: float | None = None,
 ):
     """Make ``cmd_build`` price a billed build without a real warehouse.
 
@@ -701,7 +703,7 @@ def _install_fake_pricing(
     """
 
     from exmergo_dex_core.engine import DexEngine
-    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.guards.cost_guard import CostGate, ledger_field, utc_day_start
     from exmergo_dex_core.transform import dev_target
 
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
@@ -710,14 +712,30 @@ def _install_fake_pricing(
         def __init__(self):
             self.paradigm = paradigm
             self.name = connector
+            # With a store, the gate is wired the way `new_cost_gate` wires a
+            # real one (live reader, record hook, the store's own lock) so the
+            # reservation a build holds while dbt runs is exercised. Without one
+            # it stays the plain snapshot gate the pricing tests want.
             self.cost_gate = CostGate(
                 paradigm=paradigm,
                 ceiling=ceiling,
-                session_ceiling=None,
-                session_spent=0.0,
+                session_ceiling=session_ceiling,
+                session_spent=(
+                    0.0
+                    if store is None
+                    else (
+                        lambda: store.spend_since(
+                            utc_day_start(),
+                            field=ledger_field(paradigm),
+                            connector=connector,
+                        )
+                    )
+                ),
                 confirmed=confirmed,
                 connector=connector,
                 command="transform build",
+                record=None if store is None else store.append_spend_log,
+                lock=None if store is None else store.spend_lock,
             )
             self.closed = False
 
@@ -1433,3 +1451,113 @@ def test_a_billed_build_under_a_cumulative_cap_stays_quiet(
     )
     assert rc == 0, envelope
     assert [w for w in envelope["warnings"] if "budget.session_ceiling" in w] == []
+
+
+def test_a_running_build_holds_its_headroom_and_gives_it_back(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The case the reservation exists for, on the command where it matters most.
+
+    A build is the longest billed command dex has, and it settles outside the
+    cost gate entirely: dbt executes the statements, so nothing reaches the
+    ledger until the run finishes. For as long as it runs, its headroom used to
+    look free, and a concurrent `explore profile` was admitted against a daily
+    budget the build had already committed.
+
+    The probe fires from inside the fake dbt runner, which is exactly the window
+    a real build is open for.
+    """
+
+    import json as json_mod
+
+    from exmergo_dex_core.config import Budget, DexConfig
+    from exmergo_dex_core.connect import new_cost_gate
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError, utc_day_start
+    from exmergo_dex_core.storage import FilesystemStore
+
+    store = FilesystemStore(tmp_path)
+    config = DexConfig(
+        connector="bigquery",
+        budget=Budget(ceiling=100_000_000.0, session_ceiling=8_000_000.0),
+    )
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+        store=store,
+        session_ceiling=8_000_000.0,
+    )
+
+    refused: list[bool] = []
+
+    def probe_while_dbt_runs():
+        # A second command arriving mid-build. 5 MB is held of an 8 MB day, so a
+        # 5 MB scan no longer fits, and before reservations it would have.
+        concurrent = new_cost_gate(
+            "bigquery", config, store, confirmed=True, command="explore profile"
+        )
+        try:
+            concurrent.preflight_command(5_000_000.0)
+        except OverCeilingError:
+            refused.append(True)
+        finally:
+            concurrent.settle()
+
+    target_dir = bigquery_project_dir / "target"
+    run_results = json_mod.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 3_000_000},
+                }
+            ]
+        }
+    )
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    import subprocess as _subprocess
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            probe_while_dbt_runs()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "run_results.json").write_text(run_results, encoding="utf-8")
+            return _subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert refused == [True], "a concurrent command was admitted against held headroom"
+
+    # ...and the hold is given back once dbt returns, so the day settles to what
+    # the build really cost rather than to what it was quoted.
+    assert (
+        store.spend_since(utc_day_start(), field="billed_bytes", connector="bigquery")
+        == 3_000_000
+    )
+    assert envelope["data"]["spend"]["session_spent_today"] == 3_000_000

@@ -231,6 +231,285 @@ def test_a_free_gate_never_warns_about_a_cumulative_cap():
     assert _gate(paradigm=Paradigm.FREE_LOCAL, session_ceiling=None).warnings() == []
 
 
+def test_a_gate_whose_store_cannot_serialize_the_admission_warns():
+    """A ceiling that cannot bind under concurrency has to say so.
+
+    Both shipped backends implement the lock, so this reaches only a host that
+    selected a backend of its own. It warns rather than refusing, the same call
+    made for a missing cumulative cap: refusing would break a backend written
+    before the capability existed.
+    """
+
+    warning = _gate(
+        session_ceiling=10_000.0, record=lambda entry: None, lock=None
+    ).warnings()
+    assert len(warning) == 1
+    assert "spend lock" in warning[0]
+    assert "budget.session_ceiling" in warning[0]
+
+
+def test_a_gate_whose_store_serializes_the_admission_stays_quiet():
+    from contextlib import nullcontext
+
+    gate = _gate(session_ceiling=10_000.0, record=lambda entry: None, lock=nullcontext)
+    assert gate.serialized is True
+    assert gate.warnings() == []
+
+
+def test_a_gate_with_no_ledger_never_warns_about_serializing_one():
+    """Nothing is appended, so nothing can be raced.
+
+    This is every free path and every gate built without a store. Warning here
+    would report a hazard that does not exist, on the commands least able to act
+    on it.
+    """
+
+    assert _gate(session_ceiling=10_000.0, record=None).warnings() == []
+
+
+# --- reserving the headroom a command was admitted against -----------------------
+
+
+class _Ledger:
+    """The smallest thing that behaves like a shared spend ledger.
+
+    A list plus the two members the gate reaches for, so these assertions are
+    about the gate rather than about a backend. `FilesystemStore` is exercised
+    against the real thing in the concurrency suite.
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+
+    def append(self, entry: dict) -> None:
+        self.entries.append(dict(entry))
+
+    def total(self) -> float:
+        return sum(e.get("billed_bytes", 0.0) for e in self.entries)
+
+    def kinds(self) -> list[str]:
+        return [e["entry"] for e in self.entries]
+
+
+def _ledger_gate(ledger: _Ledger, **overrides) -> CostGate:
+    from contextlib import nullcontext
+
+    kwargs = {
+        "session_ceiling": 1_000.0,
+        "session_spent": ledger.total,
+        "record": ledger.append,
+        "lock": nullcontext,
+    }
+    kwargs.update(overrides)
+    return _gate(**kwargs)
+
+
+def test_an_admitted_command_books_its_estimate_before_it_runs():
+    """The hold is what a concurrent command settles against.
+
+    Without it the second command reads a ledger that will not show the first
+    one's spend until it finishes, and admits itself against headroom that is
+    already committed.
+    """
+
+    ledger = _Ledger()
+    _ledger_gate(ledger).preflight_command(600.0)
+    assert ledger.kinds() == ["reservation"]
+    assert ledger.total() == 600.0
+
+
+def test_a_refused_command_books_nothing():
+    """Every refusal leaves through the exception before the reservation.
+
+    The common case is the unconfirmed handshake, which is how every billed
+    command starts, so a gate that reserved on the way to asking would hold
+    headroom for work that was never authorized.
+    """
+
+    ledger = _Ledger()
+    with pytest.raises(ConfirmationRequiredError):
+        _ledger_gate(ledger, confirmed=False).preflight_command(10.0)
+    with pytest.raises(OverCeilingError):
+        _ledger_gate(ledger).preflight_command(5_000.0)
+    with pytest.raises(CeilingRequiredError):
+        _ledger_gate(ledger, ceiling=None, session_ceiling=None).preflight_command(10.0)
+    assert ledger.entries == []
+
+
+def test_a_second_gate_sees_the_first_ones_hold():
+    ledger = _Ledger()
+    _ledger_gate(ledger).preflight_command(600.0)
+    with pytest.raises(OverCeilingError):
+        _ledger_gate(ledger).preflight_command(600.0)
+
+
+def test_settling_releases_what_was_held_but_not_spent():
+    """The ledger nets back to actual spend, which is what makes this safe.
+
+    A day already finished sums to what it really cost, exactly as before
+    reservations existed, so nothing summing settled spend had to change.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    gate.record_billed(400.0)
+    gate.settle()
+    assert ledger.kinds() == ["reservation", "settlement", "release"]
+    assert ledger.total() == 400.0
+
+
+def test_the_freed_headroom_admits_the_next_command():
+    ledger = _Ledger()
+    first = _ledger_gate(ledger)
+    first.preflight_command(600.0)
+    first.record_billed(400.0)
+    first.settle()
+    # 1,000 ceiling less 400 actually spent, not less the 600 that was held.
+    assert _ledger_gate(ledger).preflight_command(600.0).ceiling == 600.0
+
+
+def test_a_gate_does_not_charge_itself_for_its_own_reservation():
+    """The invariant the whole design rests on.
+
+    A live reading includes this gate's own writes, so `session_spent` is that
+    reading net of them: the day's spend belonging to other commands. Without
+    the subtraction every ceiling after the reservation would tighten by the
+    gate's own estimate, and a command would refuse itself partway through.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    assert gate.session_spent == 0.0
+    assert gate.effective_ceiling() == 1_000.0
+    gate.record_billed(400.0)
+    gate._refresh()
+    assert gate.session_spent == 0.0
+
+
+def test_an_estimate_that_drifts_past_its_booking_is_re_admitted():
+    """The gap a live BigQuery run exposed after the reservation landed.
+
+    A command is bounded per statement by the ceiling rather than by its own
+    estimate, deliberately, so a drifting estimate stops mid-command instead of
+    overrunning. Under concurrency that bound was computed from the reading the
+    command was admitted on, which cannot see headroom a later command took. So
+    drift could spend into another command's hold even though every admission
+    was correct.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(300.0)
+    gate.charge(200.0)
+    assert ledger.kinds() == ["reservation"]  # inside the booking: no re-admit
+
+    # Another command takes headroom after this one was admitted.
+    other = _ledger_gate(ledger)
+    other.preflight_command(600.0)
+
+    # Drifting past the 300 booked now has to fit what is genuinely left, and
+    # 300 + 600 already accounts for the whole 1,000 ceiling.
+    with pytest.raises(OverCeilingError):
+        gate.charge(400.0)
+    # The refused charge is not counted, so the command can still finish inside
+    # what it did book.
+    assert gate._estimated == 200.0
+    gate.charge(100.0)
+
+
+def test_the_server_side_cap_never_exceeds_what_was_booked():
+    """The backstop that binds when an estimate is wrong has to bind under
+    concurrency too, or two commands hand the warehouse caps that overlap."""
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(300.0)
+    assert gate.remaining_for_statement() == 300
+    gate.record_billed(100.0)
+    assert gate.remaining_for_statement() == 200
+
+
+def test_settling_is_idempotent():
+    """Three funnels settle a gate and they overlap by design, not by accident:
+    the command layer on its way out, the engine when it rebuilds a gate, and
+    engine shutdown."""
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    gate.settle()
+    gate.settle()
+    gate.settle()
+    assert ledger.kinds().count("release") == 1
+
+
+def test_a_phase_extends_the_hold_rather_than_adding_a_second():
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(100.0)
+    gate.charge(100.0)
+    gate.preflight_phase(300.0)
+    assert ledger.kinds() == ["reservation", "reservation"]
+    assert ledger.total() == 400.0
+    gate.settle()
+    assert ledger.total() == 0.0
+
+
+def test_settlement_reports_the_days_total_not_this_commands_share():
+    """Two commands used to each report their own spend under a name that
+    promises the day's, so a caller reading either one saw a fraction of the
+    truth."""
+
+    ledger = _Ledger()
+    other = _ledger_gate(ledger)
+    other.preflight_command(300.0)
+    other.record_billed(300.0)
+    other.settle()
+
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(200.0)
+    gate.record_billed(200.0)
+    gate.settle()
+    assert gate.spend_summary() == {
+        "bytes_billed": 200.0,
+        "session_spent_today": 500.0,
+    }
+
+
+def test_nothing_is_reserved_without_a_cumulative_ceiling_to_protect():
+    """A reservation exists to be seen by a command settling against
+    `session_ceiling`. With none set nothing reads it, so the ledger stays
+    byte-identical for every project that never configured a daily cap."""
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger, session_ceiling=None)
+    gate.preflight_command(600.0)
+    gate.record_billed(400.0)
+    gate.settle()
+    assert ledger.kinds() == ["settlement"]
+
+
+def test_a_contended_lock_refuses_rather_than_running_unguarded():
+    """Proceeding without the lock is the defect this guard closes, so a lock
+    that cannot be taken is a refusal. It is the recoverable kind: whatever
+    holds it is a billed command that will finish."""
+
+    from exmergo_dex_core.guards.cost_guard import SpendLockTimeoutError
+
+    def contended():
+        raise TimeoutError("waited 30.0s for the spend lock")
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger, lock=contended)
+    with pytest.raises(SpendLockTimeoutError) as exc_info:
+        gate.preflight_command(10.0)
+    assert "re-issuing the same command is safe" in str(exc_info.value)
+    assert exc_info.value.cost.paradigm is Paradigm.BYTES_SCANNED
+    assert ledger.entries == []
+
+
 def test_the_ledger_and_envelope_spellings_stay_distinct():
     """`billed_bytes` goes to the ledger, `bytes_billed` to the envelope.
 
