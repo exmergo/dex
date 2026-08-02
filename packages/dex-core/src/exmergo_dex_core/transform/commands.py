@@ -419,6 +419,7 @@ def build(
     from ..guards.cost_guard import (
         ConfirmationRequiredError,
         no_session_ceiling_warning,
+        unserialized_ledger_warning,
     )
 
     # `from .build import ...` rather than `from . import build`: the package
@@ -503,6 +504,11 @@ def build(
             notes=[
                 *price_notes,
                 *no_session_ceiling_warning(paradigm, config.budget.session_ceiling),
+                *unserialized_ledger_warning(
+                    paradigm,
+                    config.budget.session_ceiling,
+                    callable(getattr(store, "spend_lock", None)),
+                ),
             ],
         )
         raise
@@ -515,6 +521,7 @@ def build(
         store,
         extra_notes=[*price_notes, *dev_warnings],
         session_ceiling=config.budget.session_ceiling,
+        gate=command_args.cost_gate(adapter) if adapter is not None else None,
     )
 
 
@@ -767,6 +774,7 @@ def _shape_build_result(
     store: Store,
     extra_notes=(),
     session_ceiling: float | None = None,
+    gate=None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -779,11 +787,22 @@ def _shape_build_result(
     A failed run reports its spend too: dbt bills for the statements it ran
     before it stopped, and a caller sizing the re-run needs that number more
     than a successful one does.
+
+    dbt has returned by the time this runs, so the headroom the handshake booked
+    is released here, before the ledger is read back. A build is the longest
+    billed command dex has, which makes it both the one whose hold matters most
+    to a concurrent command and the one where reporting the day's total without
+    releasing first would overstate it by the whole estimate.
     """
 
     from ..envelope import Paradigm
-    from ..guards.cost_guard import no_session_ceiling_warning
+    from ..guards.cost_guard import (
+        no_session_ceiling_warning,
+        unserialized_ledger_warning,
+    )
 
+    if gate is not None:
+        gate.settle()
     messages = summary.pop("messages", [])
     notes = [*extra_notes, *summary.pop("notes", [])]
     spend: dict[str, float] | None = None
@@ -823,7 +842,15 @@ def _shape_build_result(
         if seconds:
             summary["seconds_billed"] = seconds
             spend = _record_build_spend(store, connector, seconds, paradigm)
-    notes = [*notes, *no_session_ceiling_warning(paradigm, session_ceiling)]
+    notes = [
+        *notes,
+        *no_session_ceiling_warning(paradigm, session_ceiling),
+        *unserialized_ledger_warning(
+            paradigm,
+            session_ceiling,
+            callable(getattr(store, "spend_lock", None)),
+        ),
+    ]
     if summary["success"]:
         return BuildResult(
             success=True,
