@@ -248,6 +248,11 @@ class DexEngine:
         a second one to replace it would re-read the whole spend ledger for the
         same answer, and the CLI's one-command-per-process shape means that
         wasted read would land on every single invocation.
+
+        A rebuild settles the outgoing gate first. It has normally settled
+        itself already, on its own way out; this covers the command that raised
+        past that point, so the headroom it booked is released by the next
+        command rather than held until the UTC rollover.
         """
 
         budget = self.budget if budget is None else budget
@@ -271,7 +276,9 @@ class DexEngine:
             return self._adapter_instance
 
         adapter = self._adapter_instance
-        if command_args.cost_gate(adapter) is not None:
+        outgoing = command_args.cost_gate(adapter)
+        if outgoing is not None:
+            outgoing.settle()
             adapter.cost_gate = connect.new_cost_gate(
                 adapter.name,
                 self.config,
@@ -630,11 +637,25 @@ class DexEngine:
     # --- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the held connection. Idempotent."""
+        """Close the held connection, releasing any held spend headroom first.
+
+        Idempotent. The CLI closes from a ``finally``, so this is the funnel that
+        catches a command interrupted partway: without it, a gate that had been
+        admitted but never settled would hold its estimate against the day's
+        cumulative ceiling until the UTC rollover. Releasing must not be able to
+        stop the connection closing, so a store that cannot be reached at this
+        point loses the release rather than leaking the connection.
+        """
 
         adapter = self._adapter_instance
         self._adapter_instance = None
-        if adapter is not None:
+        if adapter is None:
+            return
+        gate = command_args.cost_gate(adapter)
+        try:
+            if gate is not None:
+                gate.settle()
+        finally:
             adapter.close()
 
     def __enter__(self) -> DexEngine:

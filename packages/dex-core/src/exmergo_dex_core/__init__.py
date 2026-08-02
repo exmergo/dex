@@ -94,6 +94,8 @@ _EXPORTS = {
     "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
     "Snapshot": "maintain.snapshot",
+    "SpendLock": "storage",
+    "SpendLockTimeoutError": "guards.cost_guard",
     "Store": "storage",
     "StoreContext": "storage",
     "StoreFactory": "storage",
@@ -133,6 +135,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ConfirmationRequiredError,
         CostGuardError,
         OverCeilingError,
+        SpendLockTimeoutError,
     )
     from .guards.dialect import DialectDependencyError
     from .guards.query_firewall import QueryRefusedError
@@ -150,6 +153,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         FilesystemStore,
         MaintainStore,
         MemoryStore,
+        SpendLock,
         Store,
         StoreContext,
         StoreFactory,
@@ -208,6 +212,8 @@ __all__ = [
     "SemanticQueryRefusedError",
     "SemanticSource",
     "Snapshot",
+    "SpendLock",
+    "SpendLockTimeoutError",
     "Store",
     "StoreContext",
     "StoreFactory",

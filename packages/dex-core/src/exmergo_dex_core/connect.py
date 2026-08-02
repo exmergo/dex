@@ -222,20 +222,29 @@ def new_cost_gate(
 
     Kept here, alongside credential discovery, on purpose: a host that supplies
     its own connection must never be the thing that supplies the guard.
+
+    The day's spend is passed as a reader rather than a number, so the gate
+    re-reads it when it admits work instead of deciding the whole command from
+    one reading taken here. The lock comes from the store when the store has
+    one; without it the gate still reserves and says on every billed result that
+    the cumulative ceiling is advisory.
     """
 
     paradigm = paradigm_for(connector)
+    field = ledger_field(paradigm)
+    lock = getattr(store, "spend_lock", None)
     return CostGate(
         paradigm=paradigm,
         ceiling=budget if budget is not None else config.budget.ceiling,
         session_ceiling=config.budget.session_ceiling,
-        session_spent=store.spend_since(
-            utc_day_start(), field=ledger_field(paradigm), connector=connector
+        session_spent=lambda: store.spend_since(
+            utc_day_start(), field=field, connector=connector
         ),
         confirmed=confirmed,
         connector=connector,
         command=command,
         record=store.append_spend_log,
+        lock=lock if callable(lock) else None,
     )
 
 
