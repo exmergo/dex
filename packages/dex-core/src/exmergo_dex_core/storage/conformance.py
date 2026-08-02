@@ -39,6 +39,14 @@ engine as an instance**, mix :class:`StoreFactoryContract` in as well. It routes
 against a store built the way dex would build it, and "the suite is green" keeps
 meaning the backend is both correct and constructable rather than only the first.
 
+**If your backend serves concurrent requests**, mix :class:`SpendLockContract` in
+too. It is the only optional capability here, and skipping it costs correctness
+rather than convenience: without a lock two overlapping billed commands are
+admitted against the same headroom and the cumulative session ceiling does not
+bind. dex reports that on every billed result rather than assuming it, so a
+backend without one is honest rather than silently broken, but a hosted backend
+wants the lock.
+
 This module imports pytest, so it is deliberately not imported by
 ``exmergo_dex_core.storage``: a bare ``import exmergo_dex_core`` must not require
 a test framework. Install the ``[storage-conformance]`` extra to get what running
@@ -49,6 +57,8 @@ keeps it that way.
 
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from itertools import count
 from typing import Any
@@ -59,11 +69,12 @@ import pytest
 from ..cache import CacheProvenance, Dataset, DexCache
 from ..maintain.drift import AxisResult, DriftFinding, DriftReport
 from ..maintain.snapshot import Snapshot, WarehouseBaseline
-from .base import Document, ExploreStore, StoreContext
+from .base import Document, ExploreStore, SpendLock, StoreContext
 
 __all__ = [
     "ExploreStoreContract",
     "MaintainStoreContract",
+    "SpendLockContract",
     "StoreContract",
     "StoreFactoryContract",
 ]
@@ -664,6 +675,167 @@ class StoreContract(MaintainStoreContract):
             "two keys share the plan store, so one tenant can read and apply "
             f"another's proposed dbt changes. Got {two.list_plans()!r}"
         )
+
+
+class SpendLockContract(_KeyedContract):
+    """The optional capability that makes the cumulative spend ceiling bind.
+
+    Mix it in alongside the contract for your tier::
+
+        class TestMyStore(SpendLockContract, ExploreStoreContract):
+            def make_store(self, key):
+                return MyStore(tenant=key)
+
+    The cost gate reads the day's spend, decides whether the command fits under
+    ``budget.session_ceiling``, and books the headroom, all inside one
+    ``spend_lock``. Without it two commands read the same total and both decide
+    yes, which is legal for each and wrong for the pair.
+
+    Three properties, and the third is the one most likely to be missed. **It
+    must exclude**, so a second holder waits. **It must be re-entrant for one
+    holder**, because the gate settles from more than one funnel and a settle
+    inside a held section is expected rather than a deadlock to design around.
+    And **it must be scoped to the ledger this store reads, not to the backend**,
+    so two tenants never wait on each other; a single global mutex passes the
+    first two assertions and quietly serializes an entire deployment.
+
+    Only threads are exercised here, because that is the population a suite can
+    portably create. A backend spanning processes or hosts has to reach for
+    whatever its own substrate offers (an advisory file lock, a transaction, a
+    conditional write) and this contract cannot see the difference. That gap is
+    real, and it is why the two shipped backends carry cross-process assertions
+    of their own in dex's suite rather than relying on this class.
+    """
+
+    #: How long an assertion waits for something it expects to *happen* before
+    #: calling the backend broken. Generous on purpose: a slow CI box must not
+    #: read as a failure.
+    lock_timeout: float = 10.0
+
+    #: How long an assertion waits to be satisfied that something did *not*
+    #: happen. Short, and it can be: a lock that fails to exclude admits its
+    #: second holder in microseconds, so the only reason to wait at all is
+    #: thread scheduling. The assertions that use it first wait out
+    #: :attr:`lock_timeout` for the contending thread to reach the lock, so a
+    #: slow machine delays the probe rather than passing it vacuously.
+    overlap_probe: float = 0.5
+
+    @contextmanager
+    def _held(self, store) -> Any:
+        """Hold ``store``'s spend lock on another thread for the block's duration.
+
+        A separate thread because the point is always what a *different* holder
+        sees, and a re-entrant lock would let the same thread straight back in.
+        Yields a handle whose ``release()`` drops the lock early, for the
+        assertions that then check the waiter got through.
+
+        **The holder outlasts anything that waits on it**, which is what keeps
+        these assertions from being decided by which of two equal timeouts fires
+        first. Holding for exactly ``lock_timeout`` while an assertion waits
+        ``lock_timeout`` for a contender makes the outcome a coin flip on a busy
+        machine, and a contract that reports a backend as broken once in a
+        hundred runs is one nobody trusts.
+        """
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with store.spend_lock(timeout=self.lock_timeout):
+                entered.set()
+                release.wait(self.lock_timeout * 4)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        try:
+            assert entered.wait(self.lock_timeout), (
+                "a thread could not take spend_lock on an idle store within "
+                f"{self.lock_timeout}s, so the lock never becomes available"
+            )
+            yield type("_Holder", (), {"release": staticmethod(release.set)})
+        finally:
+            release.set()
+            holder.join(self.lock_timeout)
+
+    def _contend(self, store, attempting, crossed) -> None:
+        """Start a thread that reaches for ``store``'s lock and reports both
+        that it tried and, when it succeeds, that it got in."""
+
+        def contend():
+            attempting.set()
+            with store.spend_lock(timeout=self.lock_timeout):
+                crossed.set()
+
+        threading.Thread(target=contend, daemon=True).start()
+
+    def test_the_store_declares_the_capability(self, store):
+        assert isinstance(store, SpendLock), (
+            f"{type(store).__name__} does not satisfy SpendLock, so mixing this "
+            "contract in asserts nothing. Add "
+            "spend_lock(self, *, timeout=...) returning a context manager"
+        )
+
+    def test_the_lock_excludes_a_second_holder(self, store):
+        attempting, crossed = threading.Event(), threading.Event()
+        with self._held(store) as holder:
+            self._contend(store, attempting, crossed)
+            # Wait for the contender to actually reach the lock before judging
+            # whether it got through, so a slow machine delays this rather than
+            # passing it without a contender having tried.
+            assert attempting.wait(self.lock_timeout), "the contender never started"
+            assert not crossed.wait(self.overlap_probe), (
+                "a second holder entered spend_lock while the first still held it, "
+                "so the lock does not exclude. The cost gate reads the day's spend "
+                "and books headroom inside this section, and two commands running "
+                "it at once are admitted against the same headroom"
+            )
+            holder.release()
+            assert crossed.wait(self.lock_timeout), (
+                "the second holder never acquired spend_lock after the first "
+                "released it, so the lock excludes permanently rather than "
+                "serializing. Check that the section releases on the way out"
+            )
+
+    def test_the_lock_is_reentrant_for_one_holder(self, store):
+        done = threading.Event()
+
+        def nest():
+            with (
+                store.spend_lock(timeout=self.lock_timeout),
+                store.spend_lock(timeout=self.lock_timeout),
+            ):
+                pass
+            done.set()
+
+        thread = threading.Thread(target=nest, daemon=True)
+        thread.start()
+        assert done.wait(self.lock_timeout), (
+            "taking spend_lock twice on one thread deadlocked. dex settles a gate "
+            "from more than one funnel and a settle inside a held section is "
+            "expected, so the lock has to be re-entrant for the holder"
+        )
+
+    def test_two_keys_do_not_wait_on_each_other(self):
+        """A lock scoped to the backend rather than to the ledger.
+
+        It excludes and it is re-entrant, so the two assertions above pass, and
+        it serializes every tenant in the deployment against every other. That is
+        a performance failure severe enough to be a correctness one under load,
+        and it is invisible in any single-tenant test.
+        """
+
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
+        attempting, crossed = threading.Event(), threading.Event()
+        with self._held(one):
+            self._contend(two, attempting, crossed)
+            # A lock scoped to one ledger lets this straight through while
+            # another ledger's is held; one scoped to the backend cannot let it
+            # through at all, so the generous wait costs nothing when it passes.
+            assert crossed.wait(self.lock_timeout), (
+                "one key's spend lock blocked another key's, so the lock is scoped "
+                "to the backend rather than to the ledger it protects. Every tenant "
+                "then waits on every other tenant's billed commands"
+            )
 
 
 class StoreFactoryContract(_KeyedContract):
