@@ -17,6 +17,9 @@ Two properties are load-bearing:
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -46,6 +49,7 @@ class MemoryStore:
         self._plans: dict[str, TransformPlan] = {}
         self._queries: list[dict] = []
         self._spend: list[dict] = []
+        self._spend_lock = threading.RLock()
 
     @classmethod
     def from_context(cls, context: StoreContext) -> MemoryStore:
@@ -110,6 +114,21 @@ class MemoryStore:
         connector: str | None = None,
     ) -> float:
         return spend_total(self._spend, cutoff_iso, field=field, connector=connector)
+
+    @contextmanager
+    def spend_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
+        """Serialize the spend admission across threads sharing this instance.
+
+        The ledger lives in one process, so the whole population that could race
+        is the threads holding this object and a plain lock is genuinely atomic
+        rather than advisory. ``timeout`` is accepted and not enforced: honoring
+        it would mean reporting a lock contended by a section that only spans a
+        ledger read and a list append, which cannot outlast any sane timeout, and
+        a spurious refusal there would be worse than the wait.
+        """
+
+        with self._spend_lock:
+            yield
 
     # --- plans ----------------------------------------------------------------
 
