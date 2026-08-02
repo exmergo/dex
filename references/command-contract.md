@@ -372,6 +372,23 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   plus `session_spent_today`, which is what the next command's cumulative
   ceiling will start from. A failed build reports it too: dbt bills for the
   statements it ran before it stopped.
+- **The cumulative ceiling binds across commands that overlap in time**, not
+  only across commands that follow one another. An admitted command books its
+  estimate against the day's headroom before it runs and releases the unspent
+  part when it settles, so a second command issued while the first is still
+  running is measured against what is genuinely left, and the server-side cap
+  each statement carries is bounded by that booking rather than by the whole
+  ceiling. Three consequences a caller can see:
+  - `cost.ceiling` on a refusal reflects headroom another command is holding, so
+    two runs of the same command can be refused against different numbers.
+  - `session_spent_today` counts headroom held by commands still in flight, so
+    while another billed command is running it reads higher than settled spend
+    and can briefly exceed `session_ceiling` without anything having overspent.
+    Run commands one at a time and it is exactly settled spend.
+  - A command killed outright leaves its estimate booked until the UTC rollover.
+    Every softer exit, including an interrupt, releases. This errs conservative
+    on purpose: the alternative is a hold that expires while its command is
+    still spending.
 - **A billed command with no cumulative ceiling warns.** `budget.ceiling` is
   *refused* when missing, because nothing runs unbudgeted;
   `budget.session_ceiling` is only warned about, because refusing would break

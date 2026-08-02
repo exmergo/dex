@@ -54,6 +54,12 @@ at runtime. Passing an explore-only store to a transform command refuses with a
 message naming the tier and the missing members, rather than failing on a missing
 attribute several frames down.
 
+Two capabilities sit alongside the tiers rather than inside them, and both are
+optional: `SpendLock`, so the cumulative spend ceiling binds when two commands
+overlap, and the construction contract, so your backend can be named in
+configuration. A backend is a complete backend without either, and the first is
+one every concurrent host wants.
+
 ## Writing one
 
 ```python
@@ -98,6 +104,56 @@ engine = DexEngine(connector="bigquery", config=cfg, store=MyStore(tenant))
 Use `spend_total` rather than reimplementing the ledger arithmetic. It is exported
 for exactly this reason: every backend then answers the session-budget question
 identically, which is a property you want in a guard.
+
+## Serializing the spend admission
+
+One optional capability, and the only place in this seam where skipping something
+costs correctness rather than convenience. If your backend can be reached by more
+than one command at a time, implement it.
+
+```python
+from contextlib import contextmanager
+
+
+class MyStore:
+    @contextmanager
+    def spend_lock(self, *, timeout: float = 30.0):
+        with self._lock_for(self.tenant, timeout=timeout):
+            yield
+```
+
+**What dex does with it.** The cost gate reads the day's spend, decides whether
+the command fits under `budget.session_ceiling`, and books that much headroom in
+the ledger, all inside one `spend_lock`. It is held for the decision only, never
+across a warehouse query, so it costs microseconds and never serializes work that
+has no reason to wait.
+
+**Three properties, and the third is the one most often missed.**
+
+- **It excludes.** A second holder waits.
+- **It is re-entrant for one holder.** dex settles a gate from more than one
+  funnel, so a settle inside a section already held is expected rather than a
+  deadlock to design around.
+- **It is scoped to the ledger this store reads, not to the backend.** A single
+  global mutex satisfies the first two and quietly serializes every tenant in the
+  deployment against every other. That is the same isolation the tier contracts
+  already require, and a lock is the easy place to forget it, because a
+  single-tenant test cannot see the difference.
+
+Raise the builtin `TimeoutError` when `timeout` elapses; dex turns it into a
+named refusal carrying the cost. The builtin is what the protocol asks for so
+your backend needs no import from dex to satisfy it.
+
+**Without it your backend still works.** dex books the headroom regardless, which
+narrows the race from the duration of a warehouse query to the microseconds
+around the ledger read, and every billed command carries a warning that the
+cumulative ceiling is advisory. That is a warning rather than a refusal on
+purpose, matching the call already made for a `session_ceiling` nobody set:
+refusing would break a backend written before this existed. It is not a reason to
+skip the lock on anything serving concurrent requests.
+
+`SpendLockContract` in the conformance suite is the executable version of all of
+the above.
 
 ## Constructing one
 
@@ -221,13 +277,36 @@ permissive, which makes it worth stating plainly: key stores exactly as you key
 principals. A host that splits stores for some other reason, one per repo root
 say, has split the budget too and will not be told.
 
-**The ledger read-then-write is not atomic at the protocol level.** The cost gate
-calls `spend_since` and then `append_spend_log`. The cumulative session ceiling
-therefore binds exactly when commands are serialized, which is the CLI's
-one-command-per-process shape; under genuinely concurrent commands the overshoot
-is bounded by the sum of the concurrent estimates. A backend that can make the
-pair atomic for one key should, and a multi-tenant backend serving concurrent
-requests per tenant is where that stops being optional.
+**The ledger read-then-write has to be atomic for the cumulative ceiling to
+bind**, and `SpendLock` below is how a backend provides it. The cost gate reads
+`spend_since`, decides whether the command fits under `budget.session_ceiling`,
+and appends, and two commands running that sequence at once read the same total
+and both decide yes. Implement the lock and dex serializes the sequence through
+it. Without one dex still books the headroom, which narrows the window from the
+length of a warehouse query to the microseconds around the read, and warns on
+every billed command that the ceiling is advisory on this backend.
+
+**Entries are stored, not interpreted.** Each carries an `entry` kind
+(`reservation`, `settlement`, `release`) and a `reservation_id` tying the three
+together, because the ceiling has to hold headroom for a command that has been
+admitted and has not finished paying. A release carries a **negative**
+magnitude, and that is the one thing to know here: a backend that clamps or
+filters on sign would leak held headroom for the rest of the UTC day. Sum what
+you are given.
+
+Two properties follow, and neither required a change to any backend written
+before reservations existed:
+
+- **A day that has finished sums to actual spend**, exactly as it always did, so
+  nothing summing settled spend saw a different number.
+- **A day with commands still running sums to actual spend plus the headroom
+  they hold.** That is not an accounting error; it is the number a concurrent
+  command has to see.
+
+A process killed outright cannot release, so its reservation stands until the
+UTC rollover. That is deliberate, and it is the safe direction: the alternative
+is expiring a hold, which would mean teaching every backend's `spend_since` to
+tell the entry kinds apart and reason about time.
 
 **The protocol is synchronous.** A backend whose client is async wraps it, running
 the coroutine to completion inside the method. Every caller in the engine is
@@ -305,6 +384,27 @@ This is why construction is not a second, unchecked obligation: with it, "the
 conformance suite is green" still means your backend is both correct and
 constructable. Without it, the suite proves behavior only, and a backend can pass
 every assertion here and still fail the moment configuration names it.
+
+**If your backend serves concurrent requests**, mix in `SpendLockContract` the
+same way, and it checks all three properties from
+[Serializing the spend admission](#serializing-the-spend-admission), including
+the scope one:
+
+```python
+from exmergo_dex_core.storage.conformance import ExploreStoreContract, SpendLockContract
+
+
+class TestMyStore(SpendLockContract, ExploreStoreContract):
+    def make_store(self, key):
+        return MyStore(tenant=key)
+```
+
+It exercises threads, because that is the population a suite can portably create.
+If your backend spans processes or hosts, the lock has to reach whatever your own
+substrate offers (an advisory file lock, a transaction, a conditional write) and
+this contract cannot tell the difference. That gap is real, and it is why the two
+shipped backends carry cross-process assertions of their own rather than treating
+a green contract as the whole answer.
 
 ## Which calls need nothing on the filesystem
 
