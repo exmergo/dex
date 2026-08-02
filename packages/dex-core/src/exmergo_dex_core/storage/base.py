@@ -21,6 +21,12 @@ two shipped backends. :mod:`~.conformance` ships the executable copy of those
 rules: subclass ``StoreContract``, hand it a factory, and the whole contract runs
 against your backend. ``references/storage.md`` is the prose version.
 
+**Serializing the spend admission is a separate, optional capability**,
+:class:`SpendLock`, and a backend serving concurrent requests wants it: without
+one the cumulative session ceiling does not bind across overlapping billed
+commands, and dex warns on every such command rather than letting the ceiling
+look enforced.
+
 **Constructing one is a separate contract**, :class:`StoreFactory` over a
 :class:`StoreContext`, and it is optional. A host that passes its own instance to
 the engine never needs it; it exists so a backend can also be *named* somewhere
@@ -37,6 +43,7 @@ surface would double the contract for no caller that exists.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -158,6 +165,16 @@ class ExploreStore(Protocol):
         The ledger is the audit trail for warehouse spend and the substrate for
         the cumulative session budget: byte counts, job ids, and statement
         hashes only, never SQL values or credentials.
+
+        **A backend stores entries; it does not interpret them.** Entries carry
+        an ``entry`` kind (``reservation``, ``settlement``, ``release``) and a
+        ``reservation_id`` tying the three together, because the cumulative
+        ceiling holds headroom for a command that has been admitted but has not
+        finished paying. A release carries a negative magnitude, which is the
+        one thing worth knowing here: **a backend must not assume the magnitude
+        is positive**, and one that clamps or filters would leak held headroom
+        for the rest of the UTC day. Sum what you are given, the way
+        :func:`spend_total` does.
         """
         ...
 
@@ -191,17 +208,28 @@ class ExploreStore(Protocol):
         ledger line means one spend record is lost, and refusing to run every
         subsequent billed command because of one bad line is the worse failure.
 
-        **Concurrency.** The cost gate calls this and then calls
-        :meth:`append_spend_log`, and that read-then-write is not atomic at the
-        protocol level. The cumulative session ceiling therefore binds exactly
-        when commands are serialized, which is the CLI's one-command-per-process
-        shape, and under genuinely concurrent commands the overshoot is bounded
-        by the sum of the concurrent estimates. A backend that can make the pair
-        atomic for one key (a transaction, a conditional write) should, and a
-        multi-tenant backend serving concurrent requests per tenant is where that
-        stops being optional. The protocol does not grow a member for it, because
-        an optional member no implementer can rely on is worse than a stated
-        bound.
+        **What the total means depends on when you read it.** The cost gate
+        books a reservation at the estimate when it admits a command and
+        releases it when the command settles, so a day already finished sums to
+        actual spend, exactly as it always has, while a day with commands still
+        running sums to actual spend plus the headroom those commands hold. The
+        second is not an accounting error; it is the number a concurrent command
+        has to see for the ceiling to bind.
+
+        **Concurrency, and how a backend opts into the guarantee.** The gate
+        reads this and then appends, and that read-then-write has to be atomic
+        for the cumulative ceiling to bind. Implement :class:`SpendLock` and the
+        gate serializes the pair through it. Without one the gate still reserves,
+        which narrows the window from the duration of a warehouse query to the
+        few microseconds between the read and the append, and it **warns on
+        every billed command** that the cumulative ceiling is not enforced on
+        this backend. A guard that is narrower than it looks is worse than one
+        that is absent, so the narrowing is reported rather than assumed.
+
+        The capability is deliberately separate from the tiers: a store is
+        useful without it, and the reason an optional member is tolerable here
+        is that dex detects its absence and says so, rather than relying on
+        every implementer to have read a paragraph.
         """
         ...
 
@@ -259,6 +287,38 @@ class Store(MaintainStore, Protocol):
         ...
 
     def plan_locator(self, plan_id: str) -> str: ...
+
+
+@runtime_checkable
+class SpendLock(Protocol):
+    """Optional: serialize the spend admission so the cumulative ceiling binds.
+
+    One method, on top of any tier. A store that has it lets the cost gate make
+    "read the day's spend, decide, book the headroom" one indivisible step, which
+    is what stops two concurrent billed commands being admitted against the same
+    headroom. A store without it still works, and every billed command run
+    against it warns that the cumulative ceiling is advisory there.
+
+    **The scope to lock is the ledger this store reads, and nothing wider.** The
+    gate holds it for the few microseconds around the decision and never across
+    a warehouse query, so locking the whole backend would serialize commands that
+    have no reason to wait for each other. Two stores keyed differently must not
+    contend: that is the same isolation the tier contracts already require, and a
+    lock is the one place it is easy to forget, since a single global mutex looks
+    correct in a single-tenant test.
+
+    It must be **reentrant for one holder**. The gate settles from more than one
+    funnel and a settle inside an already-held section is expected rather than a
+    deadlock to design around.
+
+    Raise the builtin :class:`TimeoutError` when ``timeout`` elapses. The gate
+    turns that into a named refusal carrying the cost; the builtin is what the
+    protocol asks for so a backend needs no import from dex to satisfy it.
+    """
+
+    def spend_lock(self, *, timeout: float = 30.0) -> AbstractContextManager[None]:
+        """Hold the spend-admission lock for this store's ledger."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -332,6 +392,11 @@ def spend_total(
     the ledger is stored. String comparison on ``at`` is correct because every
     stamp is written by dex in the same UTC ISO format. Malformed entries are
     skipped rather than poisoning the budget check.
+
+    A plain sum, negatives included: a release is a reservation entry with the
+    sign flipped, so the three entry kinds net out to actual spend with no
+    branch on kind here. That is why adding reservations did not change what any
+    existing backend's ``spend_since`` returns for a settled day.
     """
 
     total = 0.0
