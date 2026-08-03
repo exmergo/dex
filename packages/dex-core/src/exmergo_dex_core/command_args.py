@@ -255,10 +255,17 @@ def stamp_spend(result: Result, adapter: Adapter) -> Result:
     result already carrying a cost (a phase checkpoint priced its own ask) keeps
     it; only the spend summary is refreshed. Free connectors have no gate and so
     report no spend at all, rather than a row of zeroes.
+
+    This is the settlement funnel for every billed command that returns a
+    result, so it is where the gate releases the headroom it booked to be
+    admitted. Settling before reading the summary is what makes
+    ``session_spent_today`` the day's total rather than this command's share of
+    it.
     """
 
     gate = cost_gate(adapter)
     if gate is not None:
+        gate.settle()
         if result.cost.estimate is None:
             result.cost = gate.cost()
         spend = gate.spend_summary()

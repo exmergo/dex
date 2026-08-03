@@ -8,6 +8,7 @@ Layout (all non-secret, committed to the user's repo):
     .dex/drift.json     the last drift-detection report (see maintain/drift.py)
     .dex/queries.jsonl  the append-only `explore query` decision ledger
     .dex/spend.jsonl    the append-only billed-command ledger
+    .dex/spend.lock     an empty file; the spend-admission lock is held on it
     .dex/plans/*.json   the stored transform plans
 
 State on disk is what lets the CLI subcommands stay stateless: the agent
@@ -22,6 +23,10 @@ This module is the only place in the engine that knows these file names.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -41,7 +46,71 @@ SNAPSHOT_FILE = "snapshot.json"
 DRIFT_FILE = "drift.json"
 QUERIES_FILE = "queries.jsonl"
 SPEND_FILE = "spend.jsonl"
+SPEND_LOCK_FILE = "spend.lock"
 PLANS_DIR = "plans"
+
+# One re-entrant lock per resolved `.dex/` path, shared by every store instance
+# addressing it. The OS lock below is what serializes separate processes; this is
+# what serializes threads inside one, and it is not redundant with it: a POSIX
+# `flock` is held by the open file description, so two threads opening the same
+# lock file each get their own and neither waits for the other.
+_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+def _process_lock(key: str) -> threading.RLock:
+    with _PROCESS_LOCKS_GUARD:
+        lock = _PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROCESS_LOCKS[key] = lock
+        return lock
+
+
+# Re-entrancy is tracked per thread rather than left to the RLock, because the OS
+# lock is not re-entrant the way the RLock is: a second `flock` from the same
+# process on a second descriptor for the same file blocks forever. So a nested
+# acquisition takes the fast path and touches no descriptor at all.
+_HELD = threading.local()
+
+
+def _held_depths() -> dict[str, int]:
+    depths = getattr(_HELD, "depths", None)
+    if depths is None:
+        depths = {}
+        _HELD.depths = depths
+    return depths
+
+
+try:  # POSIX
+    import fcntl
+
+    def _lock_descriptor(handle) -> bool:
+        """True when the exclusive lock was taken, False when someone holds it."""
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    def _unlock_descriptor(handle) -> None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+except ImportError:  # Windows
+    import msvcrt
+
+    def _lock_descriptor(handle) -> bool:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    def _unlock_descriptor(handle) -> None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
 
 _DOCUMENT_FILES = {
     Document.CACHE: CACHE_FILE,
@@ -152,6 +221,59 @@ class FilesystemStore:
             except json.JSONDecodeError:
                 continue
         return spend_total(entries, cutoff_iso, field=field, connector=connector)
+
+    @contextmanager
+    def spend_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
+        """Serialize the spend admission across every process holding this root.
+
+        Two locks, because the CLI runs one command per process while a host can
+        run several engines in one. An advisory `flock` on `.dex/spend.lock`
+        keeps processes apart; a per-path re-entrant lock keeps threads apart,
+        and it is genuinely needed rather than belt-and-braces, since a POSIX
+        lock belongs to the open file description and two threads opening the
+        same file would each get their own and neither would wait.
+
+        The lock file is created and never removed. Unlinking it is what would
+        break this: the lock is on the inode, so a holder and a waiter that
+        opened it either side of a delete would hold two different files and both
+        proceed. An empty file per repo is cheaper than that failure.
+        """
+
+        self.dex_dir.mkdir(parents=True, exist_ok=True)
+        path = self.dex_dir / SPEND_LOCK_FILE
+        key = str(path)
+        depths = _held_depths()
+        if depths.get(key, 0):
+            depths[key] += 1
+            try:
+                yield
+            finally:
+                depths[key] -= 1
+            return
+
+        deadline = time.monotonic() + timeout
+        if not _process_lock(key).acquire(timeout=max(timeout, 0.0)):
+            raise TimeoutError(
+                f"waited {timeout}s for the spend lock at {path} and another "
+                "thread still holds it"
+            )
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                while not _lock_descriptor(handle):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"waited {timeout}s for the spend lock at {path} and "
+                            "another process still holds it"
+                        )
+                    time.sleep(0.01)
+                depths[key] = 1
+                try:
+                    yield
+                finally:
+                    depths[key] = 0
+                    _unlock_descriptor(handle)
+        finally:
+            _process_lock(key).release()
 
     # --- plans ----------------------------------------------------------------
 

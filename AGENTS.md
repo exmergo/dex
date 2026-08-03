@@ -151,7 +151,12 @@ them.
    handshake and instead states, explicitly and on every result, that the cost
    guard is unavailable and spend is governed by the dbt Cloud environment, not
    by dex. The local backend (`--local`) executes through dex's own connector and
-   keeps the full cost-before-spend handshake.
+   keeps the full cost-before-spend handshake. `budget.session_ceiling` binds
+   across commands that overlap in time as well as across commands that follow
+   one another: an admitted command books its estimate against the day's
+   headroom before it runs, so issuing several billed commands at once cannot
+   spend the same budget twice. If a cache backend cannot serialize that, every
+   billed command says so.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.

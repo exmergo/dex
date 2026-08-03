@@ -246,6 +246,105 @@ def test_a_refusal_never_reports_a_metered_connector_as_free(paradigm, monkeypat
     assert no_ceiling.cost.paradigm is paradigm
 
 
+@pytest.mark.parametrize("backend", ["filesystem", "memory"])
+def test_two_concurrent_billed_commands_cannot_both_pass_one_session_ceiling(
+    tmp_path, backend
+):
+    """The cumulative ceiling binds across commands, not only within one.
+
+    The guard used to read the day's spend once when a gate was built and decide
+    the whole command from that reading, so two commands overlapping in time were
+    admitted against the same headroom. Reproduced live on BigQuery: a sequential
+    pair refused as designed, the same pair issued concurrently both ran, and the
+    ledger finished 15.3% over a seeded `session_ceiling`. Nothing looked wrong
+    afterwards, because every entry in that ledger was true.
+
+    Here rather than only in the cost-guard suite because a ceiling that reports
+    a number which did not bind is a safety regression, not a bug: it is the
+    control the published cost claim rests on.
+    """
+
+    import threading
+
+    from exmergo_dex_core.config import Budget, DexConfig
+    from exmergo_dex_core.connect import new_cost_gate
+    from exmergo_dex_core.guards.cost_guard import CostGuardError, utc_day_start
+
+    store = FilesystemStore(tmp_path) if backend == "filesystem" else MemoryStore()
+    config = DexConfig(
+        connector="bigquery", budget=Budget(ceiling=1_000.0, session_ceiling=1_000.0)
+    )
+    # Every gate is built before any of them admits, which is what makes this an
+    # honest test of the race rather than of thread scheduling: all four read the
+    # same empty ledger, and under the old design that reading was the whole basis
+    # for every decision that followed.
+    gates = [
+        new_cost_gate(
+            "bigquery", config, store, confirmed=True, command="explore profile"
+        )
+        for _ in range(4)
+    ]
+    admitted: list[bool] = []
+    ready = threading.Barrier(len(gates))
+
+    def run(gate):
+        ready.wait()
+        try:
+            gate.preflight_command(600.0)
+        except CostGuardError:
+            return
+        try:
+            gate.record_billed(500.0, statement="select 1")
+            admitted.append(True)
+        finally:
+            gate.settle()
+
+    threads = [threading.Thread(target=run, args=(g,)) for g in gates]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(admitted) == 1
+    settled = store.spend_since(
+        utc_day_start(), field="billed_bytes", connector="bigquery"
+    )
+    assert settled <= 1_000.0
+
+
+def test_every_shipped_store_can_serialize_the_spend_admission(tmp_path):
+    """A ceiling dex cannot enforce has to be one dex reports it cannot enforce.
+
+    Both shipped backends carry the lock, so the CLI and the default library path
+    are safe by default rather than safe by documentation. A backend without one
+    still runs, and every billed command against it says the cumulative ceiling is
+    advisory there, which is the same rule the rest of the guard follows: a
+    control that is narrower than it looks is worse than one that is absent.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.storage import SpendLock
+
+    for store in (FilesystemStore(tmp_path), MemoryStore()):
+        assert isinstance(store, SpendLock), type(store).__name__
+
+    def gate(lock):
+        return CostGate(
+            paradigm=env.Paradigm.BYTES_SCANNED,
+            ceiling=10.0,
+            session_ceiling=1_000.0,
+            session_spent=0.0,
+            confirmed=True,
+            connector="bigquery",
+            record=lambda entry: None,
+            lock=lock,
+        )
+
+    assert gate(FilesystemStore(tmp_path).spend_lock).warnings() == []
+    unguarded = gate(None).warnings()
+    assert len(unguarded) == 1 and "spend lock" in unguarded[0]
+
+
 def test_a_scope_flag_cannot_widen_the_committed_allowlist():
     """The source allowlist in .dex/config.yml is a committed cost boundary. A
     per-command flag scopes work inside it and can never reach outside it, on any

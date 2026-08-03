@@ -17,10 +17,10 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core.storage import FilesystemStore, MemoryStore
-from exmergo_dex_core.storage.conformance import StoreContract
+from exmergo_dex_core.storage.conformance import SpendLockContract, StoreContract
 
 
-class TestFilesystemStore(StoreContract):
+class TestFilesystemStore(SpendLockContract, StoreContract):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
         # One root per test, with the key as a subdirectory: two keys are two
@@ -31,7 +31,7 @@ class TestFilesystemStore(StoreContract):
         return FilesystemStore(self.root / key)
 
 
-class TestMemoryStore(StoreContract):
+class TestMemoryStore(SpendLockContract, StoreContract):
     def make_store(self, key: str) -> MemoryStore:
         # Nothing to key on: a MemoryStore's state is the instance, so a distinct
         # instance is a distinct key by construction.

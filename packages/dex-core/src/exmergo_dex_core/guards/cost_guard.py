@@ -15,12 +15,22 @@ numeric budget is optional, but the confirm handshake still runs so the gating
 path is exercised on every connector. Billed paradigms require both a ceiling and
 confirmation. DuckDB resource bounds (memory, threads, read-only) are enforced by
 the adapter, not here.
+
+**The cumulative ceiling is settled against the ledger, so admitting a command
+has to be atomic with booking its headroom.** Reading the day's spend and then
+deciding leaves a window in which a second command reads the same number and
+decides the same way, and both are then legal individually and wrong together.
+So an admitted command writes a reservation at its estimate before it runs and
+releases it when it settles, both under the store's spend lock. See
+:meth:`CostGate.settle` for what an interrupted command leaves behind.
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import UTC, datetime
 
 from ..envelope import Cost, Paradigm
@@ -49,6 +59,16 @@ class OverCeilingError(CostGuardError):
 
 class CeilingRequiredError(CostGuardError):
     """A billed paradigm was invoked with no ceiling; nothing runs without one."""
+
+
+class SpendLockTimeoutError(CostGuardError):
+    """The spend-admission lock could not be taken, so nothing was admitted.
+
+    A refusal rather than a proceed-anyway, because the lock is the thing that
+    makes the cumulative ceiling bind: running without it is the defect this
+    guard exists to close. It is also the recoverable kind of refusal, since
+    whatever holds the lock is a billed command that will finish.
+    """
 
 
 class ConfirmationRequiredError(CostGuardError):
@@ -155,6 +175,38 @@ def no_session_ceiling_warning(
     ]
 
 
+def unserialized_ledger_warning(
+    paradigm: Paradigm, session_ceiling: float | None, serialized: bool
+) -> list[str]:
+    """The warning a billed command carries when its store cannot serialize the
+    spend admission.
+
+    Only when a cumulative ceiling is actually set: with none, there is nothing
+    for the lock to protect and :func:`no_session_ceiling_warning` is already
+    saying the more useful thing. Both shipped backends implement the lock, so
+    this is silent unless a host selected a backend of its own.
+
+    A warning rather than a refusal, which is the same call made for an unset
+    cumulative ceiling: refusing would break a host whose backend predates the
+    capability, and the reservation still narrows the race from the length of a
+    warehouse query to the microseconds around the ledger read.
+
+    Module level beside its siblings for the reason this file already documents:
+    ``transform build`` prices itself outside the gate and has to reach the same
+    sentence.
+    """
+
+    if paradigm is Paradigm.FREE_LOCAL or session_ceiling is None or serialized:
+        return []
+    return [
+        "the cumulative spend ceiling is advisory on this cache backend: it "
+        "does not implement the optional spend lock, so two overlapping billed "
+        "commands can be admitted against the same headroom and the day's total "
+        "can exceed budget.session_ceiling. Select a backend that implements it "
+        "(both backends dex ships do), or run billed commands one at a time"
+    ]
+
+
 def preflight(
     estimate: float | None,
     ceiling: float | None,
@@ -199,6 +251,13 @@ class CostGate:
     without a ceiling. Billed bytes are appended to the ``.dex/spend.jsonl``
     ledger through ``record`` (functional DI), and the session ceiling is
     settled against spend already in that ledger.
+
+    Three functional dependencies rather than a store, because the gate needs
+    three verbs and a store is sixteen: ``read_session_spent`` for the day's
+    total, ``record`` to append, ``lock`` to make the pair of them atomic. A
+    caller with no ledger (DuckDB, and any gate built directly) passes a plain
+    float for the first and omits the other two, which is why those paths need
+    no store at all.
     """
 
     def __init__(
@@ -207,23 +266,113 @@ class CostGate:
         paradigm: Paradigm,
         ceiling: float | None,
         session_ceiling: float | None,
-        session_spent: float,
+        session_spent: float | Callable[[], float],
         confirmed: bool,
         connector: str,
         command: str | None = None,
         record: Callable[[dict], None] | None = None,
+        lock: Callable[[], AbstractContextManager[None]] | None = None,
     ):
         self.paradigm = paradigm
         self.ceiling = ceiling
         self.session_ceiling = session_ceiling
-        self.session_spent = session_spent
         self.confirmed = confirmed
         self.connector = connector
         self.command = command
         self._record = record
+        self._lock = lock
         self._estimated = 0.0
         self._billed = 0.0
         self._command_estimate: float | None = None
+        # What this gate has itself appended to the ledger, netted. Subtracted
+        # from every live reading so `session_spent` keeps meaning what it meant
+        # when it was a constructor argument: the day's spend belonging to OTHER
+        # commands. Without it a gate would read its own reservation back and
+        # charge itself for it twice, and every ceiling below would tighten by
+        # its own estimate.
+        self._ledger_written = 0.0
+        self._reserved = 0.0
+        self._settled = False
+        self._reservation_id = uuid.uuid4().hex[:16]
+        self._read_session_spent: Callable[[], float] = (
+            session_spent
+            if callable(session_spent)
+            else (lambda fixed=float(session_spent): fixed)
+        )
+        self.session_spent = self._read_session_spent()
+
+    @property
+    def serialized(self) -> bool:
+        """Whether the spend admission is safe from being raced.
+
+        True with a lock, and also true with no ledger writer at all: a gate that
+        appends nowhere shares no ledger, so there is nothing for a concurrent
+        command to race it on. The second case is every free path and every gate
+        built without a store, and folding it in here is what keeps those from
+        warning about a ledger they do not have.
+        """
+
+        return self._lock is not None or self._record is None
+
+    @contextmanager
+    def _admission(self) -> Iterator[None]:
+        """The critical section around read, decide, and book.
+
+        Held for the decision only, never across a warehouse query: a lock that
+        spans execution would serialize commands that have no reason to wait for
+        each other, and would ask a hosted backend to hold one for minutes.
+        """
+
+        try:
+            with self._lock() if self._lock is not None else nullcontext():
+                self._refresh()
+                yield
+        except TimeoutError as exc:
+            raise SpendLockTimeoutError(
+                f"could not take the spend lock ({exc}); another billed command "
+                "is being admitted. Nothing ran, so re-issuing the same command "
+                "is safe",
+                cost=Cost(
+                    paradigm=self.paradigm,
+                    estimate=self._command_estimate,
+                    ceiling=self.ceiling,
+                ),
+            ) from exc
+
+    def _refresh(self) -> None:
+        self.session_spent = self._read_session_spent() - self._ledger_written
+
+    def _append(self, kind: str, amount: float, **extra) -> None:
+        if self._record is None:
+            return
+        self._record(
+            {
+                "at": datetime.now(UTC).isoformat(),
+                "connector": self.connector,
+                "command": self.command,
+                "entry": kind,
+                "reservation_id": self._reservation_id,
+                self.ledger_field(): amount,
+                **extra,
+            }
+        )
+        self._ledger_written += amount
+
+    def _reserve_to(self, target: float) -> None:
+        """Hold ``target`` of the day's headroom, topping up what is held.
+
+        Only with a cumulative ceiling set: a reservation exists to be seen by a
+        concurrent command settling against ``session_ceiling``, so with none
+        there is nothing it could protect, and writing one anyway would put a
+        number in the ledger that no ceiling reads. That keeps the ledger
+        byte-identical for every project that never set a daily cap.
+        """
+
+        if self.session_ceiling is None or self.paradigm is Paradigm.FREE_LOCAL:
+            return
+        if target > self._reserved:
+            self._append("reservation", target - self._reserved)
+            self._reserved = target
 
     def effective_ceiling(self) -> float | None:
         """The binding ceiling: the per-command budget or what remains of the
@@ -249,25 +398,35 @@ class CostGate:
         over-ceiling estimate still refuses first (confirmation cannot
         override it), and a confirmed run without a ceiling still refuses:
         nothing executes unbudgeted.
+
+        The whole check runs inside the admission section, against a reading
+        taken there rather than at construction, and an admitted command books
+        its estimate before the section ends. **A refusal books nothing**: every
+        branch below leaves through the exception, so an unconfirmed handshake
+        (much the most common outcome, since it is how every billed command
+        starts) touches the ledger not at all.
         """
 
         self._command_estimate = estimate
-        ceiling = self.effective_ceiling()
-        cost = Cost(paradigm=self.paradigm, estimate=estimate, ceiling=ceiling)
-        if ceiling is not None and estimate > ceiling:
-            raise OverCeilingError(
-                f"estimated cost {estimate} exceeds the ceiling {ceiling} "
-                f"({self.paradigm.value}); raise the budget or narrow the work",
-                cost=cost,
-            )
-        if not self.confirmed:
-            raise ConfirmationRequiredError(cost)
-        if self.paradigm is not Paradigm.FREE_LOCAL and ceiling is None:
-            raise CeilingRequiredError(
-                f"no ceiling set for a {self.paradigm.value} connector; pass "
-                "--budget or set one in .dex/config.yml",
-                cost=cost,
-            )
+        with self._admission():
+            ceiling = self.effective_ceiling()
+            cost = Cost(paradigm=self.paradigm, estimate=estimate, ceiling=ceiling)
+            if ceiling is not None and estimate > ceiling:
+                raise OverCeilingError(
+                    f"estimated cost {estimate} exceeds the ceiling {ceiling} "
+                    f"({self.paradigm.value}); raise the budget or narrow the "
+                    "work",
+                    cost=cost,
+                )
+            if not self.confirmed:
+                raise ConfirmationRequiredError(cost)
+            if self.paradigm is not Paradigm.FREE_LOCAL and ceiling is None:
+                raise CeilingRequiredError(
+                    f"no ceiling set for a {self.paradigm.value} connector; pass "
+                    "--budget or set one in .dex/config.yml",
+                    cost=cost,
+                )
+            self._reserve_to(estimate)
         return cost
 
     def preflight_phase(self, estimate: float) -> Cost:
@@ -280,26 +439,52 @@ class CostGate:
         budget directly from it. Raises :class:`ConfirmationRequiredError`
         rather than :class:`OverCeilingError` because a bigger budget on
         re-run can cover it; ``needs_confirmation`` is the recovery channel.
+
+        An admitted phase extends the reservation rather than adding a second
+        one, because the command holds one hold for its whole life and the
+        phase raises what that hold is worth.
         """
 
-        ceiling = self.effective_ceiling()
-        needed = self._estimated + estimate
-        cost = Cost(paradigm=self.paradigm, estimate=needed, ceiling=ceiling)
-        if ceiling is not None and needed > ceiling:
-            raise ConfirmationRequiredError(cost)
+        with self._admission():
+            ceiling = self.effective_ceiling()
+            needed = self._estimated + estimate
+            cost = Cost(paradigm=self.paradigm, estimate=needed, ceiling=ceiling)
+            if ceiling is not None and needed > ceiling:
+                raise ConfirmationRequiredError(cost)
+            self._reserve_to(needed)
         return cost
 
     def charge(self, estimate: float) -> None:
         """Gate one statement on the confirmed run. Accumulates estimates so a
-        sequence of statements is bounded as a whole, not just individually."""
+        sequence of statements is bounded as a whole, not just individually.
 
-        preflight(
-            self._estimated + estimate,
-            self.effective_ceiling(),
-            paradigm=self.paradigm,
-            confirmed=self.confirmed,
-        )
-        self._estimated += estimate
+        A statement inside what the command already booked takes the cheap local
+        path: the headroom is held, so no reading can change whether it fits.
+        **An estimate that drifts past the booking is re-admitted** against a
+        live reading instead, because past that point the command is asking for
+        headroom it never reserved, and the frozen reading it was admitted on
+        cannot see what a concurrent command has taken since. Only the drift pays
+        for the lock, and drift is the exception rather than the rule.
+        """
+
+        needed = self._estimated + estimate
+        if self._reserved and needed > self._reserved:
+            with self._admission():
+                preflight(
+                    needed,
+                    self.effective_ceiling(),
+                    paradigm=self.paradigm,
+                    confirmed=self.confirmed,
+                )
+                self._reserve_to(needed)
+        else:
+            preflight(
+                needed,
+                self.effective_ceiling(),
+                paradigm=self.paradigm,
+                confirmed=self.confirmed,
+            )
+        self._estimated = needed
 
     def try_charge(self, estimate: float) -> bool:
         """Non-raising :meth:`charge` for optional spend (e.g. distinct-count
@@ -315,9 +500,20 @@ class CostGate:
         """The server-side cap for the next statement, in the paradigm's unit
         (bytes for ``maximum_bytes_billed``, seconds for a statement timeout):
         what remains of the effective ceiling after everything already charged.
+
+        Bounded by the booking as well as by the ceiling, when there is one. The
+        two differ exactly when another command is holding headroom, and handing
+        the warehouse the wider of them is how the backstop that is supposed to
+        bind when an estimate is wrong ends up permitting the pair to overspend
+        together. :meth:`charge` widens the booking when the estimate genuinely
+        drifts, so this tightens the cap without capping honest work.
         """
 
         ceiling = self.effective_ceiling()
+        if self._reserved:
+            ceiling = (
+                self._reserved if ceiling is None else min(ceiling, self._reserved)
+            )
         if ceiling is None:
             return None
         return max(int(ceiling - self._billed), 0)
@@ -335,31 +531,65 @@ class CostGate:
         so anything the caller would wrongly assume is enforced belongs here.
         """
 
-        return no_session_ceiling_warning(self.paradigm, self.session_ceiling)
+        return [
+            *no_session_ceiling_warning(self.paradigm, self.session_ceiling),
+            *unserialized_ledger_warning(
+                self.paradigm, self.session_ceiling, self.serialized
+            ),
+        ]
 
     def record_billed(
         self, billed: float, *, job_id: str | None = None, statement: str = ""
     ) -> None:
         """Account one executed statement's actual spend and append it to the
         ledger. Statements are stored as a hash, never as text, so the ledger
-        can hold no values."""
+        can hold no values.
+
+        Deliberately outside the admission lock. This is a pure append with
+        nothing read back, so it races nothing, and taking the lock here would
+        hold it once per statement on a path that runs while the warehouse is
+        working.
+        """
 
         self._billed += billed
-        if self._record is not None:
-            self._record(
-                {
-                    "at": datetime.now(UTC).isoformat(),
-                    "connector": self.connector,
-                    "command": self.command,
-                    self.ledger_field(): billed,
-                    "job_id": job_id,
-                    "statement_sha256": hashlib.sha256(
-                        statement.encode("utf-8")
-                    ).hexdigest()[:16]
-                    if statement
-                    else None,
-                }
-            )
+        self._append(
+            "settlement",
+            billed,
+            job_id=job_id,
+            statement_sha256=hashlib.sha256(statement.encode("utf-8")).hexdigest()[:16]
+            if statement
+            else None,
+        )
+
+    def settle(self) -> None:
+        """Release the unspent hold and re-read the day, once per command.
+
+        Called from the command layer's settlement funnel, from the engine when
+        it rebuilds a gate, and from engine shutdown, so an interrupted command
+        releases as reliably as a completed one. Idempotent, because those three
+        overlap by design rather than by accident.
+
+        **A process killed outright leaves its reservation standing**, and it
+        holds the estimate against the day's headroom until the UTC rollover.
+        That is the safe direction for a spend guard and it is why there is no
+        expiry: expiring a hold would mean teaching every backend's
+        ``spend_since`` to tell the entry kinds apart and reason about time,
+        which is a protocol change for a case the three funnels already cover.
+        """
+
+        if self._settled:
+            return
+        self._settled = True
+        # Entering the section re-reads the day, which is what makes
+        # `spend_summary` report the true total rather than this command's view
+        # of it. Releasing after that needs no second read: the release lowers
+        # the live total and this gate's own written total by the same amount,
+        # so the difference between them, which is what `session_spent` holds,
+        # does not move.
+        with self._admission():
+            if self._reserved:
+                self._append("release", -self._reserved)
+                self._reserved = 0.0
 
     def cost(self) -> Cost:
         """The preflight cost to stamp into the envelope: the whole-command
@@ -380,7 +610,15 @@ class CostGate:
     def spend_summary(self) -> dict:
         """Actual spend for the envelope's ``data`` (the ``cost`` field stays a
         preflight estimate by contract). Key names deliberately avoid every
-        envelope-sanitizer pattern and carry the paradigm's unit."""
+        envelope-sanitizer pattern and carry the paradigm's unit.
+
+        ``session_spent_today`` is the day's total across every command, not
+        this one's contribution to it, which is why it is read after
+        :meth:`settle`: the sum of what other commands have settled plus what
+        this one just did. Two commands running at once used to report their own
+        spend under a name that promised the day's, so a caller reading either
+        one saw a fraction of the truth.
+        """
 
         return {
             spend_field(self.paradigm): self._billed,

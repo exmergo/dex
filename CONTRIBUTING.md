@@ -250,6 +250,13 @@ reset hook to keep one assertion's writes out of the next.
 `references/storage.md` covers the tiers, the contracts that are not obvious from
 the signatures, and which calls need nothing on the filesystem.
 
+If your backend can be reached by more than one command at a time, also
+implement `spend_lock` and mix in `SpendLockContract`. It is the one optional
+capability whose absence costs correctness: without it two overlapping billed
+commands are admitted against the same headroom and `budget.session_ceiling`
+does not bind. dex says so on every billed result rather than assuming it, so a
+backend without one is honest rather than silently broken.
+
 Backends contributed here run the same suite: see
 `packages/dex-core/tests/storage/test_parity.py`, which is deliberately the same
 three lines a third party writes.

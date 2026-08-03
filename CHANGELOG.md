@@ -9,6 +9,87 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`budget.session_ceiling` now binds under concurrency** ([#159]). The cost
+  gate read the day's spend once, when it was built, and every ceiling decision
+  for the life of that gate derived from that one reading. Two billed commands
+  overlapping in time were therefore admitted against the same headroom. Nothing
+  looked wrong afterwards: every ledger entry was well-formed and true, and only
+  the aggregate was over budget.
+
+  Re-verified live at 1.5.0 on BigQuery before this was scoped. A sequential
+  pair refused exactly as designed; the same pair issued concurrently both ran,
+  and the ledger finished **15.3% over** a seeded `session_ceiling`. Two further
+  findings came out of that run. Inspecting the executed jobs showed the
+  **server-side backstop was raced too**: each command's first statement carried
+  the whole daily ceiling as its `maximum_bytes_billed`, so the warehouse-side
+  bound on the pair was twice the ceiling. And `data.spend.session_spent_today`
+  **under-reported**, because each command added its own spend to a stale
+  reading, so two concurrent commands reporting 25.2 MB and 21.0 MB had in fact
+  spent 46.1 MB between them.
+
+  The fix is not a fresher read, which is the shape the defect first suggests: a
+  read followed by a decision leaves a window in which two commands read the
+  same number and both decide yes, however recent the number is. An admitted
+  command now **books its estimate against the day's headroom before it runs**
+  and releases the unspent part when it settles, both inside a lock the store
+  provides. A refusal books nothing, so the unconfirmed handshake that begins
+  every billed command stays a pure read. `transform build` reserves too, which
+  matters most there: dbt executes the statements, so nothing reached the ledger
+  until the run finished and a build's headroom looked free for as long as it
+  ran.
+
+  The server-side cap is bounded by the booking as well as by the ceiling, which
+  is what closes the warehouse-side half. Two commands admitted together now
+  carry caps that sum to at most the ceiling, verified on the live jobs, where
+  before both carried the whole of it. A command whose estimate drifts past what
+  it booked is re-admitted against a live reading rather than spending into
+  headroom another command holds, so drift is still allowed to use budget that
+  is genuinely free and no longer able to use budget that is not.
+
+  Ledger entries gain an `entry` kind (`reservation`, `settlement`, `release`)
+  and a `reservation_id`. A release is negative, so **a day that has finished
+  sums to actual spend exactly as before**, and no consumer summing settled
+  spend sees a different number; a day with commands still running sums to
+  actual spend plus the headroom they hold, which is the number a concurrent
+  command has to see. `spend_since` is unchanged, so every storage backend
+  written before this keeps working untouched.
+
+  A process killed outright cannot release, and its reservation then stands
+  until the UTC rollover. That is deliberate and it is the safe direction for a
+  spend guard. Every softer exit releases: the settlement funnel, the engine
+  rebuilding a gate, and engine shutdown, which the CLI calls from a `finally`.
+
+### Added
+
+- **`SpendLock`, an optional storage capability** ([#159]). A store that
+  implements `spend_lock` lets dex make the spend admission atomic. Both shipped
+  backends implement it, so the CLI and the default library path are safe by
+  default rather than safe by documentation: the filesystem backend takes an
+  advisory lock on `.dex/spend.lock` (plus a per-path in-process lock, since a
+  POSIX lock belongs to the open file description and would not keep two threads
+  apart), and the memory backend takes a re-entrant lock.
+
+  It sits beside the tiers rather than inside them, and a backend without one
+  still runs: dex reserves regardless, which narrows the race from the duration
+  of a warehouse query to the microseconds around the ledger read, and **every
+  billed command warns that the cumulative ceiling is advisory on that
+  backend**. A warning rather than a refusal, matching the call already made for
+  a `session_ceiling` nobody set.
+
+  This reverses a decision recorded on the protocol, which said it would not
+  grow a member for atomicity because an optional member no implementer can rely
+  on is worse than a stated bound. That holds for a member dex would use
+  silently; it does not hold for one dex detects and reports, because a caller
+  is then never told a ceiling bound when it did not.
+
+  `SpendLockContract` ships in the conformance suite alongside the tier
+  contracts. It checks that the lock excludes, that it is re-entrant for one
+  holder, and that it is scoped to the ledger rather than to the backend, the
+  last being the failure a single-tenant test cannot see: a global mutex passes
+  the first two and serializes every tenant in a deployment.
+
 ## [1.5.0] - 2026-08-01
 
 ### Added

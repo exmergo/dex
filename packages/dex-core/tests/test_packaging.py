@@ -437,15 +437,18 @@ def test_the_wheel_ships_the_typed_marker(wheel: str):
 # no full-tier or hosted implementer could get green.
 OUTSIDE_FULL_BACKEND = '''
 import json
+import threading
 
 from exmergo_dex_core.cache import DexCache
 from exmergo_dex_core.storage import (
     Document,
+    SpendLock,
     Store,
     StoreContext,
     spend_total,
 )
 from exmergo_dex_core.storage.conformance import (
+    SpendLockContract,
     StoreContract,
     StoreFactoryContract,
 )
@@ -460,9 +463,20 @@ class TinyStore:
 
     _state: dict = {}
 
+    _locks: dict = {}
+    _locks_guard = threading.Lock()
+
     def __init__(self, key):
         self.key = key
         self._docs = self._state.setdefault(key, {})
+
+    def spend_lock(self, *, timeout=30.0):
+        # Per key, not per backend: two tenants must not wait on each other. A
+        # single module-level lock passes the exclusion assertions and quietly
+        # serializes every tenant in the deployment.
+        with self._locks_guard:
+            lock = self._locks.setdefault(self.key, threading.RLock())
+        return lock
 
     def load_cache(self):
         raw = self._docs.get("cache")
@@ -549,9 +563,10 @@ def tiny_store_factory(context):
 
 def test_the_published_protocol_is_satisfied():
     assert isinstance(TinyStore("k"), Store)
+    assert isinstance(TinyStore("k"), SpendLock)
 
 
-class TestTinyStore(StoreContract):
+class TestTinyStore(SpendLockContract, StoreContract):
     def make_store(self, key):
         return TinyStore(key)
 
