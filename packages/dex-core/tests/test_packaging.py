@@ -182,6 +182,11 @@ def test_an_install_that_cannot_parse_sql_refuses_and_names_the_fix(wheel: str):
     assert "No module named" not in message, (
         f"the refusal must name the extra, not the missing module: {message}"
     )
+    # #170: classifying *why* the refusal happened must not itself import
+    # something this bare install lacks (a prior bug: reason_for's own
+    # lazy imports of connector-extra-dependent modules crashed the process
+    # instead of degrading, so the envelope above never got printed at all).
+    assert envelope["reason"] == "prerequisite", envelope
 
     # And the guard is reached before anything is opened or priced, so asking is
     # free: `ensure_available` must not need the thing whose absence it reports.

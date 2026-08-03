@@ -17,7 +17,7 @@ from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import BigQueryTarget, DexConfig
 from exmergo_dex_core.engine import DexEngine
-from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.envelope import Paradigm, Reason
 from exmergo_dex_core.explore import commands as explore_cmds
 from exmergo_dex_core.guards.cost_guard import CostGate
 from exmergo_dex_core.storage import FilesystemStore
@@ -704,6 +704,8 @@ def test_over_ceiling_refusal_reports_the_metered_paradigm(
     assert envelope.cost.ceiling == MB
     assert "exceeds the ceiling" in envelope.errors[0]
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+    # #170: a machine-readable reason alongside the prose.
+    assert envelope.reason is Reason.GUARD
 
 
 def test_no_ceiling_refusal_reports_the_metered_paradigm(
@@ -719,6 +721,8 @@ def test_no_ceiling_refusal_reports_the_metered_paradigm(
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
     assert envelope.cost.ceiling is None
     assert "no ceiling set" in envelope.errors[0]
+    # #170: a machine-readable reason alongside the prose.
+    assert envelope.reason is Reason.GUARD
 
 
 def test_budget_exhaustion_carries_both_the_ceiling_and_the_spend(

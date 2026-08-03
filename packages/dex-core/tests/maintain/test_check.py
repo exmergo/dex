@@ -11,6 +11,8 @@ def test_check_requires_a_snapshot(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "check")
     assert rc == 1 and payload["status"] == "error"
     assert "maintain snapshot" in payload["errors"][0]
+    # #170: a machine-readable reason alongside the prose.
+    assert payload["reason"] == "prerequisite"
 
 
 def test_clean_world_reports_every_axis_clean(maintain_repo):

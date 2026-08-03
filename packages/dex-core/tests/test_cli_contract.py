@@ -50,7 +50,15 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
     assert out.count("\n") == 1, "exactly one line on stdout"
     payload = json.loads(out)
     assert payload["status"] in _VALID_STATUSES
-    assert set(payload) == {"status", "data", "cost", "warnings", "diffs", "errors"}
+    assert set(payload) == {
+        "status",
+        "data",
+        "cost",
+        "warnings",
+        "diffs",
+        "errors",
+        "reason",
+    }
     assert rc in (0, 1)
 
 

@@ -234,7 +234,7 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     except DialectDependencyError as exc:
         # A missing extra, caught before the command imported anything that needed
         # it, so nothing has been opened or priced. The message names the install.
-        return env.error(str(exc))
+        return env.error_for(exc)
     except ConfirmationRequiredError as exc:
         return env.needs_confirmation(
             exc.request.data, cost=exc.request.cost, warnings=exc.request.warnings
@@ -242,7 +242,8 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     except BudgetExhaustedError as exc:
         # Partial completion: an error, but one that reports what the attempt
         # actually cost, because that is what a caller needs to size the re-run.
-        return env.error(
+        return env.error_for(
+            exc,
             env.redact(str(exc)),
             data={"spend": exc.spend} if exc.spend else {},
             cost=exc.cost or env.Cost(),
@@ -255,7 +256,7 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # catch-all for the reason this function exists: a refusal that escapes
         # arrives with no cost at all, and an empty cost block on a spend
         # refusal reads as a claim that nothing was going to be spent.
-        return env.error(env.redact(str(exc)), cost=exc.cost or env.Cost())
+        return env.error_for(exc, env.redact(str(exc)), cost=exc.cost or env.Cost())
 
 
 def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -383,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         # has to decide whether to retry.
         if paradigm is None and getattr(args, "connector", None):
             paradigm = paradigm_for(args.connector)
-        envelope = env.error(env.redact(str(exc)))
+        envelope = env.error_for(exc, env.redact(str(exc)))
 
     # Every command runs against a connector or against none, so every envelope
     # can name the paradigm a later billed command would spend in. Filled only

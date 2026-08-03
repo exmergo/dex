@@ -72,6 +72,27 @@ class Cost(BaseModel):
     ceiling: float | None = None
 
 
+class Reason(str, Enum):
+    """Why an error envelope was refused, coarse enough for a host to branch
+    on retry/setup/stop without parsing prose. Derived from the exception's
+    class (see :func:`reason_for`), never invented per call site, so it stays
+    consistent with every refusal's typed exception as new ones are added.
+    Populated only when ``status`` is ``error``.
+    """
+
+    GUARD = "guard"  # a cost/PII/firewall/safety policy said no
+    PREREQUISITE = "prerequisite"  # run a named setup command first, then retry
+    CONNECTION = "connection"  # the warehouse/backend could not be reached
+    CONFIGURATION = (
+        "configuration"  # the engine/repo is wired without something it needs
+    )
+    REQUEST = "request"  # this call's input cannot be resolved or used
+    EXECUTION_FAILURE = (
+        "execution_failure"  # the operation ran (e.g. dbt build) and failed
+    )
+    INTERNAL = "internal"  # unclassified: not a deliberate dex refusal
+
+
 class Envelope(BaseModel):
     """The single object every command prints to stdout."""
 
@@ -82,6 +103,7 @@ class Envelope(BaseModel):
     # Reviewable diffs (propose-don't-impose). Nothing is applied just by being here.
     diffs: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    reason: Reason | None = None
 
 
 # Keys whose presence anywhere in ``data`` indicates a credential or secret has
@@ -179,6 +201,143 @@ def not_implemented(command: str) -> Envelope:
 
 def error(message: str, **kwargs: Any) -> Envelope:
     return Envelope(status=Status.ERROR, errors=[message], **kwargs)
+
+
+_reason_overrides_cache: list[tuple[type[BaseException], Reason]] | None = None
+
+
+def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
+    """Built on first use, not at import time: the exception classes it
+    references live in modules that already import this one at their own top
+    level (``explore/commands.py``, ``transform/commands.py``,
+    ``transform/build.py``, ``connect.py``, ``guards/cost_guard.py``), so
+    importing them here at module load would be circular. By the time any
+    error envelope is built, every module is already loaded, so a call-time
+    import (the same lazy-import pattern ``cli.py``'s own ``_run`` already
+    uses for command modules) is safe. Cached after the first call so the
+    import cost is paid once, not on every error envelope.
+
+    Two tiers, not one: a handful of exception families live in modules with
+    no optional-dependency imports of their own and are always available; the
+    rest live behind connector extras (sqlglot, scikit-learn, the dbt reader)
+    that a bare or partial install may not have -- and importing THOSE must
+    not itself crash the very refusal (a missing extra) that names the gap.
+    """
+
+    global _reason_overrides_cache
+    if _reason_overrides_cache is not None:
+        return _reason_overrides_cache
+
+    # Always safe: no imports of their own (`errors.py`) or explicitly
+    # designed to import without the dialect engine (`guards/dialect.py` is
+    # the module that checks whether sqlglot is even installed).
+    from .errors import (
+        ConfigurationError,
+        ConnectorError,
+        DexError,
+        PrerequisiteError,
+        RequestError,
+    )
+    from .guards.dialect import DialectDependencyError
+
+    overrides: list[tuple[type[BaseException], Reason]] = [
+        (DialectDependencyError, Reason.PREREQUISITE),
+        (PrerequisiteError, Reason.PREREQUISITE),  # CacheRequiredError, NoBaselineError
+        (ConnectorError, Reason.CONNECTION),  # every *ConnectionError subclass
+        (ConfigurationError, Reason.CONFIGURATION),
+        (RequestError, Reason.REQUEST),
+        (DexError, Reason.REQUEST),  # generic fallback for any other deliberate refusal
+        (ValueError, Reason.REQUEST),  # the pre-typed-error convention: bad input
+    ]
+
+    # Everything else pulls in a connector extra transitively (sqlglot,
+    # scikit-learn, the dbt reader chain) that a bare or partial install may
+    # not have -- and a missing-extra refusal (DialectDependencyError,
+    # ClusterDependencyError) is exactly the scenario where that extra is
+    # absent. A ModuleNotFoundError here must not crash the one command
+    # reporting exactly that, so a failed optional import just keeps the
+    # safe subset above (an unlisted subclass still resolves through
+    # `DexError`/`ValueError`) instead of propagating.
+    try:
+        from .connect import CredentialDiscoveryError
+        from .dbt_project import DbtProjectError
+        from .explore.cluster import ClusterDependencyError, ClusterError
+        from .explore.semantic import SemanticBackendError, SemanticQueryRefusedError
+        from .guards.cost_guard import CostGuardError
+        from .guards.query_firewall import QueryRefusedError
+        from .guards.sql_guard import NotSelectOnlyError
+        from .results import BudgetExhaustedError
+        from .transform.build import DbtRunError, ProdTargetRefusedError
+        from .transform.commands import BuildFailedError, DbtParseError
+        from .transform.plans import PlanError
+        from .transform.scaffold import ScaffoldError
+        from .transform.validate import EditValidationError
+    except ImportError:
+        _reason_overrides_cache = overrides
+        return overrides
+
+    # Most-specific-first: a subclass here overrides its parent's bucket.
+    # Anything not listed falls through to the nearest listed ancestor via
+    # isinstance, so a new DexError subclass only needs an entry when its own
+    # reason diverges from its parent's.
+    _reason_overrides_cache = [
+        (SemanticQueryRefusedError, Reason.GUARD),  # policy, not backend failure
+        (ClusterDependencyError, Reason.PREREQUISITE),  # install the extra, retry
+        (DialectDependencyError, Reason.PREREQUISITE),
+        (PrerequisiteError, Reason.PREREQUISITE),
+        (CostGuardError, Reason.GUARD),  # OverCeilingError, CeilingRequiredError
+        (BudgetExhaustedError, Reason.GUARD),
+        (QueryRefusedError, Reason.GUARD),
+        (NotSelectOnlyError, Reason.GUARD),
+        (ProdTargetRefusedError, Reason.GUARD),
+        (ConnectorError, Reason.CONNECTION),
+        (CredentialDiscoveryError, Reason.CONFIGURATION),  # will not appear on a retry
+        (ConfigurationError, Reason.CONFIGURATION),
+        (DbtProjectError, Reason.CONFIGURATION),
+        (SemanticBackendError, Reason.CONFIGURATION),  # after SemanticQueryRefusedError
+        (BuildFailedError, Reason.EXECUTION_FAILURE),
+        (DbtRunError, Reason.EXECUTION_FAILURE),
+        (RequestError, Reason.REQUEST),
+        (DbtParseError, Reason.REQUEST),
+        (PlanError, Reason.REQUEST),  # PlanNotFoundError
+        (ScaffoldError, Reason.REQUEST),
+        (EditValidationError, Reason.REQUEST),
+        (ClusterError, Reason.REQUEST),  # after ClusterDependencyError
+        (DexError, Reason.REQUEST),
+        (ValueError, Reason.REQUEST),
+    ]
+    return _reason_overrides_cache
+
+
+def reason_for(exc: BaseException) -> Reason:
+    """Classify why a caught exception refused, from its class alone.
+
+    Fails toward the informative: an unrecognized ``DexError`` subclass or a
+    bare ``ValueError`` still reads as ``REQUEST`` (a deliberate refusal, bad
+    input assumed) rather than ``INTERNAL``, which is reserved for exceptions
+    that are not a deliberate dex refusal at all.
+    """
+
+    for exc_type, reason in _reason_overrides():
+        if isinstance(exc, exc_type):
+            return reason
+    return Reason.INTERNAL
+
+
+def error_for(
+    exc: BaseException, message: str | None = None, **kwargs: Any
+) -> Envelope:
+    """Build an error envelope from a caught exception: ``errors`` defaults to
+    ``str(exc)`` (override via ``message`` for call sites that add context or
+    redact), and ``reason`` is derived automatically via :func:`reason_for`.
+    """
+
+    return Envelope(
+        status=Status.ERROR,
+        errors=[message if message is not None else str(exc)],
+        reason=reason_for(exc),
+        **kwargs,
+    )
 
 
 def needs_confirmation(

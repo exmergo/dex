@@ -13,6 +13,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A machine-readable `reason` on every error envelope, alongside `status`**
+  ([#170]). #155 gave every deliberate refusal a typed exception a library
+  consumer can catch, but a host driving the CLI still only ever saw
+  `status: error` and a prose string: `OverCeilingError` and a BigQuery
+  connection fault arrived in the identical shape. A host mapping the
+  envelope onto its own automation had to pattern-match error text to tell a
+  policy refusal from a transient fault, and got it wrong in the field: a
+  `connection refused` blip scored the same as a real policy violation and
+  was treated as a permanent stop rather than something to retry.
+
+  `reason` is one of seven values (`guard`, `prerequisite`, `connection`,
+  `configuration`, `request`, `execution_failure`, `internal`), derived
+  automatically from the caught exception's class, never invented per call
+  site: `guard` covers a cost/PII/firewall/safety policy declining
+  (`OverCeilingError`, `QueryRefusedError`, a production-target refusal);
+  `prerequisite` covers a named setup command that needs to run first, then
+  retry (`CacheRequiredError`, `NoBaselineError`, a missing optional extra);
+  `connection` covers an unreachable warehouse; `configuration` covers the
+  engine or repo being wired without something it needs; `request` covers
+  bad input to this specific call; `execution_failure` covers an operation
+  that ran (a `dbt build`) and failed partway; `internal` is reserved for
+  whatever is not a deliberate dex refusal at all. `reason` is `null` outside
+  `status: error`, same discipline as `cost.paradigm`'s null default (#162):
+  an envelope that was not a refusal makes no claim about why.
+
+  The prose messages are unchanged and stay the primary explanation for a
+  human; `reason` is an addition for a host that wants to branch on retry
+  semantics without regex-matching a string this project should stay free to
+  reword.
+
+  Classification itself is deliberately two-tiered: a small, always-available
+  set of families resolves without importing anything connector-specific,
+  and only a broader set (which pulls in sqlglot, scikit-learn, and the dbt
+  reader transitively) is attempted after. Reason: classifying a missing-extra
+  refusal is exactly the moment those imports are least likely to succeed,
+  and a `ModuleNotFoundError` while classifying an error must not crash the
+  process reporting it. A packaging test against a real isolated wheel
+  install with no connector extra pins this end to end.
+
 - **A project can declare a composite grain via `unique_combination_of_columns`**
   ([#169]). `DeclaredKey.column` was a single string, so a project could only
   ever declare that ONE column is unique, never that a table's real key is the

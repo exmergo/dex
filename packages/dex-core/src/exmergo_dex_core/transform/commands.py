@@ -158,7 +158,7 @@ def cmd_init(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             layered_schemas=bool(getattr(args, "layered_schemas", False)),
         )
     except ValueError as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)
     return to_envelope(
         result,
         hints={
@@ -242,9 +242,9 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         )
         return to_envelope(result, hints=_plan_hint(result))
     except DbtParseError as exc:
-        return env.error(str(exc), warnings=exc.warnings)
+        return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)
 
 
 def macro(engine: DexEngine, name: str | None = None) -> MacroListResult | MacroResult:
@@ -304,7 +304,7 @@ def cmd_macro(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         result = macro(engine, getattr(args, "argument", None))
     except DbtParseError as exc:
-        return env.error(str(exc), warnings=exc.warnings)
+        return env.error_for(exc, warnings=exc.warnings)
     if isinstance(result, MacroListResult):
         return to_envelope(
             result, hints={"next": "scaffold one with `transform macro <name>`"}
@@ -371,7 +371,7 @@ def cmd_apply(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(apply(engine, getattr(args, "argument", None)))
     except ValueError as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)
 
 
 def plans(engine: DexEngine) -> PlanListResult:
@@ -535,8 +535,8 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         data = exc.result.data()
         if exc.result.spend is not None:
             data["spend"] = exc.result.spend
-        return env.error(
-            str(exc),
+        return env.error_for(
+            exc,
             data=data,
             cost=exc.result.cost,
             warnings=exc.result.warnings,
@@ -575,7 +575,7 @@ def cmd_deps(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(deps(engine))
     except BuildFailedError as exc:
-        return env.error(str(exc), data=exc.result.data(), warnings=exc.result.warnings)
+        return env.error_for(exc, data=exc.result.data(), warnings=exc.result.warnings)
 
 
 def semantic_define(
@@ -647,9 +647,9 @@ def _semantic_envelope(
             no_parse=bool(getattr(args, "no_parse", False)),
         )
     except DbtParseError as exc:
-        return env.error(str(exc), warnings=exc.warnings)
+        return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
-        return env.error(str(exc))
+        return env.error_for(exc)
     return to_envelope(result, hints=_plan_hint(result))
 
 
