@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-08-03
+
 ### Fixed
 
 - **`budget.session_ceiling` now binds under concurrency** ([#159]). The cost
