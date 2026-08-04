@@ -803,7 +803,14 @@ def definitions(
 
     try:
         view = load(project)
-    except DbtProjectError as exc:
+    except (DbtProjectError, yaml.YAMLError) as exc:
+        # `yaml.YAMLError` alongside `DbtProjectError` for the same reason the
+        # three profile readers above pair them: `load` parses dbt_project.yml, so
+        # a project file that is not valid YAML surfaces as a parser error rather
+        # than ours. Catching only `DbtProjectError` here let that one case escape
+        # the promise this function's docstring makes -- an unreadable project is
+        # supposed to yield the empty view with a note, and instead `explore
+        # --use-project` raised out of a read that is meant to degrade.
         return ProjectDefinitions(
             notes=[
                 f"dbt project at '{project}' could not be read ({exc}); "

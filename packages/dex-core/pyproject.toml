@@ -135,6 +135,16 @@ cluster = ["scikit-learn>=1.4"]
 # imports lazily and a packaging test installs no extra at all), so this is a floor
 # raised for the wider tiers rather than a new requirement on the narrow one.
 storage-conformance = ["pytest>=8", "exmergo-dex-core[sql]"]
+# The project conformance contract (`exmergo_dex_core.adapters.conformance`), for
+# anyone implementing a project format outside this distribution. Named on the same
+# rule as the extra above: an install line answers "conformance to what?" alone.
+#
+# Unlike [storage-conformance] this needs no dialect engine, and that is a property
+# worth keeping rather than a coincidence: the contract reads a project and asserts
+# on `ProjectDefinitions`, so nothing in it reaches the SQL guard. A packaging test
+# holds it true, because the cheapest way for this to acquire a heavier floor is for
+# an assertion to start building something that parses SQL.
+project-conformance = ["pytest>=8"]
 # One command for users who want every optional capability at once: every
 # connector, both semantic-layer backends, and clustering. Self-references the
 # other extras so their requirement lists stay defined in exactly one place, which

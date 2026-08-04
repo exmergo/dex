@@ -261,6 +261,46 @@ Backends contributed here run the same suite: see
 `packages/dex-core/tests/storage/test_parity.py`, which is deliberately the same
 three lines a third party writes.
 
+## Writing a project format
+
+The source of truth lives behind a tiered protocol in `adapters/project.py`, and
+that contract is public too. The usual reason to write one is that your models are
+not a dbt project: an orchestrated asset graph, SQLMesh, or a semantic layer that
+owns its own definitions still knows which tables it builds, at what grain, and how
+they relate.
+
+Implement the tier your format can answer (`ExploreProject` is one method;
+`MaintainProject` adds the two snapshot layers; `EditableProject` adds the write
+path), then prove it with the suite dex ships:
+
+```
+pip install "exmergo-dex-core[project-conformance]"
+```
+
+```python
+from exmergo_dex_core.adapters.conformance import ExploreProjectContract
+
+
+class TestMyProject(ExploreProjectContract):
+    def make_project(self):
+        return MyProject(nothing_declared())
+```
+
+The assertion worth the most is behavioural rather than structural: `definitions()`
+must not raise, on an absent project, an ambiguous one, or a source that will not
+parse. Explore runs against warehouses with no project at all, so a format that
+raises there turns an ordinary state into an outage. Override
+`make_unreadable_project()` to get those assertions running against your format
+instead of skipped.
+
+Declining `EditableProject` is a supported answer, not a gap. A project reduced from
+a running graph cannot receive an edit, because its source of truth is the code that
+produced the graph. `references/project.md` covers the tiers, the rules that are not
+obvious from the signatures, and what the construction contract still leaves open.
+
+Formats contributed here run the same suite: see
+`packages/dex-core/tests/adapters/test_project_parity.py`.
+
 ## Linting and formatting (Ruff)
 
 We use [Ruff](https://docs.astral.sh/ruff/) as both the linter and the

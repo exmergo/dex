@@ -291,10 +291,10 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     dbt adapters and MetricFlow in one environment, it is also the only place a
     version conflict between them can surface at all.
 
-    `dev` and `storage-conformance` are excluded deliberately: contributor tooling,
-    not capabilities. `storage-conformance` carries a test runner for people
-    implementing a storage backend, and nobody installing "everything dex can do"
-    wants pytest.
+    `dev` and the two `*-conformance` extras are excluded deliberately: contributor
+    tooling, not capabilities. They carry a test runner for people implementing a
+    storage backend or a project format, and nobody installing "everything dex can
+    do" wants pytest.
     """
 
     extras = _project_metadata()["optional-dependencies"]
@@ -302,7 +302,7 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     referenced = set(
         extras["all"][0].removeprefix("exmergo-dex-core[").removesuffix("]").split(",")
     )
-    tooling = {"all", "dev", "storage-conformance"}
+    tooling = {"all", "dev", "storage-conformance", "project-conformance"}
     assert referenced == set(extras) - tooling, (
         f"[all] does not cover {sorted(set(extras) - tooling - referenced)}"
     )

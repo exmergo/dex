@@ -9,6 +9,49 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **The project seam is tiered, and load-bearing** ([#171]). `ProjectAdapter` had
+  exactly one reference in the distribution, its own `class` statement, and
+  `DbtProject` was never constructed anywhere, tests included, while every
+  project-reading consumer went to `dbt_project` directly. It is now three nested
+  protocols in `adapters/project.py`:
+  `ExploreProject` (`definitions()`), `MaintainProject` (adding
+  `transform_layer()` and `semantic_layer()`), and `EditableProject` (adding
+  `write_edits()`), with `tier_of()` reporting the highest tier an object
+  satisfies. `DbtProject` implements all three by delegating to the functions
+  that already existed, and explore's one project read now goes through it, so
+  the seam carries a real read path instead of describing one.
+
+  Tier 2 is two methods rather than one returning a union, because
+  `maintain.snapshot` already exposes exactly those two and `maintain.commands`
+  already calls them; a union would have to be unpacked at every call site.
+  Declining `EditableProject` is a supported answer: a project reduced from a
+  running graph cannot receive an edit, and a tier is checkable where a
+  `writeback: no` flag would be a claim the engine has to trust.
+
+- **A conformance contract for project formats** ([#171]).
+  `exmergo_dex_core.adapters.conformance` ships the seam's rules as assertions, so
+  a format outside this distribution runs them in its own suite, the way
+  `storage.conformance` already does for backends. Install
+  `exmergo-dex-core[project-conformance]`, which needs only pytest: nothing in the
+  contract reaches the dialect engine, and a packaging test keeps it that way.
+  `references/project.md` covers the tiers and what the construction contract
+  still leaves open.
+
+### Fixed
+
+- **`definitions()` no longer raises on a project file that is not valid YAML**
+  ([#171]). Its docstring promises that no project, an ambiguous choice, or an
+  unreadable project yields the empty view and never an exception, and explore
+  depends on that: exploration runs against warehouses with no project at all. But
+  `load` parses `dbt_project.yml` with `yaml.safe_load`, so a malformed project
+  file arrived as `yaml.YAMLError` while only `DbtProjectError` was caught, and
+  `explore --use-project` raised out of a read that is meant to degrade. The three
+  profile readers in the same module already pair the two exceptions; this is that
+  pairing on the read path. Found by the first run of the new conformance suite
+  against the shipped format.
+
 ## [1.5.1] - 2026-08-03
 
 ### Fixed
