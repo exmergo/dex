@@ -36,7 +36,13 @@ dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no ro
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
 dex explore map                   -> write/update the .dex cache; print a summary
-dex explore query "<SELECT ...>"  -> run one agent-authored SELECT through the query firewall
+dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
+                                     free and connectionless (a store read, no warehouse);
+                                     declared joins solid, inferred dotted, and a cardinality
+                                     drawn only where the cache proved it; draws profiled,
+                                     joined objects with their grain/key/join/PII columns
+                                     (--full for every eligible object and column); every
+                                     elision is counted in notes; dex writes no file
 dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII non-key columns
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows

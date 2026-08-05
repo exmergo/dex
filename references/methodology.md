@@ -138,6 +138,43 @@ dropped objects disappear, while the original creation timestamp is preserved. W
 is printed back is a counts-level summary, never the cache contents, keeping the
 output sense-making rather than a dump.
 
+## Diagrams: serializing structure, never drawing values
+
+`explore diagram` renders the cached map as a Mermaid `erDiagram`. It is a pure
+function of the cache: it opens no connection, needs no credential, spends
+nothing, and can be re-run freely while a diagram is being shaped.
+
+**The rule that bounds it, and every renderer after it: dex may serialize
+structure it has already computed into a text format, and dex never renders data
+values into a visual encoding.** An entity-relationship diagram of the objects,
+keys, and joins is structure. A chart of null fractions or value distributions is
+a picture of the data itself, which is a different product's job. In practice
+that admits `erDiagram`, `flowchart`, and `classDiagram`, and rules out `pie`,
+`xychart`, `sankey`, and `quadrantChart`. No column value reaches a diagram: the
+cached min and max are never read, and a PII flag renders as its category and
+confidence, because flagged-not-hidden is the posture everywhere else too.
+
+A diagram is trusted more readily than the JSON it came from, so the cardinality
+rules are strict. Mermaid requires a glyph on every edge and dex's relationship
+record carries no cardinality, so the renderer derives one only from what was
+proven. It claims "exactly one" on the parent side only when the parent key is a
+proven key **and** the join was declared in the project or measured with no
+orphans; it degrades to "zero or one" when uniqueness is proven but nothing
+measured the overlap; and it degrades to "zero or many" when uniqueness was never
+established at all. Declared joins are drawn solid and inferred joins dotted, and
+the edge label carries the kind, the confidence, and the orphan fraction, so an
+unverified guess says so on its face.
+
+Selection follows the same rule as the rest of explore: a fully attributed
+diagram of a large warehouse is a schema dump, so the default draws objects that
+were profiled and participate in a join, carrying their grain, key, join, and
+PII-flagged columns. `--full` widens to every eligible object and column, an
+entity cap binds in both modes, and everything left out is counted in the notes.
+
+Rendering is deterministic, so the same cache produces byte-identical output and
+a regenerated file diffs cleanly. dex writes no diagram file: the text comes back
+in the envelope and choosing where it lands is the caller's decision.
+
 ## What the agent sees
 
 Every command prints exactly one sanitized JSON envelope (see
