@@ -64,6 +64,55 @@ COMMAND_SURFACE: dict[str, list[str]] = {
 }
 
 
+def _bare_subcommand_index() -> dict[str, list[str]]:
+    """Map each subcommand name to the groups that define it."""
+    index: dict[str, list[str]] = {}
+    for group, names in COMMAND_SURFACE.items():
+        for name in names:
+            index.setdefault(name, []).append(group)
+    return index
+
+
+def _rewrite_unambiguous_bare_subcommand(argv: list[str]) -> list[str]:
+    """Insert the group for an unambiguous bare subcommand; else return argv."""
+    if not argv:
+        return argv
+    i = 0
+    while i < len(argv) and argv[i].startswith("-"):
+        if argv[i] in {
+            "--connector",
+            "--path",
+            "--scope",
+            "--project",
+            "--dataset",
+            "--repo-root",
+            "--cache-backend",
+            "--budget",
+        }:
+            i += 2
+            continue
+        i += 1
+    if i >= len(argv):
+        return argv
+    token = argv[i]
+    if token in COMMAND_SURFACE:
+        return argv
+    groups = _bare_subcommand_index().get(token, [])
+    if len(groups) == 1:
+        return argv[:i] + [groups[0], token] + argv[i + 1 :]
+    return argv
+
+
+def _bare_subcommand_suggestion(token: str) -> str | None:
+    groups = _bare_subcommand_index().get(token, [])
+    if not groups:
+        return None
+    if len(groups) == 1:
+        return f"did you mean '{groups[0]} {token}'?"
+    listed = ", ".join(f"'{g} {token}'" for g in groups)
+    return f"subcommand '{token}' is ambiguous; try one of: {listed}"
+
+
 def _sub_connection_options() -> argparse.ArgumentParser:
     """The connection options as a parent for subparsers, with SUPPRESS defaults.
 
@@ -352,7 +401,36 @@ def main(argv: list[str] | None = None) -> int:
     from .connect import paradigm_for
 
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    rewritten = _rewrite_unambiguous_bare_subcommand(raw)
+    try:
+        args = parser.parse_args(rewritten)
+    except SystemExit as exc:
+        # argparse already printed usage; add a bare-subcommand suggestion when useful.
+        if exc.code not in (0, None):
+            # Find first positional token for suggestion.
+            token = None
+            j = 0
+            while j < len(raw) and raw[j].startswith("-"):
+                if raw[j] in {
+                    "--connector",
+                    "--path",
+                    "--scope",
+                    "--project",
+                    "--dataset",
+                    "--repo-root",
+                    "--cache-backend",
+                    "--budget",
+                }:
+                    j += 2
+                    continue
+                j += 1
+            if j < len(raw):
+                token = raw[j]
+            tip = _bare_subcommand_suggestion(token) if token else None
+            if tip:
+                print(f"dex: {tip}", file=sys.stderr)
+        raise
     # The connector in play, for envelopes that never priced anything and so
     # never stamped a paradigm of their own. Read off the engine as soon as it
     # exists, because `close()` runs before the handlers below and drops the
