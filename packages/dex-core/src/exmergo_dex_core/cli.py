@@ -194,6 +194,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--layered-schemas", action="store_true", default=False
                     )
+                    sp.add_argument(
+                        "--in-place",
+                        action="store_true",
+                        default=False,
+                        help="scaffold into the current directory instead of <name>/",
+                    )
                 if group == "transform" and name == "plan":
                     # The agent-authored edits payload: a JSON file, or - for stdin.
                     sp.add_argument("--edits-file", default=None)

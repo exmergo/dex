@@ -88,6 +88,7 @@ def init_project(
     path: str | None = None,
     repo_root: Path | str = ".",
     layered_schemas: bool = False,
+    in_place: bool = False,
 ) -> InitResult:
     """Render a fresh dbt project skeleton and record the choices in config.
 
@@ -118,7 +119,13 @@ def init_project(
             "duckdb|bigquery|snowflake|databricks|postgres|redshift`"
         )
 
+    # ``.`` or --in-place scaffolds at the run root using the directory name.
+    if name.strip() in {".", "./"}:
+        in_place = True
+        name = root.resolve().name
     project_name = sanitize_project_name(name)
+    project_prefix = "" if in_place else f"{project_name}/"
+    project_dir = "." if in_place else project_name
     existing = discover_projects(root)
     if existing:
         raise InitError(
@@ -131,18 +138,18 @@ def init_project(
     profiles_text = render_profile(project_name, path, config, root)
 
     files: dict[str, str] = {
-        f"{project_name}/{PROJECT_FILE}": _project_yaml(
+        f"{project_prefix}{PROJECT_FILE}": _project_yaml(
             project_name, layered_schemas=layered_schemas
         ),
-        f"{project_name}/{PROFILES_FILE}": profiles_text,
-        f"{project_name}/models/staging/.gitkeep": "",
-        f"{project_name}/models/marts/.gitkeep": "",
+        f"{project_prefix}{PROFILES_FILE}": profiles_text,
+        f"{project_prefix}models/staging/.gitkeep": "",
+        f"{project_prefix}models/marts/.gitkeep": "",
     }
     if layered_schemas:
         from .scaffold import macro_edit
 
-        files[f"{project_name}/models/intermediate/.gitkeep"] = ""
-        files[f"{project_name}/macros/generate_schema_name.sql"] = macro_edit(
+        files[f"{project_prefix}models/intermediate/.gitkeep"] = ""
+        files[f"{project_prefix}macros/generate_schema_name.sql"] = macro_edit(
             "generate_schema_name", "macros"
         ).new_content
     collisions = sorted(rel for rel in files if (root / rel).exists())
@@ -154,7 +161,7 @@ def init_project(
         )
 
     config.connector = connector
-    config.dbt_project_dir = project_name
+    config.dbt_project_dir = project_dir
     config.dbt_target = "dev"
 
     config_rel = f"{DEX_DIR}/{CONFIG_FILE}"
@@ -176,7 +183,7 @@ def init_project(
     created = list(files) + ([config_rel] if old_config is None else [])
     return InitResult(
         project_name=project_name,
-        project_dir=project_name,
+        project_dir=project_dir,
         connector=connector,
         created=created,
         diffs=diffs,
