@@ -77,6 +77,7 @@ _EXPORTS = {
     "FilesystemStore": "storage",
     "MaintainStore": "storage",
     "MemoryStore": "storage",
+    "MermaidDiagram": "explore.diagram",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
     "OverCeilingError": "guards.cost_guard",
@@ -100,6 +101,7 @@ _EXPORTS = {
     "StoreContext": "storage",
     "StoreFactory": "storage",
     "StoreRequiredError": "errors",
+    "render_er_mermaid": "explore.diagram",
     "to_envelope": "results",
 }
 
@@ -126,6 +128,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     )
     from .explore.cluster import ClusterDependencyError, ClusterError
     from .explore.commands import CacheRequiredError
+    from .explore.diagram import MermaidDiagram, render_er_mermaid
     from .explore.semantic import (
         SemanticBackendError,
         SemanticQueryRefusedError,
@@ -195,6 +198,7 @@ __all__ = [
     "FilesystemStore",
     "MaintainStore",
     "MemoryStore",
+    "MermaidDiagram",
     "NoBaselineError",
     "NoConnectorSelectedError",
     "OverCeilingError",
@@ -219,6 +223,7 @@ __all__ = [
     "StoreFactory",
     "StoreRequiredError",
     "__version__",
+    "render_er_mermaid",
     "to_envelope",
 ]
 

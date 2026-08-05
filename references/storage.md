@@ -410,7 +410,10 @@ a green contract as the whole answer.
 
 A host with no project on disk can run the whole explore surface: `inventory`,
 `profile`, `relationships`, `map`, `query`, and `cluster` need a connector and a
-store and nothing else. Hosted semantic-layer calls (`semantic_list` and
+store and nothing else. `diagram` needs less still: it reads the cache out of the
+store and renders it, so a host holding a populated store can call it with no
+connector resolved and no credential in play. Hosted semantic-layer calls
+(`semantic_list` and
 `semantic_query` against dbt Cloud) need even less: no store, no connector, no
 repo root.
 

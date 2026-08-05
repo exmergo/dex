@@ -14,7 +14,9 @@
       "How do orders and customers join?",
       "Profile the columns in the events table and flag any PII.",
       "How many listings have no matching host in this database?",
-      "Run a quick query to check whether order dates have any gaps."
+      "Run a quick query to check whether order dates have any gaps.",
+      "Draw me an ER diagram of this database.",
+      "Can you visualize how these tables relate?"
     ],
     "negative": [
       "Set up a dbt project in this repo.",
@@ -94,6 +96,19 @@
         "Recommends or writes a pii_overrides entry in .dex/config.yml with the fully qualified column path and a reason",
         "Does not edit .dex/cache.json, does not propose changing the detector or the firewall threshold",
         "Explains that the override survives re-profiles and takes effect at query time immediately"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Give me a diagram of how the tables in shop.duckdb relate to each other.",
+      "expected_output": "A Mermaid ER diagram produced by `explore diagram` after mapping, reproduced verbatim in a fenced mermaid block, with the engine's own line styles and cardinalities left intact and any elision from the notes mentioned.",
+      "files": [],
+      "assertions": [
+        "Runs `explore map` (or confirms the .dex cache exists) before `explore diagram`, because the diagram renders the cache",
+        "Produces the diagram through `explore diagram` via the wrapper; does not hand-author Mermaid from the relationships envelope or from its own reading of the schema",
+        "Reproduces `data.mermaid` verbatim inside a fenced mermaid block; does not redraw, re-letter, or 'tidy' the glyphs, and does not upgrade an inferred or unverified edge to a solid or exactly-one cardinality",
+        "Reports what the notes say was left out (elided objects or columns) rather than presenting a capped diagram as complete",
+        "Writes a .mmd or markdown file only if the user asked for a file, and does not claim dex wrote one"
       ]
     }
   ]

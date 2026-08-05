@@ -93,6 +93,14 @@ benchmarks/**/results/
 benchmarks/**/runs/
 benchmarks/**/.out/
 
+# ─── Node (the Mermaid syntax canary only) ───────────────────────────────────
+# This is a Python repo with exactly one npm touchpoint: the CI job that runs
+# `explore diagram` output through the real Mermaid parser. That job installs
+# outside the checkout, but anyone reproducing it by hand from the repo root
+# would otherwise leave ~160MB of untracked files behind.
+node_modules/
+package-lock.json
+
 # ─── Logs & temp ─────────────────────────────────────────────────────────────
 *.log
 tmp/

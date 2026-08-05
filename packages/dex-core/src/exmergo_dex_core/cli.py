@@ -39,6 +39,7 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "profile",
         "relationships",
         "map",
+        "diagram",
         "query",
         "cluster",
         "semantic",
@@ -155,7 +156,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument("--limit", type=int, default=None)
                     sp.add_argument("--local", action="store_true", default=False)
                     sp.add_argument("--api", action="store_true", default=False)
-                if group == "explore" and name == "map":
+                # `map --full` profiles every object rather than the top-ranked;
+                # `diagram --full` draws every eligible object and column rather
+                # than the connected-and-profiled default. Same word, same sense
+                # (stop selecting, take everything), different subject.
+                if group == "explore" and name in {"map", "diagram"}:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
@@ -286,6 +291,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "profile": explore_cmds.cmd_profile,
             "relationships": explore_cmds.cmd_relationships,
             "map": explore_cmds.cmd_map,
+            "diagram": explore_cmds.cmd_diagram,
             "query": explore_cmds.cmd_query,
             "cluster": explore_cmds.cmd_cluster,
         }

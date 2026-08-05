@@ -1,6 +1,6 @@
 ---
 name: explore
-description: 'Use this to make sense of a database, warehouse, or DuckDB file: inventory and rank what is there, profile columns, detect PII, flag grain and data-quality problems, infer and verify how tables join, answer ad-hoc data questions with guarded SQL probes, and cluster rows into segments with k-means, producing a draft map without dumping the schema into context. Trigger it for casual, artifact-first prompts like "what''s in my duckdb", "what''s in this database", "what data do I have", "take a look at data.duckdb", or "any PII in here", as well as analyst questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", "is this data any good", "profile these columns", or ad-hoc counts and distributions like "how many orders have no customer", and unsupervised segmentation like "cluster my customers", "find natural segments in this table", or "run k-means on these columns". Any mention of exploring, inspecting, querying, understanding, or clustering a .duckdb or .db file, a warehouse connection, or unfamiliar data qualifies. This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).'
+description: 'Use this to make sense of a database, warehouse, or DuckDB file: inventory and rank what is there, profile columns, detect PII, flag grain and data-quality problems, infer and verify how tables join, render those relationships as a Mermaid ER diagram, answer ad-hoc data questions with guarded SQL probes, and cluster rows into segments with k-means, producing a draft map without dumping the schema into context. Trigger it for casual, artifact-first prompts like "what''s in my duckdb", "what''s in this database", "what data do I have", "take a look at data.duckdb", or "any PII in here", as well as analyst questions like "what is in this warehouse", "which tables matter", "what does this table contain", "how do these tables relate", "draw an ER diagram of this database", "visualize how these tables relate", "is this data any good", "profile these columns", or ad-hoc counts and distributions like "how many orders have no customer", and unsupervised segmentation like "cluster my customers", "find natural segments in this table", or "run k-means on these columns". Any mention of exploring, inspecting, querying, understanding, or clustering a .duckdb or .db file, a warehouse connection, or unfamiliar data qualifies. This is read-only sense-making and writes nothing but the .dex/ cache. Do not use it to author or change dbt models or the semantic layer (use transform) or to detect drift and reconcile a project (use maintain).'
 ---
 
 # Explore
@@ -60,13 +60,26 @@ Subcommands, in the usual order:
    free metadata check cannot see (e.g. rows changed but the schema did not).
    `explore relationships` and the standalone `explore profile` reuse fresh
    profiles the same way.
-6. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
+6. `explore diagram [--full]` renders the cached map as a Mermaid ER diagram in
+   `data.mermaid`. Free and connectionless (it reads the cache, never the
+   warehouse), so it is safe to re-run while shaping the picture. **Reproduce the
+   string verbatim in a fenced ```mermaid block so the human can see it, and
+   write it to a `.mmd` or a markdown file when they want one on disk: the
+   engine deliberately writes no file.** Never redraw or "tidy up" the diagram
+   by hand. The glyphs are claims the engine derived from evidence, and a
+   plausible-looking cardinality you supplied is exactly the overclaim this
+   command exists to prevent: declared joins are solid, inferred dotted, and an
+   unverified inference never says "exactly one". Read `notes` before presenting
+   it, since it states any object or column that was left out; `--full` widens
+   from the default (profiled, joined objects and their grain, key, join, and
+   PII columns) to everything eligible.
+7. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
    don't cover: you write the SQL, the engine's query firewall refuses or bounds
    it. Requires the `.dex/` cache (run `map` first). Results come back row-major
    and capped; a refusal names the offending column and the fix, so one rewrite
    is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
    writing a probe: it maps common questions to effective probe shapes.
-7. `explore cluster <object> [--features a,b,c] [-k N]` runs k-means over a
+8. `explore cluster <object> [--features a,b,c] [-k N]` runs k-means over a
    bounded sample of the object's numeric columns and returns the segment
    structure: per-cluster sizes and fractions, centroids (each coordinate is a
    cluster's mean of that feature, an aggregate), the silhouette score, and,
@@ -95,7 +108,7 @@ Subcommands, in the usual order:
    sample clause reads a fraction), so surface the estimate and get a budget
    first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
    automatically for this subcommand.
-8. `explore semantic list` and `explore semantic query` reach the dbt semantic
+9. `explore semantic list` and `explore semantic query` reach the dbt semantic
    layer (metrics, dimensions, entities). `list` is discovery: which metrics
    exist and which dimensions each can be grouped by. `query` takes a `--metric`
    and a `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and

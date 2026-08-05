@@ -144,6 +144,56 @@ class MapResult(Result):
         }
 
 
+class DiagramResult(Result):
+    """The cached map serialized as a Mermaid ER diagram.
+
+    ``notes`` is always reported, like ``query`` and ``cluster``: an empty list
+    is the positive statement "every eligible object and column is drawn", and
+    without it a caller cannot tell a complete diagram from a capped one.
+
+    ``entities`` maps each Mermaid entity name back to its fully-qualified
+    warehouse identifier, because Mermaid names cannot carry dots and a caller
+    resolving a box back to a real object has no other way to do it. It is a
+    dict here and a list of records in the payload, deliberately: see
+    :meth:`data`.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    mermaid: str = ""
+    entities: dict[str, str] = Field(default_factory=dict)
+    entity_count: int = 0
+    edge_count: int = 0
+    elided_entity_count: int = 0
+    elided_column_count: int = 0
+    elided_edge_count: int = 0
+    full: bool = False
+    updated_at: str = ""
+
+    def data(self) -> dict[str, Any]:
+        # `entities` becomes a list of records rather than an object keyed by
+        # entity name, because a warehouse object name must never become a JSON
+        # key: the envelope sanitizer matches key names against secret-like
+        # substrings, so a table legitimately called `access_tokens` or
+        # `user_credentials` would raise on the way out and take the whole
+        # command down with it. Nothing keyed by user data crosses this
+        # boundary.
+        return {
+            "mermaid": self.mermaid,
+            "entities": [
+                {"entity": name, "identifier": identifier}
+                for name, identifier in sorted(self.entities.items())
+            ],
+            "entity_count": self.entity_count,
+            "edge_count": self.edge_count,
+            "elided_entity_count": self.elided_entity_count,
+            "elided_column_count": self.elided_column_count,
+            "elided_edge_count": self.elided_edge_count,
+            "full": self.full,
+            "updated_at": self.updated_at,
+        }
+
+
 class QueryResult(Result):
     """One firewalled SELECT, capped and returned columnar.
 

@@ -58,3 +58,23 @@ or Databricks (no coverage). Runbooks live in `benchmarks/`.
 Tier 1 always gates (fast, free). Tier 2 gates on release (a safety regression
 blocks regardless of pass-rate). Tier 3 runs on a schedule and pre-release under a
 cost ceiling; a pass-rate or cost/turn regression blocks a release.
+
+Two jobs are deliberately **advisory** rather than blocking, because both track a
+moving upstream and a failure means the world changed rather than that this
+change broke something. `sqlglot-canary` runs the guards and the safety spine
+against the newest sqlglot, above the declared ceiling, so raising that ceiling is
+a decision taken on evidence. `mermaid-syntax` renders `explore diagram` output
+and parses it with the real Mermaid package from npm.
+
+The second one is worth explaining, because it is the one place CI reaches outside
+Python. dex emits Mermaid text and never renders it, so no declared dependency
+pins the syntax dialect the renderer has to stay compatible with: that contract is
+with a parser living in whatever tool a reader opens the diagram in. Holding it
+means running the genuine parser, which is a Node package. Depending on a Python
+mermaid wrapper instead would not have helped: the string builders replace none of
+the renderer's actual work (the cardinality derivation and the key and PII marks),
+the image renderers post the diagram to a third-party host, which is disqualifying
+for a tool whose premise is that your data does not leave, and the one parser
+binding needs Node installed anyway. So the dependency stays in CI, where it
+belongs, and the fixture corpus is generated from the renderer rather than
+committed so it cannot drift from what dex actually emits.

@@ -9,7 +9,74 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-08-05
+
 ### Added
+
+- **`explore diagram`: the cached map as a Mermaid ER diagram** ([#189]).
+  Serializes what `explore map` already learned (objects, keys, grain, joins,
+  PII flags) into an `erDiagram` under `data.mermaid`, with an `entities` legend
+  mapping each entity name back to its fully-qualified identifier. It is a pure
+  function of the exploration cache, so it opens no connection, needs no
+  credential, and cannot spend: free on every connector, and re-runnable while
+  shaping a diagram. Also exported as `render_er_mermaid` for a Python host that
+  already holds a cache.
+
+  **The rule this establishes, because a renderer invites the next one:** dex
+  may serialize structure it has already computed into a text format, and dex
+  never renders data values into a visual encoding. A schema graph is structure;
+  a chart of null fractions is a picture of the data, which is a different
+  product's job. `references/methodology.md` states it, and it is what admits
+  `erDiagram` while ruling out `pie` and `xychart`.
+
+  The cardinality rules are the substance. Mermaid demands a glyph on every edge
+  and a relationship record carries no cardinality, so a naive renderer invents
+  one, and a diagram is believed more readily than the JSON behind it. The
+  parent side claims "exactly one" only when the parent key is proven **and** the
+  join was declared or measured with no orphans; it degrades to "zero or one"
+  when uniqueness is proven but nothing measured the overlap, and to "zero or
+  many" when uniqueness was never established. Declared joins draw solid,
+  inferred dotted, and the label carries the kind, the confidence, and the
+  orphan fraction, so an unverified guess says so on its face.
+
+  Selection follows the rest of explore: the default draws profiled objects that
+  participate in a join with their grain, key, join, and PII-flagged columns,
+  `--full` widens to every eligible object and column, an entity cap binds in
+  both modes, and every elision is counted in `notes`. No column value reaches a
+  diagram (the cached min and max are never read) and PII renders as category and
+  confidence, asserted in the safety spine because a diagram is the most
+  shareable artifact dex produces. Rendering is deterministic, so a regenerated
+  file diffs cleanly. dex writes no file: the text comes back in the envelope and
+  where it lands is the caller's decision.
+
+  **No Mermaid dependency, and an advisory `mermaid-syntax` CI job instead.** The
+  renderer is stdlib plus dex's own cache types. Every Python Mermaid package was
+  considered and none fits: the string builders replace none of the actual work
+  (the cardinality derivation, the key and PII marks), the image renderers POST
+  the diagram to a third-party host, which is disqualifying for a tool whose
+  premise is that your data does not leave the machine, and the one parser binding
+  requires Node installed anyway while sitting at 0.0.4 on a deprecated Mermaid
+  API. But the compatibility contract is real (it is with a parser in someone
+  else's tool), and the repo rule is that such a contract gets a test running
+  outside this repository, so CI now renders a fixture corpus from the engine and
+  parses each case with the genuine `mermaid` package from npm. The corpus is
+  generated rather than committed so it cannot drift from what dex emits, and the
+  dump fails if it stops covering every cardinality glyph the policy can produce.
+
+  That job immediately corrected two assumptions in the first draft's own
+  comments: a dotted entity name and a `NUMERIC(10,2)` type both parse fine in
+  Mermaid 11, while angle-bracket types, spaces in a type name, leading digits, and
+  embedded quotes genuinely break the attribute grammar. The identifier
+  normalization is unchanged (short entity names are a legibility choice and the
+  sanitizer answers the four real failures); the comments explaining it are now
+  accurate rather than plausible.
+
+  The entity legend crosses the boundary as a list of records rather than an
+  object keyed by entity name. Keying it by name would have handed the warehouse
+  the power to fail the boundary check, since the envelope sanitizer matches key
+  names against secret-like substrings and a table called `access_tokens` is an
+  ordinary thing to own. A spine assertion now states that as a rule for every
+  future payload, not just this one.
 
 - **The project seam is tiered, and load-bearing** ([#171]). `ProjectAdapter` had
   exactly one reference in the distribution, its own `class` statement, and
