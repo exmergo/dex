@@ -58,12 +58,14 @@ from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..storage import Document, ExploreStore
 from . import cluster as cluster_mod
+from . import diagram as diagram_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
 from . import rank as rank_mod
 from . import relationships as rel_mod
 from .results import (
     ClusterResult,
+    DiagramResult,
     InventoryEntry,
     InventoryResult,
     MapResult,
@@ -1186,6 +1188,56 @@ def _null_drop_note(
         "total_rows above is cache-derived (from the last explore map/profile), "
         "a different moment than this live count"
     )
+
+
+def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
+    """Serialize the cached map as a Mermaid ER diagram.
+
+    Free everywhere and on every connector: it reads the exploration cache and
+    nothing else, so it opens no connection, needs no credential, and cannot
+    spend. That is what makes it safe to re-run while iterating on a diagram,
+    and it is why there is no confirm handshake here.
+
+    Cache-gated like :func:`query` and :func:`cluster`, for a different reason:
+    those need the cache to know what is safe to touch, this one needs it
+    because the cache *is* the subject. An empty cache is a prerequisite
+    failure naming `explore map`, never an empty diagram, because a diagram of
+    nothing and a diagram of an unexplored warehouse look identical.
+    """
+
+    cache = engine.store.load_cache()
+    if cache is None:
+        raise CacheRequiredError(
+            "no exploration cache yet; run `explore map` first so there is a "
+            "map to draw"
+        )
+
+    rendered = diagram_mod.render_er_mermaid(cache, full=full)
+    if not rendered.entity_count:
+        raise CacheRequiredError(
+            "the exploration cache holds no object that can be drawn: run "
+            "`explore map` (or `explore profile <object>`) so objects carry "
+            "profiles and inferred joins"
+        )
+    return DiagramResult(
+        mermaid=rendered.mermaid,
+        entities=rendered.entities,
+        entity_count=rendered.entity_count,
+        edge_count=rendered.edge_count,
+        elided_entity_count=rendered.elided_entity_count,
+        elided_column_count=rendered.elided_column_count,
+        elided_edge_count=rendered.elided_edge_count,
+        full=full,
+        updated_at=cache.provenance.updated_at or "",
+        notes=rendered.notes,
+    )
+
+
+def cmd_diagram(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        return to_envelope(diagram(engine, full=getattr(args, "full", False)))
+    except (CacheRequiredError, ValueError) as exc:
+        return env.error_for(exc)
 
 
 def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
