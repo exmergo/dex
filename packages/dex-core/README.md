@@ -51,6 +51,7 @@ from exmergo_dex_core import DexEngine
 with DexEngine(connector="duckdb", path="shop.duckdb") as eng:
     mapped = eng.map()
     rows = eng.query("select status, count(*) from orders group by status")
+    print(eng.diagram().mermaid)  # the map as a Mermaid ER diagram
 ```
 
 Methods return domain objects (`DexCache`, `Dataset`, `Snapshot`) and result
@@ -175,7 +176,10 @@ the command contract or the Python API.
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
 ad-hoc SELECTs behind a PII-aware query firewall (`explore query`), all
-read-only. It starts bare by default; with `--use-project` it reads an existing
+read-only. `explore diagram` serializes the map it built as a Mermaid
+`erDiagram`, free and without opening a connection, drawing declared joins solid
+and inferred joins dotted and claiming a cardinality only where the cache proved
+one. It starts bare by default; with `--use-project` it reads an existing
 dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
