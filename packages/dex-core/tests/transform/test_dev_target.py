@@ -1243,3 +1243,25 @@ def test_an_explicit_config_reaches_the_probe_instead_of_one_on_disk(
 
     assert calls[0]["config"] is config
     assert calls[0]["config"].snowflake.dev_database == "DBT_DEV"
+
+
+def test_duckdb_equivalent_path_spellings_are_accepted(
+    dbt_project_dir: Path, tmp_path: Path
+):
+    """Relative, ./prefixed, and absolute paths to the same file are not drift."""
+    from exmergo_dex_core.config import DuckDBTarget
+
+    warehouse = dbt_project_dir / "warehouse.duckdb"
+    warehouse.write_text("", encoding="utf-8")
+    # profiles.yml already points at ./warehouse.duckdb in fixtures in many cases;
+    # write an explicit matching profile path.
+    profiles = dbt_project_dir / "profiles.yml"
+    profiles.write_text(
+        "test:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        "      path: ./warehouse.duckdb\n",
+        encoding="utf-8",
+    )
+    for declared in ("warehouse.duckdb", "./warehouse.duckdb", str(warehouse.resolve())):
+        config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=declared))
+        # should not raise
+        dev_target.check(dbt_project_dir, "dev", config, dbt_project_dir)
