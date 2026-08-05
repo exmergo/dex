@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .adapters.base import Adapter
     from .explore.results import (
         ClusterResult,
+        DiagramResult,
         InventoryResult,
         MapResult,
         ProfileResult,
@@ -475,6 +476,19 @@ class DexEngine:
         from .explore import commands as explore
 
         return explore.cluster(self, obj, features=features, k=k)
+
+    def diagram(self, *, full: bool = False) -> DiagramResult:
+        """The cached map as a Mermaid ER diagram. Reads the store, nothing else.
+
+        Free on every connector and the one explore method that opens no
+        connection at all, so a host holding a populated store can call it with
+        no credential in play. See :mod:`~.explore.diagram` for what the
+        rendered cardinalities are and are not allowed to claim.
+        """
+
+        from .explore import commands as explore
+
+        return explore.diagram(self, full=full)
 
     # The two semantic methods import from `explore.semantic.commands`, not from
     # `explore.commands`: on the hosted backend dbt Cloud renders and executes the
