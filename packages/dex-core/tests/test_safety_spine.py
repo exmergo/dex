@@ -19,6 +19,7 @@ from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, PIIFlag
 from exmergo_dex_core.config import DexConfig
 from exmergo_dex_core.engine import DexEngine
+from exmergo_dex_core.explore.diagram import render_er_mermaid
 from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import FilesystemStore, MemoryStore
 
@@ -545,6 +546,80 @@ def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     assert with_override.columns[0].pii_overridden is not None, "the audit trail"
 
 
+def test_the_er_diagram_marks_pii_and_carries_no_column_value():
+    """A rendered diagram is the most shareable artifact dex produces: it gets
+    pasted into issues, committed, and dropped into chat, where none of the
+    envelope's context travels with it. So the rule that holds for the envelope
+    has to hold here in its strictest form. The cache retains min/max for every
+    safe column, and the renderer must never reach for them; the PII flag is
+    (category, confidence) and IS drawn, because flagged-not-hidden is the
+    posture and a diagram that quietly omitted a sensitive column would be
+    hiding rather than flagging.
+    """
+
+    from exmergo_dex_core.cache import (
+        Dataset,
+        DexCache,
+        PIICategory,
+        Relationship,
+    )
+    from exmergo_dex_core.explore.diagram import render_er_mermaid
+
+    customers = Dataset(
+        identifier="shop.main.customers",
+        columns=[
+            ColumnProfile(
+                name="customer_id",
+                data_type="INTEGER",
+                is_unique=True,
+                min_value=1,
+                max_value=987654,
+            ),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                min_value="aaron@example.com",
+                max_value="zoe@example.com",
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+            ),
+            ColumnProfile(
+                name="ssn",
+                data_type="VARCHAR",
+                pii=PIIFlag(category=PIICategory.GOVERNMENT_ID, confidence=0.9),
+            ),
+        ],
+        candidate_keys=[["customer_id"]],
+        grain=["customer_id"],
+    )
+    orders = Dataset(
+        identifier="shop.main.orders",
+        columns=[
+            ColumnProfile(name="order_id", data_type="INTEGER", is_unique=True),
+            ColumnProfile(name="customer_id", data_type="INTEGER"),
+        ],
+    )
+    cache = DexCache(
+        datasets=[customers, orders],
+        relationships=[
+            Relationship(
+                from_dataset="shop.main.orders",
+                from_columns=["customer_id"],
+                to_dataset="shop.main.customers",
+                to_columns=["customer_id"],
+            )
+        ],
+    )
+
+    for mermaid in (
+        render_er_mermaid(cache).mermaid,
+        render_er_mermaid(cache, full=True).mermaid,
+    ):
+        for value in ("987654", "aaron@example.com", "zoe@example.com"):
+            assert value not in mermaid, "a column value reached the diagram"
+        assert "pii:email 0.95" in mermaid
+        assert "pii:government_id 0.90" in mermaid
+
+
 # --- Family 4: propose-don't-impose ------------------------------------------
 
 
@@ -1032,6 +1107,15 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
         queried = eng.query("select count(*) as n from customers")
         assert queried.row_count == 1
 
+        # The diagram renders an artifact a caller will very likely want on
+        # disk, which is exactly why the engine hands back a string and writes
+        # nothing: choosing where a file lands is the caller's decision, and a
+        # renderer that helpfully dropped a `.mmd` somewhere would break the
+        # no-persistence promise this whole test exists to hold.
+        drawn = eng.diagram(full=True)
+        assert drawn.entity_count == 1
+        assert drawn.mermaid.startswith("erDiagram\n")
+
     assert snapshot() == before
     assert not (repo / ".dex").exists()
 
@@ -1088,6 +1172,40 @@ def test_query_results_are_columnar_and_pass_the_sanitizer(capsys):
     # The query path's list-of-lists shape crosses cleanly; the dict-row rule
     # above still guards every other command against accidental record dumps.
     env.emit(env.ok({"columns": ["id", "n"], "cells": [[1, 3], [2, 5]]}))
+    assert capsys.readouterr().out
+
+
+def test_no_payload_is_keyed_by_a_warehouse_object_name(capsys):
+    """The sanitizer matches *key names* against secret-like substrings, so any
+    payload that keys an object by user-controlled data hands a warehouse the
+    power to fail the boundary check. A table called `access_tokens` is an
+    entirely ordinary thing to own, and the diagram's entity legend is the one
+    payload that was tempted to key by object name; it emits records instead.
+
+    Stated as a rule rather than a diagram test because the next payload that
+    wants a name-keyed map should meet this assertion first.
+    """
+
+    from exmergo_dex_core.cache import Dataset, DexCache
+    from exmergo_dex_core.explore.results import DiagramResult
+
+    hostile = ["access_tokens", "user_credentials", "api_key_rotation", "secrets"]
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier=f"vault.main.{name}",
+                columns=[ColumnProfile(name="id", data_type="INTEGER", is_unique=True)],
+            )
+            for name in hostile
+        ]
+    )
+    rendered = render_er_mermaid(cache, full=True)
+    assert set(rendered.entities) == set(hostile), "the fixture must be hostile"
+
+    envelope = to_envelope(
+        DiagramResult(mermaid=rendered.mermaid, entities=rendered.entities)
+    )
+    env.emit(envelope)  # raises SanitizationError if any object name became a key
     assert capsys.readouterr().out
 
 
