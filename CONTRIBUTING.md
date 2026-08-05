@@ -300,6 +300,32 @@ code. Open PRs cannot merge until this check is green, alongside the existing
 CI (tests, safety spine, and the em-dash prose check). Run Ruff or the
 pre-commit hook locally before you push so the gate passes on the first try.
 
+## The Mermaid syntax canary
+
+`explore diagram` emits Mermaid text. dex never renders it, so nothing in
+`pyproject.toml` pins the syntax dialect it has to stay compatible with, and the
+`mermaid-syntax` CI job holds that contract instead: it renders a fixture corpus
+from the engine and parses each one with the real `mermaid` package from npm. It is
+advisory, like `sqlglot-canary`, because a Mermaid release breaking our dialect
+should be loud without blocking an unrelated merge.
+
+To reproduce it locally you need Node. Install outside the checkout so a Python
+repo does not acquire a 160MB `node_modules` (it is gitignored either way):
+
+```bash
+mkdir -p /tmp/mermaid-canary && cd /tmp/mermaid-canary
+npm install mermaid@^11 jsdom@^26
+cp "$OLDPWD/scripts/check_mermaid_syntax.mjs" .
+
+cd "$OLDPWD"
+uv run --project packages/dex-core python scripts/dump_mermaid_fixtures.py /tmp/mermaid-fixtures
+cd /tmp/mermaid-canary && node check_mermaid_syntax.mjs /tmp/mermaid-fixtures
+```
+
+If you change `explore/diagram.py`, run this. A construct that parses in the
+Mermaid you happen to have may still be outside the conservative `erDiagram`
+subset the module commits to, and the corpus is what tells you.
+
 ## Prose is em-dash free
 
 All shipped prose in this repo avoids em dashes (an Exmergo brand rule),
