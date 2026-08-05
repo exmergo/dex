@@ -99,6 +99,51 @@ jobs:
           uv run --no-sync python -c "import sqlglot; print('testing sqlglot', sqlglot.__version__)"
           uv run --no-sync pytest -q -m "not packaging"
 
+  # `explore diagram` emits Mermaid and dex never renders it, so nothing in
+  # pyproject.toml pins the syntax dialect it has to stay compatible with: the
+  # contract is with a parser living in whatever tool a reader opens the diagram
+  # in. This runs the renderer's own output through the real mermaid package,
+  # which is the only way to hold that contract from here, and it is why there is
+  # no Python mermaid dependency (every candidate is either a string builder that
+  # replaces nothing, or a renderer that would POST the schema to a third-party
+  # host). Advisory like sqlglot-canary and for the same reason: it tracks a
+  # moving upstream, so a Mermaid release breaking our dialect should be loud
+  # without blocking a merge that changed nothing.
+  mermaid-syntax:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Installed outside the repo, and the checker is copied in beside it,
+      # because Node resolves `node_modules` by walking up from the script's own
+      # location. That keeps a 160MB dependency tree out of the working copy of a
+      # Python repo, where nobody expects one and nothing ignores it. Pinned
+      # major, floating within it, mirroring how sqlglot is bounded: a patch
+      # should not be able to fail this, and moving the major should be a
+      # deliberate act taken on this job's evidence.
+      - name: Install the Mermaid parser outside the repo
+        run: |
+          mkdir -p "$RUNNER_TEMP/mermaid-canary"
+          cd "$RUNNER_TEMP/mermaid-canary"
+          npm install --silent mermaid@^11 jsdom@^26
+          cp "$GITHUB_WORKSPACE/scripts/check_mermaid_syntax.mjs" .
+      # Generated from the renderer rather than committed, so the corpus cannot
+      # drift from what dex actually emits. The dump self-checks that it still
+      # covers every cardinality glyph the policy can produce.
+      - name: Render the fixture corpus
+        run: uv run --project packages/dex-core python scripts/dump_mermaid_fixtures.py "$RUNNER_TEMP/mermaid-fixtures"
+      - name: Parse every fixture with the real Mermaid parser
+        run: |
+          cd "$RUNNER_TEMP/mermaid-canary"
+          node -e "console.log('testing mermaid', require('mermaid/package.json').version)"
+          node check_mermaid_syntax.mjs "$RUNNER_TEMP/mermaid-fixtures"
+
   # The Tier-2 eval harness scoring core (triggering, output-quality, uplift math),
   # exercised with fake backends: deterministic, free, no model in the loop. The
   # live Claude-driven evals run on release, not here. Stdlib only, so uvx supplies
