@@ -33,6 +33,7 @@ from ..adapters.base import Adapter, ObjectMeta, name_list
 # Aliased: `QueryResult` here is the explore record, and the adapter's
 # same-named row carrier is only a type hint on one shaping helper.
 from ..adapters.base import QueryResult as AdapterQueryResult  # noqa: F401
+from ..adapters.project import DbtProject
 from ..cache import (
     Dataset,
     DexCache,
@@ -1514,7 +1515,11 @@ def _project_definitions(
             )
         return defs
     pin = Path(repo_root) / config.dbt_project_dir if config.dbt_project_dir else None
-    return dbt_project.definitions(repo_root, pin)
+    # Through the seam rather than the module: this is the one project read on the
+    # explore path, so routing it here is what makes `ExploreProject` load-bearing
+    # instead of a protocol nothing satisfies. `DbtProject.definitions` delegates
+    # to the same function this line used to call, so the read is unchanged.
+    return DbtProject(repo_root, pin).definitions()
 
 
 def _relationship_edge_key(rel: Relationship) -> tuple:

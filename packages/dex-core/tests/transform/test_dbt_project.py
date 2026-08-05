@@ -536,6 +536,27 @@ def test_definitions_degrades_without_a_project(tmp_path: Path):
     assert defs.notes == []
 
 
+def test_definitions_degrades_on_an_unparseable_project_file(tmp_path: Path):
+    """A dbt_project.yml that is not valid YAML degrades rather than raising.
+
+    `load` parses it with `yaml.safe_load`, so this case arrives as `yaml.YAMLError`
+    rather than `DbtProjectError`, and catching only the latter let it escape the
+    promise the docstring makes two lines up from the `try`. The three profile
+    readers in this module already pair the two exceptions; this is the same pairing
+    on the read path that explore depends on.
+    """
+
+    project = tmp_path / "analytics"
+    project.mkdir()
+    (project / "dbt_project.yml").write_text("name: [unclosed\n", encoding="utf-8")
+
+    defs = definitions(tmp_path, project)
+
+    assert defs.present is False
+    assert defs.declared_keys == [] and defs.foreign_keys == []
+    assert any("could not be read" in note for note in defs.notes)
+
+
 def test_definitions_degrades_on_multiple_projects(tmp_path: Path):
     for name in ("one", "two"):
         child = tmp_path / name
