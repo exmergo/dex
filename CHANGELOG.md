@@ -26,7 +26,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   The cap (`_COMPOSITE_PAIR_CAP`) is raised from 3 to 5 for headroom, and a
   pair that shares a column with an already-kept pair is now dropped as a
   near-duplicate when its product is within `_COMPOSITE_REDUNDANCY_RATIO`
-  (3.0x) of the kept pair's — the same idea tried with interchangeable
+  (3.0x) of the kept pair's: the same idea tried with interchangeable
   filler, not a genuinely different candidate. A pair whose product diverges
   meaningfully still gets its own slot even if it reuses a column, which is
   what lets the true grain through. Each additional slot is still a real
