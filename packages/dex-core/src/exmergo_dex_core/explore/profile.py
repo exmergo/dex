@@ -37,7 +37,17 @@ _EXACT_DISTINCT_CAP = 8
 # Composite-key probes are capped much tighter than single-column escalation:
 # each pair costs a full two-column DISTINCT scan (not one cheap aggregate),
 # and the ranking puts a real grain in the first slots when one exists.
-_COMPOSITE_PAIR_CAP = 3
+_COMPOSITE_PAIR_CAP = 5
+
+# A later pair that shares a column with an already-kept pair is treated as
+# the same hypothesis tried with different filler ("does this dimension have
+# *a* partner?") when its product is within this multiple of the kept pair's
+# -- not a genuinely different candidate. Keeping the ratio bounded (rather
+# than 1:1) is what stops several near-identical junk pairs from each
+# consuming a cap slot; a pair whose product diverges meaningfully (a real
+# competing hypothesis, not filler) still gets its own slot even if it
+# reuses a column.
+_COMPOSITE_REDUNDANCY_RATIO = 3.0
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
@@ -539,10 +549,14 @@ def _probe_composite_keys(
     id-shaped members first (real grains are key-shaped), smallest product
     next (a minimal grain sits just above the row count; a pair of two
     near-unique columns lands near rows squared and is analytically useless
-    even when technically unique). Bounded to ``_COMPOSITE_PAIR_CAP`` pairs in
-    one batched adapter call; a pair is proven when its exact combination
-    count equals the row count. Adapters without
-    ``distinct_combination_counts`` degrade to no composite keys.
+    even when technically unique). Before the cut, pairs that share a column
+    with an already-kept pair and score within ``_COMPOSITE_REDUNDANCY_RATIO``
+    of it are dropped as the same hypothesis tried with different filler, so
+    the cap is spent on genuinely distinct candidates rather than several
+    near-identical pairs anchored on one popular column. Bounded to
+    ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a pair is
+    proven when its exact combination count equals the row count. Adapters
+    without ``distinct_combination_counts`` degrade to no composite keys.
     """
 
     if not row_count:
@@ -585,7 +599,20 @@ def _probe_composite_keys(
         return []
 
     ranked.sort()
-    chosen = [list(pair) for _ids, _product, pair in ranked[:_COMPOSITE_PAIR_CAP]]
+    deduped: list[tuple[int, int, tuple[str, str]]] = []
+    best_product_for: dict[str, int] = {}
+    for ids, product, pair in ranked:
+        if any(
+            col in best_product_for
+            and product <= best_product_for[col] * _COMPOSITE_REDUNDANCY_RATIO
+            for col in pair
+        ):
+            continue  # near-duplicate: same anchor, interchangeable filler
+        deduped.append((ids, product, pair))
+        for col in pair:
+            best_product_for.setdefault(col, product)
+
+    chosen = [list(pair) for _ids, _product, pair in deduped[:_COMPOSITE_PAIR_CAP]]
     exact = combo_counts(identifier, chosen)
     return [combo for combo in chosen if exact.get(tuple(combo)) == row_count]
 

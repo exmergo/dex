@@ -9,6 +9,32 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A crowded low-cardinality dimension no longer pushes the true grain out
+  of the composite-key probe** ([#168]). `_probe_composite_keys` ranks
+  candidate 2-column keys by smallest distinct-count product and probes only
+  the top few, because each probe is a real two-column `DISTINCT` scan. When
+  one dimension column happened to pair cheaply with several other columns,
+  every one of those pairs ranked ahead of the true grain purely because they
+  shared that same attractive anchor, even though they were really the same
+  hypothesis ("does this dimension have *a* partner?") tried with different
+  filler. The true grain, which can legitimately score worse on raw product,
+  never got probed, and a wrong (or no) grain was recorded instead, so
+  `maintain grain` went on monitoring the wrong composite indefinitely.
+
+  The cap (`_COMPOSITE_PAIR_CAP`) is raised from 3 to 5 for headroom, and a
+  pair that shares a column with an already-kept pair is now dropped as a
+  near-duplicate when its product is within `_COMPOSITE_REDUNDANCY_RATIO`
+  (3.0x) of the kept pair's — the same idea tried with interchangeable
+  filler, not a genuinely different candidate. A pair whose product diverges
+  meaningfully still gets its own slot even if it reuses a column, which is
+  what lets the true grain through. Each additional slot is still a real
+  scan, but the batch stays one statement, and a metered adapter that cannot
+  cover the wider batch within the confirmed budget already degrades to
+  "grain unknown" via `distinct_combination_counts`'s existing contract, so
+  this does not bypass cost guards.
+
 ## [1.5.2] - 2026-08-05
 
 ### Added
