@@ -590,6 +590,44 @@ def test_distinct_combination_counts_batch_into_one_guarded_statement(
     assert adapter.distinct_combination_counts("dexdb.shop.customers", []) == {}
 
 
+def test_value_domain_counts_batch_into_one_guarded_statement(fake_pg_connection):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(
+        rows=[
+            {
+                "d_0": [{"v": "prod", "c": 60}, {"v": "dev", "c": 40}],
+                "n_0": 2,
+                "d_1": [{"v": "x", "c": 100}],
+                "n_1": 1,
+            }
+        ],
+        seconds=0.5,
+    )
+    adapter = make_adapter(fake_pg_connection)
+    result = adapter.value_domain_counts(
+        "dexdb.shop.customers", ["env_tier", "flag"], limit=25
+    )
+    assert result["env_tier"].values == [("prod", 60), ("dev", 40)]
+    assert result["env_tier"].total_distinct == 2
+    assert result["flag"].values == [("x", 100)]
+    stmts = fake_pg_connection.data_statements
+    assert len(stmts) == 1
+    sql = stmts[0].sql
+    assert "json_agg" in sql
+    assert assert_select_only(sql, dialect="postgres") == sql
+    assert adapter.value_domain_counts("dexdb.shop.customers", [], limit=25) == {}
+
+
+def test_value_domain_counts_skipped_when_budget_cannot_cover(fake_pg_connection):
+    adapter = make_adapter(fake_pg_connection, ceiling=1.0)
+    result = adapter.value_domain_counts("dexdb.shop.customers", ["env_tier"], limit=25)
+    assert result == {}
+    assert fake_pg_connection.data_statements == []
+    notes = adapter.table_notes("dexdb.shop.customers")
+    assert any("value-domain probe skipped" in note for note in notes)
+
+
 def test_composite_probe_skipped_when_budget_cannot_cover(fake_pg_connection):
     adapter = make_adapter(fake_pg_connection, ceiling=1.0)
     result = adapter.distinct_combination_counts(

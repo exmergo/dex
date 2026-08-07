@@ -48,6 +48,7 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    ValueDomainSample,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -836,6 +837,55 @@ class PostgresAdapter:
         return {
             tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
         }
+
+    def value_domain_counts(
+        self, identifier: str, columns: list[str], *, limit: int
+    ) -> dict[str, ValueDomainSample]:
+        """Top ``limit`` values by frequency per column, plus each column's
+        exact distinct-group count, spent only within the already-confirmed
+        budget: when the remaining budget cannot cover the extra scan,
+        return nothing and report no value domain. A metered adapter never
+        self-escalates past its ceiling.
+        """
+
+        if not columns:
+            return {}
+        meta, _ = self.table_metadata(identifier)
+        estimate = self._scan_seconds(meta.byte_size)
+        if not self.cost_gate.try_charge(estimate):
+            self._note(
+                identifier,
+                "value-domain probe skipped: the remaining budget could not "
+                "cover the extra scan; no value domain reported",
+            )
+            return {}
+        table = self._quote(identifier)
+        parts = []
+        for i, name in enumerate(columns):
+            qcol = _quote_ident(name)
+            parts.append(
+                "(SELECT json_agg(json_build_object('v', v, 'c', c)) FROM "  # noqa: S608
+                f"(SELECT {qcol} AS v, COUNT(*) AS c FROM {table} "
+                f"WHERE {qcol} IS NOT NULL GROUP BY {qcol} ORDER BY c DESC, v "
+                f"LIMIT {limit}) AS q_{i}) AS d_{i}"
+            )
+            parts.append(
+                f"(SELECT COUNT(*) FROM (SELECT DISTINCT {qcol} FROM {table} "  # noqa: S608
+                f"WHERE {qcol} IS NOT NULL) AS n_{i}) AS n_{i}"
+            )
+        sql = assert_select_only(f"SELECT {', '.join(parts)}", dialect=self.dialect)
+        rows, labels = self._run(sql)
+        values = dict(zip(labels, rows[0], strict=True))
+        result = {}
+        for i, name in enumerate(columns):
+            domain = values[f"d_{i}"]
+            if isinstance(domain, str):
+                domain = json.loads(domain)
+            result[name] = ValueDomainSample(
+                values=[(entry["v"], entry["c"]) for entry in (domain or [])],
+                total_distinct=int(values[f"n_{i}"]),
+            )
+        return result
 
     # --- execution (the single billed door) --------------------------------------
 

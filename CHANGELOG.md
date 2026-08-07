@@ -36,12 +36,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `elided` count rather than dropped; only a true count that breaks the
   fraction bar (a near-key the approximation missed) is dropped entirely.
 
-  New adapter capability (`value_domain_counts`), implemented for DuckDB and
-  BigQuery this pass; other connectors don't implement it yet and degrade to
-  reporting no domain, identical to how an adapter that predates this
-  feature behaves. On BigQuery it is spent only inside the already-confirmed
-  budget, floored at the per-query minimum like every other optional
-  escalation, and `profile_estimate` reserves for it up front.
+  New adapter capability (`value_domain_counts`), implemented across every
+  connector (DuckDB, BigQuery, Snowflake, Databricks, Redshift, Postgres),
+  matching the existing `exact_distinct_counts`/`distinct_combination_counts`
+  precedent. Every metered connector spends it only inside the
+  already-confirmed budget, floored like every other optional escalation,
+  and degrades to reporting no domain (plus a table note) rather than
+  self-escalating when the remaining budget can't cover it. The reported
+  order is re-sorted by the engine rather than trusted from the adapter, since
+  not every dialect's array-aggregate reliably preserves an inner subquery's
+  `ORDER BY` once collected into one value. Redshift's implementation reads
+  back multiple tagged rows instead of one struct-shaped row (its
+  semi-structured `SUPER` type is treated as degraded elsewhere in that
+  adapter already), trading the column's native value type for a text cast
+  that lets heterogeneous columns batch into one `UNION ALL` statement.
 
 - **transform init**: allow initializing into the current directory ([#235]).
 

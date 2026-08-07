@@ -630,6 +630,45 @@ def test_distinct_combination_counts_degrade_when_budget_cannot_cover(
     assert data_statements(fake_databricks) == []
 
 
+def test_value_domain_counts_batch_into_one_guarded_statement(fake_databricks):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [
+        {
+            "d_0": [{"v": "prod", "c": 60}, {"v": "dev", "c": 40}],
+            "n_0": 2,
+            "d_1": [{"v": "x", "c": 100}],
+            "n_1": 1,
+        }
+    ]
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    result = adapter.value_domain_counts(
+        "shop.core.customers", ["env_tier", "flag"], limit=25
+    )
+    assert result["env_tier"].values == [("prod", 60), ("dev", 40)]
+    assert result["env_tier"].total_distinct == 2
+    assert result["flag"].values == [("x", 100)]
+    stmts = data_statements(fake_databricks)
+    assert len(stmts) == 1
+    assert "collect_list" in stmts[0].sql
+    assert assert_select_only(stmts[0].sql, dialect="databricks") == stmts[0].sql
+    assert adapter.value_domain_counts("shop.core.customers", [], limit=25) == {}
+
+
+def test_value_domain_counts_degrade_when_budget_cannot_cover(fake_databricks):
+    warm(fake_databricks)
+    adapter = make_adapter(fake_databricks, ceiling=100.0)
+    adapter.cost_gate.charge(99.5)
+    result = adapter.value_domain_counts("shop.core.customers", ["env_tier"], limit=25)
+    assert result == {}
+    assert any(
+        "value-domain probe skipped" in note
+        for note in adapter.table_notes("shop.core.customers")
+    )
+    assert data_statements(fake_databricks) == []
+
+
 # --- factory, dialect, and warehouse pin forms ----------------------------------------
 
 

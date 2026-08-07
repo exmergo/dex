@@ -791,6 +791,90 @@ def test_composite_probe_skipped_when_budget_cannot_cover(fake_redshift_connecti
     )
 
 
+def test_value_domain_counts_batch_into_one_guarded_statement(
+    fake_redshift_connection,
+):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    fake_redshift_connection.row_resolver = lambda sql: FakeResult(
+        rows=[
+            {"col": 0, "v": "prod", "c": 60},
+            {"col": 0, "v": "dev", "c": 40},
+            {"col": 0, "v": None, "c": 2},
+            {"col": 1, "v": "x", "c": 100},
+            {"col": 1, "v": None, "c": 1},
+        ],
+        seconds=0.5,
+    )
+    adapter = make_adapter(fake_redshift_connection, ceiling=100_000.0)
+    result = adapter.value_domain_counts(
+        "dexdb.shop.customers", ["env_tier", "flag"], limit=25
+    )
+    assert result["env_tier"].values == [("prod", 60), ("dev", 40)]
+    assert result["env_tier"].total_distinct == 2
+    assert result["flag"].values == [("x", 100)]
+    assert result["flag"].total_distinct == 1
+    stmts = fake_redshift_connection.data_statements
+    assert len(stmts) == 1
+    sql = stmts[0].sql
+    assert "UNION ALL" in sql
+    assert assert_select_only(sql, dialect="redshift") == sql
+    assert adapter.value_domain_counts("dexdb.shop.customers", [], limit=25) == {}
+
+
+def test_value_domain_counts_skipped_when_budget_cannot_cover(
+    fake_redshift_connection,
+):
+    adapter = make_adapter(fake_redshift_connection, ceiling=1.0)
+    result = adapter.value_domain_counts("dexdb.shop.customers", ["env_tier"], limit=25)
+    assert result == {}
+    assert fake_redshift_connection.data_statements == []
+    assert any(
+        "value-domain probe skipped" in note
+        for note in adapter.table_notes("dexdb.shop.customers")
+    )
+
+
+def test_value_domain_counts_carries_the_wake_floor_when_it_bills_first(
+    fake_redshift_connection,
+):
+    """Like the exact-distinct escalation, the value-domain probe can be a
+    command's first billed statement, so the pending wake minimum rides its
+    charge (and stays pending on refusal). One probe over customers estimates
+    scan (100s) + floor (60s)."""
+
+    def resolve(sql):
+        if "UNION ALL" in sql:
+            return FakeResult(
+                rows=[{"col": 0, "v": "x", "c": 1}, {"col": 0, "v": None, "c": 1}],
+                seconds=0.1,
+            )
+        return FakeResult(rows=[{"n": 1}], seconds=0.1)
+
+    fake_redshift_connection.row_resolver = resolve
+
+    # Covers the scan but not scan + floor: the probe must refuse rather than
+    # under-charge its way in, and the floor stays pending.
+    strict = make_adapter(fake_redshift_connection, ceiling=155.0)
+    assert (
+        strict.value_domain_counts("dexdb.shop.customers", ["env_tier"], limit=25) == {}
+    )
+    assert fake_redshift_connection.data_statements == []
+    assert strict._wake_floor_pending is True
+
+    # Once charged, the floor is consumed: probe (100 + 60) plus a follow-up
+    # query (100, floorless) fit a 270s ceiling only if the second statement
+    # does not carry the floor again.
+    adapter = make_adapter(fake_redshift_connection, ceiling=270.0)
+    result = adapter.value_domain_counts("dexdb.shop.customers", ["env_tier"], limit=25)
+    assert result["env_tier"].values == [("x", 1)]
+    adapter.run_query(
+        "SELECT count(*) AS n FROM dexdb.shop.customers",
+        max_rows=10,
+        timeout_seconds=30.0,
+    )
+
+
 def test_composite_probe_carries_the_wake_floor_when_it_bills_first(
     fake_redshift_connection,
 ):

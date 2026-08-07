@@ -53,6 +53,7 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    ValueDomainSample,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -927,6 +928,71 @@ class RedshiftAdapter:
         values = dict(zip(labels, rows[0], strict=True))
         return {
             tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
+        }
+
+    def value_domain_counts(
+        self, identifier: str, columns: list[str], *, limit: int
+    ) -> dict[str, ValueDomainSample]:
+        """Top ``limit`` values by frequency per column, plus each column's
+        exact distinct-group count, spent only within the already-confirmed
+        budget: when the remaining budget cannot cover the extra scan,
+        return nothing and report no value domain. A metered adapter never
+        self-escalates past its ceiling.
+
+        Unlike the other adapters' single-row batching, this reads back
+        multiple rows tagged by a column index, one row per top value plus a
+        sentinel row (``v IS NULL``) carrying the exact distinct-group count:
+        Redshift's struct/array support is the least reliable of every
+        dialect here (its semi-structured SUPER type is treated as degraded
+        elsewhere in this adapter), so this avoids depending on it at all.
+        The tradeoff is losing the column's native type for the reported
+        value (cast to text so heterogeneous columns can UNION into one
+        statement), which is acceptable for a name/label domain.
+        """
+
+        if not columns:
+            return {}
+        meta, _ = self.table_metadata(identifier)
+        estimate = self._scan_seconds(meta.byte_size) + self._wake_floor()
+        if not self.cost_gate.try_charge(estimate):
+            self._note(
+                identifier,
+                "value-domain probe skipped: the remaining budget could not "
+                "cover the extra scan; no value domain reported",
+            )
+            return {}
+        self._consume_wake_floor()
+        table = self._quote(identifier)
+        branches = []
+        for i, name in enumerate(columns):
+            qcol = _quote_ident(name)
+            branches.append(
+                f"SELECT {i} AS col, CAST(v AS VARCHAR) AS v, c AS c FROM "  # noqa: S608
+                f"(SELECT {qcol} AS v, COUNT(*) AS c FROM {table} "
+                f"WHERE {qcol} IS NOT NULL GROUP BY {qcol} ORDER BY c DESC, v "
+                f"LIMIT {limit}) AS q_{i}"
+            )
+            branches.append(
+                f"SELECT {i} AS col, CAST(NULL AS VARCHAR) AS v, COUNT(*) AS c "  # noqa: S608
+                f"FROM (SELECT DISTINCT {qcol} FROM {table} "
+                f"WHERE {qcol} IS NOT NULL) AS n_{i}"
+            )
+        sql = assert_select_only(" UNION ALL ".join(branches), dialect=self.dialect)
+        rows, labels = self._run(sql)
+        by_column: dict[int, list[tuple]] = {i: [] for i in range(len(columns))}
+        totals: dict[int, int] = {}
+        for row in rows:
+            values = dict(zip(labels, row, strict=True))
+            col_index = int(values["col"])
+            if values["v"] is None:
+                totals[col_index] = int(values["c"])
+            else:
+                by_column[col_index].append((values["v"], int(values["c"])))
+        return {
+            name: ValueDomainSample(
+                values=by_column[i], total_distinct=totals.get(i, len(by_column[i]))
+            )
+            for i, name in enumerate(columns)
         }
 
     # --- execution (the single billed door) --------------------------------------

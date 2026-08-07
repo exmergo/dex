@@ -701,8 +701,13 @@ def _probe_value_domains(
             # this is really a near-key column, so report no domain at all
             # rather than a capped slice of one.
             continue
+        # Sorted here, not trusted from the adapter: not every dialect's
+        # array-aggregate reliably preserves the inner subquery's ORDER BY
+        # once it's collected into a single value, so frequency order is
+        # guaranteed at this one point instead of per-dialect.
+        ordered = sorted(sample.values, key=lambda pair: pair[1], reverse=True)
         domains[name] = ValueDomain(
-            values=[ValueCount(value=json_safe(v), count=c) for v, c in sample.values],
+            values=[ValueCount(value=json_safe(v), count=c) for v, c in ordered],
             elided=max(0, sample.total_distinct - len(sample.values)),
         )
     return domains
