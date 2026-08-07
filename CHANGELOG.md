@@ -17,6 +17,11 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **transform dev-target preflight compares resolved DuckDB paths** ([#234]).
+  Relative and absolute spellings of the same warehouse file (e.g. `warehouse.duckdb`
+  vs `./warehouse.duckdb`) are no longer treated as configuration drift.
+
+
 - **A crowded low-cardinality dimension no longer pushes the true grain out
   of the composite-key probe** ([#168]). `_probe_composite_keys` ranks
   candidate 2-column keys by smallest distinct-count product and probes only

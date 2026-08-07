@@ -1261,7 +1261,11 @@ def test_duckdb_equivalent_path_spellings_are_accepted(
         "      path: ./warehouse.duckdb\n",
         encoding="utf-8",
     )
-    for declared in ("warehouse.duckdb", "./warehouse.duckdb", str(warehouse.resolve())):
+    for declared in (
+        "warehouse.duckdb",
+        "./warehouse.duckdb",
+        str(warehouse.resolve()),
+    ):
         config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=declared))
         # should not raise
         dev_target.check(dbt_project_dir, "dev", config, dbt_project_dir)

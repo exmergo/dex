@@ -99,7 +99,6 @@ def _resolve_declared_path(declared: str, base_dir: Path) -> Path:
         return path if path.is_absolute() else (base_dir / path).absolute()
 
 
-
 def check(
     project_dir: Path | str,
     target: str,
