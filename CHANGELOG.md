@@ -50,10 +50,16 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   semi-structured `SUPER` type is treated as degraded elsewhere in that
   adapter already), trading the column's native value type for a text cast
   that lets heterogeneous columns batch into one `UNION ALL` statement.
+- **CLI**: resolve unambiguous bare subcommands and suggest alternatives when the name is ambiguous ([#236]).
 
 - **transform init**: allow initializing into the current directory ([#235]).
 
 ### Fixed
+
+- **transform dev-target preflight compares resolved DuckDB paths** ([#234]).
+  Relative and absolute spellings of the same warehouse file (e.g. `warehouse.duckdb`
+  vs `./warehouse.duckdb`) are no longer treated as configuration drift.
+
 
 - **A crowded low-cardinality dimension no longer pushes the true grain out
   of the composite-key probe** ([#168]). `_probe_composite_keys` ranks
