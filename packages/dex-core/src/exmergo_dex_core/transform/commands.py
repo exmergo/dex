@@ -84,6 +84,7 @@ def init_project(
     connector: str | None = None,
     path: str | None = None,
     layered_schemas: bool = False,
+    in_place: bool = False,
 ) -> InitResult:
     """Bootstrap a dbt project in the repo, rendering profiles from dex config.
 
@@ -120,6 +121,7 @@ def init_project(
         path=path,
         repo_root=repo_root,
         layered_schemas=layered_schemas,
+        in_place=in_place,
     )
 
     # The renderers persisted the resolved dev namespaces into .dex/config.yml,
@@ -156,6 +158,7 @@ def cmd_init(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             connector=getattr(args, "connector", None),
             path=getattr(args, "path", None),
             layered_schemas=bool(getattr(args, "layered_schemas", False)),
+            in_place=bool(getattr(args, "in_place", False)),
         )
     except ValueError as exc:
         return env.error_for(exc)

@@ -578,6 +578,7 @@ class DexEngine:
         connector: str | None = None,
         path: str | None = None,
         layered_schemas: bool = False,
+        in_place: bool = False,
     ) -> InitResult:
         from .transform import commands as transform
 
@@ -587,6 +588,7 @@ class DexEngine:
             connector=connector,
             path=path,
             layered_schemas=layered_schemas,
+            in_place=in_place,
         )
 
     def plan(

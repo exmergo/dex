@@ -9,6 +9,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **transform init**: allow initializing into the current directory ([#235]).
+
 ### Fixed
 
 - **A crowded low-cardinality dimension no longer pushes the true grain out
