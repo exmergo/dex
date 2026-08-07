@@ -11,6 +11,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **CLI**: resolve unambiguous bare subcommands and suggest alternatives when the name is ambiguous ([#236]).
+
 - **transform init**: allow initializing into the current directory ([#235]).
 
 ### Fixed
