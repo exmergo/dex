@@ -87,6 +87,18 @@ _DRIFT_FIELDS: dict[str, tuple[tuple[str, str, str], ...]] = {
 _CASE_FOLDING = {"snowflake"}
 
 
+def _resolve_declared_path(declared: str, base_dir: Path) -> Path:
+    """Expand user, make absolute against ``base_dir``, and resolve symlinks."""
+    path = Path(declared).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    try:
+        return path.resolve()
+    except OSError:
+        # Unresolvable symlink / missing parent: still normalize as absolute.
+        return path if path.is_absolute() else (base_dir / path).absolute()
+
+
 def check(
     project_dir: Path | str,
     target: str,
@@ -146,6 +158,10 @@ def _assert_no_drift(
         return
     fold = config.connector in _CASE_FOLDING
     divergent = []
+    # Config paths resolve against the repo root (committed target); profile
+    # paths resolve against the dbt project dir (dbt's cwd).
+    config_base = Path(repo_root)
+    profile_base = project
     for attribute, config_key, profile_key in _DRIFT_FIELDS.get(config.connector, ()):
         # An unset config field was never a claim about the dev target, so it
         # cannot have drifted away from one.
@@ -154,6 +170,17 @@ def _assert_no_drift(
         want = getattr(target_config, attribute, None)
         got = profile.get(profile_key)
         if want is None or got is None:
+            continue
+        if config.connector == "duckdb" and attribute == "path":
+            want_resolved = _resolve_declared_path(str(want), config_base)
+            got_resolved = _resolve_declared_path(str(got), profile_base)
+            if want_resolved == got_resolved:
+                continue
+            divergent.append(
+                f"  {config_key}: {want} (resolves to {want_resolved})\n"
+                f"  {PROFILES_FILE} {target}.{profile_key}: {got} "
+                f"(resolves to {got_resolved})"
+            )
             continue
         if (str(want).upper() == got.upper()) if fold else (str(want) == got):
             continue
