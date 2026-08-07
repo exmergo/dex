@@ -49,6 +49,26 @@ class PIIFlag(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class ValueCount(BaseModel):
+    """One distinct value's frequency, part of a reported value domain."""
+
+    value: object
+    count: int
+
+
+class ValueDomain(BaseModel):
+    """A column's value domain: distinct values by frequency, capped.
+
+    ``elided`` is the number of additional distinct values beyond the cap
+    (0 when the column's full domain fit). Never populated for a PII-flagged
+    column, at any confidence -- see `_probe_value_domains` in
+    `explore/profile.py`.
+    """
+
+    values: list[ValueCount]
+    elided: int = 0
+
+
 class ColumnProfile(BaseModel):
     """Aggregate-derived understanding of one column, built from SQL aggregates and
     never from raw rows in context."""
@@ -68,6 +88,7 @@ class ColumnProfile(BaseModel):
     #: detector, cleared this column. None when no override applied or the
     #: detector matched nothing.
     pii_overridden: PIICategory | None = None
+    value_domain: ValueDomain | None = None
 
 
 class Dataset(BaseModel):

@@ -60,6 +60,28 @@ def _near_unique_not_proven_resolver(sql: str):
     return [values]
 
 
+def _domain_eligible_resolver(sql: str):
+    """Like `_near_unique_not_proven_resolver`, but every filler column
+    (customers.plan_tier, orders.customer_id, orders.total) is also given a
+    small, domain-eligible cardinality instead of the generic 40. Their
+    value-domain probes are a genuinely different query shape -- a capped
+    frequency list, not the scalar the other escalations return under the
+    same `d_i`/`n_i` aliases -- so they are answered separately (keyed off
+    `ARRAY_AGG`, the marker unique to that statement) rather than sharing
+    the generic per-index values. This makes profiling this fixture's
+    tables actually spend the new reserve instead of leaving it as unused
+    padding, which is what the beyond-budget verify-checkpoint tests need."""
+
+    values = _near_unique_not_proven_resolver(sql)[0]
+    values["nd_1"] = 5  # orders.customer_id (customers.email stays PII-excluded
+    values["nd_2"] = 5  # regardless); customers.plan_tier / orders.total
+    if "ARRAY_AGG" in sql:
+        for i in range(3):
+            values[f"d_{i}"] = [{"v": f"v{j}", "c": 1} for j in range(5)]
+            values[f"n_{i}"] = 5
+    return [values]
+
+
 def _adapter(fake_bq_client, *, confirmed: bool, budget: float | None, record=None):
     gate = CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
@@ -145,10 +167,10 @@ def test_unconfirmed_profile_returns_needs_confirmation(
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
     # The single below-floor batch floors to the per-query minimum, plus a
-    # floor reserved for each of the two possible escalation queries (2
-    # columns, 100 rows): 10 + 10 + 10 = 30 MB.
-    assert envelope.cost.estimate == 30 * MB
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 30 * MB}
+    # floor reserved for each of the three possible escalation queries (2
+    # columns, 100 rows): 10 + 10 + 10 + 10 = 40 MB.
+    assert envelope.cost.estimate == 40 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 40 * MB}
     assert "--confirm" in envelope.data["hint"]
     # Nothing executed: only free metadata and dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -169,7 +191,7 @@ def test_confirmed_profile_runs_and_stamps_spend(
     )
     assert envelope.status.value == "ok"
     assert envelope.data["datasets"][0]["identifier"] == "test-proj.shop.customers"
-    assert envelope.cost.estimate == 30 * MB  # floored preflight estimate + reserve
+    assert envelope.cost.estimate == 40 * MB  # floored preflight estimate + reserve
     assert envelope.cost.ceiling == 100 * MB
     # The aggregate batch plus the exact-distinct escalation (optional spend
     # inside the confirmed budget): both scans land in the ledger.
@@ -184,9 +206,9 @@ def test_unconfirmed_map_estimates_selected_objects(
     envelope = _dispatch(tmp_path, subcommand="map")
     assert envelope.status.value == "needs_confirmation"
     # customers and events each floor to the per-query minimum plus a floor
-    # per possible escalation query (30 MB apiece); logs.requests needs a
+    # per possible escalation query (40 MB apiece); logs.requests needs a
     # partition filter, so it contributes zero.
-    assert envelope.cost.estimate == 2 * 30 * MB
+    assert envelope.cost.estimate == 2 * 40 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -246,7 +268,7 @@ def test_unconfirmed_map_excludes_fresh_cached_objects(
     assert envelope.status.value == "needs_confirmation"
     # Only events is priced now (customers is fresh-cached, requests is
     # partition-filtered to zero), so the estimate halves versus the no-cache run.
-    assert envelope.cost.estimate == 30 * MB
+    assert envelope.cost.estimate == 40 * MB
     assert "test-proj.shop.customers" not in envelope.data["per_table_bytes"]
     assert any("fresh-cached" in note for note in envelope.data["notes"])
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -475,6 +497,7 @@ def fk_bq_client():
             schema=[
                 bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
                 bigquery.SchemaField("email", "STRING"),
+                bigquery.SchemaField("plan_tier", "STRING"),
             ],
             num_rows=100,
             num_bytes=5_000,
@@ -520,22 +543,25 @@ def test_verify_within_budget_runs_in_one_pass(fk_bq_client, route_adapter, tmp_
 def test_verify_beyond_budget_checkpoints_before_any_probe(
     fk_bq_client, route_adapter, tmp_path
 ):
-    # 60 MB matches profile_estimate()'s worst-case total exactly (two tables,
-    # each floored aggregate batch plus both possible escalation reserves: 30
-    # MB apiece), so the initial handshake just barely passes. A near-unique
-    # column that escalates without fully proving uniqueness (unlike the
-    # shared resolver's exact d_i == nd_i) leaves the composite-key probe
-    # un-short-circuited, so both escalations this fixture's estimate reserved
-    # for actually run and get charged -- leaving no headroom for the
-    # two-table verify probe, which floors to another 20 MB.
-    fk_bq_client.row_resolver = _near_unique_not_proven_resolver
+    # 80 MB is profile_estimate()'s worst-case total for two tables (each
+    # floored aggregate batch plus all three possible escalation reserves: 40
+    # MB apiece), so the initial handshake passes. A near-unique column that
+    # escalates without fully proving uniqueness (unlike the shared
+    # resolver's exact d_i == nd_i) leaves the composite-key probe
+    # un-short-circuited, and every filler column is domain-eligible, so
+    # every escalation this fixture's estimate reserved for actually runs and
+    # gets charged: 2 tables x (exact-distinct + combination) = 4 charges,
+    # plus 3 value-domain probes (customers.plan_tier, orders.customer_id,
+    # orders.total) = 7 charges x ~10 MB =~ 73 MB profiling, which alone
+    # already leaves no room for the two-table verify probe's 20 MB floor.
+    fk_bq_client.row_resolver = _domain_eligible_resolver
     route_adapter(fk_bq_client)
     envelope = _dispatch(
         tmp_path,
         subcommand="map",
         verify=True,
         confirm=True,
-        budget=float(60 * MB),
+        budget=float(80 * MB),
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.data["phase"] == "verify"
@@ -545,7 +571,7 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     assert "--budget" in envelope.data["hint"]
     # The raised estimate is the whole-command total the re-run needs.
     assert envelope.cost.estimate > envelope.cost.ceiling
-    assert envelope.cost.ceiling == 60 * MB
+    assert envelope.cost.ceiling == 80 * MB
     # No probe was billed; profiling spend is reported on the checkpoint.
     assert not _probe_executed(fk_bq_client)
     assert envelope.data["spend"]["bytes_billed"] > 0
@@ -561,14 +587,17 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
 def test_relationships_verify_beyond_budget_checkpoints(
     fk_bq_client, route_adapter, tmp_path
 ):
-    fk_bq_client.row_resolver = _near_unique_not_proven_resolver
+    # See test_verify_beyond_budget_checkpoints_before_any_probe: every
+    # filler column's value-domain probe is what actually spends the new
+    # reserve rather than leaving it as unused padding.
+    fk_bq_client.row_resolver = _domain_eligible_resolver
     route_adapter(fk_bq_client)
     envelope = _dispatch(
         tmp_path,
         subcommand="relationships",
         verify=True,
         confirm=True,
-        budget=float(60 * MB),
+        budget=float(80 * MB),
     )
     assert envelope.status.value == "needs_confirmation"
     assert envelope.data["phase"] == "verify"
@@ -700,7 +729,7 @@ def test_over_ceiling_refusal_reports_the_metered_paradigm(
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
     # The two numbers the prose names, structured: what was asked for and what
     # was allowed. A caller sizes the re-run from these without parsing text.
-    assert envelope.cost.estimate == 30 * MB
+    assert envelope.cost.estimate == 40 * MB
     assert envelope.cost.ceiling == MB
     assert "exceeds the ceiling" in envelope.errors[0]
     assert all(c.dry_run for c in fake_bq_client.query_calls)

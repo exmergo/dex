@@ -88,6 +88,20 @@ class ColumnAggregate:
 
 
 @dataclass(frozen=True)
+class ValueDomainSample:
+    """One column's raw value-domain probe result. ``values`` is already
+    capped and ordered by frequency descending; ``total_distinct`` is the
+    *exact* distinct-group count (never the approximate estimate), so the
+    caller can compute an accurate elided count and, if the exact count
+    turns out to exceed the cap after all (an approximate pre-check
+    under-estimated), drop the domain rather than report a partial one.
+    """
+
+    values: list[tuple[object, int]]
+    total_distinct: int
+
+
+@dataclass(frozen=True)
 class QueryResult:
     """The result of one firewall-approved agent query, columnar.
 
@@ -335,6 +349,20 @@ class Adapter(Protocol):
         bounded and deliberate; a metered adapter that cannot cover the scan
         within the confirmed budget returns ``{}`` and explains itself through
         a table note instead of self-escalating."""
+        ...
+
+    def value_domain_counts(
+        self, identifier: str, columns: list[str], *, limit: int
+    ) -> dict[str, ValueDomainSample]:
+        """Top ``limit`` values by frequency for each named column, plus each
+        column's exact distinct-group count, batched into as few statements
+        as possible. The engine calls this only for columns already screened
+        as non-PII and low-cardinality, so the spend is bounded and
+        deliberate; a metered adapter that cannot cover the scan within the
+        confirmed budget returns ``{}`` and explains itself through a table
+        note, same as ``distinct_combination_counts``. Optional: an adapter
+        that does not implement it simply reports no value domain, exactly
+        like an adapter that predates this capability."""
         ...
 
     def run_query(

@@ -1074,13 +1074,16 @@ class _StubAdapter:
         approx: dict[str, int],
         nulls: dict[str, float] | None = None,
         combos: dict[tuple[str, ...], int] | None = None,
+        domains: dict[str, object] | None = None,
     ):
         self.rows = rows
         self.approx = approx
         self.nulls = nulls or {}
         self.combos = combos or {}
+        self.domains = domains or {}
         self.calls: list[list[str]] = []
         self.combo_calls: list[list[list[str]]] = []
+        self.domain_calls: list[list[str]] = []
 
     def table_metadata(self, identifier):
         from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
@@ -1126,6 +1129,10 @@ class _StubAdapter:
         return {
             tuple(c): self.combos.get(tuple(c), self.rows - 10) for c in combinations
         }
+
+    def value_domain_counts(self, identifier, columns, *, limit):
+        self.domain_calls.append(list(columns))
+        return {n: self.domains[n] for n in columns if n in self.domains}
 
 
 def test_escalation_policy_is_bounded_and_targeted():
@@ -1308,6 +1315,194 @@ def test_composite_grain_detected_end_to_end(composite_grain_duckdb: Path, capsy
     orders = ds["orders"]
     assert orders["grain"] == ["order_key"]
     assert orders["composite_keys"] == []
+
+
+# --- value-domain reporting (#203) -----------------------------------------------
+
+
+def test_value_domain_reported_for_eligible_low_cardinality_column():
+    """The issue's own acceptance case: a four-value non-PII string column
+    reports its domain with counts."""
+
+    from exmergo_dex_core.adapters.base import ValueDomainSample
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"env_tier": 4},
+        domains={
+            "env_tier": ValueDomainSample(
+                values=[("prod", 600), ("staging", 250), ("dev", 100), ("test", 50)],
+                total_distinct=4,
+            )
+        },
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    col = datasets[0].columns[0]
+    assert adapter.domain_calls == [["env_tier"]]
+    assert col.value_domain is not None
+    assert [(v.value, v.count) for v in col.value_domain.values] == [
+        ("prod", 600),
+        ("staging", 250),
+        ("dev", 100),
+        ("test", 50),
+    ]
+    assert col.value_domain.elided == 0
+
+
+def test_value_domain_never_reported_for_pii_flagged_column_any_confidence():
+    """A flagged column reports no domain at any confidence or cardinality,
+    even if the adapter would have happily returned one. ``ssn`` (rather
+    than an email/name pattern) because the stub's columns are all typed
+    INTEGER, and the EMAIL/NAME categories are string-only -- GOVERNMENT_ID
+    flags on any type."""
+
+    from exmergo_dex_core.adapters.base import ValueDomainSample
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"ssn": 4},
+        domains={"ssn": ValueDomainSample(values=[(123, 500)], total_distinct=1)},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.domain_calls == []  # never even queried
+    assert datasets[0].columns[0].value_domain is None
+
+
+def test_value_domain_excluded_for_high_cardinality_column():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(rows=1000, approx={"code": 30})  # over the cap of 25
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.domain_calls == []
+    assert datasets[0].columns[0].value_domain is None
+
+
+def test_value_domain_excluded_when_fraction_exceeds_cutoff_on_small_table():
+    """The 'tiny table of distinct people' case: 20 distinct values clears
+    the absolute cap of 25, but on a 40-row table that's 50% of rows, far
+    past the 10% fraction cutoff -- a near-key, not a categorical dimension."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(rows=40, approx={"code": 20})
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.domain_calls == []
+    assert datasets[0].columns[0].value_domain is None
+
+
+def test_value_domain_excluded_for_composite_key_member():
+    """`line_no` is well within the cap and fraction on its own, but it is a
+    proven composite-key member, so it must report no domain even though the
+    adapter would have returned one."""
+
+    from exmergo_dex_core.adapters.base import ValueDomainSample
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_key": 250, "line_no": 4, "qty": 30, "filler": 2},
+        combos={("order_key", "line_no"): 1000},
+        domains={
+            "line_no": ValueDomainSample(
+                values=[(1, 250), (2, 250), (3, 250), (4, 250)], total_distinct=4
+            )
+        },
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert datasets[0].composite_keys == [["order_key", "line_no"]]
+    assert "line_no" not in adapter.domain_calls[0]
+    cols = {c.name: c for c in datasets[0].columns}
+    assert cols["line_no"].value_domain is None
+
+
+def test_value_domain_reports_elided_when_the_exact_count_exceeds_the_cap():
+    """HLL under-estimated: the approx distinct count (20) cleared the cap,
+    but the exact probe reveals 30 true values, still well within the 10%
+    fraction on this large table. Report the capped slice with an accurate
+    elided count instead of dropping it."""
+
+    from exmergo_dex_core.adapters.base import ValueDomainSample
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=10_000,
+        approx={"code": 20},
+        domains={
+            "code": ValueDomainSample(
+                values=[(f"v{i}", 100) for i in range(25)], total_distinct=30
+            )
+        },
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    domain = datasets[0].columns[0].value_domain
+    assert domain is not None
+    assert len(domain.values) == 25
+    assert domain.elided == 5
+
+
+def test_value_domain_dropped_when_the_exact_fraction_breaks_the_safety_bar():
+    """The approx distinct count (20) passed the pre-scan fraction check on
+    this 250-row table (20/250 = 8%), but the exact probe reveals the true
+    count (30) actually breaks the 10% bar (30/250 = 12%) -- a near-key the
+    approximation missed. Report no domain at all, not a partial one."""
+
+    from exmergo_dex_core.adapters.base import ValueDomainSample
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(
+        rows=250,
+        approx={"code": 20},
+        domains={
+            "code": ValueDomainSample(
+                values=[(f"v{i}", 5) for i in range(25)], total_distinct=30
+            )
+        },
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert datasets[0].columns[0].value_domain is None
+
+
+def test_adapter_without_value_domain_counts_degrades_gracefully():
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    adapter = _StubAdapter(rows=1000, approx={"env_tier": 4})
+    adapter.value_domain_counts = None  # shadow: adapter can't probe
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+    assert datasets[0].columns[0].value_domain is None
+
+
+def test_value_domain_detected_end_to_end(tmp_path: Path, capsys):
+    """The issue's own `raw_workspaces` shape: a low-cardinality non-PII
+    column reports its domain, a candidate key and a PII-flagged column
+    (even a low-cardinality one) do not."""
+
+    import duckdb
+
+    db_path = tmp_path / "raw.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE raw_workspaces (ws_id VARCHAR, env_tier VARCHAR, email VARCHAR)"
+    )
+    rows = [
+        (f"ws{i}", ["prod", "staging", "dev", "test"][i % 4], f"u{i}@x.com")
+        for i in range(100)
+    ]
+    conn.executemany("INSERT INTO raw_workspaces VALUES (?, ?, ?)", rows)
+    conn.close()
+
+    payload = _run(
+        ["explore", "profile", "raw_workspaces", "--path", str(db_path)], capsys
+    )
+    cols = {c["name"]: c for c in payload["data"]["datasets"][0]["columns"]}
+
+    assert cols["ws_id"]["value_domain"] is None  # candidate key
+    assert cols["email"]["value_domain"] is None  # PII, despite low cardinality
+    domain = cols["env_tier"]["value_domain"]
+    assert domain is not None
+    assert domain["elided"] == 0
+    assert {v["value"] for v in domain["values"]} == {"prod", "staging", "dev", "test"}
 
 
 def test_row_count_refreshes_after_the_aggregate_scan():
