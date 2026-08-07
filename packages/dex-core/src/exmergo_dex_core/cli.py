@@ -99,7 +99,7 @@ def _rewrite_unambiguous_bare_subcommand(argv: list[str]) -> list[str]:
         return argv
     groups = _bare_subcommand_index().get(token, [])
     if len(groups) == 1:
-        return argv[:i] + [groups[0], token] + argv[i + 1 :]
+        return [*argv[:i], groups[0], token, *argv[i + 1 :]]
     return argv
 
 
