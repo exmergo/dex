@@ -1215,12 +1215,44 @@ def test_composite_probe_is_bounded_and_targeted():
 def test_composite_probe_caps_the_pair_count():
     from exmergo_dex_core.explore import profile as profile_mod
 
-    # Five interchangeable mid-cardinality columns: every pair survives the
-    # product test, so only the cap keeps the probe bounded.
-    adapter = _StubAdapter(rows=1000, approx={f"c{i}_id": 100 + i for i in range(5)})
+    # Twelve columns with geometrically spread cardinalities: every pair
+    # survives the product test, and their products are spread widely enough
+    # that redundancy dedup (#168) leaves dozens of genuinely distinct
+    # candidates -- so the cap, not the dedup, is what keeps the probe
+    # bounded here.
+    approx = {}
+    for i in range(6):
+        approx[f"a{i}_id"] = 32 * (2**i)
+        approx[f"b{i}_id"] = 64 * (2**i)
+    adapter = _StubAdapter(rows=1000, approx=approx)
     profile_mod.profile(adapter, ["db.s.t"])
     assert len(adapter.combo_calls) == 1
-    assert len(adapter.combo_calls[0]) == 3
+    assert len(adapter.combo_calls[0]) == 5  # _COMPOSITE_PAIR_CAP
+
+
+def test_composite_probe_dedups_same_anchor_pairs_so_the_true_grain_survives():
+    """#168: several pairs crossing one low-cardinality dimension with
+    different, equally uninteresting partners must not consume the entire
+    cap and crowd out the true grain, which can legitimately score worse on
+    raw distinct-count product than that junk cluster."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    # dim's five (dim, j_i) pairings all score identically (product == row
+    # count) and are near-duplicates of each other -- only one should survive
+    # as dim's representative. (date, dim) scores 5x worse but is a
+    # genuinely different hypothesis and must still get a slot.
+    approx = {"dim": 10, "date": 500, **{f"j{i}": 100 for i in range(1, 6)}}
+    adapter = _StubAdapter(rows=1000, approx=approx, combos={("date", "dim"): 1000})
+    datasets = profile_mod.profile(adapter, ["db.s.t"])
+
+    assert len(adapter.combo_calls) == 1
+    probed = adapter.combo_calls[0]
+    assert ["date", "dim"] in probed
+    dim_pairs = [pair for pair in probed if "dim" in pair]
+    assert len(dim_pairs) == 2, probed  # (date, dim) plus one junk representative
+
+    assert datasets[0].composite_keys == [["date", "dim"]]
 
 
 def test_composite_probe_skipped_when_single_key_exists():
