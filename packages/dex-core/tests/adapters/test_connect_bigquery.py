@@ -200,11 +200,12 @@ def test_profile_estimate_floors_each_batch_at_the_billing_minimum(fake_bq_clien
     adapter = make_adapter(fake_bq_client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.customers"])
     # One batch over one table (the raw 5000-byte scan floors to the minimum)
-    # plus a floor reserved for each of the two possible escalation queries
-    # (customers has 2 non-blob columns and 100 rows, so both are possible):
-    # 10 MB aggregate + 10 MB near-unique reserve + 10 MB composite reserve.
-    assert per_table["test-proj.shop.customers"] == 30 * MB
-    assert total == 30 * MB
+    # plus a floor reserved for each of the three possible escalation queries
+    # (customers has 2 non-blob columns and 100 rows, so all three are
+    # possible): 10 MB aggregate + 10 MB near-unique reserve + 10 MB
+    # value-domain reserve + 10 MB composite reserve.
+    assert per_table["test-proj.shop.customers"] == 40 * MB
+    assert total == 40 * MB
 
 
 def test_every_executed_job_carries_maximum_bytes_billed(fake_bq_client):
@@ -438,21 +439,22 @@ def test_profile_estimate_sums_free_dry_runs(fake_bq_client):
         ["test-proj.shop.customers", "test-proj.shop.events", "test-proj.logs.requests"]
     )
     # Each queryable table is one below-floor batch (floors to the minimum)
-    # plus a floor reserved for each of its two possible escalation queries
-    # (both tables have >= 2 non-blob columns and > 0 rows): 30 MB apiece.
-    assert per_table["test-proj.shop.customers"] == 30 * MB
-    assert per_table["test-proj.shop.events"] == 30 * MB
+    # plus a floor reserved for each of its three possible escalation queries
+    # (both tables have >= 2 non-blob columns and > 0 rows): 40 MB apiece.
+    assert per_table["test-proj.shop.customers"] == 40 * MB
+    assert per_table["test-proj.shop.events"] == 40 * MB
     assert per_table["test-proj.logs.requests"] == 0.0  # unqueryable, skipped
-    assert total == 60 * MB
+    assert total == 80 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
-def test_profile_estimate_reserves_only_the_near_unique_floor_for_one_column(
+def test_profile_estimate_skips_only_the_composite_reserve_for_one_column(
     fake_bq_client,
 ):
     """A composite-key probe needs at least 2 columns to form a combination;
     a single-column table can never trigger one, so the estimate must not
-    reserve for it (issue #107)."""
+    reserve for it (issue #107) -- but the near-unique and value-domain
+    reserves apply to a single column just as well, so both still count."""
 
     from fakes.bigquery import FakeBigQueryClient, FakeTable
 
@@ -471,9 +473,9 @@ def test_profile_estimate_reserves_only_the_near_unique_floor_for_one_column(
     )
     adapter = make_adapter(client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.single_col"])
-    # 10 MB aggregate + 10 MB near-unique reserve only (no composite reserve).
-    assert per_table["test-proj.shop.single_col"] == 20 * MB
-    assert total == 20 * MB
+    # 10 MB aggregate + 10 MB near-unique + 10 MB value-domain (no composite).
+    assert per_table["test-proj.shop.single_col"] == 30 * MB
+    assert total == 30 * MB
 
 
 def test_profile_estimate_skips_the_reserve_for_a_provably_empty_table(fake_bq_client):
@@ -536,8 +538,8 @@ def test_profile_estimate_still_reserves_for_a_view_with_unknown_row_count(
     adapter = make_adapter(client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.a_view"])
     # Full reserve still applies despite the unknown (None) row count.
-    assert per_table["test-proj.shop.a_view"] == 30 * MB
-    assert total == 30 * MB
+    assert per_table["test-proj.shop.a_view"] == 40 * MB
+    assert total == 40 * MB
 
 
 def _blob_fake_client():
@@ -618,6 +620,47 @@ def test_distinct_combination_counts_degrade_when_budget_cannot_cover(fake_bq_cl
     assert result == {}
     assert any(
         "composite-key probe skipped" in note
+        for note in adapter.table_notes("test-proj.shop.customers")
+    )
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_value_domain_counts_batch_into_one_guarded_statement(fake_bq_client):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    fake_bq_client.row_resolver = lambda sql: [
+        {
+            "d_0": [{"v": "prod", "c": 60}, {"v": "dev", "c": 40}],
+            "n_0": 2,
+            "d_1": [{"v": "x", "c": 100}],
+            "n_1": 1,
+        }
+    ]
+    adapter = make_adapter(fake_bq_client)
+    result = adapter.value_domain_counts(
+        "test-proj.shop.customers", ["env_tier", "flag"], limit=25
+    )
+    assert result["env_tier"].values == [("prod", 60), ("dev", 40)]
+    assert result["env_tier"].total_distinct == 2
+    assert result["flag"].values == [("x", 100)]
+    assert result["flag"].total_distinct == 1
+    billed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(billed) == 1
+    sql = billed[0].sql
+    assert "ARRAY_AGG" in sql
+    assert assert_select_only(sql, dialect="bigquery") == sql
+    assert adapter.value_domain_counts("test-proj.shop.customers", [], limit=25) == {}
+
+
+def test_value_domain_counts_degrade_when_budget_cannot_cover(fake_bq_client):
+    adapter = make_adapter(fake_bq_client, ceiling=100 * MB)
+    adapter.cost_gate.charge(100 * MB - 1_000)
+    result = adapter.value_domain_counts(
+        "test-proj.shop.customers", ["env_tier"], limit=25
+    )
+    assert result == {}
+    assert any(
+        "value-domain probe skipped" in note
         for note in adapter.table_notes("test-proj.shop.customers")
     )
     assert all(c.dry_run for c in fake_bq_client.query_calls)

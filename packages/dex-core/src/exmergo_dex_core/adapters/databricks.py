@@ -42,6 +42,7 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    ValueDomainSample,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -1031,6 +1032,57 @@ class DatabricksAdapter:
             tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
         }
 
+    def value_domain_counts(
+        self, identifier: str, columns: list[str], *, limit: int
+    ) -> dict[str, ValueDomainSample]:
+        """Top ``limit`` values by frequency per column, plus each column's
+        exact distinct-group count, spent only within the already-confirmed
+        budget: when the remaining budget cannot cover the extra scan,
+        return nothing and report no value domain. A metered adapter never
+        self-escalates past its ceiling. The array-of-structs this collects
+        need not preserve frequency order itself (the engine re-sorts): the
+        subquery's own ``ORDER BY ... LIMIT`` is what selects the right top
+        values, not the order they land in `collect_list`.
+        """
+
+        if not columns:
+            return {}
+        self._ensure_detail(identifier)
+        meta, _ = self.table_metadata(identifier)
+        estimate = self._statement_seconds(meta.byte_size)
+        if not self.cost_gate.try_charge(estimate):
+            self._note(
+                identifier,
+                "value-domain probe skipped: the remaining budget could not "
+                "cover the extra scan; no value domain reported",
+            )
+            return {}
+        table = self._quote(identifier)
+        parts = []
+        for i, name in enumerate(columns):
+            qcol = _quote_ident(name)
+            parts.append(
+                "(SELECT collect_list(struct(v AS v, c AS c)) FROM "  # noqa: S608
+                f"(SELECT {qcol} AS v, COUNT(*) AS c FROM {table} "
+                f"WHERE {qcol} IS NOT NULL GROUP BY {qcol} ORDER BY c DESC, v "
+                f"LIMIT {limit}) AS q_{i}) AS d_{i}"
+            )
+            parts.append(
+                f"(SELECT COUNT(*) FROM (SELECT DISTINCT {qcol} FROM {table} "  # noqa: S608
+                f"WHERE {qcol} IS NOT NULL) AS n_{i}) AS n_{i}"
+            )
+        sql = assert_select_only(f"SELECT {', '.join(parts)}", dialect=self.dialect)
+        rows, labels = self._run(sql)
+        values = dict(zip(labels, rows[0], strict=True))
+        result = {}
+        for i, name in enumerate(columns):
+            domain = values[f"d_{i}"] or []
+            result[name] = ValueDomainSample(
+                values=[(_field(entry, "v"), _field(entry, "c")) for entry in domain],
+                total_distinct=int(values[f"n_{i}"]),
+            )
+        return result
+
     # --- execution (the single billed door) --------------------------------------
 
     def run_query(
@@ -1185,3 +1237,12 @@ def _quote_ident(name: str) -> str:
 
     escaped = name.replace("`", "``")
     return f"`{escaped}`"
+
+
+def _field(entry: object, key: str) -> object:
+    """Read one field off a returned STRUCT row, which the connector may
+    hand back as either a mapping or an attribute-bearing Row object."""
+
+    if isinstance(entry, dict):
+        return entry[key]
+    return getattr(entry, key)

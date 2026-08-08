@@ -20,6 +20,7 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    ValueDomainSample,
     distinct_combination_sql,
     json_safe,
     shape_stat_expressions,
@@ -309,6 +310,43 @@ class DuckDBAdapter:
         values = dict(zip(labels, row, strict=True))
         return {
             tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
+        }
+
+    def value_domain_counts(
+        self, identifier: str, columns: list[str], *, limit: int
+    ) -> dict[str, ValueDomainSample]:
+        """Top ``limit`` values by frequency per column, plus each column's
+        exact distinct-group count, all in one statement: two scalar
+        subqueries per column (the capped frequency list as a single
+        list-of-structs value, and the true distinct count so the caller can
+        tell an elided domain from a complete one)."""
+
+        if not columns:
+            return {}
+        table = self._quote(identifier)
+        parts = []
+        for i, name in enumerate(columns):
+            qcol = _quote_ident(name)
+            parts.append(
+                "(SELECT list(struct_pack(v := v, c := c)) FROM "  # noqa: S608
+                f"(SELECT {qcol} AS v, COUNT(*) AS c FROM {table} "
+                f"WHERE {qcol} IS NOT NULL GROUP BY {qcol} ORDER BY c DESC, v "
+                f"LIMIT {limit}) AS q_{i}) AS d_{i}"
+            )
+            parts.append(
+                f"(SELECT COUNT(*) FROM (SELECT DISTINCT {qcol} FROM {table} "  # noqa: S608
+                f"WHERE {qcol} IS NOT NULL) AS n_{i}) AS n_{i}"
+            )
+        sql = f"SELECT {', '.join(parts)}"
+        row = self._run_select(assert_select_only(sql, dialect=self.dialect))[0]
+        labels = [d[0] for d in self._conn.description]
+        values = dict(zip(labels, row, strict=True))
+        return {
+            name: ValueDomainSample(
+                values=[(entry["v"], entry["c"]) for entry in values[f"d_{i}"]],
+                total_distinct=int(values[f"n_{i}"]),
+            )
+            for i, name in enumerate(columns)
         }
 
     def _build_aggregate_sql(

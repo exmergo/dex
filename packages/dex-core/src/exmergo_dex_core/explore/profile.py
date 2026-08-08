@@ -16,7 +16,14 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from ..adapters.base import Adapter, ColumnAggregate, is_blob_type, json_safe
-from ..cache import ColumnProfile, Dataset, PIICategory, PIIFlag
+from ..cache import (
+    ColumnProfile,
+    Dataset,
+    PIICategory,
+    PIIFlag,
+    ValueCount,
+    ValueDomain,
+)
 from ..config import PIIOverrideMatcher
 from ..progress import ProgressReporter
 
@@ -48,6 +55,15 @@ _COMPOSITE_PAIR_CAP = 5
 # competing hypothesis, not filler) still gets its own slot even if it
 # reuses a column.
 _COMPOSITE_REDUNDANCY_RATIO = 3.0
+
+# A column's value domain is reported only when its distinct count clears
+# BOTH bars: small absolutely (this cap) and small relative to the table
+# (the fraction below), so a tiny table's near-key column does not qualify
+# on the absolute count alone. Deliberately conservative -- this codebase's
+# general posture is to under-report rather than over-report, and a false
+# negative here just costs one more `explore query`.
+_VALUE_DOMAIN_CAP = 25
+_VALUE_DOMAIN_MAX_FRACTION = 0.10
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
@@ -414,6 +430,9 @@ def profile(
         composite_keys = _probe_composite_keys(
             adapter, identifier, meta.row_count, aggregates
         )
+        value_domains = _probe_value_domains(
+            adapter, identifier, meta.row_count, aggregates, prelim_pii, composite_keys
+        )
 
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
@@ -458,6 +477,7 @@ def profile(
                     max_value=json_safe(agg.max_value) if agg else None,
                     pii=pii,
                     pii_overridden=overridden.get(col.name),
+                    value_domain=value_domains.get(col.name),
                 )
             )
 
@@ -615,6 +635,82 @@ def _probe_composite_keys(
     chosen = [list(pair) for _ids, _product, pair in deduped[:_COMPOSITE_PAIR_CAP]]
     exact = combo_counts(identifier, chosen)
     return [combo for combo in chosen if exact.get(tuple(combo)) == row_count]
+
+
+def _probe_value_domains(
+    adapter: Adapter,
+    identifier: str,
+    row_count: int | None,
+    aggregates: dict[str, ColumnAggregate],
+    prelim_pii: dict[str, PIIFlag | None],
+    composite_keys: list[list[str]],
+) -> dict[str, ValueDomain]:
+    """Report the value domain of a column with no PII flag at any
+    confidence, a distinct count that clears both the absolute cap and the
+    row-relative fraction, and that is not a candidate key -- so a caller
+    can write a correct CASE expression without a raw SQL client, the one
+    place the PII policy and query firewall don't apply.
+
+    Eligibility is decided from the approximate pre-scan distinct count (cost
+    control: an obviously-too-wide column is never even queried), but the
+    reported domain is built from the exact count the probe itself returns.
+    When HLL under-estimated and the true count is still within the
+    row-relative fraction, the result is capped to the top values by
+    frequency with the remainder counted as ``elided`` rather than dropped;
+    only a true count that breaks the fraction bar (a near-key column the
+    approximation missed) is dropped entirely.
+
+    ``prelim_pii``, not the post-``_refine_confidence`` flag: refinement
+    only adjusts confidence, never presence, so the two are equivalent for
+    an any-confidence presence check, and ``prelim_pii`` is already computed
+    before the aggregate scan even runs.
+    """
+
+    domain_fn = getattr(adapter, "value_domain_counts", None)
+    if domain_fn is None or not row_count:
+        return {}
+
+    composite_members = {c for pair in composite_keys for c in pair}
+    eligible = []
+    for name, agg in aggregates.items():
+        if prelim_pii.get(name) is not None:
+            continue  # flagged at any confidence: never a domain
+        if name in composite_members:
+            continue
+        if agg.is_unique and agg.null_fraction in (0.0, None):
+            continue  # single-column key
+        if not agg.distinct_count or agg.distinct_count > _VALUE_DOMAIN_CAP:
+            continue
+        non_null = row_count * (1 - (agg.null_fraction or 0.0))
+        if non_null <= 0 or agg.distinct_count > non_null * _VALUE_DOMAIN_MAX_FRACTION:
+            continue
+        eligible.append(name)
+    if not eligible:
+        return {}
+
+    samples = domain_fn(identifier, eligible, limit=_VALUE_DOMAIN_CAP)
+    domains: dict[str, ValueDomain] = {}
+    for name, sample in samples.items():
+        agg = aggregates[name]
+        non_null = row_count * (1 - (agg.null_fraction or 0.0))
+        if (
+            non_null <= 0
+            or sample.total_distinct > non_null * _VALUE_DOMAIN_MAX_FRACTION
+        ):
+            # The approximate pre-check under-estimated the true fraction:
+            # this is really a near-key column, so report no domain at all
+            # rather than a capped slice of one.
+            continue
+        # Sorted here, not trusted from the adapter: not every dialect's
+        # array-aggregate reliably preserves the inner subquery's ORDER BY
+        # once it's collected into a single value, so frequency order is
+        # guaranteed at this one point instead of per-dialect.
+        ordered = sorted(sample.values, key=lambda pair: pair[1], reverse=True)
+        domains[name] = ValueDomain(
+            values=[ValueCount(value=json_safe(v), count=c) for v, c in ordered],
+            elided=max(0, sample.total_distinct - len(sample.values)),
+        )
+    return domains
 
 
 def _refine_confidence(

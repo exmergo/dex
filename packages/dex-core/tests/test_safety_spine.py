@@ -3051,7 +3051,10 @@ def fk_bq_client():
     client = FakeBigQueryClient(
         project="test-proj",
         tables=[
-            table("customers", [("id", "INTEGER"), ("email", "STRING")]),
+            table(
+                "customers",
+                [("id", "INTEGER"), ("email", "STRING"), ("plan_tier", "STRING")],
+            ),
             table(
                 "orders",
                 [("id", "INTEGER"), ("customer_id", "INTEGER"), ("total", "NUMERIC")],
@@ -3060,18 +3063,30 @@ def fk_bq_client():
     )
     # A near-unique column that escalates without fully proving uniqueness
     # (d_0 of 99, not 100) leaves the composite-key probe un-short-circuited, so
-    # both escalations the estimate reserved for actually run and get charged.
-    # That is what leaves no headroom for the verify probe below.
+    # every escalation the estimate reserved for actually runs and gets
+    # charged. plan_tier/customer_id/total are also domain-eligible (small
+    # cardinality, index 1/2), so the value-domain reserve is spent for real
+    # too, not left as unused padding -- together, that is what leaves no
+    # headroom for the verify probe below.
     values = {"n_total": 100, "nonnull_fk": 100, "orphans": 0}
     for i in range(10):
         values |= {
             f"nn_{i}": 100,
-            f"nd_{i}": 100 if i == 0 else 40,
+            f"nd_{i}": 100 if i == 0 else 5,
             f"mn_{i}": 1,
             f"mx_{i}": 100,
-            f"d_{i}": 99 if i == 0 else 40,
+            f"d_{i}": 99 if i == 0 else 5,
         }
-    client.row_resolver = lambda sql: [values]
+
+    def resolve(sql):
+        row = dict(values)
+        if "ARRAY_AGG" in sql:
+            for i in range(3):
+                row[f"d_{i}"] = [{"v": f"v{j}", "c": 1} for j in range(5)]
+                row[f"n_{i}"] = 5
+        return [row]
+
+    client.row_resolver = resolve
     return client
 
 
@@ -3089,8 +3104,11 @@ def test_api_verify_checkpoint_keeps_what_it_already_paid_for(
 
     import exmergo_dex_core.connect as connect_mod
 
+    # 80 MB is profile_estimate()'s worst-case total for two tables (each
+    # floored aggregate batch plus all three possible escalation reserves: 40
+    # MB apiece) -- the minimum that clears the confirm handshake at all.
     engine = _billed_engine(
-        fk_bq_client, tmp_path, confirmed=True, budget=float(60 * 1024 * 1024)
+        fk_bq_client, tmp_path, confirmed=True, budget=float(80 * 1024 * 1024)
     )
     monkeypatch.setattr(connect_mod, "open_adapter", engine._open_for_test)
     with engine:

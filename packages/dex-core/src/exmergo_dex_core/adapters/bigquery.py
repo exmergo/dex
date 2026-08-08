@@ -28,6 +28,7 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    ValueDomainSample,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -589,6 +590,52 @@ class BigQueryAdapter:
             tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(combinations)
         }
 
+    def value_domain_counts(
+        self, identifier: str, columns: list[str], *, limit: int
+    ) -> dict[str, ValueDomainSample]:
+        """Top ``limit`` values by frequency per column, spent only within
+        the already-confirmed budget: when the remaining budget cannot cover
+        the extra scan, return nothing and report no value domain. A metered
+        adapter never self-escalates past its ceiling.
+
+        Charged at the floored bytes, not the raw dry-run number: this is one
+        billed query like any other, so it bills (and must be budgeted
+        against) at least the per-query minimum (issue #107)."""
+
+        if self._unqueryable(identifier) or not columns:
+            return {}
+        table = self._quote(identifier)
+        parts = []
+        for i, name in enumerate(columns):
+            qcol = _quote_ident(name)
+            parts.append(
+                "(SELECT ARRAY_AGG(STRUCT(v AS v, c AS c) ORDER BY c DESC, v "  # noqa: S608
+                f"LIMIT {limit}) FROM (SELECT {qcol} AS v, COUNT(*) AS c "
+                f"FROM {table} WHERE {qcol} IS NOT NULL GROUP BY {qcol}) ) AS d_{i}"
+            )
+            parts.append(
+                f"(SELECT COUNT(*) FROM (SELECT DISTINCT {qcol} FROM {table} "  # noqa: S608
+                f"WHERE {qcol} IS NOT NULL)) AS n_{i}"
+            )
+        sql = assert_select_only(f"SELECT {', '.join(parts)}", dialect=self.dialect)
+        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+        if not self.cost_gate.try_charge(floored):
+            self._note(
+                identifier,
+                "value-domain probe skipped: the remaining budget could not "
+                "cover the extra scan; no value domain reported",
+            )
+            return {}
+        _job, iterator = self._run(sql)
+        rows = list(iterator)
+        return {
+            name: ValueDomainSample(
+                values=[(entry["v"], entry["c"]) for entry in rows[0][f"d_{i}"]],
+                total_distinct=int(rows[0][f"n_{i}"]),
+            )
+            for i, name in enumerate(columns)
+        }
+
     # --- estimation (free dry-runs; feeds the confirm handshake) --------------
 
     def profile_estimate(
@@ -659,6 +706,7 @@ class BigQueryAdapter:
                     )
             if scan_columns and meta.row_count != 0:
                 total += float(_MIN_BILLED_BYTES)  # exact_distinct_counts
+                total += float(_MIN_BILLED_BYTES)  # value_domain_counts
                 if len(scan_columns) >= 2:
                     total += float(_MIN_BILLED_BYTES)  # distinct_combination_counts
             per_table[identifier] = total

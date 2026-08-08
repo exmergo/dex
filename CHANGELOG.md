@@ -11,6 +11,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`explore profile` reports the value domain of a low-cardinality non-PII
+  column** ([#203]). `ColumnProfile.min_value`/`max_value` are suppressed for
+  every string column, PII or not, because a string extreme is itself a raw
+  value. On a raw source table (the norm: mostly string-typed columns), a
+  caller learned `env_tier` had 4 distinct values and had no way to learn
+  what they were, short of a raw SQL client, exactly the one place the PII
+  policy and query firewall do not apply.
+
+  A column now reports its `value_domain` (distinct values by frequency,
+  capped, with an `elided` count when the cap binds) when it carries no PII
+  flag at all, at any confidence, its distinct count clears both an absolute
+  cap (25) and a row-relative fraction (10% of non-null rows, so a tiny
+  table's near-key column does not qualify on the absolute count alone), and
+  it is not a candidate key (single-column or a proven composite member). A
+  flagged column reports no domain at any confidence or cardinality, full
+  stop; detection, confidence, and the block threshold are unchanged.
+
+  Eligibility is decided from the approximate pre-scan distinct count (cost
+  control: an obviously-too-wide column is never even queried), but the
+  reported domain is built from the exact count the new probe itself
+  returns: when the approximation under-estimated and the true count is
+  still within the fraction bar, the result is capped with an honest
+  `elided` count rather than dropped; only a true count that breaks the
+  fraction bar (a near-key the approximation missed) is dropped entirely.
+
+  New adapter capability (`value_domain_counts`), implemented across every
+  connector (DuckDB, BigQuery, Snowflake, Databricks, Redshift, Postgres),
+  matching the existing `exact_distinct_counts`/`distinct_combination_counts`
+  precedent. Every metered connector spends it only inside the
+  already-confirmed budget, floored like every other optional escalation,
+  and degrades to reporting no domain (plus a table note) rather than
+  self-escalating when the remaining budget can't cover it. The reported
+  order is re-sorted by the engine rather than trusted from the adapter, since
+  not every dialect's array-aggregate reliably preserves an inner subquery's
+  `ORDER BY` once collected into one value. Redshift's implementation reads
+  back multiple tagged rows instead of one struct-shaped row (its
+  semi-structured `SUPER` type is treated as degraded elsewhere in that
+  adapter already), trading the column's native value type for a text cast
+  that lets heterogeneous columns batch into one `UNION ALL` statement.
 - **CLI**: resolve unambiguous bare subcommands and suggest alternatives when the name is ambiguous ([#236]).
 
 - **transform init**: allow initializing into the current directory ([#235]).
