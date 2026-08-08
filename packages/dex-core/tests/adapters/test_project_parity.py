@@ -14,16 +14,24 @@ keeps the seam load-bearing rather than merely defined.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
+from exmergo_dex_core import dbt_project
 from exmergo_dex_core.adapters.conformance import (
     DeclaringProjectContract,
     MaintainProjectContract,
+    ProjectFactoryContract,
 )
-from exmergo_dex_core.adapters.project import DbtProject, tier_of
+from exmergo_dex_core.adapters.project import (
+    DbtProject,
+    MaintainProject,
+    ProjectContext,
+    tier_of,
+)
+from exmergo_dex_core.config import DexConfig
 from exmergo_dex_core.dbt_project import ProjectDefinitions
+from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.explore import commands as explore_commands
 from exmergo_dex_core.maintain.drift import schema_drift
 from exmergo_dex_core.maintain.snapshot import (
@@ -32,6 +40,7 @@ from exmergo_dex_core.maintain.snapshot import (
     SourceTable,
     TransformLayer,
 )
+from exmergo_dex_core.storage import MemoryStore
 
 _PROJECT_YML = (
     'name: dex_test\nversion: "1.0.0"\nprofile: dex_test\nmodel-paths: ["models"]\n'
@@ -106,6 +115,29 @@ class TestDbtProject(DeclaringProjectContract, MaintainProjectContract):
         )
 
 
+class TestDbtProjectFactory(ProjectFactoryContract, MaintainProjectContract):
+    """The shipped format, built the way configuration builds it.
+
+    The same few lines a third party writes, and the reason the construction half
+    is worth running in-repo: every other assertion above constructs `DbtProject`
+    directly, which is the one path a host reaching dex as a subprocess cannot
+    take.
+    """
+
+    tier = MaintainProject
+
+    @pytest.fixture(autouse=True)
+    def _root(self, tmp_path: Path):
+        self.root = tmp_path
+
+    def build(self, context: ProjectContext) -> DbtProject:
+        return DbtProject.from_context(context)
+
+    def empty_context(self) -> ProjectContext:
+        _project(self.root)
+        return ProjectContext(repo_root=str(self.root), project_dir="analytics")
+
+
 class _PathlessProject:
     """A tier-2 format reduced from objects rather than files.
 
@@ -178,8 +210,12 @@ def test_a_pathless_source_omits_provenance_from_a_dangling_finding():
     assert "declared_in" not in dangling[0].data
 
 
+def _engine(root: Path, **config) -> DexEngine:
+    return DexEngine(repo_root=str(root), config=DexConfig(**config))
+
+
 def test_explore_reads_the_project_through_the_seam(monkeypatch, tmp_path: Path):
-    """The control: explore's project read goes through `DbtProject`, not around it.
+    """The control: explore's project read goes through the seam, not around it.
 
     Every other assertion in this file would pass just as well if
     `_project_definitions` called `dbt_project.definitions` directly, because
@@ -199,14 +235,115 @@ def test_explore_reads_the_project_through_the_seam(monkeypatch, tmp_path: Path)
 
     monkeypatch.setattr(DbtProject, "definitions", recording)
 
-    engine = SimpleNamespace(
-        config=SimpleNamespace(dbt_project_dir="analytics"),
-        repo_root=str(tmp_path),
+    defs = explore_commands._project_definitions(
+        _engine(tmp_path, dbt_project_dir="analytics"), use_project=True
     )
-    defs = explore_commands._project_definitions(engine, use_project=True)
 
-    assert calls == [(Path(tmp_path), project)], (
-        "explore did not read the project through DbtProject; the seam is defined "
+    assert calls == [(tmp_path, project)], (
+        "explore did not read the project through the project seam; it is defined "
         "but not load-bearing"
     )
     assert defs.present
+
+
+class _RecordedProject(_PathlessProject):
+    """A tier-2 format that counts what maintain asked it for."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def transform_layer(self) -> TransformLayer:
+        self.calls.append("transform_layer")
+        return super().transform_layer()
+
+    def semantic_layer(self) -> SemanticLayer:
+        self.calls.append("semantic_layer")
+        return super().semantic_layer()
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("snapshot", ["transform_layer", "semantic_layer"]),
+        ("schema_drift", ["transform_layer"]),
+        ("check", ["transform_layer", "semantic_layer"]),
+        ("semantic_drift", ["transform_layer", "semantic_layer"]),
+    ],
+)
+def test_maintain_reads_the_layers_through_the_seam(
+    duckdb_file: Path, tmp_path: Path, command: str, expected: list[str]
+):
+    """The same control for tier 2, and it is what makes the tier real.
+
+    `DbtProject.transform_layer` delegates to the same function `maintain` used to
+    call on a view it loaded itself, so every drift assertion in the suite passes
+    either way. What separates the two is whether a format that is *not* a dbt
+    project is ever consulted, which is the entire content of the tier. Driving a
+    pathless format through the engine is the only way to ask that question.
+
+    The exact call list matters as much as the count: `schema` needs one layer and
+    reading both would make a format pay for a channel that command never uses.
+    """
+
+    project = _RecordedProject()
+    engine = DexEngine(
+        repo_root=str(tmp_path),
+        config=DexConfig(connector="duckdb", duckdb={"path": str(duckdb_file)}),
+        store=MemoryStore(),
+        project_format=project,
+    )
+    engine.snapshot()
+    project.calls.clear()
+
+    getattr(engine, command)()
+
+    assert project.calls == expected, (
+        f"maintain {command} did not read its layers through MaintainProject; the "
+        "tier is defined but not load-bearing"
+    )
+
+
+def test_maintain_loads_the_dbt_project_once_per_command(monkeypatch, tmp_path: Path):
+    """Routing through the tier must not cost a second full load.
+
+    `transform_layer()` and `semantic_layer()` each need the view, and three of the
+    four commands that read layers need both, so a project that reloaded per
+    accessor would double the most expensive read on the maintain path: `load`
+    walks the model and macro trees, reads and hashes every file, and parses a
+    `manifest.json` that is routinely several megabytes. Nothing about the results
+    would change, which is why this is asserted on the call count.
+    """
+
+    _project(tmp_path)
+    loads: list[Path] = []
+    real = dbt_project.load
+
+    def counting(project_dir):
+        loads.append(Path(project_dir))
+        return real(project_dir)
+
+    monkeypatch.setattr(dbt_project, "load", counting)
+
+    project = DbtProject.from_context(
+        ProjectContext(repo_root=str(tmp_path), project_dir="analytics")
+    )
+    project.transform_layer()
+    project.semantic_layer()
+
+    assert len(loads) == 1, f"expected one load per instance, got {len(loads)}"
+
+
+def test_the_seam_finds_an_unpinned_project_in_a_subdirectory(tmp_path: Path):
+    """Both tiers resolve the same project when nothing pinned a directory.
+
+    `definitions()` discovers; `load()` used to resolve straight to the repo root,
+    so a project one directory down was found by tier 1 and missing to tier 2. The
+    two tiers disagreeing about which project they are reading is the kind of split
+    that surfaces as drift nobody can reproduce.
+    """
+
+    project = _project(tmp_path)
+    seam = DbtProject.from_context(ProjectContext(repo_root=str(tmp_path)))
+
+    assert seam.definitions().present
+    assert Path(seam.load().root) == project.resolve()
