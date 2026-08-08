@@ -20,7 +20,10 @@ difference between them is load-bearing, so it is spelled out here.
 The query grammar is identical across backends: entity-qualified group-by tokens
 (`user__pricing_tier`, `metric_time`), the Jinja filter dialect in `--where`
 (`{{ Dimension('session__is_deleted') }} = false`), and a `--grain` that applies
-to `metric_time`.
+to `metric_time`. `--metric`, `--group-by`, and `--order-by` each take either a
+comma-separated list or a repeated flag, and the two mix freely: `--group-by a,b`
+and `--group-by a --group-by b` are the same query. `--where` never splits, because
+a filter clause carries commas of its own.
 
 ## Choosing a backend (ambient, like a connector)
 
@@ -53,16 +56,36 @@ spine, in order:
    When the cache cannot speak to a dimension (never profiled, or a computed
    expression rather than a bare column), the name heuristic is the fail-closed
    floor, so silence never clears.
-2. **Relation pre-check.** The rendered SQL bakes in `relation_name` from the
+2. **SELECT-only assertion.** Before anything else touches the statement or the
+   connection, the rendered SQL is proven read-only.
+3. **Relation pre-check.** The rendered SQL bakes in `relation_name` from the
    compiled manifest, which routinely disagrees with the connection when the
-   project was compiled elsewhere. Each relation is resolved against the cached
-   inventory, and a relation this connection does not have is refused with a
-   precise message before the cost handshake, so a namespace mismatch never bills
-   a failed job. A same-named table in another database does not satisfy the
-   check. Without a cached inventory there is nothing to check against, and the
-   query proceeds.
-3. **SELECT-only assertion**, then the **cost-before-spend handshake**, then the
-   active connector.
+   project was compiled elsewhere. The authority is the connection itself: each
+   relation is resolved against the `.dex/` cache first, because that costs
+   nothing, and anything the cache cannot resolve is resolved against the live
+   inventory, the same listing `explore profile` resolves its arguments against. A
+   relation this connection does not have is refused with a precise message before
+   the cost handshake, so a namespace mismatch never bills a failed job. A
+   same-named table in another database does not satisfy the check.
+
+   The cache records what has been *profiled*, which is a different question from
+   what exists, so it can only clear a relation and never condemn one: a model
+   `transform build` created minutes ago is in the warehouse and not in the cache,
+   and it is queryable straight away. What that costs is PII evidence, not access,
+   so a result whose relations carry no profile says which ones and names
+   `explore profile` as the fix, rather than the screening quietly weakening to the
+   name heuristic with nothing said.
+
+   A refusal is scoped to what the listing can actually settle. A relation in a
+   database this connection does not carry is refused: no allowlist could bring it
+   into scope, so this is the compiled-elsewhere mismatch. A relation in a listed
+   schema that the listing did not contain is refused too, and says so differently,
+   because that is a model not built into this target rather than a wrong
+   namespace. A relation in an unlisted schema of a connected database is not
+   refused: the dataset allowlist is narrower than the dbt project, dex never
+   looked there, and refusing would answer a question it did not ask. An inventory
+   that cannot be read settles nothing either, and the query proceeds.
+4. The **cost-before-spend handshake**, then the active connector.
 
 **dex owns execution here, so the full cost guard applies** exactly as it does for
 `explore query`. `list` is a pure read-view over `target/semantic_manifest.json`
@@ -112,6 +135,13 @@ profiler uses) is the fail-closed floor for a layer that carries no such metadat
 Grouping or filtering by a PII-shaped dimension (`user__email`) is refused with a
 recovery hint before anything reaches dbt Cloud.
 
+Where the floor was all that ran, the result says so, the same way the local
+backend discloses an unprofiled relation. The two silences are reported separately
+because their fixes differ: a layer that answered and carries no PII metadata for a
+dimension wants `meta: {pii: true}` on it in the dbt project, while a
+dimension-metadata call that never answered (which degrades every ref to the
+heuristic at once) wants retrying.
+
 ## The asymmetry at a glance
 
 | | Local (`--local`) | Hosted (`--api`) |
@@ -123,7 +153,8 @@ recovery hint before anything reaches dbt Cloud.
 | Ceiling enforced by dex | yes (`maximum_bytes_billed` / timeout) | no: the dbt Cloud environment's own limits |
 | `--confirm` required | yes, on billed connectors | no (nothing dex can gate) |
 | PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata plus a name heuristic |
-| Namespace mismatch | refused before spend, against the cached inventory | dbt Cloud resolves its own relations |
+| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about |
+| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations |
 | Credentials | the connector's, never in context | a dbt Cloud service token, never in context |
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |

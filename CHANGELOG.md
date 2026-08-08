@@ -9,6 +9,79 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore semantic query --local` no longer refuses a relation it has simply
+  never profiled** ([#134]). The relation pre-check resolved the rendered metric
+  SQL against `.dex/cache.json` and refused anything it could not find there. That
+  file records what has been *profiled*, which is a different question from what
+  exists, so a model `transform build` had created minutes earlier was refused
+  until `explore profile` was run on it: the build-then-validate loop cost a
+  profiling pass in the middle, and the refusal blamed a compiled-namespace
+  mismatch it had never measured, sending the reader to `dbt parse` for a cache
+  miss.
+
+  The authority is now the connection itself. The cache stays as a free fast path
+  and can only clear a relation, never condemn one; anything it cannot resolve is
+  resolved against the live inventory, the same listing `explore profile` already
+  resolves its arguments against, and that listing is only read when the cache
+  came up short. A repo that never ran `explore map` gains the guard rather than
+  skipping it, since the check no longer needs a cache to have something to check
+  against.
+
+  A refusal is now scoped to what the listing can settle, and says which of two
+  things went wrong. A relation in a database this connection does not carry is
+  the compiled-elsewhere mismatch and is refused as one. A relation missing from a
+  schema the listing did cover is a model not built into this target, and says
+  that instead. A relation in an unlisted schema of a connected database is not
+  refused at all: the dataset allowlist is narrower than the dbt project, dex never
+  looked there, and the old check would have refused a legitimate query on the
+  strength of a question it never asked.
+
+  Querying a relation with no profile does cost something real, just not access:
+  the PII request-gate loses its value evidence and falls back to the name
+  heuristic. That is now disclosed on the result, naming the relations and
+  `explore profile`, rather than the screening quietly weakening. The obvious
+  shortcut, writing the manifest's relations into the cache, is deliberately not
+  taken: a cached column with no PII flag reads as "profiled and cleared", so
+  registering unprofiled columns would switch the name heuristic off on exactly
+  the fresh relation that most needs it.
+
+  Two smaller defects fell out of the same rewrite. CTE names in the rendered SQL
+  were treated as physical relations, so a MetricFlow subquery alias that failed to
+  resolve was refused as a foreign table. And the SELECT-only assertion now runs
+  before the pre-check rather than after, because the pre-check can introspect the
+  connection and a statement should be proven read-only before anything else
+  touches it.
+
+- **The hosted backend discloses name-only PII screening too** ([#134]). Fixing the
+  local side first made the asymmetry visible: local now says when its PII evidence
+  was missing, while the hosted gate fell back to the name heuristic silently in two
+  cases. A dimension the layer carries no `config.meta` for was screened by name
+  with nothing said, and a dimension-metadata call that failed outright degraded
+  *every* ref to the heuristic while `_meta_lookup` swallowed the error into a
+  lookup that answered None for everything. Both are now reported on the result, and
+  reported separately, because a layer that answered and knows nothing wants
+  `meta: {pii: true}` on the dimension in the dbt project while a call that never
+  answered wants retrying. The gate itself is unchanged; what changes is that the
+  weaker screening stops passing for the stronger one.
+
+### Changed
+
+- **`explore semantic query` accepts comma-separated name lists** ([#135]).
+  `--group-by a,b` failed, on the local backend as an unresolvable MetricFlow
+  format and on the hosted backend as an invalid semantic-layer name, and only the
+  repeated flag worked. A comma-joined list is the natural first guess, a common
+  CLI convention, and already what `explore profile` and `explore cluster
+  --features` accept. `--metric`, `--group-by`, and `--order-by` now take either
+  spelling and mix them freely; `--where` deliberately does not split, because a
+  Jinja filter clause carries commas of its own. Normalization happens on the query
+  object rather than in the CLI, so both backends and a library caller building the
+  query directly get it from one place. The empty-metric guard moved to after
+  normalization for the same reason: `--metric ,` is now refused identically on both
+  backends, where before local had its own guard and hosted would have asked dbt
+  Cloud for no metrics at all.
+
 ## [1.6.0] - 2026-08-08
 
 ### Added

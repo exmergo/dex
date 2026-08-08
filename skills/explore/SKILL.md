@@ -112,7 +112,9 @@ Subcommands, in the usual order:
    layer (metrics, dimensions, entities). `list` is discovery: which metrics
    exist and which dimensions each can be grouped by. `query` takes a `--metric`
    and a `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
-   `--limit`) and returns a metric's values as a capped, columnar result. Two backends answer
+   `--limit`) and returns a metric's values as a capped, columnar result. Name
+   flags take a comma-separated list or a repeated flag (`--group-by a,b` is
+   `--group-by a --group-by b`); `--where` is never split. Two backends answer
    these, chosen by `.dex/config.yml` `semantic.backend` and overridable with
    `--local` / `--api`. `--local` renders the SQL with MetricFlow and executes it
    through dex's own connector and cost handshake, so cost is surfaced before
