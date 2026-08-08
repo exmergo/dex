@@ -17,6 +17,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`transform plan` accepts a line-broken top-level dbt `ref()`** ([#195]).
+  Placeholder-only Jinja lines remain intact after the model's first `SELECT` or
+  `WITH`, while standalone config headers before the query are still removed.
+
 - **transform dev-target preflight compares resolved DuckDB paths** ([#234]).
   Relative and absolute spellings of the same warehouse file (e.g. `warehouse.duckdb`
   vs `./warehouse.duckdb`) are no longer treated as configuration drift.
