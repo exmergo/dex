@@ -9,13 +9,18 @@ renderer-only ``SqlClient`` (MetricFlow never opens a connection or sees a
 credential), then runs the rendered SQL through dex's own spine, in order: a PII
 request-gate on the grouped and filtered dimensions (resolved to physical columns
 and checked against the ``.dex/`` cache, with a name heuristic as the floor), a
-relation pre-check against the cached inventory, a SELECT-only assertion, the
-cost-before-spend handshake, and the connector. dex owns execution here, so the
-full cost guard applies, unlike the hosted backend.
+SELECT-only assertion, a relation pre-check against the connection's own
+inventory, the cost-before-spend handshake, and the connector. dex owns execution
+here, so the full cost guard applies, unlike the hosted backend.
+
+The SELECT-only assertion runs before the relation pre-check because the pre-check
+may introspect the live connection: whatever else happens to a rendered statement,
+it is proven read-only first.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
 
@@ -250,14 +255,6 @@ class LocalMetricFlowBackend:
         from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
 
         dialect = get_dialect(self._connector)
-        # The rendered SQL bakes in the relation names the project was compiled
-        # against, which routinely disagree with the connection when a manifest
-        # was built elsewhere. Catch that here, with a precise message, instead of
-        # letting the warehouse answer with a table-not-found after a billed job.
-        mismatch = self._namespace_mismatch(sql, cache, dialect)
-        if mismatch is not None:
-            raise SemanticBackendError(mismatch)
-
         try:
             assert_select_only(sql, dialect=dialect)
         except NotSelectOnlyError as exc:
@@ -265,7 +262,19 @@ class LocalMetricFlowBackend:
                 f"rendered metric SQL was not read-only: {exc}"
             ) from exc
 
+        # One adapter for the whole command: the pre-check may introspect the
+        # connection, and `_adapter` rebuilds the cost gate on every call, so
+        # asking twice would settle and rebuild a gate for nothing.
         adapter = self._dex._adapter("explore semantic query")
+        refusal, unprofiled = self._relation_precheck(
+            sql,
+            cache,
+            dialect,
+            lambda: [meta.identifier for meta in adapter.list_objects()],
+        )
+        if refusal is not None:
+            raise SemanticBackendError(refusal)
+
         estimate_fn = getattr(adapter, "query_estimate", None)
         estimate = estimate_fn(sql) if estimate_fn else 0.0
         command_args.billed_handshake("explore semantic query", adapter, estimate)
@@ -282,6 +291,7 @@ class LocalMetricFlowBackend:
             max_cell_chars=self._limits.max_cell_chars,
             max_payload_bytes=self._limits.max_payload_bytes,
             truncated_by_source=result.truncated,
+            extra_notes=_unprofiled_note(unprofiled),
         )
         record = SemanticQueryResult.from_capped(capped, backend=self.name)
         return command_args.stamp_spend(record, adapter)
@@ -290,9 +300,12 @@ class LocalMetricFlowBackend:
         """The exploration cache with config PII overrides applied in memory, or None.
 
         Absence is not fatal here (unlike ``explore query``, whose whole policy is
-        the cache): the metric query still has the name heuristic and the semantic
-        layer's own metadata, and the relation pre-check simply has no inventory to
-        check against. A repo that never ran ``explore map`` can still query metrics.
+        the cache: it tracks PII taint through the projection of agent-authored SQL
+        and cannot do that for a relation it has never seen). A metric query is
+        governed at the request, by dimension name, before any SQL exists, so the
+        name heuristic and the semantic layer's own metadata still bind, and the
+        relation pre-check falls through to the live inventory. A repo that never
+        ran ``explore map`` can still query metrics.
         """
 
         try:
@@ -384,52 +397,95 @@ class LocalMetricFlowBackend:
         self._dim_columns = mapping
         return mapping
 
-    def _namespace_mismatch(self, sql: str, cache, dialect: str) -> str | None:
-        """A refusal message when the rendered SQL reads relations this connection
-        does not have, else None.
+    def _relation_precheck(
+        self,
+        sql: str,
+        cache,
+        dialect: str,
+        live_identifiers: Callable[[], list[str]],
+    ) -> tuple[str | None, list[str]]:
+        """``(refusal message or None, relations with no profile)`` for the
+        rendered SQL.
 
         MetricFlow bakes ``node_relation.relation_name`` from the compiled manifest
         straight into the SQL, so a project compiled against another database (or a
-        different dev target) renders relations that do not exist here. Without an
-        inventory there is nothing to check against, and a relation that resolves by
-        suffix is accepted: the cache is normalized per connector, so an exact
-        string match would reject legitimate namespace spellings.
+        different dev target) renders relations that do not exist here. Catching
+        that is worth a precise message before the cost handshake rather than a
+        table-not-found from the warehouse.
+
+        The authority is the *connection*, not the ``.dex/`` cache. That cache
+        records what has been profiled, which is a different question: a model
+        ``transform build`` created minutes ago is in the warehouse and not in the
+        cache, and refusing it made "build a model, then validate its metric"
+        impossible without a profiling pass in between. So the cache is only a free
+        fast path, and anything it cannot resolve is asked of the live inventory,
+        the same authority ``explore profile`` resolves its arguments against.
+
+        What the listing can and cannot settle is :func:`_relation_verdict`. An
+        inventory that cannot be read at all settles nothing, and a relation that
+        is genuinely absent still fails at planning without billing.
+
+        Resolution is by suffix in both directions, because the cache and the
+        inventory are namespace-normalized per connector and an exact string
+        compare would reject legitimate spellings.
         """
 
-        if cache is None or not cache.datasets:
-            return None
+        relations = _rendered_relations(sql, dialect)
+        if not relations:
+            return None, []
+
+        datasets = list(cache.datasets) if cache is not None else []
+        cached = [dataset.identifier for dataset in datasets]
+        # Presence is not a profile: `explore map` writes inventory-only entries
+        # with no columns, and those tell the PII gate nothing.
+        profiled = {dataset.identifier for dataset in datasets if dataset.columns}
+
+        unresolved: list[str] = []
+        unprofiled: list[str] = []
+        for name in relations:
+            matches = match_identifier(name, cached)
+            if not matches:
+                unresolved.append(name)
+                unprofiled.append(name)
+            elif not any(match in profiled for match in matches):
+                unprofiled.append(name)
+        if not unresolved:
+            return None, unprofiled
+
         try:
-            import sqlglot
-
-            parsed = sqlglot.parse_one(sql, read=dialect)
+            live = live_identifiers()
         except Exception:
-            return None  # unparseable SQL is the SELECT-only guard's problem
-        from sqlglot import exp
+            return None, unprofiled
 
-        known = [dataset.identifier for dataset in cache.datasets]
-        unknown: list[str] = []
-        for table in parsed.find_all(exp.Table):
-            parts = (table.args.get("catalog"), table.args.get("db"), table.this)
-            name = ".".join(part.name for part in parts if part)
-            if not name or not table.name:
+        verdicts: dict[str, list[str]] = {"foreign": [], "missing": []}
+        for name in unresolved:
+            if match_identifier(name, live):
                 continue
-            # Resolve the qualified name as written. Deliberately no bare-name
-            # fallback: `match_identifier` matches any identifier ending in
-            # `.orders`, so falling back would let a relation from another
-            # database pass purely because a same-named table exists here, which
-            # is exactly the mismatch this check exists to catch.
-            if not match_identifier(name, known):
-                unknown.append(name)
-        if not unknown:
-            return None
-        named = ", ".join(sorted(set(unknown)))
-        return (
-            f"refused: the metric query reads {named}, which this connection does "
-            "not have. The project was compiled against a different namespace than "
-            "the one dex is connected to; re-run `dbt parse` against the target "
-            "you are querying, or point dex at the connection the project was "
-            "built for."
-        )
+            verdict = _relation_verdict(name, live)
+            if verdict is not None:
+                verdicts[verdict].append(name)
+
+        if verdicts["foreign"]:
+            named = ", ".join(sorted(set(verdicts["foreign"])))
+            return (
+                f"refused: the metric query reads {named}, in a namespace this "
+                "connection does not reach. The project was compiled against a "
+                "different namespace than the one dex is connected to; re-run "
+                "`dbt parse` against the target you are querying, or point dex at "
+                "the connection the project was built for.",
+                unprofiled,
+            )
+        if verdicts["missing"]:
+            named = ", ".join(sorted(set(verdicts["missing"])))
+            return (
+                f"refused: the metric query reads {named}, which this connection "
+                "does not have: its namespace was listed and the relation was not "
+                "in it. Build the model into the target you are querying, or "
+                "re-run `dbt parse` if the project was compiled against a "
+                "different target.",
+                unprofiled,
+            )
+        return None, unprofiled
 
     def _render(self, q: SemanticQuery) -> str:
         from metricflow.engine.metricflow_engine import MetricFlowQueryRequest
@@ -499,3 +555,97 @@ class LocalMetricFlowBackend:
         module = import_module(f"{_RENDER_ROOT}.{module_name}")
         renderer = getattr(module, class_name)()
         return _RendererOnlySqlClient(renderer, SqlEngine[engine_name])
+
+
+# ---- the relation pre-check's plumbing --------------------------------------
+
+
+def _rendered_relations(sql: str, dialect: str) -> list[str]:
+    """The physical relations a rendered statement reads, as written, in order.
+
+    CTE names are excluded: MetricFlow renders a query as a stack of named
+    subqueries, and a CTE is defined by the statement itself rather than looked up
+    in the connection, so treating one as a relation invents a missing table. Only
+    an unqualified reference can be a CTE, so a qualified name of the same spelling
+    is still a relation.
+    """
+
+    try:
+        import sqlglot
+
+        parsed = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return []  # unparseable SQL was already the SELECT-only guard's problem
+    from sqlglot import exp
+
+    ctes = {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
+    names: list[str] = []
+    for table in parsed.find_all(exp.Table):
+        parts = (table.args.get("catalog"), table.args.get("db"), table.this)
+        name = ".".join(part.name for part in parts if part)
+        if not name or not table.name:
+            continue
+        if name == table.name and name.lower() in ctes:
+            continue
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _relation_verdict(name: str, live: list[str]) -> str | None:
+    """Why a relation absent from ``live`` is absent: ``"foreign"``, ``"missing"``,
+    or None when the listing cannot settle it.
+
+    The two answers are different problems with different fixes, and the top-level
+    namespace is what separates them. dex's dataset allowlist scopes which schemas
+    *within* a connection are inventoried, so a relation in an unlisted schema of a
+    connected database is out of the listing's scope, not out of reach: refusing it
+    would answer a question dex never asked. A relation in a database the
+    connection does not carry at all is the mismatch this check exists for, because
+    no allowlist could bring it into scope.
+
+    An unqualified name is never adjudicated: it resolves against the session's
+    default schema, which the listing does not describe.
+    """
+
+    parts = name.lower().split(".")
+    if len(parts) < 2:
+        return None
+    catalogs: set[str] = set()
+    schemas: set[str] = set()
+    namespaces: set[str] = set()
+    for ident in live:
+        listed = ident.lower().split(".")
+        if len(listed) < 2:
+            continue
+        schemas.add(listed[-2])
+        namespaces.add(".".join(listed[-3:-1]) if len(listed) >= 3 else listed[-2])
+        if len(listed) >= 3:
+            catalogs.add(listed[-3])
+
+    if len(parts) >= 3:
+        catalog, schema = parts[-3], parts[-2]
+        if catalogs and catalog not in catalogs:
+            return "foreign"
+        return "missing" if f"{catalog}.{schema}" in namespaces else None
+    return "missing" if parts[-2] in schemas else None
+
+
+def _unprofiled_note(relations: list[str]) -> list[str]:
+    """The disclosure that a queried relation carries no profile.
+
+    The PII request-gate adjudicates a dimension from its physical column's cached
+    flag and falls back to the name heuristic when the cache cannot speak. That
+    fallback is the fail-closed floor, not an equivalent, so a result whose
+    relations were never profiled says which ones and how to fix it rather than
+    letting the weaker screening pass unremarked.
+    """
+
+    if not relations:
+        return []
+    ordered = sorted(set(relations))
+    return [
+        "PII screening fell back to the name heuristic: the .dex/ cache holds no "
+        f"profile for {', '.join(ordered)}. Run `explore profile "
+        f"{' '.join(ordered)}` for value-evidence screening."
+    ]

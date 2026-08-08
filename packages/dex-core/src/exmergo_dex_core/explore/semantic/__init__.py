@@ -36,6 +36,18 @@ from ...guards import PII_BLOCK_CONFIDENCE
 from ..profile import detect_pii
 
 
+def _split_tokens(raw: list[str]) -> list[str]:
+    """Flatten repeated and comma-joined name lists into one clean token list.
+
+    A metric, dimension, or entity name is an identifier, so a comma can never be
+    part of one and splitting on it is lossless. Never apply this to ``where``,
+    whose Jinja clauses carry commas of their own
+    (``{{ TimeDimension('metric_time', 'month') }}``).
+    """
+
+    return [part.strip() for entry in raw for part in entry.split(",") if part.strip()]
+
+
 @dataclass
 class SemanticQuery:
     """A backend-neutral metric query: the grammar shared by MetricFlow, the dbt
@@ -46,6 +58,11 @@ class SemanticQuery:
     time bucket without spelling it into the token; ``where`` clauses use the Jinja
     filter dialect (``{{ Dimension('session__is_deleted') }} = false``) verbatim on
     both backends.
+
+    Name lists normalize here rather than at the CLI, so the two backends and a
+    library caller building the query object directly all see the same tokens: a
+    comma-joined list (``--group-by a,b``) is as natural a first guess as the
+    repeated flag, and mixing the two is natural too.
     """
 
     metrics: list[str]
@@ -54,6 +71,11 @@ class SemanticQuery:
     order_by: list[str] = field(default_factory=list)
     grain: str | None = None
     limit: int | None = None
+
+    def __post_init__(self) -> None:
+        self.metrics = _split_tokens(self.metrics)
+        self.group_by = _split_tokens(self.group_by)
+        self.order_by = _split_tokens(self.order_by)
 
 
 @dataclass
@@ -220,6 +242,30 @@ def screen_dimension_refs(
                 (ref, f"{flag.category.value} (name heuristic, {flag.confidence:.2f})")
             )
     return blocked
+
+
+def unadjudicated_refs(
+    refs: list[str],
+    *,
+    meta_lookup: Callable[[str], Any] | None = None,
+) -> list[str]:
+    """The refs no authoritative source spoke to, in the order they were requested.
+
+    The counterpart to :func:`screen_dimension_refs`, over the same lookup: those
+    refs passed the gate on the name heuristic alone, which is the fail-closed
+    floor and not equivalent to evidence. Run it after the gate has cleared a
+    query, so what it returns is exactly the set the result should disclose. A
+    caller with no lookup at all had no evidence for anything.
+    """
+
+    if meta_lookup is None:
+        return list(refs)
+    unknown: list[str] = []
+    for ref in refs:
+        meta = meta_lookup(ref)
+        if not _meta_says_pii(meta) and not _meta_clears(meta):
+            unknown.append(ref)
+    return unknown
 
 
 def cap_columnar(

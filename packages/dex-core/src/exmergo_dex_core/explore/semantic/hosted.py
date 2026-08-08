@@ -19,7 +19,6 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable
 from typing import Any
 
 from ... import envelope as env
@@ -36,6 +35,7 @@ from . import (
     cap_columnar,
     requested_dimension_refs,
     screen_dimension_refs,
+    unadjudicated_refs,
 )
 
 # The very explicit line the founder asked for: wherever a reader or agent might
@@ -51,6 +51,35 @@ _MISSING_EXTRA = (
     "the hosted semantic-layer backend needs the [semantic-api] extra: "
     "pip install 'exmergo-dex-core[semantic-api]'"
 )
+
+
+def _screening_notes(unknown: list[str], meta: dict[str, Any] | None) -> list[str]:
+    """The disclosure that the PII gate cleared dimensions on their names alone.
+
+    The layer's own ``config.meta`` is what makes the gate authoritative here, the
+    way a column profile does on the local backend. Where it says nothing the name
+    heuristic is the only thing that ran, and a result that does not say so lets
+    the weaker screening pass for the stronger one. The two silences are reported
+    separately because they have different fixes: a layer that answered and carries
+    no PII metadata wants the dimension marked in the dbt project, while a metadata
+    call that never answered wants retrying.
+    """
+
+    if not unknown:
+        return []
+    if meta is None:
+        return [
+            "PII screening used the name heuristic alone: the dimension-metadata "
+            "call to dbt Cloud did not answer, so the layer's own PII metadata "
+            "was unavailable for this query."
+        ]
+    return [
+        "PII screening used the name heuristic alone for "
+        f"{', '.join(unknown)}: the semantic layer carries no PII metadata for "
+        "them. Mark a dimension with `meta: {pii: true}` in the dbt project to "
+        "make the layer authoritative."
+    ]
+
 
 # MetricFlow standard time grains, the only values the API's grain enum accepts.
 _GRAINS = ("day", "week", "month", "quarter", "year")
@@ -211,7 +240,9 @@ class HostedDbtCloudBackend:
 
     def query(self, q: SemanticQuery) -> SemanticQueryResult:
         refs = requested_dimension_refs(q)
-        blocked = screen_dimension_refs(refs, meta_lookup=self._meta_lookup(q.metrics))
+        meta = self._dimension_meta(q.metrics)
+        lookup = (lambda _ref: None) if meta is None else meta.get
+        blocked = screen_dimension_refs(refs, meta_lookup=lookup)
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
             raise SemanticQueryRefusedError(
@@ -219,6 +250,7 @@ class HostedDbtCloudBackend:
                 "the semantic layer. PII is flagged, never surfaced; query a "
                 "non-PII dimension instead."
             )
+        notes = _screening_notes(unadjudicated_refs(refs, meta_lookup=lookup), meta)
 
         query_id = self._create_query(q)
         json_result = self._await_result(query_id)
@@ -226,16 +258,21 @@ class HostedDbtCloudBackend:
         # under its own warehouse connection, so there is no estimate dex could
         # honestly report and no ceiling it could have enforced.
         return SemanticQueryResult.from_capped(
-            self._shape(json_result),
+            self._shape(json_result, extra_notes=notes),
             backend=self.name,
             query_id=query_id,
             cost=env.Cost(paradigm=env.Paradigm.HOSTED),
             warnings=[_HOSTED_COST_WARNING],
         )
 
-    def _meta_lookup(self, metrics: list[str]) -> Callable[[str], Any]:
-        """A ``ref -> dbt config.meta`` lookup for the PII gate. Best-effort: if the
-        dimension-metadata call fails, the name heuristic still screens every ref."""
+    def _dimension_meta(self, metrics: list[str]) -> dict[str, Any] | None:
+        """``dimension name -> its dbt config.meta`` for the PII gate, or None when
+        the layer could not be asked at all.
+
+        Best-effort by design: a metadata call that fails leaves the name heuristic
+        screening every ref, which is the fail-closed floor. The None is what lets
+        the caller tell that degradation apart from a layer that answered and simply
+        carries no PII metadata, so neither one passes unremarked."""
 
         try:
             metric_inputs = ", ".join(f'{{name: "{_ident(m)}"}}' for m in metrics)
@@ -245,12 +282,12 @@ class HostedDbtCloudBackend:
             )
             data = self._post(query)
         except SemanticBackendError:
-            return lambda _ref: None
+            return None
         meta: dict[str, Any] = {}
         for d in data.get("dimensions") or []:
             cfg = d.get("config")
             meta[d.get("name")] = cfg.get("meta") if isinstance(cfg, dict) else None
-        return lambda ref: meta.get(ref)
+        return meta
 
     def _create_query(self, q: SemanticQuery) -> str:
         if not q.metrics:
@@ -321,7 +358,9 @@ class HostedDbtCloudBackend:
             f"timed out waiting for semantic layer query {query_id}"
         )
 
-    def _shape(self, json_result: Any) -> dict[str, Any]:
+    def _shape(
+        self, json_result: Any, *, extra_notes: list[str] | None = None
+    ) -> dict[str, Any]:
         payload = (
             json.loads(json_result) if isinstance(json_result, str) else json_result
         ) or {}
@@ -343,4 +382,5 @@ class HostedDbtCloudBackend:
             max_rows=self._limits.max_rows,
             max_cell_chars=self._limits.max_cell_chars,
             max_payload_bytes=self._limits.max_payload_bytes,
+            extra_notes=extra_notes,
         )

@@ -59,22 +59,24 @@ def semantic_query(
 
     from . import SemanticBackendError, SemanticQuery, resolve_backend
 
-    if not metrics:
+    # Built before the check, because the query object is what normalizes the name
+    # lists: `--metric ,` is as empty as no flag at all, and both backends should
+    # hear the same thing about it rather than one refusing and the other asking
+    # dbt Cloud for no metrics.
+    query = SemanticQuery(
+        metrics=metrics,
+        group_by=group_by or [],
+        where=where or [],
+        order_by=order_by or [],
+        grain=grain,
+        limit=limit,
+    )
+    if not query.metrics:
         raise SemanticBackendError(
             "a metric query needs at least one metric (discover them with "
             "`explore semantic list`)"
         )
-    backend = resolve_backend(engine, api=api, local=local)
-    return backend.query(
-        SemanticQuery(
-            metrics=metrics,
-            group_by=group_by or [],
-            where=where or [],
-            order_by=order_by or [],
-            grain=grain,
-            limit=limit,
-        )
-    )
+    return resolve_backend(engine, api=api, local=local).query(query)
 
 
 def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
