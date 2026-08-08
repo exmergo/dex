@@ -41,6 +41,12 @@ declared join actually reach the engine, which is the whole reason a project is
 read on the explore path: those two arrive through ``definitions()`` and through no
 other channel.
 
+**If dex is going to build your format rather than be handed one**, mix
+:class:`ProjectFactoryContract` in front. Construction is a separate contract from
+the tiers for the same reason it is separate in storage, and a format that passes
+the behavioral suite can still be unreachable from configuration, so "the suite is
+green" should mean correct *and* constructable.
+
 This module imports pytest, so it is deliberately not imported by
 :mod:`exmergo_dex_core.adapters`: a bare ``import exmergo_dex_core`` must not
 require a test framework. Install the ``[project-conformance]`` extra to get what
@@ -55,15 +61,18 @@ import pytest
 
 from ..dbt_project import ProjectDefinitions
 from ..maintain.snapshot import Snapshot
-from .project import ExploreProject, tier_of
+from .project import ExploreProject, ProjectContext, tier_of
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from ..maintain.snapshot import SemanticLayer, TransformLayer
 
 __all__ = [
     "DeclaringProjectContract",
     "ExploreProjectContract",
     "MaintainProjectContract",
+    "ProjectFactoryContract",
 ]
 
 
@@ -325,3 +334,96 @@ class MaintainProjectContract(ExploreProjectContract):
 
         assert restored.transform_layer == snap.transform_layer
         assert restored.semantic_layer == snap.semantic_layer
+
+
+class ProjectFactoryContract:
+    """The construction half, for a format dex builds rather than receives.
+
+    Mix it in front of the contract for your tier, and the whole behavioral suite
+    runs against projects built the way dex builds them::
+
+        class TestMyProject(ProjectFactoryContract, MaintainProjectContract):
+            tier = MaintainProject
+
+            def build(self, context):
+                return my_project_factory(context)
+
+            def empty_context(self):
+                return ProjectContext(options={"graph": "empty"})
+
+    Two hooks rather than one factory attribute, because a plain function assigned
+    to a class attribute binds as a method and would arrive with ``self`` in front
+    of the context, which is a confusing failure to meet on your first run.
+
+    ``empty_context`` is where your format says what it is keyed by. Build the
+    context the way a real configuration entry would produce it: a
+    directory-keyed format sets ``repo_root`` and ``project_dir``, a format
+    reduced from something already running sets neither and reads ``options``.
+    Return the context that reaches the project :meth:`make_project` returns, so
+    the behavioral assertions and the construction assertions describe the same
+    project.
+    """
+
+    #: The tier :meth:`build` promises to return. Widen it to ``MaintainProject``
+    #: or ``EditableProject`` alongside the matching contract class; the default is
+    #: the floor every format meets.
+    tier: Any = ExploreProject
+
+    def build(self, context: ProjectContext) -> Any:
+        """Your factory, called with a context. One line in most formats."""
+
+        raise NotImplementedError(
+            "a factory conformance subclass must implement "
+            "build(context) -> project, calling the factory under test"
+        )
+
+    def empty_context(self) -> ProjectContext:
+        """The context that builds a project with nothing declared in it."""
+
+        raise NotImplementedError(
+            "a factory conformance subclass must implement "
+            "empty_context() -> ProjectContext, keying the project the way a "
+            "real configuration entry would"
+        )
+
+    def make_project(self) -> ExploreProject:
+        return self.build(self.empty_context())
+
+    def test_the_factory_builds_a_project_of_the_declared_tier(self) -> None:
+        built = self.build(self.empty_context())
+        assert isinstance(built, self.tier), (
+            f"the factory returned {type(built).__name__}, which does not satisfy "
+            f"{self.tier.__name__}. A format that passes the behavioral suite and "
+            "fails here is unusable from configuration: dex builds it, checks the "
+            "tier the command needs, and refuses. Check that build() returns the "
+            "project rather than a class, a coroutine, or a wrapper"
+        )
+
+    def test_an_option_the_format_cannot_honor_is_refused(self) -> None:
+        """Accepted-and-ignored is worse than refused, and this is where it starts.
+
+        ``options`` reaches your factory verbatim and dex never validates a key,
+        so a factory that ignores what it does not recognize turns a typo into a
+        project silently read from somewhere other than where the configuration
+        said. The failure surfaces as drift nobody can reproduce, arbitrarily far
+        from the config line that caused it.
+
+        The key below is deliberately one no format would define. If yours has a
+        reason to accept unknown keys, override this with the assertion that is
+        true for your format rather than deleting it.
+        """
+
+        context = self.empty_context()
+        polluted = ProjectContext(
+            repo_root=context.repo_root,
+            project_dir=context.project_dir,
+            options={**context.options, "dex_conformance_unknown_option": "x"},
+        )
+
+        with pytest.raises(Exception) as refusal:
+            self.build(polluted)
+
+        assert "dex_conformance_unknown_option" in str(refusal.value), (
+            "the factory refused, but the message does not name the option it "
+            "refused. A reader has to be able to find the line to delete"
+        )

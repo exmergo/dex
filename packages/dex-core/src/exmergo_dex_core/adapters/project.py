@@ -31,26 +31,34 @@ A tier is checkable: ``isinstance(project, EditableProject)`` is either true or 
 is not, and a format that cannot receive edits cannot accidentally claim it can.
 The declaration and the enforcement become the same object.
 
-That matters most for the write path. ``maintain reconcile``'s two mechanical write
-paths already gate on the ``models/staging/stg_<table>.*`` scaffold convention and
-fail closed to advisory, so a generated or derived project tree is safe from them
-today -- but safe by naming coincidence rather than by contract, and a format whose
-layer directories happened to use that vocabulary would not be. Declining a tier
-makes it structural.
+That matters most for the write path, and ``maintain reconcile`` is the caller.
+Its two mechanical write paths gate on the ``models/staging/stg_<table>.*``
+scaffold convention and fail closed to advisory, so a generated or derived project
+tree was safe from them by naming coincidence rather than by contract, and a format
+whose layer directories happened to use that vocabulary would not have been.
+Reconcile now asks for :class:`EditableProject` before it proposes an edit at all,
+which makes the guarantee structural; the convention checks stay as a second line,
+because the declaration replaces the coincidence rather than the check that made
+the coincidence survivable.
 
-**Non-goal: this does not describe how a project is constructed.** Locating and
-building one is a separate contract, deliberately left open here: the formats
-disagree about what keys them (a directory, a graph already in memory, a service),
-and that disagreement does not resolve by picking whichever the first format used.
-``StoreContext`` is the shape that question took for storage.
+**Constructing one is a separate contract**, :class:`ProjectFactory` over a
+:class:`ProjectContext`, and it is optional. A host that passes its own instance to
+the engine never needs it; it exists so a format can also be *named* in
+configuration and built by dex, which is the only door open to a host that reaches
+dex as a subprocess. Keeping it off the tiers is what preserves the property that
+makes this seam cheap: a class with the right methods is a project, with no base
+class to inherit and no registration step.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .. import dbt_project
+from ..errors import ConfigurationError, RepoRootRequiredError
 from ..maintain import snapshot
 
 if TYPE_CHECKING:
@@ -63,6 +71,8 @@ __all__ = [
     "ExploreProject",
     "MaintainProject",
     "ProjectAdapter",
+    "ProjectContext",
+    "ProjectFactory",
     "tier_of",
 ]
 
@@ -132,7 +142,10 @@ class EditableProject(MaintainProject, Protocol):
     that is regenerated from something else on the next run.
 
     Declining this tier is the honest answer for such a format, and the reason the
-    tiers exist rather than a ``writeback`` flag.
+    tiers exist rather than a ``writeback`` flag. ``maintain reconcile`` reads it:
+    a format that does not satisfy this protocol gets advisory-only proposals and
+    no stored plan, which is the behavior a generated tree previously got by
+    naming coincidence.
     """
 
     def write_edits(self, edits: Any) -> Any:
@@ -159,6 +172,77 @@ class ProjectAdapter(Protocol):
     def write_edits(self, edits: Any) -> Any:
         """Write proposed edits back into the project as reviewable diffs."""
         ...
+
+
+@dataclass(frozen=True)
+class ProjectContext:
+    """Everything a format gets to build itself from when dex constructs it.
+
+    Three fields, because the formats disagree about what keys them and the
+    disagreement is not resolvable by picking a winner. A dbt project is keyed by
+    a directory. A project reduced from a graph already in memory has neither a
+    directory nor a repository. A hosted format has service coordinates and
+    neither. A contract shaped around the directory-shaped one would leave the
+    other two unbuildable, which is the group this seam exists for.
+
+    ``repo_root`` is the directory dex was pointed at, or ``None`` when there is
+    no repository in the picture.
+
+    ``project_dir`` is where within that repository the project was pinned,
+    relative to ``repo_root``, as recorded in configuration. It is ``None`` when
+    nothing pinned one, which for a directory-keyed format means "discover it".
+    A format not keyed by a directory ignores this exactly as a format with no
+    repository ignores ``repo_root``: both are slots for the formats that have
+    them, not an assumption that every format does.
+
+    ``options`` is the format's own non-secret coordinates, passed through
+    verbatim from wherever the format was named. dex does not interpret it, so
+    the keys are the format's to define and the format's to validate: refuse an
+    option you cannot honor rather than accepting and ignoring it, because a
+    silently dropped setting is indistinguishable from a working one until dex
+    is reading the wrong project.
+
+    **Construction has to be cheap.** dex builds a project per command rather
+    than holding one, because a project is an artifact a previous command may
+    have just rewritten and a stale read is a wrong drift report. Open a
+    connection, fetch a graph, or parse anything large lazily on first use, not
+    in the factory.
+
+    **No secret ever arrives here.** A format named in ``.dex/config.yml`` is
+    named in a committed file, so a password, key, token, or connection string in
+    ``options`` would be a credential in version control. Read the credential the
+    way the rest of the engine does, from the environment at construction time,
+    or skip this contract entirely and hand the engine a project you built
+    yourself (``DexEngine(project_format=...)``), which is the right shape for a
+    host that already holds per-request credentials.
+    """
+
+    repo_root: str | None = None
+    project_dir: str | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class ProjectFactory(Protocol):
+    """Anything that turns a :class:`ProjectContext` into a project.
+
+    One call, one argument, so the shapes a format author would reach for all
+    qualify without adapters: a module-level function, a class whose ``__init__``
+    takes the context, or a classmethod such as
+    :meth:`DbtProject.from_context`.
+
+    The returned project need only satisfy the tier its host uses; a factory
+    building an :class:`ExploreProject` is a complete factory.
+
+    **Do not validate a factory with ``isinstance``.** This protocol is
+    ``runtime_checkable`` for symmetry with the tiers, but a callable protocol
+    can only check that ``__call__`` exists, which every callable satisfies. What
+    is worth checking is the project that comes back, and the tiers are genuinely
+    ``isinstance``-checkable, so build first and check the result against the tier
+    the caller needs.
+    """
+
+    def __call__(self, context: ProjectContext) -> ExploreProject: ...
 
 
 def tier_of(project: object) -> int:
@@ -189,6 +273,13 @@ class DbtProject:
     call. ``repo_root`` is where dex was pointed; ``project_dir`` pins one project
     within it and stays optional, because ``None`` is how ``definitions()`` is
     reached when ``dbt_project_dir`` is unset and discovery has to run.
+
+    **One instance is meant to live for one command.** It memoizes the loaded view
+    (see :meth:`load`), and a project on disk is an artifact ``transform apply``
+    and ``transform build`` rewrite, so an instance held across commands would
+    serve a view of the project as it was before the write. dex builds one per
+    command for exactly that reason; a host constructing its own owns that
+    decision.
     """
 
     name = "dbt"
@@ -200,19 +291,75 @@ class DbtProject:
     ):
         self.repo_root = Path(repo_root)
         self.project_dir = Path(project_dir) if project_dir is not None else None
+        self._view: DbtProjectView | None = None
+
+    @classmethod
+    def from_context(cls, context: ProjectContext) -> DbtProject:
+        """Build from configuration, refusing coordinates it cannot honor.
+
+        ``repo_root`` is required rather than optional: a dbt project is a
+        git-reviewable filesystem artifact by design, so there is no dbt project
+        to read without one, and refusing here names the fix instead of failing
+        several frames down on a path built from ``None``.
+
+        ``options`` are refused rather than ignored. dbt takes none, and this
+        format's one coordinate is ``project_dir``, which has its own slot;
+        accepting an unknown key and dropping it is indistinguishable from
+        honoring it right up until dex reads the wrong project.
+
+        ``project_dir`` arrives relative to ``repo_root``, which is how it is
+        written in configuration and the only form that survives the repository
+        moving, so it is joined here rather than passed through.
+        """
+
+        if context.repo_root is None:
+            raise RepoRootRequiredError(
+                "the dbt project format needs a repo root: the project is a "
+                "git-reviewable filesystem artifact, so build the engine with "
+                "DexEngine.from_repo(repo_root) or pass repo_root="
+            )
+        if context.options:
+            named = ", ".join(sorted(context.options))
+            raise ConfigurationError(
+                f"the dbt project format takes no options, and got: {named}. "
+                "Pin the project directory with `dbt_project_dir` in "
+                ".dex/config.yml, which is the one coordinate this format has"
+            )
+        root = Path(context.repo_root)
+        pin = root / context.project_dir if context.project_dir else None
+        return cls(root, pin)
 
     def definitions(self) -> ProjectDefinitions:
         return dbt_project.definitions(self.repo_root, self.project_dir)
 
     def load(self) -> DbtProjectView:
-        """Load the project into an in-memory view.
+        """Load the project into an in-memory view, once per instance.
 
         Raises ``DbtProjectError`` when there is no project to load, which is what
         every caller of ``dbt_project.load`` already expects. Tier 1 is the channel
         with the never-raises promise.
+
+        Memoized because it is the expensive call on every maintain path: it walks
+        the model and macro trees, reads and hashes every file, and parses a
+        ``manifest.json`` that is routinely several megabytes. The two layer
+        accessors below each need it, and three of the four commands that read
+        layers need both, so without the memo routing them through this seam would
+        cost a second full load. The memo's lifetime is the instance's, which is
+        why the class docstring says how long an instance is meant to live.
+
+        Discovery runs when nothing pinned a directory, matching
+        :meth:`definitions`. Resolving to ``repo_root`` instead would find a
+        project only when it sits at the repository root, so the two tiers would
+        disagree about which project they were reading in every repo that keeps
+        its dbt project in a subdirectory. The result is absolute because the
+        view's ``root`` reaches ``transform.plans``, which records a directory
+        relative to the repo root and re-resolves it at apply time.
         """
 
-        return dbt_project.load(self.project_dir or self.repo_root)
+        if self._view is None:
+            project = self.project_dir or dbt_project.find_project(self.repo_root)
+            self._view = dbt_project.load(Path(project).resolve())
+        return self._view
 
     def transform_layer(self) -> TransformLayer:
         return snapshot.transform_layer(self.load())
