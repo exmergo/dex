@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-08
+
 ### Added
 
 - **A project format can be named in configuration, and `maintain` reads it**
