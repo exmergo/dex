@@ -12,6 +12,14 @@ from exmergo_dex_core.transform.validate import (
 )
 
 
+def _model_sql(content: str) -> PlanEdit:
+    return PlanEdit(
+        path="model.sql",
+        new_content=content,
+        kind=EditKind.MODEL_SQL,
+    )
+
+
 def test_find_inlined_secret_flags_a_literal_value():
     assert find_inlined_secret("o:\n  password: hunter2\n") == "password"
 
@@ -77,3 +85,67 @@ def test_validate_profiles_yml_accepts_env_var_indirection():
         kind=EditKind.PROFILES_YML,
     )
     assert validate_edit(edit) == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select a\nfrom\n  {{ ref('stg_accounts') }}\n",
+        (
+            "select a\n"
+            "from {{ ref('stg_accounts') }}\n"
+            "join\n"
+            "  {{ ref('stg_contacts') }}\n"
+            "  on stg_accounts.id = stg_contacts.account_id\n"
+        ),
+        (
+            "with accounts as (\n"
+            "  select a\n"
+            "  from\n"
+            "    {{ ref('stg_accounts') }}\n"
+            ")\n"
+            "select * from accounts\n"
+        ),
+    ],
+    ids=["top-level-from", "top-level-join", "cte"],
+)
+def test_validate_model_sql_keeps_jinja_references_after_query_start(sql: str):
+    assert validate_edit(_model_sql(sql)) == []
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "{{ config(materialized='view') }}",
+        "{{- config(materialized='view') -}}",
+    ],
+    ids=["plain", "whitespace-control"],
+)
+@pytest.mark.parametrize("gap", ["", "\n"], ids=["adjacent", "blank-line"])
+def test_validate_model_sql_drops_jinja_config_header(header: str, gap: str):
+    sql = f"{header}\n{gap}select a\nfrom source\n"
+    assert validate_edit(_model_sql(sql)) == []
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        "-- SELECT is only mentioned in this comment",
+        "/*\nWITH is only mentioned in this comment\n*/",
+    ],
+    ids=["line-comment", "block-comment"],
+)
+def test_validate_model_sql_finds_query_start_outside_comments(comment: str):
+    sql = f"{comment}\n{{{{ config(materialized='view') }}}}\nselect 1\n"
+    assert validate_edit(_model_sql(sql)) == []
+
+
+def test_validate_model_sql_finds_query_after_leading_inline_comment():
+    sql = "/* model note */ select a\nfrom\n  {{ ref('stg_accounts') }}\n"
+    assert validate_edit(_model_sql(sql)) == []
+
+
+def test_validate_model_sql_warns_when_model_is_entirely_jinja():
+    assert validate_edit(_model_sql("{{ generate_model() }}\n")) == [
+        "model.sql: model is entirely jinja; SELECT-only check skipped"
+    ]

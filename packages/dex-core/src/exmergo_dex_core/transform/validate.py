@@ -11,7 +11,10 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+import sqlglot
 import yaml
+from sqlglot.errors import TokenError
+from sqlglot.tokens import TokenType
 
 from ..errors import DexError
 from ..guards.sql_guard import assert_select_only
@@ -134,23 +137,41 @@ def strip_jinja(sql: str) -> str:
     """Reduce a dbt model to plain SQL for the SELECT-only check.
 
     Inline expressions (``{{ ref(...) }}``) become an identifier placeholder;
-    statement and comment blocks are removed. A line that was nothing but
-    jinja is dropped at the top level (a ``{{ config(...) }}`` header), but
-    inside parentheses it becomes a placeholder subquery, because there it is
-    a macro rendering a whole SELECT (``from ( {{ unpivot_json_object(...) }} )``)
-    and dropping it would leave unparseable SQL. Depth counting is naive about
-    parens inside string literals; a miscount only ever refuses, never admits.
+    statement and comment blocks are removed. Before the query starts, a
+    placeholder-only line is dropped at the top level (a ``{{ config(...) }}``
+    header). Once the first SQL ``SELECT`` or ``WITH`` token has started the
+    query, it is preserved as an identifier so a line-broken ``ref()`` remains
+    parseable. Inside parentheses it becomes a placeholder subquery, because
+    there it is a macro rendering a whole SELECT
+    (``from ( {{ unpivot_json_object(...) }} )``), and dropping it would leave
+    unparseable SQL. Depth counting is naive about parens inside string literals;
+    a miscount only ever refuses, never admits.
     """
 
     text = _JINJA_COMMENT.sub("", sql)
     text = _JINJA_STMT.sub("", text)
     text = _JINJA_EXPR.sub(_PLACEHOLDER, text)
+    # Token lines locate the query without mistaking keywords in comments or
+    # strings for its start.
+    try:
+        query_start_line = next(
+            (
+                token.line
+                for token in sqlglot.tokenize(text)
+                if token.token_type in (TokenType.SELECT, TokenType.WITH)
+            ),
+            None,
+        )
+    except TokenError:
+        query_start_line = None
     lines: list[str] = []
     depth = 0
-    for line in text.splitlines():
+    for line_number, line in enumerate(text.splitlines(), start=1):
         if line.strip() == _PLACEHOLDER:
             if depth > 0:
                 lines.append(line.replace(_PLACEHOLDER, f"select {_PLACEHOLDER}"))
+            elif query_start_line is not None and line_number >= query_start_line:
+                lines.append(line)
             continue
         depth += line.count("(") - line.count(")")
         lines.append(line)
