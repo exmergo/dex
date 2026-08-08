@@ -73,13 +73,22 @@ class WarehouseBaseline(BaseModel):
 
 
 class SourceTable(BaseModel):
-    """One declared dbt source table: a contract the warehouse must keep honoring."""
+    """One declared source table: a contract the warehouse must keep honoring.
+
+    ``path`` is provenance for the ``dangling_source`` finding: the file an
+    analyst would open to fix the declaration. It is ``None`` for a project
+    format that declares its sources somewhere other than a file of their own,
+    and nothing ever opens it. Inventing a plausible path instead would attach a
+    file that is not there to a high-severity finding, which is the trap
+    :class:`SemanticModelDef` avoids one field over by mapping unresolvable
+    columns to ``None``.
+    """
 
     source_name: str
     schema_name: str | None = None
     table: str
     columns: list[str] = Field(default_factory=list)
-    path: str
+    path: str | None = None
 
 
 class TransformLayer(BaseModel):
@@ -90,6 +99,15 @@ class TransformLayer(BaseModel):
     ``ref()`` calls (source entries as ``source_name.table``), which is how a
     warehouse-level finding is traced to the models it lands on without
     re-reading the project at detection time.
+
+    ``notes`` is how a project format says what it could not supply, the way
+    ``ProjectDefinitions.notes`` does on the declarations channel. A format whose
+    layer is faithful but narrower than a dbt project's (no file hashes because it
+    has no files, say) records that here, and the maintain commands fold it into
+    their warnings. It is informational only: no detector reads it, and it is
+    excluded from every comparison, so a changed note is never drift. Anything dex
+    must *decide* from belongs in a project tier, which is checkable, rather than
+    in prose the engine would have to trust.
     """
 
     files: dict[str, str] = Field(default_factory=dict)
@@ -97,6 +115,7 @@ class TransformLayer(BaseModel):
     sources: list[SourceTable] = Field(default_factory=list)
     model_sources: dict[str, list[str]] = Field(default_factory=dict)
     model_refs: dict[str, list[str]] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
 
 
 class SemanticModelDef(BaseModel):
@@ -108,11 +127,13 @@ class SemanticModelDef(BaseModel):
     column (a bare-identifier ``expr``, or a name with no ``expr``, which dbt
     treats as the column itself); computed expressions map to ``None``.
     Guessing columns out of expressions would turn every refactor into a false
-    dangling-ref finding.
+    dangling-ref finding. ``path`` is ``None`` on the same principle: it is
+    provenance carried on the ``definition_changed`` finding, absent for a format
+    whose definitions are objects rather than files, and never opened.
     """
 
     name: str
-    path: str
+    path: str | None = None
     content_sha256: str
     model_ref: str | None = None
     entities: dict[str, str | None] = Field(default_factory=dict)
@@ -144,18 +165,31 @@ class SemanticModelDef(BaseModel):
 class MetricDef(BaseModel):
     """One metric: a content hash plus the measures and metrics it draws from,
     so warehouse drift can be traced through measures up to the metrics it
-    ultimately biases."""
+    ultimately biases.
+
+    ``path`` follows :class:`SemanticModelDef`: provenance for
+    ``definition_changed``, ``None`` where the definition has no file, never
+    opened."""
 
     name: str
-    path: str
+    path: str | None = None
     content_sha256: str
     input_measures: list[str] = Field(default_factory=list)
     input_metrics: list[str] = Field(default_factory=list)
 
 
 class SemanticLayer(BaseModel):
+    """The semantic layer's fingerprint: every named definition the project holds.
+
+    ``notes`` carries the same meaning as on :class:`TransformLayer`, and for the
+    same reason: this is a return type a non-dbt project format fills in, and a
+    layer that is narrower than a dbt one needs somewhere to say so that travels
+    with the value rather than sitting beside it.
+    """
+
     semantic_models: list[SemanticModelDef] = Field(default_factory=list)
     metrics: list[MetricDef] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class Snapshot(BaseModel):

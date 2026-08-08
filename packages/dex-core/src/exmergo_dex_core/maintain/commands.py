@@ -130,6 +130,7 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
     warnings.extend(
         _cache_age_warnings(snap, config.profile_freshness_hours, now),
     )
+    warnings.extend(_layer_notes(transform_layer, semantic_layer))
     locator = store.save_snapshot(snap)
 
     return SnapshotResult(
@@ -218,7 +219,8 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
         store,
         warnings=warnings
         + _column_detail_warnings(snap)
-        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
+        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours)
+        + _layer_notes(snap.transform_layer, current_transform),
     )
     result.cost = cost
     return result
@@ -320,6 +322,10 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
         )
     current_transform = snapshot_mod.transform_layer(view)
     current_semantic = snapshot_mod.semantic_layer(view)
+    # Extended here rather than at the two returns so the confirmation path
+    # carries them too: the free findings it returns are bounded by whatever the
+    # format could not supply, exactly as the settled ones are.
+    warnings.extend(_layer_notes(snap.semantic_layer, current_semantic))
     scope_names = list(objects or [])
 
     adapter = engine._adapter("maintain semantic")
@@ -411,6 +417,17 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     except (DbtProjectError, ValueError) as exc:
         project_available = False
         warnings.append(f"semantic axis skipped (no dbt project: {exc})")
+    # All four layers: `check` sweeps every axis, so both the baseline's limits
+    # and the current read's bound what it reports. Added before the two returns
+    # so the confirmation path carries them as well.
+    warnings.extend(
+        _layer_notes(
+            snap.transform_layer,
+            snap.semantic_layer,
+            current_transform,
+            current_semantic,
+        )
+    )
 
     adapter = engine._adapter("maintain check")
     connector = adapter.name
@@ -769,6 +786,25 @@ def _cache_age_warnings(
         "the warehouse since then is not in it and will report as drift. Run "
         "`explore map` first, then `maintain snapshot`, to pin current state"
     ]
+
+
+def _layer_notes(*layers: object) -> list[str]:
+    """What the project format said it could not supply, from every layer read.
+
+    Both sides are collected, baseline and freshly read, because the two payload
+    sites read different ones: ``dangling_source`` compares against the
+    baseline's declared sources, while ``definition_changed`` reads the current
+    project. Surfacing one side would leave the other axis's limits unexplained.
+    In practice both come from the same format and say the same thing, so the
+    common case deduplicates to one line.
+    """
+
+    seen: list[str] = []
+    for layer in layers:
+        for note in getattr(layer, "notes", None) or []:
+            if note not in seen:
+                seen.append(note)
+    return seen
 
 
 def _adapter_notes(adapter, identifiers: list[str]) -> list[str]:
