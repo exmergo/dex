@@ -11,6 +11,7 @@ from exmergo_dex_core.maintain.drift import (
     CardinalityCheck,
     cardinality_drift,
     cardinality_plan,
+    semantic_free_drift,
 )
 from exmergo_dex_core.maintain.snapshot import (
     SemanticLayer,
@@ -142,6 +143,9 @@ def test_definition_change_and_churn_are_reported(maintain_repo):
 
     changed_names = {f["data"]["name"] for f in by_code["definition_changed"]}
     assert changed_names == {"revenue"}
+    # The dbt path names the file, which is the non-degraded half of the pair
+    # asserted by test_a_pathless_definition_omits_its_provenance below.
+    assert by_code["definition_changed"][0]["data"]["path"] == SEMANTIC_PATH
     assert {f["data"]["name"] for f in by_code["definition_added"]} == {
         "orders_shipped"
     }
@@ -214,6 +218,36 @@ def test_new_categorical_value_is_a_cardinality_delta_never_a_value(maintain_rep
     # never reaches the envelope (or `.dex/`); naming it is a job for a
     # firewalled `explore query` if the user asks.
     assert "refunded" not in json.dumps(payload)
+
+
+def test_a_pathless_definition_omits_its_provenance():
+    """A definition with no file yields `definition_changed` without a `path`.
+
+    Direct rather than through the CLI because this payload reads the *current*
+    project, and `maintain semantic` refuses without a dbt project to read, so a
+    non-dbt format reaches this detector only as a caller. `kind` and `name`
+    still identify the definition, which is what makes the finding actionable
+    with the file gone.
+    """
+
+    baseline = SemanticLayer(
+        semantic_models=[
+            SemanticModelDef(name="orders", content_sha256="before"),
+        ],
+        notes=["definitions are objects, not files"],
+    )
+    current = SemanticLayer(
+        semantic_models=[
+            SemanticModelDef(name="orders", content_sha256="after"),
+        ]
+    )
+    snap = Snapshot(created_at="2024-01-01T00:00:00", semantic_layer=baseline)
+
+    findings = semantic_free_drift(None, current, [], snap)
+
+    changed = [f for f in findings if f.code == "definition_changed"]
+    assert len(changed) == 1
+    assert changed[0].data == {"kind": "semantic_model", "name": "orders"}
 
 
 def _snapshot_with_two_semantic_models() -> tuple[Snapshot, SemanticLayer]:

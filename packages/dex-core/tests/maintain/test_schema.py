@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from exmergo_dex_core.maintain.snapshot import SourceTable, TransformLayer
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -105,6 +106,42 @@ def test_dropped_source_table_is_flagged_dangling(maintain_repo):
     assert dangling["identifier"] == "main.orders"
     assert dangling["severity"] == "high"
     assert dangling["data"]["declared_in"] == "models/staging/_dex_sources.yml"
+
+
+def test_a_host_supplied_pathless_baseline_omits_declared_in_and_carries_its_note(
+    maintain_repo,
+):
+    """The same finding from a baseline a non-dbt format supplied.
+
+    This is the channel that makes an optional `path` reachable today: a host
+    builds the layers itself and persists them through the store, and
+    `dangling_source` reads the baseline's declared sources, so it fires with no
+    project on disk involved. The pair to
+    `test_dropped_source_table_is_flagged_dangling` above, which asserts the dbt
+    path still carries the file it always had.
+    """
+
+    maintain_repo.snapshot()
+    store = FilesystemStore(maintain_repo.root)
+    snap = store.load_snapshot()
+    snap.transform_layer = TransformLayer(
+        models=["stg_orders"],
+        sources=[SourceTable(source_name="main", table="orders")],
+        notes=["sources are declared in configuration, so no file declares them"],
+    )
+    store.save_snapshot(snap)
+
+    maintain_repo.sql("DROP TABLE orders")
+
+    _rc, payload = maintain_repo.dex("maintain", "schema")
+    dangling = _by_code(payload)["dangling_source"][0]
+    assert dangling["identifier"] == "main.orders"
+    assert dangling["severity"] == "high"
+    # Absent, not null: the identifier above is what makes it actionable.
+    assert "declared_in" not in dangling["data"]
+    assert any(
+        "declared in configuration" in warning for warning in payload["warnings"]
+    ), payload["warnings"]
 
 
 def test_new_table_is_reported_added(maintain_repo):

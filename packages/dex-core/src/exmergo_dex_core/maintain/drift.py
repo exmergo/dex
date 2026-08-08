@@ -304,7 +304,12 @@ def schema_drift(
                             f"declared source {source.source_name}.{source.table} "
                             "has no matching warehouse object"
                         ),
-                        data={"declared_in": source.path},
+                        # The key is omitted rather than null when the format has
+                        # no file to name: a null provenance forces every reader
+                        # to branch, and both branches fall back to the
+                        # identifier above. An absent key lets `.get(default)`
+                        # do that on its own.
+                        data=({"declared_in": source.path} if source.path else {}),
                     )
                 )
     return findings
@@ -625,6 +630,7 @@ def semantic_free_drift(
     for key in sorted(base_defs.keys() & cur_defs.keys()):
         if base_defs[key].content_sha256 != cur_defs[key].content_sha256:
             kind, name = key
+            path = cur_defs[key].path
             findings.append(
                 DriftFinding(
                     axis="semantic",
@@ -634,7 +640,10 @@ def semantic_free_drift(
                         f"the definition of {kind.replace('_', ' ')} '{name}' "
                         "changed since the baseline"
                     ),
-                    data={"kind": kind, "name": name, "path": cur_defs[key].path},
+                    # `path` omitted rather than null where the definition has no
+                    # file; `kind` and `name` already identify it.
+                    data={"kind": kind, "name": name}
+                    | ({"path": path} if path else {}),
                 )
             )
 
