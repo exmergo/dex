@@ -646,6 +646,148 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     assert not new_model.exists()
 
 
+def _reconcile_fixtures(dbt_project_dir: Path) -> tuple[FilesystemStore, str]:
+    """A repo primed so `maintain reconcile` would propose a mechanical edit.
+
+    A dex-scaffolded staging model, a profiled baseline of the table behind it,
+    and a `column_added` finding against that table: the three conditions the
+    mechanical path requires. Everything below turns on whether the project
+    format is asked before that path is taken.
+    """
+
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.drift import AxisResult, DriftFinding, DriftReport
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    staging = dbt_project_dir / "models" / "staging"
+    (staging / "stg_orders.sql").write_text(
+        "select id, customer_id from {{ source('main', 'orders') }}\n", encoding="utf-8"
+    )
+    (staging / "stg_orders.yml").write_text(
+        "version: 2\nmodels:\n  - name: stg_orders\n    columns:\n      - name: id\n",
+        encoding="utf-8",
+    )
+
+    created_at = datetime.now(UTC).isoformat()
+    store = FilesystemStore(dbt_project_dir.parent)
+    store.save_snapshot(
+        Snapshot(
+            created_at=created_at,
+            connector="duckdb",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="warehouse.main.orders",
+                        row_count=3,
+                        columns=[
+                            ColumnProfile(name="id", data_type="INTEGER"),
+                            ColumnProfile(name="customer_id", data_type="INTEGER"),
+                        ],
+                        profiled_at=created_at,
+                    )
+                ]
+            ),
+        )
+    )
+    store.save_drift(
+        DriftReport(
+            connector="duckdb",
+            snapshot_created_at=created_at,
+            axes={
+                "schema": AxisResult(
+                    run_at=created_at,
+                    findings=[
+                        DriftFinding(
+                            axis="schema",
+                            code="column_added",
+                            identifier="warehouse.main.orders",
+                            column="discount",
+                            detail="a new column appeared on orders",
+                            data={"data_type": "DOUBLE"},
+                        )
+                    ],
+                )
+            },
+        )
+    )
+    return store, created_at
+
+
+class _NotEditableProject:
+    """Tier 2: a format reduced from a running graph, declining the write tier."""
+
+    name = "graph"
+
+    def definitions(self):
+        from exmergo_dex_core.dbt_project import ProjectDefinitions
+
+        return ProjectDefinitions(present=True)
+
+    def transform_layer(self):
+        from exmergo_dex_core.maintain.snapshot import TransformLayer
+
+        return TransformLayer()
+
+    def semantic_layer(self):
+        from exmergo_dex_core.maintain.snapshot import SemanticLayer
+
+        return SemanticLayer()
+
+
+def test_a_format_that_declines_the_write_tier_gets_no_mechanical_edit(
+    dbt_project_dir: Path,
+):
+    """Propose-don't-impose, made structural rather than coincidental.
+
+    dex must not author an edit into a project whose format says it cannot
+    receive one. A reduction of a running graph is the case: its source of truth
+    is the code that produced the graph, so writing into the reduction edits an
+    artifact regenerated on the next run, and the human reviewing that diff is
+    reviewing something that will be overwritten.
+
+    Until the write tier was asked, this held only by accident. Both mechanical
+    paths key on the `models/staging/stg_<table>.*` scaffold convention and fail
+    closed, so a generated tree was safe exactly as long as its own directory
+    naming happened not to collide, and a format whose layers used that
+    vocabulary would have been written into. The consumer who built the second
+    format pinned that invariant with a test in their own repository, which is
+    the wrong side of the boundary for an invariant this one owes.
+
+    Paired deliberately: the fixtures are identical and the dbt format takes the
+    mechanical path through them, so a regression that broke reconcile outright
+    would fail the first half rather than pass the second by doing nothing.
+    """
+
+    store, _ = _reconcile_fixtures(dbt_project_dir)
+    config = DexConfig(dbt_project_dir="analytics")
+
+    editable = DexEngine(
+        config=config, store=store, repo_root=str(dbt_project_dir.parent)
+    ).reconcile()
+
+    assert [p.kind for p in editable.proposals] == ["mechanical"], (
+        "the non-degraded path is not reachable, so the degraded assertion below "
+        "would pass for the wrong reason"
+    )
+    assert editable.plan_id is not None and editable.diffs
+
+    declined = DexEngine(
+        config=config,
+        store=store,
+        repo_root=str(dbt_project_dir.parent),
+        project_format=_NotEditableProject(),
+    ).reconcile()
+
+    assert declined.proposals, "the findings must still be surfaced, only advisory"
+    assert {p.kind for p in declined.proposals} == {"advisory"}
+    assert declined.plan_id is None
+    assert not declined.diffs
+    assert store.latest_plan() is None or store.latest_plan().plan_id == (
+        editable.plan_id
+    ), "a format that declines the write tier stored a plan"
+    assert any("does not implement the write tier" in w for w in declined.warnings)
+
+
 def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: Path):
     # profiles.yml is an editable surface, but a credential must never reach the
     # plan diff (and thus agent context). An inlined literal is refused whether
