@@ -36,11 +36,12 @@ its filesystem at all can supply the connection instead; see ``connection=`` and
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
-from .config import CacheConfig, DexConfig, load_config
+from .config import CacheConfig, DexConfig, ProjectConfig, load_config
 from .connect import ConnectionSource, SemanticSource
 from .envelope import Paradigm
 from .errors import RepoRootRequiredError, StoreRequiredError
@@ -49,6 +50,12 @@ from .storage import ExploreStore, MemoryStore, Store, StoreContext, build_store
 
 if TYPE_CHECKING:
     from .adapters.base import Adapter
+    from .adapters.project import (
+        EditableProject,
+        ExploreProject,
+        MaintainProject,
+        ProjectFactory,
+    )
     from .explore.results import (
         ClusterResult,
         DiagramResult,
@@ -149,6 +156,7 @@ class DexEngine:
         confirmed: bool = False,
         connection: ConnectionSource | None = None,
         semantic_source: SemanticSource | None = None,
+        project_format: ExploreProject | None = None,
     ) -> None:
         # Two config attributes, deliberately. `config` is what commands read and
         # is always a real object; `_declared` records whether one was actually
@@ -179,6 +187,16 @@ class DexEngine:
         self.budget = budget
         self.confirmed = confirmed
         self._adapter_instance: Adapter | None = None
+        # The project seam, in its two shapes. `_project_format` is an instance a
+        # host handed us and always wins; `_project_factory` is what a configured
+        # name resolved to, called fresh per command. See `project_format()` for
+        # why one is held and the other is not. The private names are not
+        # squeamishness: `self.project` is the warehouse billing project, taken
+        # long before this seam existed.
+        self._project_format = project_format
+        self._project_name = "dbt"
+        self._project_factory: ProjectFactory | None = None
+        self._project_options: Mapping[str, Any] = {}
 
     @classmethod
     def from_repo(
@@ -186,6 +204,7 @@ class DexEngine:
         repo_root: str | Path,
         *,
         cache_backend: str | None = None,
+        project_format_name: str | None = None,
         **overrides: Any,
     ) -> DexEngine:
         """Build from a project on disk: config from ``.dex/``, store from config.
@@ -209,6 +228,14 @@ class DexEngine:
         coordinates; the most useful thing this override does is fall back to the
         filesystem backend for one command, and that would refuse outright if a
         custom backend's options came along.
+
+        The project format resolves the same way and takes the same override
+        rules, with one difference: what is held is the *factory*, not a built
+        project. A store is state with a lifetime and is built once; a project is
+        a read of an artifact a later command may rewrite, so it is built per
+        command. See :meth:`project_format`. ``project_format_name`` is the CLI's
+        ``--project-format``, and a ``project_format=`` instance passed here wins
+        over both, exactly as ``store=`` does.
         """
 
         root = str(repo_root)
@@ -220,7 +247,18 @@ class DexEngine:
             overrides["store"] = build_store(
                 selected, StoreContext(repo_root=root, options=options)
             )
-        return cls(repo_root=root, **overrides)
+        engine = cls(repo_root=root, **overrides)
+        if engine._project_format is None:
+            from .adapters.project_resolver import resolve_project_factory
+
+            declared = getattr(overrides["config"], "project", None) or ProjectConfig()
+            chosen = project_format_name or declared.format
+            engine._project_name = chosen
+            engine._project_factory = resolve_project_factory(chosen)
+            engine._project_options = (
+                declared.options if chosen == declared.format else {}
+            )
+        return engine
 
     # --- the single adapter funnel ------------------------------------------
 
@@ -345,6 +383,112 @@ class DexEngine:
         if self.config.dbt_project_dir:
             return (Path(root) / self.config.dbt_project_dir).resolve()
         return find_project(root).resolve()
+
+    def project_format(self) -> ExploreProject:
+        """The project this engine reads, built from whatever named it.
+
+        The seam every command reads a project through. Three sources, in
+        precedence order: an instance the host passed as ``project_format=``, the
+        format ``project.format`` selected (or ``--project-format`` overrode), and
+        the shipped dbt format when nothing selected anything.
+
+        **A project dex built is not held across commands, and that is
+        deliberate.** ``self._adapter_instance`` is held because a warehouse
+        session is expensive to reopen and can wake a warehouse; a project is a
+        read of an artifact on disk that ``transform apply`` and ``transform
+        build`` rewrite, so holding one would serve a later command the project as
+        it was before the write, and a drift report computed against a stale
+        project is wrong rather than merely slow. Construction is cheap by
+        contract (see :class:`~.adapters.project.ProjectContext`) and the expensive
+        part, the load itself, is memoized inside the instance for the command
+        that holds it.
+
+        A host-supplied instance *is* held, because its lifetime is the host's to
+        decide: a host that reduced a project from a graph it owns knows when that
+        graph changed and dex does not.
+
+        The name says ``format`` because the plain one is taken: ``self.project``
+        is the warehouse billing project, and has been since before this seam
+        existed.
+        """
+
+        if self._project_format is not None:
+            return self._project_format
+
+        from .adapters.project import ProjectContext
+        from .adapters.project_resolver import SHIPPED, construct_project
+
+        # Through `construct_project` rather than calling the factory directly,
+        # so the tier floor is checked on what a configured name actually built.
+        # A factory that returns the wrong thing otherwise degrades into a project
+        # that answers nothing, and the first symptom is a command warning about a
+        # missing tier several frames from the config line that caused it.
+        return construct_project(
+            self._project_name,
+            self._project_factory or SHIPPED["dbt"],
+            ProjectContext(
+                repo_root=self.repo_root,
+                project_dir=self.config.dbt_project_dir,
+                options=self._project_options,
+            ),
+        )
+
+    def maintain_project(self) -> MaintainProject | None:
+        """The project when it can serve as a drift baseline, else ``None``.
+
+        The project tiers are nested, and a format implementing only
+        :class:`~.adapters.project.ExploreProject` is complete rather than
+        partial: it contributes declared keys and joins to exploration and simply
+        cannot be a baseline. So ``None`` is an answer here rather than a failure,
+        the same way it is in :meth:`editable_project`, and the caller decides
+        whether its command can proceed without one.
+
+        What is *not* an answer is a format that could not be built at all. That
+        propagates, because it is a wiring mistake in a committed file: every
+        command will hit it, so degrading to a warning would hide the one thing
+        the operator needs to fix.
+        """
+
+        from .adapters.project import MaintainProject as _MaintainProject
+
+        project = self.project_format()
+        return project if isinstance(project, _MaintainProject) else None
+
+    def project_tier_note(self) -> str:
+        """Why the configured format cannot be a baseline, in one clause.
+
+        Folded into the warning each maintain command already emits when it has
+        no project, so a narrow format reads as a narrow format rather than as an
+        absent one. The tier is counted rather than named: telling someone whose
+        format implements nothing that it "implements only the explore tier"
+        sends them looking for the method they already have.
+        """
+
+        from .adapters.project import tier_of
+
+        project = self.project_format()
+        named = getattr(project, "name", type(project).__name__)
+        return (
+            f"the '{named}' project format reaches tier {tier_of(project)} of 3, "
+            "so it cannot produce the two snapshot layers a baseline is made of; "
+            "implement transform_layer() and semantic_layer() to reach "
+            "exmergo_dex_core.adapters.project.MaintainProject"
+        )
+
+    def editable_project(self) -> EditableProject | None:
+        """The project when it declares it can receive edits, else ``None``.
+
+        ``None`` is an answer rather than a failure, and the caller that asks is
+        ``maintain reconcile``: a format declining the write tier gets
+        proposal-only reconciliation, which is the correct behavior and the reason
+        the tiers exist instead of a ``writeback`` flag. Returning ``None`` rather
+        than raising is what lets the caller degrade instead of refusing.
+        """
+
+        from .adapters.project import EditableProject as _EditableProject
+
+        project = self.project_format()
+        return project if isinstance(project, _EditableProject) else None
 
     def require_repo_root(self, what: str) -> str:
         """The repo root, or a refusal naming what needed it.

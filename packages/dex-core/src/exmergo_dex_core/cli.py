@@ -87,6 +87,7 @@ def _rewrite_unambiguous_bare_subcommand(argv: list[str]) -> list[str]:
             "--dataset",
             "--repo-root",
             "--cache-backend",
+            "--project-format",
             "--budget",
         }:
             i += 2
@@ -155,6 +156,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", action="append", default=None)
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--cache-backend", default=None)
+    parser.add_argument("--project-format", default=None)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--budget", type=float, default=None)
 
@@ -420,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--dataset",
                     "--repo-root",
                     "--cache-backend",
+                    "--project-format",
                     "--budget",
                 }:
                     j += 2
@@ -451,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         engine = DexEngine.from_repo(
             repo_root(args),
             cache_backend=getattr(args, "cache_backend", None),
+            project_format_name=getattr(args, "project_format", None),
             connector=getattr(args, "connector", None),
             path=getattr(args, "path", None),
             project=getattr(args, "project", None),

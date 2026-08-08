@@ -402,6 +402,44 @@ class CacheConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectConfig(BaseModel):
+    """Which format owns the source of truth, and how to reach it.
+
+    The project is what declares intent: which models exist, at what grain, how
+    they join, what the metrics mean. dex reads it and reasons over it. Today one
+    format ships, and ``dbt`` is the default, so a repo that selects nothing
+    behaves exactly as it did before this setting existed.
+
+    ``format`` is an open registry rather than a closed set. It accepts a name dex
+    ships (``dbt``), a dotted ``mypkg.projects:my_project`` path, or a name an
+    installed distribution registered under the ``exmergo_dex_core.projects``
+    entry-point group. A format published as its own package is therefore
+    selectable without a change to dex, which is the only door open to a host that
+    reaches dex as a subprocess and cannot pass an object.
+    ``--project-format`` overrides it for one run, the way ``--connector``
+    overrides the configured connector. Naming a *different* format that way
+    leaves ``options`` behind, because they are not namespaced by format and one
+    format's coordinates are not another's.
+
+    ``options`` reaches the selected format's factory verbatim: dex does not
+    interpret it, so the keys belong to the format and the format validates
+    them. The shipped dbt format takes none; its one coordinate is
+    ``dbt_project_dir`` below, which has its own slot because it predates this
+    setting and because pinning a directory within the repository is the one
+    thing a directory-keyed format needs from configuration.
+    See ``references/project.md``.
+
+    **Credentials are never here.** This file is committed, so a token or
+    connection string among the options would be a secret in version control. A
+    format needing one reads it at runtime the way ``connect.py`` does, or the
+    host builds the project itself and passes it to ``DexEngine``, which always
+    wins over anything named here.
+    """
+
+    format: str = "dbt"
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -420,8 +458,15 @@ class DexConfig(BaseModel):
     postgres: PostgresTarget | None = None
     redshift: RedshiftTarget | None = None
     dbt_target: str | None = None
+    # Which format owns the source of truth. Defaults to dbt, so a repo that
+    # selects nothing behaves exactly as it did before this setting existed.
+    project: ProjectConfig = Field(default_factory=ProjectConfig)
     # Pins the dbt project directory (relative to the repo root) when discovery
-    # would be ambiguous; by default the project is located automatically.
+    # would be ambiguous; by default the project is located automatically. Stays
+    # a top-level key rather than moving under `project.options`: it predates the
+    # format setting, it is read by `transform build` (which pins its subprocess
+    # cwd to it) as well as by the project seam, and moving a released key to win
+    # a tidier shape would cost a deprecation for no reader's benefit.
     dbt_project_dir: str | None = None
     # How `explore semantic` reaches the semantic layer (local MetricFlow vs a
     # hosted dbt Cloud deployment). Defaults to local; a bare project queries the
