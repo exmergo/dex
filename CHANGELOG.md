@@ -11,6 +11,104 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A project format can be named in configuration, and `maintain` reads it**
+  ([#171]). The project seam had three tiers, a conformance suite and one
+  implementation, and no way to reach any of it: there was no configuration key
+  naming a format and no constructor argument to inject one, so a second format
+  was readable in principle and unreachable in practice. `.dex/config.yml` now
+  takes a `project:` block with `format:` and `options:`, resolved through the
+  same open registry `cache.backend` uses (a shipped name, a dotted
+  `mypkg.projects:my_project` path, or a name registered under the
+  `exmergo_dex_core.projects` entry-point group), with shipped names always
+  winning so installing a package can never silently redirect which models a repo
+  is reasoned about. `--project-format` overrides it for one run and leaves
+  `options` behind when it names a different format, because options are not
+  namespaced by format.
+
+  Both doors, deliberately, because the two halves serve different hosts.
+  `DexEngine(project_format=...)` is for a host running dex in its own process
+  and holding a graph it built; it always wins over configuration. A name in a
+  committed file is the only door open to a host that reaches dex as a
+  subprocess, which is the deployment shape that asked for this, and shipping
+  only the constructor argument would have repeated the gap storage had to close
+  afterwards.
+
+  Construction is a separate contract (`ProjectContext`, `ProjectFactory`) rather
+  than members on the tiers, which is what keeps a class with the right methods a
+  project, with no base class and no registration step. `ProjectContext` carries
+  a nullable `repo_root`, a nullable `project_dir`, and verbatim `options`: a dbt
+  project is keyed by a directory, one reduced from a running graph by nothing at
+  all, and a hosted one by service coordinates, so a context shaped around the
+  only format that exists would have left the other two unbuildable. `options`
+  are the format's to define and the format's to validate, and refusing one you
+  cannot honor is part of the contract, because a silently dropped setting is
+  indistinguishable from a working one until dex is reading a different project
+  than the configuration named.
+
+  dex builds a project per command and never holds one it built. A project is an
+  artifact `transform apply` and `transform build` rewrite, so an instance held
+  across commands would serve a later command the project as it was before the
+  write, and a drift report computed against a stale project is wrong rather than
+  merely slow. An instance a host hands in is held, because its freshness is the
+  host's to know. Construction therefore has to be cheap, which is stated on the
+  contract.
+
+  `maintain snapshot`, `schema`, `semantic` and `check` now read their two
+  snapshot layers through `MaintainProject` instead of loading a dbt project
+  directly, so a format that is not a dbt project can be a drift baseline through
+  a supported path rather than by a host hand-building a `Snapshot`. `reconcile`
+  stays outside tier 2 on the record: it wants the project's file surface rather
+  than a layer, and widening tier 2 to carry a bag of file paths and file contents
+  would make it a tier no format without files could reach.
+
+  `DbtProject` memoizes its loaded view for the life of the instance, because the
+  two layer accessors each need it and three of the four commands need both, so
+  routing without the memo would have cost a second full walk of the model and
+  macro trees plus a second parse of a routinely multi-megabyte `manifest.json`.
+
+- **`maintain reconcile` asks the project whether it may be written to** ([#171]).
+  A format that does not implement `EditableProject` gets every finding back as an
+  advisory proposal, with no edits, no diffs and no stored plan, and a warning
+  naming the format and the tier it declined. The findings are still surfaced:
+  declining the write tier removes dex's authority to author an edit, not an
+  operator's need to see the drift.
+
+  This was previously true by accident. Reconcile's two mechanical write paths
+  gate on the `models/staging/stg_<table>.*` scaffold convention and fail closed,
+  so a generated tree was safe exactly as long as its own directory naming
+  happened not to collide, and a format whose layers used that vocabulary would
+  have been written into. The consumer who built the second format pinned that
+  invariant with a test in their own repository, which is the wrong side of the
+  boundary for an invariant this one owes. The convention checks stay as a second
+  line: the declaration replaces the coincidence, not the check that made the
+  coincidence survivable. Asserted in the safety spine, paired with the dbt format
+  taking the mechanical path through identical fixtures so a regression that broke
+  reconcile outright cannot pass by doing nothing.
+
+  A second gate sits behind the first for the case that does not exist yet: a
+  format that implements the write tier but is not one dex can author edits for
+  (they are dbt artifacts, a staging model and its schema YAML) also degrades to
+  advisory, with its own message, rather than reaching a dbt-shaped code path.
+
+- **`ProjectError`, the format-neutral refusal** ([#171]). `maintain`'s layer
+  reads catch it, because the format on the other side of the seam is whatever
+  configuration named and catching the dbt format's own error there would let a
+  second format's failure through to a traceback. `DbtProjectError` is now a
+  subclass, so every existing catch and every existing consumer keeps working.
+
+- **`ProjectFactoryContract` in the shipped conformance suite** ([#171]). The
+  construction half, mixed in front of the tier contract, so "the suite is green"
+  means a format is correct **and** constructable: it checks that a factory builds
+  the tier it declares and that an option the format cannot honor is refused by
+  name rather than accepted and dropped. `[project-conformance]` still needs only
+  pytest, now held by a packaging test that installs the wheel and asserts no
+  dialect engine came with it, which both `pyproject.toml` and
+  `references/project.md` promised and nothing checked. A second packaging test
+  builds an out-of-tree format against the published wheel alone and runs the
+  shipped contract against it, and a third registers one under the entry-point
+  group across two installed wheels, which is the only honest way to test a group
+  that exists only as installed-distribution metadata.
+
 - **`explore profile` reports the value domain of a low-cardinality non-PII
   column** ([#203]). `ColumnProfile.min_value`/`max_value` are suppressed for
   every string column, PII or not, because a string extreme is itself a raw
@@ -97,6 +195,32 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   dbt format always has paths and would never exercise the freedom below.
 
 ### Fixed
+
+- **A malformed `dbt_project.yml` is now a refusal that names the file, not a
+  traceback** ([#171]). `load` parsed the project file with `yaml.safe_load` and
+  let the parser error escape, and `yaml.YAMLError` descends from `Exception`
+  rather than `ValueError`, so it went straight past every caller's handler: all
+  four `maintain` detection commands caught what looked like a complete pair and
+  did not catch this. `definitions()` had been patched to compensate at its own
+  call site, which fixed the explore path and left the rest. The wrap now happens
+  in `load` itself, so `write_edits` (which loads before it writes) is covered by
+  the same fix, and `definitions()`'s local workaround is gone.
+
+- **The project seam finds a project in a subdirectory** ([#171]).
+  `DbtProject.load()` resolved to `project_dir or repo_root`, running no discovery,
+  while `definitions()` on the same object searched the repo root and its immediate
+  children. So the two tiers of one project disagreed about which project they were
+  reading in every repo that keeps its dbt project one directory down: tier 1 found
+  it and tier 2 raised "no dbt_project.yml". Nothing had hit it because `load()` had
+  no production caller until `maintain` was routed through the tier. The result is
+  also resolved to an absolute path now, because the view's root reaches the plan
+  store, which records a directory relative to the repo root and re-resolves it at
+  apply time.
+
+- **A `key_lost_uniqueness` finding with no scaffolded YAML to extend now says so**
+  ([#171]). `reconcile` emitted the proposal and skipped the test edit silently, so
+  a reader saw a proposal with no edit and no way to tell whether dex had declined
+  or failed. The sibling path for the model SQL had always emitted a reason.
 
 - **`transform plan` accepts a line-broken top-level dbt `ref()`** ([#195]).
   Placeholder-only Jinja lines remain intact after the model's first `SELECT` or
