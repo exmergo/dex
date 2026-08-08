@@ -22,7 +22,6 @@ import json
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import command_args, dbt_project
@@ -33,7 +32,6 @@ from ..adapters.base import Adapter, ObjectMeta, name_list
 # Aliased: `QueryResult` here is the explore record, and the adapter's
 # same-named row carrier is only a type hint on one shaping helper.
 from ..adapters.base import QueryResult as AdapterQueryResult  # noqa: F401
-from ..adapters.project import DbtProject
 from ..cache import (
     Dataset,
     DexCache,
@@ -1486,7 +1484,7 @@ def _shape_query_payload(
 def _project_definitions(
     engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
-    """The dbt project's declared definitions, honoring the config pin.
+    """The project's declared definitions, read through the tier-1 seam.
 
     Exploration starts bare: warehouse observations stay independent of
     whatever repo dex happens to run from, so the declared definitions fold in
@@ -1495,14 +1493,21 @@ def _project_definitions(
     with an ambiguous choice) degrades to the empty view, so explore keeps
     working on raw warehouses, and an engine with no repo root at all does the
     same rather than refusing.
+
+    The discovery note is dbt-shaped and stays gated on the dbt format being the
+    one selected. It looks for a ``dbt_project.yml`` on disk, which tells a host
+    whose format is a graph in memory nothing true; a format asked whether it is
+    "present but unused" would have to be read to answer, and reading it is
+    precisely what this branch exists not to do.
     """
 
-    config = engine.config
     repo_root = engine.repo_root
     if repo_root is None or not use_project:
         defs = dbt_project.ProjectDefinitions()
         discovered = (
-            dbt_project.discover_projects(repo_root) if repo_root is not None else []
+            dbt_project.discover_projects(repo_root)
+            if repo_root is not None and engine.config.project.format == "dbt"
+            else []
         )
         if discovered:
             # project_dir marks "found but unused" so the empty-declared note
@@ -1514,12 +1519,10 @@ def _project_definitions(
                 "exploration"
             )
         return defs
-    pin = Path(repo_root) / config.dbt_project_dir if config.dbt_project_dir else None
     # Through the seam rather than the module: this is the one project read on the
-    # explore path, so routing it here is what makes `ExploreProject` load-bearing
-    # instead of a protocol nothing satisfies. `DbtProject.definitions` delegates
-    # to the same function this line used to call, so the read is unchanged.
-    return DbtProject(repo_root, pin).definitions()
+    # explore path, and `definitions()` is the channel declared keys and joins
+    # reach dex through at all. Whichever format configuration named answers here.
+    return engine.project_format().definitions()
 
 
 def _relationship_edge_key(rel: Relationship) -> tuple:
