@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from ..dbt_project import ProjectDefinitions
+from ..maintain.snapshot import Snapshot
 from .project import ExploreProject, tier_of
 
 if TYPE_CHECKING:
@@ -297,3 +298,30 @@ class MaintainProjectContract(ExploreProjectContract):
             f"transform_layer() reports models {sorted(layer_models)} that "
             f"definitions() does not list as built: {sorted(built)}"
         )
+
+    def test_the_layers_survive_a_snapshot_round_trip(self) -> None:
+        """A tier-2 format's layers can be persisted as a baseline and read back.
+
+        This is what reaching tier 2 buys, so it is worth asserting rather than
+        assuming: the layers go into a `Snapshot`, a store serializes it, and a
+        later command loads it and diffs against it. A layer that cannot survive
+        that trip is not a baseline, and the failure would surface on the *next*
+        run rather than the one that produced it.
+
+        The assertion is equality after a JSON round trip specifically, not a
+        deep copy, because the in-memory store copies rather than serializing and
+        would hide the whole class of defect this catches: a value the format
+        chose that the model accepts in Python and rejects on the way back.
+        """
+
+        project = self.make_project()
+
+        snap = Snapshot(
+            created_at="2026-01-01T00:00:00+00:00",
+            transform_layer=project.transform_layer(),
+            semantic_layer=project.semantic_layer(),
+        )
+        restored = Snapshot.model_validate_json(snap.model_dump_json())
+
+        assert restored.transform_layer == snap.transform_layer
+        assert restored.semantic_layer == snap.semantic_layer

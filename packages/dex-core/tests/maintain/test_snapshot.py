@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from exmergo_dex_core.maintain.commands import _layer_notes
+from exmergo_dex_core.maintain.snapshot import TransformLayer
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -52,6 +54,48 @@ def test_snapshot_pins_cache_and_fingerprints_layers(maintain_repo):
     assert snap.transform_layer.model_sources == {"stg_orders": ["main.orders"]}
     revenue = next(m for m in snap.semantic_layer.metrics if m.name == "revenue")
     assert revenue.input_measures == ["order_amount"]
+
+
+def test_layer_notes_are_collected_from_every_side_and_deduplicated():
+    """Both layers a command read, baseline and current, with repeats folded.
+
+    Both sides are collected because the two provenance payloads read different
+    ones: `dangling_source` compares against the baseline's declared sources
+    while `definition_changed` reads the current project. In practice the same
+    format produces both and says the same thing, so the repeat has to collapse
+    or every warning list carries it twice.
+    """
+
+    shared = "sources are declared in configuration"
+    baseline = TransformLayer(notes=[shared])
+    current = TransformLayer(notes=[shared, "no file hashes: there are no files"])
+
+    assert _layer_notes(baseline, current, None) == [
+        shared,
+        "no file hashes: there are no files",
+    ]
+
+
+def test_a_baseline_layer_note_surfaces_on_every_detection_run(maintain_repo):
+    """A note pinned into the baseline is reported by `check`, not only at pin time.
+
+    The baseline is what bounds what the schema axis can compare, and a host
+    re-runs detection far more often than it re-pins. A note that surfaced only
+    when the snapshot was taken would explain the limits of a run nobody was
+    reading and stay silent on the ones they were.
+    """
+
+    maintain_repo.snapshot()
+    store = FilesystemStore(maintain_repo.root)
+    snap = store.load_snapshot()
+    snap.transform_layer.notes = ["the transform layer is reduced from an asset graph"]
+    snap.semantic_layer.notes = ["metrics are Python objects, so none names a file"]
+    store.save_snapshot(snap)
+
+    rc, payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert "the transform layer is reduced from an asset graph" in payload["warnings"]
+    assert "metrics are Python objects, so none names a file" in payload["warnings"]
 
 
 def test_snapshot_without_cache_is_metadata_only(dex, tmp_path: Path):
