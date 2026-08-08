@@ -183,3 +183,5 @@ them.
 - The source of truth (dbt) and `.dex/` cache: `references/canonical-model.md`.
 - Where `.dex/` state lives, selecting a backend, and writing one:
   `references/storage.md`.
+- Which format owns the source of truth, selecting one, and writing one:
+  `references/project.md`.

@@ -33,7 +33,7 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 from .diffs import file_diff
-from .errors import DexError
+from .errors import ProjectError
 
 PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
@@ -58,8 +58,14 @@ _ALLOWED_ROOT_FILES = frozenset(
 )
 
 
-class DbtProjectError(DexError):
-    pass
+class DbtProjectError(ProjectError):
+    """The dbt format's refusal, and the shipped implementation of ``ProjectError``.
+
+    Rooted on the format-neutral base so a caller holding whatever project
+    configuration named can catch one type. ``maintain`` is that caller: it reads
+    layers through the project tier, and the format on the other side is not
+    necessarily this one.
+    """
 
 
 class SourceFile(BaseModel):
@@ -200,7 +206,17 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
     if not project_file.is_file():
         raise DbtProjectError(f"no {PROJECT_FILE} in '{root}'")
 
-    raw = yaml.safe_load(project_file.read_text(encoding="utf-8")) or {}
+    # Wrapped rather than left to escape: a project file that is not valid YAML
+    # is an unreadable project, which is exactly what `DbtProjectError` means,
+    # and `yaml.YAMLError` descends from `Exception` rather than `ValueError`, so
+    # it slipped past every caller's handler. `definitions` had to pair the two
+    # exceptions itself to keep its never-raises promise; wrapping at the source
+    # covers the callers that cannot (`maintain`'s four layer reads, which catch
+    # the project family, and `write_edits`, which loads before it writes).
+    try:
+        raw = yaml.safe_load(project_file.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise DbtProjectError(f"{project_file} is not valid YAML: {exc}") from exc
     project_name = raw.get("name")
     if not project_name:
         raise DbtProjectError(f"{project_file} has no 'name'")
@@ -803,14 +819,13 @@ def definitions(
 
     try:
         view = load(project)
-    except (DbtProjectError, yaml.YAMLError) as exc:
-        # `yaml.YAMLError` alongside `DbtProjectError` for the same reason the
-        # three profile readers above pair them: `load` parses dbt_project.yml, so
-        # a project file that is not valid YAML surfaces as a parser error rather
-        # than ours. Catching only `DbtProjectError` here let that one case escape
-        # the promise this function's docstring makes -- an unreadable project is
-        # supposed to yield the empty view with a note, and instead `explore
-        # --use-project` raised out of a read that is meant to degrade.
+    except DbtProjectError as exc:
+        # A malformed `dbt_project.yml` is covered: `load` wraps the parser error
+        # rather than letting it escape, which is what keeps the never-raises
+        # promise in this docstring true. It was not always so, and the failure
+        # was invisible from here: `yaml.YAMLError` descends from `Exception`,
+        # not `ValueError`, so it went straight past a handler that looked
+        # complete.
         return ProjectDefinitions(
             notes=[
                 f"dbt project at '{project}' could not be read ({exc}); "

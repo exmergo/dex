@@ -8,6 +8,21 @@ envelope out.
 Only this layer reaches the store; the detectors in ``drift.py`` stay pure
 comparisons so they are testable without a warehouse. Detection commands save
 their findings as a drift report so the stateless ``reconcile`` has one to read.
+
+**The project is read through its tier, never through a format's module.** The
+four detection commands ask ``MaintainProject`` for the two snapshot layers, which
+is what lets a format that is not a dbt project be a drift baseline. They share
+``_read_layers`` for that, so there is one definition of what counts as reading a
+project and one place that decides which failures degrade and which refuse.
+
+``reconcile`` is the exception, and deliberately so. It does not want a layer, it
+wants the project's file surface: the two mechanical write paths look up
+``models/staging/stg_<table>.*`` in it, and the plan store records the directory
+the edits were pinned against. Neither is expressible in tier 2, and widening tier
+2 to carry them would put a bag of file paths and file contents on the contract,
+which a format with no files could not produce. A tier no non-dbt format can reach
+is a tier that format does not have, so ``reconcile`` asks the *write* tier
+instead and degrades to proposal-only when a format declines it.
 """
 
 from __future__ import annotations
@@ -16,13 +31,13 @@ import argparse
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from pydantic import ValidationError
+
 from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
-from ..dbt_project import DbtProjectError
-from ..dbt_project import load as load_project
-from ..errors import PrerequisiteError
+from ..errors import PrerequisiteError, ProjectError, RepoRootRequiredError
 from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, FilesystemStore, MaintainStore
 from . import drift as drift_mod
@@ -31,6 +46,7 @@ from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotRes
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
+    from .snapshot import SemanticLayer, TransformLayer
 
 _SNAPSHOT_HINT = (
     "re-run `maintain snapshot` after each known-good build so drift is measured "
@@ -46,6 +62,41 @@ _NO_SNAPSHOT_ERROR = (
     "no drift baseline yet; run `maintain snapshot` first (ideally right after "
     "a known-good build)"
 )
+
+
+def _read_layers(
+    engine: DexEngine, *, semantic: bool = True
+) -> tuple[TransformLayer | None, SemanticLayer | None, str | None]:
+    """The current project's snapshot layers, or why there are none.
+
+    Returns ``(transform, semantic, reason)``. ``reason`` is ``None`` on success
+    and otherwise a clause each command folds into its own warning, so the four
+    detection commands share one definition of "read the project" while keeping
+    the sentence that says what *this* command loses without it.
+
+    ``semantic=False`` skips the second layer rather than reading and discarding
+    it. `maintain schema` needs only the transform half, and on the dbt format
+    each accessor runs its own YAML pass over the model tree.
+
+    Three states degrade to a reason and are not errors: no project, an
+    unreadable one, and a format narrower than tier 2. Two do not, and are
+    deliberately left to propagate. A format that could not be *built* is a
+    wiring mistake in a committed file, so every command will hit it and hiding
+    it behind a warning would bury the only thing worth fixing. And a repo root
+    that was never supplied is caught here rather than left to propagate only
+    because a host exploring with no repository at all is an ordinary state, the
+    same reason ``definitions()`` may not raise.
+    """
+
+    try:
+        project = engine.maintain_project()
+        if project is None:
+            return None, None, engine.project_tier_note()
+        transform = project.transform_layer()
+        current = project.semantic_layer() if semantic else None
+    except (ProjectError, RepoRootRequiredError, ValidationError) as exc:
+        return None, None, str(exc)
+    return transform, current, None
 
 
 class NoBaselineError(PrerequisiteError):
@@ -101,14 +152,10 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
                 "to give the grain and cardinality axes a baseline"
             )
 
-    transform_layer = semantic_layer = None
-    try:
-        view = load_project(engine.project_dir())
-        transform_layer = snapshot_mod.transform_layer(view)
-        semantic_layer = snapshot_mod.semantic_layer(view)
-    except (DbtProjectError, ValueError) as exc:
+    transform_layer, semantic_layer, no_project = _read_layers(engine)
+    if no_project is not None:
         warnings.append(
-            f"no dbt project fingerprinted ({exc}); the semantic axis and "
+            f"no project fingerprinted ({no_project}); the semantic axis and "
             "reconcile need one"
         )
 
@@ -192,13 +239,10 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
         raise NoBaselineError(_NO_SNAPSHOT_ERROR)
 
     warnings: list[str] = []
-    current_transform = None
-    try:
-        view = load_project(engine.project_dir())
-        current_transform = snapshot_mod.transform_layer(view)
-    except (DbtProjectError, ValueError) as exc:
+    current_transform, _, no_project = _read_layers(engine, semantic=False)
+    if no_project is not None:
         warnings.append(
-            f"orphan-relation classification skipped (no dbt project: {exc})"
+            f"orphan-relation classification skipped (no project: {no_project})"
         )
 
     adapter = engine._adapter("maintain schema")
@@ -309,10 +353,9 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     snap = store.load_snapshot()
     if snap is None:
         raise NoBaselineError(_NO_SNAPSHOT_ERROR)
-    try:
-        view = load_project(engine.project_dir())
-    except (DbtProjectError, ValueError) as exc:
-        raise DbtProjectError(f"the semantic axis needs a dbt project: {exc}") from exc
+    current_transform, current_semantic, no_project = _read_layers(engine)
+    if no_project is not None:
+        raise ProjectError(f"the semantic axis needs a project: {no_project}")
 
     warnings: list[str] = []
     if snap.semantic_layer is None:
@@ -320,8 +363,6 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
             "the baseline has no semantic fingerprint, so every definition "
             "reads as new; re-run `maintain snapshot` to fix the baseline"
         )
-    current_transform = snapshot_mod.transform_layer(view)
-    current_semantic = snapshot_mod.semantic_layer(view)
     # Extended here rather than at the two returns so the confirmation path
     # carries them too: the free findings it returns are bounded by whatever the
     # format could not supply, exactly as the settled ones are.
@@ -408,15 +449,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     scope_names = list(objects or [])
 
     warnings = _grain_baseline_warnings(snap) + _column_detail_warnings(snap)
-    current_transform = current_semantic = None
-    project_available = True
-    try:
-        view = load_project(engine.project_dir())
-        current_transform = snapshot_mod.transform_layer(view)
-        current_semantic = snapshot_mod.semantic_layer(view)
-    except (DbtProjectError, ValueError) as exc:
-        project_available = False
-        warnings.append(f"semantic axis skipped (no dbt project: {exc})")
+    current_transform, current_semantic, no_project = _read_layers(engine)
+    project_available = no_project is None
+    if no_project is not None:
+        warnings.append(f"semantic axis skipped (no project: {no_project})")
     # All four layers: `check` sweeps every axis, so both the baseline's limits
     # and the current read's bound what it reports. Added before the two returns
     # so the confirmation path carries them as well.
@@ -523,13 +559,26 @@ def cmd_check(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileResult:
-    """Propose the dbt edits that reconcile detected drift.
+    """Propose the edits that reconcile detected drift.
 
     Reads the last drift report, never re-scans, and writes nothing to the
     project: applying is ``transform apply <plan-id>``, so the human-edit
     conflict handshake is inherited unchanged.
+
+    **Whether a mechanical edit may be proposed at all is the project's to
+    declare.** A format that cannot receive an edit, because its source of truth
+    is the code that generated it and writing into the reduction would edit an
+    artifact regenerated on the next run, declines the write tier, and every
+    finding here comes back advisory. That used to be true by accident: both
+    mechanical paths key on the ``models/staging/stg_<table>.*`` scaffold
+    convention and fail closed, so a generated tree was safe as long as its
+    directories happened not to use that vocabulary. Asking the tier makes it
+    safe because the format said so. The convention checks stay as a second line;
+    the declaration replaces the coincidence, not the check that made the
+    coincidence survivable.
     """
 
+    from ..adapters.project import DbtProject
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
@@ -563,12 +612,30 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     if not findings:
         return ReconcileResult(warnings=warnings)
 
-    try:
-        view = load_project(engine.project_dir())
-    except (DbtProjectError, ValueError) as exc:
-        raise DbtProjectError(f"reconcile edits a dbt project: {exc}") from exc
+    editable = engine.editable_project()
+    view = None
+    if editable is None:
+        named = getattr(engine.project_format(), "name", "this")
+        warnings.append(
+            f"the '{named}' project format does not implement the write tier, so "
+            "every proposal below is advisory and no plan is stored: dex will not "
+            "author an edit into a project the format says cannot receive one. "
+            "Reconcile what these findings describe wherever your models are "
+            "actually defined"
+        )
+    elif not isinstance(editable, DbtProject):
+        warnings.append(
+            f"the '{editable.name}' project format implements the write tier, but "
+            "reconcile's mechanical edits are dbt artifacts (a staging model and "
+            "its schema YAML) and dex cannot yet author them for another format, "
+            "so every proposal below is advisory"
+        )
+    else:
+        try:
+            view = editable.load()
+        except (ProjectError, ValueError) as exc:
+            raise ProjectError(f"reconcile edits a project: {exc}") from exc
 
-    repo_root = engine.require_repo_root("reconciling a dbt project")
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
@@ -579,7 +646,13 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     warnings.extend(build_warnings)
 
     result = ReconcileResult(proposals=proposals, warnings=warnings)
-    if edits:
+    # A plan is pinned to the directory its edits were planned against, so there is
+    # no plan without a project to pin to. `build` returns no edits without one,
+    # which is the same statement from the other side.
+    if edits and view is not None:
+        # Only the plan store needs the repo root, so asking for it here keeps the
+        # advisory-only path reachable for an engine that has none.
+        repo_root = engine.require_repo_root("storing a reconcile plan")
         intent = (
             f"maintain reconcile {drift_class}" if drift_class else "maintain reconcile"
         )
@@ -596,7 +669,7 @@ def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     drift_class = getattr(args, "drift_class", None)
     try:
         result = reconcile(engine, drift_class)
-    except (NoBaselineError, DbtProjectError) as exc:
+    except (NoBaselineError, ProjectError) as exc:
         return env.error_for(exc)
     if not result.proposals:
         scope = f" for the '{drift_class}' axis" if drift_class else ""

@@ -53,11 +53,19 @@ run. Declining the tier is the honest answer, and it is why the tiers exist rath
 than a `writeback: no` flag. A flag is a claim the engine has to trust, while a tier
 is checkable.
 
-That distinction has teeth today. `maintain reconcile`'s two mechanical write paths
-gate on the `models/staging/stg_<table>.*` scaffold convention and fail closed to
-advisory, so a generated tree is already safe from them, but safe because its naming
-happens not to collide rather than because it declared anything. A format whose
-layer directories used that vocabulary would not be.
+That distinction has teeth, and it is what `maintain reconcile` reads. A format that
+does not implement `EditableProject` gets every finding back as an advisory
+proposal, with no edits and no stored plan, and a warning naming the format and the
+tier it declined. The findings themselves are still surfaced: declining the write
+tier removes dex's authority to author an edit, not your need to see the drift.
+
+That used to hold by accident. Reconcile's two mechanical write paths gate on the
+`models/staging/stg_<table>.*` scaffold convention and fail closed, so a generated
+tree was safe as long as its own directory naming happened not to collide, and a
+format whose layers used that vocabulary would have been written into. The
+convention checks are still there as a second line; what changed is that the tier is
+asked first, so the guarantee rests on what your format declared rather than on what
+it happened to be called.
 
 ## The one rule that is not visible in the signatures
 
@@ -152,7 +160,11 @@ class TestMyProject(ExploreProjectContract):
 ```
 
 pytest collects the inherited assertions and runs the contract against your format.
-Use `MaintainProjectContract` instead if you reach tier 2.
+Use `MaintainProjectContract` instead if you reach tier 2, and mix
+`ProjectFactoryContract` in front of it if dex will build your format from a name
+rather than be handed an instance. Construction is a separate contract, so a format
+that passes the behavioral suite can still be unreachable from configuration; "the
+suite is green" should mean correct **and** constructable.
 
 Tier 2's assertions are thin, because the layers' contents are your format's business.
 The one worth knowing about is that your layers **survive a JSON round trip inside a
@@ -181,23 +193,104 @@ Formats contributed here run the same suite: see
 `packages/dex-core/tests/adapters/test_project_parity.py`, which is deliberately the
 same few lines a third party writes.
 
-## What the tiers do not settle
+## Constructing one
 
-**How a project gets constructed is a separate question, and it is still open.**
+The tiers describe what dex may ask of a project it already holds. Getting it to
+hold one is a separate contract, and it is separate on purpose: keeping it off the
+tiers is what preserves the property that makes this seam cheap, that a class with
+the right methods is a project, with no base class and no registration step.
 
-The tiers describe what dex may ask of a project it already holds. They say nothing
-about how it came to hold one, and that gap is deliberate rather than an oversight:
-the formats disagree about what keys them. A dbt project is keyed by a directory. A
-project reduced from a graph already in memory has no directory and no repository. A
-hosted one has service coordinates and neither.
+There are two ways in, and a host normally needs only one.
 
-Storage answered the equivalent question with `StoreContext` plus a resolver, after
-finding that a constructor argument alone was unreachable for a host that talks to
-dex as a subprocess. Whether the same answer is right here has not been decided, and
-picking one now on the strength of the only format that exists would be picking the
-directory-shaped one.
+**A host that runs dex in its own process hands over an instance.**
 
-Until it is settled, dex constructs `DbtProject` itself at the one place `explore`
-reads a project, exactly as it constructed `dbt_project` calls before. A second
-format is readable through these tiers; naming one in configuration is what the
-construction contract still owes.
+```python
+engine = DexEngine.from_repo(repo_root, project_format=MyProject(graph))
+```
+
+That always wins over anything named in configuration. A caller holding an object
+has already made the decision configuration exists to make for the callers who are
+not.
+
+**Everyone else names a format in `.dex/config.yml`**, which is the only door open
+to a host that reaches dex as a subprocess:
+
+```yaml
+project:
+  format: mypkg.projects:my_project
+  options:
+    graph: orders
+```
+
+`format` is an open registry rather than a closed set:
+
+| Name | Example | For |
+|---|---|---|
+| shipped | `dbt` | dex's own formats, and never shadowable by anything installed |
+| dotted path | `mypkg.projects:my_project` | a factory reachable by import, with no packaging work |
+| entry point | `acme` | a name an installed distribution registered under `exmergo_dex_core.projects` |
+
+A format published as its own package registers itself:
+
+```toml
+# in your own pyproject.toml
+[project.entry-points."exmergo_dex_core.projects"]
+acme = "dex_acme_format:acme_format"
+```
+
+Install it beside dex and `format: acme` resolves. A shipped name always wins over a
+registration, so installing a package can never silently redirect which models an
+existing repo is reasoned about, and nothing in the output would have said so.
+
+`--project-format` overrides the configured name for one run. It leaves `options`
+behind when it names a different format, because options are not namespaced by
+format and one format's coordinates are not another's.
+
+### What a factory is
+
+Anything callable that takes a `ProjectContext` and returns a project: a function, a
+class whose `__init__` takes one, or a classmethod like `DbtProject.from_context`.
+
+`ProjectContext` has three fields, and the point of the shape is that a format
+ignores the ones it does not have.
+
+- **`repo_root`**, the directory dex was pointed at, or `None` when there is no
+  repository in the picture.
+- **`project_dir`**, where within that repository the project was pinned, relative
+  to `repo_root`. `None` when nothing pinned one.
+- **`options`**, your format's own coordinates, passed through verbatim. dex does
+  not interpret them, so the keys are yours to define and yours to validate.
+
+**Refuse an option you cannot honor.** A silently dropped setting is
+indistinguishable from a working one right up until dex is reading a different
+project than the configuration named, and that surfaces as drift nobody can
+reproduce, arbitrarily far from the line that caused it. The shipped dbt format
+refuses unknown options by naming them, and the conformance suite checks that yours
+does too.
+
+**Construction has to be cheap.** dex builds a project per command rather than
+holding one, because a project is an artifact a previous command may have just
+rewritten and a stale read is a wrong drift report. Open a connection, fetch a
+graph, or parse anything large lazily on first use, not in the factory. An instance
+a host hands in is held instead, because its freshness is the host's to know.
+
+**No secret ever reaches a `ProjectContext`**, because `.dex/config.yml` is
+committed. Read the credential from the environment at construction, or skip this
+contract and hand the engine a project you built yourself.
+
+### Two alternatives that were rejected
+
+Recorded so they are not re-argued.
+
+**A constructor argument alone.** It is the smaller change and it is what storage
+shipped first, and storage had to add the other half afterwards for exactly the
+reason that applies here: a host talking to dex as a subprocess has no object to
+pass, so the seam would have been unreachable for the deployment shape that asked
+for it.
+
+**Keying the context on a directory.** `project_dir` alone reads naturally against
+the only format that exists, and that is what makes it the wrong choice: a project
+reduced from a running graph has no directory, a hosted one has service coordinates,
+and a contract shaped around dbt would have left both unbuildable. The nullable
+slots plus verbatim `options` are what let a format that is keyed by nothing at all
+be named the same way.

@@ -293,10 +293,27 @@ raises there turns an ordinary state into an outage. Override
 `make_unreadable_project()` to get those assertions running against your format
 instead of skipped.
 
+Mix `ProjectFactoryContract` in front of your tier contract if dex will build your
+format from a name rather than be handed an instance, which is what a host reaching
+dex as a subprocess needs. Naming one is the same shape as naming a storage backend:
+
+```yaml
+project:
+  format: mypkg.projects:my_project
+  options:
+    graph: orders
+```
+
+A shipped name, a dotted path, or an entry point under `exmergo_dex_core.projects`,
+with shipped names always winning so an install can never silently redirect which
+models a repo is reasoned about.
+
 Declining `EditableProject` is a supported answer, not a gap. A project reduced from
 a running graph cannot receive an edit, because its source of truth is the code that
-produced the graph. `references/project.md` covers the tiers, the rules that are not
-obvious from the signatures, and what the construction contract still leaves open.
+produced the graph, and `maintain reconcile` reads that declaration: your format
+gets advisory proposals and no stored plan, by contract rather than by luck.
+`references/project.md` covers the tiers, the construction contract, and the rules
+that are not obvious from the signatures.
 
 Formats contributed here run the same suite: see
 `packages/dex-core/tests/adapters/test_project_parity.py`.

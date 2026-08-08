@@ -878,3 +878,268 @@ def test_an_entry_point_registration_selects_a_backend_dex_does_not_ship(
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "resolved AcmeStore acme://acme-inc/cache" in done.stdout
+
+
+# --- the project seam, from outside the distribution --------------------------
+
+OUTSIDE_PROJECT_FORMAT = '''
+"""A project format written against the published wheel alone.
+
+Deliberately pathless: no repository, no directory, no file per declaration, so
+nothing here can accidentally depend on the shipped dbt format's shape. It reaches
+tier 2 and declines tier 3, which is the answer a reduction of a running graph is
+supposed to be able to give.
+"""
+
+from exmergo_dex_core.adapters.conformance import (
+    MaintainProjectContract,
+    ProjectFactoryContract,
+)
+from exmergo_dex_core.adapters.project import (
+    EditableProject,
+    MaintainProject,
+    ProjectContext,
+)
+from exmergo_dex_core.dbt_project import ProjectDefinitions
+from exmergo_dex_core.maintain.snapshot import (
+    SemanticLayer,
+    SourceTable,
+    TransformLayer,
+)
+
+NOTE = "definitions live in a graph, so no file backs one"
+
+
+class TinyGraphProject:
+    name = "tiny_graph"
+
+    def __init__(self, models):
+        self._models = list(models)
+
+    def definitions(self):
+        return ProjectDefinitions(
+            present=True, built_relation_names=sorted(self._models), notes=[NOTE]
+        )
+
+    def transform_layer(self):
+        return TransformLayer(
+            models=sorted(self._models),
+            sources=[SourceTable(source_name="raw", table="events")],
+            notes=[NOTE],
+        )
+
+    def semantic_layer(self):
+        return SemanticLayer(notes=[NOTE])
+
+
+def tiny_graph(context):
+    unknown = set(context.options) - {"models"}
+    if unknown:
+        raise ValueError("unknown options: " + ", ".join(sorted(unknown)))
+    return TinyGraphProject(context.options.get("models", []))
+
+
+def test_declining_the_write_tier_is_a_complete_answer():
+    project = tiny_graph(ProjectContext())
+    assert isinstance(project, MaintainProject)
+    assert not isinstance(project, EditableProject)
+
+
+class TestTinyGraphProject(ProjectFactoryContract, MaintainProjectContract):
+    tier = MaintainProject
+
+    def build(self, context):
+        return tiny_graph(context)
+
+    def empty_context(self):
+        return ProjectContext(options={"models": []})
+'''
+
+
+def test_a_project_format_outside_the_distribution_passes_the_shipped_contract(
+    wheel: str, tmp_path: Path
+):
+    """A project format implemented by someone who cannot see this source tree.
+
+    The same argument the storage version makes, and it lands harder here: the
+    only format in this repository is dbt, so every in-repo assertion about the
+    seam is written by the author of the protocol against the format the protocol
+    was shaped around. This builds the wheel, installs it with no access to the
+    repo, writes a format against the published names alone, and runs the shipped
+    contract, construction half included.
+    """
+
+    suite = tmp_path / "test_outside_project_format.py"
+    suite.write_text(OUTSIDE_PROJECT_FORMAT.lstrip(), encoding="utf-8")
+    spec = f"exmergo-dex-core[project-conformance] @ {wheel}"
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "pytest",
+            "-q",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
+
+
+def test_the_project_contract_needs_only_a_test_runner(wheel: str, tmp_path: Path):
+    """`[project-conformance]` is pytest and nothing else, held by installing it.
+
+    Both `pyproject.toml` and `references/project.md` promise this extra needs no
+    dialect engine and no connector, and nothing checked it. The cheapest way for
+    the floor to grow is for one assertion to start building something that parses
+    SQL, which would not fail anywhere: this repo's dev environment has sqlglot,
+    so the extra would quietly become heavier for every implementer while staying
+    green here. The assertion is on sqlglot's absence first, for the same reason
+    the storage version makes it: without that, the rest passes for the wrong
+    reason the moment anything puts a dialect engine back in the environment.
+    """
+
+    suite = tmp_path / "test_light_floor.py"
+    suite.write_text(
+        "import sys\n\n"
+        "from exmergo_dex_core.adapters import conformance\n\n\n"
+        "def test_the_contract_imports_no_dialect_engine():\n"
+        "    assert 'sqlglot' not in sys.modules\n"
+        "    assert conformance.MaintainProjectContract\n",
+        encoding="utf-8",
+    )
+    spec = f"exmergo-dex-core[project-conformance] @ {wheel}"
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
+
+
+PROJECT_PLUGIN_PYPROJECT = """
+[project]
+name = "dex-acme-format"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.entry-points."exmergo_dex_core.projects"]
+acme = "dex_acme_format:acme_format"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/dex_acme_format.py"]
+sources = ["src"]
+"""
+
+PROJECT_PLUGIN_MODULE = '''
+"""A project format published as its own package, selectable by short name."""
+
+from exmergo_dex_core.dbt_project import ProjectDefinitions
+from exmergo_dex_core.maintain.snapshot import SemanticLayer, TransformLayer
+
+
+class AcmeProject:
+    name = "acme"
+
+    def __init__(self, graph):
+        self.graph = graph
+
+    def definitions(self):
+        return ProjectDefinitions(present=True, built_relation_names=[self.graph])
+
+    def transform_layer(self):
+        return TransformLayer(models=[self.graph])
+
+    def semantic_layer(self):
+        return SemanticLayer()
+
+
+def acme_format(context):
+    graph = context.options.get("graph")
+    if not graph:
+        raise ValueError("this format needs project.options.graph")
+    return AcmeProject(str(graph))
+'''
+
+
+def test_an_entry_point_registration_selects_a_format_dex_does_not_ship(
+    wheel: str, tmp_path: Path
+):
+    """The registration path for the project seam, across two installed wheels.
+
+    A dotted path needs no packaging and is tested from the source tree. An entry
+    point cannot be: the group is metadata a *built and installed* distribution
+    carries, so a test that fakes it proves only that the code reads what the test
+    handed it. This is also the shape the offer on the table takes, a format
+    maintained in its own repository against the published wheel, so the path
+    being real is the difference between the seam being usable and being described.
+    """
+
+    plugin = tmp_path / "format-plugin"
+    (plugin / "src").mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        PROJECT_PLUGIN_PYPROJECT.lstrip(), encoding="utf-8"
+    )
+    (plugin / "src" / "dex_acme_format.py").write_text(
+        PROJECT_PLUGIN_MODULE.lstrip(), encoding="utf-8"
+    )
+
+    out = tmp_path / "format-dist"
+    subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [_uv(), "build", "--wheel", "--out-dir", str(out), str(plugin)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    built = list(out.glob("*.whl"))
+    assert len(built) == 1, built
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            wheel,
+            "--with",
+            str(built[0]),
+            "python",
+            "-c",
+            "from exmergo_dex_core.adapters.project import ProjectContext, tier_of;"
+            "from exmergo_dex_core.adapters.project_resolver import build_project;"
+            'p = build_project("acme", ProjectContext(options={"graph": "orders"}));'
+            'print("resolved", p.name, tier_of(p), p.transform_layer().models)',
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "resolved acme 2 ['orders']" in done.stdout

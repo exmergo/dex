@@ -57,11 +57,17 @@ def build(
     findings: list[DriftFinding],
     snap: Snapshot,
     cache: DexCache | None,
-    view: DbtProjectView,
+    view: DbtProjectView | None,
     *,
     pii_overrides: PIIOverrideMatcher | None = None,
 ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
     """Map findings to proposals and plan edits. Pure: writes nothing.
+
+    ``view`` is ``None`` when the project format declines the write tier, or when
+    it declares the tier but is not one dex can author edits for. Every proposal
+    is advisory in that case and no edit is produced, which is the same outcome
+    the scaffold-convention checks below already reach for a project that has no
+    dex-scaffolded models, arrived at by declaration instead of by coincidence.
 
     ``pii_overrides`` carries the config's reviewed non-PII column paths, so a
     drift-added column a human already cleared is not re-flagged into the
@@ -79,15 +85,17 @@ def build(
         elif finding.code.startswith("definition_"):
             definition_churn = True
         else:
-            proposals.append(_advisory(finding, view))
+            proposals.append(_advisory(finding))
 
     for identifier, table_findings in sorted(schema_patches.items()):
         table = identifier.rsplit(".", 1)[-1]
         base = _base_dataset(identifier, cache, snap)
         model_path = f"models/staging/stg_{table}.sql"
-        if base is None or model_path not in view.files:
+        if view is None or base is None or model_path not in view.files:
             reason = (
-                "no profiled baseline to rebuild from"
+                "this project format cannot receive edits"
+                if view is None
+                else "no profiled baseline to rebuild from"
                 if base is None
                 else f"no dex-scaffolded staging model at {model_path}"
             )
@@ -143,7 +151,7 @@ def build(
 # --- helpers -------------------------------------------------------------------
 
 
-def _advisory(finding: DriftFinding, view: DbtProjectView) -> Proposal:
+def _advisory(finding: DriftFinding) -> Proposal:
     if finding.code == "orphan_relation":
         drop_statement = finding.data.get(
             "drop_statement", f"DROP TABLE {finding.identifier};"
@@ -268,11 +276,19 @@ def _patched_dataset(
 
 
 def _grain_test_edits(
-    proposals: list[Proposal], view: DbtProjectView
+    proposals: list[Proposal], view: DbtProjectView | None
 ) -> tuple[list[PlanEdit], list[str]]:
     """Back key_lost_uniqueness proposals with a `unique` test edit when the
     scaffolded YAML exists and does not already alert. The duplicates
-    themselves stay a human decision; the edit only makes the break visible."""
+    themselves stay a human decision; the edit only makes the break visible.
+
+    Every path out of this that produces no edit says so in ``warnings``. The
+    proposal itself survives either way, so a silent skip here would leave a
+    reader looking at a `key_lost_uniqueness` proposal with no test edit and no
+    way to tell whether dex declined or failed."""
+
+    if view is None:
+        return [], []
 
     edits: list[PlanEdit] = []
     warnings: list[str] = []
@@ -283,6 +299,11 @@ def _grain_test_edits(
         path = f"models/staging/stg_{table}.yml"
         source = view.files.get(path)
         if source is None:
+            warnings.append(
+                f"no dex-scaffolded {path} to extend, so the lost unique key on "
+                f"{proposal.identifier} has no test edit; add a `unique` test "
+                "wherever that model is defined"
+            )
             continue
         try:
             parsed = yaml.safe_load(source.content)

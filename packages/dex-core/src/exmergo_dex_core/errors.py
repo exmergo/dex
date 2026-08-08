@@ -80,6 +80,25 @@ class PrerequisiteError(DexError):
     """
 
 
+class ProjectError(DexError):
+    """A project could not be read, and the format says why.
+
+    The project seam is tiered, and the two tiers make opposite promises.
+    ``definitions()`` must never raise, because exploration runs against
+    warehouses with no project at all. ``transform_layer()`` and
+    ``semantic_layer()`` presume a project that loads, because an empty layer
+    compared against an empty layer reads as "no drift" rather than "this could
+    not be checked". This is what the second pair raises when that presumption
+    fails, and it is the type ``maintain`` catches to degrade.
+
+    It exists as a root rather than as one format's exception because the
+    commands that catch it are format-neutral: they hold whatever project was
+    named in configuration, and catching the dbt format's own error there would
+    let a second format's failure through to a traceback. Every format raises
+    this or a subclass of it; ``DbtProjectError`` is the shipped one.
+    """
+
+
 class ConnectorError(DexError):
     """A warehouse connection could not be established.
 
