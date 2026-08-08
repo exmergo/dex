@@ -21,6 +21,12 @@ pins it when discovery would be ambiguous. Absent a dbt project, explore still
 works (writing only to the `.dex/` cache); transform and maintain require one,
 since dbt is what they edit and diff.
 
+dbt is the format dex ships, not the only one it can read. `maintain`'s four
+detection commands read whichever format `project.format` names, so a host whose
+models are not a dbt project can still be a drift baseline; `transform` and
+`maintain reconcile`'s mechanical edits are dbt throughout. See
+[`project.md`](project.md) for the seam and how to name another format.
+
 ## How dex writes
 
 Every proposed change is a **plan**: the agent-authored file contents, validated
