@@ -27,13 +27,17 @@ from exmergo_dex_core.cache import (
 from exmergo_dex_core.config import DexConfig, QueryLimits
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.explore import semantic as sem
+from exmergo_dex_core.explore.results import SemanticQueryResult
 from exmergo_dex_core.explore.semantic import (
     SemanticQuery,
     cap_columnar,
     requested_dimension_refs,
     screen_dimension_refs,
 )
-from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+from exmergo_dex_core.explore.semantic.local import (
+    LocalMetricFlowBackend,
+    _unprofiled_note,
+)
 from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import MemoryStore
 
@@ -63,6 +67,74 @@ def test_requested_dimension_refs_from_group_by_and_where():
     assert "session__is_deleted" in refs
     assert "user" in refs
     assert len(refs) == len(set(refs))  # de-duplicated
+
+
+def test_query_accepts_comma_joined_name_lists():
+    # Issue #135: `--group-by a,b` is the natural first guess and a common CLI
+    # convention; the repeated flag was the only form that worked. Normalizing on
+    # the query object covers both backends and a library caller at once.
+    q = SemanticQuery(
+        metrics=["sessions,queries"],
+        group_by=["user__pricing_tier, metric_time", "session__mode"],
+        order_by=["-sessions,metric_time"],
+    )
+    assert q.metrics == ["sessions", "queries"]
+    assert q.group_by == ["user__pricing_tier", "metric_time", "session__mode"]
+    assert q.order_by == ["-sessions", "metric_time"]
+
+
+def test_cli_group_by_reaches_the_backend_split(monkeypatch):
+    """`--group-by a,b` and `--group-by a --group-by b` must arrive identically.
+
+    Through the real parser and the real command handler, because the wiring is
+    what issue #135 was about: the flag stays `action="append"` and the splitting
+    happens on the query object, so both spellings and their mixture converge.
+    """
+
+    from exmergo_dex_core.cli import _build_parser
+    from exmergo_dex_core.explore.semantic import commands as semantic_commands
+
+    seen: list[SemanticQuery] = []
+
+    class _Recorder:
+        name = "local"
+
+        def query(self, q):
+            seen.append(q)
+            return SemanticQueryResult(backend="local")
+
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: _Recorder())
+    parser = _build_parser()
+    for flags in (
+        ["--group-by", "user__pricing_tier,metric_time"],
+        ["--group-by", "user__pricing_tier", "--group-by", "metric_time"],
+    ):
+        args = parser.parse_args(
+            ["explore", "semantic", "query", "--metric", "sessions", "--local", *flags]
+        )
+        semantic_commands.cmd_semantic(args, _engine())
+    assert [q.group_by for q in seen] == [["user__pricing_tier", "metric_time"]] * 2
+
+
+def test_query_leaves_where_clauses_alone():
+    # A Jinja filter carries commas of its own, so the split that helps names would
+    # cut a clause in half. This is the one list that must never be normalized.
+    clause = "{{ TimeDimension('metric_time', 'month') }} > '2020-01-01'"
+    assert SemanticQuery(metrics=["m"], where=[clause]).where == [clause]
+
+
+def test_query_drops_empty_name_tokens():
+    q = SemanticQuery(metrics=["m"], group_by=["a,, b ", "  ", ""])
+    assert q.group_by == ["a", "b"]
+
+
+def test_a_metric_list_that_normalizes_to_nothing_is_refused():
+    # `--metric ,` is as empty as no flag at all, and the refusal must not depend
+    # on which backend would have answered.
+    from exmergo_dex_core.explore.semantic.commands import semantic_query
+
+    with pytest.raises(sem.SemanticBackendError, match="at least one metric"):
+        semantic_query(_engine(), [","], api=True)
 
 
 def test_screen_blocks_pii_name_allows_clean():
@@ -201,6 +273,63 @@ def test_hosted_query_is_warn_only_and_shaped():
     assert envelope.status == env.Status.OK
     assert envelope.data["columns"] == ["metric_time__month", "sessions"]
     assert envelope.data["query_id"] == "FAKE_QID"
+
+
+def test_hosted_discloses_name_only_screening():
+    # The layer's own config.meta is what makes the hosted gate authoritative, the
+    # way a column profile does locally. Where it says nothing, only the name
+    # heuristic ran, and the result has to say so rather than letting the weaker
+    # screening pass for the stronger one.
+    backend = FakeHostedBackend(
+        result=table_json_result(["sessions"], ["string"], [[5.0]]),
+        dimensions_meta=[
+            {"name": "user__pricing_tier", "config": {"meta": {"pii": False}}}
+        ],
+    )
+    result = backend.query(
+        SemanticQuery(
+            metrics=["sessions"], group_by=["user__pricing_tier", "session__mode"]
+        )
+    )
+    note = next(n for n in result.notes if "name heuristic" in n)
+    # adjudicated by the layer, so absent; unknown to the layer, so named
+    assert "user__pricing_tier" not in note
+    assert "session__mode" in note
+    assert "meta: {pii: true}" in note
+
+
+def test_hosted_says_nothing_when_the_layer_adjudicated_everything():
+    backend = FakeHostedBackend(
+        result=table_json_result(["sessions"], ["string"], [[5.0]]),
+        dimensions_meta=[
+            {"name": "user__pricing_tier", "config": {"meta": {"pii": False}}}
+        ],
+    )
+    result = backend.query(
+        SemanticQuery(metrics=["sessions"], group_by=["user__pricing_tier"])
+    )
+    assert not any("name heuristic" in n for n in result.notes)
+
+
+def test_hosted_discloses_a_metadata_call_that_never_answered():
+    # A failed metadata call degrades to the name heuristic for every ref. That was
+    # silent, which is the one direction a PII posture must never fail quietly in;
+    # it is also a different fix from a layer that answered and knows nothing.
+    class _NoMetadata(FakeHostedBackend):
+        def _post(self, query: str) -> dict:
+            if "dimensions(environmentId" in query:
+                raise sem.SemanticBackendError("dbt Cloud did not answer")
+            return super()._post(query)
+
+    backend = _NoMetadata(result=table_json_result(["sessions"], ["string"], [[5.0]]))
+    result = backend.query(
+        SemanticQuery(metrics=["sessions"], group_by=["user__pricing_tier"])
+    )
+    note = next(n for n in result.notes if "name heuristic" in n)
+    assert "did not answer" in note
+    # and the gate still bound on the way there, on the heuristic alone
+    with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
+        backend.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
 
 
 def test_hosted_pii_gate_blocks_before_execution():
@@ -348,36 +477,165 @@ def test_local_cache_lookup_is_silent_on_unknown_dimensions(tmp_path: Path):
     assert lookup("order__status") is None
 
 
-def test_namespace_precheck_refuses_a_foreign_relation(tmp_path: Path):
+class _Inventory:
+    """A live inventory listing, counting how often the pre-check asked for it."""
+
+    def __init__(self, identifiers: list[str], *, fails: bool = False) -> None:
+        self.identifiers = identifiers
+        self.fails = fails
+        self.calls = 0
+
+    def __call__(self) -> list[str]:
+        self.calls += 1
+        if self.fails:
+            raise RuntimeError("inventory unavailable")
+        return self.identifiers
+
+
+def test_relation_precheck_refuses_a_foreign_database(tmp_path: Path):
+    # The manifest was compiled against another database entirely. No allowlist
+    # could bring it into scope, so this is the mismatch the check exists for.
     backend = LocalMetricFlowBackend(
         _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
-    sql = "SELECT status FROM other_db.main.orders"
-    message = backend._namespace_mismatch(sql, cache, "duckdb")
+    live = _Inventory(["wh.main.orders", "wh.staging.customers"])
+    message, _unprofiled = backend._relation_precheck(
+        "SELECT status FROM other_db.main.orders", cache, "duckdb", live
+    )
     assert message is not None
     assert "different namespace" in message
+    assert "other_db.main.orders" in message
 
 
-def test_namespace_precheck_accepts_a_suffix_match(tmp_path: Path):
+def test_relation_precheck_refuses_a_relation_gone_from_a_listed_schema(tmp_path: Path):
+    # Same database, same schema, and the inventory looked: the model was renamed,
+    # dropped, or never built into this target. A different problem, so a different
+    # message; blaming the compiled namespace would send the reader the wrong way.
+    backend = LocalMetricFlowBackend(
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    live = _Inventory(["wh.main.customers"])
+    message, _unprofiled = backend._relation_precheck(
+        "SELECT status FROM wh.main.orders", None, "duckdb", live
+    )
+    assert message is not None
+    assert "was listed and the relation was not in it" in message
+    assert "Build the model" in message
+
+
+def test_relation_precheck_accepts_a_suffix_match(tmp_path: Path):
     # The cache is connector-normalized, so a legitimate spelling that resolves by
     # suffix must pass rather than being rejected on an exact string compare.
     backend = LocalMetricFlowBackend(
         _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
+    live = _Inventory(["wh.main.orders"])
     for sql in ("SELECT status FROM main.orders", "SELECT status FROM orders"):
-        assert backend._namespace_mismatch(sql, cache, "duckdb") is None
+        assert backend._relation_precheck(sql, cache, "duckdb", live) == (None, [])
+    # resolved from the cache alone, so the connection was never asked
+    assert live.calls == 0
 
 
-def test_namespace_precheck_noops_without_an_inventory(tmp_path: Path):
-    # No `explore map` yet: nothing to check against, so metric queries still run.
+def test_relation_precheck_accepts_a_built_but_unprofiled_relation(tmp_path: Path):
+    # Issue #134: `transform build` creates the relation, `explore profile` is what
+    # puts it in the cache, and the query must not need the second step. The cache
+    # holds a different table, so the miss is real and the live listing decides.
     backend = LocalMetricFlowBackend(
         _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
     )
-    sql = "SELECT status FROM anything.at.all"
-    assert backend._namespace_mismatch(sql, None, "duckdb") is None
-    assert backend._namespace_mismatch(sql, DexCache(datasets=[]), "duckdb") is None
+    cache = _cache_with(
+        [ColumnProfile(name="status", data_type="VARCHAR")],
+        identifier="wh.main.customers",
+    )
+    live = _Inventory(["wh.main.customers", "wh.main.orders"])
+    message, unprofiled = backend._relation_precheck(
+        "SELECT status FROM wh.main.orders", cache, "duckdb", live
+    )
+    assert message is None
+    assert live.calls == 1
+    # queryable, and the weaker PII screening it implies is disclosed
+    assert unprofiled == ["wh.main.orders"]
+    note = _unprofiled_note(unprofiled)[0]
+    assert "wh.main.orders" in note and "explore profile" in note
+
+
+def test_relation_precheck_runs_without_a_cache(tmp_path: Path):
+    # No `explore map` yet is no longer a hole in the guard: the connection itself
+    # is the authority, so a foreign relation is still refused before any spend.
+    backend = LocalMetricFlowBackend(
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    live = _Inventory(["wh.main.orders"])
+    for cache in (None, DexCache(datasets=[])):
+        message, _unprofiled = backend._relation_precheck(
+            "SELECT status FROM wh.main.gone", cache, "duckdb", live
+        )
+        assert message is not None
+    assert backend._relation_precheck(
+        "SELECT status FROM wh.main.orders", None, "duckdb", live
+    ) == (None, ["wh.main.orders"])
+
+
+def test_relation_precheck_never_refuses_an_unlisted_schema(tmp_path: Path):
+    # The dataset allowlist can be narrower than the dbt project. `elsewhere` is a
+    # schema of a database this connection does carry, so it is out of the
+    # listing's scope rather than out of reach, and dex must not answer for it.
+    backend = LocalMetricFlowBackend(
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    live = _Inventory(["wh.main.orders"])
+    message, unprofiled = backend._relation_precheck(
+        "SELECT status FROM wh.elsewhere.orders", None, "duckdb", live
+    )
+    assert message is None
+    assert unprofiled == ["wh.elsewhere.orders"]
+
+
+def test_relation_precheck_does_not_refuse_on_an_unreadable_inventory(tmp_path: Path):
+    # An introspection failure is not evidence of a missing relation, and a
+    # genuinely missing one still fails at planning without billing.
+    backend = LocalMetricFlowBackend(
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    live = _Inventory([], fails=True)
+    message, _unprofiled = backend._relation_precheck(
+        "SELECT status FROM wh.main.orders", None, "duckdb", live
+    )
+    assert message is None
+    assert live.calls == 1
+
+
+def test_relation_precheck_ignores_cte_names(tmp_path: Path):
+    # MetricFlow renders a stack of named subqueries. A CTE is defined by the
+    # statement, not looked up in the connection, so it is not a missing relation.
+    backend = LocalMetricFlowBackend(
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    live = _Inventory(["wh.main.orders"])
+    sql = "WITH subq_0 AS (SELECT status FROM wh.main.orders) SELECT status FROM subq_0"
+    assert backend._relation_precheck(sql, None, "duckdb", live) == (
+        None,
+        ["wh.main.orders"],
+    )
+
+
+def test_relation_precheck_says_nothing_about_a_profiled_relation(tmp_path: Path):
+    # A profile in the cache is what the PII gate needs, so there is nothing to
+    # disclose. An inventory-only entry (no columns) is not a profile.
+    backend = LocalMetricFlowBackend(
+        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    live = _Inventory(["wh.main.orders"])
+    sql = "SELECT status FROM wh.main.orders"
+    profiled = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
+    assert backend._relation_precheck(sql, profiled, "duckdb", live) == (None, [])
+    inventory_only = DexCache(datasets=[Dataset(identifier="wh.main.orders")])
+    assert backend._relation_precheck(sql, inventory_only, "duckdb", live) == (
+        None,
+        ["wh.main.orders"],
+    )
 
 
 def test_token_never_reaches_the_envelope():

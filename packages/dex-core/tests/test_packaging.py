@@ -277,6 +277,26 @@ def test_the_hosted_semantic_backend_needs_only_its_own_extra(wheel: str):
     assert done.returncode == 0, done.stderr
     assert "environment id" in done.stdout, done.stdout
 
+    # `query`, not just `list`. The two share a command module but not a code
+    # path: query normalizes the intent and routes through a second function, and
+    # every assertion above stops at discovery, so a parser import added to the
+    # query path would not have been caught here. Same refusal (coordinates this
+    # install cannot invent), reached with the name lists in their comma form so
+    # the normalization is proven reachable where no dialect engine exists.
+    done = _run_isolated(
+        wheel,
+        "from exmergo_dex_core.cli import main;"
+        "from exmergo_dex_core.explore.semantic import SemanticQuery;"
+        "\nassert SemanticQuery(metrics=['a,b'], group_by=['c,d']).group_by == "
+        "['c', 'd']"
+        "\nmain(['explore', 'semantic', 'query', '--metric', 'sessions,queries',"
+        " '--group-by', 'user__pricing_tier,metric_time', '--api'])",
+        extras=["semantic-api"],
+    )
+    envelope = json.loads(done.stdout)
+    assert envelope["status"] == "error", done.stdout
+    assert "environment id" in envelope["errors"][0], done.stdout
+
 
 def test_the_all_extra_installs_every_optional_capability(wheel: str):
     """`[all]` has to mean all of them, and they have to co-resolve.

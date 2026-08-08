@@ -2983,6 +2983,9 @@ def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Pa
     # Family 2 + 1: rendered metric SQL bakes in the relations the project was
     # compiled against. Reading a namespace this connection does not have is
     # refused BEFORE the cost handshake, so a mismatch never bills a failed job.
+    # The connection's own inventory is the authority, so the refusal holds with a
+    # profiling cache and without one; what it must never do is refuse a relation
+    # that is in the warehouse and merely absent from that cache.
     from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
     from exmergo_dex_core.config import QueryLimits
     from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
@@ -2998,10 +3001,19 @@ def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Pa
             )
         ]
     )
-    verdict = backend._namespace_mismatch(
-        "SELECT status FROM other_db.main.orders", cache, "duckdb"
+    live = ["wh.main.orders", "wh.staging.customers"]
+    for held in (cache, None):
+        verdict, _unprofiled = backend._relation_precheck(
+            "SELECT status FROM other_db.main.orders", held, "duckdb", lambda: live
+        )
+        assert verdict is not None and "different namespace" in verdict
+    # and the relation the connection does carry is not collateral damage
+    assert (
+        backend._relation_precheck(
+            "SELECT status FROM wh.main.orders", None, "duckdb", lambda: live
+        )[0]
+        is None
     )
-    assert verdict is not None and "different namespace" in verdict
 
 
 def test_hosted_semantic_pii_dimension_refused_not_surfaced():
