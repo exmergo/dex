@@ -54,6 +54,48 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 - **transform init**: allow initializing into the current directory ([#235]).
 
+- **`notes` on both maintain snapshot layers** ([#193]). `TransformLayer` and
+  `SemanticLayer` now carry `notes: list[str]`, matching the one
+  `ProjectDefinitions` has carried all along, and the four `maintain` commands
+  fold them into their warnings. Without it a project format producing a layer
+  that is faithful but narrower than a dbt project's had nowhere in the return
+  value to say so, and kept those caveats beside the bridge instead, where no
+  caller reading the snapshot ever saw them. That gap is what made the optional
+  `path` below only half a fix: a reader seeing no provenance still could not
+  tell "dex failed to record it" from "this format has no files", and the reason
+  is a property of the format rather than of the finding. A `file_count` of zero
+  beside a dozen models is the same problem one layer up.
+
+  Notes are collected from every layer a command read, baseline and current, then
+  deduplicated. Both sides, because the two provenance payloads read different
+  ones: `dangling_source` compares against the baseline's declared sources while
+  `definition_changed` reads the current project, so surfacing one side would
+  leave the other axis's limits unexplained. In practice the same format produces
+  both and says the same thing, which is what the deduplication is for. They are
+  reported at detection time as well as when a baseline is pinned, because a host
+  re-runs detection far more often than it re-pins.
+
+  Informational by design, and the boundary is worth stating because the next ask
+  will test it: no detector reads a note, notes take no part in any comparison so
+  a changed note is never drift, and dex does not branch on one. Anything dex has
+  to *decide* from belongs in a tier, which is checkable, rather than in prose the
+  engine would have to trust. That is the same reason the tiers exist instead of a
+  `writeback` flag.
+
+- **The project conformance contract asserts that a format's layers can be a
+  baseline** ([#193]). `MaintainProjectContract` gains one assertion: the two
+  layers survive a JSON round trip inside a `Snapshot`. That is precisely what
+  reaching tier 2 buys, since a store serializes the baseline and a later command
+  loads it back to diff against, and nothing checked it. The check is a real
+  serialization rather than a copy because that is where a value a format chose
+  can be accepted in Python and rejected on the way back, and the failure would
+  otherwise surface on the run after the one that caused it. No test in this
+  repository had ever round-tripped a populated layer through JSON: the storage
+  conformance fixture builds its snapshot with both layers unset, and the
+  in-memory backend copies rather than serializing. The contract still needs only
+  pytest. In-repo it now also runs against a pathless format, because the shipped
+  dbt format always has paths and would never exercise the freedom below.
+
 ### Fixed
 
 - **`transform plan` accepts a line-broken top-level dbt `ref()`** ([#195]).
@@ -64,6 +106,42 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   Relative and absolute spellings of the same warehouse file (e.g. `warehouse.duckdb`
   vs `./warehouse.duckdb`) are no longer treated as configuration drift.
 
+- **A project format with no files no longer has to invent provenance**
+  ([#193]). `SourceTable`, `SemanticModelDef` and `MetricDef` each required a
+  `path` with no default, so a format whose sources are declared in configuration
+  and whose semantic models and metrics are objects in a running graph had nothing
+  to supply and shipped the empty string. All three are now `str | None`.
+
+  The cost of the required field was never a broken read. Every consumer of those
+  three values is a provenance string in a finding payload, `declared_in` on
+  `dangling_source` and `path` on `definition_changed`, and dex opens neither. It
+  was that a `high` severity finding handed an analyst a file to go and check
+  which, for a pathless format, would not be there. That is the argument
+  `SemanticModelDef`'s own docstring already makes one field over, where a computed
+  expression maps to `None` because guessing columns out of expressions would turn
+  every refactor into a false dangling-ref finding.
+
+  The empty string was worse than a fabricated path in one specific way, and this
+  is why the change matters beyond the format that reported it: `""` was an
+  undocumented sentinel. A format author reading `path: str` had no way to tell
+  that the empty string was the sanctioned answer rather than a bug, so the next
+  implementer picks `"n/a"`, or a synthetic path that reads exactly like a real
+  one. `str | None = None` puts the answer in the signature, which is the same move
+  as a declinable tier over a capability flag: the declaration and the enforcement
+  become the same object.
+
+  Both payloads now **omit** the key rather than reporting a null. A null-valued
+  provenance key forces every reader to branch, and both branches fall back to the
+  identifier the finding already carries, while an absent key lets a
+  `.get(default)` do that on its own. Omission also cannot regress an existing
+  consumer, because the shipped dbt format always has a path and never produces
+  one; a null would be a new value shape in a key that is already there.
+
+  `SNAPSHOT_SCHEMA_VERSION` is deliberately unchanged. Widening a field is
+  backward compatible on read, so every existing baseline loads untouched, and the
+  only break is in the downgrade direction: an older engine reading a snapshot
+  that contains a null path. Such a snapshot can only have been written by a format
+  that older engine could not have served anyway.
 
 - **A crowded low-cardinality dimension no longer pushes the true grain out
   of the composite-key probe** ([#168]). `_probe_composite_keys` ranks

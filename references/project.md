@@ -110,6 +110,32 @@ Where your format's shape and this model's shape disagree, say so in `notes` rat
 than inventing a value. A fabricated field is indistinguishable from a measured one
 by the time a finding is shown to a human.
 
+That rule holds at tier 2 too, and two things make it possible to follow there.
+
+**The three `path` fields are optional.** `SourceTable`, `SemanticModelDef` and `MetricDef`
+each carry a `path`, and each accepts `None`. They are provenance and nothing else: the
+file an analyst would open, carried on the `dangling_source` and `definition_changed`
+findings, never opened by dex. A format whose sources are declared in configuration, or
+whose metrics are objects in a graph, leaves them unset, and the finding omits the key
+rather than reporting a null. Both findings still identify their subject by name, so
+nothing is lost but a shortcut. Supplying a plausible-looking path instead would attach
+a file that is not there to a high-severity finding, which is the same failure the
+`None` on `SemanticModelDef`'s column mappings exists to avoid.
+
+**`TransformLayer` and `SemanticLayer` carry `notes`.** Same meaning as on
+`ProjectDefinitions`: what your format could not supply. A layer that is faithful but
+narrower than a dbt project's has somewhere in the return value to say so, and the
+`maintain` commands fold those notes into their warnings, at detection time as well as
+when the baseline is pinned. Worth using for anything a reader would otherwise
+misread: a `file_count` of zero beside a dozen models is a shape nobody can interpret
+without one line of explanation.
+
+Notes are informational, deliberately. No detector reads them, they take no part in any
+comparison (so a changed note is never drift), and dex will not branch on one. Anything
+dex has to *decide* from belongs in a tier, which is checkable, rather than in prose the
+engine would have to trust. That is the same reason the tiers exist instead of a
+`writeback` flag.
+
 ## Proving it works
 
 ```
@@ -127,6 +153,14 @@ class TestMyProject(ExploreProjectContract):
 
 pytest collects the inherited assertions and runs the contract against your format.
 Use `MaintainProjectContract` instead if you reach tier 2.
+
+Tier 2's assertions are thin, because the layers' contents are your format's business.
+The one worth knowing about is that your layers **survive a JSON round trip inside a
+`Snapshot`**, since that is what reaching tier 2 buys: a store serializes the baseline
+and a later command loads it back to diff against. The check is deliberately a real
+serialization rather than a copy, because that is where a value your format chose can be
+accepted in Python and rejected on the way back, and the failure would otherwise surface
+on the run *after* the one that caused it.
 
 Two hooks are worth overriding beyond `make_project`:
 
