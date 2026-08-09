@@ -9,6 +9,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- `references/canonical-model.md`'s extension-seam section described a single
+  `ProjectAdapter` protocol with `load()` and `write_edits()` as the live seam. That
+  protocol is superseded, unreferenced, and satisfies no tier, so a format written
+  against it is refused as "not a project", and this is the document a reader reaches
+  before writing one. It now describes the three tiers and points at
+  `references/project.md`.
+
 ## [1.6.1] - 2026-08-09
 
 ### Fixed
