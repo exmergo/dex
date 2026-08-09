@@ -308,10 +308,19 @@ A shipped name, a dotted path, or an entry point under `exmergo_dex_core.project
 with shipped names always winning so an install can never silently redirect which
 models a repo is reasoned about.
 
-Declining `EditableProject` is a supported answer, not a gap. A project reduced from
-a running graph cannot receive an edit, because its source of truth is the code that
-produced the graph, and `maintain reconcile` reads that declaration: your format
-gets advisory proposals and no stored plan, by contract rather than by luck.
+Declining `EditableProject` is a supported answer, not a gap. The clearest case is a
+project reduced from a running graph, where the reduction is not the source of truth:
+the code that produced the graph is, so an edit written into the reduction is
+overwritten on the next run. `maintain reconcile` reads that declaration, and your
+format gets advisory proposals and no stored plan, by contract rather than by luck.
+
+Decide it by asking which artifact an edit would land in, not where your project came
+from. Those questions come apart more often than the graph example suggests: an asset
+graph carries neither column names nor join keys, so a format over one reads its
+declared keys, joins and semantics from somewhere else, and that somewhere is usually
+a hand-authored file that nothing regenerates. Such a file is a real source of truth
+and it is the shape `reconcile` already proposes edits to, so a format holding one may
+serve this tier for that channel while still refusing to author a model.
 `references/project.md` covers the tiers, the construction contract, and the rules
 that are not obvious from the signatures.
 

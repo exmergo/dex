@@ -80,12 +80,37 @@ credential becomes persistent state.
 ## The extension seam (more formats later)
 
 Supporting more model formats over time does not require a neutral internal model.
-It requires a thin `ProjectAdapter` protocol (`adapters/project.py`) with one
-implementation today, `DbtProject`. Future sources (SQLMesh, Cube) become new
-adapter implementations. The interface is thin and dbt is its only implementation
-in v1; dex does not build a rich neutral model behind it, and it does not project
-the dbt model back out into other formats. dex reasons over the dbt project and
-authors into it directly; there is no one-way exporter path.
+It requires a seam thin enough that a class with the right methods is a project,
+with no base class to inherit and no registration step. That seam is three nested
+protocols in `adapters/project.py`, and a format implements the tiers it can serve:
+
+| tier | protocol | adds |
+|---|---|---|
+| 1 | `ExploreProject` | `definitions()` |
+| 2 | `MaintainProject` | `transform_layer()`, `semantic_layer()` |
+| 3 | `EditableProject` | `write_edits()` |
+
+`DbtProject` is the one implementation dex ships. Future sources (SQLMesh, Cube, an
+orchestrated asset graph) become new implementations of the same protocols without
+touching the engine that reasons over a project. Nothing behind the seam is a rich
+neutral model: `definitions()` returns the engine's existing `ProjectDefinitions`
+rather than a parallel vocabulary that would have to be mapped at every call site,
+and dex does not project the dbt model back out into other formats. dex reasons
+over the project and authors into it directly; there is no one-way exporter path.
+
+Tiers rather than a capability flag, because a flag is a claim the engine has to
+trust while `isinstance(project, EditableProject)` is checkable. A format that
+cannot receive an edit declines tier 3 and cannot accidentally claim otherwise.
+
+[`project.md`](project.md) is the contract itself: what each tier owes its callers,
+the one rule that is not visible in the signatures, how a format is named in
+configuration, and the conformance suite that proves an implementation works.
+Read that before writing a format; this section only says where the seam sits.
+
+> An earlier version of this section named a single `ProjectAdapter` protocol with
+> `load()` and `write_edits()`. That protocol still exists, unreferenced, because it
+> has been public since v1, but it is superseded and satisfies no tier. Anything
+> written against it would be refused as "not a project".
 
 ## The round-trip rule (reconcile, simplified)
 

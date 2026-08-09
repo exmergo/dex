@@ -137,12 +137,24 @@ class EditableProject(MaintainProject, Protocol):
     """Tier 3: the write path.
 
     Implemented only by formats whose source of truth can actually receive an edit.
-    A project reduced from a running graph cannot: its source of truth is the code
-    that produced the graph, and writing into the reduction would edit an artifact
-    that is regenerated from something else on the next run.
+    The clearest case that cannot is a project reduced from a running graph, where
+    the reduction is not the source of truth: the code that produced the graph is,
+    and writing into the reduction would edit an artifact regenerated from
+    something else on the next run.
 
-    Declining this tier is the honest answer for such a format, and the reason the
-    tiers exist rather than a ``writeback`` flag. ``maintain reconcile`` reads it:
+    **That test is about the artifact an edit would land in, not about where the
+    project came from**, and the two come apart more often than the graph example
+    suggests. A format may reduce a graph for its model list while reading its
+    declared keys, joins and semantics from hand-authored files that nothing
+    regenerates. Those files are a genuine source of truth, they are exactly the
+    shape ``reconcile`` proposes edits to, and a format holding one can reach this
+    tier for that channel while still declining to author a model. Ask which
+    artifact the edit lands in and whether anything rewrites it; do not infer the
+    answer from the project being graph-derived.
+
+    Declining this tier is the honest answer for a format with no such artifact,
+    and the reason the tiers exist rather than a ``writeback`` flag.
+    ``maintain reconcile`` reads it:
     a format that does not satisfy this protocol gets advisory-only proposals and
     no stored plan, which is the behavior a generated tree previously got by
     naming coincidence.
