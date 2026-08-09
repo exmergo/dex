@@ -178,8 +178,9 @@ class EditableProject(MaintainProject, Protocol):
         That refusal is propose-don't-impose itself, which is why it is on the
         signature rather than left to an implementation to remember: a write path
         that cannot receive ``confirmed`` defaults to overwriting the edit someone
-        made while the plan sat in review. :class:`~.conformance.
-        EditableProjectContract` asserts the behavior, because no shape check can.
+        made while the plan sat in review.
+        :class:`~.conformance.EditableProjectContract` asserts the behavior,
+        because no shape check can.
         """
         ...
 
