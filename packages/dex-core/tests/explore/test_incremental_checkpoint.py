@@ -121,17 +121,11 @@ def _raise_on_nth_object(monkeypatch, n: int):
     original = BigQueryAdapter.column_aggregates
     state = {"count": 0}
 
-    def wrapped(self, identifier, columns, *, safe_min_max=None, shape_stats=None):
+    def wrapped(self, identifier, columns, **kwargs):
         state["count"] += 1
         if state["count"] >= n:
             raise OverCeilingError("simulated ceiling crossed mid-run")
-        return original(
-            self,
-            identifier,
-            columns,
-            safe_min_max=safe_min_max,
-            shape_stats=shape_stats,
-        )
+        return original(self, identifier, columns, **kwargs)
 
     monkeypatch.setattr(BigQueryAdapter, "column_aggregates", wrapped)
     return state

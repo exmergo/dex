@@ -85,6 +85,28 @@ class ColumnAggregate:
     upper_vocab_fraction: float | None = None
     person_shape_fraction: float | None = None
     avg_token_count: float | None = None
+    #: Declared-type-vs-content statistics, computed only for columns the
+    #: engine requested via ``type_stats`` (non-PII string/integer columns).
+    #: Fractions and (for epoch) an exact min/max used only to translate into
+    #: a calendar date; never a raw value. ``None`` means not computed (not
+    #: requested, ineligible type, or the dialect could not).
+    numeric_string_fraction: float | None = None
+    integer_string_fraction: float | None = None
+    iso_date_fraction: float | None = None
+    iso_datetime_fraction: float | None = None
+    slash_date_fraction: float | None = None
+    slash_datetime_fraction: float | None = None
+    #: Fraction of slash-date-shaped rows whose first/second component
+    #: exceeds 12 -- a logical proof that component can't be a month, used
+    #: to disambiguate %m/%d/%Y from %d/%m/%Y (see `type_contradiction_expressions`).
+    slash_first_component_over_12_fraction: float | None = None
+    slash_second_component_over_12_fraction: float | None = None
+    epoch_seconds_fraction: float | None = None
+    epoch_millis_fraction: float | None = None
+    epoch_seconds_min_value: int | None = None
+    epoch_seconds_max_value: int | None = None
+    epoch_millis_min_value: int | None = None
+    epoch_millis_max_value: int | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +306,166 @@ def shape_stat_value(
     return float(value) if value is not None else None
 
 
+def is_string_type(data_type: str) -> bool:
+    upper = data_type.upper()
+    return any(h in upper for h in ("CHAR", "TEXT", "STRING", "VARCHAR"))
+
+
+def is_integer_type(data_type: str) -> bool:
+    """``"INT"`` substring after excluding boolean/temporal (``INTERVAL``
+    contains ``"INT"``). Deliberately excludes Snowflake's ``"FIXED"`` (its
+    ``SHOW COLUMNS`` reports no scale, so ``NUMBER(38,0)`` and ``NUMBER(10,2)``
+    render identically) and every ``DECIMAL``/``NUMERIC``/``DOUBLE``/``FLOAT``/
+    ``REAL`` spelling -- a Snowflake integer stored as ``NUMBER`` is a known,
+    accepted false negative for the type-contradiction epoch check, consistent
+    with this codebase's under-report-over-over-report posture elsewhere."""
+
+    upper = data_type.upper()
+    if any(h in upper for h in ("BOOL", "DATE", "TIME", "TIMESTAMP", "INTERVAL")):
+        return False
+    return "INT" in upper
+
+
+# Declared-type-vs-content patterns (issue #204). No `\d`, no lookaround: the
+# shared regex predicates must parse identically across every dialect's regex
+# engine (see each adapter's `_regexp_predicate`).
+NUMERIC_PATTERN = r"^-?[0-9]+(\.[0-9]+)?$"
+INTEGER_PATTERN = r"^-?[0-9]+$"
+ISO_DATE_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+ISO_DATETIME_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}$"
+# Zero-padded 2-digit components only, deliberately: this shape matches both
+# %m/%d/%Y and %d/%m/%Y identically, which is what makes the SUBSTR-position
+# extraction below reliable (a 1-digit field would shift the fixed offsets).
+SLASH_DATE_PATTERN = r"^[0-9]{2}/[0-9]{2}/[0-9]{4}$"
+SLASH_DATETIME_PATTERN = r"^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}$"
+# Length-bounded, NOT the general NUMERIC_PATTERN: a CAST gated behind this
+# predicate can never overflow BIGINT/INT64 (max ~9.2e18, 19 digits) on any
+# dialect, unlike an unbounded numeric string (e.g. a 20-digit surrogate id).
+EPOCH_SECONDS_SHAPE_PATTERN = r"^-?[0-9]{1,10}$"
+EPOCH_MILLIS_SHAPE_PATTERN = r"^-?[0-9]{1,13}$"
+
+EPOCH_SECONDS_LOW = 946684800  # 2000-01-01T00:00:00Z
+EPOCH_SECONDS_HIGH = 4102444800  # 2100-01-01T00:00:00Z
+EPOCH_MILLIS_LOW = EPOCH_SECONDS_LOW * 1000
+EPOCH_MILLIS_HIGH = EPOCH_SECONDS_HIGH * 1000
+
+
+def type_contradiction_expressions(
+    qcol: str,
+    i: int,
+    *,
+    is_string: bool,
+    is_integer: bool,
+    regexp_predicate: Callable[[str, str], str],
+    bigint_type: str,
+) -> list[str]:
+    """Declared-type-vs-content aggregate expressions for one column.
+
+    Every CAST is guarded behind a length-bounded shape predicate inside a
+    CASE -- never combined with AND, which the SQL standard does not
+    guarantee to evaluate left-to-right -- so a non-numeric string never
+    reaches a CAST on a dialect with no ``TRY_CAST`` (Postgres, Redshift), and
+    the gating patterns are always length-bounded so the CAST itself can never
+    overflow BIGINT/INT64. Only fractions and translated-to-date integers
+    (read back and converted to a calendar date by the caller) ever leave the
+    engine through this path. ``qcol`` must already be quoted/escaped by the
+    calling adapter. Returns ``[]`` for a column that is neither string- nor
+    integer-typed (nothing to check).
+    """
+
+    def fraction(value_expr: str, condition: str, alias: str) -> str:
+        return (
+            f"AVG(CASE WHEN {condition} THEN 1.0 "
+            f"WHEN {value_expr} IS NOT NULL THEN 0.0 END) AS {alias}"
+        )
+
+    def plain_fraction(pattern: str, alias: str) -> str:
+        return fraction(qcol, regexp_predicate(qcol, pattern), alias)
+
+    exprs: list[str] = []
+    if is_string:
+        exprs += [
+            plain_fraction(NUMERIC_PATTERN, f"ts_ns_{i}"),
+            plain_fraction(INTEGER_PATTERN, f"ts_is_{i}"),
+            plain_fraction(ISO_DATE_PATTERN, f"ts_iso_d_{i}"),
+            plain_fraction(ISO_DATETIME_PATTERN, f"ts_iso_dt_{i}"),
+        ]
+        slash_date_pred = regexp_predicate(qcol, SLASH_DATE_PATTERN)
+        slash_datetime_pred = regexp_predicate(qcol, SLASH_DATETIME_PATTERN)
+        exprs += [
+            fraction(qcol, slash_date_pred, f"ts_sl_d_{i}"),
+            fraction(qcol, slash_datetime_pred, f"ts_sl_dt_{i}"),
+        ]
+        slash_either = f"({slash_date_pred} OR {slash_datetime_pred})"
+        first_val = (
+            f"CASE WHEN {slash_either} THEN "
+            f"CAST(SUBSTR({qcol}, 1, 2) AS {bigint_type}) END"
+        )
+        second_val = (
+            f"CASE WHEN {slash_either} THEN "
+            f"CAST(SUBSTR({qcol}, 4, 2) AS {bigint_type}) END"
+        )
+        exprs += [
+            fraction(first_val, f"{first_val} > 12", f"ts_sl1_{i}"),
+            fraction(second_val, f"{second_val} > 12", f"ts_sl2_{i}"),
+        ]
+        seconds_shape = regexp_predicate(qcol, EPOCH_SECONDS_SHAPE_PATTERN)
+        millis_shape = regexp_predicate(qcol, EPOCH_MILLIS_SHAPE_PATTERN)
+        seconds_val = (
+            f"CASE WHEN {seconds_shape} THEN CAST({qcol} AS {bigint_type}) END"
+        )
+        millis_val = f"CASE WHEN {millis_shape} THEN CAST({qcol} AS {bigint_type}) END"
+    elif is_integer:
+        seconds_val = millis_val = qcol  # already numeric: no CAST, no overflow surface
+    else:
+        return []
+
+    seconds_cond = f"{seconds_val} BETWEEN {EPOCH_SECONDS_LOW} AND {EPOCH_SECONDS_HIGH}"
+    millis_cond = f"{millis_val} BETWEEN {EPOCH_MILLIS_LOW} AND {EPOCH_MILLIS_HIGH}"
+    exprs += [
+        fraction(seconds_val, seconds_cond, f"ts_ep_s_{i}"),
+        fraction(millis_val, millis_cond, f"ts_ep_ms_{i}"),
+        f"MIN(CASE WHEN {seconds_cond} THEN {seconds_val} END) AS ts_ep_s_mn_{i}",
+        f"MAX(CASE WHEN {seconds_cond} THEN {seconds_val} END) AS ts_ep_s_mx_{i}",
+        f"MIN(CASE WHEN {millis_cond} THEN {millis_val} END) AS ts_ep_ms_mn_{i}",
+        f"MAX(CASE WHEN {millis_cond} THEN {millis_val} END) AS ts_ep_ms_mx_{i}",
+    ]
+    return exprs
+
+
+def type_contradiction_aggregate_kwargs(
+    values: dict[str, object], i: int, wanted: bool
+) -> dict[str, float | int | None]:
+    """Every type-contradiction field for one column, ready to splat into a
+    ``ColumnAggregate(...)`` call:
+    ``**type_contradiction_aggregate_kwargs(values, i, wants_type)``."""
+
+    def frac(alias: str) -> float | None:
+        v = values.get(alias) if wanted else None
+        return float(v) if v is not None else None
+
+    def epoch(alias: str) -> int | None:
+        v = values.get(alias) if wanted else None
+        return int(v) if v is not None else None
+
+    return {
+        "numeric_string_fraction": frac(f"ts_ns_{i}"),
+        "integer_string_fraction": frac(f"ts_is_{i}"),
+        "iso_date_fraction": frac(f"ts_iso_d_{i}"),
+        "iso_datetime_fraction": frac(f"ts_iso_dt_{i}"),
+        "slash_date_fraction": frac(f"ts_sl_d_{i}"),
+        "slash_datetime_fraction": frac(f"ts_sl_dt_{i}"),
+        "slash_first_component_over_12_fraction": frac(f"ts_sl1_{i}"),
+        "slash_second_component_over_12_fraction": frac(f"ts_sl2_{i}"),
+        "epoch_seconds_fraction": frac(f"ts_ep_s_{i}"),
+        "epoch_millis_fraction": frac(f"ts_ep_ms_{i}"),
+        "epoch_seconds_min_value": epoch(f"ts_ep_s_mn_{i}"),
+        "epoch_seconds_max_value": epoch(f"ts_ep_s_mx_{i}"),
+        "epoch_millis_min_value": epoch(f"ts_ep_ms_mn_{i}"),
+        "epoch_millis_max_value": epoch(f"ts_ep_ms_mx_{i}"),
+    }
+
+
 @runtime_checkable
 class Adapter(Protocol):
     """Behavioral contract for a connector adapter.
@@ -323,12 +505,15 @@ class Adapter(Protocol):
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
         be computed; all others get ``None`` so values never leave the engine.
         ``shape_stats`` is the set of string column names for which the value-shape
-        fractions are computed (in the same scan); all others keep them ``None``."""
+        fractions are computed (in the same scan); all others keep them ``None``.
+        ``type_stats`` is the set of non-PII string/integer column names for which
+        the declared-type-vs-content fractions (#204) are computed, same scan."""
         ...
 
     def exact_distinct_counts(

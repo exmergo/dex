@@ -9,6 +9,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-08-09
+
+### Added
+
+- **`explore profile` flags a declared type that contradicts the column's
+  content** ([#204]). Profiling reported a column's declared type and
+  nothing about whether the content agreed with it, so a raw source table
+  (mostly string-typed columns, the landing-zone/CDC norm) went through
+  silently even when a `VARCHAR` column held nothing but epoch timestamps:
+  `data_quality` came back empty, and the caller only found out by hand,
+  the one place the PII policy and query firewall do not apply.
+
+  Three shapes are now detected, each measured as a fraction inside the
+  aggregate scan the engine already runs, at zero extra cost: a string
+  column whose values are dates/timestamps in a fixed format (ISO, or
+  `%m/%d/%Y` / `%d/%m/%Y` with or without a time part), an integer-or-string
+  column whose values are unix epochs (seconds vs. milliseconds, each with
+  an implied calendar-date range), and a string column whose values are all
+  numeric (and whether every value fits an integer). Where the day/month
+  order of a slash-separated date genuinely can't be told apart from the
+  data (neither component ever exceeds 12), the note says so rather than
+  guessing; where one component does exceed 12 somewhere, that's a logical
+  proof of the order, not a coin flip, and the note names the exact format.
+
+  A column is eligible only with no PII flag at all, at any confidence,
+  the same rule `is_min_max_safe` and the value-domain check already use.
+  Only fractions, format/unit names, and (for epoch) a calendar date
+  translated from an aggregate MIN/MAX ever leave the engine, never the
+  underlying value. Implemented across every connector (DuckDB, BigQuery,
+  Snowflake, Databricks, Redshift, Postgres), reusing the same
+  fraction-inside-a-measuring-aggregate mechanism `explore profile` already
+  uses for PII value-shape evidence.
+
 ### Fixed
 
 - Expired BigQuery credentials now report a retryable prerequisite instead of
