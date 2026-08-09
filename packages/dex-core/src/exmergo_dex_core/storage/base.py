@@ -119,6 +119,15 @@ class ExploreStore(Protocol):
         corrupt cache is a different situation from an absent one, and silently
         treating the first as the second would re-profile a warehouse (and bill
         for it) as if nothing had ever been explored.
+
+        **Raise a ``ValueError``** (pydantic's ``ValidationError`` is one, and is
+        what the shipped backends raise by validating the model). That is the
+        convention the engine reads as "this document will not parse", and it is
+        what ``load_snapshot`` is caught on to report a corrupt baseline as a
+        prerequisite failure rather than as a bad request. This load has no such
+        wrapper yet, so what a backend raises here reaches the engine's catch-all
+        either way; raise a ``ValueError`` so the load is classifiable when it
+        gets one, not because it is classified today.
         """
         ...
 
@@ -251,7 +260,19 @@ class MaintainStore(ExploreStore, Protocol):
     backend that cannot retain it across requests cannot support `maintain`.
     """
 
-    def load_snapshot(self) -> Snapshot | None: ...
+    def load_snapshot(self) -> Snapshot | None:
+        """The stored baseline, or None when nothing has been stored.
+
+        Same contract as ``load_cache``, and for a sharper reason: raise a
+        ``ValueError`` on a document that cannot be parsed. The baseline is what
+        every drift axis measures against, so returning None for a corrupt one
+        would report "no baseline yet" for a deployment that has one, and the
+        remedy dex names (`maintain snapshot`) would silently accept current
+        state as known-good. `maintain` catches this and refuses as a
+        prerequisite failure naming the fix, which it cannot do for a backend
+        that raises something else.
+        """
+        ...
 
     def save_snapshot(self, snapshot: Snapshot) -> str: ...
 

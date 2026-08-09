@@ -267,8 +267,22 @@ warehouse and bill for it. An unreadable ledger line means one spend record is
 lost, and refusing every subsequent billed command over one bad line is the worse
 failure.
 
+**Raise a `ValueError` for the document that will not parse.** Pydantic's
+`ValidationError` is one, so a backend that round-trips the models as described
+above gets this for free and needs to do nothing. It matters for a backend that
+deserializes its own rows: `maintain` catches a `ValueError` out of `load_snapshot`
+and classifies it as a prerequisite failure, which is what tells a host to stop and
+rebuild the baseline rather than retry the command. Anything else reaches the
+engine's catch-all and is reported to the operator as a bad request they made, when
+the fix is a dex command they have not run. The other loads carry no such wrapper
+yet: a raise out of `load_cache` or `load_drift` reaches the catch-all whatever its
+type. Raise a `ValueError` there anyway, so those loads are classifiable when they
+get one, rather than because it is classified today.
+
 **A stored `schema_version` is not the store's to police.** Documents carry one and
-the engine reads it. Load what you were given.
+the engine reads it: the query firewall degrades on an old cache, and `maintain`
+refuses a baseline whose version it does not read, naming `maintain snapshot`.
+Load what you were given and let the engine decide which of those it is.
 
 **The ledger is scoped to the store instance, so store granularity is ceiling
 granularity.** One principal spanning two stores has two independent session

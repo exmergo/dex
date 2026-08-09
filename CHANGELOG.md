@@ -11,6 +11,76 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **The tier-3 write path can carry the two things that make it safe** ([#241],
+  [#242]). `EditableProject.write_edits` declared one argument while the behavior it
+  governs depends on two more. `confirmed` had nowhere to go, so anything routed
+  through the tier would refuse every apply that met a conflict and could never
+  override one, and an implementation written against the published signature had no
+  way to receive it at all. That is the parameter the human-edit conflict handshake
+  turns on: every target is re-hashed against the content it was planned against, and
+  a file whose hash moved is someone's work, not a stale line to overwrite. The
+  project directory was resolved from engine configuration rather than from the plan
+  being applied, and a plan records its own directory relative to the repository root
+  precisely because that is what survives the repository moving, so the two can name
+  different projects with nothing to say so: the edits would land in whichever
+  project the engine happened to be configured for, hash-checked against that
+  project's files.
+
+  The member is now `write_edits(edits, project_dir, *, confirmed=False)`.
+  `DbtProject` passes both through, and a directory the caller names wins over the
+  one the instance was built with. Passing none keeps the configured pin, which is
+  what a caller holding engine configuration and no plan has always had.
+
+  No shipped path changes behavior, because nothing in the distribution called the
+  tier: `transform apply` calls the module-level `dbt_project.write_edits`, which
+  always resolved both correctly, and `reconcile` reads the tier only to decide
+  whether it may author an edit at all. That is the argument for fixing the signature
+  now rather than after someone builds on it. `runtime_checkable` checks only that a
+  method exists, so a third-party implementation of the one-argument shape keeps
+  satisfying `isinstance` and fails at the call.
+
+- **The conformance suite reaches tier 3** ([#241]). `EditableProjectContract` is the
+  class the suite did not have, and it asserts the behavioral half no shape check can
+  see: an unconfirmed write leaves a target someone else changed alone, and a
+  confirmed one goes through. The two are a pair on purpose, since a `write_edits`
+  that never writes satisfies the first by itself. Its one hook raises rather than
+  defaulting to a skip, unlike `make_unreadable_project`, because the excuse does not
+  carry over. A format may genuinely have no unparseable state, but a format that
+  reached tier 3 writes into a source of truth a human can also edit, so the case
+  where the human got there first exists for every one of them.
+- **A corrupt drift baseline is a prerequisite failure, not a bad request**
+  ([#243]). `load_snapshot` raises on a document it cannot parse, and pydantic's
+  `ValidationError` subclasses `ValueError`, so the refusal fell through to the
+  CLI catch-all and was classified as a *request* error. The operator was told
+  they had made a bad request when the fix is `maintain snapshot`, which is
+  exactly the retry-versus-stop distinction `PrerequisiteError` exists to carry.
+  The engine now catches `ValueError` out of the load, so a third-party backend
+  that deserializes its own rows is covered too, and `references/storage.md` and
+  the `Store` protocol both name that as the contract rather than leaving it to
+  be inferred from what the shipped backends happen to raise.
+
+- **A baseline from an unknown schema version is detected at all** ([#243]).
+  `Snapshot.schema_version` was stamped on every write and read by nothing, so a
+  document from a schema this engine does not understand was handed to the
+  detectors as though it were current. That is the worse of the two states,
+  because it is not an error: it is a drift report measured against a shape the
+  engine misread. `SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS` is the set that gives the
+  field a meaning, and the policy is refuse rather than migrate, written down
+  next to the set: a baseline is cheap to regenerate, a migration function per
+  version has to be right about a document nobody has read in a while, and a
+  wrongly migrated baseline is worse than an absent one because drift measured
+  against it looks like a result.
+
+  A set rather than the `<` comparison the query firewall uses on
+  `CACHE_SCHEMA_VERSION`, because the two documents differ: an old cache has a
+  degraded reading and the firewall adds a hint, while a baseline has no
+  degraded reading, only a wrong one. The check runs on a parsed `Snapshot`, so
+  it names a version for a document today's model still validates and refuses a
+  future one that also changed shape as a parse failure instead, with the same
+  remedy and no version named. Both messages say so. `DRIFT_SCHEMA_VERSION` is
+  deliberately left without the same gate, and the reasoning now sits next to
+  the constant.
+
 - **`explore semantic query --local` no longer refuses a relation it has simply
   never profiled** ([#134]). The relation pre-check resolved the rendered metric
   SQL against `.dex/cache.json` and refused anything it could not find there. That
@@ -66,7 +136,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   answered wants retrying. The gate itself is unchanged; what changes is that the
   weaker screening stops passing for the stronger one.
 
+### Added
+
+- **`BaselineUnreadableError`**, exported from the package root ([#243]). A
+  `PrerequisiteError`, distinct from `NoBaselineError` because "you never took a
+  baseline" and "the baseline you have is unreadable" are different facts about
+  a deployment and only one of them suggests something went wrong, so a host can
+  page on the second without paging on the first. It carries `schema_version`:
+  the stored version when the document parsed and this engine does not read that
+  version, and `None` when it did not parse at all. Those are different
+  operational events (a deployment rolled forward or back, versus an integrity
+  problem) and the attribute is what separates them without matching on message
+  prose.
+
 ### Changed
+
+- **A refusal naming `maintain snapshot` now says what running it costs**
+  ([#243]). The command is free on every connector and cannot really fail, which
+  is what makes "just re-snapshot" sound costless. A replacement pins current
+  state as known-good, so drift accumulated since the last readable baseline is
+  absorbed and never reported on any axis. A baseline newer than the engine
+  reading it is also told to upgrade dex first: dex advises committing
+  `.dex/snapshot.json` like a lockfile, so that state is usually a colleague on
+  a newer dex, and replacing the baseline resolves it by overwriting one they
+  can still read.
 
 - **`explore semantic query` accepts comma-separated name lists** ([#135]).
   `--group-by a,b` failed, on the local backend as an unresolvable MetricFlow

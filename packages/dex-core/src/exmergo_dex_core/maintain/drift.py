@@ -30,6 +30,29 @@ from ..cache import Dataset, Relationship, match_identifier
 from ..explore import relationships as rel_mod
 from .snapshot import SemanticLayer, Snapshot, TransformLayer
 
+#: Deliberately without the supported-set gate `SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS`
+#: gives the baseline, and this is where that decision is recorded rather than
+#: left for the next reader to re-derive.
+#:
+#: The two documents are not the same kind of thing. The baseline is *vouched
+#: for*: someone ran `maintain snapshot` against a state they accepted, nothing
+#: else can reproduce it, and drift measured against a version the engine
+#: misreads is a wrong answer that looks like a right one. The drift report is
+#: *derived*: it is the output of the command that reads it, `maintain check`
+#: regenerates it from the baseline on demand, `_record_axes` already discards
+#: one measured against a different baseline wholesale, and `reconcile` already
+#: has an absent-report path that names the command producing one. A version it
+#: does not recognize therefore has a cheap correct answer (rebuild) that the
+#: baseline does not have.
+#:
+#: What is *not* yet handled, and is a real gap rather than a decision: a drift
+#: report that fails to parse still raises out of `load_drift` uncaught and is
+#: classified as a request error, exactly the defect `_require_baseline` fixes
+#: for the baseline. The argument above is about versioning, not about
+#: corruption, and it does not cover that. Left out of the change for #243
+#: because the right remedy differs (treat it as absent and rebuild, rather than
+#: refuse), which deserves its own decision rather than symmetry with the
+#: baseline.
 DRIFT_SCHEMA_VERSION = 1
 
 FREE_AXES = ("schema", "volume")

@@ -34,7 +34,7 @@ implementation is complete rather than partial.
 |---|---|---|---|
 | 1 | `ExploreProject` | `definitions()` | declared keys, joins and metric models reach `explore` |
 | 2 | `MaintainProject` | `transform_layer()`, `semantic_layer()` | the format can be a drift baseline |
-| 3 | `EditableProject` | `write_edits()` | `transform` and `reconcile` may write back |
+| 3 | `EditableProject` | `write_edits(edits, project_dir, *, confirmed=False)` | `transform` and `reconcile` may write back |
 
 `tier_of(project)` reports the highest tier an object satisfies, checked with
 `isinstance` rather than declared, so a format cannot claim a tier it has not
@@ -66,6 +66,28 @@ format whose layers used that vocabulary would have been written into. The
 convention checks are still there as a second line; what changed is that the tier is
 asked first, so the guarantee rests on what your format declared rather than on what
 it happened to be called.
+
+**If you do implement tier 3, two parameters carry the whole safety story.**
+
+`project_dir` is where the edits go, and it comes from the caller rather than from
+however your project was built. dex is applying a stored plan, and a plan records the
+directory it was pinned against relative to the repository root, which is what keeps
+it valid when the repository moves. A project built from engine configuration need
+not point at the same place. Resolving the directory yourself means writing into
+whichever project the engine happened to be configured for while hash-checking
+against that project's files, and the disagreement is silent. If your format is not
+keyed by a directory, ignore the parameter, exactly as you ignore `repo_root` on
+`ProjectContext`.
+
+`confirmed` is the human-edit conflict handshake, and it is most of the reason this
+tier is separable at all. Re-hash every target against the content the edit was
+planned against. A target whose hash moved is a conflict, because a human edited it
+while the plan sat in review. With `confirmed=False` a conflict refuses the whole
+apply and writes nothing, and the divergence comes back as diffs for someone to read.
+With `confirmed=True` that someone has looked and said to go ahead. A write path that
+cannot receive `confirmed` silently overwrites the work, which is the failure this
+seam exists to prevent, so `EditableProjectContract` asserts the behavior rather than
+trusting it: no check on the shape of your class can see it.
 
 ## The one rule that is not visible in the signatures
 
@@ -160,7 +182,8 @@ class TestMyProject(ExploreProjectContract):
 ```
 
 pytest collects the inherited assertions and runs the contract against your format.
-Use `MaintainProjectContract` instead if you reach tier 2, and mix
+Use `MaintainProjectContract` instead if you reach tier 2, `EditableProjectContract`
+if you reach tier 3, and mix
 `ProjectFactoryContract` in front of it if dex will build your format from a name
 rather than be handed an instance. Construction is a separate contract, so a format
 that passes the behavioral suite can still be unreachable from configuration; "the
@@ -185,6 +208,18 @@ Two hooks are worth overriding beyond `make_project`:
   declared key and a declared join actually arrive. It is separate because the two
   contracts answer different questions: whether dex can safely call your format, and
   whether reading it was worth doing.
+
+Tier 3 adds one more hook, and unlike the two above it is **not optional**.
+`an_edit_against_a_changed_target()` returns a project, a directory, an edit set
+pinned to content that has since moved, and a callable reading what the target holds
+now. Two assertions use it: an unconfirmed write must leave the target alone, and a
+confirmed one must go through. They only mean something as a pair, since a
+`write_edits` that never writes satisfies the first on its own. The hook raises
+rather than skipping because the excuse that justifies skipping
+`make_unreadable_project` does not apply here. A format may genuinely have no
+unparseable state, but a format that reached tier 3 writes into a source of truth a
+human can also edit, so the case where the human got there first exists for all of
+them.
 
 The suite needs only pytest: no dialect engine, no connector. A packaging test keeps
 it that way.

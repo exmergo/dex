@@ -44,6 +44,36 @@ from ..dbt_project import (
 
 SNAPSHOT_SCHEMA_VERSION = 1
 
+#: Snapshot schema versions this engine can read.
+#:
+#: The field was stamped on every write from the beginning and read by nothing,
+#: so it could not have told anyone anything. This is the set that gives it a
+#: meaning, and the policy is REFUSE rather than migrate: a baseline is cheap to
+#: regenerate (`maintain snapshot`), the alternative needs a migration function
+#: per version that must itself be right about a document nobody has looked at
+#: in a while, and a wrongly-migrated baseline is worse than an absent one
+#: because drift measured against it looks like a result.
+#:
+#: There is only one version today, so nothing is refused yet. When a second
+#: arrives, add it here if and only if this engine can genuinely read it; adding
+#: it to keep an old baseline working is how the field stops meaning anything
+#: again.
+#:
+#: A set rather than the ``<`` comparison the query firewall uses on
+#: ``CACHE_SCHEMA_VERSION``, deliberately. That one degrades: an old cache is
+#: still usable, so the firewall adds a hint and carries on. A baseline is not
+#: usable-but-thin in the same way. It is the thing every axis measures against,
+#: so a version this engine does not understand has no degraded reading, only a
+#: wrong one, and membership says exactly that where ``<`` would also have to
+#: pick a side on newer-than-this-engine.
+#:
+#: The check that reads this runs on a *parsed* ``Snapshot``, so it names a
+#: version only for a document the current model still validates. A future
+#: version that also changed shape arrives as a parse failure and is refused
+#: with the same remedy and no version named. Widening that would take a
+#: contract change on ``Store``, which owns the raw document.
+SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({SNAPSHOT_SCHEMA_VERSION})
+
 
 class WarehouseBaseline(BaseModel):
     """The warehouse as last mapped: what schema/volume/grain drift diffs against."""
