@@ -99,6 +99,7 @@ def billed_handshake(
     *,
     per_table: dict[str, float] | None = None,
     notes: list[str] | None = None,
+    axes: list[str] | None = None,
 ) -> None:
     """The cost-before-spend handshake on billed connectors.
 
@@ -139,6 +140,11 @@ def billed_handshake(
             }
             if per_table:
                 data["per_table_bytes"] = per_table
+        if axes:
+            # What the estimate would add. Load-bearing for an offer, whose
+            # envelope reports `ok`: without it, an axis that did not run is
+            # indistinguishable from one that ran and found nothing.
+            data["axes"] = axes
         if notes:
             data.setdefault("notes", [])
             data["notes"] = [*data["notes"], *notes]
@@ -165,6 +171,11 @@ def confirmation_request(
     let this raise, because discarding them to ask about the billed half would
     make the caller pay attention twice for one answer. That is ``maintain
     check`` and ``maintain semantic``, whose free axes always complete.
+
+    Those two carry the returned request as ``Result.pending_offer`` rather than
+    ``pending_confirmation``, because the caller never asked for the scanning
+    axes: the request is priced work on offer, not a charge dex is waiting on.
+    Pass ``axes`` so the offer names what the estimate would add.
     """
 
     try:
