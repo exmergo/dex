@@ -398,7 +398,27 @@ class SemanticProjectContract:
 
     A format that genuinely declares no semantics should not mix this in. Its empty
     layer is correct and the tier contract already covers it.
+
+    **Semantics presuppose tier 2, and this checks that first.** ``semantic_layer``
+    is a tier-2 member, so every assertion below would otherwise fail with
+    ``AttributeError: 'MyProject' object has no attribute 'semantic_layer'`` for a
+    format that mixed this in beside :class:`ExploreProjectContract` -- an error
+    about a missing attribute, when the thing to say is that the format has not
+    reached the tier the attribute belongs to. The tier is asserted against the
+    project this contract is actually given rather than against ``make_project()``,
+    so the mixin keeps depending only on the one fixture it declares.
     """
+
+    def test_declaring_semantics_presupposes_the_maintain_tier(self) -> None:
+        project, _, _, _ = self.a_project_declaring_a_semantic_model()
+
+        assert tier_of(project) >= 2, (
+            "a format declaring semantics has to reach tier 2, because "
+            "semantic_layer() is a MaintainProject member and every assertion in "
+            "this contract calls it. Implement transform_layer() and "
+            "semantic_layer(), or drop this mixin if the format declares no "
+            "semantics -- an empty layer is already correct under the tier contract"
+        )
 
     def a_project_declaring_a_semantic_model(
         self,

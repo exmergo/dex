@@ -246,6 +246,11 @@ Two hooks are worth overriding beyond `make_project`:
   measures)` where the two mappings are `field name -> the warehouse column behind
   it`.
 
+  It asserts tier 2 first, against the project the hook returns. `semantic_layer`
+  is a tier-2 member, so a format mixing this in beside `ExploreProjectContract`
+  would otherwise fail with `AttributeError: no attribute 'semantic_layer'`, which
+  names the missing attribute rather than the tier it belongs to.
+
   This is the gap most worth closing, because the tier contract cannot see it.
   `MaintainProjectContract` checks that an *empty* project yields an empty semantic
   layer and never looks at a populated one, so a format that reads every field name

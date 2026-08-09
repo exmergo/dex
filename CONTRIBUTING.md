@@ -303,7 +303,9 @@ name, an implementation that mirrors one side onto the other satisfies it exactl
 behind it, which is the one no tier assertion can see: the tier contract only looks
 at an *empty* semantic layer, and a format that reads every field name and drops the
 columns maps everything to `None`, which validates, serializes, and compares clean
-forever while the drift check silently never runs.
+forever while the drift check silently never runs. It checks your format reaches
+tier 2 before any of that, so mixing it in beside the tier-1 contract fails with a
+sentence naming the tier rather than with a missing-attribute error.
 
 Mix `ProjectFactoryContract` in front of your tier contract if dex will build your
 format from a name rather than be handed an instance, which is what a host reaching

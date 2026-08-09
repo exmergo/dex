@@ -37,6 +37,13 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   a dropped warehouse column that should raise `dangling_reference` at high severity
   raises nothing. The absence is indistinguishable from agreement.
 
+  `SemanticProjectContract` asserts tier 2 before anything else, against the project
+  its own hook returns. `semantic_layer` is a tier-2 member, so a format mixing the
+  contract in beside `ExploreProjectContract` would otherwise fail with
+  `AttributeError: no attribute 'semantic_layer'`, naming the missing attribute
+  rather than the tier it belongs to. Checking the hook's project rather than
+  `make_project()` keeps the mixin dependent only on the one fixture it declares.
+
   All three are opt-in, and the two on `DeclaringProjectContract` skip with a message
   naming what goes unchecked rather than silently: an existing implementer's green
   suite must not turn red on an upgrade, and a format may genuinely have no
