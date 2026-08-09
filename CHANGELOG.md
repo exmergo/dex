@@ -9,6 +9,94 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **A free answer stops arriving shaped like a bill** ([#136]). `maintain check`
+  and `maintain semantic` complete their free axes on every call: schema, volume,
+  and the reference and definition half of semantic are metadata reads that finish
+  and settle. Both returned that finished work inside a `needs_confirmation`
+  envelope, because the axes that scan were priced and unconfirmed. So the command
+  a maintenance session opens with reported its entire triage, in one field report
+  373 findings, in a response shaped like a pending charge for work the caller had
+  not asked for and might never want.
+
+  Two costs came out of that. Confirming things that cost nothing is a habit, and
+  the handshake only works on commands where it does cost something. And the
+  framing taught the wrong reading: reaching for `data.findings` inside a refusal
+  is the natural move, and doing it is how the stale-baseline line in `warnings`
+  got missed.
+
+  The split is now on whether the caller asked. `needs_confirmation` means dex is
+  waiting on you for work you requested, and nothing you asked for has run.
+  Optional priced work rides on a completed answer instead: `status: ok`, findings
+  final, and the estimate under `data.offer` with the same breakdown and
+  `--confirm --budget` hint a refusal carried. `data.offer.axes` names what the
+  estimate would add and `data.axes_run` what already finished, which is what now
+  separates "grain found nothing" from "grain did not run" since the status no
+  longer implies it. `cost.estimate` stays unset, so an `ok` never carries a
+  number that reads as spend. Nothing about the spend gate moved: the confirmed
+  re-issue is identical and no scan runs without it. `explore relationships
+  --verify` and `explore map --verify` keep `needs_confirmation`, correctly, since
+  there the caller did ask for the probes and the budget ran out mid-command.
+
+  A host reading `data["estimated_bytes"]` on these two commands reads
+  `data["offer"]["estimated_bytes"]`.
+
+- **The same two commands stopped dropping their baseline caveats on the
+  unconfirmed call.** The branch that returned early built its result without
+  `_baseline_warnings`, which the settled branch includes, so the warnings that a
+  baseline no longer describes the warehouse (a cache newer than the snapshot, a
+  snapshot pinned from an already-stale cache) were missing from precisely the
+  response most sessions read. Confirmed against the dogfood project, where
+  `maintain semantic` reported a 327-hour-old baseline and `maintain check`, same
+  session and same baseline, reported nothing. Both paths now carry identical
+  warnings, because what bounds the settled answer bounds the free one.
+
+- **`semantic plan` reports what changed, not what was re-typed** ([#109]).
+  Classification compared names against the project and nothing else, so any name
+  already present read as `updated`. The edit unit is a whole file, so extending a
+  shared `semantic_models.yml` means re-stating every definition in it, and a
+  two-metric change reported 27 objects as updated with a `+16/-0` diff. The one
+  place a reviewer confirms blast radius was the place it was hidden.
+
+  There is now a third class. `updated` means the parsed definition actually
+  differs from the project's; a definition re-stated identically in the file that
+  already holds it is `unchanged`. Key order and formatting are not changes; list
+  order is, and identical content written to a different file is a move, so both
+  still read as `updated`. A plan whose every definition is unchanged warns that
+  it changes nothing.
+
+### Added
+
+- **A per-definition edit unit for the semantic layer** ([#109]).
+  `semantic define|update|plan` take `--definitions-file <path|->` beside
+  `--edits-file`: `{"definitions": [{"kind", "path", "content"}, ...]}`, where
+  `kind` is `semantic_model` or `metric` and `content` is that one definition's
+  YAML body. This is the stronger half of the fix. The whole-file unit is what
+  generated the `updated` noise, and re-typing twenty-seven untouched definitions
+  to add two is also how a stray key gets injected into a metric by hand, caught
+  in the field only by eye and by the parse gate.
+
+  The name is read from the content, so the two cannot disagree, and `path` may be
+  omitted for a definition the project already declares, defaulting to the file
+  that holds it. An explicit path that would relocate an existing definition is
+  refused, because writing it to a second file duplicates the name. Each
+  definition is spliced into its file as text, preserving every other byte
+  including the comments a semantic layer accumulates; a round trip through
+  `safe_dump` would reformat the file and produce a larger diff than the payload
+  it replaces. The result is re-parsed and compared against what was sent, and a
+  layout the splice cannot span safely (a flow-style sequence, anchors or aliases,
+  multiple documents, tab indentation) is refused with `--edits-file` named as the
+  way in. Classification is scoped to the definitions named, so a spliced file's
+  other definitions appear in no class at all.
+
+  It lowers to the whole-file `PlanEdit` the engine already stores, so the plan
+  format, the diffs, the conflict hashing, and `transform apply` are unchanged.
+  Deleting a definition remains a whole-file edit.
+
+  `AGENTS.md`, `references/command-contract.md`, and both the `transform` and
+  `maintain` skills document the new payload, the third class, and the offer.
+
 ## [1.6.1] - 2026-08-09
 
 ### Fixed
