@@ -44,6 +44,22 @@ from ..dbt_project import (
 
 SNAPSHOT_SCHEMA_VERSION = 1
 
+#: Snapshot schema versions this engine can read.
+#:
+#: The field was stamped on every write from the beginning and read by nothing,
+#: so it could not have told anyone anything. This is the set that gives it a
+#: meaning, and the policy is REFUSE rather than migrate: a baseline is cheap to
+#: regenerate (`maintain snapshot`), the alternative needs a migration function
+#: per version that must itself be right about a document nobody has looked at
+#: in a while, and a wrongly-migrated baseline is worse than an absent one
+#: because drift measured against it looks like a result.
+#:
+#: There is only one version today, so nothing is refused yet. When a second
+#: arrives, add it here if and only if this engine can genuinely read it; adding
+#: it to keep an old baseline working is how the field stops meaning anything
+#: again.
+SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({SNAPSHOT_SCHEMA_VERSION})
+
 
 class WarehouseBaseline(BaseModel):
     """The warehouse as last mapped: what schema/volume/grain drift diffs against."""

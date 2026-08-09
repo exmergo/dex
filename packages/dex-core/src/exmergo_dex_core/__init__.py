@@ -78,6 +78,7 @@ _EXPORTS = {
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
+    "BaselineUnreadableError": "maintain.commands",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
     "OverCeilingError": "guards.cost_guard",
@@ -144,7 +145,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     )
     from .guards.dialect import DialectDependencyError
     from .guards.query_firewall import QueryRefusedError
-    from .maintain.commands import NoBaselineError
+    from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
     from .results import (
         BudgetExhaustedError,
@@ -175,6 +176,7 @@ except PackageNotFoundError:
 # checker) sees the public surface without executing anything. `tests/
 # test_engine.py` asserts the two stay in step and that every name resolves.
 __all__ = [
+    "BaselineUnreadableError",
     "BudgetExhaustedError",
     "CacheRequiredError",
     "CeilingRequiredError",

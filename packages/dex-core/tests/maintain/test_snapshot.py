@@ -270,3 +270,85 @@ def test_a_metadata_baseline_makes_no_cache_age_claim(dex, tmp_path: Path):
     assert payload["data"]["baseline"]["column_detail_count"] == 1
     assert not [w for w in payload["warnings"] if "without column detail" in w]
     assert not [w for w in payload["warnings"] if "freshness" in w]
+
+
+# --- schema_version: written since v1, read by nothing until now (#243) ------
+
+
+def _rewrite_baseline(root: Path, **changes) -> None:
+    """Edit the stored baseline in place, the way a bad migration or a hand-edit
+    would. Goes through the file rather than the model so the document can hold
+    a shape the model would refuse to construct."""
+
+    path = root / ".dex" / "snapshot.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc.update(changes)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_a_baseline_from_an_unknown_schema_version_is_refused(maintain_repo):
+    """The gap this closes: the field was stamped on every write and read by
+    nothing, so a document from a schema this engine does not understand was
+    handed to the detectors as though it were current. That failure is the bad
+    kind, because it is not an error: it is a drift report measured against a
+    shape the engine misread."""
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, schema_version=99)
+
+    code, payload = maintain_repo.dex("maintain", "check")
+
+    assert code != 0
+    assert payload["reason"] == "prerequisite", (
+        "an unreadable baseline is a prerequisite failure: the call is well formed "
+        "and a named command fixes it"
+    )
+    message = " ".join(payload["errors"])
+    assert "99" in message and "maintain snapshot" in message
+
+
+def test_a_corrupt_baseline_is_a_prerequisite_not_a_bad_request(maintain_repo):
+    """`ValidationError` subclasses `ValueError`, so a corrupt baseline reached
+    the CLI catch-all and was classified as a REQUEST error. That tells an
+    operator they typed something wrong when the fix is `maintain snapshot`, and
+    it is the retry-versus-stop distinction `PrerequisiteError` exists to carry."""
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, warehouse="not an object")
+
+    code, payload = maintain_repo.dex("maintain", "check")
+
+    assert code != 0
+    assert payload["reason"] == "prerequisite", (
+        "a corrupt baseline must not report as a bad request"
+    )
+    assert "maintain snapshot" in " ".join(payload["errors"])
+
+
+def test_an_absent_baseline_still_reads_as_absent(maintain_repo):
+    """The arm that keeps the two states apart. Both remediate the same way, so
+    a single error would have been defensible and would have thrown away the
+    distinction between "you never took a baseline" and "yours is unreadable" —
+    and only the second suggests something went wrong."""
+
+    (maintain_repo.root / ".dex" / "snapshot.json").unlink(missing_ok=True)
+
+    code, payload = maintain_repo.dex("maintain", "check")
+
+    assert code != 0
+    assert payload["reason"] == "prerequisite"
+    message = " ".join(payload["errors"])
+    assert "no drift baseline yet" in message
+    assert "could not be read" not in message
+
+
+def test_a_current_baseline_is_not_refused(maintain_repo):
+    """The quiet arm. Without it, the three assertions above are equally
+    consistent with every baseline being refused."""
+
+    maintain_repo.snapshot()
+
+    code, payload = maintain_repo.dex("maintain", "check")
+
+    assert code == 0, payload.get("errors")
+    assert payload["reason"] is None
