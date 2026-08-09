@@ -347,3 +347,59 @@ def test_scope_by_semantic_name(maintain_repo):
     _rc, payload = maintain_repo.dex("maintain", "semantic", "status")
     codes = {f["code"] for f in payload["data"]["findings"]}
     assert codes == {"dimension_cardinality_changed"}
+
+
+def test_the_free_half_is_an_answer_and_the_scan_is_an_offer(
+    maintain_repo, monkeypatch
+):
+    """`maintain semantic` on a billed connector, at the branch that decides.
+
+    The reference and definition checks are free and complete on every call, so
+    the response is `ok` and those findings are final. The cardinality scan is
+    priced work the caller did not ask for, and it comes back as an offer rather
+    than gating the answer behind a confirmation of it. Driven through a stubbed
+    handshake because the fixture warehouse is DuckDB, which has no cost gate at
+    all and so never reaches this branch.
+    """
+
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.envelope import Cost, Paradigm, Status
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.results import ConfirmationRequest, to_envelope
+
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "INSERT INTO stg_orders VALUES (999, 1, 5.0, 'refunded', DATE '2024-03-01')"
+    )
+
+    captured: dict = {}
+
+    def stub(command, adapter, estimate, **kwargs):
+        captured.update(command=command, estimate=estimate, **kwargs)
+        return ConfirmationRequest(
+            cost=Cost(paradigm=Paradigm.BYTES_SCANNED, estimate=estimate),
+            data={"command": command, "estimated_bytes": estimate, **kwargs},
+        )
+
+    monkeypatch.setattr(command_args, "confirmation_request", stub)
+
+    from exmergo_dex_core.engine import DexEngine
+
+    with DexEngine.from_repo(str(maintain_repo.root)) as engine:
+        result = maintain_cmds.semantic_drift(engine)
+
+    assert result.pending_confirmation is None
+    assert result.pending_offer is not None
+    assert captured["axes"] == ["semantic_cardinality"]
+
+    envelope = to_envelope(result)
+    assert envelope.status is Status.OK
+    assert envelope.data["offer"]["axes"] == ["semantic_cardinality"]
+    assert envelope.cost.estimate is None
+    # The free half really is complete: the definition/reference findings are in
+    # the envelope, while the value behind the cardinality delta never ran.
+    assert not [
+        f
+        for f in envelope.data["findings"]
+        if f["code"] == "dimension_cardinality_changed"
+    ]
