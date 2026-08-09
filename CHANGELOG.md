@@ -50,6 +50,18 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   multi-column grain to express. `DbtProject` implements all three in
   `tests/adapters/test_project_parity.py`, so the shipped format is held to them too.
 
+### Fixed
+
+- **A dev-target refusal no longer mixes path separators mid-sentence on
+  Windows.** The message names the config file beside the profile it disagrees
+  with, and the first half is built from a literal (`.dex/config.yml`) while the
+  second took the platform separator, so a Windows reader got
+  `.dex/config.yml and analytics\profiles.yml`. Both halves are repo-relative
+  labels a reader matches against paths written in configuration rather than
+  paths anything opens, so both now use forward slashes. The assertion that
+  covers it was passing on CI and failing on a Windows checkout, which is the
+  other half of the same bug.
+
 ## [1.6.2] - 2026-08-09
 
 ### Added
