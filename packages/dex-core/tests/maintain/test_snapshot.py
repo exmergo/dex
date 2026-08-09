@@ -270,3 +270,171 @@ def test_a_metadata_baseline_makes_no_cache_age_claim(dex, tmp_path: Path):
     assert payload["data"]["baseline"]["column_detail_count"] == 1
     assert not [w for w in payload["warnings"] if "without column detail" in w]
     assert not [w for w in payload["warnings"] if "freshness" in w]
+
+
+# --- schema_version: written since v1, read by nothing until now (#243) ------
+
+
+#: Every `maintain` entry point that measures against the baseline, which is
+#: exactly the set of `load_snapshot()` call sites `_require_baseline` replaced.
+#:
+#: Parametrized rather than asserted once on `check`, because the consolidation
+#: is the change: a refusal arm that runs on one command proves the helper and
+#: says nothing about whether the other five reach it. Reverting five of the six
+#: back to the original three lines left the entire suite green, so this is the
+#: coverage that makes that mutation red.
+BASELINE_READERS = ("check", "schema", "volume", "grain", "semantic", "reconcile")
+
+
+def _rewrite_baseline(root: Path, **changes) -> None:
+    """Edit the stored baseline in place, the way a bad migration or a hand-edit
+    would. Goes through the file rather than the model so the document can hold
+    a shape the model would refuse to construct."""
+
+    path = root / ".dex" / "snapshot.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc.update(changes)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+@pytest.mark.parametrize("subcommand", BASELINE_READERS)
+def test_a_baseline_from_an_unknown_schema_version_is_refused(
+    maintain_repo, subcommand
+):
+    """The gap this closes: the field was stamped on every write and read by
+    nothing, so a document from a schema this engine does not understand was
+    handed to the detectors as though it were current. That failure is the bad
+    kind, because it is not an error: it is a drift report measured against a
+    shape the engine misread."""
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, schema_version=99)
+
+    code, payload = maintain_repo.dex("maintain", subcommand)
+
+    assert code != 0
+    assert payload["reason"] == "prerequisite", (
+        "an unreadable baseline is a prerequisite failure: the call is well formed "
+        "and a named command fixes it"
+    )
+    message = " ".join(payload["errors"])
+    assert "99" in message and "maintain snapshot" in message
+
+
+@pytest.mark.parametrize("subcommand", BASELINE_READERS)
+def test_a_corrupt_baseline_is_a_prerequisite_not_a_bad_request(
+    maintain_repo, subcommand
+):
+    """`ValidationError` subclasses `ValueError`, so a corrupt baseline reached
+    the CLI catch-all and was classified as a REQUEST error. That tells an
+    operator they typed something wrong when the fix is `maintain snapshot`, and
+    it is the retry-versus-stop distinction `PrerequisiteError` exists to carry."""
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, warehouse="not an object")
+
+    code, payload = maintain_repo.dex("maintain", subcommand)
+
+    assert code != 0
+    assert payload["reason"] == "prerequisite", (
+        "a corrupt baseline must not report as a bad request"
+    )
+    message = " ".join(payload["errors"])
+    assert "could not be read" in message and "maintain snapshot" in message
+
+
+@pytest.mark.parametrize("subcommand", BASELINE_READERS)
+def test_an_absent_baseline_still_reads_as_absent(maintain_repo, subcommand):
+    """The arm that keeps the two states apart. Both remediate the same way, so
+    a single error would have been defensible, and would have thrown away the
+    difference between "you never took a baseline" and "yours is unreadable".
+    Only the second suggests something went wrong."""
+
+    (maintain_repo.root / ".dex" / "snapshot.json").unlink(missing_ok=True)
+
+    code, payload = maintain_repo.dex("maintain", subcommand)
+
+    assert code != 0
+    assert payload["reason"] == "prerequisite"
+    message = " ".join(payload["errors"])
+    assert "no drift baseline yet" in message
+    assert "could not be read" not in message
+
+
+@pytest.mark.parametrize("subcommand", BASELINE_READERS)
+def test_a_current_baseline_is_not_refused(maintain_repo, subcommand):
+    """The quiet arm. Without it, the three assertions above are equally
+    consistent with every baseline being refused, on every command."""
+
+    maintain_repo.snapshot()
+    # `reconcile` needs a drift report as well as a baseline, so give every
+    # command the state it needs: this arm is about what does NOT refuse.
+    maintain_repo.dex("maintain", "check")
+
+    code, payload = maintain_repo.dex("maintain", subcommand)
+
+    assert code == 0, payload.get("errors")
+    assert payload["reason"] is None
+
+
+def test_a_baseline_newer_than_the_engine_does_not_advise_overwriting_it(
+    maintain_repo,
+):
+    """Older and newer are opposite situations and the first move differs.
+
+    dex tells operators to commit `.dex/snapshot.json` like a lockfile, so a
+    baseline newer than the engine reading it is usually a colleague on a newer
+    dex rather than a broken file. Advising `maintain snapshot` first would
+    resolve it by overwriting their baseline with one they cannot read, so the
+    newer arm names upgrading first and says what the overwrite costs."""
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, schema_version=99)
+
+    _, payload = maintain_repo.dex("maintain", "check")
+    message = " ".join(payload["errors"])
+
+    assert "upgrade dex" in message
+    assert message.index("upgrade dex") < message.index("maintain snapshot"), (
+        "the newer arm has to lead with upgrading; naming `maintain snapshot` "
+        "first is what sends an operator to overwrite a shared baseline"
+    )
+
+
+def test_replacing_a_baseline_is_not_advertised_as_free(maintain_repo):
+    """`maintain snapshot` costs nothing and cannot really fail, which is what
+    makes "just re-snapshot" sound costless. The cost is that a replacement pins
+    current state as known-good, so drift accumulated since the last readable
+    baseline is absorbed and never reported on any axis. An operator deciding
+    whether to investigate first has to be told that before they run it."""
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, schema_version=99)
+    _, version_payload = maintain_repo.dex("maintain", "check")
+
+    maintain_repo.snapshot()
+    _rewrite_baseline(maintain_repo.root, warehouse="not an object")
+    _, corrupt_payload = maintain_repo.dex("maintain", "check")
+
+    for payload in (version_payload, corrupt_payload):
+        message = " ".join(payload["errors"])
+        assert "will not be reported" in message, message
+        assert "loses no other state" not in message, (
+            "the claim this replaced: true about other documents, and wrong "
+            "about the only thing a baseline is for"
+        )
+
+
+def test_the_two_unreadable_states_are_told_apart_without_reading_prose():
+    """The public commitment. `BaselineUnreadableError` covers two operational
+    events (a deployment that rolled forward or back, and an integrity problem),
+    and a host that pages on one and not the other would otherwise have to match
+    on the message. Prose is not an interface anyone owes stability on."""
+
+    from exmergo_dex_core import BaselineUnreadableError
+
+    versioned = BaselineUnreadableError("...", schema_version=99)
+    unparseable = BaselineUnreadableError("...")
+
+    assert versioned.schema_version == 99
+    assert unparseable.schema_version is None

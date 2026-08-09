@@ -48,6 +48,63 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   carry over. A format may genuinely have no unparseable state, but a format that
   reached tier 3 writes into a source of truth a human can also edit, so the case
   where the human got there first exists for every one of them.
+- **A corrupt drift baseline is a prerequisite failure, not a bad request**
+  ([#243]). `load_snapshot` raises on a document it cannot parse, and pydantic's
+  `ValidationError` subclasses `ValueError`, so the refusal fell through to the
+  CLI catch-all and was classified as a *request* error. The operator was told
+  they had made a bad request when the fix is `maintain snapshot`, which is
+  exactly the retry-versus-stop distinction `PrerequisiteError` exists to carry.
+  The engine now catches `ValueError` out of the load, so a third-party backend
+  that deserializes its own rows is covered too, and `references/storage.md` and
+  the `Store` protocol both name that as the contract rather than leaving it to
+  be inferred from what the shipped backends happen to raise.
+
+- **A baseline from an unknown schema version is detected at all** ([#243]).
+  `Snapshot.schema_version` was stamped on every write and read by nothing, so a
+  document from a schema this engine does not understand was handed to the
+  detectors as though it were current. That is the worse of the two states,
+  because it is not an error: it is a drift report measured against a shape the
+  engine misread. `SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS` is the set that gives the
+  field a meaning, and the policy is refuse rather than migrate, written down
+  next to the set: a baseline is cheap to regenerate, a migration function per
+  version has to be right about a document nobody has read in a while, and a
+  wrongly migrated baseline is worse than an absent one because drift measured
+  against it looks like a result.
+
+  A set rather than the `<` comparison the query firewall uses on
+  `CACHE_SCHEMA_VERSION`, because the two documents differ: an old cache has a
+  degraded reading and the firewall adds a hint, while a baseline has no
+  degraded reading, only a wrong one. The check runs on a parsed `Snapshot`, so
+  it names a version for a document today's model still validates and refuses a
+  future one that also changed shape as a parse failure instead, with the same
+  remedy and no version named. Both messages say so. `DRIFT_SCHEMA_VERSION` is
+  deliberately left without the same gate, and the reasoning now sits next to
+  the constant.
+
+### Added
+
+- **`BaselineUnreadableError`**, exported from the package root ([#243]). A
+  `PrerequisiteError`, distinct from `NoBaselineError` because "you never took a
+  baseline" and "the baseline you have is unreadable" are different facts about
+  a deployment and only one of them suggests something went wrong, so a host can
+  page on the second without paging on the first. It carries `schema_version`:
+  the stored version when the document parsed and this engine does not read that
+  version, and `None` when it did not parse at all. Those are different
+  operational events (a deployment rolled forward or back, versus an integrity
+  problem) and the attribute is what separates them without matching on message
+  prose.
+
+### Changed
+
+- **A refusal naming `maintain snapshot` now says what running it costs**
+  ([#243]). The command is free on every connector and cannot really fail, which
+  is what makes "just re-snapshot" sound costless. A replacement pins current
+  state as known-good, so drift accumulated since the last readable baseline is
+  absorbed and never reported on any axis. A baseline newer than the engine
+  reading it is also told to upgrade dex first: dex advises committing
+  `.dex/snapshot.json` like a lockfile, so that state is usually a colleague on
+  a newer dex, and replacing the baseline resolves it by overwriting one they
+  can still read.
 
 ## [1.6.0] - 2026-08-08
 
