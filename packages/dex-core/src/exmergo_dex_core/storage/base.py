@@ -121,11 +121,13 @@ class ExploreStore(Protocol):
         for it) as if nothing had ever been explored.
 
         **Raise a ``ValueError``** (pydantic's ``ValidationError`` is one, and is
-        what the shipped backends raise by validating the model). The engine
-        classifies that as a prerequisite failure, which is what tells a host to
-        stop and rebuild rather than to retry. A backend that deserializes its
-        own rows and raises a driver error instead reaches the engine's catch-all
-        and is reported to the operator as a bad request they made.
+        what the shipped backends raise by validating the model). That is the
+        convention the engine reads as "this document will not parse", and it is
+        what ``load_snapshot`` is caught on to report a corrupt baseline as a
+        prerequisite failure rather than as a bad request. This load has no such
+        wrapper yet, so what a backend raises here reaches the engine's catch-all
+        either way; raise a ``ValueError`` so the load is classifiable when it
+        gets one, not because it is classified today.
         """
         ...
 

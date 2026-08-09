@@ -270,11 +270,14 @@ failure.
 **Raise a `ValueError` for the document that will not parse.** Pydantic's
 `ValidationError` is one, so a backend that round-trips the models as described
 above gets this for free and needs to do nothing. It matters for a backend that
-deserializes its own rows: the engine classifies a `ValueError` out of a load as a
-prerequisite failure, which is what tells a host to stop and rebuild the document
-rather than retry the command. Anything else reaches the engine's catch-all and is
-reported to the operator as a bad request they made, when the fix is a dex command
-they have not run.
+deserializes its own rows: `maintain` catches a `ValueError` out of `load_snapshot`
+and classifies it as a prerequisite failure, which is what tells a host to stop and
+rebuild the baseline rather than retry the command. Anything else reaches the
+engine's catch-all and is reported to the operator as a bad request they made, when
+the fix is a dex command they have not run. The other loads carry no such wrapper
+yet — a raise out of `load_cache` or `load_drift` reaches the catch-all whatever its
+type — so raise a `ValueError` there to be classifiable when they get one, not
+because it is classified today.
 
 **A stored `schema_version` is not the store's to police.** Documents carry one and
 the engine reads it: the query firewall degrades on an old cache, and `maintain`
