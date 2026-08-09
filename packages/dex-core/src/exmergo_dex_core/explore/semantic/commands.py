@@ -94,10 +94,14 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         if getattr(args, "mode", None) == "list":
             return to_envelope(semantic_list(engine, api=api, local=local))
+        metrics = [
+            *(getattr(args, "metrics", None) or []),
+            *(getattr(args, "metric", None) or []),
+        ]
         return to_envelope(
             semantic_query(
                 engine,
-                getattr(args, "metric", None) or [],
+                metrics,
                 group_by=getattr(args, "group_by", None),
                 where=getattr(args, "where", None),
                 order_by=getattr(args, "order_by", None),

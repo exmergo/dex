@@ -13,17 +13,20 @@ difference between them is load-bearing, so it is spelled out here.
   by), dimensions, and entities. This is the discovery surface an agent reads to
   decide what to query.
 - `explore semantic query` runs a metric query and returns a capped, row-major
-  result, the same envelope shape as `explore query`. It takes `--metric <m>`
-  (repeatable), and optionally `--group-by <entity__dim>` (repeatable),
+  result, the same envelope shape as `explore query`. It takes a metric
+  positionally after the explicit `query` mode, keeps `--metric <m>` as a
+  repeatable backwards-compatible spelling, and optionally takes
+  `--group-by <entity__dim>` (repeatable),
   `--where "<jinja>"`, `--order-by <c>`, `--grain <g>`, and `--limit N`.
 
 The query grammar is identical across backends: entity-qualified group-by tokens
 (`user__pricing_tier`, `metric_time`), the Jinja filter dialect in `--where`
 (`{{ Dimension('session__is_deleted') }} = false`), and a `--grain` that applies
-to `metric_time`. `--metric`, `--group-by`, and `--order-by` each take either a
-comma-separated list or a repeated flag, and the two mix freely: `--group-by a,b`
-and `--group-by a --group-by b` are the same query. `--where` never splits, because
-a filter clause carries commas of its own.
+to `metric_time`. Positional metrics and the `--metric`, `--group-by`, and
+`--order-by` flags each accept comma-separated lists. The flags may also repeat,
+and the two forms mix freely: `--group-by a,b` and
+`--group-by a --group-by b` are the same query. `--where` never splits, because a
+filter clause carries commas of its own.
 
 ## Choosing a backend (ambient, like a connector)
 
