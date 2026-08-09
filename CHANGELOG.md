@@ -34,7 +34,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   A column is eligible only with no PII flag at all, at any confidence,
   the same rule `is_min_max_safe` and the value-domain check already use.
   Only fractions, format/unit names, and (for epoch) a calendar date
-  translated from an aggregate MIN/MAX ever leave the engine -- never the
+  translated from an aggregate MIN/MAX ever leave the engine, never the
   underlying value. Implemented across every connector (DuckDB, BigQuery,
   Snowflake, Databricks, Redshift, Postgres), reusing the same
   fraction-inside-a-measuring-aggregate mechanism `explore profile` already
