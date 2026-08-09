@@ -110,8 +110,9 @@ Subcommands, in the usual order:
    automatically for this subcommand.
 9. `explore semantic list` and `explore semantic query` reach the dbt semantic
    layer (metrics, dimensions, entities). `list` is discovery: which metrics
-   exist and which dimensions each can be grouped by. `query` takes a `--metric`
-   and a `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
+   exist and which dimensions each can be grouped by. `query` takes a positional
+   metric after the explicit mode (with `--metric` kept for compatibility) and a
+   `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
    `--limit`) and returns a metric's values as a capped, columnar result. Name
    flags take a comma-separated list or a repeated flag (`--group-by a,b` is
    `--group-by a --group-by b`); `--where` is never split. Two backends answer

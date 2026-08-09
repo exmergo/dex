@@ -11,6 +11,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- `explore semantic query` accepts metrics positionally after the explicit `query`
+  mode ([#253]), matching the other `explore` verbs. The repeatable `--metric`
+  flag remains supported for existing callers, and both forms can be combined.
+
 - **Declining tier 3 is a question about the artifact an edit lands in, not about
   where the project came from.** `EditableProject`, `references/project.md` and
   `CONTRIBUTING.md` all stated the decline as an absolute: a project reduced from a

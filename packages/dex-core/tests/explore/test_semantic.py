@@ -116,6 +116,45 @@ def test_cli_group_by_reaches_the_backend_split(monkeypatch):
     assert [q.group_by for q in seen] == [["user__pricing_tier", "metric_time"]] * 2
 
 
+def test_cli_semantic_query_accepts_positional_metrics_and_keeps_the_flag(monkeypatch):
+    from exmergo_dex_core.cli import _build_parser
+    from exmergo_dex_core.explore.semantic import commands as semantic_commands
+
+    seen: list[SemanticQuery] = []
+
+    class _Recorder:
+        name = "local"
+
+        def query(self, q):
+            seen.append(q)
+            return SemanticQueryResult(backend="local")
+
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: _Recorder())
+    parser = _build_parser()
+    for metric_args in (
+        ["sessions"],
+        ["--metric", "sessions"],
+        ["sessions", "--metric", "queries"],
+    ):
+        args = parser.parse_args(
+            ["explore", "semantic", "query", *metric_args, "--local"]
+        )
+        semantic_commands.cmd_semantic(args, _engine())
+
+    assert [query.metrics for query in seen] == [
+        ["sessions"],
+        ["sessions"],
+        ["sessions", "queries"],
+    ]
+
+
+def test_cli_semantic_metric_without_explicit_query_mode_is_rejected():
+    from exmergo_dex_core.cli import _build_parser
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["explore", "semantic", "sessions"])
+
+
 def test_query_leaves_where_clauses_alone():
     # A Jinja filter carries commas of its own, so the split that helps names would
     # cut a clause in half. This is the one list that must never be normalized.

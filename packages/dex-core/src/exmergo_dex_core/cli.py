@@ -199,6 +199,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "mode", nargs="?", choices=["list", "query"], default="list"
                     )
+                    sp.add_argument("metrics", nargs="*")
                     sp.add_argument("--metric", action="append", default=None)
                     sp.add_argument("--group-by", action="append", default=None)
                     sp.add_argument("--where", action="append", default=None)
