@@ -20,12 +20,13 @@ import pytest
 from exmergo_dex_core import dbt_project
 from exmergo_dex_core.adapters.conformance import (
     DeclaringProjectContract,
+    EditableProjectContract,
     MaintainProjectContract,
     ProjectFactoryContract,
 )
 from exmergo_dex_core.adapters.project import (
     DbtProject,
-    MaintainProject,
+    EditableProject,
     ProjectContext,
     tier_of,
 )
@@ -61,7 +62,33 @@ def _project(root: Path, schema: str | None = None) -> Path:
     return project
 
 
-class TestDbtProject(DeclaringProjectContract, MaintainProjectContract):
+def _staged_conflict(root: Path):
+    """A dbt project whose planned target a human changed after planning.
+
+    Shared by both tier-3 conformance subclasses below rather than written twice,
+    because the two differ in how the project is *constructed* and not at all in
+    what the conflict looks like.
+    """
+
+    project = _project(root)
+    target = project / "models" / "stg_customers.sql"
+    edit = dbt_project.Edit(
+        path="models/stg_customers.sql",
+        new_content="select 2 as id\n",
+        old_content_hash=dbt_project.content_hash(target.read_text(encoding="utf-8")),
+    )
+    # The human, arriving after the plan pinned the hash above.
+    target.write_text("select 3 as id -- mine\n", encoding="utf-8")
+
+    return (
+        DbtProject(root, project),
+        project,
+        [edit],
+        lambda: target.read_text(encoding="utf-8"),
+    )
+
+
+class TestDbtProject(DeclaringProjectContract, EditableProjectContract):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
         # One root per assertion: a project is read from disk, so two assertions
@@ -71,6 +98,9 @@ class TestDbtProject(DeclaringProjectContract, MaintainProjectContract):
     def make_project(self) -> DbtProject:
         project = _project(self.root)
         return DbtProject(self.root, project)
+
+    def an_edit_against_a_changed_target(self):
+        return _staged_conflict(self.root)
 
     def make_unreadable_project(self) -> DbtProject:
         # A dbt_project.yml that is not parseable YAML. dbt is a filesystem format,
@@ -115,16 +145,20 @@ class TestDbtProject(DeclaringProjectContract, MaintainProjectContract):
         )
 
 
-class TestDbtProjectFactory(ProjectFactoryContract, MaintainProjectContract):
+class TestDbtProjectFactory(ProjectFactoryContract, EditableProjectContract):
     """The shipped format, built the way configuration builds it.
 
     The same few lines a third party writes, and the reason the construction half
     is worth running in-repo: every other assertion above constructs `DbtProject`
     directly, which is the one path a host reaching dex as a subprocess cannot
     take.
+
+    `tier` is the write tier rather than the read one because that is what the
+    factory actually returns, and a factory silently building one tier lower than
+    the format implements is exactly what this assertion is for.
     """
 
-    tier = MaintainProject
+    tier = EditableProject
 
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
@@ -136,6 +170,9 @@ class TestDbtProjectFactory(ProjectFactoryContract, MaintainProjectContract):
     def empty_context(self) -> ProjectContext:
         _project(self.root)
         return ProjectContext(repo_root=str(self.root), project_dir="analytics")
+
+    def an_edit_against_a_changed_target(self):
+        return _staged_conflict(self.root)
 
 
 class _PathlessProject:
@@ -347,3 +384,68 @@ def test_the_seam_finds_an_unpinned_project_in_a_subdirectory(tmp_path: Path):
 
     assert seam.definitions().present
     assert Path(seam.load().root) == project.resolve()
+
+
+def test_the_write_tier_uses_the_directory_the_caller_passed(tmp_path: Path):
+    """The applying caller's project wins over the one this instance was built for.
+
+    A stored plan records the directory it was pinned against, relative to the repo
+    root, and re-resolves it at apply time; a `DbtProject` built from engine
+    configuration points wherever configuration said. Nothing makes those the same
+    project, and the tier used to resolve from its own configuration, so the edits
+    would land in the engine's project while the hashes were checked against that
+    project's files rather than the plan's.
+
+    Asserted here rather than in the shipped contract because `project_dir` is a
+    slot for the formats keyed by a directory, so the assertion is dbt's to make.
+    """
+
+    configured = _project(tmp_path / "configured")
+    pinned = _project(tmp_path / "pinned")
+    edit = dbt_project.Edit(
+        path="models/stg_customers.sql",
+        new_content="select 2 as id\n",
+        old_content_hash=dbt_project.content_hash(
+            (pinned / "models" / "stg_customers.sql").read_text(encoding="utf-8")
+        ),
+    )
+
+    seam = DbtProject(tmp_path / "configured", configured)
+    result = seam.write_edits([edit], pinned)
+
+    assert result.written == ["models/stg_customers.sql"]
+    assert (pinned / "models" / "stg_customers.sql").read_text(
+        encoding="utf-8"
+    ) == "select 2 as id\n"
+    assert (configured / "models" / "stg_customers.sql").read_text(
+        encoding="utf-8"
+    ) == "select 1 as id\n", (
+        "the edit landed in the configured project rather than the one the caller "
+        "named, which is the disagreement this parameter exists to settle"
+    )
+
+
+def test_the_write_tier_falls_back_to_the_configured_project(tmp_path: Path):
+    """No directory from the caller means the configured pin, as it always did.
+
+    The parameter widens the protocol; it does not change what a caller holding
+    engine configuration and no plan gets. Asserted so the fallback is a decision
+    on the record rather than something a later reader deletes as dead.
+    """
+
+    configured = _project(tmp_path / "configured")
+    edit = dbt_project.Edit(
+        path="models/stg_customers.sql",
+        new_content="select 2 as id\n",
+        old_content_hash=dbt_project.content_hash(
+            (configured / "models" / "stg_customers.sql").read_text(encoding="utf-8")
+        ),
+    )
+
+    seam = DbtProject(tmp_path / "configured", configured)
+    result = seam.write_edits([edit])
+
+    assert result.written == ["models/stg_customers.sql"]
+    assert (configured / "models" / "stg_customers.sql").read_text(
+        encoding="utf-8"
+    ) == "select 2 as id\n"

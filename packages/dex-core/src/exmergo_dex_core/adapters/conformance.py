@@ -16,9 +16,9 @@ runs the contract against your format.
 **Pick the class that matches the tier you implement**, mirroring the protocols
 exactly: :class:`ExploreProjectContract` for a format that can state what it
 declares, :class:`MaintainProjectContract` when it can also produce the two
-snapshot layers. Subclassing a wider contract than your format implements is how
-you find out you have not finished, so the narrow class is a feature rather than a
-convenience.
+snapshot layers, :class:`EditableProjectContract` when it can also receive an edit.
+Subclassing a wider contract than your format implements is how you find out you
+have not finished, so the narrow class is a feature rather than a convenience.
 
 **A project is a source, not a sink, and that shapes this suite.** The storage
 contract can write through the protocol and read back, so it needs no fixtures from
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DeclaringProjectContract",
+    "EditableProjectContract",
     "ExploreProjectContract",
     "MaintainProjectContract",
     "ProjectFactoryContract",
@@ -334,6 +335,106 @@ class MaintainProjectContract(ExploreProjectContract):
 
         assert restored.transform_layer == snap.transform_layer
         assert restored.semantic_layer == snap.semantic_layer
+
+
+class EditableProjectContract(MaintainProjectContract):
+    """Tier 3. Inherits every tier-1 and tier-2 assertion.
+
+    The write tier is the one where getting it wrong costs someone their work
+    rather than costing an inaccurate report, so what is asserted here is
+    behavioural and none of it is optional.
+
+    **The hook below is mandatory, unlike :meth:`make_unreadable_project`.** That
+    one defaults to skipping because a format may genuinely have no unparseable
+    state. This one gets no such excuse: a format reaching tier 3 writes into a
+    source of truth a human can also edit, so the state where the human got there
+    first exists for every format that reaches it. A tier-3 format that cannot
+    stage that scenario cannot detect it either, and a format that cannot detect it
+    overwrites work silently, which is the one failure this seam exists to prevent.
+
+    **The two write assertions have to be read as a pair.** Refusing an unconfirmed
+    conflict is satisfied trivially by a ``write_edits`` that never writes anything,
+    so the confirmed case is what rules that out. Neither is worth much alone.
+
+    **Deliberately not asserted here: which directory the edits land in.**
+    ``project_dir`` is a slot for the formats keyed by one, so an assertion about it
+    would really be an assertion about being a filesystem format. The shipped dbt
+    format asserts it where it means something, in
+    ``tests/adapters/test_project_parity.py``.
+    """
+
+    def an_edit_against_a_changed_target(self) -> tuple[Any, Any, Any, Any]:
+        """A staged conflict: ``(project, project_dir, edits, read_target)``.
+
+        Build a project, plan an edit against something in it, then change that
+        target behind the plan's back, which is what a human editing during review
+        does. Return, in order:
+
+        - ``project``: the tier-3 project the edits are written through.
+        - ``project_dir``: whatever the caller should pass as ``write_edits``'s
+          second argument. A format not keyed by a directory returns ``None``.
+        - ``edits``: the edit set, pinned to the content from *before* the change.
+        - ``read_target``: a zero-argument callable returning what the target holds
+          right now. Any value that compares equal to itself will do; these
+          assertions only ask whether it moved.
+
+        Return a freshly staged scenario on every call. Both assertions below use
+        it and one of them writes, so a shared fixture would let the second see what
+        the first left behind.
+        """
+
+        raise NotImplementedError(
+            "a tier-3 conformance subclass must implement "
+            "an_edit_against_a_changed_target() -> (project, project_dir, edits, "
+            "read_target), staging the case the write tier exists to get right: a "
+            "human edited the target after the plan pinned its content"
+        )
+
+    def test_satisfies_the_editable_tier(self) -> None:
+        assert tier_of(self.make_project()) >= 3
+
+    def test_an_unconfirmed_write_refuses_a_target_that_moved(self) -> None:
+        """The human edit survives, and nothing is written.
+
+        This is propose-don't-impose at the only layer that can enforce it. dex
+        pins the content an edit was planned against precisely so the window
+        between planning and applying, which is a human review and can be long, does
+        not end with someone's work replaced by a proposal written before it
+        existed.
+        """
+
+        project, project_dir, edits, read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+        before = read_target()
+
+        project.write_edits(edits, project_dir)
+
+        assert read_target() == before, (
+            "write_edits() overwrote a target that changed after the edit was "
+            "planned, with confirmed left at its default. A conflict has to refuse "
+            "the whole apply and write nothing until a human confirms it"
+        )
+
+    def test_a_confirmed_write_overrides_the_conflict(self) -> None:
+        """``confirmed=True`` is the human saying they looked and meant it.
+
+        Without this the refusal above is satisfied by a write path that never
+        writes, and a format could pass the contract by doing nothing at all.
+        """
+
+        project, project_dir, edits, read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+        before = read_target()
+
+        project.write_edits(edits, project_dir, confirmed=True)
+
+        assert read_target() != before, (
+            "write_edits() left the target unchanged with confirmed=True. The "
+            "override is what a human reaches for after reading the conflict "
+            "diffs, so a format that refuses either way has no apply path"
+        )
 
 
 class ProjectFactoryContract:

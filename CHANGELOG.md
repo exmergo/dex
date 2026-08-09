@@ -11,6 +11,43 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **The tier-3 write path can carry the two things that make it safe** ([#241],
+  [#242]). `EditableProject.write_edits` declared one argument while the behavior it
+  governs depends on two more. `confirmed` had nowhere to go, so anything routed
+  through the tier would refuse every apply that met a conflict and could never
+  override one, and an implementation written against the published signature had no
+  way to receive it at all. That is the parameter the human-edit conflict handshake
+  turns on: every target is re-hashed against the content it was planned against, and
+  a file whose hash moved is someone's work, not a stale line to overwrite. The
+  project directory was resolved from engine configuration rather than from the plan
+  being applied, and a plan records its own directory relative to the repository root
+  precisely because that is what survives the repository moving, so the two can name
+  different projects with nothing to say so: the edits would land in whichever
+  project the engine happened to be configured for, hash-checked against that
+  project's files.
+
+  The member is now `write_edits(edits, project_dir, *, confirmed=False)`.
+  `DbtProject` passes both through, and a directory the caller names wins over the
+  one the instance was built with. Passing none keeps the configured pin, which is
+  what a caller holding engine configuration and no plan has always had.
+
+  No shipped path changes behavior, because nothing in the distribution called the
+  tier: `transform apply` calls the module-level `dbt_project.write_edits`, which
+  always resolved both correctly, and `reconcile` reads the tier only to decide
+  whether it may author an edit at all. That is the argument for fixing the signature
+  now rather than after someone builds on it. `runtime_checkable` checks only that a
+  method exists, so a third-party implementation of the one-argument shape keeps
+  satisfying `isinstance` and fails at the call.
+
+- **The conformance suite reaches tier 3** ([#241]). `EditableProjectContract` is the
+  class the suite did not have, and it asserts the behavioral half no shape check can
+  see: an unconfirmed write leaves a target someone else changed alone, and a
+  confirmed one goes through. The two are a pair on purpose, since a `write_edits`
+  that never writes satisfies the first by itself. Its one hook raises rather than
+  defaulting to a skip, unlike `make_unreadable_project`, because the excuse does not
+  carry over. A format may genuinely have no unparseable state, but a format that
+  reached tier 3 writes into a source of truth a human can also edit, so the case
+  where the human got there first exists for every one of them.
 - **A corrupt drift baseline is a prerequisite failure, not a bad request**
   ([#243]). `load_snapshot` raises on a document it cannot parse, and pydantic's
   `ValidationError` subclasses `ValueError`, so the refusal fell through to the
