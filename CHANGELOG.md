@@ -23,6 +23,13 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   to, so a format holding one may reach tier 3 for that channel while still refusing
   to author a model. Deciding from "this project is graph-derived" alone declines a
   tier the format could honestly serve. No behavior changes; the guidance does.
+  
+- `references/canonical-model.md`'s extension-seam section described a single
+  `ProjectAdapter` protocol with `load()` and `write_edits()` as the live seam. That
+  protocol is superseded, unreferenced, and satisfies no tier, so a format written
+  against it is refused as "not a project", and this is the document a reader reaches
+  before writing one. It now describes the three tiers and points at
+  `references/project.md`.
 
 ## [1.6.1] - 2026-08-09
 
