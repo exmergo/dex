@@ -58,6 +58,20 @@ SNAPSHOT_SCHEMA_VERSION = 1
 #: arrives, add it here if and only if this engine can genuinely read it; adding
 #: it to keep an old baseline working is how the field stops meaning anything
 #: again.
+#:
+#: A set rather than the ``<`` comparison the query firewall uses on
+#: ``CACHE_SCHEMA_VERSION``, deliberately. That one degrades: an old cache is
+#: still usable, so the firewall adds a hint and carries on. A baseline is not
+#: usable-but-thin in the same way. It is the thing every axis measures against,
+#: so a version this engine does not understand has no degraded reading, only a
+#: wrong one, and membership says exactly that where ``<`` would also have to
+#: pick a side on newer-than-this-engine.
+#:
+#: The check that reads this runs on a *parsed* ``Snapshot``, so it names a
+#: version only for a document the current model still validates. A future
+#: version that also changed shape arrives as a parse failure and is refused
+#: with the same remedy and no version named. Widening that would take a
+#: contract change on ``Store``, which owns the raw document.
 SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({SNAPSHOT_SCHEMA_VERSION})
 
 

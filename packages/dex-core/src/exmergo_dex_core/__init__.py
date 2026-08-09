@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 # subprocess per command, so keeping package import to almost nothing is free
 # latency on every invocation.
 _EXPORTS = {
+    "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
     "CacheRequiredError": "explore.commands",
     "CeilingRequiredError": "guards.cost_guard",
@@ -78,7 +79,6 @@ _EXPORTS = {
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
-    "BaselineUnreadableError": "maintain.commands",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
     "OverCeilingError": "guards.cost_guard",
