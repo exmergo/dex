@@ -58,6 +58,7 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
             ],
             safe={"id"},
             shape={"email"},
+            type_req={"id", "email"},
         )
     finally:
         adapter.close()
@@ -65,8 +66,47 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # Shape statistics ride the same guarded statement (regex predicates inside
     # measuring aggregates, never a raw value in the projection).
     assert "su_1" in sql and "sp_1" in sql and "st_1" in sql
+    # Declared-type-vs-content statistics (#204) ride the same statement too:
+    # string-eligible fractions on the VARCHAR column, epoch fractions on both.
+    assert "ts_ns_1" in sql and "ts_sl1_1" in sql
+    assert "ts_ep_s_0" in sql and "ts_ep_s_1" in sql
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
+
+
+def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
+    """#204: the concrete epoch integer, and the concrete date-shaped string,
+    must never reach the generated data-quality note text -- only the
+    fraction, the format/unit name, and (for epoch) the *translated* calendar
+    date, which is derived from an aggregate MIN/MAX, not a row value."""
+
+    import duckdb
+
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "epoch.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE events (id INTEGER, crt_ts_epoch VARCHAR)")
+    conn.executemany(
+        "INSERT INTO events VALUES (?, ?)",
+        [(i, str(1_700_000_000 + i)) for i in range(50)],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (dataset,) = profile(adapter, ["epoch.main.events"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "epoch" in notes.lower()
+    for i in range(50):
+        assert str(1_700_000_000 + i) not in notes, (
+            "no concrete epoch value may appear in note text"
+        )
+    # The translated calendar date is what appears, not the integer.
+    assert "2023-11-14" in notes
 
 
 def test_combination_probe_sql_is_select_only_in_every_dialect():
@@ -1383,6 +1423,7 @@ def _bq_adapter(fake_bq_client, *, ceiling=500 * 1024 * 1024, confirmed=True):
 def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     # Family 1: every statement the adapter generates passes the SELECT-only
     # guard in the bigquery dialect (asserted at build time, no client needed).
+    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _bq_adapter(fake_bq_client)
@@ -1394,11 +1435,18 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}, shape
+        "test-proj.shop.customers", columns, {"id"}, shape, type_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    # Declared-type-vs-content statistics (#204) ride the same statement too.
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
@@ -1730,6 +1778,7 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _sf_adapter(fake_sf_connection)
@@ -1741,11 +1790,17 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
     sql, _plan = adapter._build_aggregate_sql(
-        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape
+        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
     assert assert_select_only(sql, dialect="snowflake") == sql
 
 
@@ -2000,6 +2055,7 @@ def _dbx_adapter(fake_databricks, *, ceiling=600.0, confirmed=True):
 def test_databricks_generated_sql_is_select_only(fake_databricks):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the databricks dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _dbx_adapter(fake_databricks)
@@ -2011,11 +2067,17 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
     sql, _plan = adapter._build_aggregate_sql(
-        "shop.core.customers", columns, {"id"}, shape
+        "shop.core.customers", columns, {"id"}, shape, type_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
 
 
@@ -2204,6 +2266,7 @@ def _pg_adapter(fake_pg_connection, *, ceiling=600.0, confirmed=True):
 def test_postgres_generated_sql_is_select_only(fake_pg_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the postgres dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _pg_adapter(fake_pg_connection)
@@ -2215,11 +2278,17 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape
+        "dexdb.shop.customers", columns, {"id"}, shape, type_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
 
 
@@ -2438,6 +2507,7 @@ def _redshift_adapter(fake_redshift_connection, *, ceiling=600.0, confirmed=True
 def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the redshift dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _redshift_adapter(fake_redshift_connection)
@@ -2449,11 +2519,17 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape
+        "dexdb.shop.customers", columns, {"id"}, shape, type_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
     assert assert_select_only(sql, dialect="redshift") == sql
 
 

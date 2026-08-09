@@ -32,10 +32,14 @@ from .base import (
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
 )
 
 PARADIGM = "bytes_scanned"
@@ -44,6 +48,8 @@ DIALECT = "bigquery"
 # Columns are profiled in batches so one statement against a very wide table
 # does not balloon (up to 4 expressions per column).
 _COLUMN_BATCH = 50
+
+_BIGINT_TYPE = "INT64"
 
 # BigQuery bills at least this much for any on-demand query that scans data.
 # A remaining budget below it can never cover a statement, so we refuse with
@@ -365,17 +371,19 @@ class BigQueryAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         if self._unqueryable(identifier):
             return [self._empty_aggregate(col) for col in columns]
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
         sample_percent = self._sample_percent(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, sample_percent=sample_percent
+                identifier, batch, safe, shape, type_req, sample_percent=sample_percent
             )
             try:
                 _job, iterator = self._execute(sql)
@@ -435,28 +443,29 @@ class BigQueryAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]]]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape fractions only where requested. Pure (no client), so
-        # the SELECT-only property is testable without a connection. Repeated
-        # (ARRAY) columns get no aggregates at all: they cannot be NULL in
-        # BigQuery and COUNT/DISTINCT are invalid on them; other nested types
-        # get a COUNTIF non-null count only.
+        # and value-shape/type-contradiction fractions only where requested.
+        # Pure (no client), so the SELECT-only property is testable without a
+        # connection. Repeated (ARRAY) columns get no aggregates at all: they
+        # cannot be NULL in BigQuery and COUNT/DISTINCT are invalid on them;
+        # other nested types get a COUNTIF non-null count only.
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             repeated = col.data_type.upper().startswith("ARRAY")
             nested = repeated or self._is_nested(col.data_type)
             if repeated:
-                plan.append((i, col, False, False, False, False))
+                plan.append((i, col, False, False, False, False, False))
                 continue
             if nested:
                 select_parts.append(f"COUNTIF({qcol} IS NOT NULL) AS nn_{i}")
-                plan.append((i, col, True, False, False, False))
+                plan.append((i, col, True, False, False, False, False))
                 continue
             select_parts.append(f"COUNT({qcol}) AS nn_{i}")
             select_parts.append(f"APPROX_COUNT_DISTINCT({qcol}) AS nd_{i}")
@@ -467,7 +476,19 @@ class BigQueryAdapter:
             wants_shape = col.name in shape
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, True, True, wants_min_max, wants_shape))
+            wants_type = col.name in type_req
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            plan.append((i, col, True, True, wants_min_max, wants_shape, wants_type))
         source = self._quote(identifier)
         if sample_percent is not None:
             source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
@@ -486,13 +507,21 @@ class BigQueryAdapter:
     def _read_aggregates(
         self,
         row: Any,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
         n_total = int(row["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, has_count, wants_distinct, wants_min_max, wants_shape in plan:
+        for (
+            i,
+            col,
+            has_count,
+            wants_distinct,
+            wants_min_max,
+            wants_shape,
+            wants_type,
+        ) in plan:
             nn = row[f"nn_{i}"] if has_count else None
             has_counts = nn is not None
             null_fraction = (
@@ -517,6 +546,7 @@ class BigQueryAdapter:
                     upper_vocab_fraction=shape_stat_value(row, f"su_{i}", wants_shape),
                     person_shape_fraction=shape_stat_value(row, f"sp_{i}", wants_shape),
                     avg_token_count=shape_stat_value(row, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(row, i, wants_type),
                 )
             )
         return aggregates
@@ -682,10 +712,11 @@ class BigQueryAdapter:
                 if not is_blob_type(c.data_type)
                 or f"{identifier}.{c.name}".lower() in blob_paths
             ]
-            # min/max and shape fractions add no scanned bytes: columnar
-            # billing already charges the whole column.
+            # min/max, shape, and type-contradiction fractions add no scanned
+            # bytes: columnar billing already charges the whole column.
             safe: set[str] = set()
             shape: set[str] = set()
+            type_req: set[str] = set()
             sample_percent = self._sample_percent(identifier)
             total = 0.0
             for start in range(0, len(scan_columns), _COLUMN_BATCH):
@@ -694,6 +725,7 @@ class BigQueryAdapter:
                     scan_columns[start : start + _COLUMN_BATCH],
                     safe,
                     shape,
+                    type_req,
                     sample_percent=sample_percent,
                 )
                 try:

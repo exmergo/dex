@@ -401,7 +401,13 @@ def test_shape_stats_requested_only_for_generic_name_string_columns():
             return meta, self.columns
 
         def column_aggregates(
-            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
         ):
             self.shape_requests.append(set(shape_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -412,6 +418,185 @@ def test_shape_stats_requested_only_for_generic_name_string_columns():
     # (first_name), not the denylisted qualifier (product_name), not another
     # category (email), not a numeric column.
     assert adapter.shape_requests == [{"reviewer_name"}]
+
+
+def test_type_stats_requested_only_for_eligible_non_pii_columns():
+    """#204: only non-PII string/integer columns buy declared-type-vs-content
+    SQL -- not a float column (neither shape check applies), not a
+    PII-flagged column (any confidence, full stop, same rule as min/max
+    safety and value-domain eligibility)."""
+
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.type_requests: list[set[str]] = []
+            self.columns = [
+                ColumnMeta("id", "INTEGER", False, 0),
+                ColumnMeta("crt_ts_epoch", "VARCHAR", True, 1),
+                ColumnMeta("amount", "NUMERIC", True, 2),
+                ColumnMeta("email", "VARCHAR", True, 3),
+            ]
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=1,
+                byte_size=None,
+                column_count=len(self.columns),
+            )
+            return meta, self.columns
+
+        def column_aggregates(
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+        ):
+            self.type_requests.append(set(type_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.type_requests == [{"id", "crt_ts_epoch"}]
+
+
+# --- declared-type-vs-content notes (#204) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "expect_substring"),
+    [
+        # Clean numeric-only string, every value an integer.
+        (
+            {"numeric_string_fraction": 1.0, "integer_string_fraction": 1.0},
+            "numeric-only",
+        ),
+        # A decimal numeric string: not every value fits an integer.
+        (
+            {"numeric_string_fraction": 1.0, "integer_string_fraction": 0.0},
+            "the rest carry a decimal point",
+        ),
+        ({"iso_date_fraction": 1.0}, "%Y-%m-%d"),
+        ({"iso_datetime_fraction": 1.0}, "%Y-%m-%d %H:%M:%S"),
+        # %m/%d/%Y: the second component (day) is proven >12 somewhere, which
+        # rules out the second component being a month, so it must be MDY.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.0,
+                "slash_second_component_over_12_fraction": 0.1,
+            },
+            "%m/%d/%Y",
+        ),
+        # %d/%m/%Y: the first component is proven >12 somewhere.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.1,
+                "slash_second_component_over_12_fraction": 0.0,
+            },
+            "%d/%m/%Y",
+        ),
+        # Genuinely ambiguous: neither component ever exceeds 12, so the data
+        # cannot distinguish the two orderings.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.0,
+                "slash_second_component_over_12_fraction": 0.0,
+            },
+            "ambiguous",
+        ),
+        # Contradiction: both components are proven >12 at different rows, so
+        # no single format order fits every value -- no note, not a guess.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.1,
+                "slash_second_component_over_12_fraction": 0.1,
+            },
+            None,
+        ),
+        # Epoch seconds vs. milliseconds, distinguished by which fraction wins.
+        (
+            {
+                "epoch_seconds_fraction": 1.0,
+                "epoch_seconds_min_value": 1_600_000_000,
+                "epoch_seconds_max_value": 1_700_000_000,
+            },
+            "seconds",
+        ),
+        (
+            {
+                "epoch_millis_fraction": 1.0,
+                "epoch_millis_min_value": 1_600_000_000_000,
+                "epoch_millis_max_value": 1_700_000_000_000,
+            },
+            "milliseconds",
+        ),
+        # A genuine integer measure (an amount, a count): no plausible epoch
+        # fraction at all, so no note.
+        ({"epoch_seconds_fraction": 0.0, "epoch_millis_fraction": 0.0}, None),
+        # No evidence at all: fail closed.
+        ({}, None),
+    ],
+)
+def test_type_contradiction_note_decisions(agg_kwargs: dict, expect_substring):
+    from exmergo_dex_core.explore.profile import _type_contradiction_notes
+
+    notes = _type_contradiction_notes("crt_ts", "VARCHAR", _aggregate(**agg_kwargs))
+    if expect_substring is None:
+        assert notes == []
+    else:
+        assert any(expect_substring in n for n in notes), notes
+
+
+def test_type_contradiction_note_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _type_contradiction_notes
+
+    assert _type_contradiction_notes("crt_ts", "VARCHAR", None) == []
+
+
+def test_pii_flagged_column_gets_no_type_contradiction_note(tmp_path: Path):
+    """The integration-level gate: `prelim_pii[...] is None` at the `profile()`
+    call site, not just the pure decision function -- a PII-flagged column's
+    content is never even offered to `_type_contradiction_notes`, at any
+    confidence, even though the content itself matches a pattern cleanly."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "pii_epoch.duckdb"
+    conn = duckdb.connect(str(db_path))
+    # "ssn" is a GOVERNMENT_ID token, flagged regardless of type; its content
+    # is a clean numeric-only string, which would otherwise earn a note.
+    conn.execute("CREATE TABLE t (ssn VARCHAR)")
+    conn.executemany(
+        "INSERT INTO t VALUES (?)", [(str(100000000 + i),) for i in range(50)]
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["pii_epoch.main.t"])
+    finally:
+        adapter.close()
+
+    assert dataset.columns[0].pii is not None
+    assert dataset.data_quality == []
 
 
 # --- pii_overrides: the durable human decision ---------------------------------
@@ -536,7 +721,13 @@ def test_pii_override_pattern_clears_across_multiple_tables():
             return meta, columns
 
         def column_aggregates(
-            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
         ):
             self.shape_requests.append(set(shape_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -1104,7 +1295,13 @@ class _StubAdapter:
         return meta, columns
 
     def column_aggregates(
-        self, identifier, columns, *, safe_min_max=None, shape_stats=None
+        self,
+        identifier,
+        columns,
+        *,
+        safe_min_max=None,
+        shape_stats=None,
+        type_stats=None,
     ):
         from exmergo_dex_core.adapters.base import ColumnAggregate
 
@@ -1541,7 +1738,13 @@ def test_row_count_refreshes_after_the_aggregate_scan():
             ]
 
         def column_aggregates(
-            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
         ):
             self.scanned = True
             return [

@@ -22,9 +22,13 @@ from .base import (
     QueryResult,
     ValueDomainSample,
     distinct_combination_sql,
+    is_integer_type,
+    is_string_type,
     json_safe,
     shape_stat_expressions,
     shape_stat_value,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
 )
 
 
@@ -42,6 +46,8 @@ DEFAULT_THREADS = 4
 # Columns are profiled in batches so a single statement against a very wide table
 # does not balloon (4 expressions per column).
 _COLUMN_BATCH = 50
+
+_BIGINT_TYPE = "BIGINT"
 
 # Nested types DuckDB cannot apply approx_count_distinct / min / max to cleanly.
 _NESTED_TYPE_PREFIXES = ("STRUCT", "MAP", "LIST", "UNION")
@@ -210,14 +216,20 @@ class DuckDBAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             results.extend(
                 self._aggregate_batch(
-                    identifier, columns[start : start + _COLUMN_BATCH], safe, shape
+                    identifier,
+                    columns[start : start + _COLUMN_BATCH],
+                    safe,
+                    shape,
+                    type_req,
                 )
             )
         return results
@@ -228,8 +240,11 @@ class DuckDBAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
     ) -> list[ColumnAggregate]:
-        sql, plan = self._build_aggregate_sql(identifier, columns, safe, shape)
+        sql, plan = self._build_aggregate_sql(
+            identifier, columns, safe, shape, type_req
+        )
         row = self._run_select(sql)[0]
         # Re-read by alias name via the cursor description so we never rely on
         # column position arithmetic.
@@ -238,7 +253,7 @@ class DuckDBAdapter:
 
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
+        for i, col, wants_distinct, wants_min_max, wants_shape, wants_type in plan:
             nn = int(values[f"nn_{i}"])
             null_fraction = (1 - nn / n_total) if n_total > 0 else None
             distinct = (
@@ -264,6 +279,7 @@ class DuckDBAdapter:
                         values, f"sp_{i}", wants_shape
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(values, i, wants_type),
                 )
             )
         return aggregates
@@ -355,15 +371,16 @@ class DuckDBAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
+        type_req: set[str],
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool]]]:
         # One aggregate query for the whole batch: COUNT(*) once, plus per column a
         # non-null count, an approximate distinct, min/max only where allowed, and
-        # value-shape fractions only where requested.
+        # value-shape/type-contradiction fractions only where requested.
         # Returns the SQL and a plan mapping each column to which aggregates it got,
         # so results read back by alias unambiguously. Pure: builds no connection,
         # so it is unit-testable (SELECT-only) without touching the database.
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -378,7 +395,21 @@ class DuckDBAdapter:
             wants_shape = (col.name in shape) and not nested
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
+            wants_type = (col.name in type_req) and not nested
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            plan.append(
+                (i, col, wants_distinct, wants_min_max, wants_shape, wants_type)
+            )
         # Interpolated parts are quoted+escaped identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         cols_sql = ", ".join(select_parts)

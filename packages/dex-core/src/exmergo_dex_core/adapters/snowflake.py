@@ -44,15 +44,21 @@ from .base import (
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
     name_list,
     scope_within,
     shape_stat_expressions,
     shape_stat_value,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
 )
 
 PARADIGM = "compute_time"
 DIALECT = "snowflake"
+
+_BIGINT_TYPE = "BIGINT"
 
 # Snowflake keeps a read-only INFORMATION_SCHEMA in every database and an
 # account-internal SNOWFLAKE database. Neither is ever a source, and neither may
@@ -733,16 +739,18 @@ class SnowflakeAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
         meta, _ = self.table_metadata(identifier)
         sample_percent = self._sample_percent(identifier, meta.byte_size)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, sample_percent=sample_percent
+                identifier, batch, safe, shape, type_req, sample_percent=sample_percent
             )
             rows, labels = self._execute(
                 sql, estimate=self._scan_seconds(meta.byte_size)
@@ -772,18 +780,19 @@ class SnowflakeAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool]]]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape fractions only where requested. Pure (no
-        # connection), so the SELECT-only property is testable offline.
-        # Semi-structured columns get the non-null count only
+        # and value-shape/type-contradiction fractions only where requested.
+        # Pure (no connection), so the SELECT-only property is testable
+        # offline. Semi-structured columns get the non-null count only
         # (APPROX_COUNT_DISTINCT and MIN/MAX are invalid or meaningless on
         # them).
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -798,7 +807,21 @@ class SnowflakeAdapter:
             wants_shape = (col.name in shape) and not nested
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
+            wants_type = (col.name in type_req) and not nested
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            plan.append(
+                (i, col, wants_distinct, wants_min_max, wants_shape, wants_type)
+            )
         source = self._quote(identifier)
         if sample_percent is not None:
             source += f" SAMPLE SYSTEM ({sample_percent})"
@@ -814,13 +837,13 @@ class SnowflakeAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
+        for i, col, wants_distinct, wants_min_max, wants_shape, wants_type in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -854,6 +877,7 @@ class SnowflakeAdapter:
                         values, f"sp_{i}", wants_shape
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(values, i, wants_type),
                 )
             )
         return aggregates

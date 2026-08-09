@@ -15,7 +15,14 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from ..adapters.base import Adapter, ColumnAggregate, is_blob_type, json_safe
+from ..adapters.base import (
+    Adapter,
+    ColumnAggregate,
+    is_blob_type,
+    is_integer_type,
+    json_safe,
+)
+from ..adapters.base import is_string_type as _base_is_string_type
 from ..cache import (
     ColumnProfile,
     Dataset,
@@ -158,7 +165,6 @@ _NUMERIC_HINTS = (
 )
 _TEMPORAL_HINTS = ("DATE", "TIME", "TIMESTAMP", "INTERVAL")
 _BOOLEAN_HINTS = ("BOOL",)
-_STRING_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
 
 _MAX_CONFIDENCE = 0.95
 
@@ -206,8 +212,10 @@ def _normalize(column_name: str) -> str:
 
 
 def _is_string_type(data_type: str) -> bool:
-    upper = data_type.upper()
-    return any(h in upper for h in _STRING_HINTS)
+    # Delegates to adapters.base so profile.py's request-set construction and
+    # each adapter's SQL-branch decision (#204) classify a declared type the
+    # same way, single-sourced.
+    return _base_is_string_type(data_type)
 
 
 def is_numeric_type(data_type: str) -> bool:
@@ -337,6 +345,140 @@ def is_min_max_safe(data_type: str, pii: PIIFlag | None) -> bool:
     )
 
 
+# A detector reports only once it clears this fraction of non-null values,
+# matching the codebase's general under-report-over-over-report posture: a
+# false negative here just costs one more `explore query`.
+_TYPE_CONTRADICTION_MATCH_THRESHOLD = 0.95
+
+
+def _type_contradiction_notes(
+    col_name: str, data_type: str, agg: ColumnAggregate | None
+) -> list[str]:
+    """Data-quality notes for a declared type that contradicts its column's
+    content (#204): a string holding dates/timestamps, epoch-shaped numbers,
+    or numeric-only text. Fractions, pattern/format names, and (for epoch) a
+    translated calendar date only -- never a raw value. Fail closed: a
+    missing fraction (not requested, ineligible type, PII-flagged, or the
+    dialect could not) yields no note for that detector.
+    """
+
+    if agg is None:
+        return []
+    notes: list[str] = []
+
+    for fraction, fmt in (
+        (agg.iso_date_fraction, "%Y-%m-%d"),
+        (agg.iso_datetime_fraction, "%Y-%m-%d %H:%M:%S"),
+    ):
+        if fraction is not None and fraction >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+            notes.append(_temporal_note(col_name, data_type, fraction, fmt))
+
+    slash_note = _slash_date_note(col_name, data_type, agg)
+    if slash_note is not None:
+        notes.append(slash_note)
+
+    if (
+        agg.numeric_string_fraction is not None
+        and agg.numeric_string_fraction >= _TYPE_CONTRADICTION_MATCH_THRESHOLD
+    ):
+        notes.append(_numeric_string_note(col_name, data_type, agg))
+
+    epoch_note = _epoch_note(col_name, data_type, agg)
+    if epoch_note is not None:
+        notes.append(epoch_note)
+
+    return notes
+
+
+def _temporal_note(col_name: str, data_type: str, fraction: float, fmt: str) -> str:
+    return (
+        f"{col_name} is declared {data_type} but {fraction:.0%} of values match "
+        f"the {fmt} date format; consider casting with that format"
+    )
+
+
+def _slash_date_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | None:
+    """Disambiguate %m/%d/%Y from %d/%m/%Y, which share one regex shape.
+
+    A component that exceeds 12 anywhere in the data is a logical proof that
+    component cannot be a month -- not a confidence bar, a single
+    counterexample is conclusive -- so `> 0` decides this, never the 0.95
+    match threshold used everywhere else in this module.
+    """
+
+    date_frac = agg.slash_date_fraction or 0.0
+    datetime_frac = agg.slash_datetime_fraction or 0.0
+    total = date_frac + datetime_frac  # mutually exclusive shapes: sum is coverage
+    if total < _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return None
+    has_time = datetime_frac > date_frac
+
+    first_over = (agg.slash_first_component_over_12_fraction or 0.0) > 0
+    second_over = (agg.slash_second_component_over_12_fraction or 0.0) > 0
+    if first_over and second_over:
+        return None  # contradiction: no single format order fits every row
+
+    def fmt(day_first: bool) -> str:
+        base = "%d/%m/%Y" if day_first else "%m/%d/%Y"
+        return f"{base} %H:%M:%S" if has_time else base
+
+    if first_over:  # first component can't be a month (>12): must be the day
+        return _temporal_note(col_name, data_type, total, fmt(day_first=True))
+    if second_over:  # second component can't be a month: must be MDY
+        return _temporal_note(col_name, data_type, total, fmt(day_first=False))
+
+    # Neither component ever exceeds 12: the order cannot be told apart from
+    # the data alone -- say so rather than guessing.
+    return (
+        f"{col_name} is declared {data_type} and {total:.0%} of values match a "
+        f"slash-separated date shape, but the day/month order is ambiguous "
+        f"({fmt(day_first=True)} and {fmt(day_first=False)} both fit every "
+        "value); casting either way risks a silent swap"
+    )
+
+
+def _numeric_string_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str:
+    integer_fraction = agg.integer_string_fraction or 0.0
+    if integer_fraction >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        shape = "every value fits an integer"
+    else:
+        shape = (
+            f"only {integer_fraction:.0%} of values fit an integer "
+            "(the rest carry a decimal point)"
+        )
+    return (
+        f"{col_name} is declared {data_type} but {agg.numeric_string_fraction:.0%} "
+        f"of values are numeric-only strings; {shape}"
+    )
+
+
+def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | None:
+    seconds = agg.epoch_seconds_fraction or 0.0
+    millis = agg.epoch_millis_fraction or 0.0
+    if (
+        seconds < _TYPE_CONTRADICTION_MATCH_THRESHOLD
+        and millis < _TYPE_CONTRADICTION_MATCH_THRESHOLD
+    ):
+        return None
+    if seconds >= millis:
+        unit, fraction = "seconds", seconds
+        lo, hi = agg.epoch_seconds_min_value, agg.epoch_seconds_max_value
+    else:
+        unit, fraction = "milliseconds", millis
+        lo, hi = agg.epoch_millis_min_value, agg.epoch_millis_max_value
+    if lo is None or hi is None:
+        return None  # evidence incomplete: fail closed, no unverifiable claim
+
+    divisor = 1000 if unit == "milliseconds" else 1
+    lo_date = datetime.fromtimestamp(lo / divisor, tz=UTC).date().isoformat()
+    hi_date = datetime.fromtimestamp(hi / divisor, tz=UTC).date().isoformat()
+    return (
+        f"{col_name} is declared {data_type} but {fraction:.0%} of values fall "
+        f"in the plausible unix-epoch-{unit} range; implied date range "
+        f"{lo_date} to {hi_date}"
+    )
+
+
 def profile(
     adapter: Adapter,
     identifiers: list[str],
@@ -399,6 +541,16 @@ def profile(
             for name, (flag, generic) in classified.items()
             if generic and prelim_pii[name] is not None
         }
+        # Declared-type-vs-content checks (#204) run only for non-PII
+        # string/integer columns: PII at any confidence is excluded, full
+        # stop, the same rule is_min_max_safe and value-domain eligibility
+        # already use.
+        type_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None
+            and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
+        }
 
         # Blob-type columns can only ever yield a null fraction and a distinct
         # estimate, yet a columnar engine bills for the whole column once it is
@@ -415,7 +567,11 @@ def profile(
         aggregates = {
             a.name: a
             for a in adapter.column_aggregates(
-                identifier, scan_columns, safe_min_max=safe, shape_stats=shape
+                identifier,
+                scan_columns,
+                safe_min_max=safe,
+                shape_stats=shape,
+                type_stats=type_stats,
             )
         }
         # Re-read the metadata after the aggregate scan: adapters whose
@@ -464,6 +620,10 @@ def profile(
                 generic=col.name in shape,
                 row_count=meta.row_count,
             )
+            if prelim_pii[col.name] is None:
+                data_quality.extend(
+                    _type_contradiction_notes(col.name, col.data_type, agg)
+                )
             profiles.append(
                 ColumnProfile(
                     name=col.name,

@@ -52,14 +52,20 @@ from .base import (
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
 )
 
 PARADIGM = "db_load"
 DIALECT = "postgres"
+
+_BIGINT_TYPE = "BIGINT"
 
 # Columns are profiled in batches so one statement against a very wide table
 # does not balloon (up to 3 expressions per column).
@@ -610,9 +616,11 @@ class PostgresAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
         meta, _ = self.table_metadata(identifier)
         sample_percent = self._sample_percent(identifier, meta.byte_size)
         stats = self._table_stats(identifier)
@@ -620,7 +628,7 @@ class PostgresAdapter:
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, sample_percent=sample_percent
+                identifier, batch, safe, shape, type_req, sample_percent=sample_percent
             )
             rows, labels = self._execute(
                 sql, estimate=self._scan_seconds(meta.byte_size)
@@ -667,18 +675,19 @@ class PostgresAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool]]]:
         # One aggregate statement per batch, a single cheap pass: COUNT(*)
         # once, then per column a non-null count, min/max only where allowed,
-        # and value-shape fractions only where requested. Distinct counts
-        # deliberately do NOT scan here (they come free from pg_stats);
-        # COUNT(DISTINCT) across every column is exactly the sort/hash load a
-        # production primary should not carry. Pure (no connection), so the
-        # SELECT-only property is testable offline.
+        # and value-shape/type-contradiction fractions only where requested.
+        # Distinct counts deliberately do NOT scan here (they come free from
+        # pg_stats); COUNT(DISTINCT) across every column is exactly the
+        # sort/hash load a production primary should not carry. Pure (no
+        # connection), so the SELECT-only property is testable offline.
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             degraded = self._is_degraded(col.data_type)
@@ -691,7 +700,21 @@ class PostgresAdapter:
             wants_shape = (col.name in shape) and not degraded
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
+            wants_type = (col.name in type_req) and not degraded
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            plan.append(
+                (i, col, wants_distinct, wants_min_max, wants_shape, wants_type)
+            )
         source = self._quote(identifier)
         if sample_percent is not None:
             source += f" TABLESAMPLE SYSTEM ({sample_percent})"
@@ -708,7 +731,7 @@ class PostgresAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]],
         stats: dict[str, float],
         *,
         row_basis: int | None,
@@ -716,7 +739,7 @@ class PostgresAdapter:
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
+        for i, col, wants_distinct, wants_min_max, wants_shape, wants_type in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -752,6 +775,7 @@ class PostgresAdapter:
                         values, f"sp_{i}", wants_shape
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(values, i, wants_type),
                 )
             )
         return aggregates
