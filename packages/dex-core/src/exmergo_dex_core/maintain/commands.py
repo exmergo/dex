@@ -696,7 +696,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import DbtProject
+    from ..adapters.project import PlacingProject
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
@@ -739,12 +739,14 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             "Reconcile what these findings describe wherever your models are "
             "actually defined"
         )
-    elif not isinstance(editable, DbtProject):
+    elif not isinstance(editable, PlacingProject):
         warnings.append(
             f"the '{editable.name}' project format implements the write tier, but "
-            "reconcile's mechanical edits are dbt artifacts (a staging model and "
-            "its schema YAML) and dex cannot yet author them for another format, "
-            "so every proposal below is advisory"
+            "does not say where a proposed edit lands, so reconcile has no path to "
+            "plan an edit against and every proposal below is advisory. A format "
+            "reaches this path by implementing `PlacingProject`, which answers "
+            "where an edit of a given kind goes and may decline a kind by "
+            "answering None"
         )
     else:
         try:
@@ -758,6 +760,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         store.load_cache(),
         view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        placement=editable if isinstance(editable, PlacingProject) else None,
     )
     warnings.extend(build_warnings)
 

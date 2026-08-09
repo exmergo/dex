@@ -64,12 +64,14 @@ from ..maintain import snapshot
 if TYPE_CHECKING:
     from ..dbt_project import DbtProjectView, ProjectDefinitions
     from ..maintain.snapshot import SemanticLayer, TransformLayer
+    from ..transform.plans import EditKind
 
 __all__ = [
     "DbtProject",
     "EditableProject",
     "ExploreProject",
     "MaintainProject",
+    "PlacingProject",
     "ProjectAdapter",
     "ProjectContext",
     "ProjectFactory",
@@ -193,6 +195,60 @@ class EditableProject(MaintainProject, Protocol):
         made while the plan sat in review.
         :class:`~.conformance.EditableProjectContract` asserts the behavior,
         because no shape check can.
+        """
+        ...
+
+
+@runtime_checkable
+class PlacingProject(Protocol):
+    """Optional beside tier 3: where a proposed edit lands.
+
+    Tier 3 says a format *can* receive an edit. It does not say where the edit
+    goes, and ``maintain reconcile`` decides that before it consults the format:
+    both of its mechanical write paths build ``models/staging/stg_<table>.sql``
+    and ``models/staging/stg_<table>.yml`` and then look those up in the view
+    ``load()`` returned. A second format satisfying tier 3 in full is therefore
+    handed edits naming files it does not have, and its only options are to
+    refuse them or to guess a mapping. A wrong guess writes into the wrong file
+    with a hash check that passes, because the file was not there.
+
+    Implementing this says where. It is deliberately not a request to let a
+    format author the edit *content*: reconcile still decides what to write, and
+    a format that cannot accept what reconcile writes says so per kind, below.
+
+    **A protocol rather than a flag, for the reason the tiers are.** A flag is a
+    claim the engine has to interpret and trust. ``isinstance(project,
+    PlacingProject)`` is checkable, and a format that cannot place an edit
+    cannot accidentally claim it can.
+
+    **Separate from** :class:`EditableProject` **rather than a method on it.**
+    The tiers are ``runtime_checkable``, so a method added to tier 3 silently
+    demotes every format that has not implemented it yet: ``tier_of`` would
+    start answering 2 where it answered 3, and the write path would close for
+    exactly the implementers who were already passing. Beside it, the answer for
+    a format that has not implemented this is "tier 3, placement unknown", which
+    is the truth and is what the caller warns about.
+    """
+
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        """Where an edit of ``kind`` for ``model`` lives, or ``None``.
+
+        ``model`` is the warehouse table the finding is about, not a model name
+        in any format's vocabulary: the ``stg_`` prefix is dbt's own scaffold
+        convention and applying it here would push that convention through the
+        seam meant to escape it.
+
+        The return is a key into whatever :meth:`EditableProject.load` returns,
+        not a filesystem path. The format already owns that keyspace; reconcile
+        is only guessing keys into it today.
+
+        **``None`` per kind is the point, not a degenerate case.** The kinds are
+        not equally receivable and a format is expected to answer differently
+        across them. The shape this exists for is a format whose models are
+        reduced from a running graph, and so cannot receive an authored
+        ``MODEL_SQL``, while its declared keys and joins are hand-written files
+        that nothing regenerates and can receive a ``SCHEMA_YML`` test. One
+        ``None`` and one path is a complete, honest answer.
         """
         ...
 
@@ -430,3 +486,16 @@ class DbtProject:
             project_dir or self.project_dir or self.repo_root,
             confirmed=confirmed,
         )
+
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        """The scaffold convention, which is what reconcile hard-coded before.
+
+        Both kinds resolve, because for dbt both artifacts are the source of
+        truth. A kind reconcile does not propose today returns ``None`` rather
+        than a path this class would be inventing.
+        """
+
+        from ..transform.plans import EditKind as _EditKind
+
+        suffix = {_EditKind.MODEL_SQL: "sql", _EditKind.SCHEMA_YML: "yml"}.get(kind)
+        return None if suffix is None else f"models/staging/stg_{model}.{suffix}"
