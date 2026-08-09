@@ -785,7 +785,7 @@ def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     drift_class = getattr(args, "drift_class", None)
     try:
         result = reconcile(engine, drift_class)
-    except (NoBaselineError, ProjectError) as exc:
+    except (NoBaselineError, BaselineUnreadableError, ProjectError) as exc:
         return env.error_for(exc)
     if not result.proposals:
         scope = f" for the '{drift_class}' axis" if drift_class else ""
