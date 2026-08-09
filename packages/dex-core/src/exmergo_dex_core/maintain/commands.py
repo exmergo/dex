@@ -466,9 +466,10 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     """Definitions that no longer match: dangling references, new categoricals.
 
     Two-phase on billed connectors: definition and reference checks are free and
-    run immediately; the dimension-cardinality scan waits behind the handshake,
-    and an unconfirmed call still returns the complete free findings alongside
-    the estimate rather than throwing away work that cost nothing but is real.
+    run immediately; the dimension-cardinality scan is offered on top. An
+    unconfirmed call is a complete answer for the free half, not a pending
+    charge, so it returns ``ok`` carrying those findings and an offer for the
+    scan rather than throwing away work that cost nothing but is real.
     """
 
     store = engine.store
@@ -501,22 +502,23 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     checks = drift_mod.cardinality_plan(
         current_semantic, snap, _semantic_names(scope_names) if scope_names else None
     )
-    pending: ConfirmationRequest | None = None
+    offer: ConfirmationRequest | None = None
     billed_findings: list[drift_mod.DriftFinding] = []
     if checks:
         estimate, per_table = drift_mod.cardinality_estimate(adapter, checks)
-        pending = command_args.confirmation_request(
+        offer = command_args.confirmation_request(
             "maintain semantic",
             adapter,
             estimate,
             per_table=per_table,
+            axes=["semantic_cardinality"],
             notes=[
-                "the definition and reference checks are free and already "
-                "complete (their findings are included in this envelope); "
-                "the estimate covers only the dimension-cardinality scan"
+                "the definition and reference findings in this envelope are "
+                "final; the estimate buys the dimension-cardinality scan on top "
+                "of them"
             ],
         )
-    if pending is None:
+    if offer is None:
         billed_findings = _semantic_scope(
             drift_mod.cardinality_drift(adapter, checks, current_semantic),
             scope_names,
@@ -524,19 +526,20 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
 
     ranked = drift_mod.rank_findings(free_findings + billed_findings)
     _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
-    if pending is not None:
-        # The free half is complete and real, so it returns alongside the ask
-        # for the scanning half rather than being discarded and re-derived.
-        result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
-        result.pending_confirmation = pending
-        return result
-    result = _drift_result(
-        {"semantic": ranked},
-        snap,
-        store,
-        warnings=warnings
-        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
+    # Identical warnings either way. Every reason this baseline may not describe
+    # the warehouse bounds the free findings exactly as it bounds the settled
+    # ones, and the unconfirmed call is the one a session makes first, so it is
+    # the last place that caveat should go missing.
+    warnings = warnings + _baseline_warnings(
+        store, snap, engine.config.profile_freshness_hours
     )
+    if offer is not None:
+        # The free half is complete and real, so it returns as the answer it is,
+        # with the scanning half offered on top rather than gating it.
+        result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
+        result.pending_offer = offer
+        return result
+    result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
     return command_args.stamp_spend(result, adapter)
 
 
@@ -550,7 +553,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     Two-phase by construction: the free axes (schema, volume, semantic
     references) always run and their findings always return; the scanning axes
     (grain, cardinality) run immediately on free connectors and behind one
-    combined estimate on billed ones.
+    combined estimate on billed ones. An unconfirmed call on a billed connector
+    is therefore a complete answer for three axes rather than a pending charge,
+    and says so: ``ok``, with ``axes_run`` naming what finished and ``offer``
+    naming what the estimate would add.
 
     ``objects`` narrows every axis exactly like the focused detectors do:
     schema/volume/grain resolve it against known identifiers (raising if a
@@ -609,27 +615,46 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     scans_needed = bool(
         plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
     )
-    pending: ConfirmationRequest | None = None
+    offer: ConfirmationRequest | None = None
     if scans_needed and command_args.cost_gate(adapter) is not None:
         grain_total, grain_per = drift_mod.grain_estimate(adapter, plan)
         card_total, card_per = drift_mod.cardinality_estimate(adapter, checks)
         per_table = dict(grain_per)
         for identifier, estimate in card_per.items():
             per_table[identifier] = per_table.get(identifier, 0.0) + estimate
-        pending = command_args.confirmation_request(
+        # Only the axes with work planned, so the offer names what the estimate
+        # actually buys rather than the pair it usually covers.
+        grain_planned = bool(
+            plan.key_checks or plan.fanout_pairs or plan.composite_checks
+        )
+        offered_axes = [
+            axis
+            for axis, planned in (
+                ("grain", grain_planned),
+                ("semantic_cardinality", bool(checks)),
+            )
+            if planned
+        ]
+        offer = command_args.confirmation_request(
             "maintain check",
             adapter,
             grain_total + card_total,
             per_table=per_table,
+            axes=offered_axes,
             notes=[
-                "the schema, volume, and semantic reference checks are free "
-                "and already complete (their findings are included in this "
-                "envelope); the estimate covers the grain and "
-                "dimension-cardinality scans"
+                "the schema, volume, and semantic reference findings in this "
+                "envelope are final; the estimate buys the grain and "
+                "dimension-cardinality scans on top of them"
             ],
         )
 
-    if pending is not None:
+    # Identical warnings on both paths: what bounds the settled answer bounds the
+    # free one too, and the unconfirmed call is the one a session opens with.
+    warnings = warnings + _baseline_warnings(
+        store, snap, engine.config.profile_freshness_hours
+    )
+
+    if offer is not None:
         drift_mod.annotate_impacts(schema_findings + volume_findings, snap)
         by_axis = {
             "schema": drift_mod.rank_findings(schema_findings),
@@ -641,7 +666,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
             store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
         )
         result = _drift_result(by_axis, snap, store, warnings=warnings)
-        result.pending_confirmation = pending
+        result.pending_offer = offer
         return result
 
     grain_findings = drift_mod.grain_drift(
@@ -662,13 +687,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     _record_axes(
         store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
     )
-    result = _drift_result(
-        by_axis,
-        snap,
-        store,
-        warnings=warnings
-        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
-    )
+    result = _drift_result(by_axis, snap, store, warnings=warnings)
     return command_args.stamp_spend(result, adapter)
 
 

@@ -46,9 +46,13 @@ class PlanResult(Result):
     paths: list[str] = Field(default_factory=list)
     plan_path: str = ""
     # Semantic authoring classifies each name it touched, so a mixed payload
-    # reports which definitions it created and which it evolved.
+    # reports which definitions it created, which it evolved, and which it
+    # merely re-stated. The third class is what keeps the first two readable:
+    # a whole-file edit restates every definition in the file, and without it
+    # a two-object change reports as a thirty-object one.
     defined: list[str] | None = None
     updated: list[str] | None = None
+    unchanged: list[str] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -62,6 +66,8 @@ class PlanResult(Result):
             payload["defined"] = self.defined
         if self.updated is not None:
             payload["updated"] = self.updated
+        if self.unchanged is not None:
+            payload["unchanged"] = self.unchanged
         return payload
 
 

@@ -62,13 +62,13 @@ project's real config instead of a wrong default.
 | `transform macro [name]` | no name lists the shipped dbt macros; a name proposes scaffolding it into the project's macro directory as a plan (dbt-parse-checked, applied with `transform apply`); re-running diffs the project's copy against the shipped version |
 | `transform build --target dev` | prod-looking targets refused outright; then a free dev-target preflight (refuses when `.dex/config.yml` and the rendered `profiles.yml` disagree, or when the dev database does not exist, naming the fix); then the cost preflight, priced upfront by a free `dbt compile` dry-run of each node (a partial floor when a cold dev target has not built a node's inputs yet; degrades to no estimate when dex cannot open its own connection); runs only with `--confirm` and a budget; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
 | `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
-| `semantic define\|update\|plan ... --edits-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies per name; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
+| `semantic define\|update\|plan ... --edits-file <f>\|--definitions-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies each name `defined`, `updated`, or `unchanged`; `--definitions-file` names one definition at a time instead of a whole file; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
 | `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` (pins the `.dex/` map + per-layer definition fingerprints) |
-| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors (free axes now, one estimate for the scanning axes) |
+| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors: the free axes complete and return `ok`, with one estimate for the scanning axes under `data.offer` |
 | `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources (free) |
 | `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata) |
 | `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout (scans; gated on billed connectors) |
-| `maintain semantic [<objects>]` | definition drift and dangling refs (free) plus categorical dimension cardinality change (scans; gated on billed connectors) |
+| `maintain semantic [<objects>]` | definition drift and dangling refs (free, and returned as `ok`) plus categorical dimension cardinality change (scans; offered under `data.offer` and gated on billed connectors) |
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
@@ -82,6 +82,13 @@ is not free: `schema`, `volume`, and the reference half of `semantic` are metada
 scan and go through the `--confirm --budget` handshake on billed connectors. The
 engine does not care which skill fronts a subcommand.
 
+A command whose free half completed reports `ok` and puts the price of the
+scanning half in `data.offer`, rather than gating the whole answer behind a
+confirmation. `needs_confirmation` means dex is waiting on you for work you asked
+for; an offer is work you did not ask for, and ignoring it is a valid choice.
+Read `data.axes_run` for what completed and `data.offer.axes` for what the
+estimate would add, since with an `ok` status those are no longer implied.
+
 Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "op", "content"}, ...]}`
 with `kind` one of `model_sql`, `schema_yml`, `semantic_yml`, `packages_yml` (the
@@ -89,7 +96,15 @@ guarded way to author the project-root `packages.yml`/`dependencies.yml`, so
 declaring a dbt package is a reviewable diff too), `macro_sql`, `project_yml`
 (the project-root `dbt_project.yml`), or `profiles_yml` (the project-root
 `profiles.yml`, secret-guarded so a credential never enters the diff: reference
-secrets via `{{ env_var('NAME') }}`). `op` is `upsert` (create or update, the
+secrets via `{{ env_var('NAME') }}`). The semantic commands take a second,
+narrower payload instead: `--definitions-file <path|->` with
+`{"definitions": [{"kind", "path", "content"}, ...]}`, where `kind` is
+`semantic_model` or `metric` and `content` is that one definition's YAML body.
+The name is read from the content, and `path` may be omitted for a definition
+the project already declares, in which case it is rewritten where it lives. Use
+it whenever a change touches part of a shared file: the engine writes each
+definition in place and leaves every other byte, including comments, untouched,
+so the diff and the classification both describe only what changed. `op` is `upsert` (create or update, the
 default, carrying `content`) or `delete` (remove the file, no `content`); a
 delete is a reviewable diff too, guarded so the plan is refused if any surviving
 file still `ref()`s a deleted model, and a rename is one plan (delete old, create
@@ -110,7 +125,17 @@ would spend requires an explicit `--confirm` and a session budget: on a
 metered connector (BigQuery, Snowflake, Databricks, Redshift, and Postgres)
 the first call returns `needs_confirmation` with a free estimate, and the
 same command is re-issued with `--confirm --budget <magnitude>` once the user
-has agreed to the spend. The magnitude is paradigm-relative: **bytes** on
+has agreed to the spend.
+
+One exception to the status, not to the rule: a command that finished free work
+the caller did want, and can offer paid work they did not ask for, returns `ok`
+with the estimate under `data.offer` instead. That is `maintain check` and
+`maintain semantic`. The re-issue is identical (`--confirm --budget`), nothing
+runs until it arrives, and `cost.estimate` stays empty so an `ok` never reads as
+though it spent. Reserve `needs_confirmation` for reading "dex is waiting on
+me", and an offer for "there is more available if I want it".
+
+The magnitude is paradigm-relative: **bytes** on
 BigQuery (an exact free dry-run figure), **warehouse-seconds** on Snowflake
 (a heuristic labeled `estimate_quality: "heuristic"`, with a credit
 translation alongside) and on Databricks (a floor labeled

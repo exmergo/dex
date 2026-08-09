@@ -3282,6 +3282,74 @@ def test_api_verify_checkpoint_keeps_what_it_already_paid_for(
     assert any("saved unverified" in note for note in result.notes)
 
 
+def test_api_unrequested_paid_work_is_offered_not_demanded(
+    api_engine, fake_bq_client, tmp_path
+):
+    """Family 2: the handshake guards spend, not the delivery of free answers.
+
+    `maintain check` completes its free axes on every call. Returning those
+    inside a `needs_confirmation` envelope asked the caller to confirm work they
+    had not requested in order to read work that cost nothing, which teaches the
+    habit of confirming reflexively. The guarantee that matters is unchanged and
+    asserted here: no scan runs, and the estimate is surfaced first. What
+    changed is that the free answer is delivered as one.
+    """
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+    from exmergo_dex_core.results import to_envelope
+
+    now = datetime.now(UTC).isoformat()
+    FilesystemStore(tmp_path).save_snapshot(
+        Snapshot(
+            created_at=now,
+            connector="bigquery",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="test-proj.shop.customers",
+                        row_count=100,
+                        byte_size=5_000,
+                        columns=[
+                            ColumnProfile(
+                                name="id",
+                                data_type="INTEGER",
+                                nullable=False,
+                                null_fraction=0.0,
+                                distinct_count=100,
+                                distinct_count_exact=True,
+                                is_unique=True,
+                            )
+                        ],
+                        candidate_keys=[["id"]],
+                        grain=["id"],
+                        profiled_at=now,
+                    )
+                ]
+            ),
+            warehouse_from="cache",
+        )
+    )
+
+    with api_engine() as engine:
+        from exmergo_dex_core.maintain import commands as maintain_cmds
+
+        result = maintain_cmds.check(engine)
+
+    # Nothing dex was not asked to do has run, and nothing was billed.
+    assert result.pending_confirmation is None
+    assert result.pending_offer is not None
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    assert result.spend is None
+
+    envelope = to_envelope(result)
+    assert envelope.status is env.Status.OK
+    # Cost before spend still holds: the price is on the response, in the one
+    # place that means "not yet spent" rather than "already spent".
+    assert envelope.data["offer"]["estimated_bytes"] > 0
+    assert envelope.cost.estimate is None
+
+
 def test_api_pii_stays_flagged_and_never_surfaced(duckdb_file: Path):
     # Family 3, through the API: the firewall's verdict does not depend on which
     # door the query came in through.
