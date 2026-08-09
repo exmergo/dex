@@ -46,12 +46,23 @@ other channel: not through the layers, not through a content hash. A format that
 implements only tier 1 has already delivered the part of a project that changes what
 `explore` concludes.
 
-**Tier 3 is the one to decline on purpose.** A project reduced from a running graph
-cannot receive an edit: its source of truth is the code that produced the graph, so
-writing into the reduction would edit an artifact that is regenerated on the next
-run. Declining the tier is the honest answer, and it is why the tiers exist rather
-than a `writeback: no` flag. A flag is a claim the engine has to trust, while a tier
-is checkable.
+**Tier 3 is the one to decline on purpose.** The clearest case is a project reduced
+from a running graph, where the reduction is not the source of truth: the code that
+produced the graph is, so writing into the reduction would edit an artifact that is
+regenerated on the next run. Declining the tier is the honest answer, and it is why
+the tiers exist rather than a `writeback: no` flag. A flag is a claim the engine has
+to trust, while a tier is checkable.
+
+**Ask which artifact the edit lands in, not where the project came from.** Those two
+questions have different answers more often than the graph example suggests. A format
+can reduce a graph for its model list and still read its declared keys, joins and
+semantics from hand-authored files that nothing regenerates, which is a common shape:
+an asset graph carries neither column names nor join keys, so a format over one has
+to get them from somewhere, and that somewhere is usually a file a person wrote. Those
+files are a real source of truth and they are the shape `reconcile` already proposes
+edits to. A format holding one may reach tier 3 for that channel while still refusing
+to author a model, and deciding from "we are graph-derived" alone would decline a tier
+it could honestly serve.
 
 That distinction has teeth, and it is what `maintain reconcile` reads. A format that
 does not implement `EditableProject` gets every finding back as an advisory

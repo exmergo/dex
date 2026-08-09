@@ -13,6 +13,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 - Expired BigQuery credentials now report a retryable prerequisite instead of
   an internal error.
+  
+### Changed
+
+- **Declining tier 3 is a question about the artifact an edit lands in, not about
+  where the project came from.** `EditableProject`, `references/project.md` and
+  `CONTRIBUTING.md` all stated the decline as an absolute: a project reduced from a
+  running graph cannot receive an edit. That is right about the reduction and wrong
+  as a general rule, and the two come apart more often than the graph example
+  suggests. An asset graph carries neither column names nor join keys, so a format
+  over one reads its declared keys, joins and semantics from somewhere else, and that
+  somewhere is usually a hand-authored file that nothing regenerates. Those files are
+  a real source of truth and they are the shape `reconcile` already proposes edits
+  to, so a format holding one may reach tier 3 for that channel while still refusing
+  to author a model. Deciding from "this project is graph-derived" alone declines a
+  tier the format could honestly serve. No behavior changes; the guidance does.
+  
+- `references/canonical-model.md`'s extension-seam section described a single
+  `ProjectAdapter` protocol with `load()` and `write_edits()` as the live seam. That
+  protocol is superseded, unreferenced, and satisfies no tier, so a format written
+  against it is refused as "not a project", and this is the document a reader reaches
+  before writing one. It now describes the three tiers and points at
+  `references/project.md`.
 
 ## [1.6.1] - 2026-08-09
 
