@@ -148,8 +148,39 @@ class EditableProject(MaintainProject, Protocol):
     naming coincidence.
     """
 
-    def write_edits(self, edits: Any) -> Any:
-        """Write proposed edits back into the project as reviewable diffs."""
+    def write_edits(
+        self, edits: Any, project_dir: Any, *, confirmed: bool = False
+    ) -> Any:
+        """Write proposed edits back into the project as reviewable diffs.
+
+        **``project_dir`` comes from the caller, not from how this project was
+        built.** The caller is applying a stored plan, and a plan records the
+        directory it was pinned against relative to the repository root, which is
+        what keeps it valid when the repository moves (see ``transform.plans``). A
+        project built from engine configuration need not point at that directory, so
+        resolving it here would write the edits into whichever project the engine
+        happened to be configured for, and hash-check them against that project's
+        files. The two agreeing is the common case rather than a guarantee, and the
+        disagreement is silent.
+
+        It is a slot for the formats that have one, exactly as ``repo_root`` and
+        ``project_dir`` are on :class:`ProjectContext`. A format keyed by something
+        other than a directory ignores it, rather than this protocol growing a
+        variant per kind of coordinate.
+
+        **``confirmed`` carries the human-edit conflict handshake, and cannot be
+        left out.** Re-hash every target against the content the edit was planned
+        against; a file whose hash moved is a conflict. With ``confirmed=False`` a
+        conflict refuses the whole apply and writes nothing, surfacing the
+        divergence as diffs for a human to read. With ``confirmed=True`` the
+        conflicts are overridden because someone said so.
+
+        That refusal is propose-don't-impose itself, which is why it is on the
+        signature rather than left to an implementation to remember: a write path
+        that cannot receive ``confirmed`` defaults to overwriting the edit someone
+        made while the plan sat in review. :class:`~.conformance.
+        EditableProjectContract` asserts the behavior, because no shape check can.
+        """
         ...
 
 
@@ -367,5 +398,22 @@ class DbtProject:
     def semantic_layer(self) -> SemanticLayer:
         return snapshot.semantic_layer(self.load())
 
-    def write_edits(self, edits: Any) -> Any:
-        return dbt_project.write_edits(edits, self.project_dir or self.repo_root)
+    def write_edits(
+        self, edits: Any, project_dir: Any = None, *, confirmed: bool = False
+    ) -> Any:
+        """The caller's directory wins over the one this instance was built from.
+
+        ``project_dir`` is optional here and required by the protocol, which is a
+        widening rather than a disagreement: this class is also constructed directly
+        by callers holding engine configuration and no plan, and they have nothing
+        to pass. When they pass nothing the configured pin is used, which is the
+        behavior this method always had. When a caller does pass one it wins, and
+        that is the point: it is the directory the plan being applied was pinned
+        against, and the plan is the authority on where its own hashes came from.
+        """
+
+        return dbt_project.write_edits(
+            edits,
+            project_dir or self.project_dir or self.repo_root,
+            confirmed=confirmed,
+        )
