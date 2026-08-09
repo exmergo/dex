@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-08-09
+
 ### Added
 
 - **`explore profile` flags a declared type that contradicts the column's
