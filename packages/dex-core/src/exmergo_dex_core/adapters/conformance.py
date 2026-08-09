@@ -64,6 +64,7 @@ from ..maintain.snapshot import Snapshot
 from .project import ExploreProject, ProjectContext, tier_of
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from typing import Any
 
     from ..maintain.snapshot import SemanticLayer, TransformLayer
@@ -74,6 +75,7 @@ __all__ = [
     "ExploreProjectContract",
     "MaintainProjectContract",
     "ProjectFactoryContract",
+    "SemanticProjectContract",
 ]
 
 
@@ -216,6 +218,47 @@ class DeclaringProjectContract:
 
         raise NotImplementedError
 
+    def a_project_declaring_a_composite_key(
+        self,
+    ) -> tuple[ExploreProject, str, tuple[str, ...]] | None:
+        """A project whose grain needs more than one column, or ``None``.
+
+        Returns ``(project, model, columns)`` with ``columns`` in declared order.
+
+        **Declare more than two columns.** A format that handles a composite key
+        by special-casing the pair satisfies a two-column fixture and fails a
+        four-column one, so a pair cannot tell you what you came to find out.
+
+        ``None`` skips, because a format may genuinely have no way to express a
+        multi-column grain: dbt's own ``unique`` test is column level, and a
+        format modelling grain one column at a time is not incomplete, it is
+        differently shaped. Override it if you can express one, because
+        ``declared_composite_keys`` is a separate field from ``declared_keys``
+        and nothing else in this suite reaches it.
+        """
+
+        return None
+
+    def a_project_declaring_a_join_with_differently_named_sides(
+        self,
+    ) -> tuple[ExploreProject, str, str, str, str] | None:
+        """A join whose two ends are spelled differently, or ``None``.
+
+        Returns ``(project, model, column, to_model, to_column)``, and ``column``
+        must not equal ``to_column`` -- this contract checks that and refuses a
+        mirrored fixture, because a mirrored one cannot fail for the right reason.
+
+        **This is a distinct case from :meth:`a_project_declaring_a_join` and not
+        a redundant one.** If both ends of your fixture are named ``date``, an
+        implementation that reads the source column and copies it onto the target
+        satisfies the assertion exactly, and the defect ships. A foreign key whose
+        two ends are spelled differently is the ordinary case rather than the
+        exotic one, and a format that mirrors would join on a column the target may
+        not have, surfacing as a wrong answer rather than as a failure.
+        """
+
+        return None
+
     def test_a_declared_unique_key_reaches_the_engine(self) -> None:
         project, model, column = self.a_project_declaring_a_unique_key()
 
@@ -251,6 +294,184 @@ class DeclaringProjectContract:
         assert matching, (
             f"expected a declared join {model}.{column} -> {to_model}.{to_column}, "
             f"got {declared}"
+        )
+
+    def test_a_composite_grain_keeps_every_column_and_their_order(self) -> None:
+        """A truncated composite key is silent, which is what makes it expensive.
+
+        It does not read as a missing declaration. It reads as a declared grain
+        that is simply narrower than the truth, so every check downstream runs
+        against a grain the author never claimed and the findings look like data
+        problems rather than a misread declaration.
+        """
+
+        supplied = self.a_project_declaring_a_composite_key()
+        if supplied is None:
+            pytest.skip(
+                "a_project_declaring_a_composite_key() returned None: this format "
+                "declares it cannot express a multi-column grain, so "
+                "declared_composite_keys goes unchecked"
+            )
+        project, model, columns = supplied
+
+        declared = project.definitions().declared_composite_keys
+        matching = [k for k in declared if k.model == model]
+
+        assert matching, (
+            f"expected a composite key on {model}, got {declared}. A multi-column "
+            "grain belongs in declared_composite_keys, not as several entries in "
+            "declared_keys: those say each column is unique on its own, which is a "
+            "different and much stronger claim"
+        )
+        assert tuple(matching[0].columns) == tuple(columns), (
+            f"expected columns {tuple(columns)} in order, got "
+            f"{tuple(matching[0].columns)}"
+        )
+
+    def test_a_join_keeps_its_two_sides_apart_when_they_are_named_differently(
+        self,
+    ) -> None:
+        """The case :meth:`test_a_declared_join_carries_both_sides` cannot reach.
+
+        An implementation that mirrors the source column onto the target passes
+        that one whenever the fixture's two ends share a name, and this is the
+        assertion that separates them.
+        """
+
+        supplied = self.a_project_declaring_a_join_with_differently_named_sides()
+        if supplied is None:
+            pytest.skip(
+                "a_project_declaring_a_join_with_differently_named_sides() returned "
+                "None: a join whose ends are spelled differently goes unchecked, so "
+                "an implementation that mirrors one side onto the other would pass "
+                "this suite"
+            )
+        project, model, column, to_model, to_column = supplied
+
+        assert column != to_column, (
+            "this fixture has to name its two sides differently, or it cannot "
+            "detect the mirroring it exists to detect"
+        )
+
+        declared = project.definitions().foreign_keys
+        matching = [
+            fk
+            for fk in declared
+            if fk.model == model and fk.column == column and fk.to_model == to_model
+        ]
+
+        assert matching, (
+            f"expected a declared join from {model}.{column} to {to_model}, "
+            f"got {declared}"
+        )
+        assert matching[0].to_column == to_column, (
+            f"the join's target column arrived as {matching[0].to_column!r}, "
+            f"expected {to_column!r}. Reading it as {column!r} is the mirroring "
+            "failure: the far side is a column the target may not even have"
+        )
+
+
+class SemanticProjectContract:
+    """Opt-in, tier 2: a populated semantic layer keeps the column behind each field.
+
+    Mix in beside :class:`MaintainProjectContract` when your format declares
+    semantics at all::
+
+        class TestMyProject(SemanticProjectContract, MaintainProjectContract):
+            def make_project(self): ...
+            def a_project_declaring_a_semantic_model(self): ...
+
+    **Why this is separate from the tier contract, and worth the trouble.**
+    :class:`MaintainProjectContract` asserts that an *empty* project produces an
+    empty semantic layer. Nothing there looks at a populated one, so a format that
+    reads every dimension and measure name and drops the physical column behind
+    each passes the tier suite completely.
+
+    That is not a hypothetical shape. ``SemanticModelDef`` keys every field to a
+    warehouse column, and ``maintain``'s drift detector skips any field whose column
+    is ``None`` -- correctly, because it cannot resolve what it was not given. So a
+    layer mapped entirely to ``None`` validates, serializes, and compares clean
+    forever: the check does not fail, it never runs, and a dropped warehouse column
+    that should raise ``dangling_reference`` at high severity raises nothing. The
+    absence is indistinguishable from agreement, which is the worst property a
+    check can have.
+
+    A format that genuinely declares no semantics should not mix this in. Its empty
+    layer is correct and the tier contract already covers it.
+    """
+
+    def a_project_declaring_a_semantic_model(
+        self,
+    ) -> tuple[Any, str, Mapping[str, str | None], Mapping[str, str | None]]:
+        """A project declaring one semantic model.
+
+        Returns ``(project, name, dimensions, measures)``, where the two mappings
+        are ``field name -> the warehouse column behind it``, exactly as you expect
+        them to arrive on ``SemanticModelDef``.
+
+        **Map a field to ``None`` when your format has no bare column for it**, and
+        include at least one such field if your format can produce one: a computed
+        field, or one whose expression is not a plain column name. ``None`` is the
+        honest answer there and an invented column is not, because a consumer
+        resolving column names would treat a fabricated one as a reference that no
+        longer resolves.
+        """
+
+        raise NotImplementedError(
+            "a semantic conformance subclass must implement "
+            "a_project_declaring_a_semantic_model() -> (project, name, dimensions, "
+            "measures), mapping each field to the warehouse column behind it"
+        )
+
+    def test_a_semantic_field_carries_the_column_behind_it(self) -> None:
+        project, name, dimensions, measures = (
+            self.a_project_declaring_a_semantic_model()
+        )
+
+        layer = project.semantic_layer()
+        matching = [m for m in layer.semantic_models if m.name == name]
+
+        assert matching, (
+            f"expected a semantic model named {name!r}, got "
+            f"{[m.name for m in layer.semantic_models]}"
+        )
+        model = matching[0]
+        assert dict(model.dimensions) == dict(dimensions), (
+            "the dimension to column mapping did not survive. A layer whose columns "
+            "are all None still validates and still compares clean, so the drift "
+            "check simply never runs"
+        )
+        assert dict(model.measures) == dict(measures), (
+            "the measure to column mapping did not survive; see above"
+        )
+
+    def test_a_categorical_dimension_maps_only_to_a_real_column(self) -> None:
+        """``categorical_dimensions`` takes ``str``, not ``str | None``.
+
+        So a field that is categorical *and* unresolved cannot be represented
+        there, and the two properties have to stay independent: being categorical
+        says how the field behaves, having a column says whether it can be checked.
+        A format that collapses them either drops a categorical field that happens
+        to lack a column, or supplies an invented column to keep it. Both are worse
+        than leaving it out of this one mapping, which is what the typing asks for.
+        """
+
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+
+        model = next(
+            m for m in project.semantic_layer().semantic_models if m.name == name
+        )
+
+        columns = model.categorical_dimensions.values()
+        assert all(isinstance(c, str) and c for c in columns), (
+            "categorical_dimensions holds a null or empty column: its values are "
+            f"required strings, got {model.categorical_dimensions!r}. Leave an "
+            "unresolved categorical field out of this mapping rather than "
+            "inventing a column to keep it in"
+        )
+        assert set(model.categorical_dimensions) <= set(model.dimensions), (
+            "categorical_dimensions names a field that is not a dimension: "
+            f"{sorted(set(model.categorical_dimensions) - set(model.dimensions))}"
         )
 
 

@@ -194,7 +194,8 @@ class TestMyProject(ExploreProjectContract):
 
 pytest collects the inherited assertions and runs the contract against your format.
 Use `MaintainProjectContract` instead if you reach tier 2, `EditableProjectContract`
-if you reach tier 3, and mix
+if you reach tier 3, mix `DeclaringProjectContract` and `SemanticProjectContract`
+beside it for the content your format declares, and mix
 `ProjectFactoryContract` in front of it if dex will build your format from a name
 rather than be handed an instance. Construction is a separate contract, so a format
 that passes the behavioral suite can still be unreachable from configuration; "the
@@ -219,6 +220,45 @@ Two hooks are worth overriding beyond `make_project`:
   declared key and a declared join actually arrive. It is separate because the two
   contracts answer different questions: whether dex can safely call your format, and
   whether reading it was worth doing.
+
+  It carries two further hooks that default to skipping, and both are worth
+  supplying if your format can reach the state:
+
+  - **`a_project_declaring_a_composite_key()`** returns `(project, model, columns)`.
+    `declared_composite_keys` is a separate field from `declared_keys` and nothing
+    else in the suite reaches it. **Declare more than two columns**: a format that
+    handles a composite grain by special-casing the pair passes a two-column fixture
+    and fails a four-column one, so a pair cannot tell you what you came to find out.
+    A truncated composite key is the expensive failure here, because it does not read
+    as a missing declaration. It reads as a narrower grain that is simply wrong.
+  - **`a_project_declaring_a_join_with_differently_named_sides()`** returns the same
+    shape as `a_project_declaring_a_join`, with `column != to_column` (the contract
+    checks that and refuses a mirrored fixture). If both ends of your join fixture are
+    spelled the same, an implementation that reads the source column and copies it
+    onto the target satisfies the plain join assertion exactly, and the defect ships.
+    A key whose two ends are named differently is the ordinary case, and a format that
+    mirrors joins on a column the target may not have, surfacing as a wrong answer
+    rather than as a failure.
+
+- **`SemanticProjectContract`**, mixed in beside `MaintainProjectContract` if your
+  format declares semantics at all. Its one hook,
+  `a_project_declaring_a_semantic_model()`, returns `(project, name, dimensions,
+  measures)` where the two mappings are `field name -> the warehouse column behind
+  it`.
+
+  This is the gap most worth closing, because the tier contract cannot see it.
+  `MaintainProjectContract` checks that an *empty* project yields an empty semantic
+  layer and never looks at a populated one, so a format that reads every field name
+  and drops the column behind each passes the tier suite completely. `SemanticModelDef`
+  keys every field to a column and the drift detector skips any field whose column is
+  `None`, correctly, since it cannot resolve what it was not given. A layer mapped
+  entirely to `None` therefore validates, serializes, and compares clean forever: the
+  check does not fail, it never runs, and a dropped warehouse column that should raise
+  `dangling_reference` at high severity raises nothing. Map a field to `None` when you
+  genuinely have no bare column for it, and include one such field if you can produce
+  one, because `categorical_dimensions` takes `str` rather than `str | None` and a
+  field that is categorical *and* unresolved has to be left out of that mapping rather
+  than given an invented column.
 
 Tier 3 adds one more hook, and unlike the two above it is **not optional**.
 `an_edit_against_a_changed_target()` returns a project, a directory, an edit set

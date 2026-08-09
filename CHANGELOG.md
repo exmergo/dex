@@ -9,6 +9,40 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **The conformance suite reaches the content a format declares, not just its
+  shape** ([#259]). Three assertions, each covering a way a format can pass the
+  existing suite while being wrong in a way that costs a real check.
+
+  `DeclaringProjectContract` gains two optional hooks.
+  `a_project_declaring_a_composite_key()` reaches `declared_composite_keys`, which
+  is a separate field from `declared_keys` and which nothing in the suite touched
+  before; it asks for more than two columns, because a format that special-cases the
+  pair passes a two-column fixture and fails a four-column one. A truncated
+  composite key does not read as a missing declaration, it reads as a narrower grain
+  that is simply wrong, which is what makes it worth its own assertion.
+  `a_project_declaring_a_join_with_differently_named_sides()` covers the case
+  `test_a_declared_join_carries_both_sides` structurally cannot: if a fixture names
+  both ends of a join the same, an implementation that copies the source column onto
+  the target satisfies it exactly. The contract refuses a mirrored fixture here.
+
+  `SemanticProjectContract` is new, and it closes the largest hole.
+  `MaintainProjectContract` asserts that an empty project yields an empty semantic
+  layer and never looks at a populated one, so a format that reads every dimension
+  and measure name and drops the physical column behind each passed the whole suite.
+  `SemanticModelDef` keys every field to a column and the drift detector skips any
+  field whose column is `None`, so a layer mapped entirely to `None` validates,
+  serializes, and compares clean forever: the check does not fail, it never runs, and
+  a dropped warehouse column that should raise `dangling_reference` at high severity
+  raises nothing. The absence is indistinguishable from agreement.
+
+  All three are opt-in, and the two on `DeclaringProjectContract` skip with a message
+  naming what goes unchecked rather than silently: an existing implementer's green
+  suite must not turn red on an upgrade, and a format may genuinely have no
+  multi-column grain to express. `DbtProject` implements all three in
+  `tests/adapters/test_project_parity.py`, so the shipped format is held to them too.
+
 ## [1.6.2] - 2026-08-09
 
 ### Added

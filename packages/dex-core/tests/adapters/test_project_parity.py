@@ -23,6 +23,7 @@ from exmergo_dex_core.adapters.conformance import (
     EditableProjectContract,
     MaintainProjectContract,
     ProjectFactoryContract,
+    SemanticProjectContract,
 )
 from exmergo_dex_core.adapters.project import (
     DbtProject,
@@ -88,7 +89,9 @@ def _staged_conflict(root: Path):
     )
 
 
-class TestDbtProject(DeclaringProjectContract, EditableProjectContract):
+class TestDbtProject(
+    DeclaringProjectContract, SemanticProjectContract, EditableProjectContract
+):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
         # One root per assertion: a project is read from disk, so two assertions
@@ -142,6 +145,78 @@ class TestDbtProject(DeclaringProjectContract, EditableProjectContract):
             "customer_id",
             "stg_customers",
             "id",
+        )
+
+    def a_project_declaring_a_join_with_differently_named_sides(self):
+        # dbt's `relationships` test exists to express exactly this, and the
+        # fixture above already happens to use it: `customer_id` on one side, `id`
+        # on the other. Returned again through the widened hook rather than left to
+        # skip, so the assertion that the two stay apart actually runs.
+        return self.a_project_declaring_a_join()
+
+    def a_project_declaring_a_composite_key(self):
+        # Four columns, not two: a format special-casing the pair would pass a
+        # two-column fixture. dbt carries this as a model-level
+        # `unique_combination_of_columns`, which is a different construct from the
+        # column-level `unique` above and lands in a different field.
+        project = _project(
+            self.root,
+            "version: 2\n"
+            "models:\n"
+            "  - name: stg_customers\n"
+            "    tests:\n"
+            "      - unique_combination_of_columns:\n"
+            "          combination_of_columns:\n"
+            "            - tenant_id\n"
+            "            - id\n"
+            "            - valid_from\n"
+            "            - source_system\n",
+        )
+        return (
+            DbtProject(self.root, project),
+            "stg_customers",
+            ("tenant_id", "id", "valid_from", "source_system"),
+        )
+
+    def a_project_declaring_a_semantic_model(self):
+        """One semantic model covering all three ways a field resolves.
+
+        A bare `expr` is the column, an absent one means the field's own name is,
+        and a computed expression resolves to nothing. The third is the case worth
+        having: `markup` is `type: categorical` AND unresolved, so it must appear in
+        `dimensions` mapped to None and must NOT appear in `categorical_dimensions`,
+        whose values are required strings. A format that collapses those two
+        properties either drops the field or invents a column for it.
+        """
+
+        project = _project(self.root)
+        (project / "models" / "semantic.yml").write_text(
+            "semantic_models:\n"
+            "  - name: customers_sm\n"
+            "    model: ref('stg_customers')\n"
+            "    dimensions:\n"
+            "      - name: signed_up_at\n"
+            "        type: time\n"
+            "      - name: region\n"
+            "        type: categorical\n"
+            "        expr: region_code\n"
+            "      - name: markup\n"
+            "        type: categorical\n"
+            "        expr: base_rate * 1.2\n"
+            "    measures:\n"
+            "      - name: revenue\n"
+            "        agg: sum\n"
+            "        expr: revenue_net\n"
+            "      - name: blended\n"
+            "        agg: sum\n"
+            "        expr: revenue_net + adjustments\n",
+            encoding="utf-8",
+        )
+        return (
+            DbtProject(self.root, project),
+            "customers_sm",
+            {"signed_up_at": "signed_up_at", "region": "region_code", "markup": None},
+            {"revenue": "revenue_net", "blended": None},
         )
 
 

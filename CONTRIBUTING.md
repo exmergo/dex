@@ -293,6 +293,18 @@ raises there turns an ordinary state into an outage. Override
 `make_unreadable_project()` to get those assertions running against your format
 instead of skipped.
 
+Mix in the contracts covering what your format *declares*, beside the one for your
+tier. `DeclaringProjectContract` checks that a declared key and a declared join
+arrive, and carries two further hooks worth supplying: a composite key of more than
+two columns (a format that special-cases the pair passes a two-column fixture), and
+a join whose two ends are spelled differently (if both ends of your fixture share a
+name, an implementation that mirrors one side onto the other satisfies it exactly).
+`SemanticProjectContract` checks that each semantic field keeps the warehouse column
+behind it, which is the one no tier assertion can see: the tier contract only looks
+at an *empty* semantic layer, and a format that reads every field name and drops the
+columns maps everything to `None`, which validates, serializes, and compares clean
+forever while the drift check silently never runs.
+
 Mix `ProjectFactoryContract` in front of your tier contract if dex will build your
 format from a name rather than be handed an instance, which is what a host reaching
 dex as a subprocess needs. Naming one is the same shape as naming a storage backend:
