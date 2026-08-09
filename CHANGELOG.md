@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-08-09
+
 ### Fixed
 
 - **The tier-3 write path can carry the two things that make it safe** ([#241],
