@@ -10,12 +10,14 @@ import pytest
 
 pytest.importorskip("google.cloud.bigquery")
 
+from google.auth.exceptions import RefreshError
 from google.cloud import bigquery
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter, BigQueryConnectionError
 from exmergo_dex_core.config import BigQueryTarget
-from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.envelope import Paradigm, Reason, reason_for
+from exmergo_dex_core.errors import PrerequisiteError
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -72,6 +74,23 @@ def test_capabilities_shape(fake_bq_client):
     assert caps["dataset_count"] == 2  # shop + logs
     # Capabilities is a free probe: no queries were issued to compute it.
     assert fake_bq_client.query_calls == []
+
+
+def test_expired_credentials_are_a_prerequisite(fake_bq_client, monkeypatch):
+    message = (
+        "Reauthentication is needed. Please run `gcloud auth "
+        "application-default login` to reauthenticate."
+    )
+
+    def expired(*_args, **_kwargs):
+        yield from ()
+        raise RefreshError(message)
+
+    monkeypatch.setattr(fake_bq_client, "list_datasets", expired)
+    with pytest.raises(PrerequisiteError) as exc_info:
+        make_adapter(fake_bq_client).capabilities()
+    assert reason_for(exc_info.value) is Reason.PREREQUISITE
+    assert str(exc_info.value) == message
 
 
 def test_list_objects_uses_free_api_metadata_only(fake_bq_client):

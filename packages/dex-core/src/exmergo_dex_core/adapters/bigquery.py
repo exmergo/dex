@@ -16,11 +16,12 @@ simply calls no mutating client API, and the docs recommend read-only roles
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ..config import BigQueryTarget
 from ..envelope import Paradigm
-from ..errors import ConnectorError
+from ..errors import ConnectorError, PrerequisiteError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -104,6 +105,7 @@ class BigQueryAdapter:
         # [bigquery] extra; only this adapter pulls it in.
         try:
             from google.api_core import exceptions as api_exceptions
+            from google.auth import exceptions as auth_exceptions
             from google.cloud import bigquery
         except ImportError as exc:
             raise RuntimeError(
@@ -112,6 +114,7 @@ class BigQueryAdapter:
             ) from exc
         self._bq = bigquery
         self._api_exceptions = api_exceptions
+        self._auth_exceptions = auth_exceptions
         self._client = client or bigquery.Client(
             project=project, credentials=credentials
         )
@@ -229,10 +232,10 @@ class BigQueryAdapter:
 
     def _resolve_datasets(self) -> list[str]:
         if not self.target.datasets:
-            return sorted(
-                f"{self.project}.{item.dataset_id}"
-                for item in self._client.list_datasets(self.project)
+            datasets = self._request(
+                lambda: list(self._client.list_datasets(self.project))
             )
+            return sorted(f"{self.project}.{item.dataset_id}" for item in datasets)
         with blame(self._scope_origin, BigQueryConnectionError):
             return sorted(
                 {self._resolve_dataset(entry) for entry in self.target.datasets}
@@ -259,7 +262,7 @@ class BigQueryAdapter:
         qualified = token if "." in token else f"{self.project}.{token}"
         project, _, dataset = qualified.partition(".")
         try:
-            self._client.get_dataset(qualified)
+            self._request(lambda: self._client.get_dataset(qualified))
         except self._api_exceptions.NotFound as exc:
             raise BigQueryConnectionError(
                 f"scope '{entry}' does not exist: project {project} has no "
@@ -871,6 +874,12 @@ class BigQueryAdapter:
             sql, job_config=job_config, location=self.target.location
         )
         return float(getattr(job, "total_bytes_processed", 0) or 0)
+
+    def _request(self, operation: Callable[[], Any]) -> Any:
+        try:
+            return operation()
+        except self._auth_exceptions.RefreshError as exc:
+            raise PrerequisiteError(str(exc)) from exc
 
     def _cancel(self, job: Any) -> None:
         # Best-effort: the timeout is raised regardless, and a failed cancel

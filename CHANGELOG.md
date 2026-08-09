@@ -9,6 +9,11 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- Expired BigQuery credentials now report a retryable prerequisite instead of
+  an internal error.
+
 ## [1.6.1] - 2026-08-09
 
 ### Fixed
