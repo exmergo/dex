@@ -16,14 +16,22 @@
       "How many listings have no matching host in this database?",
       "Run a quick query to check whether order dates have any gaps.",
       "Draw me an ER diagram of this database.",
-      "Can you visualize how these tables relate?"
+      "Can you visualize how these tables relate?",
+      "Build a staging model for the orders table.",
+      "Build a mart that scores each customer for churn risk. Source data: int_sales__orders_enriched. Explore to understand available columns.",
+      "Fix the rpt_customer_metrics.sql model. It produces inf and NaN values in calculated columns and does not exclude NULL customer_id. The model reads from int_sales__orders_enriched.",
+      "Create models/marts/customer_cohorts.sql showing monthly retention by acquisition cohort. Use the orders and customers source tables.",
+      "The finance team says fct_daily_revenue is double counting refunds since the SAP migration. Find the cause and fix it."
     ],
     "negative": [
       "Set up a dbt project in this repo.",
-      "Build a staging model for the orders table.",
       "Refactor this dbt model and add tests.",
       "Define a revenue metric on top of fct_orders.",
-      "What changed in the warehouse and did my dbt project drift?"
+      "What changed in the warehouse and did my dbt project drift?",
+      "Build models/marts/basket_composition.sql. Source: ORDERS (order_id VARCHAR, customer_id VARCHAR, ordered_at TIMESTAMP, grand_total DECIMAL, status VARCHAR) and ORDER_LINES (line_id VARCHAR, order_id VARCHAR, sku VARCHAR, qty INTEGER, unit_price DECIMAL). Group baskets by size band and report average margin per band.",
+      "Rename the column cust_id to customer_id across models/staging/sap/, about 30 files, and keep the yml docs in sync.",
+      "The CI job fails on dbt parse after I merged main. Jinja compilation error in macros/cents_to_dollars.sql, undefined variable. Fix the macro.",
+      "Bump dbt-core to 1.10 in requirements.txt and fix the deprecation warnings in dbt_project.yml."
     ]
   },
   "evals": [
