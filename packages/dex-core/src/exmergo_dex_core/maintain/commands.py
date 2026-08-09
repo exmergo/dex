@@ -108,6 +108,132 @@ class NoBaselineError(PrerequisiteError):
     """
 
 
+class BaselineUnreadableError(PrerequisiteError):
+    """A baseline exists and this engine cannot read it.
+
+    Distinct from :class:`NoBaselineError` on purpose. Both remediate the same
+    way, so the status is the same, but "you never took a baseline" and "the
+    baseline you have is unreadable" are different facts about the deployment,
+    and only one of them suggests something went wrong. A host that wants to
+    page on the second and not the first can now tell them apart without
+    matching on prose.
+
+    Two states reach this one class, and :attr:`schema_version` is how a caller
+    separates *them* without matching on prose either. It carries the stored
+    version when the document parsed and this engine does not read that version,
+    and is ``None`` when the document did not parse at all. Worth separating,
+    because they are different operational events: a version this engine does
+    not know usually means the deployment rolled forward or back, while a
+    document that will not parse is an integrity problem. One class rather than
+    two because the remediation is identical, and a host that does not care
+    should not have to catch two names to stay correct.
+    """
+
+    def __init__(self, message: str, *, schema_version: int | None = None) -> None:
+        super().__init__(message)
+        #: The stored schema version when the baseline parsed and this engine
+        #: does not read that version; ``None`` when it failed to parse at all.
+        self.schema_version = schema_version
+
+
+#: Appended wherever the remedy is a fresh baseline. `maintain snapshot` is free
+#: on every connector and cannot really fail, which makes "just re-snapshot"
+#: sound costless. The cost is not in dollars: a replacement pins *current* state
+#: as known-good, so whatever drifted between the last readable baseline and now
+#: is absorbed and never reported again, on any axis. An operator deciding
+#: whether to investigate before replacing needs that said before they run it.
+_REPLACEMENT_ABSORBS_DRIFT = (
+    "note that a replacement pins current state as known-good, so anything that "
+    "drifted since the last readable baseline will not be reported"
+)
+
+
+def _require_baseline(store: MaintainStore) -> snapshot_mod.Snapshot:
+    """The stored baseline, or a refusal that names the command producing one.
+
+    Every drift axis went through the same three lines, and two of the three
+    states they could reach were wrong.
+
+    **A corrupt baseline reported as a bad request.** ``load_snapshot`` raises,
+    and pydantic's ``ValidationError`` subclasses ``ValueError``, so it fell to
+    the CLI catch-all and was classified as a *request* error. That tells an
+    operator they typed something wrong when the fix is `maintain snapshot`, and
+    it is exactly the retry-versus-stop distinction ``PrerequisiteError`` exists
+    to carry.
+
+    **An incompatible baseline was not detected at all.** ``schema_version`` was
+    stamped on every write and read by nothing, so a document from a future or
+    unknown schema was handed to the detectors as though it were current. The
+    failure that produces is the bad kind: not an error, but a drift report
+    measured against a shape the engine misunderstood.
+
+    **What the version check does not reach**, stated here because the guarantee
+    is narrower than "an incompatible baseline is refused" sounds. The check runs
+    on a *parsed* :class:`~.snapshot.Snapshot`, because the store hands back a
+    model and the raw document is not the engine's to see (``storage/base.py``).
+    So a future version whose shape this model still validates is named exactly,
+    and a future version whose shape it rejects arrives as a parse failure
+    instead: same refusal, same remediation, but the message cannot say which
+    version it came from. Both messages therefore name the possibility. Reading
+    the version off the document before validating it would take a contract
+    change on ``Store``, which is a wider change than this one.
+    """
+
+    try:
+        snap = store.load_snapshot()
+    except ValueError as exc:
+        # ValueError rather than pydantic's ValidationError, which it subclasses.
+        # `references/storage.md` requires a backend to raise on a document it
+        # cannot parse, and has never named the exception; the store contract is
+        # public, and a backend deserializing its own rows raises whatever `json`
+        # or its driver raises. Catching only pydantic's error would leave every
+        # third-party backend reproducing the exact defect this function fixes,
+        # which is the kind of gap that looks fixed from inside this repo.
+        detail = (
+            f"{exc.error_count()} validation error(s)"
+            if isinstance(exc, ValidationError)
+            else str(exc)
+        )
+        raise BaselineUnreadableError(
+            f"the stored drift baseline could not be read ({detail}). It is "
+            "either corrupt or written by a newer dex whose shape this engine "
+            "does not know. Re-run `maintain snapshot` to replace it, or move to "
+            "the dex that wrote it if that is what happened; "
+            f"{_REPLACEMENT_ABSORBS_DRIFT}"
+        ) from exc
+
+    if snap is None:
+        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+
+    if snap.schema_version not in snapshot_mod.SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS:
+        supported = ", ".join(
+            str(v) for v in sorted(snapshot_mod.SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS)
+        )
+        # Older and newer are opposite situations with opposite first moves, and
+        # one sentence covering both sends half of them the wrong way. dex tells
+        # operators to commit `.dex/snapshot.json` like a lockfile, so a baseline
+        # newer than the engine reading it is usually a colleague on a newer dex
+        # rather than a broken file, and "re-run `maintain snapshot`" resolves it
+        # by overwriting *their* baseline with one they can no longer read.
+        remedy = (
+            "upgrade dex to a version that reads it, or re-run `maintain "
+            "snapshot` to replace it at this engine's version, which makes it "
+            "unreadable to the newer dex that wrote it: prefer upgrading when "
+            "the baseline is committed and shared"
+            if snap.schema_version
+            > max(snapshot_mod.SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS)
+            else "re-run `maintain snapshot` to take a fresh one"
+        )
+        raise BaselineUnreadableError(
+            f"the stored drift baseline is schema version {snap.schema_version}, "
+            f"and this engine reads {supported}: {remedy}; "
+            f"{_REPLACEMENT_ABSORBS_DRIFT}",
+            schema_version=snap.schema_version,
+        )
+
+    return snap
+
+
 def snapshot(engine: DexEngine) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
@@ -234,9 +360,7 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     """
 
     store = engine.store
-    snap = store.load_snapshot()
-    if snap is None:
-        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    snap = _require_baseline(store)
 
     warnings: list[str] = []
     current_transform, _, no_project = _read_layers(engine, semantic=False)
@@ -293,9 +417,7 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
     """
 
     store = engine.store
-    snap = store.load_snapshot()
-    if snap is None:
-        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    snap = _require_baseline(store)
     scope_names = list(objects or [])
 
     adapter = engine._adapter("maintain grain")
@@ -350,9 +472,7 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     """
 
     store = engine.store
-    snap = store.load_snapshot()
-    if snap is None:
-        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    snap = _require_baseline(store)
     current_transform, current_semantic, no_project = _read_layers(engine)
     if no_project is not None:
         raise ProjectError(f"the semantic axis needs a project: {no_project}")
@@ -442,9 +562,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """
 
     store = engine.store
-    snap = store.load_snapshot()
-    if snap is None:
-        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    snap = _require_baseline(store)
     config = engine.config
     scope_names = list(objects or [])
 
@@ -583,9 +701,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     from . import reconcile as reconcile_mod
 
     store = engine.store
-    snap = store.load_snapshot()
-    if snap is None:
-        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    snap = _require_baseline(store)
     report = store.load_drift()
     if report is None:
         raise NoBaselineError(
@@ -669,7 +785,7 @@ def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     drift_class = getattr(args, "drift_class", None)
     try:
         result = reconcile(engine, drift_class)
-    except (NoBaselineError, ProjectError) as exc:
+    except (NoBaselineError, BaselineUnreadableError, ProjectError) as exc:
         return env.error_for(exc)
     if not result.proposals:
         scope = f" for the '{drift_class}' axis" if drift_class else ""
@@ -695,9 +811,7 @@ def _detect_free_axis(
     The cost stamp still reflects the connector's paradigm for the caller."""
 
     store = engine.store
-    snap = store.load_snapshot()
-    if snap is None:
-        raise NoBaselineError(_NO_SNAPSHOT_ERROR)
+    snap = _require_baseline(store)
 
     adapter = engine._adapter(f"maintain {axis}")
     current = snapshot_mod.warehouse_from_metadata(adapter).datasets
