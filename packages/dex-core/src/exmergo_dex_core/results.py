@@ -74,12 +74,27 @@ class BudgetExhaustedError(DexError):
 class Result(BaseModel):
     """Base for every engine result.
 
-    ``pending_confirmation`` is the two-phase case, and it is why confirmation is
-    not always an exception. Commands that price a second phase only after paying
-    for the first (``relationships`` and ``map`` pricing verify probes after
-    inference finds candidates; ``check`` pricing its scanning axes after the free
-    ones complete) must return the work already paid for *and* the ask for the
-    rest. Raising would throw away results the user has already been billed for.
+    Two fields carry a priced second phase, and which one a command uses decides
+    the status its envelope prints. The question they answer is not "is there
+    money on the table" but "did the caller get what they asked for".
+
+    ``pending_confirmation`` is the ask dex is *waiting on*: the caller requested
+    the paid work and it has not been authorized, so nothing they asked for has
+    finished. It is still not an exception, because a command that priced its
+    second phase only after paying for the first must return the work already
+    billed alongside the ask; raising would discard results the user has paid
+    for. ``relationships`` and ``map`` price verify probes after inference finds
+    candidates, and that is this case: ``--verify`` was requested.
+
+    ``pending_offer`` is work the caller *did not* ask for. ``maintain check``
+    and ``maintain semantic`` complete every free axis on any call, and the
+    scanning axes are an extension offered on top. Reporting that as a pending
+    charge trains a caller to confirm things that cost nothing, which erodes the
+    handshake everywhere it does matter, and frames a complete answer as though
+    nothing had run. So it prints ``ok`` with the offer under ``data.offer``,
+    and confirming remains the only way to spend.
+
+    Setting both is a contradiction and :func:`to_envelope` refuses it.
     """
 
     # Whether the payload carries `notes` even when there is nothing to say.
@@ -99,6 +114,7 @@ class Result(BaseModel):
     # Reviewable diffs (propose-don't-impose). Nothing is applied by being here.
     diffs: list[dict[str, Any]] = Field(default_factory=list)
     pending_confirmation: ConfirmationRequest | None = None
+    pending_offer: ConfirmationRequest | None = None
 
     def data(self) -> dict[str, Any]:
         """The command-specific payload, keyed as the command contract documents."""
@@ -136,6 +152,12 @@ def to_envelope(result: Result, *, hints: dict[str, Any] | None = None) -> env.E
     if result.spend is not None:
         data["spend"] = result.spend
 
+    if result.pending_confirmation is not None and result.pending_offer is not None:
+        raise ValueError(
+            "a result cannot both wait on a confirmation and offer optional paid "
+            "work: pick the one that describes whether the caller asked for it"
+        )
+
     if result.pending_confirmation is not None:
         pending = result.pending_confirmation
         # The ask first, then the results already paid for: a two-phase command
@@ -147,4 +169,20 @@ def to_envelope(result: Result, *, hints: dict[str, Any] | None = None) -> env.E
             warnings=[*result.warnings, *pending.warnings],
             diffs=result.diffs,
         )
+
+    if result.pending_offer is not None:
+        offer = result.pending_offer
+        # Nested rather than merged, unlike the confirmation path above: this
+        # envelope's own payload is the answer, and an estimate for work that did
+        # not run has no business sitting beside findings that did. For the same
+        # reason the offer's estimate stays out of `cost`, which on an `ok` reads
+        # as what this run cost. It lives in one place, `data.offer`, where
+        # reaching for it is a deliberate act.
+        return env.ok(
+            {**data, "offer": offer.data},
+            cost=result.cost,
+            warnings=[*result.warnings, *offer.warnings],
+            diffs=result.diffs,
+        )
+
     return env.ok(data, cost=result.cost, warnings=result.warnings, diffs=result.diffs)
