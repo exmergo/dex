@@ -72,15 +72,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `--group-by a,b` failed, on the local backend as an unresolvable MetricFlow
   format and on the hosted backend as an invalid semantic-layer name, and only the
   repeated flag worked. A comma-joined list is the natural first guess, a common
-  CLI convention, and already what `explore profile` and `explore cluster
-  --features` accept. `--metric`, `--group-by`, and `--order-by` now take either
-  spelling and mix them freely; `--where` deliberately does not split, because a
-  Jinja filter clause carries commas of its own. Normalization happens on the query
-  object rather than in the CLI, so both backends and a library caller building the
-  query directly get it from one place. The empty-metric guard moved to after
-  normalization for the same reason: `--metric ,` is now refused identically on both
-  backends, where before local had its own guard and hosted would have asked dbt
-  Cloud for no metrics at all.
+  CLI convention, and already what `explore profile` and
+  `explore cluster --features` accept. `--metric`, `--group-by`, and `--order-by`
+  now take either spelling and mix them freely; `--where` deliberately does not
+  split, because a Jinja filter clause carries commas of its own. Normalization
+  happens on the query object rather than in the CLI, so both backends and a
+  library caller building the query directly get it from one place. The
+  empty-metric guard moved to after normalization for the same reason:
+  `--metric ,` is now refused identically on both backends, where before local had
+  its own guard and hosted would have asked dbt Cloud for no metrics at all.
 
 ## [1.6.0] - 2026-08-08
 
