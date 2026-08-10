@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-08-10
+
 ### Changed
 
 - **`explore query` accepts more than one statement per call** ([#265]). The
