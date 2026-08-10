@@ -170,6 +170,45 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.
+- `transform plan` reports the **row-population consequence** of an edit to a
+  model that already exists, under `data.row_attribution`. Validation proves an
+  edit is well formed; this is the only plan-time check that asks whether it
+  behaves the same. In scope is everything that can change which rows enter a
+  model: `WHERE`, `HAVING` and `QUALIFY` predicates, a join added, removed or
+  retyped between inner and left, a swapped driving relation, and `DISTINCT` or
+  `GROUP BY` changes. Out of scope, and silent by construction rather than by
+  filtering, are column expressions, aliases, casts and ordering, none of which
+  can move a row.
+
+  Each change is measured by applying it, alone, to the prior model and counting,
+  so a delta belongs to one change rather than to the edit as a whole. That
+  matters because a ticket routinely *requires* a row-population change, and a
+  net figure cannot tell a requested change from a silent side effect. The
+  whole-model net is reported alongside, measured on the authored model rather
+  than summed from the parts; when the two disagree the changes interact and
+  `interacts` says so, because isolated counterfactuals do not compose.
+
+  **This is a warning and never a refusal**, and the plan is built and stored
+  before any of it runs, so nothing here can stop a plan from existing. Naming a
+  change is free and opens no connection, so it always happens. Measuring one is
+  a `COUNT` aggregate over the relations the model already reads, free on DuckDB
+  and spend elsewhere, so counting runs unasked only on DuckDB; on a billed
+  connector it needs `--attribute-rows` and then goes through the ordinary
+  estimate and `--confirm --budget` handshake, with the priced ask returned
+  beside the stored plan so a confirmed re-run measures without re-planning.
+  `--no-attribute-rows` turns counting off anywhere.
+
+  Every counting statement is one `SELECT COUNT(*)` over the model, cleared by
+  the query firewall like any agent-authored SQL, so the model's parents must be
+  profiled and the PII policy applies (a count projects no column, so a filter
+  over a flagged column is still attributable and no value crosses the envelope).
+  Nothing is materialized and no relation is created. A change dex cannot isolate
+  or measure reports `attributed: false` and names why: macro-generated SQL, a
+  jinja statement block, a renamed or added CTE that cannot be paired with a
+  prior scope, a relation absent from the cache, or a counterfactual that is not
+  valid on its own because it depends on something else in the same edit.
+  Authoring a model that does not exist yet produces no findings and opens
+  nothing.
 - `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
