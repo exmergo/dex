@@ -196,11 +196,18 @@ class QueryLimits(BaseModel):
 
     The caps protect agent context from token blowups: an oversized result is
     truncated with an explicit note rather than trusted to agent frugality.
+
+    ``max_rows`` and ``max_cell_chars`` bound one statement. ``max_payload_bytes``
+    bounds the whole call, because a call answering several statements can flood
+    context with results that are each individually small; the budget is spent in
+    statement order and what one statement leaves unspent the next may use.
+    ``max_statements`` bounds how many a single call may carry at all.
     """
 
     max_rows: int = 50
     max_cell_chars: int = 256
     max_payload_bytes: int = 16384
+    max_statements: int = 10
     timeout_seconds: float = 30.0
 
 

@@ -10,12 +10,21 @@ have to map before you can probe. A table the engine has not profiled, including
 a model you built moments ago, is profiled as part of answering, so a probe
 against something new costs one call.
 
-Two habits pay for everything else:
+Three habits pay for everything else:
 
 - **One probe, one question.** Decide what you are testing before writing SQL,
   and name the output columns after the answer (`orphans`, `dupes`, `coverage`).
-- **Batch related measures.** Eight aggregates in one SELECT cost one round trip;
-  eight probes cost eight. Combine counts that share a FROM clause.
+- **Batch related measures into one SELECT.** Eight aggregates over the same FROM
+  clause are one scan; eight separate probes are eight, and on a metered
+  warehouse you pay for each. Combine counts that share a FROM clause.
+- **Send unrelated probes in one call.** Questions that do not share a FROM
+  clause cannot share a SELECT, but they can share a call: pass a statement per
+  argument, or `--sql-file <path>` for a longer list. That saves the call, not
+  the scan, which is why it is the second choice and not the first. Each
+  statement is firewalled and answered on its own, `data.results` holds one entry
+  per statement, and a refusal on one leaves the rest intact. The result-size cap
+  is the call's rather than each statement's, so keep a batch aggregated: ten
+  statements share the budget one statement would have had to itself.
 
 Firewall rules that shape your SQL: values may be projected only from profiled,
 PII-cleared columns; over a flagged column use a measuring aggregate (COUNT,

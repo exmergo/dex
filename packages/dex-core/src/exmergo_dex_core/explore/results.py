@@ -225,6 +225,60 @@ class QueryResult(Result):
         }
 
 
+class QueryStatementResult(BaseModel):
+    """One statement's own outcome inside a call that carried several.
+
+    Carries a verdict beside the payload because a batch is not all-or-nothing:
+    the firewall adjudicates each statement on its own, so the third can be
+    refused while the first two answered, and discarding those two would throw
+    away work the caller has already been billed for. ``status`` is ``ok``,
+    ``refused`` (the guard said no), ``failed`` (the warehouse did), or
+    ``skipped`` (the budget ran out before this statement ran).
+
+    ``line`` is the line the statement started on when it came from a file, and
+    None when it came from argv, where the position is the whole address.
+    """
+
+    index: int
+    status: str
+    line: int | None = None
+    columns: list[str] = Field(default_factory=list)
+    types: list[str] = Field(default_factory=list)
+    cells: list[list[Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+    tables: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+    reason: str | None = None
+
+
+class QueryBatchResult(Result):
+    """Several firewalled SELECTs from one call, each with its own verdict.
+
+    ``profiled_on_demand`` sits here rather than on the statements because the
+    scan is shared: the objects the whole batch needs are resolved as one set and
+    profiled once, so two statements over the same unprofiled table pay for it
+    once. The same is true of ``spend`` and ``cost``, which are the call's, not
+    any one statement's.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    results: list[QueryStatementResult] = Field(default_factory=list)
+    profiled_on_demand: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "results": [r.model_dump(mode="json") for r in self.results],
+            "statement_count": len(self.results),
+            "ok_count": sum(1 for r in self.results if r.status == "ok"),
+            "failed_count": sum(1 for r in self.results if r.status != "ok"),
+            "profiled_on_demand": self.profiled_on_demand,
+        }
+
+
 class ClusterResult(Result):
     """k-means over a bounded sample, reported as aggregates only.
 

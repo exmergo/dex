@@ -21,7 +21,9 @@ import fnmatch
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import command_args, dbt_project
@@ -48,14 +50,18 @@ from ..config import (
     pii_override_paths,
 )
 from ..errors import PrerequisiteError, RequestError
-from ..guards.cost_guard import ConfirmationRequiredError, OverCeilingError
+from ..guards.cost_guard import (
+    ConfirmationRequiredError,
+    CostGuardError,
+    OverCeilingError,
+)
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
     assert_query_shape,
     inspect_query,
 )
-from ..guards.sql_guard import referenced_relations
+from ..guards.sql_guard import referenced_relations, split_statements
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..storage import Document, ExploreStore
@@ -72,7 +78,9 @@ from .results import (
     InventoryResult,
     MapResult,
     ProfileResult,
+    QueryBatchResult,
     QueryResult,
+    QueryStatementResult,
     RankedObject,
     RelationshipsResult,
 )
@@ -802,26 +810,165 @@ def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
     )
 
 
+@dataclass
+class _Statement:
+    """One statement on its way through a call, and what became of it.
+
+    ``error`` holds the exception object rather than its message because the
+    single-statement door re-raises it: a rebuilt exception would lose the type
+    the caller branches on and the ``from`` chain a refusal carries.
+    """
+
+    index: int
+    sql: str
+    line: int | None = None
+    status: str = "ok"
+    inspected: InspectedQuery | None = None
+    result: QueryResult | None = None
+    error: Exception | None = None
+
+    @property
+    def live(self) -> bool:
+        return self.error is None and self.status == "ok"
+
+    def stop(self, exc: Exception, status: str) -> None:
+        self.error = exc
+        self.status = status
+
+
+@dataclass
+class _Batch:
+    """What the statements of one call share: a connection, a scan, a spend."""
+
+    adapter: Adapter | None = None
+    profiled: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
 def query(
     engine: DexEngine, sql: str, *, auto_profile: bool | None = None
 ) -> QueryResult:
     """Run one caller-authored SELECT through the query firewall.
+
+    The single-statement door onto :func:`query_batch`'s runner, and it stays a
+    door rather than a second implementation so the envelope a lone statement
+    produces cannot drift from the one it produced before batching existed. A
+    refusal is raised here rather than reported, because with one statement there
+    is no surviving neighbor for a status field to protect.
+    """
+
+    batch, shared = _run_statements(engine, [(sql, None)], auto_profile=auto_profile)
+    statement = batch[0]
+    if statement.error is not None:
+        raise statement.error
+
+    record = statement.result
+    command_args.stamp_spend(record, shared.adapter)
+    if shared.profiled and command_args.cost_gate(shared.adapter) is not None:
+        record.notes.append(
+            f"the spend reported here covers profiling {len(shared.profiled)} "
+            "object(s) and running the query"
+        )
+    return record
+
+
+def query_batch(
+    engine: DexEngine,
+    statements: list[tuple[str, int | None]] | list[str],
+    *,
+    auto_profile: bool | None = None,
+) -> QueryBatchResult:
+    """Run several caller-authored SELECTs through the query firewall, in order.
+
+    An agent asking a chain of small questions is the common case, and each call
+    it spends on dex is one it did not spend on the task. What batching buys is
+    call count and nothing else: every statement is parsed, adjudicated, and
+    ledgered on its own, and statements are never joined into one string, so a
+    batch has exactly the reach a sequence of single calls had.
+
+    What it does share is the expensive part. The objects the whole call needs
+    profiled are resolved as one set and scanned once, and the spend is quoted
+    once, so two statements over the same cold table pay for one scan and one
+    handshake rather than two of each.
+
+    A statement's own refusal is reported against that statement rather than
+    raised, because raising would discard results the caller has already been
+    billed for. Whole-call refusals (an unconfirmed spend, an absent cache) still
+    raise: nothing ran, so there is nothing to protect.
+    """
+
+    prepared = [s if isinstance(s, tuple) else (s, None) for s in statements]
+    batch, shared = _run_statements(engine, prepared, auto_profile=auto_profile)
+    result = QueryBatchResult(
+        results=[
+            QueryStatementResult(
+                index=statement.index,
+                status=statement.status,
+                line=statement.line,
+                error=(
+                    None
+                    if statement.error is None
+                    else env.redact(str(statement.error))
+                ),
+                reason=(
+                    None
+                    if statement.error is None
+                    else env.reason_for(statement.error).value
+                ),
+                **(
+                    {}
+                    if statement.result is None
+                    else {
+                        "columns": statement.result.columns,
+                        "types": statement.result.types,
+                        "cells": statement.result.cells,
+                        "row_count": statement.result.row_count,
+                        "truncated": statement.result.truncated,
+                        "tables": statement.result.tables,
+                        "notes": statement.result.notes,
+                        "warnings": statement.result.warnings,
+                    }
+                ),
+            )
+            for statement in batch
+        ],
+        profiled_on_demand=shared.profiled,
+        warnings=shared.warnings,
+    )
+    if shared.adapter is not None:
+        command_args.stamp_spend(result, shared.adapter)
+        if shared.profiled and command_args.cost_gate(shared.adapter) is not None:
+            result.notes.append(
+                f"the spend reported here covers profiling {len(shared.profiled)} "
+                f"object(s) and running {len(batch)} statement(s)"
+            )
+    return result
+
+
+def _run_statements(
+    engine: DexEngine,
+    statements: list[tuple[str, int | None]],
+    *,
+    auto_profile: bool | None = None,
+) -> tuple[list[_Statement], _Batch]:
+    """Drive every statement of one call through the firewall and the warehouse.
 
     The firewall adjudicates against the exploration cache, and that is not a
     formality: the PII policy it applies is computed from what profiling flagged,
     so a query cannot be judged against a warehouse nobody has profiled. What used
     to follow from that, sending the caller away to run a command whose exact
     argument this function was already holding, does not. An object the connection
-    has but the cache cannot speak for is profiled here and now, and the query
+    has but the cache cannot speak for is profiled here and now, and the statement
     proceeds under the flags that scan produced.
 
     Profiling costs money on a metered connector, so it is priced, not implied:
-    the estimate covers the profile and the query together and one handshake
-    admits both. ``auto_profile=False`` (``--no-auto-profile``, or
+    the estimate covers the profiles and the statements together and one handshake
+    admits them all. ``auto_profile=False`` (``--no-auto-profile``, or
     ``auto_profile: false`` in config) restores the strict prerequisite, and on
     that path nothing here touches the connection before the firewall has spoken.
 
-    Every decision, allowed or refused, lands in the query ledger.
+    Every decision, allowed or refused, lands in the query ledger, one entry per
+    statement whatever the call carried.
     """
 
     store = engine.store
@@ -835,133 +982,285 @@ def query(
     dialect = get_dialect(engine.connector or config.connector)
     auto = config.auto_profile if auto_profile is None else auto_profile
 
-    profiled_names: list[str] = []
-    adapter = None
-    warnings: list[str] = []
+    batch = [_Statement(i, sql, line) for i, (sql, line) in enumerate(statements)]
+    size = len(batch)
+    shared = _Batch()
+
+    def ledger(statement: _Statement, entry: dict) -> None:
+        store.append_query_log({"at": at, **entry, **_batch_marks(statement, size)})
+
     if auto:
         # Read-only first, before anything reaches the warehouse. Resolving a
         # relation introspects the live connection, and no agent-authored
         # statement earns that until it is proven to be a single SELECT.
-        try:
-            assert_query_shape(sql, dialect=dialect)
-        except QueryRefusedError as exc:
-            store.append_query_log(
-                {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
-            )
-            raise
-        named = referenced_relations(sql, dialect=dialect)
-        if named:
-            adapter = engine._adapter("explore query")
-            gap = _object_gap(adapter, cache, named)
-            if gap.absent:
-                exc = QueryRefusedError(gap.refusal())
-                store.append_query_log(
-                    {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
+        reads: dict[int, list[str]] = {}
+        for statement in batch:
+            try:
+                assert_query_shape(statement.sql, dialect=dialect)
+            except QueryRefusedError as exc:
+                statement.stop(exc, "refused")
+                ledger(
+                    statement,
+                    {
+                        "sql": statement.sql,
+                        "decision": "refused",
+                        "reason": str(exc),
+                    },
                 )
-                raise exc
-            if gap.to_profile:
-                cache, profiled_names, warnings = _profile_for_statement(
-                    engine, adapter, sql, gap.to_profile, cache, now, at
+                continue
+            reads[statement.index] = referenced_relations(
+                statement.sql, dialect=dialect
+            )
+
+        named = list(dict.fromkeys(name for names in reads.values() for name in names))
+        if named:
+            shared.adapter = engine._adapter("explore query")
+            gap = _object_gap(shared.adapter, cache, named)
+            if gap.absent:
+                # Only the statements that named a missing object are refused; a
+                # neighbor that reads a table this connection has is unaffected by
+                # one that does not.
+                missing = {name for name, _ in gap.absent}
+                for statement in batch:
+                    if not statement.live or missing.isdisjoint(reads[statement.index]):
+                        continue
+                    exc = QueryRefusedError(gap.refusal())
+                    statement.stop(exc, "refused")
+                    ledger(
+                        statement,
+                        {
+                            "sql": statement.sql,
+                            "decision": "refused",
+                            "reason": str(exc),
+                        },
+                    )
+            live = [statement for statement in batch if statement.live]
+            # Never scan for a statement that is already refused: the objects worth
+            # profiling are the ones a statement that can still run will read.
+            wanted = {name for s in live for name in reads[s.index]}
+            to_profile = [
+                identifier
+                for identifier in gap.to_profile
+                if not wanted.isdisjoint(_names_for(identifier, gap.resolved))
+            ]
+            if to_profile and live:
+                cache, shared.profiled, shared.warnings = _profile_for_statements(
+                    engine, shared.adapter, live, to_profile, cache, now, at, size
                 )
 
-    if cache is None:
+    if cache is None and any(statement.live for statement in batch):
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` first so the query "
             "firewall knows the schema and the PII flags"
         )
 
-    # After the cache write, never before: _mask_overridden edits the datasets in
-    # place, and masking first would persist an in-memory override onto objects
-    # this run never re-profiled.
-    cache = _mask_overridden(cache, pii_override_paths(config.pii_overrides))
-    try:
-        inspected = inspect_query(sql, cache, limits, dialect=dialect)
-    except QueryRefusedError as exc:
-        entry = {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
-        if profiled_names:
-            entry["profiled_on_demand"] = profiled_names
-        store.append_query_log(entry)
-        # A caller who paid for a scan is told what they got, even when the guard
-        # then refuses: the profile is cached and the next attempt reuses it.
-        if profiled_names:
-            raise QueryRefusedError(
-                f"{exc}. {_profiled_names_phrase(profiled_names)} profiled before "
-                "this refusal; the profile is cached, so a corrected query does "
-                "not pay for it again"
-            ) from exc
-        raise
-
-    adapter = adapter or engine._adapter("explore query")
-    try:
-        # Priced once, above, when a profile was needed: `preflight_command` sets
-        # the reservation rather than adding to it, so a second handshake here
-        # would release the profile's booking. The query still passes the
-        # per-statement gate and the server-side cap on its way out.
-        if not profiled_names:
-            query_estimate = getattr(adapter, "query_estimate", None)
-            estimate = query_estimate(inspected.sql) if query_estimate else 0.0
-            try:
-                command_args.billed_handshake("explore query", adapter, estimate)
-            except ConfirmationRequiredError:
-                store.append_query_log(
-                    {
-                        "at": at,
-                        "sql": inspected.sql,
-                        "decision": "needs_confirmation",
-                        "estimated_bytes": estimate,
-                    }
+    if cache is not None:
+        # After the cache write, never before: _mask_overridden edits the datasets
+        # in place, and masking first would persist an in-memory override onto
+        # objects this run never re-profiled.
+        cache = _mask_overridden(cache, pii_override_paths(config.pii_overrides))
+    for statement in batch:
+        if not statement.live:
+            continue
+        try:
+            statement.inspected = inspect_query(
+                statement.sql, cache, limits, dialect=dialect
+            )
+        except QueryRefusedError as exc:
+            entry = {
+                "sql": statement.sql,
+                "decision": "refused",
+                "reason": str(exc),
+            }
+            if shared.profiled:
+                entry["profiled_on_demand"] = shared.profiled
+            ledger(statement, entry)
+            # A caller who paid for a scan is told what they got, even when the
+            # guard then refuses: the profile is cached and the next attempt
+            # reuses it.
+            if shared.profiled:
+                wrapped = QueryRefusedError(
+                    f"{exc}. {_profiled_names_phrase(shared.profiled)} profiled "
+                    "before this refusal; the profile is cached, so a corrected "
+                    "query does not pay for it again"
                 )
-                raise
-        result = adapter.run_query(
-            inspected.sql,
-            max_rows=inspected.row_cap,
-            timeout_seconds=limits.timeout_seconds,
+                # `raise ... from exc` in one line, split because the exception is
+                # stored and re-raised by the caller rather than raised here.
+                wrapped.__cause__ = exc
+                exc = wrapped
+            statement.stop(exc, "refused")
+
+    live = [statement for statement in batch if statement.live]
+    if not live:
+        return batch, shared
+
+    shared.adapter = shared.adapter or engine._adapter("explore query")
+    # Priced once, above, when a profile was needed: `preflight_command` sets the
+    # reservation rather than adding to it, so a second handshake here would
+    # release the profile's booking. Every statement still passes the
+    # per-statement gate and the server-side cap on its way out.
+    if not shared.profiled:
+        _price_statements(shared.adapter, live, size, ledger)
+
+    _execute(engine, shared, batch, limits, ledger)
+    return batch, shared
+
+
+def _price_statements(
+    adapter: Adapter,
+    live: list[_Statement],
+    size: int,
+    ledger: Callable[[_Statement, dict], None],
+) -> None:
+    """One handshake for the whole call, itemized per statement.
+
+    Summed rather than charged one at a time so the ceiling binds on what the call
+    will actually spend: a caller confirming a batch is confirming all of it, and
+    a sequence of per-statement asks would let the third statement discover a
+    budget the first two had already eaten.
+    """
+
+    query_estimate = getattr(adapter, "query_estimate", None)
+    per_statement = {
+        _statement_label(statement, size): (
+            query_estimate(statement.inspected.sql) if query_estimate else 0.0
+        )
+        for statement in live
+    }
+    estimate = sum(per_statement.values())
+    try:
+        command_args.billed_handshake(
+            "explore query",
+            adapter,
+            estimate,
+            per_table=per_statement if size > 1 else None,
         )
     except ConfirmationRequiredError:
-        raise
-    except Exception as exc:
-        entry = {
-            "at": at,
-            "sql": inspected.sql,
-            "decision": "failed",
-            "reason": env.redact(str(exc)),
-        }
-        if profiled_names:
-            entry["profiled_on_demand"] = profiled_names
-        store.append_query_log(entry)
+        for statement in live:
+            ledger(
+                statement,
+                {
+                    "sql": statement.inspected.sql,
+                    "decision": "needs_confirmation",
+                    "estimated_bytes": per_statement[_statement_label(statement, size)]
+                    if size > 1
+                    else estimate,
+                },
+            )
         raise
 
-    payload = _shape_query_payload(result, inspected, limits)
-    notes = payload.pop("notes")
-    record = QueryResult(
-        **payload,
-        profiled_on_demand=profiled_names,
-        notes=notes,
-        warnings=[*warnings, *inspected.warnings],
-    )
-    command_args.stamp_spend(record, adapter)
-    if profiled_names and command_args.cost_gate(adapter) is not None:
-        record.notes.append(
-            f"the spend reported here covers profiling {len(profiled_names)} "
-            "object(s) and running the query"
+
+def _execute(
+    engine: DexEngine,
+    shared: _Batch,
+    batch: list[_Statement],
+    limits: QueryLimits,
+    ledger: Callable[[_Statement, dict], None],
+) -> None:
+    """Run each approved statement in order, against one shared payload budget.
+
+    The byte cap exists to keep a result from flooding agent context, so it is the
+    call's budget rather than each statement's: ten statements under a per-statement
+    cap would emit ten times what one is allowed. It is spent in statement order and
+    what one statement leaves unspent the next may use, which is why a lone
+    statement still sees the whole of it and behaves exactly as it always did.
+
+    A cost-guard refusal partway through stops the call rather than being retried
+    per statement: the budget is gone, so every statement after it would meet the
+    same wall. What already ran is kept and reported, because it has been paid for.
+    """
+
+    budget = limits.max_payload_bytes
+    stopped: Exception | None = None
+    for statement in batch:
+        if not statement.live:
+            continue
+        if stopped is not None:
+            statement.stop(stopped, "skipped")
+            continue
+        try:
+            rows = shared.adapter.run_query(
+                statement.inspected.sql,
+                max_rows=statement.inspected.row_cap,
+                timeout_seconds=limits.timeout_seconds,
+            )
+        except ConfirmationRequiredError:
+            raise
+        except Exception as exc:
+            entry = {
+                "sql": statement.inspected.sql,
+                "decision": "failed",
+                "reason": env.redact(str(exc)),
+            }
+            if shared.profiled:
+                entry["profiled_on_demand"] = shared.profiled
+            ledger(statement, entry)
+            statement.stop(exc, "failed")
+            if isinstance(exc, (CostGuardError, BudgetExhaustedError)):
+                stopped = exc
+            continue
+
+        payload = _shape_query_payload(
+            rows,
+            statement.inspected,
+            limits,
+            budget_bytes=None if len(batch) == 1 else budget,
         )
+        budget -= payload.pop("payload_bytes")
+        notes = payload.pop("notes")
+        statement.result = QueryResult(
+            **payload,
+            profiled_on_demand=shared.profiled,
+            notes=notes,
+            # A lone statement carries the call's own warnings, because there is no
+            # batch record above it to hold them.
+            warnings=[
+                *(shared.warnings if len(batch) == 1 else []),
+                *statement.inspected.warnings,
+            ],
+        )
+        entry = {
+            "sql": statement.inspected.sql,
+            "decision": "allowed",
+            "tables": statement.result.tables,
+            "row_count": statement.result.row_count,
+            "truncated": statement.result.truncated,
+        }
+        if shared.profiled:
+            entry["profiled_on_demand"] = shared.profiled
+        # The audit trail records which allowed queries projected sub-threshold
+        # PII-flagged columns, so a later review can find every such projection.
+        if statement.inspected.warnings:
+            entry["pii_warnings"] = statement.inspected.warnings
+        ledger(statement, entry)
 
-    log_entry = {
-        "at": at,
-        "sql": inspected.sql,
-        "decision": "allowed",
-        "tables": record.tables,
-        "row_count": record.row_count,
-        "truncated": record.truncated,
+
+def _batch_marks(statement: _Statement, size: int) -> dict:
+    """Where a ledger line sat in its call, when the call carried more than one.
+
+    Absent for a lone statement, so a single-statement ledger line is byte for
+    byte what it always was; present otherwise, so an auditor can see that six
+    statements were one authorization event rather than six.
+    """
+
+    if size == 1:
+        return {}
+    return {"batch_index": statement.index, "batch_size": size}
+
+
+def _statement_label(statement: _Statement, size: int) -> str:
+    if size == 1:
+        return "(the statement itself)"
+    return f"(statement {statement.index + 1})"
+
+
+def _names_for(identifier: str, resolved: dict[str, str]) -> set[str]:
+    """Every name a caller could have written for one resolved identifier."""
+
+    return {
+        identifier,
+        *(name for name, target in resolved.items() if target == identifier),
     }
-    if profiled_names:
-        log_entry["profiled_on_demand"] = profiled_names
-    # The audit trail records which allowed queries projected sub-threshold
-    # PII-flagged columns, so a later review can find every such projection.
-    if inspected.warnings:
-        log_entry["pii_warnings"] = inspected.warnings
-    store.append_query_log(log_entry)
-    return record
 
 
 def _profiled_names_phrase(names: list[str]) -> str:
@@ -970,22 +1269,23 @@ def _profiled_names_phrase(names: list[str]) -> str:
     return f"{len(names)} object(s) ({', '.join(names)}) were"
 
 
-def _profile_for_statement(
+def _profile_for_statements(
     engine: DexEngine,
     adapter: Adapter,
-    sql: str,
+    live: list[_Statement],
     to_profile: list[str],
     prior: DexCache | None,
     now: datetime,
     at: str,
+    size: int,
 ) -> tuple[DexCache, list[str], list[str]]:
-    """Price and run the profiles a statement needs, then hand back the new cache.
+    """Price and run the profiles a call needs, then hand back the new cache.
 
-    One handshake covers the profile scans and the statement itself, because the
-    caller asked one question and should be quoted one number for it. The
-    statement is priced as written rather than as the firewall will rewrite it:
-    the rewrite needs a cache that can resolve these very objects, which is what
-    this call is about to create. Nothing is lost by it, since a row cap does not
+    One handshake covers the profile scans and the statements themselves, because
+    the caller made one request and should be quoted one number for it. Statements
+    are priced as written rather than as the firewall will rewrite them: the
+    rewrite needs a cache that can resolve these very objects, which is what this
+    call is about to create. Nothing is lost by it, since a row cap does not
     reduce the bytes a scan reads or the seconds a warehouse runs.
 
     Returns the merged cache, the objects profiled, and the disclosure the result
@@ -999,30 +1299,39 @@ def _profile_for_statement(
         adapter, to_profile, include_blobs=blob_override_paths(config.blob_overrides)
     )
     query_estimate = getattr(adapter, "query_estimate", None)
-    statement_estimate = query_estimate(sql) if query_estimate else 0.0
+    per_statement = {
+        _statement_label(statement, size): (
+            query_estimate(statement.sql) if query_estimate else 0.0
+        )
+        for statement in live
+    }
+    statement_estimate = sum(per_statement.values())
+    subject = "this statement reads" if size == 1 else "these statements read"
     try:
         command_args.billed_handshake(
             "explore query",
             adapter,
             profile_estimate + statement_estimate,
-            per_table={**per_table, "(the statement itself)": statement_estimate},
+            per_table={**per_table, **per_statement},
             notes=[
-                f"{len(to_profile)} object(s) this statement reads have no usable "
+                f"{len(to_profile)} object(s) {subject} have no usable "
                 "profile, and the firewall reads PII flags from the cache; this "
                 "estimate covers profiling them and then running the statement. "
                 "Pass --no-auto-profile to be refused instead of profiling"
             ],
         )
     except ConfirmationRequiredError:
-        store.append_query_log(
-            {
-                "at": at,
-                "sql": sql,
-                "decision": "needs_confirmation",
-                "estimated_bytes": profile_estimate + statement_estimate,
-                "profile_planned": to_profile,
-            }
-        )
+        for statement in live:
+            store.append_query_log(
+                {
+                    "at": at,
+                    "sql": statement.sql,
+                    "decision": "needs_confirmation",
+                    "estimated_bytes": profile_estimate + statement_estimate,
+                    "profile_planned": to_profile,
+                    **_batch_marks(statement, size),
+                }
+            )
         raise
 
     _profiled, cache, _locator, _note = _profile_into_cache(
@@ -1064,10 +1373,94 @@ def _auto_profile_warning(names: list[str], adapter: Adapter) -> list[str]:
 
 
 def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    try:
-        return to_envelope(query(engine, args.sql, auto_profile=_auto_profile(args)))
-    except QueryRefusedError as exc:
-        return env.error_for(exc, f"query refused: {exc}")
+    statements = _statements_from(args, engine)
+    if len(statements) == 1:
+        try:
+            return to_envelope(
+                query(engine, statements[0][0], auto_profile=_auto_profile(args))
+            )
+        except QueryRefusedError as exc:
+            return env.error_for(exc, f"query refused: {exc}")
+    return _batch_envelope(
+        query_batch(engine, statements, auto_profile=_auto_profile(args))
+    )
+
+
+def _statements_from(
+    args: argparse.Namespace, engine: DexEngine
+) -> list[tuple[str, int | None]]:
+    """Where this call's statements came from: argv, or a file, never both.
+
+    Refusing the overlap rather than concatenating keeps the numbering a refusal
+    reports against unambiguous, and there is no question a caller can only ask by
+    mixing the two.
+    """
+
+    # A bare string is one statement, not a list of characters. argparse always
+    # hands over a list, but a namespace built by an embedding host need not, and
+    # the failure mode of getting this wrong is silent and absurd.
+    named = getattr(args, "sql", None)
+    positional = [named] if isinstance(named, str) else list(named or [])
+    path = getattr(args, "sql_file", None)
+    if positional and path:
+        raise RequestError(
+            "pass statements as arguments or as --sql-file, not both; the file "
+            "and the arguments would have no defined order"
+        )
+    if not positional and not path:
+        raise RequestError(
+            'name at least one statement: dex explore query "<SELECT ...>" '
+            "[more...], or --sql-file <path>"
+        )
+
+    if path:
+        source = Path(path)
+        try:
+            text = source.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RequestError(f"could not read --sql-file {path}: {exc}") from exc
+        dialect = get_dialect(engine.connector or engine.config.connector)
+        statements = split_statements(text, dialect=dialect)
+    else:
+        # Never comma-split, the way `explore profile` splits object names: SQL
+        # carries commas of its own and one argument is one statement.
+        statements = [(sql, None) for sql in positional]
+
+    limit = engine.config.query.max_statements
+    if len(statements) > limit:
+        raise RequestError(
+            f"{len(statements)} statements in one call exceeds the "
+            f"query.max_statements limit of {limit}; split the call, or raise the "
+            "limit in .dex/config.yml"
+        )
+    return statements
+
+
+def _batch_envelope(result: QueryBatchResult) -> env.Envelope:
+    """One envelope for a call that answered several statements.
+
+    A statement that failed makes the envelope's own status ``error`` even when
+    its neighbors answered, and every answer stays in ``data``. Reporting ``ok``
+    over a guard refusal would be the weaker claim, and dropping the answers to
+    report the refusal would discard work already paid for; `transform build`
+    resolves the same tension the same way.
+    """
+
+    envelope = to_envelope(result)
+    failures = [statement for statement in result.results if statement.status != "ok"]
+    if not failures:
+        return envelope
+    return env.Envelope(
+        status=env.Status.ERROR,
+        data=envelope.data,
+        cost=envelope.cost,
+        warnings=envelope.warnings,
+        errors=[
+            f"statement {statement.index + 1} {statement.status}: {statement.error}"
+            for statement in failures
+        ],
+        reason=env.Reason(failures[0].reason) if failures[0].reason else None,
+    )
 
 
 def _auto_profile(args: argparse.Namespace) -> bool | None:
@@ -1856,10 +2249,18 @@ def _shape_query_payload(
     result: QueryResult,
     inspected: InspectedQuery,
     limits: QueryLimits,
+    *,
+    budget_bytes: int | None = None,
 ) -> dict:
     """Cap the result for agent context: row-major cells, cell-width truncation,
-    and a total payload byte cap, each announced in `notes` so a cut result is
-    never mistaken for a complete one."""
+    and a payload byte cap, each announced in `notes` so a cut result is never
+    mistaken for a complete one.
+
+    ``budget_bytes`` is what remains of a multi-statement call's shared budget,
+    and None means this statement is the whole call and owns the configured cap.
+    The distinction is in the note as well as the arithmetic, because "this
+    result was too big" and "the statements before it had already spent the
+    budget" are different problems with different fixes."""
 
     notes: list[str] = []
 
@@ -1877,14 +2278,22 @@ def _shape_query_payload(
     if clipped:
         notes.append(f"{clipped} cell(s) truncated to {limits.max_cell_chars} chars")
 
+    budget = limits.max_payload_bytes if budget_bytes is None else max(budget_bytes, 0)
     dropped = 0
-    while cells and len(json.dumps(cells)) > limits.max_payload_bytes:
+    while cells and len(json.dumps(cells)) > budget:
         cells.pop()
         dropped += 1
-    if dropped:
+    if dropped and budget_bytes is None:
         notes.append(
             f"dropped {dropped} row(s) to fit the {limits.max_payload_bytes}-byte "
             "payload cap; aggregate further or select fewer columns"
+        )
+    elif dropped:
+        notes.append(
+            f"dropped {dropped} row(s) to fit the {budget} bytes left of this "
+            f"call's {limits.max_payload_bytes}-byte payload budget, which the "
+            "statements before this one had already drawn on; aggregate further, "
+            "select fewer columns, or ask fewer statements at once"
         )
 
     truncated = (result.truncated and inspected.capped_by_engine) or dropped > 0
@@ -1902,6 +2311,7 @@ def _shape_query_payload(
         "truncated": truncated,
         "tables": inspected.tables,
         "notes": notes,
+        "payload_bytes": len(json.dumps(cells)),
     }
 
 

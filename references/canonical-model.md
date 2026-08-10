@@ -55,7 +55,10 @@ informs proposals, never the source of truth:
                   values. A decision that profiled an object on demand first names it
                   under profiled_on_demand (profile_planned where the decision was
                   needs_confirmation), so a scan run on the caller's behalf is as
-                  findable as a spend. Doubles as product signal: probe shapes that
+                  findable as a spend. A call carrying several statements writes one
+                  line each, sharing a timestamp and carrying batch_index and
+                  batch_size, so six statements read as one authorization event
+                  rather than six. Doubles as product signal: probe shapes that
                   recur here are candidates for promotion to named commands.
 ```
 

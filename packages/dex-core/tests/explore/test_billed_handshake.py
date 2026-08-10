@@ -503,6 +503,94 @@ def test_confirmed_query_runs_through_the_firewall(
     assert [c.dry_run for c in fake_bq_client.query_calls] == [True, True, False]
 
 
+def test_a_batch_is_priced_once_and_itemized_per_statement(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """One question, one number. A caller confirming a batch is confirming all of
+    it, so the ceiling binds on the sum rather than on whichever statement asked
+    first."""
+
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=[
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            "SELECT COUNT(DISTINCT id) AS n FROM `test-proj`.`shop`.`customers`",
+        ],
+    )
+    assert envelope.status.value == "needs_confirmation"
+    # Two statements, each floored to the per-query billing minimum, quoted as one.
+    assert envelope.cost.estimate == 20 * MB
+    assert envelope.data["per_table_bytes"] == {
+        "(statement 1)": 10 * MB,
+        "(statement 2)": 10 * MB,
+    }
+    # The ask is as findable per statement in the ledger as a spend would be.
+    log_lines = (tmp_path / ".dex" / "queries.jsonl").read_text().splitlines()
+    decisions = [json.loads(line) for line in log_lines[-2:]]
+    assert [d["decision"] for d in decisions] == ["needs_confirmation"] * 2
+    assert [d["batch_index"] for d in decisions] == [0, 1]
+
+
+def test_a_confirmed_batch_runs_every_statement_off_one_handshake(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _seed_query_cache(tmp_path)
+    fake_bq_client.row_resolver = lambda sql: [{"n": 100}]
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=[
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            "SELECT COUNT(DISTINCT id) AS n FROM `test-proj`.`shop`.`customers`",
+        ],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert [r["cells"] for r in envelope.data["results"]] == [[[100]], [[100]]]
+    # Two command-level dry-runs (one estimate per statement, summed into a single
+    # handshake), then per statement the adapter's own defense-in-depth dry-run
+    # followed by its execution. One handshake, two runs.
+    assert [c.dry_run for c in fake_bq_client.query_calls] == [
+        True,
+        True,
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert envelope.data["spend"]["bytes_billed"] == 10_000
+
+
+def test_a_cold_batch_prices_the_shared_scan_and_every_statement_together(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Nothing is seeded, so the objects have to be profiled first. Two statements
+    over the same cold table are quoted one scan, not two."""
+
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=[
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            "SELECT COUNT(DISTINCT id) AS n FROM `test-proj`.`shop`.`customers`",
+        ],
+    )
+    assert envelope.status.value == "needs_confirmation"
+    itemized = envelope.data["per_table_bytes"]
+    assert [key for key in itemized if key.startswith("(statement")] == [
+        "(statement 1)",
+        "(statement 2)",
+    ]
+    assert len([key for key in itemized if key.startswith("test-proj")]) == 1
+    assert any("no usable profile" in note for note in envelope.data["notes"])
+
+
 def test_duckdb_explore_stays_confirmation_free(duckdb_file: Path, capsys):
     # The regression guard for the free path: no gate, no handshake, free cost.
     from exmergo_dex_core.cli import main

@@ -183,6 +183,54 @@ def test_query_firewall_refuses_writes_pragmas_and_multistatement():
             inspect_query(bad, cache, QueryLimits())
 
 
+def test_a_batch_cannot_launder_a_statement_past_the_firewall(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """`explore query` takes several statements per call, and the guard is
+    per statement or it is nothing.
+
+    Two ways a batch could weaken it, both pinned here. Riding alongside a clean
+    statement must not admit a PII projection, and a semicolon-joined argument
+    must still be refused as the smuggled second statement it is: arguments are
+    never joined into one string, so the multi-statement refusal above keeps
+    exactly the reach it had.
+    """
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base = ["--path", str(duckdb_file), "--repo-root", str(repo)]
+    assert main(["explore", "map", *base]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "explore",
+                "query",
+                "select count(*) as n from customers",
+                "select email from customers",
+                "select 1 as a; drop table customers",
+                *base,
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error" and payload["reason"] == "guard"
+    results = payload["data"]["results"]
+    assert [r["status"] for r in results] == ["ok", "refused", "refused"]
+    assert "PII-flagged" in results[1]["error"]
+    assert "exactly one statement" in results[2]["error"]
+    # No flagged value crossed the boundary anywhere in the payload, including in
+    # the neighbour that was allowed to answer.
+    assert "@" not in json.dumps(payload["data"])
+    env.sanitize(env.ok(payload["data"]))
+
+
 def test_an_install_that_cannot_validate_sql_refuses_rather_than_degrading():
     # The dialect engine ships with the connector extras, not the base install, so
     # an install that cannot parse SQL is reachable. The only safe answer is to

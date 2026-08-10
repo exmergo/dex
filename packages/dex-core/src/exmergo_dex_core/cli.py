@@ -174,8 +174,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     )
                 if group == "explore" and name == "profile":
                     sp.add_argument("objects", nargs="+")
+                # Variadic like `profile` above it: an agent asking a chain of
+                # small questions should pay one call, not one per question. Zero
+                # positionals is legal here rather than an argparse usage error so
+                # `--sql-file` can carry the batch instead; the shim refuses an
+                # empty call with an envelope, which is the contract.
                 if group == "explore" and name == "query":
-                    sp.add_argument("sql")
+                    sp.add_argument("sql", nargs="*")
+                    sp.add_argument("--sql-file", default=argparse.SUPPRESS)
                 if group == "explore" and name == "cluster":
                     sp.add_argument("object")
                 # An off switch only. Profiling an object the connection has but
