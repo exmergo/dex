@@ -175,8 +175,9 @@ the command contract or the Python API.
 `explore`: ranks what matters in an unfamiliar warehouse, profiles columns
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
-ad-hoc SELECTs behind a PII-aware query firewall (`explore query`), all
-read-only. `explore diagram` serializes the map it built as a Mermaid
+ad-hoc SELECTs behind a PII-aware query firewall (`explore query`, which takes
+several statements per call, or a `--sql-file`, and adjudicates each on its own),
+all read-only. `explore diagram` serializes the map it built as a Mermaid
 `erDiagram`, free and without opening a connection, drawing declared joins solid
 and inferred joins dotted and claiming a cardinality only where the cache proved
 one. It starts bare by default; with `--use-project` it reads an existing

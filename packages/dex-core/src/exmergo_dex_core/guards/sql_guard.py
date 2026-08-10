@@ -7,11 +7,12 @@ write or a multi-statement injection even on a connection that happened to be
 writable. Every statement the explore engine sends routes through here.
 
 Alongside that, :func:`referenced_relations` answers the parse-level question of
-which relations a statement will ask the connection for. It decides nothing; it
-exists so a caller can resolve or profile those names before a policy gate that
-needs their column detail runs. Both live here rather than in the firewall
-because neither needs the exploration cache, which is what lets a caller with no
-dialect engine reach them.
+which relations a statement will ask the connection for, and
+:func:`split_statements` answers where one statement in a file ends and the next
+begins. Both decide nothing; they exist so a caller can resolve, profile, or
+separate what it holds before a policy gate that needs the pieces runs. All three
+live here rather than in the firewall because none needs the exploration cache,
+which is what lets a caller with no dialect engine reach them.
 """
 
 # TODO: should we use scoped read-only roles instead of SQL semantics inspection?
@@ -20,8 +21,9 @@ from __future__ import annotations
 
 import sqlglot
 from sqlglot import expressions as exp
+from sqlglot.tokens import TokenType
 
-from ..errors import DexError
+from ..errors import DexError, RequestError
 
 
 class NotSelectOnlyError(DexError):
@@ -138,3 +140,93 @@ def referenced_relations(sql: str, *, dialect: str = "duckdb") -> list[str]:
         if name not in names:
             names.append(name)
     return names
+
+
+# What a line has to start with to be read as a statement of its own. Narrower
+# than what the firewall accepts, and deliberately: a continuation line like
+# `from orders` parses as a complete query on DuckDB, so without this a statement
+# split across two unterminated lines becomes two statements that both run and one
+# of which answers a question nobody asked.
+_STATEMENT_STARTS = frozenset(
+    {TokenType.SELECT, TokenType.WITH, TokenType.L_PAREN},
+)
+
+_TERMINATE_HINT = (
+    "This file has no semicolons, so every line is read as one statement; "
+    "terminate statements with `;` to let one span several lines"
+)
+
+
+def split_statements(text: str, *, dialect: str = "duckdb") -> list[tuple[str, int]]:
+    """Cut a file of SQL into statements, each with the line it starts on.
+
+    Two spellings are accepted because both are what people already have on disk:
+    a semicolon-separated file, and a file of one statement per line. Which one is
+    in front of it is decided by the text, not by a flag: a top-level semicolon
+    anywhere means semicolon-separated, and its absence means line-per-statement.
+
+    Boundaries come from the tokenizer rather than from ``str.split(";")``, so a
+    semicolon inside a string literal or a comment is text and not a boundary. The
+    raw source is sliced rather than regenerated from the parse tree, because the
+    firewall and the query ledger must see the statement the caller wrote.
+
+    Line mode is the only one that validates here, and the asymmetry is the point.
+    Without terminators a statement that fails to parse means the *boundaries* are
+    ambiguous, so the failure cannot honestly be pinned on one statement and the
+    whole file is refused naming the line. With terminators the boundaries are
+    unambiguous, so an unparseable statement is left to the caller's own guard,
+    which refuses it individually and lets its neighbors run.
+
+    Raises :class:`~..errors.RequestError` on text this cannot be cut apart.
+    """
+
+    try:
+        tokens = sqlglot.tokenize(text, read=dialect)
+    except sqlglot.errors.TokenError as exc:
+        raise RequestError(f"could not read the SQL: {exc}") from exc
+
+    if any(token.token_type is TokenType.SEMICOLON for token in tokens):
+        bounds = [
+            (token.start, token.end + 1)
+            for token in tokens
+            if token.token_type is TokenType.SEMICOLON
+        ]
+        cut = []
+        start = 0
+        for stop, resume in [*bounds, (len(text), len(text))]:
+            chunk = text[start:stop]
+            if chunk.strip():
+                leading = len(chunk) - len(chunk.lstrip())
+                cut.append(
+                    (chunk.strip(), text.count("\n", 0, start + leading) + 1),
+                )
+            start = resume
+    else:
+        cut = []
+        for number, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                on_line = sqlglot.tokenize(stripped, read=dialect)
+            except sqlglot.errors.TokenError as exc:
+                raise RequestError(f"line {number} could not be read: {exc}") from exc
+            if not on_line:
+                continue
+            if on_line[0].token_type not in _STATEMENT_STARTS:
+                raise RequestError(
+                    f"line {number} does not begin a statement (it starts with "
+                    f"{on_line[0].text!r}). {_TERMINATE_HINT}"
+                )
+            try:
+                sqlglot.parse_one(stripped, read=dialect)
+            except sqlglot.errors.SqlglotError as exc:
+                raise RequestError(
+                    f"line {number} is not a complete statement: {exc}. "
+                    f"{_TERMINATE_HINT}"
+                ) from exc
+            cut.append((stripped, number))
+
+    if not cut:
+        raise RequestError("no SQL statements found")
+    return cut

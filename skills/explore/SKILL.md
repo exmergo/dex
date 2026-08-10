@@ -73,12 +73,16 @@ Subcommands, in the usual order:
    it, since it states any object or column that was left out; `--full` widens
    from the default (profiled, joined objects and their grain, key, join, and
    PII columns) to everything eligible.
-7. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
-   don't cover: you write the SQL, the engine's query firewall refuses or bounds
-   it. A table you have not profiled, including a model you just built, is
-   profiled for you and the query then runs, so probing something new is one
+7. `explore query "<SELECT ...>" ["<SELECT ...>" ...]` answers ad-hoc questions
+   the fixed commands don't cover: you write the SQL, the engine's query firewall
+   refuses or bounds it. Pass a statement per argument, or `--sql-file <path>`
+   for a longer list, and ask a whole chain of questions in one call rather than
+   one call each; each statement is judged and answered on its own, so a refusal
+   on one does not cost you the others, and `data.results` carries one entry per
+   statement. A table you have not profiled, including a model you just built, is
+   profiled for you and the statement then runs, so probing something new is one
    call rather than three; the envelope says what it profiled, and on a metered
-   connector that profile is priced into the same confirmation as the query.
+   connector that profile is priced into the same confirmation as the statements.
    Results come back row-major and capped; a refusal names the offending column
    and the fix, so one rewrite is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
    writing a probe: it maps common questions to effective probe shapes.

@@ -53,7 +53,7 @@ budget:
 - **Billed:** profiling aggregates, `explore query`, relationship verification
   probes, and `transform build`.
 
-`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statement rather than added afterward, so the estimate you confirm is the whole cost. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statements rather than added afterward, so the estimate you confirm is the whole cost. A call carrying several statements is quoted once for all of them, itemized per statement, and an object two of them share is scanned once rather than twice. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
 
 Every billed command is estimated first with free dry-runs. Without
 `--confirm` it returns a `needs_confirmation` envelope carrying the byte

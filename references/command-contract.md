@@ -43,6 +43,9 @@ dex explore diagram               -> the cached map as a Mermaid erDiagram, in `
                                      joined objects with their grain/key/join/PII columns
                                      (--full for every eligible object and column); every
                                      elision is counted in notes; dex writes no file
+dex explore query "<SELECT ...>"  -> firewall-approved SELECTs, capped and row-major
+  [more...] | --sql-file <path>      (variadic: one call answers several questions; a file takes
+                                     one statement per line or semicolon-separated statements)
 dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII non-key columns
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows
@@ -170,6 +173,45 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
 - `transform plan` also accepts `--scaffold <table>` (repeatable): a
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests and PII flags in column `meta`) generated from the `.dex/` cache.
+- `transform plan` reports the **row-population consequence** of an edit to a
+  model that already exists, under `data.row_attribution`. Validation proves an
+  edit is well formed; this is the only plan-time check that asks whether it
+  behaves the same. In scope is everything that can change which rows enter a
+  model: `WHERE`, `HAVING` and `QUALIFY` predicates, a join added, removed or
+  retyped between inner and left, a swapped driving relation, and `DISTINCT` or
+  `GROUP BY` changes. Out of scope, and silent by construction rather than by
+  filtering, are column expressions, aliases, casts and ordering, none of which
+  can move a row.
+
+  Each change is measured by applying it, alone, to the prior model and counting,
+  so a delta belongs to one change rather than to the edit as a whole. That
+  matters because a ticket routinely *requires* a row-population change, and a
+  net figure cannot tell a requested change from a silent side effect. The
+  whole-model net is reported alongside, measured on the authored model rather
+  than summed from the parts; when the two disagree the changes interact and
+  `interacts` says so, because isolated counterfactuals do not compose.
+
+  **This is a warning and never a refusal**, and the plan is built and stored
+  before any of it runs, so nothing here can stop a plan from existing. Naming a
+  change is free and opens no connection, so it always happens. Measuring one is
+  a `COUNT` aggregate over the relations the model already reads, free on DuckDB
+  and spend elsewhere, so counting runs unasked only on DuckDB; on a billed
+  connector it needs `--attribute-rows` and then goes through the ordinary
+  estimate and `--confirm --budget` handshake, with the priced ask returned
+  beside the stored plan so a confirmed re-run measures without re-planning.
+  `--no-attribute-rows` turns counting off anywhere.
+
+  Every counting statement is one `SELECT COUNT(*)` over the model, cleared by
+  the query firewall like any agent-authored SQL, so the model's parents must be
+  profiled and the PII policy applies (a count projects no column, so a filter
+  over a flagged column is still attributable and no value crosses the envelope).
+  Nothing is materialized and no relation is created. A change dex cannot isolate
+  or measure reports `attributed: false` and names why: macro-generated SQL, a
+  jinja statement block, a renamed or added CTE that cannot be paired with a
+  prior scope, a relation absent from the cache, or a counterfactual that is not
+  valid on its own because it depends on something else in the same edit.
+  Authoring a model that does not exist yet produces no findings and opens
+  nothing.
 - `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
@@ -303,11 +345,17 @@ Two rules make it a cost control rather than a hint:
 ## The query firewall
 
 `explore query` executes SQL the agent wrote; the engine generates nothing and
-only refuses or bounds. The gate, in order:
+only refuses or bounds. A call may carry several statements, and the gate below
+runs over each of them separately: batching buys call count and nothing else.
+The gate, in order:
 
-1. **Parse, don't trust.** A single read-only SELECT, structurally checked.
-   Writes, DDL, multi-statement input, PRAGMA and DESCRIBE are refused
-   (introspection goes through `inventory`/`profile`).
+1. **Parse, don't trust.** A single read-only SELECT per statement, structurally
+   checked. Writes, DDL, PRAGMA and DESCRIBE are refused (introspection goes
+   through `inventory`/`profile`), and so is multi-statement input *inside one
+   string*: `"select 1; select 2"` stays refused whether it arrives alone or
+   alongside other arguments. Separate arguments are the supported way to ask
+   several questions, because they keep the statement boundaries explicit
+   instead of asking the parser to find them.
 2. **Resolve against the cache, then against the connection.** Every table and
    column must exist in `.dex/cache.json`, because profiling is what makes the
    PII policy computable and the firewall cannot judge a column whose flags it
@@ -327,15 +375,20 @@ only refuses or bounds. The gate, in order:
    profile is a full one, same detection, same `pii_overrides`, same cache write,
    so the flags governing the query are the flags a deliberate `explore profile`
    would have produced. On a metered connector it is priced rather than implied:
-   a single handshake covers profiling those objects and running the statement,
-   itemized per table alongside a `(the statement itself)` entry, and the
-   confirmed call does both. If the guard then refuses the query anyway, the
-   profile is still saved and the refusal says so, so a corrected query does not
-   pay for it twice.
+   a single handshake covers profiling those objects and running the statements,
+   itemized per table alongside a `(the statement itself)` entry (or one
+   `(statement N)` entry each when the call carries several), and the confirmed
+   call does both. A call is resolved as one set, so two statements over the same
+   cold table pay for one scan rather than two. If the guard then refuses a
+   statement anyway, the profile is still saved and the refusal says so, so a
+   corrected query does not pay for it twice.
 
-   An object the connection does not have is still refused. The message names
-   the connection rather than the cache, because no amount of profiling puts an
-   absent object into it. `--no-auto-profile`, or `auto_profile: false` in
+   An object the connection does not have is still refused, and only the
+   statements that named it. The message names the connection rather than the
+   cache, because no amount of profiling puts an absent object into it. A
+   statement already refused is never scanned for: the objects worth profiling
+   are the ones a statement that can still run will read.
+   `--no-auto-profile`, or `auto_profile: false` in
    `.dex/config.yml`, restores the strict prerequisite: the original refusals
    word for word, and no connection opened to produce them.
 
@@ -362,22 +415,44 @@ only refuses or bounds. The gate, in order:
    reason), which unblocks querying immediately and suppresses the flag durably
    on every later profile.
 4. **Bound the result.** LIMIT is clamped (default 50 rows), long cells are cut
-   (default 256 chars), the payload is byte-capped (default 16 KiB), and every
-   cut is announced in `notes`. A watchdog interrupts queries that outlive
-   their time budget (default 30s). All four are configurable under `query:` in
-   `.dex/config.yml`; `auto_profile` sits at the top level instead, because
-   `explore cluster` honors it too.
+   (default 256 chars), the payload is byte-capped (default 16 KiB), at most 10
+   statements ride in one call, and every cut is announced in `notes`. A watchdog
+   interrupts queries that outlive their time budget (default 30s). All of them
+   are configurable under `query:` in `.dex/config.yml`; `auto_profile` sits at
+   the top level instead, because `explore cluster` honors it too. The byte cap
+   is the one that follows the call rather than the statement, because it is the
+   one protecting agent context: a call answering ten statements must not emit
+   ten times what one statement is allowed.
 5. **Record.** Every decision, allowed, refused, or failed, is appended to
    `.dex/queries.jsonl` (SQL text and counts, never result values). An allowed
    query that projected sub-threshold flagged columns records those warnings
    under `pii_warnings`, so the audit trail keeps every such projection findable.
    A decision that profiled first records the objects under `profiled_on_demand`
    (and `profile_planned` on a `needs_confirmation`), so a scan is as findable in
-   the ledger as a spend.
+   the ledger as a spend. One entry per statement whatever the call carried; a
+   call carrying several adds `batch_index` and `batch_size` to each and gives
+   them all one timestamp, so an auditor can see that six statements were one
+   authorization event rather than six.
 
 Results are row-major (`columns`, `cells` as a list of lists, `row_count`,
 `truncated`, `notes`), which is cheaper in tokens than records and keeps the
 envelope sanitizer's list-of-dicts raw-row rule intact as a backstop.
+
+A call carrying one statement puts that shape directly in `data`. A call carrying
+several puts one entry per statement under `data.results`, each with the same
+keys plus `index`, `status` (`ok`, `refused`, `failed`, `skipped`), `error`,
+`reason`, and the source `line` when the statement came from `--sql-file`;
+`statement_count`, `ok_count` and `failed_count` sit beside them. A statement
+that failed makes the envelope's own status `error` while every answer stays in
+`data`, the same way `transform build` reports a run that failed partway: an `ok`
+envelope carrying a guard refusal would be the weaker claim, and dropping the
+answers to report the refusal would discard work already paid for.
+
+The caps follow the call rather than the statement where the difference matters.
+`query.max_rows` and `query.max_cell_chars` bound each statement;
+`query.max_payload_bytes` is the budget for the whole call, spent in statement
+order, so several statements cannot emit several times what one is allowed; and
+`query.max_statements` (default 10) bounds how many a call may carry at all.
 
 ## The envelope
 

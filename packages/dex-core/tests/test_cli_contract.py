@@ -143,6 +143,24 @@ def test_scope_is_accepted_on_every_subcommand():
             assert args.scope == ["raw"], f"{group} {sub} dropped --scope"
 
 
+def test_query_takes_several_statements_or_a_file():
+    """`explore query`'s positional is variadic like `explore profile`'s, and zero
+    of them parses so `--sql-file` can carry the batch instead. The empty call is
+    refused by the shim with an envelope rather than by argparse with a usage
+    string, because one envelope out is the contract."""
+
+    from exmergo_dex_core.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["explore", "query", "select 1", "select 2"]).sql == [
+        "select 1",
+        "select 2",
+    ]
+    args = parser.parse_args(["explore", "query", "--sql-file", "probes.sql"])
+    assert args.sql == [] and args.sql_file == "probes.sql"
+    assert parser.parse_args(["explore", "query"]).sql == []
+
+
 # --- selecting the storage backend ------------------------------------------------
 
 

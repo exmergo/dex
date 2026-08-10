@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         InventoryResult,
         MapResult,
         ProfileResult,
+        QueryBatchResult,
         QueryResult,
         RelationshipsResult,
         SemanticListResult,
@@ -610,6 +611,21 @@ class DexEngine:
 
         return explore.query(self, sql, auto_profile=auto_profile)
 
+    def query_batch(
+        self, *sql: str, auto_profile: bool | None = None
+    ) -> QueryBatchResult:
+        """Several statements in one call, each with its own verdict.
+
+        A separate method rather than an overload of :meth:`query`, because the
+        two differ in more than arity: a refusal raises there and is reported
+        here, so a caller that wanted one answer never has to check a status field
+        for it.
+        """
+
+        from .explore import commands as explore
+
+        return explore.query_batch(self, list(sql), auto_profile=auto_profile)
+
     def cluster(
         self,
         obj: str,
@@ -744,10 +760,17 @@ class DexEngine:
         *,
         edits: list[PlanEdit] | None = None,
         scaffold: list[str] | None = None,
+        attribute_rows: bool | None = None,
     ) -> PlanResult:
         from .transform import commands as transform
 
-        return transform.plan(self, intent, edits=edits, scaffold=scaffold)
+        return transform.plan(
+            self,
+            intent,
+            edits=edits,
+            scaffold=scaffold,
+            attribute_rows=attribute_rows,
+        )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:
         from .transform import commands as transform
