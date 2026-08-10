@@ -9,6 +9,42 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The three skill descriptions trigger on ticket-shaped prompts, not only on
+  conversational questions** ([#267]). The trigger evals were written as
+  first-person questions ("what's in my duckdb", "define a revenue metric on top
+  of fct_orders"), and one of them encoded a routing rule that does not survive
+  the change of register: `explore` listed "Build a staging model for the orders
+  table." as a negative. That is a compound request, since you cannot write a
+  staging model for a table whose columns and grain you have not inspected, so
+  every description tuned against that set learned to route `explore` out of dbt
+  authoring, which is most of what a real ticket asks for.
+
+  `explore` now triggers on an unmet precondition rather than on a list of
+  phrasings: you are about to write or fix SQL against tables whose columns,
+  types, grain or join keys you have not verified in this session. That covers
+  dbt authoring and bug-fix work, and it applies mid-task, not only at the start.
+  Its sibling disclaimer is scoped to deliverable ownership: explore does not
+  author the model, but it is not excluded from the task that ends in one.
+  `transform` names bug-fix tickets as in scope and states its value over
+  hand-editing the file, which is the real alternative. `maintain` adds
+  symptom-first phrasing (a test that started failing with nobody having touched
+  the model), which is how drift presents to whoever notices it. The eval sets
+  gain ticket-shaped positives and their negatives are re-sorted to genuine
+  near-misses: a ticket that already pins the full schema inline, or work local
+  to files already in hand. Every pre-existing positive is retained.
+
+  Measured with the `claude` CLI, Sonnet 5, xhigh effort, the skills installed as
+  project skills, 3 runs per query: ticket-shaped triggering goes from 7/36 (19%)
+  to 15/36 (42%), Fisher one-sided p = 0.036, consistent in direction across two
+  replicates. Conversational prompts stay at 100% and negatives stay at 0% in
+  both. Full-length benchmark tickets are unaffected, 0% before and after: those
+  prompts suppress skill invocation whatever the description says, measured
+  across 12 description variants, 5 skill names, explicit instruction, a project
+  instruction file, and `append_system_prompt`. No `SKILL.md` body and no engine
+  behavior changed.
+
 ### Added
 
 - **The conformance suite reaches the content a format declares, not just its
