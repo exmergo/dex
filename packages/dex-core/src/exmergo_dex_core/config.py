@@ -486,6 +486,12 @@ class DexConfig(BaseModel):
     # How fresh a cached profile must be to skip re-scanning it (`explore map` /
     # `explore relationships`); 0 disables reuse (always re-profile).
     profile_freshness_hours: float = 24.0
+    # Whether `explore query` and `explore cluster` may profile an object the
+    # connection has but the cache cannot speak for, instead of refusing. Priced
+    # and disclosed when it happens. Top-level rather than under `query:` because
+    # both commands honor it, and it governs profiling rather than result shape.
+    # Set false for the strict prerequisite (`--no-auto-profile` per command).
+    auto_profile: bool = True
     # Columns a human has reviewed and cleared as not PII. The only way to
     # durably clear a detector flag; hand-edits to the cache are overwritten by
     # the next profile, this list is re-applied on every profile.

@@ -159,6 +159,47 @@ def match_identifier(name: str, known: list[str]) -> list[str]:
     return sorted(set(matches))
 
 
+def relation_verdict(name: str, live: list[str]) -> str | None:
+    """Why a relation absent from ``live`` is absent: ``"foreign"``, ``"missing"``,
+    or None when the listing cannot settle it.
+
+    The two answers are different problems with different fixes, and the top-level
+    namespace is what separates them. dex's dataset allowlist scopes which schemas
+    *within* a connection are inventoried, so a relation in an unlisted schema of a
+    connected database is out of the listing's scope, not out of reach: refusing it
+    would answer a question dex never asked. A relation in a database the
+    connection does not carry at all is the real mismatch, because no allowlist
+    could bring it into scope.
+
+    An unqualified name is never adjudicated: it resolves against the session's
+    default schema, which the listing does not describe. Callers that cannot settle
+    a name must fall back to whatever refusal they would have raised anyway; None
+    here means "no opinion", never "fine".
+    """
+
+    parts = name.lower().split(".")
+    if len(parts) < 2:
+        return None
+    catalogs: set[str] = set()
+    schemas: set[str] = set()
+    namespaces: set[str] = set()
+    for ident in live:
+        listed = ident.lower().split(".")
+        if len(listed) < 2:
+            continue
+        schemas.add(listed[-2])
+        namespaces.add(".".join(listed[-3:-1]) if len(listed) >= 3 else listed[-2])
+        if len(listed) >= 3:
+            catalogs.add(listed[-3])
+
+    if len(parts) >= 3:
+        catalog, schema = parts[-3], parts[-2]
+        if catalogs and catalog not in catalogs:
+            return "foreign"
+        return "missing" if f"{catalog}.{schema}" in namespaces else None
+    return "missing" if parts[-2] in schemas else None
+
+
 def tool_version() -> str | None:
     """The installed engine version, for stamping into cache provenance.
 
