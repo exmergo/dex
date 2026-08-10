@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from exmergo_dex_core import envelope as env
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, QueryLimits, save_config
@@ -57,11 +59,172 @@ def _log_entries(repo: Path) -> list[dict]:
 def test_query_without_cache_is_refused_with_the_fix(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
+    """A statement naming no object has nothing to profile, so the cache gate
+    still binds and still writes nothing."""
+
     repo = tmp_path / "repo"
     repo.mkdir()
     payload = _query("SELECT 1", airbnb_duckdb, repo, capsys, expect_error=True)
     assert "explore map" in payload["errors"][0]
     assert not (repo / ".dex").exists(), "a refused gate writes nothing"
+
+
+def test_no_auto_profile_refuses_a_cold_start_without_touching_anything(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """The strict path is the old contract entire: refused, and no connection
+    opened to find that out."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _run(
+        [
+            "explore",
+            "query",
+            "SELECT COUNT(*) FROM RAW_LISTINGS",
+            "--no-auto-profile",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+        expect_error=True,
+    )
+    assert "explore map" in payload["errors"][0]
+    assert payload["reason"] == "prerequisite"
+    assert not (repo / ".dex").exists(), "a refused gate writes nothing"
+
+
+# --- profiling on demand ---------------------------------------------------------
+
+
+def test_cold_start_profiles_what_the_query_names(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """No cache at all is not a hard stop: the objects the statement names are
+    profiled and the query answers in one call."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _query(
+        "SELECT COUNT(*) AS n FROM RAW_LISTINGS", airbnb_duckdb, repo, capsys
+    )
+    assert payload["data"]["cells"] == [[2]]
+    assert payload["data"]["profiled_on_demand"] == ["airbnb.main.RAW_LISTINGS"]
+    assert any("profiled 1 object(s) on demand" in w for w in payload["warnings"])
+    # A real profile, written to the real cache: the next query reuses it.
+    again = _query(
+        "SELECT COUNT(*) AS n FROM RAW_LISTINGS", airbnb_duckdb, repo, capsys
+    )
+    assert again["data"]["profiled_on_demand"] == []
+
+
+def test_a_relation_newer_than_the_cache_is_profiled_not_refused(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """The case the field evidence is about: a relation built after the inventory.
+
+    An agent that just ran `dbt run` queries its own new model. It is in neither
+    the inventory nor the profiles, so a cache miss is the only thing dex has to
+    go on, and concluding "no such table" from that would refuse the majority of
+    real ad-hoc probes.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    conn = duckdb.connect(str(airbnb_duckdb))
+    conn.execute("CREATE TABLE stg_listings AS SELECT * FROM RAW_LISTINGS")
+    conn.close()
+
+    payload = _query(
+        "SELECT COUNT(*) AS n FROM stg_listings", airbnb_duckdb, repo, capsys
+    )
+    assert payload["data"]["cells"] == [[2]]
+    assert payload["data"]["profiled_on_demand"] == ["airbnb.main.stg_listings"]
+
+
+def test_an_absent_table_is_refused_naming_the_connection(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """A table the warehouse does not have is still refused, and the message no
+    longer sends the caller to profile something that is not there."""
+
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT COUNT(*) FROM nope", airbnb_duckdb, repo, capsys, expect_error=True
+    )
+    message = payload["errors"][0]
+    assert "no object named 'nope' in this connection" in message
+    assert "exploration cache" not in message
+    assert _log_entries(repo)[-1]["decision"] == "refused"
+
+
+def test_a_schema_change_under_a_cached_profile_is_reprofiled(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """Flags describing a shape the table has moved away from are not flags for
+    that table, so a drifted column signature re-profiles before adjudicating."""
+
+    duckdb = pytest.importorskip("duckdb")
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    conn = duckdb.connect(str(airbnb_duckdb))
+    conn.execute("ALTER TABLE RAW_LISTINGS ADD COLUMN reviewer_email VARCHAR")
+    conn.close()
+
+    payload = _query(
+        "SELECT COUNT(*) AS n FROM RAW_LISTINGS", airbnb_duckdb, repo, capsys
+    )
+    assert payload["data"]["profiled_on_demand"] == ["airbnb.main.RAW_LISTINGS"]
+    # The new column is now known, and its PII flag governs it like any other.
+    refused = _query(
+        "SELECT reviewer_email FROM RAW_LISTINGS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+    assert "PII-flagged" in refused["errors"][0]
+
+
+def test_an_unchanged_cached_profile_is_not_re_profiled(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """The signature check is the only staleness test on this path. Age is not:
+    a probe must not silently turn into a billed re-scan because a day passed."""
+
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    store = FilesystemStore(repo)
+    cache = store.load_cache()
+    for dataset in cache.datasets:
+        dataset.profiled_at = "2020-01-01T00:00:00+00:00"
+    store.save_cache(cache)
+
+    payload = _query(
+        "SELECT COUNT(*) AS n FROM RAW_LISTINGS", airbnb_duckdb, repo, capsys
+    )
+    assert payload["data"]["profiled_on_demand"] == []
+
+
+def test_an_on_demand_profile_still_enforces_pii(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """Profiling on demand is not a way around the policy: the flags it writes
+    are the flags a deliberate profile would have written, and they block."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _query(
+        "SELECT NAME FROM RAW_HOSTS", airbnb_duckdb, repo, capsys, expect_error=True
+    )
+    message = payload["errors"][0]
+    assert "PII-flagged" in message
+    # The scan happened and is saved, and the caller is told so rather than
+    # paying again for a corrected query.
+    assert "profiled before this refusal" in message
+    entry = _log_entries(repo)[-1]
+    assert entry["decision"] == "refused"
+    assert entry["profiled_on_demand"] == ["airbnb.main.RAW_HOSTS"]
 
 
 # --- a profile-built cache unblocks query -----------------------------------------
@@ -102,16 +265,29 @@ def test_profile_then_query_with_no_prior_map_succeeds(
     assert payload["data"]["cells"] == [[1, 1], [2, 1]]
 
 
-def test_query_on_unprofiled_table_after_profile_is_refused(
+def test_query_on_unprofiled_table_is_refused_under_no_auto_profile(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
-    """A partial cache scopes the firewall to exactly the profiled tables."""
+    """The strict prerequisite, word for word, still reachable behind the flag.
+
+    A partial cache scopes the firewall to exactly the profiled tables, and the
+    refusal names the command that widens it. This is the contract a caller opts
+    back into when it would rather be refused than have dex spend on its behalf,
+    so the wording is asserted as it shipped.
+    """
 
     repo = _profiled_repo(["RAW_LISTINGS"], airbnb_duckdb, tmp_path, capsys)
-    payload = _query(
-        "SELECT COUNT(*) FROM RAW_HOSTS",
-        airbnb_duckdb,
-        repo,
+    payload = _run(
+        [
+            "explore",
+            "query",
+            "SELECT COUNT(*) FROM RAW_HOSTS",
+            "--no-auto-profile",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
         capsys,
         expect_error=True,
     )
@@ -381,3 +557,17 @@ def test_query_log_helper_appends(tmp_path: Path):
     lines = (tmp_path / ".dex" / QUERIES_FILE).read_text().splitlines()
     assert len(lines) == 2
     assert json.loads(lines[1])["decision"] == "refused"
+
+
+def test_auto_profile_can_be_turned_off_durably_in_config(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """A repo that wants the strict prerequisite sets it once, rather than every
+    caller remembering the flag. Config turns it off; nothing turns it back on."""
+
+    repo = _profiled_repo(["RAW_LISTINGS"], airbnb_duckdb, tmp_path, capsys)
+    save_config(DexConfig(connector="duckdb", auto_profile=False), repo)
+    payload = _query(
+        "SELECT COUNT(*) FROM RAW_HOSTS", airbnb_duckdb, repo, capsys, expect_error=True
+    )
+    assert "not in the exploration cache" in payload["errors"][0]

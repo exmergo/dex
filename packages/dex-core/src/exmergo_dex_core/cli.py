@@ -178,6 +178,17 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument("sql")
                 if group == "explore" and name == "cluster":
                     sp.add_argument("object")
+                # An off switch only. Profiling an object the connection has but
+                # the cache cannot speak for is the default, so the flag that
+                # needs a spelling is the one that restores the strict
+                # prerequisite; `auto_profile: false` in config does it durably.
+                if group == "explore" and name in {"query", "cluster"}:
+                    sp.add_argument(
+                        "--no-auto-profile",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                    )
+                if group == "explore" and name == "cluster":
                     sp.add_argument(
                         "--features", action="append", default=argparse.SUPPRESS
                     )

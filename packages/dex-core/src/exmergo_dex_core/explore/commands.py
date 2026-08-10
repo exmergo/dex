@@ -38,6 +38,7 @@ from ..cache import (
     Relationship,
     RelationshipKind,
     match_identifier,
+    relation_verdict,
 )
 from ..config import (
     DexConfig,
@@ -51,8 +52,10 @@ from ..guards.cost_guard import ConfirmationRequiredError, OverCeilingError
 from ..guards.query_firewall import (
     InspectedQuery,
     QueryRefusedError,
+    assert_query_shape,
     inspect_query,
 )
+from ..guards.sql_guard import referenced_relations
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..storage import Document, ExploreStore
@@ -260,6 +263,198 @@ def cmd_inventory(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(inventory(engine, rank=getattr(args, "rank", False)))
 
 
+class _ObjectGap:
+    """What the exploration cache cannot yet say about the objects a command names.
+
+    ``to_profile`` are real warehouse objects the cache cannot adjudicate: never
+    profiled, inventoried without column detail, or profiled against a column
+    signature the warehouse has since moved away from. ``absent`` are names the
+    connection does not have at all, each paired with the reason the live listing
+    settled on. ``resolved`` maps every name as written to the identifier it
+    turned out to mean.
+
+    Empty on both counts is the ordinary case and means the caller can proceed
+    exactly as it did before any of this existed.
+    """
+
+    def __init__(
+        self,
+        to_profile: list[str],
+        absent: list[tuple[str, str]],
+        resolved: dict[str, str],
+    ) -> None:
+        self.to_profile = to_profile
+        self.absent = absent
+        self.resolved = resolved
+
+    def refusal(self) -> str:
+        """The message for names this connection does not have.
+
+        Separated by verdict because they are different problems with different
+        fixes: a namespace the connection cannot reach at all is a wiring mistake,
+        while a name absent from a namespace that *was* listed is a typo or a model
+        nobody built yet. Naming the exploration cache here would be the wrong fix
+        entirely, since no amount of profiling puts an absent object into it.
+        """
+
+        by_verdict = {
+            verdict: sorted({n for n, v in self.absent if v == verdict})
+            for verdict in ("foreign", "missing", "unlisted")
+        }
+        if by_verdict["foreign"]:
+            named = ", ".join(by_verdict["foreign"])
+            return (
+                f"'{named}' is in a namespace this connection does not reach; "
+                "point dex at the connection that carries it, or qualify the name "
+                "against the one you are connected to"
+            )
+        if by_verdict["missing"]:
+            named = ", ".join(by_verdict["missing"])
+            return (
+                f"'{named}' is not in this connection: its namespace was listed "
+                "and the relation was not in it. Check the name, or build it into "
+                "the target you are querying"
+            )
+        named = ", ".join(by_verdict["unlisted"])
+        return (
+            f"no object named '{named}' in this connection; check the name, build "
+            "it into the target you are querying, or qualify it if it lives "
+            "outside the scoped namespaces"
+        )
+
+
+def _object_gap(
+    adapter: Adapter, prior: DexCache | None, named: list[str]
+) -> _ObjectGap:
+    """Ask what would have to be profiled before a cache-resolved guard can run.
+
+    Free on every connector and it executes no SQL: object listing and per-object
+    column metadata are catalog reads everywhere, and on Databricks they come from
+    the REST catalog rather than the SQL warehouse, so this never wakes one.
+
+    The cache is a fast path and the *connection* is the authority. That ordering
+    is the whole point: an object built minutes ago is in the warehouse and cannot
+    be in a cache written before it existed, so concluding "no such object" from a
+    cache miss would refuse exactly the relations an agent most wants to probe
+    right after building them. The live listing is only consulted for what the
+    cache could not resolve, so the ordinary case never reaches it.
+
+    Deliberately *not* :func:`_split_fresh_stale`, which gates a profile the caller
+    asked for and therefore also asks how old it is and which connector wrote it.
+    The question here is narrower and it is the guard's question, not profiling's:
+    can this cache entry decide what the guard is about to decide? Two things say
+    no. An entry with no column detail cannot, and neither can one whose columns no
+    longer match the warehouse, since flags describing a shape the object has moved
+    away from are not flags for that object. Age says nothing about either, and
+    re-scanning on it would bill a probe for statistics nothing is about to read.
+
+    Anything unsettled is left alone rather than guessed at: a listing that cannot
+    be read, a metadata call that fails, an ambiguous name, and a name
+    :func:`~..cache.relation_verdict` has no opinion on all fall through to
+    whatever the guard would have said anyway. Nothing here invents a refusal, and
+    nothing here bills for a doubt.
+    """
+
+    resolved: dict[str, str] = {}
+    unresolved: list[str] = []
+    cached = {d.identifier: d for d in prior.datasets} if prior is not None else {}
+    for name in named:
+        matches = match_identifier(name, list(cached))
+        if len(matches) == 1:
+            resolved[name] = matches[0]
+        else:
+            unresolved.append(name)
+
+    absent: list[tuple[str, str]] = []
+    if unresolved:
+        try:
+            live = [meta.identifier for meta in adapter.list_objects()]
+        except Exception:
+            live = None
+        if live is not None:
+            for name in unresolved:
+                matches = match_identifier(name, live)
+                if len(matches) == 1:
+                    resolved[name] = matches[0]
+                elif not matches:
+                    # An unqualified name is one dex resolves by suffix across
+                    # everything it can see, so nothing matching means nothing it
+                    # can see matches, which is the answer `explore profile`
+                    # already gives for an unknown argument. A *qualified* name in
+                    # a namespace the listing never covered stays unadjudicated:
+                    # refusing it would answer a question dex never asked.
+                    verdict = relation_verdict(name, live)
+                    if verdict is None and "." not in name:
+                        verdict = "unlisted"
+                    if verdict is not None:
+                        absent.append((name, verdict))
+
+    to_profile: list[str] = []
+    for identifier in sorted(set(resolved.values())):
+        entry = cached.get(identifier)
+        if entry is None or not entry.columns:
+            to_profile.append(identifier)
+            continue
+        try:
+            _meta, columns = adapter.table_metadata(identifier)
+        except Exception:  # noqa: S112 -- an unreadable signature settles nothing
+            continue
+        if _column_signature(columns) != _column_signature(entry.columns):
+            to_profile.append(identifier)
+    return _ObjectGap(to_profile, absent, resolved)
+
+
+def _profile_into_cache(
+    store: ExploreStore,
+    adapter: Adapter,
+    config: DexConfig,
+    defs,
+    identifiers: list[str],
+    prior: DexCache | None,
+    now: datetime,
+) -> tuple[list[Dataset], DexCache, str, str]:
+    """Scan the named objects and fold the profiles into the cache.
+
+    The billed half of profiling, shared by every command that profiles: the
+    deliberate one, and the two that profile on demand so a guard has flags to
+    read. Call it only after the cost handshake has admitted the work; it prices
+    nothing itself.
+
+    Returns the fresh profiles, the merged cache as written, its locator, and the
+    one sentence saying what the write did. The cache is saved before the caller
+    does anything else with it, because a scan the caller paid for must survive
+    whatever happens next, including a refusal.
+
+    Per-object checkpointing runs only on billed connectors: a free connector can
+    never exhaust a budget mid-scan and its re-runs cost nothing, so the extra
+    full-document writes would buy nothing.
+    """
+
+    checkpoint = None
+    accumulated: list[Dataset] = []
+    if command_args.cost_gate(adapter) is not None:
+        checkpoint, accumulated = _profile_checkpointer(store, prior, adapter.name, now)
+    reporter = _reporter(len(identifiers), "profiled", "objects")
+    try:
+        profiled = profile_mod.profile(
+            adapter,
+            identifiers,
+            progress=reporter,
+            on_complete=checkpoint,
+            pii_overrides=pii_override_paths(config.pii_overrides),
+            include_blobs=blob_override_paths(config.blob_overrides),
+        )
+        reporter.done()
+    except OverCeilingError:
+        raise _budget_exhausted(store, adapter, accumulated, len(identifiers)) from None
+
+    _annotate_grain(profiled, defs)
+    cache, stats = _merge_profiles(prior, profiled, adapter.name, now)
+    locator = store.save_cache(cache, now=now)
+    note = _persist_note(stats, len(profiled), keeps_relationships=True)
+    return profiled, cache, locator, note
+
+
 def profile(
     engine: DexEngine,
     objects: list[str],
@@ -278,15 +473,12 @@ def profile(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
-    override_paths = pii_override_paths(config.pii_overrides)
     blob_paths = blob_override_paths(config.blob_overrides)
     adapter = engine._adapter("explore profile")
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
     prior = store.load_cache()
-    accumulated: list[Dataset] = []
-    over_ceiling = False
 
     identifiers = _resolve_identifiers(adapter, objects)
     connector = adapter.name
@@ -312,9 +504,9 @@ def profile(
             "fresh-cached (schema unchanged, profiled within the freshness "
             "window); pass --refresh to re-profile them"
         ]
-    profiled: list[Dataset] = []
     # Nothing stale means nothing to price or confirm: skip the handshake and
-    # the scan entirely, and serve the cached profiles wholesale.
+    # serve the cached profiles wholesale. The cache write below still happens,
+    # so a no-op profile refreshes provenance rather than looking like a failure.
     if stale:
         command_args.billed_handshake(
             "explore profile",
@@ -323,48 +515,21 @@ def profile(
             per_table=per_table,
             notes=handshake_notes,
         )
-        # Checkpoint per object only on billed connectors: DuckDB can never
-        # exhaust budget and its re-runs are free, so the extra full-file
-        # writes (and O(n^2) serialization on large warehouses) are scoped
-        # precisely to the population the bug affects.
-        checkpoint = None
-        if command_args.cost_gate(adapter) is not None:
-            checkpoint, accumulated = _profile_checkpointer(
-                store, prior, connector, now
-            )
-        profile_reporter = _reporter(len(stale), "profiled", "objects")
-        try:
-            profiled = profile_mod.profile(
-                adapter,
-                stale,
-                progress=profile_reporter,
-                on_complete=checkpoint,
-                pii_overrides=override_paths,
-                include_blobs=blob_paths,
-            )
-            profile_reporter.done()
-        except OverCeilingError:
-            over_ceiling = True
+    # Persist what the scan already paid for: after profiling a table, `explore
+    # query` on that table must work without a second warehouse scan. Only the
+    # freshly profiled are merged; the reused already live in the cache untouched,
+    # and prior relationships are preserved because profile runs no inference pass.
+    profiled, _cache, locator, persist_note = _profile_into_cache(
+        store, adapter, config, defs, stale, prior, now
+    )
 
-    if over_ceiling:
-        raise _budget_exhausted(store, adapter, accumulated, len(stale))
-
-    # Only the freshly profiled need annotation; the fresh-cached already carry
-    # their candidate_keys and grain from the cache write that stored them.
-    _annotate_grain(profiled, defs)
     # Freshly profiled plus fresh-cached: the full requested set, whether scanned
-    # this run or served from the cache.
+    # this run or served from the cache. Only the freshly profiled needed
+    # annotation; the fresh-cached carry their keys and grain from the write that
+    # stored them.
     datasets = profiled + list(fresh_reused.values())
 
-    # Persist what the scan already paid for: after profiling a table, `explore
-    # query` on that table must work without a second warehouse scan (the query
-    # firewall's own refusal messages promise exactly this). Only the freshly
-    # profiled are merged; the reused already live in the cache untouched. Prior
-    # relationships are preserved because profile runs no inference pass.
-    cache, stats = _merge_profiles(prior, profiled, connector, now)
-    locator = store.save_cache(cache, now=now)
-
-    notes = [_persist_note(stats, len(profiled), keeps_relationships=True)]
+    notes = [persist_note]
     notes.extend(_override_notes(datasets))
     if fresh_reused:
         window = config.profile_freshness_hours
@@ -637,54 +802,116 @@ def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
     )
 
 
-def query(engine: DexEngine, sql: str) -> QueryResult:
+def query(
+    engine: DexEngine, sql: str, *, auto_profile: bool | None = None
+) -> QueryResult:
     """Run one caller-authored SELECT through the query firewall.
 
-    The cache gate comes first and is not a formality: the PII policy the
-    firewall applies is computed from what profiling flagged, so a query cannot
-    be adjudicated against a warehouse nobody has profiled. Every decision,
-    allowed or refused, lands in the query ledger.
+    The firewall adjudicates against the exploration cache, and that is not a
+    formality: the PII policy it applies is computed from what profiling flagged,
+    so a query cannot be judged against a warehouse nobody has profiled. What used
+    to follow from that, sending the caller away to run a command whose exact
+    argument this function was already holding, does not. An object the connection
+    has but the cache cannot speak for is profiled here and now, and the query
+    proceeds under the flags that scan produced.
+
+    Profiling costs money on a metered connector, so it is priced, not implied:
+    the estimate covers the profile and the query together and one handshake
+    admits both. ``auto_profile=False`` (``--no-auto-profile``, or
+    ``auto_profile: false`` in config) restores the strict prerequisite, and on
+    that path nothing here touches the connection before the firewall has spoken.
+
+    Every decision, allowed or refused, lands in the query ledger.
     """
 
     store = engine.store
     config = engine.config
+    limits = config.query
+    now = datetime.now(UTC)
+    at = now.isoformat()
     cache = store.load_cache()
-    at = datetime.now(UTC).isoformat()
+    # The firewall parses in the active connector's dialect, so BigQuery SQL
+    # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
+    dialect = get_dialect(engine.connector or config.connector)
+    auto = config.auto_profile if auto_profile is None else auto_profile
+
+    profiled_names: list[str] = []
+    adapter = None
+    warnings: list[str] = []
+    if auto:
+        # Read-only first, before anything reaches the warehouse. Resolving a
+        # relation introspects the live connection, and no agent-authored
+        # statement earns that until it is proven to be a single SELECT.
+        try:
+            assert_query_shape(sql, dialect=dialect)
+        except QueryRefusedError as exc:
+            store.append_query_log(
+                {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
+            )
+            raise
+        named = referenced_relations(sql, dialect=dialect)
+        if named:
+            adapter = engine._adapter("explore query")
+            gap = _object_gap(adapter, cache, named)
+            if gap.absent:
+                exc = QueryRefusedError(gap.refusal())
+                store.append_query_log(
+                    {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
+                )
+                raise exc
+            if gap.to_profile:
+                cache, profiled_names, warnings = _profile_for_statement(
+                    engine, adapter, sql, gap.to_profile, cache, now, at
+                )
+
     if cache is None:
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` first so the query "
             "firewall knows the schema and the PII flags"
         )
 
-    limits = config.query
+    # After the cache write, never before: _mask_overridden edits the datasets in
+    # place, and masking first would persist an in-memory override onto objects
+    # this run never re-profiled.
     cache = _mask_overridden(cache, pii_override_paths(config.pii_overrides))
-    # The firewall parses in the active connector's dialect, so BigQuery SQL
-    # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
-    dialect = get_dialect(engine.connector or config.connector)
     try:
         inspected = inspect_query(sql, cache, limits, dialect=dialect)
     except QueryRefusedError as exc:
-        store.append_query_log(
-            {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
-        )
+        entry = {"at": at, "sql": sql, "decision": "refused", "reason": str(exc)}
+        if profiled_names:
+            entry["profiled_on_demand"] = profiled_names
+        store.append_query_log(entry)
+        # A caller who paid for a scan is told what they got, even when the guard
+        # then refuses: the profile is cached and the next attempt reuses it.
+        if profiled_names:
+            raise QueryRefusedError(
+                f"{exc}. {_profiled_names_phrase(profiled_names)} profiled before "
+                "this refusal; the profile is cached, so a corrected query does "
+                "not pay for it again"
+            ) from exc
         raise
 
-    adapter = engine._adapter("explore query")
+    adapter = adapter or engine._adapter("explore query")
     try:
-        query_estimate = getattr(adapter, "query_estimate", None)
-        estimate = query_estimate(inspected.sql) if query_estimate else 0.0
-        try:
-            command_args.billed_handshake("explore query", adapter, estimate)
-        except ConfirmationRequiredError:
-            store.append_query_log(
-                {
-                    "at": at,
-                    "sql": inspected.sql,
-                    "decision": "needs_confirmation",
-                    "estimated_bytes": estimate,
-                }
-            )
-            raise
+        # Priced once, above, when a profile was needed: `preflight_command` sets
+        # the reservation rather than adding to it, so a second handshake here
+        # would release the profile's booking. The query still passes the
+        # per-statement gate and the server-side cap on its way out.
+        if not profiled_names:
+            query_estimate = getattr(adapter, "query_estimate", None)
+            estimate = query_estimate(inspected.sql) if query_estimate else 0.0
+            try:
+                command_args.billed_handshake("explore query", adapter, estimate)
+            except ConfirmationRequiredError:
+                store.append_query_log(
+                    {
+                        "at": at,
+                        "sql": inspected.sql,
+                        "decision": "needs_confirmation",
+                        "estimated_bytes": estimate,
+                    }
+                )
+                raise
         result = adapter.run_query(
             inspected.sql,
             max_rows=inspected.row_cap,
@@ -693,24 +920,31 @@ def query(engine: DexEngine, sql: str) -> QueryResult:
     except ConfirmationRequiredError:
         raise
     except Exception as exc:
-        store.append_query_log(
-            {
-                "at": at,
-                "sql": inspected.sql,
-                "decision": "failed",
-                "reason": env.redact(str(exc)),
-            }
-        )
+        entry = {
+            "at": at,
+            "sql": inspected.sql,
+            "decision": "failed",
+            "reason": env.redact(str(exc)),
+        }
+        if profiled_names:
+            entry["profiled_on_demand"] = profiled_names
+        store.append_query_log(entry)
         raise
 
     payload = _shape_query_payload(result, inspected, limits)
     notes = payload.pop("notes")
     record = QueryResult(
         **payload,
+        profiled_on_demand=profiled_names,
         notes=notes,
-        warnings=list(inspected.warnings),
+        warnings=[*warnings, *inspected.warnings],
     )
     command_args.stamp_spend(record, adapter)
+    if profiled_names and command_args.cost_gate(adapter) is not None:
+        record.notes.append(
+            f"the spend reported here covers profiling {len(profiled_names)} "
+            "object(s) and running the query"
+        )
 
     log_entry = {
         "at": at,
@@ -720,6 +954,8 @@ def query(engine: DexEngine, sql: str) -> QueryResult:
         "row_count": record.row_count,
         "truncated": record.truncated,
     }
+    if profiled_names:
+        log_entry["profiled_on_demand"] = profiled_names
     # The audit trail records which allowed queries projected sub-threshold
     # PII-flagged columns, so a later review can find every such projection.
     if inspected.warnings:
@@ -728,11 +964,120 @@ def query(engine: DexEngine, sql: str) -> QueryResult:
     return record
 
 
+def _profiled_names_phrase(names: list[str]) -> str:
+    if len(names) == 1:
+        return f"'{names[0]}' was"
+    return f"{len(names)} object(s) ({', '.join(names)}) were"
+
+
+def _profile_for_statement(
+    engine: DexEngine,
+    adapter: Adapter,
+    sql: str,
+    to_profile: list[str],
+    prior: DexCache | None,
+    now: datetime,
+    at: str,
+) -> tuple[DexCache, list[str], list[str]]:
+    """Price and run the profiles a statement needs, then hand back the new cache.
+
+    One handshake covers the profile scans and the statement itself, because the
+    caller asked one question and should be quoted one number for it. The
+    statement is priced as written rather than as the firewall will rewrite it:
+    the rewrite needs a cache that can resolve these very objects, which is what
+    this call is about to create. Nothing is lost by it, since a row cap does not
+    reduce the bytes a scan reads or the seconds a warehouse runs.
+
+    Returns the merged cache, the objects profiled, and the disclosure the result
+    carries. Every refusal on the way out is ledgered first, so an unconfirmed ask
+    is as findable in the audit trail as a spend.
+    """
+
+    store = engine.store
+    config = engine.config
+    profile_estimate, per_table = _profile_estimate(
+        adapter, to_profile, include_blobs=blob_override_paths(config.blob_overrides)
+    )
+    query_estimate = getattr(adapter, "query_estimate", None)
+    statement_estimate = query_estimate(sql) if query_estimate else 0.0
+    try:
+        command_args.billed_handshake(
+            "explore query",
+            adapter,
+            profile_estimate + statement_estimate,
+            per_table={**per_table, "(the statement itself)": statement_estimate},
+            notes=[
+                f"{len(to_profile)} object(s) this statement reads have no usable "
+                "profile, and the firewall reads PII flags from the cache; this "
+                "estimate covers profiling them and then running the statement. "
+                "Pass --no-auto-profile to be refused instead of profiling"
+            ],
+        )
+    except ConfirmationRequiredError:
+        store.append_query_log(
+            {
+                "at": at,
+                "sql": sql,
+                "decision": "needs_confirmation",
+                "estimated_bytes": profile_estimate + statement_estimate,
+                "profile_planned": to_profile,
+            }
+        )
+        raise
+
+    _profiled, cache, _locator, _note = _profile_into_cache(
+        store,
+        adapter,
+        config,
+        _project_definitions(engine, False),
+        to_profile,
+        prior,
+        now,
+    )
+    return cache, to_profile, _auto_profile_warning(to_profile, adapter)
+
+
+def _auto_profile_warning(names: list[str], adapter: Adapter) -> list[str]:
+    """The disclosure that a scan happened which the caller did not ask for.
+
+    A warning rather than a note: this is a spend and an authorization event, not
+    a remark about the shape of the answer. It says what the profile is worth,
+    because the whole reason the guard can proceed is that this profile is the one
+    a deliberate ``explore profile`` would have written, not a weaker stand-in.
+    """
+
+    if not names:
+        return []
+    billed = (
+        " The scan is included in this command's spend."
+        if command_args.cost_gate(adapter) is not None
+        else ""
+    )
+    return [
+        f"profiled {len(names)} object(s) on demand: {', '.join(names)}. They are "
+        "in the warehouse but the .dex/ cache could not speak for them, and the "
+        "firewall reads PII flags from that cache. These are full profiles (same "
+        "detection, same overrides, same cache write) and they are saved, so the "
+        f"next statement over them profiles nothing.{billed} Pass "
+        "--no-auto-profile to be refused instead of profiled"
+    ]
+
+
 def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
-        return to_envelope(query(engine, args.sql))
+        return to_envelope(query(engine, args.sql, auto_profile=_auto_profile(args)))
     except QueryRefusedError as exc:
         return env.error_for(exc, f"query refused: {exc}")
+
+
+def _auto_profile(args: argparse.Namespace) -> bool | None:
+    """``False`` when --no-auto-profile was passed, else None to defer to config.
+
+    None rather than True so an absent flag cannot override a repo that turned the
+    behavior off; the flag is an off switch, never an on switch.
+    """
+
+    return False if getattr(args, "no_auto_profile", False) else None
 
 
 def map(
@@ -1037,29 +1382,84 @@ def cluster(
     *,
     features: list[str] | None = None,
     k: int | None = None,
+    auto_profile: bool | None = None,
 ) -> ClusterResult:
     """k-means over a bounded sample of one object's numeric columns.
 
     Cache-gated like :func:`query`, and for the same reason: profiling is what
-    says which columns are numeric and which are PII. Only the feature columns
-    are scanned, only a bounded sample is fetched into the process for
-    scikit-learn, and only aggregates (cluster sizes and centroids) come back.
-    The sample query goes through the same cost-before-spend handshake as every
-    other scanning command.
+    says which columns are numeric and which are PII. Like ``query``, an object
+    the connection has but the cache cannot speak for is profiled here rather than
+    refused, and ``auto_profile=False`` restores the strict prerequisite.
+
+    The pricing shape differs from ``query``'s and the difference is forced rather
+    than chosen. A caller-authored statement can be priced before anything is
+    profiled, so ``query`` quotes one number for the profile and the statement
+    together. Clustering's sample statement does not exist until the profile does,
+    because the feature columns are chosen from the column types, the PII flags,
+    and the inferred keys. So the profile is priced first and the sample passes the
+    mid-command gate afterward, which asks for a bigger budget rather than
+    refusing; the re-run is cheap, since the profile it already paid for is cached.
+
+    Only the feature columns are scanned, only a bounded sample is fetched into
+    the process for scikit-learn, and only aggregates (cluster sizes and
+    centroids) come back.
     """
 
     store = engine.store
     config = engine.config
     cache = store.load_cache()
+    now = datetime.now(UTC)
+    auto = config.auto_profile if auto_profile is None else auto_profile
+
+    # Fail fast if the [cluster] extra is missing: no connection, no spend.
+    cluster_mod.ensure_available()
+
+    adapter = None
+    warnings: list[str] = []
+    profiled_names: list[str] = []
+    if auto:
+        adapter = engine._adapter("explore cluster")
+        gap = _object_gap(adapter, cache, [obj])
+        if gap.absent:
+            raise RequestError(gap.refusal())
+        if gap.to_profile:
+            profile_estimate, per_table = _profile_estimate(
+                adapter,
+                gap.to_profile,
+                include_blobs=blob_override_paths(config.blob_overrides),
+            )
+            command_args.billed_handshake(
+                "explore cluster",
+                adapter,
+                profile_estimate,
+                per_table=per_table,
+                notes=[
+                    f"'{obj}' has no usable profile, and clustering picks its "
+                    "features from the column types, the PII flags, and the keys "
+                    "profiling finds; this estimate covers profiling it. The "
+                    "sample scan is priced once the features are known, and asks "
+                    "again only if it does not fit the confirmed budget. Pass "
+                    "--no-auto-profile to be refused instead of profiling"
+                ],
+            )
+            _profiled, cache, _locator, _note = _profile_into_cache(
+                store,
+                adapter,
+                config,
+                _project_definitions(engine, False),
+                gap.to_profile,
+                cache,
+                now,
+            )
+            profiled_names = gap.to_profile
+            warnings = _auto_profile_warning(profiled_names, adapter)
+
     if cache is None:
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` (or `explore profile "
             "<object>`) first so clustering knows which columns are numeric and "
             "which are PII"
         )
-
-    # Fail fast if the [cluster] extra is missing: no connection, no spend.
-    cluster_mod.ensure_available()
 
     limits = config.cluster
     known = [d.identifier for d in cache.datasets if d.columns]
@@ -1077,7 +1477,7 @@ def cluster(
         dataset, features, limits.max_features, cache.relationships
     )
 
-    adapter = engine._adapter("explore cluster")
+    adapter = adapter or engine._adapter("explore cluster")
     sample_sql, sample_method = cluster_mod.build_sample_sql(
         dataset.identifier,
         feature_names,
@@ -1099,17 +1499,38 @@ def cluster(
     query_estimate = getattr(adapter, "query_estimate", None)
     sample_estimate = query_estimate(sample_sql) if query_estimate else 0.0
     null_count_estimate = query_estimate(null_count_sql) if query_estimate else 0.0
-    command_args.billed_handshake(
-        "explore cluster",
-        adapter,
-        sample_estimate + null_count_estimate,
-        notes=[
-            f"clusters a sample of up to {limits.sample_rows} rows over "
-            f"{len(feature_names)} feature column(s); sampling: {sample_method}; "
-            "a companion count query measures how many rows the null filter "
-            "excludes, over the same table and sample scope"
-        ],
-    )
+    sample_notes = [
+        f"clusters a sample of up to {limits.sample_rows} rows over "
+        f"{len(feature_names)} feature column(s); sampling: {sample_method}; "
+        "a companion count query measures how many rows the null filter "
+        "excludes, over the same table and sample scope"
+    ]
+    if profiled_names:
+        # The profile already went through this command's one handshake, so the
+        # sample is a phase whose price only became knowable after that spend.
+        # A phase gate asks for more budget instead of refusing, and the profile
+        # it already paid for is cached, so the re-run only runs the sample.
+        pending = command_args.sample_handshake(
+            "explore cluster",
+            adapter,
+            sample_estimate + null_count_estimate,
+            notes=sample_notes,
+        )
+        if pending is not None:
+            return ClusterResult(
+                object=dataset.identifier,
+                total_rows=dataset.row_count,
+                notes=selection_notes,
+                warnings=warnings,
+                pending_confirmation=pending,
+            )
+    else:
+        command_args.billed_handshake(
+            "explore cluster",
+            adapter,
+            sample_estimate + null_count_estimate,
+            notes=sample_notes,
+        )
     sample = adapter.run_query(
         sample_sql,
         max_rows=limits.sample_rows,
@@ -1150,7 +1571,9 @@ def cluster(
         sample_method=sample_method,
         sample_repeatable=repeatable,
         clustering=clustering,
+        profiled_on_demand=profiled_names,
         notes=notes,
+        warnings=warnings,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -1247,6 +1670,7 @@ def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 args.object,
                 features=_split_features(getattr(args, "features", None)),
                 k=getattr(args, "k", None),
+                auto_profile=_auto_profile(args),
             )
         )
     except (
@@ -1894,10 +2318,16 @@ def _split_fresh_stale(
     Freshness is fail-closed: a missing or unparseable ``profiled_at``, or any
     doubt, re-profiles rather than trusting a stale scan.
 
-    All three profiling commands share this gate but arrive holding identifiers
-    at different points — ``map``/``relationships`` from inventory metas,
-    ``profile`` from resolved arguments — so it works on the identifier strings
-    they have in common, not on ``ObjectMeta``.
+    This is the gate for a *deliberate* profile, which is why the age window
+    belongs in it. The on-demand path asks a narrower question (see
+    :func:`_object_gap`) and deliberately does not reuse it: re-scanning a probe's
+    table because a day passed would bill a caller for statistics nothing is about
+    to read.
+
+    The profiling commands share this gate but arrive holding identifiers at
+    different points — ``map``/``relationships`` from inventory metas, ``profile``
+    from resolved arguments — so it works on the identifier strings they have in
+    common, not on ``ObjectMeta``.
     """
 
     if refresh or prior is None or prior.provenance.connector != connector:

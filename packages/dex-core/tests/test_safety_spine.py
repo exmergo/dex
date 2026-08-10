@@ -586,6 +586,115 @@ def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     assert with_override.columns[0].pii_overridden is not None, "the audit trail"
 
 
+def test_an_on_demand_profile_is_a_real_profile_not_a_shortcut(tmp_path: Path):
+    """Profiling on demand must not become a hole in the PII policy.
+
+    The firewall may proceed on an object nobody profiled only because dex
+    profiles it first, so the whole guarantee rests on that profile being the one
+    a deliberate `explore profile` would have written. Two things are asserted:
+    the flags block exactly as they do on a hand-profiled cache, and the cached
+    result is indistinguishable from the deliberate one for the columns and flags
+    the guard reads.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError
+    from exmergo_dex_core.storage import FilesystemStore
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE people (id INTEGER, email VARCHAR)")
+    conn.execute("INSERT INTO people VALUES (1, 'a@example.com')")
+    conn.close()
+
+    implicit_root = tmp_path / "implicit"
+    implicit_root.mkdir()
+    config = DexConfig(connector="duckdb")
+    with DexEngine(
+        connector="duckdb",
+        path=str(path),
+        config=config,
+        store=FilesystemStore(implicit_root),
+    ) as engine:
+        # Never mapped, never profiled: the object is reached for the first time
+        # by a query, and the flag it has never seen still blocks.
+        with pytest.raises(QueryRefusedError):
+            engine.query("SELECT email FROM people")
+        engine.query("SELECT COUNT(*) AS n FROM people")
+
+    deliberate_root = tmp_path / "deliberate"
+    deliberate_root.mkdir()
+    with DexEngine(
+        connector="duckdb",
+        path=str(path),
+        config=config,
+        store=FilesystemStore(deliberate_root),
+    ) as engine:
+        engine.profile("wh.main.people")
+
+    def flags(root: Path):
+        cache = FilesystemStore(root).load_cache()
+        (dataset,) = [d for d in cache.datasets if d.identifier == "wh.main.people"]
+        return [
+            (c.name, c.data_type, c.pii.category if c.pii else None)
+            for c in dataset.columns
+        ]
+
+    assert flags(implicit_root) == flags(deliberate_root)
+    assert any(category is not None for _n, _t, category in flags(implicit_root))
+
+
+def test_an_implicit_profile_cannot_be_reached_unconfirmed_or_over_ceiling(
+    fake_bq_client, monkeypatch, tmp_path: Path
+):
+    """The scan dex runs on the caller's behalf is still a scan, so the whole
+    cost lifecycle binds on it: an unconfirmed run executes nothing, an
+    over-ceiling estimate refuses and confirmation cannot override it, and the
+    quoted number covers the profile as well as the query rather than the query
+    alone."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.guards.cost_guard import (
+        ConfirmationRequiredError,
+        OverCeilingError,
+    )
+    from exmergo_dex_core.storage import FilesystemStore
+
+    sql = "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`"
+
+    def run(*, ceiling, confirmed):
+        monkeypatch.setattr(
+            DexEngine,
+            "_adapter",
+            lambda self, command=None, **kw: _bq_adapter(
+                fake_bq_client, ceiling=ceiling, confirmed=confirmed
+            ),
+        )
+        engine = DexEngine(
+            connector="bigquery",
+            repo_root=str(tmp_path),
+            store=FilesystemStore(tmp_path),
+            config=DexConfig(connector="bigquery"),
+        )
+        return engine.query(sql)
+
+    # Nothing is cached, so answering this means profiling first. Unconfirmed,
+    # that ask is raised before anything executes, and the number it carries
+    # covers the profile as well as the query.
+    with pytest.raises(ConfirmationRequiredError) as caught:
+        run(ceiling=None, confirmed=False)
+    assert caught.value.cost.estimate > 10 * 1024 * 1024
+    assert all(call.dry_run for call in fake_bq_client.query_calls)
+
+    # And confirmation cannot buy through a ceiling the combined work exceeds.
+    with pytest.raises(OverCeilingError):
+        run(ceiling=1_000, confirmed=True)
+    assert all(call.dry_run for call in fake_bq_client.query_calls)
+
+
 def test_the_er_diagram_marks_pii_and_carries_no_column_value():
     """A rendered diagram is the most shareable artifact dex produces: it gets
     pasted into issues, committed, and dropped into chat, where none of the

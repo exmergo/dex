@@ -52,8 +52,11 @@ informs proposals, never the source of truth:
                   `maintain snapshot`; the drift detectors diff current reality against it.
   queries.jsonl   the `explore query` audit log: one line per firewall decision (allowed,
                   refused, or failed) with the SQL text and result counts, never result
-                  values. Doubles as product signal: probe shapes that recur here are
-                  candidates for promotion to named commands.
+                  values. A decision that profiled an object on demand first names it
+                  under profiled_on_demand (profile_planned where the decision was
+                  needs_confirmation), so a scan run on the caller's behalf is as
+                  findable as a spend. Doubles as product signal: probe shapes that
+                  recur here are candidates for promotion to named commands.
 ```
 
 Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the dbt

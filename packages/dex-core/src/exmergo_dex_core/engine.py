@@ -605,10 +605,10 @@ class DexEngine:
             self, full=full, verify=verify, refresh=refresh, use_project=use_project
         )
 
-    def query(self, sql: str) -> QueryResult:
+    def query(self, sql: str, *, auto_profile: bool | None = None) -> QueryResult:
         from .explore import commands as explore
 
-        return explore.query(self, sql)
+        return explore.query(self, sql, auto_profile=auto_profile)
 
     def cluster(
         self,
@@ -616,10 +616,13 @@ class DexEngine:
         *,
         features: list[str] | None = None,
         k: int | None = None,
+        auto_profile: bool | None = None,
     ) -> ClusterResult:
         from .explore import commands as explore
 
-        return explore.cluster(self, obj, features=features, k=k)
+        return explore.cluster(
+            self, obj, features=features, k=k, auto_profile=auto_profile
+        )
 
     def diagram(self, *, full: bool = False) -> DiagramResult:
         """The cached map as a Mermaid ER diagram. Reads the store, nothing else.

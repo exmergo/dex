@@ -247,6 +247,57 @@ def verify_handshake(
     return None
 
 
+def sample_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    notes: list[str] | None = None,
+) -> ConfirmationRequest | None:
+    """The mid-command checkpoint for a scan whose price needed an earlier scan.
+
+    Sibling of :func:`verify_handshake` over the same ``preflight_phase`` gate, for
+    the other shape that cannot be priced up front: clustering picks its feature
+    columns out of a profile, so its sample statement does not exist until that
+    profile has been paid for. Returning rather than raising follows the same rule
+    those two already state, that a command which has already spent must not
+    discard the result and bill for it twice.
+
+    None means the confirmed budget already covers the scan and the command
+    proceeds in one pass, which is the ordinary outcome.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None:
+        return None
+    try:
+        gate.preflight_phase(estimate)
+    except ConfirmationRequiredError as exc:
+        describe = getattr(adapter, "describe_estimate", None)
+        if describe is not None:
+            data = {"command": command, **describe(estimate, None)}
+        else:
+            data = {"command": command, "estimated_bytes": estimate}
+        data.update(
+            {
+                "phase": "sample",
+                "hint": (
+                    "the profile this command needed is done and saved; the "
+                    f"sample scan is estimated at {estimate:.0f} "
+                    f"{gate.paradigm.value} beyond what remains of the confirmed "
+                    "budget. Re-run with --confirm --budget "
+                    f"{math.ceil(exc.cost.estimate)}; the cached profile is "
+                    "reused, so the re-run pays for the sample alone"
+                ),
+            }
+        )
+        if notes:
+            data.setdefault("notes", [])
+            data["notes"] = [*data["notes"], *notes]
+        return ConfirmationRequest(cost=exc.cost, data=data)
+    return None
+
+
 def stamp_spend(result: Result, adapter: Adapter) -> Result:
     """Stamp the preflight cost and the actual spend onto a result.
 

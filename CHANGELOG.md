@@ -11,6 +11,57 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **`explore query` and `explore cluster` profile the object they name instead
+  of refusing** ([#209]). The firewall resolves table and column references
+  against the `.dex/` cache, because a taint rule over PII flags is only
+  computable when the flags exist. That requirement stays. What followed from it
+  did not survive contact with use: a query naming an uncached table was sent
+  away to run a command whose exact argument dex was already holding, turning a
+  one-step question into a three-step ritual, while the alternative in the
+  caller's hand (a raw SQL client) has no steps and no firewall at all.
+
+  An object the connection has but the cache cannot adjudicate is now profiled,
+  and the statement then runs. Three states qualify: never profiled, inventoried
+  without column detail, and profiled against a column signature the warehouse
+  has since changed. Age deliberately does not, so a probe never turns into a
+  billed re-scan because a day passed.
+
+  The trigger is a live inventory lookup, not just a cache miss, which is what
+  makes the dominant real case work. Measured on an agentic dbt benchmark
+  (Claude Sonnet 5, 2,356 models), the agent adopted `dex explore` readily and
+  still went to a raw `duckdb` client for about half its probes; 11 of 14 and 20
+  of 29 of those raw probes targeted relations it had just built with `dbt run`.
+  Such a relation is neither profiled nor inventoried, because it is newer than
+  the inventory, so keying only on "inventoried but not profiled" would have
+  refused the majority of ad-hoc querying.
+
+  Nothing about the guarantee is relaxed. The profile is a full one, same
+  detection, same `pii_overrides`, same cache write, so the flags governing the
+  query are the flags a deliberate `explore profile` would have produced; the
+  spine asserts a cache written this way is indistinguishable from one written
+  the deliberate way. On a metered connector the scan is priced, not implied:
+  one handshake covers profiling and the statement together, itemized per table,
+  and an unconfirmed or over-ceiling call executes nothing. Every result that
+  profiled says so in a warning and in `data.profiled_on_demand`, and the query
+  ledger records it. Where the guard refuses the query anyway, the profile is
+  still saved and the refusal says so, so a corrected query does not pay twice.
+
+  An object the connection does not have is still refused, now with a message
+  that says that rather than naming a cache no amount of profiling would fix.
+  `--no-auto-profile`, or `auto_profile: false` in `.dex/config.yml`, restores
+  the strict prerequisite word for word, and on that path no connection is
+  opened to produce the refusal.
+
+  `explore cluster` differs in one place, forced by its shape: its sample
+  statement is built from feature columns that come out of the profile, so it
+  cannot be priced up front. The profile is priced first and the sample passes
+  the mid-command gate, which asks for a larger budget rather than refusing;
+  the re-run reuses the saved profile and pays for the sample alone.
+
+  This also closes the `explore query` half of the problem [#134] fixed for
+  `explore semantic query --local`, and the two now share their relation
+  extraction and their foreign-versus-missing verdict.
+
 - **The three skill descriptions trigger on ticket-shaped prompts, not only on
   conversational questions** ([#267]). The trigger evals were written as
   first-person questions ("what's in my duckdb", "define a revenue metric on top

@@ -261,14 +261,18 @@ def recovery_hints(offending: list[str], cache: DexCache) -> list[str]:
     return sorted(suggestions)
 
 
-def inspect_query(
-    sql: str,
-    cache: DexCache,
-    limits: QueryLimits,
-    *,
-    dialect: str = "duckdb",
-) -> InspectedQuery:
-    """Approve (and bound) an agent query, or raise :class:`QueryRefusedError`."""
+def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
+    """Prove a statement is one read-only SELECT and return its parsed root.
+
+    Split out of :func:`inspect_query` so a caller that needs to touch the live
+    connection before the cache can adjudicate (resolving a relation, profiling
+    it) can prove the statement read-only first. Whatever else happens to an
+    agent-authored statement, it is never the reason dex introspected a
+    warehouse on its behalf.
+
+    Cache-independent by construction, which is what makes it safe to run early;
+    everything that needs the cache stays in :func:`inspect_query`.
+    """
 
     try:
         assert_select_only(sql, dialect=dialect)
@@ -283,6 +287,19 @@ def inspect_query(
             f"only SELECT queries may run here, got {type(root).__name__}; use "
             "`explore inventory` / `explore profile` for introspection"
         )
+    return root
+
+
+def inspect_query(
+    sql: str,
+    cache: DexCache,
+    limits: QueryLimits,
+    *,
+    dialect: str = "duckdb",
+) -> InspectedQuery:
+    """Approve (and bound) an agent query, or raise :class:`QueryRefusedError`."""
+
+    root = assert_query_shape(sql, dialect=dialect)
 
     known = {d.identifier: d for d in cache.datasets}
     tables: set[str] = set()
