@@ -93,6 +93,26 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   silence, which was indistinguishable from dex deciding the test was already
   there.
 
+### Fixed
+
+- **The PII firewall decides again without a warehouse connection.** Since 1.6.3,
+  `explore query` opened a connection before the guard ran: the object-gap probe
+  added with the auto-profiling work took an already-open adapter, and the
+  acquisition ahead of it was unguarded. Every query naming a relation therefore
+  needed a reachable warehouse before the firewall could refuse anything, so a
+  caller holding a profiled cache and no connector got a connector error where
+  1.6.2 returned a refusal. That reaches further than an inconvenience: the guard
+  reads cached PII flags and needs no warehouse to decide, so gating it on a
+  connection turns a policy decision into a connectivity one and closes the
+  firewall in exactly the offline environments that cannot bill for a mistake.
+
+  The acquisition is now as tolerant as the use one level below it, where an
+  unreadable column signature already "settles nothing" and falls through. A
+  failed open settles nothing either. Drift detection is unchanged wherever a
+  connection exists, and nothing is swallowed: a statement that passes the guard
+  reaches the same opener afterwards and raises there, which is where a caller
+  about to run SQL wants to hear it.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed
