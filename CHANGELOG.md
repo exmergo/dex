@@ -11,6 +11,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **`explore query` accepts more than one statement per call** ([#265]). The
+  positional was singular while `explore profile`'s beside it was already
+  variadic, so N questions cost N invocations, each a fresh process re-resolving
+  the connector and reloading the `.dex/` cache. That is the wrong shape for the
+  common case, an agent asking a chain of small questions, whose alternative is
+  an unfirewalled SQL client that answers six of them in one turn.
+
+  `dex explore query "select ..." "select ..."` now runs both, and
+  `--sql-file <path>` reads a larger batch from a file (one statement per line,
+  or semicolon-separated; boundaries come from the tokenizer, so a `;` inside a
+  string literal or a comment is text rather than a split, and a file whose lines
+  cannot be told apart as statements is refused naming the line). A single
+  statement returns the envelope it always did, byte for byte, because the two
+  doors are one runner rather than two implementations. Two or more return
+  `data.results`, one entry per statement carrying the familiar `columns` /
+  `types` / `cells` / `row_count` / `truncated` shape plus its own `status`, so a
+  refusal on the third statement does not discard the first two. The envelope's
+  own status is `error` when any statement failed, with every successful result
+  still present, which is how `transform build` already reports a run that failed
+  partway.
+
+  The guard does not move. Each statement is parsed, adjudicated, and ledgered on
+  its own, statements are never joined into one string, and several statements in
+  one argument stay refused exactly as before. On a metered connector the batch is
+  priced as a batch: one estimate itemized per statement and per object, one
+  `--confirm`, and the objects a whole call needs profiled are scanned once rather
+  than once per statement. The per-statement gate and the server-side cap still
+  bind on the way out, and the ledger keeps one line per statement, adding
+  `batch_index` and `batch_size` so an auditor can see that six statements were
+  one authorization event.
+
+  Two bounds come with it, because a call that returns N results is a call that
+  can flood agent context, which is what the caps exist to prevent.
+  `query.max_payload_bytes` is now the budget for the whole call rather than for
+  one statement, spent in statement order with what one leaves unspent available
+  to the next (unchanged at 16 KB, and unchanged in effect for a single
+  statement), and a new `query.max_statements` (default 10) refuses an oversized
+  batch. `query.max_rows` and `query.max_cell_chars` still bound each statement.
+
 - **`explore query` and `explore cluster` profile the object they name instead
   of refusing** ([#209]). The firewall resolves table and column references
   against the `.dex/` cache, because a taint rule over PII flags is only
