@@ -161,13 +161,69 @@ def outlier_duckdb(tmp_path: Path) -> Path:
 def test_cluster_without_cache_is_refused_with_the_fix(
     clusterable_duckdb: Path, tmp_path: Path, capsys
 ):
+    """The strict prerequisite, still reachable and still writing nothing.
+
+    `--no-auto-profile` is the whole of the old contract: the refusal names the
+    command that fills the gap, carries the machine-readable reason, and the
+    connection is never opened, so a caller who wants the guard to refuse rather
+    than spend gets exactly that.
+    """
+
     repo = tmp_path / "repo"
     repo.mkdir()
-    payload = _cluster(clusterable_duckdb, repo, capsys=capsys, expect_error=True)
+    payload = _cluster(
+        clusterable_duckdb,
+        repo,
+        "--no-auto-profile",
+        capsys=capsys,
+        expect_error=True,
+    )
     assert "explore map" in payload["errors"][0]
     assert not (repo / ".dex").exists(), "a refused gate writes nothing"
-    # #170: a machine-readable reason alongside the prose.
+    # A machine-readable reason alongside the prose.
     assert payload["reason"] == "prerequisite"
+
+
+@requires_sklearn
+def test_cluster_profiles_the_named_object_on_demand(
+    clusterable_duckdb: Path, tmp_path: Path, capsys
+):
+    """A cold start clusters instead of refusing, and says what it profiled."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    payload = _cluster(clusterable_duckdb, repo, capsys=capsys)
+    assert payload["data"]["profiled_on_demand"] == ["customers.main.customers"]
+    assert payload["data"]["clusters"], payload
+    assert any("profiled 1 object(s) on demand" in w for w in payload["warnings"])
+    # The profile is a real one and it is saved, so a second run reuses it.
+    again = _cluster(clusterable_duckdb, repo, capsys=capsys)
+    assert again["data"]["profiled_on_demand"] == []
+
+
+@requires_sklearn
+def test_cluster_on_an_absent_object_is_refused_naming_the_connection(
+    clusterable_duckdb: Path, tmp_path: Path, capsys
+):
+    """An object the warehouse does not have is refused, and the message says so
+    rather than sending the caller to profile something that is not there."""
+
+    repo = _mapped_repo(clusterable_duckdb, tmp_path, capsys)
+    rc = main(
+        [
+            "explore",
+            "cluster",
+            "nope",
+            "--path",
+            str(clusterable_duckdb),
+            "--repo-root",
+            str(repo),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1 and payload["status"] == "error", payload
+    assert "no object named 'nope' in this connection" in payload["errors"][0]
+    assert "exploration cache" not in payload["errors"][0]
 
 
 def test_missing_cluster_extra_is_a_clean_error(

@@ -359,6 +359,15 @@ def test_unconfirmed_relationships_recommends_map(
 
 
 def _seed_query_cache(tmp_path: Path) -> None:
+    """A cache that already adjudicates `shop.customers`, so the query path prices
+    the query alone.
+
+    The column signature has to match what the fake warehouse reports, `id`
+    REQUIRED included: a seeded profile that disagrees with the live schema is one
+    the engine re-profiles before trusting it, which is the point of that check and
+    would make this a test of the wrong thing.
+    """
+
     store = FilesystemStore(tmp_path)
     store.save_cache(
         DexCache(
@@ -366,7 +375,7 @@ def _seed_query_cache(tmp_path: Path) -> None:
                 Dataset(
                     identifier="test-proj.shop.customers",
                     columns=[
-                        ColumnProfile(name="id", data_type="INTEGER"),
+                        ColumnProfile(name="id", data_type="INTEGER", nullable=False),
                         ColumnProfile(
                             name="email",
                             data_type="STRING",
@@ -396,7 +405,43 @@ def test_unconfirmed_query_returns_estimate_and_logs(
     assert json.loads(log_lines[-1])["decision"] == "needs_confirmation"
 
 
+def _clusterable_client():
+    """A fake warehouse whose `customers` carries numeric non-key columns.
+
+    The shared fixture's table is id and email, which clustering has nothing to
+    cluster on. Building the client here rather than widening the shared one keeps
+    every other test's view of that table exactly as it was.
+    """
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+    from google.cloud import bigquery
+
+    return FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="customers",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                    bigquery.SchemaField("amount", "INTEGER"),
+                    bigquery.SchemaField("score", "FLOAT"),
+                ],
+                num_rows=100,
+                num_bytes=5_000,
+            )
+        ],
+    )
+
+
 def _seed_cluster_cache(tmp_path: Path) -> None:
+    """A profile of `shop.customers` matching what `_clusterable_client` reports.
+
+    Signature-exact for the same reason as `_seed_query_cache`: a seeded profile
+    that disagrees with the live schema is re-profiled before it is trusted.
+    """
+
     store = FilesystemStore(tmp_path)
     store.save_cache(
         DexCache(
@@ -405,8 +450,9 @@ def _seed_cluster_cache(tmp_path: Path) -> None:
                     identifier="test-proj.shop.customers",
                     row_count=100,
                     columns=[
+                        ColumnProfile(name="id", data_type="INTEGER", nullable=False),
                         ColumnProfile(name="amount", data_type="INTEGER"),
-                        ColumnProfile(name="score", data_type="FLOAT64"),
+                        ColumnProfile(name="score", data_type="FLOAT"),
                     ],
                 )
             ]
@@ -414,15 +460,14 @@ def _seed_cluster_cache(tmp_path: Path) -> None:
     )
 
 
-def test_unconfirmed_cluster_returns_needs_confirmation(
-    fake_bq_client, route_adapter, tmp_path
-):
+def test_unconfirmed_cluster_returns_needs_confirmation(route_adapter, tmp_path):
     """Clustering scans the feature columns, so on a billed connector it takes
     the same cost-before-spend handshake: an estimate and needs_confirmation,
     with nothing executed."""
 
     pytest.importorskip("sklearn")
     _seed_cluster_cache(tmp_path)
+    fake_bq_client = _clusterable_client()
     route_adapter(fake_bq_client)
     envelope = _dispatch(tmp_path, subcommand="cluster", object="customers")
     assert envelope.status.value == "needs_confirmation"

@@ -608,3 +608,53 @@ def test_sub_threshold_flag_flows_through_the_unnest_as_a_warning(
         dialect="bigquery",
     )
     assert any("HINT" in warning for warning in inspected.warnings)
+
+
+# --- what a statement reads, ahead of the guard ----------------------------------
+
+
+def test_referenced_relations_names_what_the_statement_reads():
+    """The pre-pass the on-demand profiler resolves against.
+
+    It reports names, not verdicts, so it must agree with the firewall about what
+    counts as a relation and stay silent about everything else.
+    """
+
+    from exmergo_dex_core.guards.sql_guard import referenced_relations
+
+    assert referenced_relations("SELECT 1") == []
+    assert referenced_relations("SELECT * FROM orders") == ["orders"]
+    assert referenced_relations("SELECT * FROM db.main.orders") == ["db.main.orders"]
+    # Joins and subqueries are read too, and each name appears once.
+    assert referenced_relations(
+        "SELECT * FROM a JOIN b ON a.id = b.id "
+        "WHERE a.id IN (SELECT id FROM c) AND b.id IN (SELECT id FROM a)"
+    ) == ["a", "b", "c"]
+
+
+def test_referenced_relations_excludes_ctes_but_not_their_qualified_namesakes():
+    """A CTE is defined by the statement, so calling one a relation would invent a
+    missing table. Only an unqualified reference can be a CTE, so a qualified name
+    of the same spelling is still a relation."""
+
+    from exmergo_dex_core.guards.sql_guard import referenced_relations
+
+    assert referenced_relations(
+        "WITH orders AS (SELECT * FROM raw_orders) SELECT * FROM orders"
+    ) == ["raw_orders"]
+    assert referenced_relations(
+        "WITH orders AS (SELECT 1 AS n) SELECT * FROM orders, db.main.orders"
+    ) == ["db.main.orders"]
+
+
+def test_referenced_relations_is_silent_where_it_cannot_speak():
+    """Unparseable input belongs to the guards that parse for policy, and a
+    table-valued function is not an object anyone could profile."""
+
+    from exmergo_dex_core.guards.sql_guard import referenced_relations
+
+    assert referenced_relations("SELECT FROM WHERE ((") == []
+    assert (
+        referenced_relations("SELECT * FROM generate_series(1, 10)", dialect="postgres")
+        == []
+    )
