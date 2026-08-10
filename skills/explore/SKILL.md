@@ -75,9 +75,12 @@ Subcommands, in the usual order:
    PII columns) to everything eligible.
 7. `explore query "<SELECT ...>"` answers an ad-hoc question the fixed commands
    don't cover: you write the SQL, the engine's query firewall refuses or bounds
-   it. Requires the `.dex/` cache (run `map` first). Results come back row-major
-   and capped; a refusal names the offending column and the fix, so one rewrite
-   is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
+   it. A table you have not profiled, including a model you just built, is
+   profiled for you and the query then runs, so probing something new is one
+   call rather than three; the envelope says what it profiled, and on a metered
+   connector that profile is priced into the same confirmation as the query.
+   Results come back row-major and capped; a refusal names the offending column
+   and the fix, so one rewrite is enough. Read `${CLAUDE_SKILL_DIR}/references/probe-playbook.md` before
    writing a probe: it maps common questions to effective probe shapes.
 8. `explore cluster <object> [--features a,b,c] [-k N]` runs k-means over a
    bounded sample of the object's numeric columns and returns the segment

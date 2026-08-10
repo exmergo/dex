@@ -3,9 +3,12 @@
 A probe is one agent-authored SELECT run through the engine's query firewall. The
 firewall guarantees safety; this playbook is about effectiveness: asking the
 question in a shape that returns a small, decisive answer instead of a wall of
-rows. Profile first (`explore map`), probe second; the profile usually already
-holds the answer (null fractions, distinct counts, min/max, candidate keys), and
-probes exist for the questions it does not.
+rows. Map first (`explore map`) when you are getting your bearings: the profile
+usually already holds the answer (null fractions, distinct counts, min/max,
+candidate keys), and probes exist for the questions it does not. But you do not
+have to map before you can probe. A table the engine has not profiled, including
+a model you built moments ago, is profiled as part of answering, so a probe
+against something new costs one call.
 
 Two habits pay for everything else:
 
@@ -134,9 +137,10 @@ firewall the same way: the condition is a filter, not a projected value.
 
 The refusal names the column, its PII category, and the fix. Rewrite once: swap
 the value-carrying expression for a measuring one, or drop the column from the
-projection. Do not retry the same shape, do not route around the engine with
-Python or a database CLI, and if the refusal says a table is not profiled, run
-`explore profile <table>` (or `explore map`) and probe again.
+projection. Do not retry the same shape and do not route around the engine with
+Python or a database CLI. A refusal naming a table the connection does not have
+is a real answer: check the name, or build the model into the target you are
+querying. It will not be fixed by profiling.
 
 Two newer paths the refusal may name:
 

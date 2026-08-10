@@ -88,6 +88,8 @@ rather than hides:
 **Metered:** profiling aggregates, `explore query`, relationship
 verification probes, distinct-count escalations, and `transform build`.
 
+`explore query` and `explore cluster` profile an object they name that this connection has but the `.dex/` cache cannot adjudicate. That scan is billed, and it is priced into the same handshake as the statement rather than added afterward, so the estimate you confirm is the whole cost. Resolving which objects need it stays free: it is object listing and column metadata, the same reads the inventory uses. Pass `--no-auto-profile` (or set `auto_profile: false` in `.dex/config.yml`) to be refused instead.
+
 Budgets (`budget.ceiling`, `--budget`, `budget.session_ceiling`) are
 compute-seconds: the number you budget is the number the server enforces.
 Every cost surface also carries the translation to **RPU-hours**

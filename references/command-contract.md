@@ -308,10 +308,43 @@ only refuses or bounds. The gate, in order:
 1. **Parse, don't trust.** A single read-only SELECT, structurally checked.
    Writes, DDL, multi-statement input, PRAGMA and DESCRIBE are refused
    (introspection goes through `inventory`/`profile`).
-2. **Resolve against the cache.** Every table and column must exist in
-   `.dex/cache.json`; no cache or an unprofiled object refuses with the fix
-   ("run `explore map` first"). Profiling is what makes the PII policy
-   computable, so probing requires it.
+2. **Resolve against the cache, then against the connection.** Every table and
+   column must exist in `.dex/cache.json`, because profiling is what makes the
+   PII policy computable and the firewall cannot judge a column whose flags it
+   does not have. What follows from a cache miss is not a refusal, though: the
+   object is looked up in the live inventory, and if the connection has it, it is
+   profiled and the query then runs. This covers the case no amount of upfront
+   exploration can, a relation built since the last inventory (a model `dbt run`
+   just created), which is neither profiled nor inventoried.
+
+   Three states trigger the profile: never profiled, present but inventory-only
+   (no column detail), and profiled against a column signature the warehouse has
+   since changed. Age does not: a cached profile whose columns still match is
+   reused however old it is, so a probe never silently becomes a re-scan.
+
+   The scan is disclosed, never silent. The result warns, naming what was
+   profiled, and `data.profiled_on_demand` lists it for a machine reader. The
+   profile is a full one, same detection, same `pii_overrides`, same cache write,
+   so the flags governing the query are the flags a deliberate `explore profile`
+   would have produced. On a metered connector it is priced rather than implied:
+   a single handshake covers profiling those objects and running the statement,
+   itemized per table alongside a `(the statement itself)` entry, and the
+   confirmed call does both. If the guard then refuses the query anyway, the
+   profile is still saved and the refusal says so, so a corrected query does not
+   pay for it twice.
+
+   An object the connection does not have is still refused. The message names
+   the connection rather than the cache, because no amount of profiling puts an
+   absent object into it. `--no-auto-profile`, or `auto_profile: false` in
+   `.dex/config.yml`, restores the strict prerequisite: the original refusals
+   word for word, and no connection opened to produce them.
+
+   `explore cluster` resolves its object the same way, with one difference in
+   pricing that its shape forces. Its sample statement is built from the feature
+   columns, which come out of the profile, so the profile is priced first and the
+   sample passes a mid-command gate afterward: a budget too small for the sample
+   returns `needs_confirmation` with the profile already saved, rather than
+   refusing and discarding it.
 3. **Classify the projection.** Output may carry values only from profiled
    columns whose PII flag is absent or below the blocking threshold. A flag at
    confidence 0.5 or above blocks projection; the threshold is a hard-coded
@@ -332,11 +365,15 @@ only refuses or bounds. The gate, in order:
    (default 256 chars), the payload is byte-capped (default 16 KiB), and every
    cut is announced in `notes`. A watchdog interrupts queries that outlive
    their time budget (default 30s). All four are configurable under `query:` in
-   `.dex/config.yml`.
+   `.dex/config.yml`; `auto_profile` sits at the top level instead, because
+   `explore cluster` honors it too.
 5. **Record.** Every decision, allowed, refused, or failed, is appended to
    `.dex/queries.jsonl` (SQL text and counts, never result values). An allowed
    query that projected sub-threshold flagged columns records those warnings
    under `pii_warnings`, so the audit trail keeps every such projection findable.
+   A decision that profiled first records the objects under `profiled_on_demand`
+   (and `profile_planned` on a `needs_confirmation`), so a scan is as findable in
+   the ledger as a spend.
 
 Results are row-major (`columns`, `cells` as a list of lists, `row_count`,
 `truncated`, `notes`), which is cheaper in tokens than records and keeps the
