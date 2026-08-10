@@ -98,6 +98,74 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform plan` attributes an edit's row-population change to the change
+  that caused it** ([#266]). Planning already validated an edit against the real
+  schema: column names, refs, materialization, deletions. It never compared the
+  edit's *behaviour* to the behaviour of the model being replaced, so a change to
+  which rows enter a model passed silently. The model compiles, the columns are
+  right, every value is plausible, and the row population is different from what
+  it was. On a fix or refactor ticket that is the failure mode, because the
+  caller was asked to change some behaviour and not other behaviour, and nothing
+  distinguished the two.
+
+  Measured on an agentic dbt benchmark. A model carried a pre-existing
+  `where status != 'CANCELLED'` that the ticket did not mention and the reference
+  solution keeps. Profiling correctly reported `status` as unnormalised, 21
+  distinct values including `CANCELLED`, `cancelled` and `C`, next to a
+  clean-looking `is_cancelled` boolean, so the caller substituted
+  `where not is_cancelled`. That is defensible engineering and wrong in this
+  warehouse, where the two columns are mutually inconsistent: 158 rows match the
+  string, 26 the boolean, 19 both. The two changes the ticket asked for netted
+  -1 row. The one predicate swap nobody asked for accounted for +8, and the task
+  failed on the row count alone with every other assertion passing. Three further
+  runs of the same ticket reached the same wrong count by a different route,
+  widening the customer universe with an added `LEFT JOIN`.
+
+  A bare "the row count changed" warning does not help here, because that ticket
+  *requires* two row-population changes. Only per-change attribution separates a
+  requested change from a silent side effect, so that is what plan now reports
+  under `data.row_attribution`: each `WHERE`, `HAVING` and `QUALIFY` predicate,
+  each join added, removed or retyped, each swapped driving relation, and each
+  `DISTINCT` or `GROUP BY` change, named and measured by applying it alone to the
+  prior model and counting. Column expressions, aliases, casts and ordering
+  produce nothing, by construction rather than by filtering, because they cannot
+  change which rows enter a model and reporting them would bury the signal under
+  an ordinary refactor. The whole-edit net is measured on the authored model and
+  reported alongside, never summed from the parts, and when the two disagree
+  `interacts` says so rather than letting a reader total the column and trust a
+  number the warehouse would not produce.
+
+  A warning, never a refusal. Changing the filter is sometimes exactly the job.
+  What matters is that it is visible and quantified while the caller can still
+  act on it, which is before `transform apply`.
+
+  Naming a change is static and opens no connection, so it always runs.
+  Measuring one is a `COUNT` aggregate over relations the model already reads,
+  which is free on DuckDB and spend everywhere else, so the split is explicit:
+  counting runs unasked on a free connector, and on BigQuery, Snowflake,
+  Databricks, Redshift and Postgres it runs only under `--attribute-rows`,
+  priced through the ordinary estimate and `--confirm --budget` handshake. A
+  metered `transform plan` that does not ask for it behaves exactly as it did
+  before, down to the envelope and down to not opening a connection.
+  `--no-attribute-rows` turns counting off anywhere.
+
+  Nothing about the guarantees is relaxed. The plan is built and stored before
+  any of this runs, so a failure to attribute can never prevent a plan from
+  existing, and planning still writes nothing into the dbt project. Every
+  statement is one `SELECT COUNT(*)` cleared by the query firewall, so the
+  model's parents must be profiled and the PII policy applies; a count projects
+  no column, so a model filtering on a flagged column is still attributable and
+  no value crosses the envelope. Nothing is materialized, no relation is created,
+  and neither version of the model is built. A change that cannot be isolated or
+  measured reports `attributed: false` and names why: macro-generated SQL, a
+  jinja statement block, a CTE renamed so no prior scope can be paired with it, a
+  relation the cache cannot place, or a counterfactual that is not valid alone
+  because it depends on something else in the same edit. Authoring a model that
+  does not exist yet produces no findings and opens nothing. The two caps that
+  bound the work, six changes per model and five models per plan, are stated in a
+  warning whenever they bind, because a capped run that said nothing about the
+  cap would read as full coverage.
+
 - **The conformance suite reaches the content a format declares, not just its
   shape** ([#259]). Three assertions, each covering a way a format can pass the
   existing suite while being wrong in a way that costs a real check.
