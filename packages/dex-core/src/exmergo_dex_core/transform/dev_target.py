@@ -807,7 +807,16 @@ def _declares_sources(project: Path) -> bool:
 
 
 def _relative(path: Path, repo_root: Path | str) -> str:
+    """A repo-relative path for display, with forward slashes on every platform.
+
+    The messages this feeds name it beside `.dex/config.yml`, which is built from
+    a literal and so always uses forward slashes. Returning the native separator
+    made the two halves of one sentence disagree on Windows:
+    ``.dex/config.yml and analytics\\profiles.yml``. These are labels a reader
+    matches against paths written in configuration, not paths anything opens.
+    """
+
     try:
-        return str(path.resolve().relative_to(Path(repo_root).resolve()))
+        return path.resolve().relative_to(Path(repo_root).resolve()).as_posix()
     except ValueError:
-        return str(path)
+        return path.as_posix()
