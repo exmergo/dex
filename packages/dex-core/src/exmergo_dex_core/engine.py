@@ -744,10 +744,17 @@ class DexEngine:
         *,
         edits: list[PlanEdit] | None = None,
         scaffold: list[str] | None = None,
+        attribute_rows: bool | None = None,
     ) -> PlanResult:
         from .transform import commands as transform
 
-        return transform.plan(self, intent, edits=edits, scaffold=scaffold)
+        return transform.plan(
+            self,
+            intent,
+            edits=edits,
+            scaffold=scaffold,
+            attribute_rows=attribute_rows,
+        )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:
         from .transform import commands as transform
