@@ -89,6 +89,10 @@ INTERNAL_REFUSALS = {
     # An envelope-layer invariant, raised at the CLI boundary rather than
     # returned from the engine.
     "SanitizationError",
+    # Control flow inside row-population attribution, never a boundary event:
+    # every one is caught and rendered as the `reason` on a finding that reports
+    # it could not attribute a change. A consumer reads that field, not this type.
+    "UnattributableError",
     # The transform surface. Every one of these needs a repo_root, so they sit
     # outside "reachable from the public API without a repo_root". Worth
     # revisiting as a family if a host ever drives transform programmatically.
