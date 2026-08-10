@@ -59,3 +59,17 @@ def get_dialect(connector: str) -> str:
     names so parsing has a deterministic fallback."""
 
     return _DIALECTS.get(connector, "duckdb")
+
+
+# Connectors that bill nothing for a scan. Kept beside the dialect map and for
+# the same reason: a command deciding whether an optional scan is free enough to
+# run unasked must not have to construct an adapter (and open a connection) to
+# find out. An unknown name is treated as billed, so the cautious answer is the
+# default one.
+_FREE_CONNECTORS = frozenset({"duckdb"})
+
+
+def is_free_connector(connector: str) -> bool:
+    """Whether ``connector`` bills nothing, resolved without constructing anything."""
+
+    return connector in _FREE_CONNECTORS
