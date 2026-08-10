@@ -89,6 +89,17 @@ class ColumnProfile(BaseModel):
     #: detector matched nothing.
     pii_overridden: PIICategory | None = None
     value_domain: ValueDomain | None = None
+    #: Temporal continuity (#206): the range between min and max at a
+    #: detected granularity ("day" | "month" | "hour") against how many of
+    #: those periods are actually present. ``None`` outside a date/timestamp
+    #: column, or when there isn't enough evidence (e.g. min/max absent).
+    #: The statistic is neutral -- a genuinely sparse event-timestamp column
+    #: reports large numbers here without being flagged as broken.
+    temporal_granularity: str | None = None
+    temporal_span: int | None = None
+    temporal_distinct_periods: int | None = None
+    temporal_missing_periods: int | None = None
+    temporal_largest_gap: int | None = None
 
 
 class Dataset(BaseModel):

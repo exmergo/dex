@@ -9,6 +9,40 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore profile` reports temporal continuity for date and timestamp
+  columns** ([#206]). A temporal column reported a null fraction, a distinct
+  count, and a min/max, and nothing said whether the range was continuous: a
+  table covering 3,000 days with 2,900 distinct days looked identical to one
+  covering all 3,000. Two real failure modes share exactly this signature and
+  neither shows up in the row count: a half-failed load missing a
+  day/partition (the total moves by a fraction of a percent, no drift
+  threshold fires, but every daily aggregate for that period is wrong), and a
+  date-spine defect (a rollup built from observed dates instead of a
+  calendar, so zero-activity periods vanish instead of appearing as zero).
+
+  Each eligible column now reports its detected granularity (day by default,
+  month or hour where the data is clearly at that grain), `span` (periods
+  between min and max, inclusive, at that grain), `distinct_periods`,
+  `missing_periods` (`span - distinct_periods`), and `largest_gap` (the
+  widest run of consecutive missing periods). The statistic is neutral: a
+  genuinely sparse column (an event timestamp on a rare event) reports its
+  numbers without being characterized as broken; interpretation belongs to
+  whoever reads it, explicitly including a future drift-sweep detector this
+  only lands the raw statistics for (issue #226, not built here).
+
+  `largest_gap` rides the same aggregate batch that already fetches
+  min/max/distinct, as a correlated scalar subquery (`LAG() OVER (ORDER BY
+  period)`, the same "subquery inside the flat SELECT" shape the
+  composite-key probe already uses) rather than a new row-returning adapter
+  capability: zero extra round trip, one bounded scalar per column. Hour
+  granularity is skipped for a bare calendar date (nothing to truncate to an
+  hour, and BigQuery's `DATE_TRUNC` does not even accept that unit).
+  Implemented across every connector (DuckDB, BigQuery, Snowflake,
+  Databricks, Redshift, Postgres); gated on no PII flag at all, at any
+  confidence, the same rule #204's declared-type checks already use.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed

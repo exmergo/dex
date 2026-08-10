@@ -55,10 +55,12 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
             [
                 ColumnMeta("id", "INTEGER", True, 0),
                 ColumnMeta("email", "VARCHAR", True, 1),
+                ColumnMeta("signup_date", "TIMESTAMP", True, 2),
             ],
-            safe={"id"},
+            safe={"id", "signup_date"},
             shape={"email"},
             type_req={"id", "email"},
+            temporal_req={"signup_date"},
         )
     finally:
         adapter.close()
@@ -70,6 +72,12 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # string-eligible fractions on the VARCHAR column, epoch fractions on both.
     assert "ts_ns_1" in sql and "ts_sl1_1" in sql
     assert "ts_ep_s_0" in sql and "ts_ep_s_1" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too: the
+    # alignment fractions and all three granularity variants for the date column.
+    assert "tc_da_2" in sql and "tc_ma_2" in sql
+    assert "tp_d_2" in sql and "tg_d_2" in sql
+    assert "tp_m_2" in sql and "tg_m_2" in sql
+    assert "tp_h_2" in sql and "tg_h_2" in sql
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
 
@@ -1757,11 +1765,16 @@ def _bq_adapter(fake_bq_client, *, ceiling=500 * 1024 * 1024, confirmed=True):
 def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     # Family 1: every statement the adapter generates passes the SELECT-only
     # guard in the bigquery dialect (asserted at build time, no client needed).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _bq_adapter(fake_bq_client)
     _meta, columns = adapter.table_metadata("test-proj.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -1774,13 +1787,19 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}, shape, type_req
+        "test-proj.shop.customers", columns, {"id"}, shape, type_req, temporal_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     # Declared-type-vs-content statistics (#204) ride the same statement too.
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too,
+    # using TIMESTAMP_TRUNC/TIMESTAMP_DIFF (BigQuery's reversed argument
+    # order and type-specific truncation family).
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "TIMESTAMP_TRUNC" in sql and "TIMESTAMP_DIFF" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
@@ -2112,11 +2131,16 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _sf_adapter(fake_sf_connection)
     _meta, columns = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
+    columns = [*columns, ColumnMeta("SIGNUP_TS", "TIMESTAMP_NTZ", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2129,12 +2153,16 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    temporal_req = {"SIGNUP_TS"}
     sql, _plan = adapter._build_aggregate_sql(
-        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req
+        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req, temporal_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
     assert assert_select_only(sql, dialect="snowflake") == sql
 
 
@@ -2389,11 +2417,16 @@ def _dbx_adapter(fake_databricks, *, ceiling=600.0, confirmed=True):
 def test_databricks_generated_sql_is_select_only(fake_databricks):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the databricks dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _dbx_adapter(fake_databricks)
     _meta, columns = adapter.table_metadata("shop.core.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2406,12 +2439,16 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "shop.core.customers", columns, {"id"}, shape, type_req
+        "shop.core.customers", columns, {"id"}, shape, type_req, temporal_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "date_trunc" in sql and "TIMESTAMPDIFF" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
 
 
@@ -2600,11 +2637,16 @@ def _pg_adapter(fake_pg_connection, *, ceiling=600.0, confirmed=True):
 def test_postgres_generated_sql_is_select_only(fake_pg_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the postgres dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _pg_adapter(fake_pg_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2617,12 +2659,16 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req
+        "dexdb.shop.customers", columns, {"id"}, shape, type_req, temporal_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "date_trunc" in sql and "EXTRACT(EPOCH" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
 
 
@@ -2841,11 +2887,16 @@ def _redshift_adapter(fake_redshift_connection, *, ceiling=600.0, confirmed=True
 def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the redshift dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _redshift_adapter(fake_redshift_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2858,12 +2909,16 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req
+        "dexdb.shop.customers", columns, {"id"}, shape, type_req, temporal_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
     assert assert_select_only(sql, dialect="redshift") == sql
 
 
