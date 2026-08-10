@@ -237,6 +237,51 @@ def test_cost_guard_blocks_over_ceiling():
 
 
 @pytest.mark.parametrize(
+    "connector", ["bigquery", "snowflake", "databricks", "redshift", "postgres"]
+)
+def test_row_attribution_never_spends_unasked_on_a_metered_connector(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """Naming a row-affecting change is free; measuring one is a scan. A metered
+    connector must therefore not be touched by planning unless the caller asked,
+    which is what keeps `transform plan` free of a handshake for the edits that
+    cost nothing. The edit here does move rows, so a connection would be opened
+    if the gate were on the wrong side."""
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.row_attribution import attribute
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    model.write_text("select * from raw_customers where id > 0\n", encoding="utf-8")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("planning opened a connection without --attribute-rows")
+
+    monkeypatch.setattr(DexEngine, "_adapter", refuse)
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector=connector),
+    )
+    edits = [
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select * from raw_customers where id > 5\n",
+        )
+    ]
+    # requested=None is the default: follow the connector, and every one of these
+    # bills, so none of them may be opened.
+    outcome = attribute(engine, edits, requested=None)
+    assert outcome.models, "the change is still named, for free"
+    changes = outcome.models[0].changes
+    assert changes and all(not c.attributed for c in changes)
+    assert all("--attribute-rows" in (c.reason or "") for c in changes)
+    assert outcome.adapter is None and outcome.pending is None
+
+
+@pytest.mark.parametrize(
     "paradigm",
     [env.Paradigm.BYTES_SCANNED, env.Paradigm.COMPUTE_TIME, env.Paradigm.DB_LOAD],
 )
@@ -793,6 +838,138 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     # Planning returns reviewable diffs and touches nothing in the project.
     assert diffs and diffs[0]["unified"]
     assert not new_model.exists()
+
+
+def _attribution_repo(dbt_project_dir: Path, duckdb_file: Path, model_sql: str) -> Path:
+    """A project whose one model reads a real warehouse table, cache and all.
+
+    Row-population attribution is the only plan-time check that reaches the
+    warehouse, so the spine exercises it against the real engine rather than a
+    stand-in: a real cache, the real firewall, the real adapter.
+    """
+
+    repo = dbt_project_dir.parent
+    (dbt_project_dir / "models" / "staging" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    tables:\n"
+        "      - name: customers\n      - name: orders\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "stg_orders.sql").write_text(
+        model_sql, encoding="utf-8"
+    )
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        repo_root=str(repo),
+        store=FilesystemStore(repo),
+        config=DexConfig(connector="duckdb"),
+    ) as engine:
+        engine.map(full=True)
+    return repo
+
+
+_PRIOR_STG_ORDERS = "select * from {{ source('raw', 'customers') }}\nwhere id > 0\n"
+
+
+def _attribute(repo: Path, duckdb_file: Path, authored: str):
+    from exmergo_dex_core import transform
+
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        repo_root=str(repo),
+        store=FilesystemStore(repo),
+        config=DexConfig(connector="duckdb"),
+    ) as engine:
+        return engine.plan(
+            "edit the filter",
+            edits=[
+                transform.PlanEdit(
+                    path="models/staging/stg_orders.sql",
+                    kind=transform.EditKind.MODEL_SQL,
+                    new_content=authored,
+                )
+            ],
+        )
+
+
+def test_row_attribution_measures_and_still_writes_nothing(
+    dbt_project_dir: Path, duckdb_file: Path
+):
+    """Attribution runs statements against the warehouse. It must remain a
+    reader: the plan is still a proposal and the project is still untouched."""
+
+    repo = _attribution_repo(dbt_project_dir, duckdb_file, _PRIOR_STG_ORDERS)
+    model = dbt_project_dir / "models" / "staging" / "stg_orders.sql"
+    before = model.read_text()
+
+    result = _attribute(
+        repo,
+        duckdb_file,
+        "select * from {{ source('raw', 'customers') }}\nwhere id > 1\n",
+    )
+    measured = [c for c in result.row_attribution[0]["changes"] if c["attributed"]]
+    assert measured and all(c["delta"] is not None for c in measured)
+    # Propose-don't-impose survives a check that reaches the warehouse.
+    assert model.read_text() == before
+    assert result.diffs and result.diffs[0]["unified"]
+
+
+def test_row_attribution_over_a_pii_column_carries_no_value(
+    dbt_project_dir: Path, duckdb_file: Path
+):
+    """A filter on a PII-flagged column is still attributable, because the
+    statement projects COUNT(*) and nothing else. The count is a statistic; the
+    values it counts never leave the engine."""
+
+    repo = _attribution_repo(dbt_project_dir, duckdb_file, _PRIOR_STG_ORDERS)
+    result = _attribute(
+        repo,
+        duckdb_file,
+        "select * from {{ source('raw', 'customers') }}\nwhere email like 'a%'\n",
+    )
+    changes = result.row_attribution[0]["changes"]
+    assert any(c["attributed"] and c["delta"] is not None for c in changes)
+    # The PII column is named as SQL, never as data: no address appears anywhere.
+    payload = to_envelope(result).model_dump(mode="json")
+    assert "email" in str(payload), "the predicate itself is reported"
+    assert "@example.com" not in str(payload)
+
+
+def test_every_statement_row_attribution_issues_is_a_bare_count(
+    dbt_project_dir: Path, duckdb_file: Path, monkeypatch
+):
+    """The generated SQL is SELECT-only and projects one aggregate. This is the
+    property that lets attribution reach the warehouse at all."""
+
+    from exmergo_dex_core.adapters import duckdb as duckdb_adapter
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    issued: list[str] = []
+    original = duckdb_adapter.DuckDBAdapter.run_query
+
+    def recording(self, sql, **kwargs):
+        issued.append(sql)
+        return original(self, sql, **kwargs)
+
+    monkeypatch.setattr(duckdb_adapter.DuckDBAdapter, "run_query", recording)
+
+    repo = _attribution_repo(dbt_project_dir, duckdb_file, _PRIOR_STG_ORDERS)
+    issued.clear()
+    _attribute(
+        repo,
+        duckdb_file,
+        "select * from {{ source('raw', 'customers') }}\nwhere id > 1\n",
+    )
+
+    assert issued, "the attribution ran statements"
+    for sql in issued:
+        assert_select_only(sql, dialect="duckdb")
+        upper = sql.upper()
+        assert "COUNT(*)" in upper
+        assert not any(
+            forbidden in upper for forbidden in ("INSERT", "UPDATE", "DELETE", "CREATE")
+        )
 
 
 def _reconcile_fixtures(dbt_project_dir: Path) -> tuple[FilesystemStore, str]:

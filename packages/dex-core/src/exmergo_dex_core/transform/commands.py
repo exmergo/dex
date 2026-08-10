@@ -177,6 +177,7 @@ def plan(
     *,
     edits: list[PlanEdit] | None = None,
     scaffold: list[str] | None = None,
+    attribute_rows: bool | None = None,
 ) -> PlanResult:
     """Turn authored edits into a stored plan of reviewable diffs.
 
@@ -184,6 +185,10 @@ def plan(
     Deletes and project/profile edits are gated by dbt's own parser here rather
     than at build time, because a broken ``dbt_project.yml`` breaks everything
     and an orphaning delete is cheaper to catch before it is stored.
+
+    ``attribute_rows`` controls the row-population report (see
+    :mod:`.row_attribution`), which runs after the plan is stored so that nothing
+    it finds, and no way it fails, can stop a plan from existing.
     """
 
     edits = list(edits or [])
@@ -232,7 +237,59 @@ def plan(
 
     result = _make_plan(engine, intent, edits)
     result.warnings.extend(parse_notes)
+    _attribute_rows(engine, result, edits, requested=attribute_rows)
     return result
+
+
+def _attribute_rows(
+    engine: DexEngine,
+    result: PlanResult,
+    edits: list[PlanEdit],
+    *,
+    requested: bool | None,
+) -> None:
+    """Fold the row-population report onto a plan that is already stored.
+
+    Deliberately total: an edit that cannot move rows, a project dex cannot read,
+    a warehouse it cannot reach, all return quietly, because the plan is the
+    command's product and this is commentary on it. The one thing that does
+    propagate is the priced ask on a metered connector, which rides back on the
+    result beside the plan rather than replacing it.
+
+    The broad ``except`` is the backstop behind that: the plan is stored by the
+    time this runs, so a defect in the analysis must not turn a successful plan
+    into an error envelope the caller cannot read a plan id out of. It names the
+    exception type rather than swallowing it, so a bug still surfaces.
+
+    A cost-guard refusal is deliberately **not** caught. An over-ceiling estimate
+    and a missing ceiling are the two things confirmation cannot override, and a
+    backstop that downgraded either to a warning would leave the guard reporting
+    a number that did not bind, which is the failure mode the whole gate exists
+    to prevent.
+    """
+
+    from ..guards.cost_guard import CostGuardError
+    from .row_attribution import attribute
+
+    try:
+        outcome = attribute(engine, edits, requested=requested)
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        result.warnings.append(
+            "could not analyse this edit's effect on the row population "
+            f"({type(exc).__name__}: {exc}); the plan itself is unaffected"
+        )
+        return
+    result.warnings.extend(outcome.warnings)
+    if not outcome:
+        return
+
+    result.row_attribution = [model.model_dump(mode="json") for model in outcome.models]
+    if outcome.pending is not None:
+        result.pending_confirmation = outcome.pending
+    if outcome.adapter is not None:
+        command_args.stamp_spend(result, outcome.adapter)
 
 
 def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -242,6 +299,7 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             getattr(args, "argument", None) or "",
             edits=_edits_from_payload(getattr(args, "edits_file", None)),
             scaffold=getattr(args, "scaffold", None),
+            attribute_rows=getattr(args, "attribute_rows", None),
         )
         return to_envelope(result, hints=_plan_hint(result))
     except DbtParseError as exc:

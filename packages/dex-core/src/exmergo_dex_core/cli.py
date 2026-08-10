@@ -267,6 +267,24 @@ def _build_parser() -> argparse.ArgumentParser:
                     # The agent-authored edits payload: a JSON file, or - for stdin.
                     sp.add_argument("--edits-file", default=None)
                     sp.add_argument("--scaffold", action="append", default=None)
+                    # Tri-state, and the default is the connector's: naming a
+                    # row-affecting change is free, measuring one is a scan. So
+                    # counting runs unasked only where it bills nothing, and the
+                    # flag is how a caller overrides that in either direction.
+                    rows = sp.add_mutually_exclusive_group()
+                    rows.add_argument(
+                        "--attribute-rows",
+                        dest="attribute_rows",
+                        action="store_true",
+                        default=None,
+                        help="measure the row-population delta of each change",
+                    )
+                    rows.add_argument(
+                        "--no-attribute-rows",
+                        dest="attribute_rows",
+                        action="store_false",
+                        help="name row-affecting changes without measuring them",
+                    )
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)

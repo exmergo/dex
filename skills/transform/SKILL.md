@@ -114,6 +114,18 @@ check" note just means no connection was reachable at init time.
   `--scaffold <table>` (repeatable) to generate a staging skeleton
   (`stg_<table>.sql` plus per-model YAML with key tests and PII meta) from the
   `.dex/` cache instead of, or on top of, hand-authored edits.
+- When you edit a model that already exists, the plan reports what your change
+  does to its **row population** under `data.row_attribution`: every predicate,
+  join, source and grain change is named, and each is measured on its own against
+  the prior model. Read it before applying. A change you were not asked to make
+  carrying a non-zero `delta` is the signal to look at: the model still compiles
+  and the columns are still right, and it is now returning a different set of
+  rows. It is advisory, never a refusal, because changing the filter is sometimes
+  the job. On DuckDB the deltas are measured automatically; on a billed connector
+  the changes are named for free and measuring them needs `--attribute-rows`
+  (then the usual `--confirm --budget` once priced), so ask the user before
+  spending. A change reported with `attributed: false` names why it could not be
+  measured; treat that as unknown, not as zero.
 - `transform apply [plan-id]` writes the plan into the dbt project (the latest
   unapplied plan when no id is given; any plan kind, semantic included). The
   result is still a reviewable git diff for the user. If a human edited a file
