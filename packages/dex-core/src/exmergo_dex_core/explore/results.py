@@ -211,6 +211,7 @@ class QueryResult(Result):
     row_count: int = 0
     truncated: bool = False
     tables: list[str] = Field(default_factory=list)
+    profiled_on_demand: list[str] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
         return {
@@ -220,6 +221,7 @@ class QueryResult(Result):
             "row_count": self.row_count,
             "truncated": self.truncated,
             "tables": self.tables,
+            "profiled_on_demand": self.profiled_on_demand,
         }
 
 
@@ -244,6 +246,7 @@ class ClusterResult(Result):
     sample_method: str = ""
     sample_repeatable: bool = False
     clustering: dict[str, Any] = Field(default_factory=dict)
+    profiled_on_demand: list[str] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
         return {
@@ -252,6 +255,7 @@ class ClusterResult(Result):
             "dropped_null_rows": self.dropped_null_rows,
             "sample_method": self.sample_method,
             "sample_repeatable": self.sample_repeatable,
+            "profiled_on_demand": self.profiled_on_demand,
             **self.clustering,
         }
 
