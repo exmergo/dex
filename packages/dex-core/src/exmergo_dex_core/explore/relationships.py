@@ -23,6 +23,7 @@ from ..cache import (
     RelationshipKind,
     match_identifier,
 )
+from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
 from ..progress import ProgressReporter
 from .profile import NEAR_UNIQUE_RATIO
@@ -58,6 +59,12 @@ _COLUMN_ALIAS_PREFIX = re.compile(r"^[a-z]{1,3}_", re.IGNORECASE)
 # a name that's merely popular.
 _GENERIC_NAME_MIN_HOSTS = 3
 
+# A trailing table-version marker (`_v2`, `_v3`, ...), stripped unconditionally
+# when the configured `EntityAffixes` don't resolve a match on their own. This
+# is a structural convention (like the `_ID_SUFFIXES` shapes), not a
+# house-specific word, so it isn't part of the configurable affix lists.
+_VERSION_SUFFIX = re.compile(r"_v\d+$", re.IGNORECASE)
+
 
 class SuppressedMatch(NamedTuple):
     """A same-named-FK match withheld because the shared name is too generic
@@ -67,6 +74,54 @@ class SuppressedMatch(NamedTuple):
 
     shared_name: str
     host_count: int
+
+
+class AffixMatch(NamedTuple):
+    """A join matched only after stripping a configured entity affix (see
+    `EntityAffixes`) from the parent's table name, because the exact-name tier
+    missed. Recorded so a caller can report when a match relied on
+    affix-stripping rather than an exact entity name; scored lower than an
+    exact match to the same key (issue #208)."""
+
+    child_column: str
+    parent: str
+    stripped_to: str
+
+
+def _strip_configured_affixes(name: str, affixes: EntityAffixes) -> str:
+    """Lowercased ``name`` with configured prefixes/suffixes, and a trailing
+    version marker, stripped repeatedly until none remain.
+
+    Repetition (rather than one pass) is what lets a name layered with more
+    than one convention reduce fully: `conversation_history_data` sheds
+    `_data` and then `_history` in two passes of the same suffix loop, in
+    whatever order the config lists them.
+    """
+
+    stripped = name.lower()
+    changed = True
+    while changed:
+        changed = False
+        version = _VERSION_SUFFIX.search(stripped)
+        if version is not None and version.start() > 0:
+            stripped = stripped[: version.start()]
+            changed = True
+            continue
+        for suffix in affixes.suffixes:
+            tail = f"_{suffix.lower()}"
+            if stripped.endswith(tail) and len(stripped) > len(tail):
+                stripped = stripped[: -len(tail)]
+                changed = True
+                break
+        if changed:
+            continue
+        for prefix in affixes.prefixes:
+            head = f"{prefix.lower()}_"
+            if stripped.startswith(head) and len(stripped) > len(head):
+                stripped = stripped[len(head) :]
+                changed = True
+                break
+    return stripped
 
 
 def _fk_stem(column_name: str) -> str | None:
@@ -174,7 +229,11 @@ def _key_host_counts(keyed: dict[str, list[list[str]]]) -> dict[str, int]:
 
 
 def infer_relationships(
-    datasets: list[Dataset], *, suppressed: list[SuppressedMatch] | None = None
+    datasets: list[Dataset],
+    *,
+    suppressed: list[SuppressedMatch] | None = None,
+    affixes: EntityAffixes | None = None,
+    affix_matches: list[AffixMatch] | None = None,
 ) -> list[Relationship]:
     """Infer many-to-one joins from column names, type compatibility, and the
     aggregate signals already profiled (uniqueness, distinct counts, min/max).
@@ -187,6 +246,13 @@ def infer_relationships(
     `_GENERIC_NAME_MIN_HOSTS`) is recorded to ``suppressed`` when a caller
     passes a list, so the withheld count and the names involved can be
     reported; the default ``None`` costs nothing extra.
+
+    ``affixes`` (a project's configured :class:`EntityAffixes`, or ``None`` to
+    skip the tier entirely) lets a parent whose name carries a house-convention
+    suffix or prefix the exact entity-name tier can't see (a CDC history table,
+    a landing-zone `_data`/`_raw` suffix, ...) still match, at a base confidence
+    kept below the exact tier's; matches made this way are recorded to
+    ``affix_matches`` the same way suppressions are.
     """
 
     keyed = {d.identifier: candidate_keys(d) for d in datasets}
@@ -202,7 +268,14 @@ def infer_relationships(
                 if parent.identifier == child.identifier:
                     continue
                 match = _match_parent(
-                    col, stem, parent, keyed[parent.identifier], host_counts, suppressed
+                    col,
+                    stem,
+                    parent,
+                    keyed[parent.identifier],
+                    host_counts,
+                    suppressed,
+                    affixes,
+                    affix_matches,
                 )
                 if match is not None:
                     to_columns, confidence = match
@@ -574,6 +647,8 @@ def _match_parent(
     parent_keys: list[list[str]],
     host_counts: dict[str, int],
     suppressed: list[SuppressedMatch] | None,
+    affixes: EntityAffixes | None = None,
+    affix_matches: list[AffixMatch] | None = None,
 ) -> tuple[list[str], float] | None:
     parent_table = parent.identifier.rsplit(".", 1)[-1]
     stripped = _LAYER_PREFIX.sub("", parent_table)
@@ -602,6 +677,34 @@ def _match_parent(
             if pcol is not None and _type_compatible(col.data_type, pcol.data_type):
                 base = 0.85 if target in parent_key_names else 0.5
                 return [pcol.name], _score(base, col, pcol)
+
+    # Weaker: the exact-name tier above missed because the parent's name
+    # carries a house-convention affix a bare layer prefix doesn't cover (a
+    # CDC history table, a landing-zone `_data`/`_raw` suffix, a versioned
+    # `_v2` table, ...). Stripping the configured affixes and retrying the
+    # same comparison catches these (issue #208), at a base confidence kept
+    # below every tier above so an unambiguous match is never re-ranked
+    # behind a guess that needed help. Tried only when `affixes` is passed,
+    # so a caller that doesn't configure it pays nothing extra.
+    if affixes is not None:
+        affix_stripped = _strip_configured_affixes(stripped, affixes)
+        if affix_stripped and affix_stripped != stripped.lower():
+            affix_entities = {affix_stripped, _singularize(affix_stripped).lower()}
+            if stem_l in affix_entities or _singularize(stem).lower() in affix_entities:
+                targets = list(_ID_SUFFIXES)
+                targets += [f"{stem_l}_{suffix}" for suffix in _ID_SUFFIXES]
+                targets += [f"{stem_l}{suffix}" for suffix in _ID_SUFFIXES]
+                for target in targets:
+                    pcol = parent_cols.get(target)
+                    if pcol is not None and _type_compatible(
+                        col.data_type, pcol.data_type
+                    ):
+                        base = 0.5 if target in parent_key_names else 0.25
+                        if affix_matches is not None:
+                            affix_matches.append(
+                                AffixMatch(col.name, parent.identifier, affix_stripped)
+                            )
+                        return [pcol.name], _score(base, col, pcol)
 
     # Same-named foreign key shared by both tables (e.g. customer_id in both),
     # joining to the parent's key of that name. Trusted only when the name

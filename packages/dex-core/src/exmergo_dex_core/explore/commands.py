@@ -681,7 +681,13 @@ def relationships(
     # this run or reused. Inference and merge fold by identifier over the union.
     datasets = profiled + list(fresh_reused.values())
     suppressed: list[rel_mod.SuppressedMatch] = []
-    inferred = rel_mod.infer_relationships(datasets, suppressed=suppressed)
+    affix_matches: list[rel_mod.AffixMatch] = []
+    inferred = rel_mod.infer_relationships(
+        datasets,
+        suppressed=suppressed,
+        affixes=config.entity_affixes,
+        affix_matches=affix_matches,
+    )
     if verify:
         probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
         verify_pending = command_args.verify_handshake(
@@ -768,6 +774,7 @@ def relationships(
             "dataset mapped alongside its source)"
         )
     notes.extend(_generic_name_notes(suppressed))
+    notes.extend(_affix_match_notes(affix_matches))
     if carried_relationships > 0:
         notes.append(
             f"carried forward {carried_relationships} prior relationship(s) "
@@ -1593,7 +1600,13 @@ def map(
     all_selected = profiled + list(fresh_reused.values())
     _annotate_grain(profiled, defs, orphaned=orphaned)
     suppressed: list[rel_mod.SuppressedMatch] = []
-    inferred = rel_mod.infer_relationships(all_selected, suppressed=suppressed)
+    affix_matches: list[rel_mod.AffixMatch] = []
+    inferred = rel_mod.infer_relationships(
+        all_selected,
+        suppressed=suppressed,
+        affixes=config.entity_affixes,
+        affix_matches=affix_matches,
+    )
     if verify:
         probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
         verify_pending = command_args.verify_handshake(
@@ -1721,6 +1734,7 @@ def map(
             "dataset mapped alongside its source)"
         )
     notes.extend(_generic_name_notes(suppressed))
+    notes.extend(_affix_match_notes(affix_matches))
     if verify_pending is not None:
         notes.append(
             "relationships saved unverified; verification awaits confirmation "
@@ -2680,6 +2694,25 @@ def _generic_name_notes(suppressed: list[rel_mod.SuppressedMatch]) -> list[str]:
         f"({shown}{more}); a name shared this widely (the norm for Firestore/"
         "Mongo/DynamoDB-style CDC exports) is a naming convention, not evidence "
         "of a relationship, so these never reached --verify"
+    ]
+
+
+def _affix_match_notes(affix_matches: list[rel_mod.AffixMatch]) -> list[str]:
+    """Explain when a join matched only after stripping a configured entity
+    affix (see `EntityAffixes`), so the lower confidence these joins carry
+    doesn't read as an unexplained demotion (issue #208)."""
+
+    if not affix_matches:
+        return []
+    examples = ", ".join(
+        f"{m.child_column} -> {m.parent} (stripped to {m.stripped_to})"
+        for m in affix_matches[:5]
+    )
+    more = f", +{len(affix_matches) - 5} more" if len(affix_matches) > 5 else ""
+    return [
+        f"matched {len(affix_matches)} join(s) to a parent name only after "
+        f"stripping a configured prefix/suffix ({examples}{more}); scored below "
+        "an exact entity-name match to the same key"
     ]
 
 

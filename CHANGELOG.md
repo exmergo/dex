@@ -93,6 +93,33 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   silence, which was indistinguishable from dex deciding the test was already
   there.
 
+### Fixed
+
+- **Entity matching survives table-name suffixes and layer prefixes**
+  ([#208]). A foreign key matched a parent by comparing the singularized
+  column stem against the parent table's name, layer prefix stripped, so a
+  parent named plainly for its entity matched
+  (`inventory_transactions.product_id -> products.id`), but a parent whose
+  name also carried a CDC history suffix or a landing-zone suffix did not:
+  singularizing `conversation_id` yields `conversation`, and nothing
+  recovered `conversation` from `conversation_history_data`, so inference
+  fell back to a child-to-child edge between two tables that merely shared
+  the FK's name, measured at an orphan fraction of 1.0.
+
+  Entity matching now also compares against the parent's name with a small,
+  ordered set of prefixes (`stg_`, `src_`, `raw_`, `dim_`, `fct_`, `fact_`,
+  `int_`, `base_`) and suffixes (`_history`, `_data`, `_raw`, `_snapshot`,
+  `_current`) stripped, repeated until none remain, plus a table-version
+  suffix (`_v2`, `_v3`, ...) always stripped. A match that needed stripping
+  scores below an exact match to the same key, so an unambiguous case is
+  never re-ranked behind a guess that needed help, and `explore
+  relationships`/`explore map`'s notes say when a join relied on it. Where
+  stripping resolves more than one candidate parent, both are proposed
+  instead of the matcher picking one, and `--verify` decides between them.
+  The affix list lives in `.dex/config.yml` under `entity_affixes`
+  (`prefixes`/`suffixes`), small by default and overridable for a house
+  convention it doesn't already cover.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed

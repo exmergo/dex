@@ -21,6 +21,7 @@ from exmergo_dex_core.cache import (
     RelationshipKind,
 )
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
@@ -329,6 +330,232 @@ def test_dealiased_match_skips_when_stripped_to_a_bare_suffix():
     a = _ds("db.main.alpha", [_col("a_key", distinct=2, unique=True)], rows=2)
     b = _ds("db.main.beta", [_col("b_key", distinct=2)], rows=2)
     assert infer_relationships([a, b]) == []
+
+
+# --- affix-stripped entity matching (issue #208) -------------------------------
+
+
+def test_history_data_suffixed_parent_is_not_matched_without_affixes_configured():
+    """The affix-stripping tier is opt-in per call: a caller that doesn't pass
+    `affixes` sees the exact pre-fix behavior, unchanged."""
+
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    assert infer_relationships([parent, child]) == []
+
+
+def test_history_data_suffix_is_stripped_when_affixes_are_configured():
+    """The exact scenario from issue #208: singularizing conversation_id yields
+    conversation, but the parent table carries both a CDC history suffix and a
+    landing-zone data suffix. Stripping both in sequence (`_data`, then
+    `_history`) recovers the match."""
+
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    rels = infer_relationships([parent, child], affixes=EntityAffixes())
+    assert len(rels) == 1
+    rel = rels[0]
+    assert rel.from_dataset == "db.main.conversation_part_history_data"
+    assert rel.from_columns == ["conversation_id"]
+    assert rel.to_dataset == "db.main.conversation_history_data"
+    assert rel.to_columns == ["id"]
+    assert rel.confidence < 0.85
+
+
+def test_affix_stripped_match_scores_below_an_exact_match_to_the_same_shape():
+    """A match that needed stripping must rank below an unambiguous exact
+    match, so ranking still prefers the case that needed no help."""
+
+    exact = infer_relationships(
+        [
+            _ds("db.main.products", [_col("id", distinct=5, unique=True)], rows=5),
+            _ds(
+                "db.main.inventory_transactions",
+                [_col("product_id", distinct=5)],
+                rows=20,
+            ),
+        ],
+        affixes=EntityAffixes(),
+    )
+    stripped = infer_relationships(
+        [
+            _ds(
+                "db.main.product_history_data",
+                [_col("id", distinct=5, unique=True)],
+                rows=5,
+            ),
+            _ds("db.main.inventory_events", [_col("product_id", distinct=5)], rows=20),
+        ],
+        affixes=EntityAffixes(),
+    )
+    assert len(exact) == 1
+    assert len(stripped) == 1
+    assert exact[0].confidence > stripped[0].confidence
+
+
+def test_versioned_parent_table_suffix_is_stripped():
+    """A versioned table (`_v2`) is a structural convention, always stripped,
+    not part of the configurable affix list."""
+
+    parent = _ds("db.main.products_v2", [_col("id", distinct=5, unique=True)], rows=5)
+    child = _ds("db.main.orders", [_col("product_id", distinct=5)], rows=20)
+    rels = infer_relationships([parent, child], affixes=EntityAffixes())
+    assert len(rels) == 1
+    assert rels[0].to_dataset == "db.main.products_v2"
+
+
+def test_layer_prefix_alone_needs_no_affix_config():
+    """A bare layer prefix (already handled by `_LAYER_PREFIX`) must still
+    match with `affixes=None`; the new tier only extends what the exact tier
+    can't already see."""
+
+    hosts = _ds("db.main.RAW_HOSTS", [_col("ID", distinct=2, unique=True)], rows=2)
+    listings = _ds("db.main.RAW_LISTINGS", [_col("HOST_ID", distinct=2)], rows=2)
+    rels = infer_relationships([hosts, listings])
+    assert len(rels) == 1
+    assert rels[0].confidence >= 0.85
+
+
+def test_ambiguous_affix_stripped_candidates_are_both_proposed():
+    """Where stripping produces two candidate parents, both must be proposed;
+    the matcher must not pick a winner (issue #208 acceptance criterion)."""
+
+    history = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    current = _ds(
+        "db.main.conversation_current_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    replies = _ds("db.main.replies", [_col("conversation_id", distinct=5)], rows=20)
+    rels = infer_relationships([history, current, replies], affixes=EntityAffixes())
+    targets = {r.to_dataset for r in rels}
+    assert targets == {
+        "db.main.conversation_history_data",
+        "db.main.conversation_current_data",
+    }
+
+
+def test_affix_stripped_match_is_recorded():
+    affix_matches: list = []
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    rels = infer_relationships(
+        [parent, child], affixes=EntityAffixes(), affix_matches=affix_matches
+    )
+    assert len(rels) == 1
+    assert len(affix_matches) == 1
+    assert affix_matches[0].child_column == "conversation_id"
+    assert affix_matches[0].parent == "db.main.conversation_history_data"
+    assert affix_matches[0].stripped_to == "conversation"
+
+
+def test_configured_affixes_can_be_narrowed_or_disabled():
+    """The affix list is configurable and small by default, not exhaustive: a
+    project can shrink or empty it, and a suffix outside the configured set
+    stays unmatched."""
+
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    assert (
+        infer_relationships([parent, child], affixes=EntityAffixes(suffixes=[]))
+        == []
+    )
+
+
+def test_relationships_envelope_explains_affix_stripped_matches(
+    tmp_path: Path, capsys
+):
+    """End-to-end: `explore relationships` wires the default configured
+    `entity_affixes` through by default, proposes the affix-stripped edge, and
+    explains it in `notes`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "intercom.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE conversation_history_data (id INTEGER)")
+    conn.execute("INSERT INTO conversation_history_data SELECT * FROM range(5)")
+    conn.execute(
+        "CREATE TABLE conversation_part_history_data (conversation_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_part_history_data "
+        "SELECT i % 5 FROM range(20) t(i)"
+    )
+    conn.close()
+
+    payload = _run(["explore", "relationships", "--path", str(path)], capsys)
+    data = payload["data"]
+    by_fk = {tuple(r["from_columns"]): r for r in data["relationships"]}
+    rel = by_fk[("conversation_id",)]
+    assert rel["to_dataset"].endswith(".conversation_history_data")
+    assert rel["to_columns"] == ["id"]
+    assert any("stripping a configured prefix/suffix" in n for n in data["notes"])
+
+
+def test_affix_stripped_join_survives_verify(tmp_path: Path, capsys):
+    """The exact scenario from issue #208's acceptance criteria: the
+    affix-stripped join is proposed and survives `--verify` (zero orphans lift
+    its confidence rather than the probe demoting it away)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "intercom.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE conversation_history_data (id INTEGER)")
+    conn.execute("INSERT INTO conversation_history_data SELECT * FROM range(5)")
+    conn.execute(
+        "CREATE TABLE conversation_part_history_data (conversation_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_part_history_data "
+        "SELECT i % 5 FROM range(20) t(i)"
+    )
+    conn.close()
+
+    payload = _run(
+        ["explore", "relationships", "--path", str(path), "--verify"], capsys
+    )
+    data = payload["data"]
+    by_fk = {tuple(r["from_columns"]): r for r in data["relationships"]}
+    rel = by_fk[("conversation_id",)]
+    assert rel["to_dataset"].endswith(".conversation_history_data")
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.0
 
 
 # --- same-lineage / replica folding --------------------------------------------
