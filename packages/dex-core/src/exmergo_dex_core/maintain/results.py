@@ -14,7 +14,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..results import Result
-from .drift import DriftFinding
+from .drift import AxisResult, DriftFinding
 from .reconcile import Proposal
 from .snapshot import Snapshot
 
@@ -90,11 +90,13 @@ class DriftResult(Result):
 
     ``by_axis`` is the per-axis split and ``findings`` the merged ranking. Both
     are reported because they answer different questions: the ranking says what
-    to look at, the split says what was looked at.
+    to look at, the split says what was looked at. The split carries the actual
+    findings too: an empty per-axis list must mean that axis found nothing, not
+    that its findings live only in the merged ranking.
     """
 
     findings: list[DriftFinding] = Field(default_factory=list)
-    by_axis: dict[str, int] = Field(default_factory=dict)
+    by_axis: dict[str, AxisResult] = Field(default_factory=dict)
     snapshot_created_at: str | None = None
     warehouse_from: str = ""
     drift_path: str = ""
@@ -104,7 +106,13 @@ class DriftResult(Result):
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "axes_run": sorted(self.by_axis),
-            "axes": dict(self.by_axis),
+            "axes": {
+                axis: {
+                    **result.model_dump(mode="json"),
+                    "finding_count": len(result.findings),
+                }
+                for axis, result in self.by_axis.items()
+            },
             "baseline": {
                 "snapshot_created_at": self.snapshot_created_at,
                 "from": self.warehouse_from,

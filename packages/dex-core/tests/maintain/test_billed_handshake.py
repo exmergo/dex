@@ -257,7 +257,7 @@ def test_confirmed_check_completes_the_scanning_axes(
 
     envelope = _dispatch(tmp_path, "check", confirm=True, budget=float(100 * MB))
     assert envelope.status.value == "ok"
-    assert envelope.data["axes"]["grain"] == 0
+    assert envelope.data["axes"]["grain"]["finding_count"] == 0
     report = FilesystemStore(tmp_path).load_drift()
     assert {"schema", "volume", "grain"} <= set(report.axes)
 
