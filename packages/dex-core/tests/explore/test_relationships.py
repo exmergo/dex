@@ -493,14 +493,11 @@ def test_configured_affixes_can_be_narrowed_or_disabled():
         rows=20,
     )
     assert (
-        infer_relationships([parent, child], affixes=EntityAffixes(suffixes=[]))
-        == []
+        infer_relationships([parent, child], affixes=EntityAffixes(suffixes=[])) == []
     )
 
 
-def test_relationships_envelope_explains_affix_stripped_matches(
-    tmp_path: Path, capsys
-):
+def test_relationships_envelope_explains_affix_stripped_matches(tmp_path: Path, capsys):
     """End-to-end: `explore relationships` wires the default configured
     `entity_affixes` through by default, proposes the affix-stripped edge, and
     explains it in `notes`."""
@@ -514,8 +511,7 @@ def test_relationships_envelope_explains_affix_stripped_matches(
         "CREATE TABLE conversation_part_history_data (conversation_id INTEGER)"
     )
     conn.execute(
-        "INSERT INTO conversation_part_history_data "
-        "SELECT i % 5 FROM range(20) t(i)"
+        "INSERT INTO conversation_part_history_data SELECT i % 5 FROM range(20) t(i)"
     )
     conn.close()
 
@@ -542,8 +538,7 @@ def test_affix_stripped_join_survives_verify(tmp_path: Path, capsys):
         "CREATE TABLE conversation_part_history_data (conversation_id INTEGER)"
     )
     conn.execute(
-        "INSERT INTO conversation_part_history_data "
-        "SELECT i % 5 FROM range(20) t(i)"
+        "INSERT INTO conversation_part_history_data SELECT i % 5 FROM range(20) t(i)"
     )
     conn.close()
 
