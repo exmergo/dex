@@ -19,6 +19,8 @@ writes to the project and human edits stay authoritative at apply time.
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 import yaml
 from pydantic import BaseModel, Field
 
@@ -375,18 +377,44 @@ def _grain_test_edits(
             continue
         if not isinstance(parsed, dict):
             continue
+        # The convention leaks through content as well as through paths, and
+        # placement only closes the path half. This matched `stg_{table}` inside
+        # the YAML, so a format that placed the file correctly and names its
+        # model `orders` was still missed, silently, one line before the edit.
+        #
+        # The model is named after the file the format chose. For dbt that is the
+        # same string it always matched, because the scaffold path is
+        # `models/staging/stg_{table}.yml` and its stem is `stg_{table}`; for a
+        # format placing `declarations/orders.yml` it is `orders`. The format
+        # already answered "where does this table's declaration live", and this
+        # reads the answer instead of asserting dbt's spelling over it. A format
+        # that packs many models into one file finds no entry and is warned
+        # below, which is a refusal to guess rather than a wrong write.
+        declared = PurePosixPath(path).stem
         entry = next(
             (
                 column
                 for model in parsed.get("models") or []
-                if isinstance(model, dict) and model.get("name") == f"stg_{table}"
+                if isinstance(model, dict) and model.get("name") == declared
                 for column in model.get("columns") or []
                 if isinstance(column, dict) and column.get("name") == proposal.column
             ),
             None,
         )
-        if entry is None or "unique" in (entry.get("tests") or []):
-            continue  # already alerting (or no scaffolded column entry to extend)
+        if entry is None:
+            # Split from the "already alerting" skip below, which is silent
+            # because it is correct. This one is a miss: the file resolved and
+            # the column entry did not, and a reader looking at the proposal
+            # would otherwise have no way to tell that from dex declining.
+            warnings.append(
+                f"{path} declares no column '{proposal.column}' under a model "
+                f"named '{declared}', so the lost unique key on "
+                f"{proposal.identifier} has no test edit; add a `unique` test "
+                "there by hand"
+            )
+            continue
+        if "unique" in (entry.get("tests") or []):
+            continue  # already alerting
         entry.setdefault("tests", []).append("unique")
         edits.append(
             PlanEdit(
