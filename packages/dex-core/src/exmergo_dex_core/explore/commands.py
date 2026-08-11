@@ -1828,7 +1828,22 @@ def cluster(
     warnings: list[str] = []
     profiled_names: list[str] = []
     if auto:
-        adapter = engine._adapter("explore cluster")
+        try:
+            adapter = engine._adapter("explore cluster")
+        except DexError:
+            # The same tolerance the query path applies, at the second site the
+            # object-gap probe was added to. `cluster` decides two things from
+            # the cache alone -- "there is no cache" and "that object is not in
+            # it" -- and both refusals sit below this acquisition, so gating it
+            # here made them unreachable wherever no connector is installed.
+            #
+            # `auto_profile` defaults to True, so this is the ordinary path and
+            # not an opt-in one; `--no-auto-profile` was the only way left to
+            # reach either refusal offline. Nothing is swallowed: an object that
+            # IS profiled still needs a connection to build its sample, reaches
+            # the opener at the bottom of this function, and raises there.
+            adapter = None
+    if adapter is not None:
         gap = _object_gap(adapter, cache, [obj])
         if gap.absent:
             raise RequestError(gap.refusal())

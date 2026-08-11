@@ -113,6 +113,17 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   reaches the same opener afterwards and raises there, which is where a caller
   about to run SQL wants to hear it.
 
+- **`explore cluster` refuses from the cache again without a connection.** The
+  same probe was added to `cluster` in the same change, in front of the two
+  things that command decides from the cache alone: that there is no cache at
+  all, and that the named object is not in it. Both refusals sat below the
+  acquisition, so both became connector errors. `auto_profile` defaults to
+  `true`, which made this the ordinary path rather than an opt-in one, and
+  `--no-auto-profile` the only remaining way to reach either refusal offline.
+  The same fall-through applies, with the same limit: an object that *is*
+  profiled still needs a connection to build its sample, so it reaches the
+  opener at the bottom of `cluster` and raises there.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed

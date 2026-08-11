@@ -15,6 +15,8 @@ from exmergo_dex_core.config import DexConfig, QueryLimits, save_config
 from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.storage.filesystem import QUERIES_FILE
 
+from .conftest import unreachable_warehouse
+
 
 def _run(argv: list[str], capsys, *, expect_error: bool = False) -> dict:
     rc = main(argv)
@@ -386,19 +388,6 @@ def test_pii_carrying_query_is_refused_and_logged(
     assert "NAME" in entries[-1]["reason"]
 
 
-def _unreachable_warehouse(monkeypatch) -> None:
-    """Every attempt to open a connection fails, the way an uninstalled connector
-    extra or an absent credential fails. Applied AFTER the cache exists, because
-    building one legitimately needs the warehouse this then takes away."""
-    from exmergo_dex_core.engine import DexEngine
-    from exmergo_dex_core.errors import ConnectorError
-
-    def _refuse(self, *args, **kwargs):
-        raise ConnectorError("the connector extra is not installed")
-
-    monkeypatch.setattr(DexEngine, "_adapter", _refuse)
-
-
 def test_a_pii_refusal_needs_no_connection(
     airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
 ):
@@ -413,7 +402,7 @@ def test_a_pii_refusal_needs_no_connection(
     same kind of doubt and now falls through the same way.
     """
     repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
-    _unreachable_warehouse(monkeypatch)
+    unreachable_warehouse(monkeypatch)
 
     payload = _query(
         "SELECT MIN(NAME) FROM RAW_HOSTS",
@@ -442,7 +431,7 @@ def test_a_query_that_passes_the_guard_still_reports_an_unreachable_warehouse(
     connection, and anything still live reaches the opener again and raises there.
     """
     repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
-    _unreachable_warehouse(monkeypatch)
+    unreachable_warehouse(monkeypatch)
 
     payload = _query(
         "SELECT COUNT(*) FROM RAW_HOSTS",
