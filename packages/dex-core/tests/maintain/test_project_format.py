@@ -18,10 +18,17 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.dbt_project import ProjectDefinitions, SourceFile
+from exmergo_dex_core.dbt_project import (
+    ApplyResult,
+    Conflict,
+    ProjectDefinitions,
+    SourceFile,
+    content_hash,
+)
 from exmergo_dex_core.maintain.snapshot import (
     SemanticLayer,
     SourceTable,
@@ -157,12 +164,15 @@ def test_the_flag_falls_back_to_dbt_for_one_command(graph_repo):
 
 _SIDECAR = "declarations/orders.yml"
 
-# The sidecar names its model with dbt's `stg_` prefix. That is not incidental
-# and the test below pins why: placement alone does not carry the naming.
+# The model is named `orders`, not `stg_orders`. The earlier version of this
+# fixture used dbt's prefix because reconcile matched it inside the YAML, so a
+# correctly placed file was still missed on its contents. Naming it in the
+# format's own vocabulary is what pins that the convention no longer leaks
+# through either half.
 _SIDECAR_CONTENT = (
     "version: 2\n"
     "models:\n"
-    "  - name: stg_orders\n"
+    "  - name: orders\n"
     "    columns:\n"
     "      - name: order_id\n"
     "        tests: [not_null]\n"
@@ -185,6 +195,10 @@ class SidecarGraphProject(GraphProject):
     nothing regenerates, and that file can receive a `unique` test. Answering
     `None` for one kind and a path for the other is the whole point of the seam:
     a single boolean here would have to be wrong about one of the two.
+
+    It reads and writes its sidecar for real, because the assertions below follow
+    a proposal through `transform apply` and a stub write path would prove only
+    that dex called something.
     """
 
     name = "sidecar"
@@ -193,25 +207,54 @@ class SidecarGraphProject(GraphProject):
         super().__init__(context)
         self.written: list = []
 
+    def _root(self) -> Path:
+        return Path(self.context.repo_root or ".")
+
     def load(self) -> SidecarView:
-        root = self.context.repo_root or "."
-        return SidecarView(
-            root,
-            {
-                _SIDECAR: SourceFile(
-                    path=_SIDECAR, content=_SIDECAR_CONTENT, sha256="unused"
-                )
-            },
-        )
+        root = self._root()
+        files = {}
+        for path in sorted(root.glob("declarations/*.yml")):
+            content = path.read_text(encoding="utf-8")
+            files[f"declarations/{path.name}"] = SourceFile(
+                path=f"declarations/{path.name}",
+                content=content,
+                sha256=content_hash(content),
+            )
+        return SidecarView(str(root), files)
 
     def edit_path(self, kind: EditKind, model: str) -> str | None:
         if kind is EditKind.SCHEMA_YML:
             return f"declarations/{model}.yml"
         return None
 
+    def editing_surface(self) -> list[str]:
+        return ["declarations"]
+
     def write_edits(self, edits, project_dir=None, *, confirmed: bool = False):
         self.written.append((edits, project_dir, confirmed))
-        return []
+        root = Path(project_dir) if project_dir else self._root()
+        conflicts, staged = [], []
+        for edit in edits:
+            target = root / edit.path
+            current = target.read_text(encoding="utf-8") if target.is_file() else None
+            found = content_hash(current) if current is not None else None
+            if found != edit.old_content_hash:
+                conflicts.append(
+                    Conflict(
+                        path=edit.path,
+                        expected_sha256=edit.old_content_hash,
+                        found_sha256=found,
+                    )
+                )
+            staged.append((target, edit))
+        if conflicts and not confirmed:
+            return ApplyResult(written=[], diffs=[], conflicts=conflicts)
+        for target, edit in staged:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(edit.new_content, encoding="utf-8")
+        return ApplyResult(
+            written=[e.path for _, e in staged], diffs=[], conflicts=conflicts
+        )
 
 
 @pytest.fixture
@@ -226,56 +269,31 @@ def sidecar_repo(maintain_repo, monkeypatch):
         + "project:\n  format: dex_sidecar_format:sidecar_project\n",
         encoding="utf-8",
     )
+    sidecar = maintain_repo.root / _SIDECAR
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(_SIDECAR_CONTENT, encoding="utf-8")
     return maintain_repo
 
 
-def test_the_plan_store_refuses_a_placed_edit_outside_dbts_editing_surface(
-    sidecar_repo,
-):
-    """The third gate, which neither #257 nor #258 describes.
-
-    With the write gate asking a capability and reconcile asking the format
-    where the edit goes, the edit is still refused, and by neither of those: at
-    plan time `plans.plan` calls `load_project` and validates every path against
-    *dbt's* `model_paths`, whatever format produced the edit. So a second format
-    naming a file outside `models/` cannot store a plan even once both of the
-    filed issues are resolved exactly as proposed.
-
-    Pinned as the current behavior rather than fixed here. The containment check
-    is a safety property, not an oversight (writes are confined to a declared
-    editing surface), so widening it means the format declaring that surface,
-    which is a design question and not this seam's to answer.
-    """
-
-    sidecar_repo.snapshot()
-    sidecar_repo.sql("INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10")
-    sidecar_repo.dex("maintain", "grain")
-
-    rc, payload = sidecar_repo.dex("maintain", "reconcile", "grain")
-
-    assert rc == 1 and payload["status"] == "error"
-    assert any(
-        "outside the project's model and macro paths" in message
-        for message in payload["errors"]
-    )
+def _grain_drift(repo):
+    repo.snapshot()
+    repo.sql("INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10")
+    repo.dex("maintain", "grain")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the plan store validates every edit against dbt's model paths; a "
-    "format has no way to declare its own editing surface yet",
-)
 def test_a_placing_format_receives_the_test_edit_in_its_own_sidecar(sidecar_repo):
-    """The end state, once the third gate above opens.
+    """The third gate, open: a format's own surface is what its edits are checked
+    against.
 
-    Placement is doing its job by this point: reconcile asked the format and
-    built the edit against `declarations/orders.yml` instead of the scaffold
-    path. What is missing is permission to store a plan touching it.
+    This was a strict xfail through the spike that found the gate. Reconcile
+    asked the format where the edit lands and built it against
+    `declarations/orders.yml`, and then `plans.plan` refused it, because
+    containment validated every path against *dbt's* `model_paths` whatever
+    format produced the edit. The format now declares the surface it owns and
+    the check reads that declaration.
     """
 
-    sidecar_repo.snapshot()
-    sidecar_repo.sql("INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10")
-    sidecar_repo.dex("maintain", "grain")
+    _grain_drift(sidecar_repo)
 
     rc, payload = sidecar_repo.dex("maintain", "reconcile", "grain")
 
@@ -287,6 +305,79 @@ def test_a_placing_format_receives_the_test_edit_in_its_own_sidecar(sidecar_repo
     assert not any(
         d["path"].startswith("models/staging/") for d in payload.get("diffs") or []
     )
+
+
+def test_the_edit_is_pinned_to_the_formats_file_not_dbts_view_of_it(sidecar_repo):
+    """The diff is the one-line change, not the whole file appearing from nowhere.
+
+    Containment and the hash pin are halves of one question, and widening the
+    first without moving the second is a quiet defect rather than a refusal: the
+    edit lands in the format's keyspace while `old_content_hash` comes from dbt's
+    view, which does not have the file. It pins as a create, the reviewable diff
+    shows a hand-written file as brand new, and the apply that follows reports a
+    conflict on a file nobody touched.
+    """
+
+    _grain_drift(sidecar_repo)
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "grain")
+
+    assert rc == 0, payload.get("errors")
+    diff = next(d for d in payload["diffs"] if d["path"] == _SIDECAR)
+    # A file the plan believes is absent diffs against /dev/null and renders
+    # every line as an addition. This one was read from the format's own view, so
+    # it diffs against itself and the untouched declarations survive as context.
+    assert "/dev/null" not in diff["unified"], diff["unified"]
+    # Context lines exist only against a file the plan knew was there. (The
+    # additions are noisier than the change, because the edit round-trips the
+    # YAML through `safe_dump`, which is how the scaffolded dbt path renders too.)
+    assert " version: 2" in diff["unified"].splitlines()
+    assert "unique" in diff["unified"]
+
+
+def test_the_plan_applies_through_the_formats_own_write_path(sidecar_repo):
+    """A plan a format can store and not apply is not a write path.
+
+    `plans.apply` wrote every plan with dbt's module-level writer, which resolves
+    each edit under the dbt project and re-hashes what it finds on disk. So the
+    plan this format can now store would still have been refused one stage later,
+    and the `write_edits` it implemented to reach tier 3 would never have been
+    called.
+    """
+
+    _grain_drift(sidecar_repo)
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0, payload.get("errors")
+
+    rc, applied = sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+
+    assert rc == 0, applied.get("errors")
+    written = (sidecar_repo.root / _SIDECAR).read_text(encoding="utf-8")
+    assert "unique" in written
+    assert "not_null" in written
+
+
+def test_the_format_declaring_its_surface_does_not_widen_it(sidecar_repo):
+    """Containment stays a safety property; only the authority moved.
+
+    The format says which paths it owns, and dex still refuses anything outside
+    them. A format that could name any path would not be declaring a surface, it
+    would be turning the check off, and the check is what keeps a mistaken or
+    adversarial path from reaching the rest of the repository.
+    """
+
+    from exmergo_dex_core.transform.plans import PlanError, contained_key
+
+    surface = SidecarGraphProject.editing_surface(None)
+
+    assert contained_key("declarations/orders.yml", surface)
+    for refused in (
+        "declarations_backup/orders.yml",  # a sibling sharing the prefix
+        "models/staging/stg_orders.yml",  # inside dbt's surface, not this one
+        "../outside.yml",  # an escape, never a format's to permit
+    ):
+        with pytest.raises(PlanError):
+            contained_key(refused, surface)
 
 
 def test_a_placing_format_still_declines_the_staging_model_channel(sidecar_repo):
