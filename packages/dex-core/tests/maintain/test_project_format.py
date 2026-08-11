@@ -16,6 +16,7 @@ in-memory graph instead is describing the seam.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -378,6 +379,122 @@ def test_the_format_declaring_its_surface_does_not_widen_it(sidecar_repo):
     ):
         with pytest.raises(PlanError):
             contained_key(refused, surface)
+
+
+@pytest.fixture
+def authored_repo(tmp_path, dex, monkeypatch):
+    """The sidecar format alone, with no dbt project sharing its root.
+
+    Deliberately not `sidecar_repo`. That fixture puts `dbt_project.yml` and
+    `declarations/` at the same path, so dbt's directory and the format's view
+    root coincide and a caller confusing the two still lands on the right file.
+    Separating them is what makes the confusion observable, and separated is the
+    normal case for a format that is not dbt: it has no reason to be rooted where
+    a dbt project happens to sit, or for one to exist at all.
+    """
+
+    module = types.ModuleType("dex_sidecar_format")
+    module.sidecar_project = SidecarGraphProject
+    monkeypatch.setitem(sys.modules, "dex_sidecar_format", module)
+
+    root = tmp_path / "repo"
+    (root / ".dex").mkdir(parents=True)
+    (root / ".dex" / "config.yml").write_text(
+        "project:\n  format: dex_sidecar_format:sidecar_project\n", encoding="utf-8"
+    )
+    sidecar = root / _SIDECAR
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(_SIDECAR_CONTENT, encoding="utf-8")
+    return root
+
+
+def _authored_edit(tmp_path: Path, content: str) -> Path:
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {"edits": [{"path": _SIDECAR, "kind": "schema_yml", "content": content}]}
+        ),
+        encoding="utf-8",
+    )
+    return payload
+
+
+_AUTHORED = _SIDECAR_CONTENT.replace("tests: [not_null]", "tests: [not_null, unique]")
+
+
+def test_an_authored_plan_needs_no_dbt_project_when_the_format_declares_one(
+    authored_repo, tmp_path, dex
+):
+    """`transform plan` reaches a format that brought its own project.
+
+    The agent-authored path asked the engine for dbt's directory unconditionally
+    and passed it beside the format, so a repository with no `dbt_project.yml`
+    failed while locating a project nothing was going to read. That is the whole
+    write surface for an authored edit (`transform plan`, `transform macro`, and
+    every `semantic define|update|plan` route through the same call), so a format
+    could declare a surface, place an edit into it, and still never be reachable
+    except through reconcile.
+    """
+
+    rc, payload = dex(
+        "--repo-root",
+        str(authored_repo),
+        "transform",
+        "plan",
+        "add a unique test",
+        "--edits-file",
+        str(_authored_edit(tmp_path, _AUTHORED)),
+    )
+
+    assert rc == 0 and payload["status"] == "ok", payload.get("errors")
+    assert payload["data"]["paths"] == [_SIDECAR]
+
+
+def test_an_authored_edit_is_pinned_and_applied_where_the_format_put_it(
+    authored_repo, tmp_path, dex
+):
+    """Both halves come from the format, with a dbt project present to be wrong about.
+
+    dbt lives in a subdirectory here, so a plan pinned against dbt's directory
+    resolves this edit under `analytics/` on the way out: the file it hashed is
+    not the file it writes. That reads as a create against a hand-written file,
+    and the apply that follows either conflicts on a file nobody edited or lands
+    the write in a tree that never had one.
+    """
+
+    (authored_repo / "analytics").mkdir()
+    (authored_repo / "analytics" / "dbt_project.yml").write_text(
+        "name: dex_test\nversion: '1.0.0'\nprofile: dex_test\n", encoding="utf-8"
+    )
+
+    rc, payload = dex(
+        "--repo-root",
+        str(authored_repo),
+        "transform",
+        "plan",
+        "add a unique test",
+        "--edits-file",
+        str(_authored_edit(tmp_path, _AUTHORED)),
+    )
+    assert rc == 0, payload.get("errors")
+    # Pinned against the file that is there, so the diff is the one-line change
+    # rather than a hand-written file appearing from nowhere.
+    diff = next(d for d in payload["diffs"] if d["path"] == _SIDECAR)
+    assert "/dev/null" not in diff["unified"], diff["unified"]
+
+    rc, applied = dex(
+        "--repo-root",
+        str(authored_repo),
+        "transform",
+        "apply",
+        payload["data"]["plan_id"],
+    )
+
+    assert rc == 0, applied.get("errors")
+    assert not applied["data"].get("conflicts")
+    assert applied["data"]["written"] == [_SIDECAR]
+    assert "unique" in (authored_repo / _SIDECAR).read_text(encoding="utf-8")
+    assert not (authored_repo / "analytics" / _SIDECAR).exists()
 
 
 def test_a_placing_format_still_declines_the_staging_model_channel(sidecar_repo):

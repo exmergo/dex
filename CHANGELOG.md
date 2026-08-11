@@ -57,6 +57,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   change as a whole-file create, and the apply that follows reports a conflict on
   a file nobody edited.
 
+  That holds for agent-authored edits too, which is the whole write surface
+  outside reconcile: `transform plan`, `transform macro`, and every
+  `semantic define|update|plan` share one call, and it asked the engine for dbt's
+  directory unconditionally. A format declaring a surface now supplies the
+  directory from its own view, so a repository with no `dbt_project.yml` can
+  reach those commands at all, and one with a dbt project elsewhere in the tree
+  no longer pins an edit against a file the apply will not write. dbt is on the
+  same path either way: its view loads the directory the engine would have named.
+
 - **A plan is applied through the format it was planned against** ([#257]).
   `transform apply` wrote every plan with dbt's writer, which resolves each edit
   under the dbt project and re-hashes what it finds on disk, so a plan a second

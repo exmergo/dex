@@ -66,8 +66,12 @@ def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str
     """
 
     if placement is None:
-        suffix = "sql" if kind is EditKind.MODEL_SQL else "yml"
-        return f"models/staging/stg_{table}.{suffix}"
+        # The same two kinds `DbtProject.edit_path` resolves, declined the same
+        # way for the rest: this branch is that method's convention inlined for
+        # callers holding no format, so answering a path where it answers `None`
+        # would make the shim and the format disagree about the same input.
+        suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
+        return None if suffix is None else f"models/staging/stg_{table}.{suffix}"
     return placement.edit_path(kind, table)
 
 
