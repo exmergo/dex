@@ -1,0 +1,102 @@
+{
+  "run_id": "2026-08-10__22-19-47__dex_claude_sonnet_5",
+  "harbor_job_name": "full-dex-20260810-221947",
+  "harbor_job_id": "fff9bb8e-d989-4c07-a5d2-7cf972354f37",
+  "benchmark": {
+    "name": "data-eng-bench",
+    "dataset": "snowflake-labs/data-eng-bench@v1.0",
+    "tasks": 103,
+    "task_digests_unmodified": true,
+    "db_type": "duckdb"
+  },
+  "agent": {
+    "name": "claude-code",
+    "version": "2.1.227",
+    "model_name": "claude-sonnet-5",
+    "reasoning_effort": "xhigh",
+    "disallowed_tools": "WebSearch,WebFetch"
+  },
+  "arm": {
+    "name": "dex",
+    "image": "ghcr.io/snowflake-labs/data-eng-bench-base:1.0.0",
+    "dex_tree_sha": "1554d248f1ed7e537855382cf8b24048b6d3d9b6",
+    "dex_tree_tag": "v1.6.3",
+    "dex_core_version": "1.6.3",
+    "claude_md_injected": true
+  },
+  "run": {
+    "n_attempts": 1,
+    "n_concurrent_trials": 2,
+    "n_trials": 103,
+    "n_errored": 0,
+    "n_retries": 0,
+    "started_at": "2026-08-10T22:19:47.917925",
+    "finished_at": "2026-08-11T10:20:51.262029",
+    "notes": "One trial (dbt-web-session-analytics) errored during agent setup on a failed Claude Code installer download and was re-run with 'harbor job resume -f NetworkConnectionError'; it passed 22/22. Totals include it. The 11.01h wall clock of the main pass excludes it."
+  },
+  "metrics": {
+    "accuracy": 0.5728,
+    "accuracy_resolved": 59,
+    "accuracy_total": 103,
+    "accuracy_stderr": null,
+    "accuracy_wilson_95": [
+      0.4764,
+      0.664
+    ],
+    "pass_at_2": null,
+    "pass_at_3": null,
+    "pass_hat_3": null,
+    "assertion_rate_pooled": 0.9435,
+    "assertion_rate_task_weighted": 0.8967,
+    "assertion_rate_task_weighted_ci_95": [
+      0.8516,
+      0.9363
+    ],
+    "assertions_passed": 2705,
+    "assertions_total": 2867
+  },
+  "metric_definitions": {
+    "accuracy": "Successful trials divided by total trials. Identical to the leaderboard's headline metric and to the quantity Snowflake's blog calls Pass@1. Errored trials count as failures.",
+    "pass_at_2": "Unbiased 1 - C(n-c,2)/C(n,2) averaged over tasks: at least one of 2 attempts succeeds. A leaderboard submission column.",
+    "pass_at_3": "Unbiased 1 - C(n-c,3)/C(n,3) averaged over tasks: AT LEAST ONE of 3 attempts succeeds. A leaderboard submission column. This is NOT Pass^3.",
+    "pass_hat_3": "Snowflake's 'Pass^3': the task counts only if ALL 3 attempts succeed. Null unless every task has at least 3 trials. Always at or below accuracy, whereas pass_at_3 is always at or above it.",
+    "assertion_rate_task_weighted": "Mean over tasks of (verifier assertions passed / total). Each task weighted equally. Not an official benchmark metric; reported because the binary reward compresses a near-miss and a non-delivery into the same zero. Interval is a 20,000-draw cluster bootstrap resampling tasks.",
+    "assertion_rate_pooled": "All assertions pooled across tasks. Overweights large suites (one task carries 219 assertions); quote alongside the task-weighted figure, never alone."
+  },
+  "dex_usage": {
+    "trials_with_agent_log": 103,
+    "by_route": {
+      "cli": 93,
+      "wrapper": 19,
+      "engine": 23,
+      "skill_tool": 19,
+      "any": 101
+    },
+    "trigger_rate_any_route": 0.9806,
+    "cli_invocations": 3124,
+    "subcommands": {
+      "explore query": 1229,
+      "explore profile": 1139,
+      "explore relationships": 455,
+      "explore": 220,
+      "explore inventory": 45,
+      "explore map": 16,
+      "explore profiling": 6,
+      "explore --help": 6,
+      "explore to": 6,
+      "explore tool": 2
+    },
+    "note": "Counted from the agent transcript only. Scanning the whole agent/ directory matches the installed skill files and reports 100% on any run where dex merely existed."
+  },
+  "resources": {
+    "total_cost_usd": 282.121,
+    "cost_usd_per_trial": 2.739,
+    "cost_basis": "claude-code total_cost_usd, Anthropic list pricing",
+    "prompt_tokens": 549597420,
+    "cache_read_tokens": 537727076,
+    "cache_creation_tokens": 11853497,
+    "output_tokens": 5073688,
+    "tokens_per_trial": 5385156,
+    "avg_trial_duration_sec": 680.21
+  }
+}

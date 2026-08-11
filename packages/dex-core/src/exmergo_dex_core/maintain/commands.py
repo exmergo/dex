@@ -696,7 +696,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import DbtProject
+    from ..adapters.project import PlacingProject
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
@@ -739,12 +739,15 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             "Reconcile what these findings describe wherever your models are "
             "actually defined"
         )
-    elif not isinstance(editable, DbtProject):
+    elif not isinstance(editable, PlacingProject):
         warnings.append(
             f"the '{editable.name}' project format implements the write tier, but "
-            "reconcile's mechanical edits are dbt artifacts (a staging model and "
-            "its schema YAML) and dex cannot yet author them for another format, "
-            "so every proposal below is advisory"
+            "does not say where a proposed edit lands, so reconcile has no path to "
+            "plan an edit against and every proposal below is advisory. A format "
+            "reaches this path by implementing `PlacingProject`: `edit_path` "
+            "answers where an edit of a given kind goes and may decline a kind by "
+            "answering None, and `editing_surface` declares the region those "
+            "paths must stay inside"
         )
     else:
         try:
@@ -758,6 +761,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         store.load_cache(),
         view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        placement=editable if isinstance(editable, PlacingProject) else None,
     )
     warnings.extend(build_warnings)
 
@@ -773,7 +777,17 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             f"maintain reconcile {drift_class}" if drift_class else "maintain reconcile"
         )
         plan, diffs, plan_warnings = plans_mod.plan(
-            intent, edits, project_dir=view.root, repo_root=repo_root, store=store
+            intent,
+            edits,
+            project_dir=view.root,
+            repo_root=repo_root,
+            store=store,
+            # The format that placed these edits also validates them. Passing it
+            # is what keeps the two halves of the check on the same project: the
+            # surface each path must land in, and the file each edit is pinned
+            # against. dbt reaches the identical checks through this argument as
+            # it did without it, and reuses the view it already loaded.
+            project_format=editable,
         )
         result.diffs = diffs
         result.warnings.extend(plan_warnings)

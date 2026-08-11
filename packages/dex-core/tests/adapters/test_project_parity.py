@@ -22,6 +22,7 @@ from exmergo_dex_core.adapters.conformance import (
     DeclaringProjectContract,
     EditableProjectContract,
     MaintainProjectContract,
+    PlacingProjectContract,
     ProjectFactoryContract,
     SemanticProjectContract,
 )
@@ -90,7 +91,10 @@ def _staged_conflict(root: Path):
 
 
 class TestDbtProject(
-    DeclaringProjectContract, SemanticProjectContract, EditableProjectContract
+    DeclaringProjectContract,
+    SemanticProjectContract,
+    PlacingProjectContract,
+    EditableProjectContract,
 ):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
@@ -104,6 +108,12 @@ class TestDbtProject(
 
     def an_edit_against_a_changed_target(self):
         return _staged_conflict(self.root)
+
+    def placeable_model(self) -> str:
+        # The warehouse table, not `stg_orders`: dbt's scaffold prefix is applied
+        # by `edit_path` on the way out, and passing the prefixed name here would
+        # assert the convention twice and prove it once.
+        return "orders"
 
     def make_unreadable_project(self) -> DbtProject:
         # A dbt_project.yml that is not parseable YAML. dbt is a filesystem format,
