@@ -9,6 +9,90 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A project format can say where its edits land, and which paths it owns**
+  ([#257], [#258]). `maintain reconcile` read the project seam's write tier and
+  then narrowed again on `isinstance(editable, DbtProject)`, so a format that
+  implemented tier 3 in full and passed the shipped conformance suite got exactly
+  what a format declining the tier got. Underneath that, the paths reconcile
+  proposed were literals (`models/staging/stg_<table>.sql` and its `.yml`) built
+  before the format was consulted, so a second format was handed edits naming
+  files it does not have. The two are one seam: those paths are keys into the
+  view the format's own `load()` returned, so a format that answers where an edit
+  goes supplies both halves.
+
+  `PlacingProject` is that seam, beside `EditableProject` rather than on it: the
+  tiers are `runtime_checkable`, so a method added to tier 3 would demote every
+  format that has not implemented it yet, closing the write path for exactly the
+  implementers who were already passing. `edit_path(kind, model)` answers where
+  an edit of a kind lands and may answer `None` to decline that kind, which is
+  the honest answer for a format whose models are reduced from a running graph
+  (no authored staging model) but whose declared keys are hand-written files
+  (a `unique` test lands fine). `editing_surface()` declares the region those
+  paths must stay inside. The write gate now asks for the capability instead of
+  the class.
+
+  dbt reaches identical behaviour by the new route: `edit_path` returns the
+  scaffold convention reconcile hard-coded, and `editing_surface` returns the
+  project's configured model and macro paths, which is what containment checked
+  directly before.
+
+### Changed
+
+- **Containment validates an edit against the surface its own format declared**
+  ([#257], [#258]). `transform plan` validated every edit path against dbt's
+  `model_paths` whatever format produced it, so a second format placing a
+  declaration sidecar was refused at plan time even with the two gates above
+  resolved. Containment stays a safety property and stays mandatory; what moved
+  is who declares the surface. A format that declares none is unaffected and
+  validates against dbt's as before, and dbt's own path is unchanged, including
+  the root manifests allowed by name and the checks that a macro and a model each
+  live where dbt will find them. Escapes (absolute paths, `..`) are refused ahead
+  of the surface and are not a format's to permit.
+
+  The file an edit is pinned against now comes from the same view as the surface
+  it is checked in. Those two disagreeing is not a refusal but a quiet defect:
+  an existing file hashes as absent, the reviewable diff renders a one-line
+  change as a whole-file create, and the apply that follows reports a conflict on
+  a file nobody edited.
+
+  That holds for agent-authored edits too, which is the whole write surface
+  outside reconcile: `transform plan`, `transform macro`, and every
+  `semantic define|update|plan` share one call, and it asked the engine for dbt's
+  directory unconditionally. A format declaring a surface now supplies the
+  directory from its own view, so a repository with no `dbt_project.yml` can
+  reach those commands at all, and one with a dbt project elsewhere in the tree
+  no longer pins an edit against a file the apply will not write. dbt is on the
+  same path either way: its view loads the directory the engine would have named.
+
+- **A plan is applied through the format it was planned against** ([#257]).
+  `transform apply` wrote every plan with dbt's writer, which resolves each edit
+  under the dbt project and re-hashes what it finds on disk, so a plan a second
+  format could now store would still have been refused one stage later and the
+  `write_edits` that format implemented to reach tier 3 would never have been
+  called. Plans planned against dbt are written by dbt exactly as before.
+
+  `EditableProject.write_edits` now documents that its return has to report
+  `written` and `conflicts`, and `EditableProjectContract` asserts it. The apply
+  path reads both to tell a refusal from a write, and a result answering neither
+  fails in both directions at once: a plan recorded as applied that wrote
+  nothing, or a conflict that never reaches the person it was raised for. This is
+  a widening of the tier-3 contract, and a format returning
+  `dbt_project.ApplyResult` (or anything exposing those two) already satisfies
+  it.
+
+- **Reconcile matches the model a format declares, not dbt's spelling of it**
+  ([#258]). The `stg_` convention leaked through file contents as well as
+  through paths: the `unique` test edit looked for a model named `stg_<table>`
+  inside the YAML, so a format that placed its sidecar correctly and named its
+  model `orders` was missed one line before the edit was built, silently. The
+  model is now read from the file the format chose, which is the same string for
+  dbt, whose scaffold path is `models/staging/stg_<table>.yml`. A file declaring
+  no matching column entry now says so in `warnings` instead of skipping in
+  silence, which was indistinguishable from dex deciding the test was already
+  there.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed

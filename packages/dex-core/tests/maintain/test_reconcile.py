@@ -286,3 +286,30 @@ def test_orphan_relation_reconcile_is_advisory_with_drop_statement(maintain_repo
     assert orphan_proposals and all(p["kind"] == "advisory" for p in orphan_proposals)
     assert "DROP TABLE" in orphan_proposals[0]["action"]
     assert "warehouse.main.stg_orders" in orphan_proposals[0]["action"]
+
+
+def test_the_no_format_fallback_answers_exactly_what_dbt_answers():
+    """`_placed(None, ...)` is `DbtProject.edit_path` inlined, including its `None`.
+
+    The fallback exists for callers holding no format and is documented as the
+    dbt scaffold convention, so the two have to agree about every kind or the
+    convention has two definitions. Declining is the half that is easy to lose:
+    a suffix picked by "SQL or otherwise" answers a `models/staging/*.yml` path
+    for kinds that have nothing to do with staging models, and a path is not
+    `None`, so the caller builds an edit instead of degrading to the advisory it
+    produces for a kind nobody can place.
+    """
+
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.maintain.reconcile import _placed
+    from exmergo_dex_core.transform.plans import EditKind
+
+    for kind in EditKind:
+        assert _placed(None, kind, "orders") == DbtProject().edit_path(kind, "orders")
+
+    # And the two kinds reconcile proposes still resolve, so the parity above is
+    # not both sides having gone silent.
+    staged = "models/staging/stg_orders"
+    assert _placed(None, EditKind.MODEL_SQL, "orders") == f"{staged}.sql"
+    assert _placed(None, EditKind.SCHEMA_YML, "orders") == f"{staged}.yml"
+    assert _placed(None, EditKind.MACRO_SQL, "orders") is None
