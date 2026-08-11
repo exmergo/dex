@@ -747,6 +747,17 @@ def relationships(
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
+    # A verified join at a catastrophic orphan rate is a finding, not just a
+    # demoted confidence (issue #207): named here so a caller reading only
+    # notes sees it, and mirrored onto the child dataset's data_quality so
+    # it survives into the cache for anything reading profiles later.
+    orphan_findings = rel_mod.orphan_findings(rels)
+    notes.extend(text for _rel, text in orphan_findings)
+    datasets_by_id = {d.identifier: d for d in datasets}
+    for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
     if fresh_reused:
         window = config.profile_freshness_hours
         notes.append(
@@ -1652,6 +1663,16 @@ def map(
         observed_namespaces=observed_namespaces,
     )
 
+    # A verified join at a catastrophic orphan rate is a finding, not just a
+    # demoted confidence (issue #207): mirrored onto the child dataset's
+    # data_quality (persisted below) and surfaced in notes further down.
+    orphan_findings = rel_mod.orphan_findings(relationship_set)
+    datasets_by_id = {d.identifier: d for d in datasets}
+    for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
     cache.provenance.created_at = (
@@ -1664,6 +1685,7 @@ def map(
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
     notes.extend(defs.notes)
+    notes.extend(text for _rel, text in orphan_findings)
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared tests; kept as declared"
