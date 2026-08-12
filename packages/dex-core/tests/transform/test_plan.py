@@ -400,6 +400,168 @@ def test_project_yml_dropping_a_model_path_warns(dbt_project_dir: Path):
     assert any("model-paths drops" in w and "models" in w for w in warnings)
 
 
+# --- column contract: authored SELECT list vs. declared schema.yml (#214) -----
+
+
+def test_column_contract_warns_when_a_declared_column_is_missing(
+    dbt_project_dir: Path,
+):
+    """Declaring both `id` and `email` (in the same plan) but authoring a
+    SELECT that only produces `id` warns, naming the missing column."""
+
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n      - name: email\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "drop email from the select",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id  # the plan still validates and stores
+    assert any("email" in w and "does not produce" in w for w in warnings), warnings
+
+
+def test_column_contract_warns_when_select_adds_an_undeclared_column(
+    dbt_project_dir: Path,
+):
+    """`stg_customers`' schema.yml declares only `id`; authoring a SELECT that
+    also produces `email` warns, naming the undeclared column."""
+
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id, 'a@example.com' as email\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "add email to the select",
+        [model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert any("email" in w and "not declared" in w for w in warnings), warnings
+
+
+def test_column_contract_is_silent_when_no_columns_are_declared(
+    dbt_project_dir: Path,
+):
+    """A model whose schema.yml entry declares no `columns:` list has no
+    contract to compare against, and the whole-project scan must not reach
+    into an unrelated model (`stg_customers`) this plan never touched."""
+
+    schema_edit = _cfg_edit(
+        "models/staging/stg_orders.yml",
+        "version: 2\nmodels:\n  - name: stg_orders\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_orders.sql",
+        "select 1 as id, 2 as customer_id\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "add stg_orders",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert not any("stg_orders" in w for w in warnings), warnings
+    # stg_customers' own on-disk mismatch (declares `id`, selects `id, email`)
+    # must stay silent too: this plan never authored that model.
+    assert not any("stg_customers" in w for w in warnings), warnings
+
+
+def test_column_contract_reports_a_select_star_as_unresolvable(
+    dbt_project_dir: Path,
+):
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select * from raw_customers\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "star it",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert any("could not be resolved statically" in w for w in warnings), warnings
+
+
+def test_column_contract_reports_an_unaliased_macro_column_as_unresolvable(
+    dbt_project_dir: Path,
+):
+    """A macro standing in for a whole column (no alias) can expand to any
+    number of real columns once dbt renders it, so it is unresolvable exactly
+    like `select *` -- not a guessable single column named `__dex_jinja__`."""
+
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select {{ dbt_utils.star(ref('raw_customers')) }} from raw_customers\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "splat it",
+        [model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert any("could not be resolved statically" in w for w in warnings), warnings
+
+
+def test_column_contract_resolves_an_aliased_macro_column(dbt_project_dir: Path):
+    """A macro call given an explicit alias has a known output name regardless
+    of what expression computed it, so it is resolvable, unlike a bare macro
+    standing in for an unknown number of columns."""
+
+    schema_edit = _cfg_edit(
+        "models/staging/schema.yml",
+        "version: 2\nmodels:\n  - name: stg_customers\n    columns:\n"
+        "      - name: id\n      - name: total\n",
+        transform.EditKind.SCHEMA_YML,
+    )
+    model_edit = _cfg_edit(
+        "models/staging/stg_customers.sql",
+        "select 1 as id, {{ some_macro(x) }} as total\n",
+        transform.EditKind.MODEL_SQL,
+    )
+    plan, _diffs, warnings = transform.plan(
+        "compute total",
+        [schema_edit, model_edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    assert plan.plan_id
+    assert not any(
+        "could not be resolved statically" in w or "declares column" in w
+        for w in warnings
+    ), warnings
+
+
 def test_plan_cli_refuses_an_inlined_profiles_secret(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

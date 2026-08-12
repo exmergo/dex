@@ -38,6 +38,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   project's configured model and macro paths, which is what containment checked
   directly before.
 
+- **`transform plan` warns when a model's authored columns diverge from its
+  declared schema.yml contract** ([#214]). A model's schema.yml entry is the
+  closest thing a dbt project has to a column contract, and plan time is the
+  cheapest moment to check it, but nothing did: a model authored with a
+  different column set than its declaration passed silently. `transform plan`
+  now compares the authored SELECT list against the declared columns for
+  every model actually being planned, and warns in both directions: a
+  declared column the SELECT does not produce, and a produced column the
+  declaration does not name.
+
+  The check never refuses. The declaration is often the side that is stale,
+  and the caller is often deliberately changing the model, so a warning in
+  the same envelope as the diff is what matters, not a block. A model with no
+  declared columns produces no warning, since there is no contract to check
+  against. Where the SELECT list cannot be resolved statically (a bare
+  `select *`, a qualified `t.*`, or a macro standing in for a whole column
+  with no alias), the warning says so instead of guessing; an aliased macro
+  call is still resolved by its own alias. Declared columns are read with
+  this same plan's own schema.yml edits overlaid on the project, so a model
+  and its documentation edited together in one plan are compared against
+  each other, not against a stale on-disk file.
+
 ### Changed
 
 - **Containment validates an edit against the surface its own format declared**
