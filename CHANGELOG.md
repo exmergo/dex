@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.4] - 2026-08-13
+
 ### Added
 
 - **A verified join with a catastrophic orphan rate is now a finding, not
