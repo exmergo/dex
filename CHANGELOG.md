@@ -168,6 +168,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   profiled still needs a connection to build its sample, so it reaches the
   opener at the bottom of `cluster` and raises there.
 
+### Fixed
+
+- **A BigQuery profile estimate reserves for an escalation query only where the
+  probe could actually issue one, and says how much of itself is reserve**
+  ([#299]). Since 1.6.0 the estimate held three per-table 10 MB floors rather
+  than two: the value-domain probe added in that release
+  ([#203]) took a reserve beside the near-unique and composite ones. The reserve
+  scales with object count rather than data size, so on a warehouse of many
+  small tables the release moved a 12-object `explore map` estimate by 125.8 MB
+  in one step and started refusing a nightly refresh that had run for months.
+
+  Three of the reserves were provably unspendable rather than merely unlikely,
+  and are now dropped. A view has no row count (BigQuery reports none, and the
+  profiling aggregate's own `COUNT(*)` is read per batch and never written back
+  to the object), and all three probes return early without one, so a view held
+  three floors no run could ever spend. Nested and repeated columns get no
+  approximate distinct in the aggregate batch, and every probe's eligibility
+  starts from one, so a table of nothing else can no more escalate than a blob
+  column already excluded from the scan; the composite reserve was already
+  conditioned on having two columns, but counted columns that can never join a
+  pair. And a value domain needs at least one distinct value within a tenth of
+  the non-null rows, so no column of a table below ten rows can qualify. The
+  thresholds that imply that floor moved next to `ValueDomainSample` so the
+  estimator and the probe cannot drift apart. Nothing else was narrowed: the
+  reserve is dropped only where a probe's own guard already rules the query out,
+  because an estimate that reserves for a query that cannot run is merely loose,
+  while one that skips a query that can is the defect [#107] closed.
+
+  That leaves the common case, a warehouse of small flat tables, reserving
+  exactly as much as before, which is the second half of this. The confirm
+  handshake and the over-ceiling refusal now split the estimate into measured
+  dry-run scan and held reserve, in prose and in `reserved_bytes` /
+  `reserved_queries`. A refusal previously said only "raise the budget or narrow
+  the work" about a number that could be three quarters reserve, leaving the
+  operator to reconstruct the split from `.dex/spend.jsonl` afterwards to find
+  out whether the estimate grew because the warehouse did or because dex added a
+  probe. Over-ceiling refusals reach the connector's own description of the
+  estimate for the first time; before this only the confirmation payload did.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed

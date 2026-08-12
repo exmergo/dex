@@ -195,6 +195,14 @@ retry with a raised budget on an over-ceiling refusal without asking.
 Metadata is free (`connect test`, `inventory` run immediately), and OK
 envelopes report actual spend under `data.spend`.
 
+On BigQuery a profiling estimate holds a 10 MB floor per table for each
+escalation query a profile may still issue after its aggregate scan, so on a
+warehouse of many small tables most of the number can be reserve for work that
+never happens. Both the handshake and the over-ceiling refusal report that split
+(`reserved_bytes` and `reserved_queries`, and in the prose). Pass it on when you
+surface the estimate: whether a number is scan or reserve changes whether
+raising the budget is buying work or headroom.
+
 When an estimate is larger than the work deserves, narrow the scope rather than
 raise the budget. `--scope` (repeatable) bounds a command to part of the
 configured source allowlist, in the connector's own vocabulary: a dataset on
