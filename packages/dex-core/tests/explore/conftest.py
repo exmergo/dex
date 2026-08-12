@@ -18,6 +18,24 @@ def _isolated_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.chdir(tmp_path)
 
 
+def unreachable_warehouse(monkeypatch) -> None:
+    """Every attempt to open a connection fails, the way an uninstalled connector
+    extra or an absent credential fails. Applied AFTER the cache exists, because
+    building one legitimately needs the warehouse this then takes away.
+
+    Shared by `test_query.py` and `test_cluster.py`: #269 hoisted an adapter
+    acquisition in front of a cache-decided refusal in *both* commands, so both
+    need the same warehouse taken away from underneath them."""
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.errors import ConnectorError
+
+    def _refuse(self, *args, **kwargs):
+        raise ConnectorError("the connector extra is not installed")
+
+    monkeypatch.setattr(DexEngine, "_adapter", _refuse)
+
+
 @pytest.fixture
 def airbnb_duckdb(tmp_path: Path) -> Path:
     """Three raw tables: person-name and free-text columns that must be flagged,

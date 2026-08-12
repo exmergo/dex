@@ -49,7 +49,7 @@ from ..config import (
     blob_override_paths,
     pii_override_paths,
 )
-from ..errors import PrerequisiteError, RequestError
+from ..errors import DexError, PrerequisiteError, RequestError
 from ..guards.cost_guard import (
     ConfirmationRequiredError,
     CostGuardError,
@@ -1014,7 +1014,24 @@ def _run_statements(
 
         named = list(dict.fromkeys(name for names in reads.values() for name in names))
         if named:
-            shared.adapter = engine._adapter("explore query")
+            try:
+                shared.adapter = engine._adapter("explore query")
+            except DexError:
+                # No connection settles nothing, exactly as an unreadable column
+                # signature settles nothing inside `_object_gap`. That tolerance
+                # already exists one level down; it was missing here, at the
+                # acquisition, and the difference is not cosmetic: the guard below
+                # decides from cached PII flags and needs no warehouse at all, so
+                # letting an absent connector stop it turns a policy decision into
+                # a connectivity one and closes the firewall in exactly the
+                # offline environments that cannot bill for a mistake.
+                #
+                # Nothing is swallowed. A statement that PASSES the guard reaches
+                # the same opener below and raises there, which is where a caller
+                # who is about to run SQL wants to hear that the warehouse is
+                # unreachable. Only a refusal now returns without it.
+                shared.adapter = None
+        if shared.adapter is not None:
             gap = _object_gap(shared.adapter, cache, named)
             if gap.absent:
                 # Only the statements that named a missing object are refused; a
@@ -1811,7 +1828,22 @@ def cluster(
     warnings: list[str] = []
     profiled_names: list[str] = []
     if auto:
-        adapter = engine._adapter("explore cluster")
+        try:
+            adapter = engine._adapter("explore cluster")
+        except DexError:
+            # The same tolerance the query path applies, at the second site the
+            # object-gap probe was added to. `cluster` decides two things from
+            # the cache alone -- "there is no cache" and "that object is not in
+            # it" -- and both refusals sit below this acquisition, so gating it
+            # here made them unreachable wherever no connector is installed.
+            #
+            # `auto_profile` defaults to True, so this is the ordinary path and
+            # not an opt-in one; `--no-auto-profile` was the only way left to
+            # reach either refusal offline. Nothing is swallowed: an object that
+            # IS profiled still needs a connection to build its sample, reaches
+            # the opener at the bottom of this function, and raises there.
+            adapter = None
+    if adapter is not None:
         gap = _object_gap(adapter, cache, [obj])
         if gap.absent:
             raise RequestError(gap.refusal())

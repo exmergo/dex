@@ -93,6 +93,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   silence, which was indistinguishable from dex deciding the test was already
   there.
 
+### Fixed
+
+- **The PII firewall decides again without a warehouse connection.** Since 1.6.3,
+  `explore query` opened a connection before the guard ran: the object-gap probe
+  added with the auto-profiling work took an already-open adapter, and the
+  acquisition ahead of it was unguarded. Every query naming a relation therefore
+  needed a reachable warehouse before the firewall could refuse anything, so a
+  caller holding a profiled cache and no connector got a connector error where
+  1.6.2 returned a refusal. That reaches further than an inconvenience: the guard
+  reads cached PII flags and needs no warehouse to decide, so gating it on a
+  connection turns a policy decision into a connectivity one and closes the
+  firewall in exactly the offline environments that cannot bill for a mistake.
+
+  The acquisition is now as tolerant as the use one level below it, where an
+  unreadable column signature already "settles nothing" and falls through. A
+  failed open settles nothing either. Drift detection is unchanged wherever a
+  connection exists, and nothing is swallowed: a statement that passes the guard
+  reaches the same opener afterwards and raises there, which is where a caller
+  about to run SQL wants to hear it.
+
+- **`explore cluster` refuses from the cache again without a connection.** The
+  same probe was added to `cluster` in the same change, in front of the two
+  things that command decides from the cache alone: that there is no cache at
+  all, and that the named object is not in it. Both refusals sat below the
+  acquisition, so both became connector errors. `auto_profile` defaults to
+  `true`, which made this the ordinary path rather than an opt-in one, and
+  `--no-auto-profile` the only remaining way to reach either refusal offline.
+  The same fall-through applies, with the same limit: an object that *is*
+  profiled still needs a connection to build its sample, so it reaches the
+  opener at the bottom of `cluster` and raises there.
+
 ## [1.6.3] - 2026-08-10
 
 ### Changed
