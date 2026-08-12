@@ -18,7 +18,7 @@ from pathlib import Path
 from .adapters.base import Adapter
 from .config import CONFIG_FILE
 from .envelope import Cost
-from .guards.cost_guard import ConfirmationRequiredError, CostGate
+from .guards.cost_guard import ConfirmationRequiredError, CostGate, OverCeilingError
 from .results import ConfirmationRequest, Result
 from .storage import DEX_DIR
 
@@ -117,8 +117,24 @@ def billed_handshake(
     gate = cost_gate(adapter)
     if gate is None:
         return
+    # What a connector can say about the composition of the estimate it just
+    # priced, asked once and used by both refusals below. Only this handshake
+    # asks: it is the one whose estimate the connector's profile pricing built,
+    # and a mid-command phase (verify probes) prices something else entirely.
+    reserve = getattr(adapter, "profile_reserve", None)
+    reserve = reserve(estimate) if reserve is not None else None
     try:
         gate.preflight_command(estimate)
+    except OverCeilingError as exc:
+        # A refusal is the message an operator acts on and the one that carries
+        # the least. Without this, an estimate padded with escalation reserve
+        # reads as work the warehouse is about to do, and the only way to tell
+        # the two apart is to reconstruct the split from the spend ledger
+        # afterwards (issue #299). Re-raised rather than mutated so the
+        # exception stays a plain immutable refusal, carrying the same cost.
+        if reserve is None:
+            raise
+        raise OverCeilingError(f"{exc}. {reserve['note']}", cost=exc.cost) from exc
     except ConfirmationRequiredError as exc:
         # The payload speaks the connector's unit. An adapter that knows more
         # than the raw magnitude (Snowflake's credit translation, its
@@ -139,6 +155,14 @@ def billed_handshake(
             }
             if per_table:
                 data["per_table_bytes"] = per_table
+        if reserve is not None:
+            # Prose and flat keys both: the note is what a person reads when
+            # deciding whether raising the budget buys work or headroom, and
+            # the keys are so a host branching on the split does not have to
+            # parse the sentence to find it.
+            data["reserved_bytes"] = reserve["reserved_bytes"]
+            data["reserved_queries"] = reserve["reserved_queries"]
+            data["notes"] = [*data.get("notes", []), reserve["note"]]
         if notes:
             data.setdefault("notes", [])
             data["notes"] = [*data["notes"], *notes]
