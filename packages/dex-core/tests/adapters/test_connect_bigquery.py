@@ -215,14 +215,57 @@ def test_describe_estimate_names_the_per_query_floor(fake_bq_client):
     assert any("10,485,760" in note or "10 MB" in note for note in described["notes"])
 
 
+def test_profile_reserve_splits_the_escalation_reserve_from_the_scan(fake_bq_client):
+    """The reserve is most of a small-table estimate, so a caller sizing a
+    budget has to be able to tell it from measured scan (issue #299)."""
+
+    adapter = make_adapter(fake_bq_client)
+    # Nothing priced yet, so there is nothing to attribute and the adapter says
+    # so rather than reporting a zero split.
+    assert adapter.profile_reserve(40 * MB) is None
+
+    total, _per_table = adapter.profile_estimate(["test-proj.shop.customers"])
+    reserve = adapter.profile_reserve(total)
+    # customers: one floored batch plus three reserved floors.
+    assert reserve["reserved_queries"] == 3
+    assert reserve["reserved_bytes"] == 30 * MB
+    assert "3 queries" in reserve["note"]
+    # The remainder is the dry-run half, named as such.
+    assert "10,485,760 bytes is dry-run scan" in reserve["note"]
+
+
+def test_profile_reserve_is_silent_when_nothing_could_escalate(fake_bq_client):
+    """An estimate with no reserve in it has no split to report, and saying so
+    with a zero would read as a measurement rather than an absence."""
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="empty_table",
+                schema=[bigquery.SchemaField("id", "INTEGER")],
+                num_rows=0,
+                num_bytes=0,
+            )
+        ],
+    )
+    adapter = make_adapter(client)
+    total, _per_table = adapter.profile_estimate(["test-proj.shop.empty_table"])
+    assert adapter.profile_reserve(total) is None
+
+
 def test_profile_estimate_floors_each_batch_at_the_billing_minimum(fake_bq_client):
     adapter = make_adapter(fake_bq_client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.customers"])
     # One batch over one table (the raw 5000-byte scan floors to the minimum)
-    # plus a floor reserved for each of the three possible escalation queries
-    # (customers has 2 non-blob columns and 100 rows, so all three are
-    # possible): 10 MB aggregate + 10 MB near-unique reserve + 10 MB
-    # value-domain reserve + 10 MB composite reserve.
+    # plus a floor reserved for each escalation query customers' metadata
+    # leaves possible (2 scalar columns, 100 rows, so all three are): 10 MB
+    # aggregate + 10 MB near-unique reserve + 10 MB value-domain reserve +
+    # 10 MB composite reserve.
     assert per_table["test-proj.shop.customers"] == 40 * MB
     assert total == 40 * MB
 
@@ -458,12 +501,15 @@ def test_profile_estimate_sums_free_dry_runs(fake_bq_client):
         ["test-proj.shop.customers", "test-proj.shop.events", "test-proj.logs.requests"]
     )
     # Each queryable table is one below-floor batch (floors to the minimum)
-    # plus a floor reserved for each of its three possible escalation queries
-    # (both tables have >= 2 non-blob columns and > 0 rows): 40 MB apiece.
+    # plus a floor per escalation query its metadata leaves possible. customers
+    # has two scalar columns and 100 rows, so all three are: 40 MB. events has
+    # only one column BigQuery can count distinctly (payload is a STRUCT,
+    # labels is REPEATED, and neither gets an approximate distinct), so a
+    # composite pair cannot be formed and that reserve is dropped: 30 MB.
     assert per_table["test-proj.shop.customers"] == 40 * MB
-    assert per_table["test-proj.shop.events"] == 40 * MB
+    assert per_table["test-proj.shop.events"] == 30 * MB
     assert per_table["test-proj.logs.requests"] == 0.0  # unqueryable, skipped
-    assert total == 80 * MB
+    assert total == 70 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -527,13 +573,14 @@ def test_profile_estimate_skips_the_reserve_for_a_provably_empty_table(fake_bq_c
     assert total == 10 * MB
 
 
-def test_profile_estimate_still_reserves_for_a_view_with_unknown_row_count(
+def test_profile_estimate_reserves_nothing_for_a_view_with_unknown_row_count(
     fake_bq_client,
 ):
-    """A view's row count is never known before the aggregate that reveals it
-    (BigQuery reports no stored row count for a view), so 'unknown' must still
-    reserve for escalation rather than being mistaken for 'empty' (issue #107).
-    """
+    """BigQuery reports no stored row count for a view, and nothing fills one
+    in later: the profiling aggregate's own COUNT(*) is read per batch and
+    never written back to the object. All three escalation probes return early
+    on a falsy row count, so a view provably cannot escalate and the floors it
+    used to reserve were money no run could spend (issue #299)."""
 
     from fakes.bigquery import FakeBigQueryClient, FakeTable
 
@@ -556,9 +603,79 @@ def test_profile_estimate_still_reserves_for_a_view_with_unknown_row_count(
     )
     adapter = make_adapter(client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.a_view"])
-    # Full reserve still applies despite the unknown (None) row count.
-    assert per_table["test-proj.shop.a_view"] == 40 * MB
-    assert total == 40 * MB
+    # Aggregate batch floor only; the unknown row count rules out all three.
+    assert per_table["test-proj.shop.a_view"] == 10 * MB
+    assert total == 10 * MB
+
+
+def _sized_table_client(**table_kwargs):
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    return FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                num_bytes=5_000,
+                **table_kwargs,
+            )
+        ],
+    )
+
+
+def test_profile_estimate_skips_the_value_domain_reserve_on_a_tiny_table():
+    """A value domain needs at least one distinct value within a tenth of the
+    non-null rows, so no column of a table below VALUE_DOMAIN_MIN_ROWS can ever
+    qualify and the probe can never be issued. One row either side of the bar,
+    since the whole point is that the reserve tracks the probe's own rule."""
+
+    from exmergo_dex_core.adapters.base import VALUE_DOMAIN_MIN_ROWS
+
+    schema = [
+        bigquery.SchemaField("id", "INTEGER"),
+        bigquery.SchemaField("status", "STRING"),
+    ]
+    below = make_adapter(
+        _sized_table_client(
+            table_id="tiny", schema=schema, num_rows=VALUE_DOMAIN_MIN_ROWS - 1
+        )
+    )
+    # Batch floor plus the near-unique and composite reserves, not the domain.
+    assert below.profile_estimate(["test-proj.shop.tiny"])[0] == 30 * MB
+
+    at_bar = make_adapter(
+        _sized_table_client(
+            table_id="tiny", schema=schema, num_rows=VALUE_DOMAIN_MIN_ROWS
+        )
+    )
+    assert at_bar.profile_estimate(["test-proj.shop.tiny"])[0] == 40 * MB
+
+
+def test_profile_estimate_reserves_nothing_for_an_all_nested_table():
+    """Nested and repeated fields get no approximate distinct in the aggregate
+    batch, and every escalation's eligibility starts from one, so a table with
+    nothing else in it can no more escalate than a blob column already excluded
+    from the scan."""
+
+    adapter = make_adapter(
+        _sized_table_client(
+            table_id="nested_only",
+            schema=[
+                bigquery.SchemaField(
+                    "payload",
+                    "RECORD",
+                    fields=[bigquery.SchemaField("tag", "STRING")],
+                ),
+                bigquery.SchemaField("labels", "STRING", mode="REPEATED"),
+                bigquery.SchemaField("shape", "GEOGRAPHY"),
+            ],
+            num_rows=100_000,
+        )
+    )
+    total, per_table = adapter.profile_estimate(["test-proj.shop.nested_only"])
+    assert per_table["test-proj.shop.nested_only"] == 10 * MB
+    assert total == 10 * MB
 
 
 def _blob_fake_client():

@@ -16,6 +16,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from ..adapters.base import (
+    VALUE_DOMAIN_CAP,
+    VALUE_DOMAIN_MAX_FRACTION,
     Adapter,
     ColumnAggregate,
     is_blob_type,
@@ -62,15 +64,6 @@ _COMPOSITE_PAIR_CAP = 5
 # competing hypothesis, not filler) still gets its own slot even if it
 # reuses a column.
 _COMPOSITE_REDUNDANCY_RATIO = 3.0
-
-# A column's value domain is reported only when its distinct count clears
-# BOTH bars: small absolutely (this cap) and small relative to the table
-# (the fraction below), so a tiny table's near-key column does not qualify
-# on the absolute count alone. Deliberately conservative -- this codebase's
-# general posture is to under-report rather than over-report, and a false
-# negative here just costs one more `explore query`.
-_VALUE_DOMAIN_CAP = 25
-_VALUE_DOMAIN_MAX_FRACTION = 0.10
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
@@ -839,23 +832,23 @@ def _probe_value_domains(
             continue
         if agg.is_unique and agg.null_fraction in (0.0, None):
             continue  # single-column key
-        if not agg.distinct_count or agg.distinct_count > _VALUE_DOMAIN_CAP:
+        if not agg.distinct_count or agg.distinct_count > VALUE_DOMAIN_CAP:
             continue
         non_null = row_count * (1 - (agg.null_fraction or 0.0))
-        if non_null <= 0 or agg.distinct_count > non_null * _VALUE_DOMAIN_MAX_FRACTION:
+        if non_null <= 0 or agg.distinct_count > non_null * VALUE_DOMAIN_MAX_FRACTION:
             continue
         eligible.append(name)
     if not eligible:
         return {}
 
-    samples = domain_fn(identifier, eligible, limit=_VALUE_DOMAIN_CAP)
+    samples = domain_fn(identifier, eligible, limit=VALUE_DOMAIN_CAP)
     domains: dict[str, ValueDomain] = {}
     for name, sample in samples.items():
         agg = aggregates[name]
         non_null = row_count * (1 - (agg.null_fraction or 0.0))
         if (
             non_null <= 0
-            or sample.total_distinct > non_null * _VALUE_DOMAIN_MAX_FRACTION
+            or sample.total_distinct > non_null * VALUE_DOMAIN_MAX_FRACTION
         ):
             # The approximate pre-check under-estimated the true fraction:
             # this is really a near-key column, so report no domain at all
