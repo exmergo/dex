@@ -11,6 +11,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A verified join with a catastrophic orphan rate is now a finding, not
+  only a demoted confidence** ([#207]). `explore relationships --verify`
+  already measured an overlap probe per inferred join and stored the
+  result as `orphan_fraction`, but when two "matching" columns shared zero
+  actual values the only consequence was a lower confidence number buried
+  in a list of edges: nothing in `notes`, `warnings`, or a dataset's
+  `data_quality` said "these two columns are named alike and are not the
+  same key." That is the exact failure a reader skimming several edges
+  misses, and the cost is specific: a model joins on the same-named
+  column, every parent-side attribute comes back `NULL`, and it looks like
+  it worked.
+
+  A verified inferred join at or above a 90% orphan rate now produces a
+  finding naming both sides and the measured fraction, in `notes` (so a
+  caller reading only the summary still sees it) and mirrored onto the
+  child dataset's `data_quality` (so it survives into the cache for
+  anything reading profiles later, not only this one command's output).
+  90% sits well above the confidence-demotion tier (which already starts
+  at 20%), so this fires only for the catastrophic case, not every
+  weakened guess; a join that was never verified reports nothing, since
+  nothing was measured. No change to inference or to the confidence
+  arithmetic itself, purely surfacing what was already computed.
 - **A project format can say where its edits land, and which paths it owns**
   ([#257], [#258]). `maintain reconcile` read the project seam's write tier and
   then narrowed again on `isinstance(editable, DbtProject)`, so a format that
