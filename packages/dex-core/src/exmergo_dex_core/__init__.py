@@ -55,6 +55,7 @@ _EXPORTS = {
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
     "CacheRequiredError": "explore.commands",
+    "CacheUnreadableError": "storage.base",
     "CeilingRequiredError": "guards.cost_guard",
     "ClusterDependencyError": "explore.cluster",
     "ClusterError": "explore.cluster",
@@ -154,6 +155,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         to_envelope,
     )
     from .storage import (
+        CacheUnreadableError,
         Document,
         ExploreStore,
         FilesystemStore,
@@ -179,6 +181,7 @@ __all__ = [
     "BaselineUnreadableError",
     "BudgetExhaustedError",
     "CacheRequiredError",
+    "CacheUnreadableError",
     "CeilingRequiredError",
     "ClusterDependencyError",
     "ClusterError",

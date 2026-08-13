@@ -31,7 +31,7 @@ from ..dbt_project import ApplyResult as PlanApplyResult
 from ..dbt_project import EditOp
 from ..errors import DexError
 from ..results import to_envelope
-from ..storage import Store
+from ..storage import Store, readable_cache
 from . import plans as plans_mod
 from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit
@@ -397,7 +397,7 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
 
     project = engine.project_dir()
     view = load_project(project)
-    cache = engine.store.load_cache()
+    cache = readable_cache(engine.store)
     edits, inputs = test_scaffold_mod.unit_test_scaffold_edits(view, cache, model_name)
 
     from .build import shadow_parse

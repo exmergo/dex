@@ -21,6 +21,7 @@ this package. It is deliberately not imported here: it needs pytest, and a bare
 """
 
 from .base import (
+    CacheUnreadableError,
     Document,
     ExploreStore,
     MaintainStore,
@@ -28,6 +29,7 @@ from .base import (
     Store,
     StoreContext,
     StoreFactory,
+    readable_cache,
     spend_total,
 )
 from .filesystem import DEX_DIR, FilesystemStore
@@ -36,6 +38,7 @@ from .resolver import build_store, resolve_store_factory
 
 __all__ = [
     "DEX_DIR",
+    "CacheUnreadableError",
     "Document",
     "ExploreStore",
     "FilesystemStore",
@@ -46,6 +49,7 @@ __all__ = [
     "StoreContext",
     "StoreFactory",
     "build_store",
+    "readable_cache",
     "resolve_store_factory",
     "spend_total",
 ]
