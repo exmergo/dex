@@ -1848,6 +1848,58 @@ def test_bigquery_over_ceiling_cannot_be_confirmed_through(fake_bq_client):
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
+def test_bigquery_a_narrowed_reserve_still_bounds_what_profiling_bills():
+    # Family 2: the estimate is a ceiling actual spend will not exceed (#107),
+    # and that has to survive every reserve the estimator declines to hold
+    # (#299). A view is the sharpest case: it has no row count, so all three
+    # escalation probes bail and the estimator now reserves nothing at all for
+    # it. If any of them could still run, this is where the quoted number would
+    # turn out to be less than the bill.
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="customers_v",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER"),
+                    bigquery.SchemaField("tier", "STRING"),
+                ],
+                num_rows=100,  # nulled out for a view, which is the point
+                num_bytes=5_000,
+                table_type="VIEW",
+            )
+        ],
+        row_resolver=lambda sql: [
+            {
+                "n_total": 100,
+                "nn_0": 100,
+                "nd_0": 100,
+                "mn_0": 1,
+                "mx_0": 100,
+                "nn_1": 100,
+                "nd_1": 3,
+                "d_0": 100,
+                "d_1": 3,
+            }
+        ],
+    )
+    adapter = _bq_adapter(client)
+    estimate, _per_table = adapter.profile_estimate(["test-proj.shop.customers_v"])
+    profile_mod.profile(adapter, ["test-proj.shop.customers_v"])
+    billed = adapter.cost_gate.spend_summary()["bytes_billed"]
+    assert billed <= estimate
+    # And no escalation was attempted, which is why nothing was reserved.
+    executed = [c for c in client.query_calls if not c.dry_run]
+    assert len(executed) == 1
+
+
 def test_bigquery_every_executed_job_is_server_capped(fake_bq_client):
     # Family 2: defense in depth past the client-side gate; a wrong estimate
     # cannot overrun the budget because the service enforces the cap.

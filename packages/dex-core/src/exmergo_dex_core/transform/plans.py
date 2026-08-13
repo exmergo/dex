@@ -19,8 +19,10 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
+import sqlglot
 import yaml
 from pydantic import BaseModel
+from sqlglot import expressions as exp
 
 from ..dbt_project import (
     REF_PATTERN,
@@ -38,7 +40,7 @@ from ..dbt_project import (
 )
 from ..diffs import file_diff
 from ..errors import DexError
-from .validate import find_inlined_secret, validate_edit
+from .validate import _PLACEHOLDER, find_inlined_secret, strip_jinja, validate_edit
 
 if TYPE_CHECKING:
     from ..adapters.project import EditableProject
@@ -304,6 +306,7 @@ def plan(
         from .scaffold import missing_macro_warnings
 
         warnings.extend(missing_macro_warnings(edits, view))
+        warnings.extend(column_contract_warnings(edits, view))
 
     created_at = datetime.now(UTC).isoformat()
     try:
@@ -433,6 +436,137 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
                 "remove the schema.yml entry in a follow-up edit"
             )
     return warnings
+
+
+def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[str]:
+    """Warn when a model's authored SELECT list diverges from what its
+    schema.yml declares, in either direction (issue #214).
+
+    schema.yml is the closest thing a dbt project has to a column contract,
+    and plan time is the cheapest moment to check it against what was actually
+    authored. Always a warning, never a refusal: the declaration is
+    frequently the side that is stale, and the caller is often deliberately
+    changing the model's shape.
+
+    Scoped to models actually authored in this plan (not every model in the
+    project) and only when that model declares a ``columns:`` list at all; a
+    model with none has no contract to compare against and produces nothing.
+    Declared columns are read with this plan's own SCHEMA_YML upserts
+    overlaid on the current project files, so a model and its doc edited
+    together in the same plan are compared against each other, not against a
+    stale on-disk declaration.
+
+    Where the authored SELECT list cannot be resolved statically (a bare
+    ``select *``, a qualified ``t.*``, or an unaliased macro call standing in
+    for a column), the comparison is skipped and that is said outright,
+    rather than guessed at.
+    """
+
+    schema_sources = {
+        path: source.content
+        for path, source in view.files.items()
+        if path.endswith((".yml", ".yaml"))
+    }
+    for edit in edits:
+        if edit.kind is EditKind.SCHEMA_YML and edit.new_content is not None:
+            schema_sources[edit.path] = edit.new_content
+
+    declared_by_model: dict[str, list[str]] = {}
+    for content in schema_sources.values():
+        try:
+            parsed = yaml.safe_load(content)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for entry in parsed.get("models") or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                continue
+            columns = [
+                column["name"]
+                for column in entry.get("columns") or []
+                if isinstance(column, dict) and isinstance(column.get("name"), str)
+            ]
+            if columns:
+                declared_by_model[entry["name"]] = columns
+
+    warnings: list[str] = []
+    for edit in edits:
+        if (
+            edit.kind is not EditKind.MODEL_SQL
+            or edit.op is not EditOp.UPSERT
+            or edit.new_content is None
+        ):
+            continue
+        model = Path(edit.path).stem
+        declared = declared_by_model.get(model)
+        if not declared:
+            continue
+        declared_lower = {c.lower() for c in declared}
+
+        produced = _select_columns(edit.new_content)
+        if produced is None:
+            warnings.append(
+                f"{edit.path}: schema.yml declares column(s) for {model}, but "
+                "the SELECT list could not be resolved statically (a `select "
+                "*`/`t.*`, or a macro standing in for a column); the "
+                "contract comparison was skipped"
+            )
+            continue
+
+        missing = sorted(declared_lower - produced)
+        if missing:
+            warnings.append(
+                f"{edit.path}: schema.yml declares column(s) {', '.join(missing)} "
+                f"for {model} that the SELECT list does not produce"
+            )
+        extra = sorted(produced - declared_lower)
+        if extra:
+            warnings.append(
+                f"{edit.path}: the SELECT list produces column(s) "
+                f"{', '.join(extra)} not declared in schema.yml for {model}"
+            )
+    return warnings
+
+
+def _select_columns(sql: str) -> set[str] | None:
+    """The lowercased output column names of a model's outermost SELECT, or
+    ``None`` if they cannot be resolved statically.
+
+    Unresolvable covers a bare ``select *``, a qualified ``t.*``, an unaliased
+    macro call standing in for a column (indistinguishable from a real column
+    once jinja is stripped to a placeholder, and can expand to any number of
+    real columns), a set operation (a UNION's branches can each project
+    differently), and anything that fails to parse. An *aliased* macro call
+    (``{{ some_macro(x) }} as total``) is resolvable: the alias is the real
+    output name regardless of what expression computed it.
+    """
+
+    stripped = strip_jinja(sql)
+    if not stripped:
+        return None
+    try:
+        parsed = sqlglot.parse_one(stripped, read="duckdb")
+    except Exception:
+        return None
+
+    node = parsed
+    while isinstance(node, (exp.With, exp.Subquery)):
+        node = node.this
+    if not isinstance(node, exp.Select):
+        return None
+
+    columns: set[str] = set()
+    for projection in node.expressions:
+        if isinstance(projection, exp.Star):
+            return None
+        if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
+            return None
+        name = projection.alias_or_name
+        if not name or _PLACEHOLDER in name:
+            return None
+        columns.add(name.lower())
+    return columns or None
 
 
 def _plan_id(intent: str, edits: list[PlanEdit]) -> str:

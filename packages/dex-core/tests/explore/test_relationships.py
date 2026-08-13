@@ -986,6 +986,168 @@ def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):
     assert rel["confidence"] < 0.5, "measured non-containment demotes the guess"
 
 
+# --- orphan findings (#207): a complete orphan rate is a finding, not just a
+# demoted confidence -------------------------------------------------------
+
+
+def _rel(
+    *,
+    from_dataset: str = "db.s.orders",
+    from_columns: list[str] | None = None,
+    to_dataset: str = "db.s.customers",
+    to_columns: list[str] | None = None,
+    kind: RelationshipKind = RelationshipKind.INFERRED,
+    verified: bool = True,
+    orphan_fraction: float | None = None,
+) -> Relationship:
+    return Relationship(
+        from_dataset=from_dataset,
+        from_columns=from_columns or ["customer_id"],
+        to_dataset=to_dataset,
+        to_columns=to_columns or ["id"],
+        kind=kind,
+        verified=verified,
+        orphan_fraction=orphan_fraction,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rel", "expect_finding"),
+    [
+        (_rel(orphan_fraction=1.0), True),
+        (_rel(orphan_fraction=0.9), True),  # exactly at the threshold
+        # The existing heavy-orphan demotion case: a real signal, but not
+        # catastrophic enough for this finding -- a different tier.
+        (_rel(orphan_fraction=0.6), False),
+        (_rel(orphan_fraction=0.0), False),
+        (_rel(orphan_fraction=None), False),  # verified but nothing measured
+        (_rel(verified=False, orphan_fraction=1.0), False),  # nothing measured
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0), False),
+    ],
+)
+def test_orphan_findings_decisions(rel: Relationship, expect_finding: bool):
+    from exmergo_dex_core.explore.relationships import orphan_findings
+
+    findings = orphan_findings([rel])
+    if expect_finding:
+        assert len(findings) == 1
+        found_rel, text = findings[0]
+        assert found_rel is rel
+        assert "db.s.orders.customer_id" in text
+        assert "db.s.customers.id" in text
+        assert "not evidence of a shared key" in text
+    else:
+        assert findings == []
+
+
+def test_verify_reports_a_complete_orphan_edge_as_a_finding(tmp_path: Path, capsys):
+    """The issue's own scenario: two columns share a name and share no
+    values at all. The finding names both sides, and the same text survives
+    into the child dataset's persisted data_quality."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "no_overlap.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    # Every customer_id points at a customer that does not exist: orphan
+    # fraction 1.0, a shared name with zero shared data.
+    conn.execute("INSERT INTO orders VALUES (10, 7), (11, 8), (12, 9)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        [
+            "explore",
+            "relationships",
+            "--verify",
+            "--path",
+            str(path),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 1.0
+
+    notes = " ".join(data["notes"])
+    assert "orders.customer_id -> " in notes and "customers.id" in notes
+    assert "100%" in notes
+    assert "not evidence of a shared key" in notes
+
+    cache = FilesystemStore(repo).load_cache()
+    orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
+    assert any("not evidence of a shared key" in n for n in orders.data_quality)
+
+
+def test_verify_at_zero_orphans_produces_no_finding(tmp_path: Path, capsys):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "clean.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 1), (11, 2)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["orphan_fraction"] == 0.0
+    assert not any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_unverified_edge_produces_no_finding(tmp_path: Path, capsys):
+    """Nothing was measured without --verify, so nothing is reported, even
+    though the columns share a name."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "unverified.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2)")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 7), (11, 8)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--path", str(path)], capsys)["data"]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is False
+    assert not any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_map_verify_also_reports_orphan_findings(tmp_path: Path, capsys):
+    """The second call site (`map --verify`) emits the identical finding
+    shape, since both commands share `orphan_findings`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "map_no_overlap.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 7), (11, 8), (12, 9)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--verify", "--path", str(path), "--repo-root", str(repo)],
+        capsys,
+    )["data"]
+    notes = " ".join(data["notes"])
+    assert "not evidence of a shared key" in notes
+
+    cache = FilesystemStore(repo).load_cache()
+    orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
+    assert any("not evidence of a shared key" in n for n in orders.data_quality)
+
+
 def test_relationships_persists_datasets_and_relationships(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):

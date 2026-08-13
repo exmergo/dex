@@ -451,6 +451,45 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
     return notes
 
 
+# Below this, a high orphan rate is still just weaker evidence for the
+# inferred join (verify_relationships already demotes confidence starting at
+# 0.2). At or above it, the two columns are effectively disjoint: a shared
+# name with this little shared data is not a shared key, and joining on it
+# returns all-NULL parent attributes while looking like it worked (issue
+# #207). Set well above the confidence-demotion tier so this fires only for
+# the catastrophic case the issue is about, not every demoted edge.
+_ORPHAN_FINDING_THRESHOLD = 0.9
+
+
+def orphan_findings(
+    relationships: list[Relationship],
+) -> list[tuple[Relationship, str]]:
+    """A verified inferred join whose orphan fraction clears
+    `_ORPHAN_FINDING_THRESHOLD`, paired with the finding text a caller (or a
+    future drift-sweep detector) needs: both sides, named, plus the measured
+    fraction. Declared joins and anything not verified (nothing was
+    measured) never qualify; confidence arithmetic is unchanged, this only
+    reports what `verify_relationships` already measured.
+    """
+
+    findings = []
+    for rel in relationships:
+        if rel.kind is not RelationshipKind.INFERRED or not rel.verified:
+            continue
+        if rel.orphan_fraction is None:
+            continue  # verified but zero non-null FK values: nothing measured
+        if rel.orphan_fraction < _ORPHAN_FINDING_THRESHOLD:
+            continue
+        text = (
+            f"{rel.from_dataset}.{rel.from_columns[0]} -> "
+            f"{rel.to_dataset}.{rel.to_columns[0]} shares a column name but "
+            f"{rel.orphan_fraction:.0%} of values have no match; the shared "
+            "name is not evidence of a shared key"
+        )
+        findings.append((rel, text))
+    return findings
+
+
 def verify_relationships(
     adapter: Adapter,
     relationships: list[Relationship],

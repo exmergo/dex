@@ -171,6 +171,11 @@ def test_unconfirmed_profile_returns_needs_confirmation(
     # columns, 100 rows): 10 + 10 + 10 + 10 = 40 MB.
     assert envelope.cost.estimate == 40 * MB
     assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 40 * MB}
+    # Three of those four floors are reserve, split out so the caller can see
+    # whether a raised budget buys work or headroom (#299).
+    assert envelope.data["reserved_bytes"] == 30 * MB
+    assert envelope.data["reserved_queries"] == 3
+    assert any("escalation reserve" in n for n in envelope.data["notes"])
     assert "--confirm" in envelope.data["hint"]
     # Nothing executed: only free metadata and dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -206,9 +211,11 @@ def test_unconfirmed_map_estimates_selected_objects(
     envelope = _dispatch(tmp_path, subcommand="map")
     assert envelope.status.value == "needs_confirmation"
     # customers and events each floor to the per-query minimum plus a floor
-    # per possible escalation query (40 MB apiece); logs.requests needs a
-    # partition filter, so it contributes zero.
-    assert envelope.cost.estimate == 2 * 40 * MB
+    # per escalation query their metadata leaves possible (40 MB for customers,
+    # 30 MB for events, whose only distinct-countable column cannot form a
+    # composite pair); logs.requests needs a partition filter, so it
+    # contributes zero.
+    assert envelope.cost.estimate == 70 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -267,8 +274,9 @@ def test_unconfirmed_map_excludes_fresh_cached_objects(
     envelope = _dispatch(tmp_path, subcommand="map")
     assert envelope.status.value == "needs_confirmation"
     # Only events is priced now (customers is fresh-cached, requests is
-    # partition-filtered to zero), so the estimate halves versus the no-cache run.
-    assert envelope.cost.estimate == 40 * MB
+    # partition-filtered to zero), so the estimate drops to that table's share
+    # of the no-cache run.
+    assert envelope.cost.estimate == 30 * MB
     assert "test-proj.shop.customers" not in envelope.data["per_table_bytes"]
     assert any("fresh-cached" in note for note in envelope.data["notes"])
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -715,6 +723,11 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     cache = FilesystemStore(tmp_path).load_cache()
     assert cache.relationships and not cache.relationships[0].verified
     assert any("unverified" in note for note in envelope.data["notes"])
+    # The verify phase prices overlap probes, which carry no escalation
+    # reserve. The profile estimate earlier in this same command did, and
+    # attributing that one to this number would describe the wrong estimate.
+    assert "reserved_bytes" not in envelope.data
+    assert not any("escalation reserve" in n for n in envelope.data["notes"])
 
 
 def test_relationships_verify_beyond_budget_checkpoints(
@@ -868,6 +881,34 @@ def test_over_ceiling_refusal_reports_the_metered_paradigm(
     assert all(c.dry_run for c in fake_bq_client.query_calls)
     # #170: a machine-readable reason alongside the prose.
     assert envelope.reason is Reason.GUARD
+
+
+def test_over_ceiling_refusal_attributes_the_estimate_it_refused_on(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Three quarters of this estimate is escalation reserve, and a refusal
+    that quotes only the total leaves the operator to reconstruct the split
+    from the spend ledger to find out whether the number grew because the
+    warehouse did (issue #299)."""
+
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(MB),
+    )
+    assert envelope.status.value == "error"
+    message = envelope.errors[0]
+    assert "exceeds the ceiling" in message
+    # 3 of the 4 floors in customers' 40 MB estimate are reserve.
+    assert "31,457,280 bytes of this estimate is escalation reserve" in message
+    assert "3 queries" in message
+    assert "10,485,760 bytes is dry-run scan" in message
+    # Still a refusal that spends nothing and cannot be confirmed through.
+    assert envelope.cost.estimate == 40 * MB
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
 def test_no_ceiling_refusal_reports_the_metered_paradigm(
