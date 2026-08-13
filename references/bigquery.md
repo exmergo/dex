@@ -72,6 +72,35 @@ BigQuery bills a 10 MB minimum per query; a remaining budget below that is
 refused with the math rather than letting the job fail server-side. Query-cache
 hits bill zero and are recorded as such.
 
+### What a profile estimate is made of
+
+A profile's cost is not one query per table. After the aggregate scan, a
+profile may issue up to three more queries against the same table: an exact
+distinct count for a near-unique column, a value-domain probe for a
+low-cardinality one, and a composite-key probe. Which of them run depends on
+the aggregate scan's own approximate results, so none can be dry-run before it,
+and the estimate holds one 10 MB floor apiece instead. A reserve is dropped only
+where an object's metadata already rules the query out: a view (no row count, so
+no probe can run), a table of nested or repeated columns only (no approximate
+distinct, which every probe starts from), a table too small for a value domain,
+or one with too few countable columns to form a composite pair.
+
+The reserve scales with object count rather than data size, so on a warehouse of
+many small tables it can be most of the number. Both the `needs_confirmation`
+payload and the over-ceiling refusal split it out, in prose and in
+`reserved_bytes` / `reserved_queries`, so a raised budget is a decision rather
+than a guess:
+
+```
+220,200,960 bytes of this estimate is escalation reserve: 21 queries at
+BigQuery's 10,485,760-byte per-query minimum, held for probes a profile may add
+after its aggregate scan and may never issue. The remaining 533,991,980 bytes
+is dry-run scan
+```
+
+A mid-command verify checkpoint prices overlap probes, which carry no reserve,
+so it reports none rather than repeating the profile's.
+
 ## Profiling behavior
 
 - Aggregates only (`COUNT`, `APPROX_COUNT_DISTINCT`, `MIN`/`MAX` on safe
@@ -84,9 +113,11 @@ hits bill zero and are recorded as such.
 - With `bigquery.max_full_profile_bytes` set, larger tables are profiled from
   a `TABLESAMPLE SYSTEM` block sample, flagged as approximate, and uniqueness
   is not judged.
-- Exact distinct-count escalation (the uniqueness proof) spends only within
-  the already-confirmed budget and degrades to approximate verdicts when the
-  remaining budget cannot cover it.
+- Exact distinct-count escalation (the uniqueness proof), the composite-key
+  probe, and the value-domain probe each spend only within the
+  already-confirmed budget, and degrade (to an approximate verdict, no
+  composite key, or no reported domain) plus a table note when the remaining
+  budget cannot cover them.
 
 ## Read-only, in depth
 

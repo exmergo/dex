@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
+from math import ceil
 from typing import Protocol, runtime_checkable
 
 from ..envelope import Paradigm
@@ -139,6 +140,24 @@ class ValueDomainSample:
 
     values: list[tuple[object, int]]
     total_distinct: int
+
+
+# A column's value domain is reported only when its distinct count clears BOTH
+# bars: small absolutely (the cap) and small relative to the table (the
+# fraction), so a tiny table's near-key column does not qualify on the absolute
+# count alone. Deliberately conservative: this codebase's general posture is to
+# under-report rather than over-report, and a false negative here just costs one
+# more `explore query`.
+#
+# They live beside the sample type rather than in `explore.profile` because a
+# metered adapter has to reserve for the probe *before* profiling runs, and the
+# two sides would drift apart the moment one of them moved. VALUE_DOMAIN_MIN_ROWS
+# is what the fraction implies rather than a threshold of its own: a domain needs
+# at least one distinct value, so a table below it can never clear the fraction
+# and never produces a probe worth reserving for.
+VALUE_DOMAIN_CAP = 25
+VALUE_DOMAIN_MAX_FRACTION = 0.10
+VALUE_DOMAIN_MIN_ROWS = ceil(1 / VALUE_DOMAIN_MAX_FRACTION)
 
 
 @dataclass(frozen=True)

@@ -1839,6 +1839,32 @@ def test_value_domain_excluded_when_fraction_exceeds_cutoff_on_small_table():
     assert datasets[0].columns[0].value_domain is None
 
 
+def test_no_column_can_have_a_value_domain_below_the_minimum_row_count():
+    """The fraction implies a floor on rows, and a metered adapter reserves
+    budget against that floor rather than against the fraction it cannot
+    evaluate before the scan (issue #299). This pins the two together: below
+    VALUE_DOMAIN_MIN_ROWS not even the narrowest possible column qualifies, so
+    an estimator that skips the reserve there skips a query that cannot run."""
+
+    from exmergo_dex_core.adapters.base import (
+        VALUE_DOMAIN_MIN_ROWS,
+        ValueDomainSample,
+    )
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    below = _StubAdapter(rows=VALUE_DOMAIN_MIN_ROWS - 1, approx={"code": 1})
+    profile_mod.profile(below, ["db.s.t"])
+    assert below.domain_calls == []
+
+    at_bar = _StubAdapter(
+        rows=VALUE_DOMAIN_MIN_ROWS,
+        approx={"code": 1},
+        domains={"code": ValueDomainSample(values=[("x", 10)], total_distinct=1)},
+    )
+    profile_mod.profile(at_bar, ["db.s.t"])
+    assert at_bar.domain_calls == [["code"]]
+
+
 def test_value_domain_excluded_for_composite_key_member():
     """`line_no` is well within the cap and fraction on its own, but it is a
     proven composite-key member, so it must report no domain even though the

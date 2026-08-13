@@ -64,12 +64,14 @@ from ..maintain import snapshot
 if TYPE_CHECKING:
     from ..dbt_project import DbtProjectView, ProjectDefinitions
     from ..maintain.snapshot import SemanticLayer, TransformLayer
+    from ..transform.plans import EditKind
 
 __all__ = [
     "DbtProject",
     "EditableProject",
     "ExploreProject",
     "MaintainProject",
+    "PlacingProject",
     "ProjectAdapter",
     "ProjectContext",
     "ProjectFactory",
@@ -193,6 +195,103 @@ class EditableProject(MaintainProject, Protocol):
         made while the plan sat in review.
         :class:`~.conformance.EditableProjectContract` asserts the behavior,
         because no shape check can.
+
+        **What comes back has to say what happened.** ``transform apply`` reads
+        ``written`` to decide whether the plan is now applied, and ``conflicts``
+        to decide whether to show a human the divergence and ask. A return that
+        answers neither leaves the caller unable to tell a refused apply from a
+        successful one, and the safe reading of that ambiguity is the wrong one
+        in both directions: a plan marked applied that was not, or a conflict
+        that never reaches the human it was raised for. Return an object exposing
+        ``written`` (the paths that changed, empty when a conflict refused the
+        apply) and ``conflicts`` (what moved under the plan);
+        :class:`~.dbt_project.ApplyResult` is the shipped one and returning it is
+        the easy answer.
+        """
+        ...
+
+
+@runtime_checkable
+class PlacingProject(Protocol):
+    """Optional beside tier 3: where a proposed edit lands.
+
+    Tier 3 says a format *can* receive an edit. It does not say where the edit
+    goes, and ``maintain reconcile`` decides that before it consults the format:
+    both of its mechanical write paths build ``models/staging/stg_<table>.sql``
+    and ``models/staging/stg_<table>.yml`` and then look those up in the view
+    ``load()`` returned. A second format satisfying tier 3 in full is therefore
+    handed edits naming files it does not have, and its only options are to
+    refuse them or to guess a mapping. A wrong guess writes into the wrong file
+    with a hash check that passes, because the file was not there.
+
+    Implementing this says where. It is deliberately not a request to let a
+    format author the edit *content*: reconcile still decides what to write, and
+    a format that cannot accept what reconcile writes says so per kind, below.
+
+    **A protocol rather than a flag, for the reason the tiers are.** A flag is a
+    claim the engine has to interpret and trust. ``isinstance(project,
+    PlacingProject)`` is checkable, and a format that cannot place an edit
+    cannot accidentally claim it can.
+
+    **Separate from** :class:`EditableProject` **rather than a method on it.**
+    The tiers are ``runtime_checkable``, so a method added to tier 3 silently
+    demotes every format that has not implemented it yet: ``tier_of`` would
+    start answering 2 where it answered 3, and the write path would close for
+    exactly the implementers who were already passing. Beside it, the answer for
+    a format that has not implemented this is "tier 3, placement unknown", which
+    is the truth and is what the caller warns about.
+    """
+
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        """Where an edit of ``kind`` for ``model`` lives, or ``None``.
+
+        ``model`` is the warehouse table the finding is about, not a model name
+        in any format's vocabulary: the ``stg_`` prefix is dbt's own scaffold
+        convention and applying it here would push that convention through the
+        seam meant to escape it.
+
+        The return is a key into whatever :meth:`EditableProject.load` returns,
+        not a filesystem path. The format already owns that keyspace; reconcile
+        is only guessing keys into it today.
+
+        **``None`` per kind is the point, not a degenerate case.** The kinds are
+        not equally receivable and a format is expected to answer differently
+        across them. The shape this exists for is a format whose models are
+        reduced from a running graph, and so cannot receive an authored
+        ``MODEL_SQL``, while its declared keys and joins are hand-written files
+        that nothing regenerates and can receive a ``SCHEMA_YML`` test. One
+        ``None`` and one path is a complete, honest answer.
+        """
+        ...
+
+    def editing_surface(self) -> list[str]:
+        """The prefixes within which this format's edits may land.
+
+        Placement says where one edit goes. This says which region of the
+        format's keyspace *any* edit may touch, and it exists because the two
+        questions have different callers. ``transform plan`` validates edits an
+        agent authored, so there is no ``(kind, model)`` pair to ask
+        :meth:`edit_path` about and no prior answer to compare against; what it
+        has is a path, and what it needs is whether that path is inside the
+        surface the format admits to owning.
+
+        Containment is a safety property, not a lookup. Writes are confined to a
+        declared surface so a mistaken or adversarial path cannot reach the rest
+        of the repository, and the declaration has to come from the format
+        because only the format knows its own layout. dbt answers with its
+        configured model and macro paths, which is what the engine checked
+        against directly before this seam existed.
+
+        Prefixes are keys into the same space :meth:`edit_path` returns, matched
+        by path segment: ``declarations`` admits ``declarations/orders.yml`` and
+        does not admit ``declarations_backup/orders.yml``. Escapes (absolute
+        paths, ``..``) are refused ahead of this and are not a format's to
+        permit.
+
+        An empty list is a format declaring no editable surface. That is a
+        coherent answer, not a failure, and it refuses every edit rather than
+        admitting all of them: the format is saying it has nowhere for an edit to
+        go, which is the same statement declining tier 3 makes.
         """
         ...
 
@@ -430,3 +529,33 @@ class DbtProject:
             project_dir or self.project_dir or self.repo_root,
             confirmed=confirmed,
         )
+
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        """The scaffold convention, which is what reconcile hard-coded before.
+
+        Both kinds resolve, because for dbt both artifacts are the source of
+        truth. A kind reconcile does not propose today returns ``None`` rather
+        than a path this class would be inventing.
+        """
+
+        from ..transform.plans import EditKind as _EditKind
+
+        suffix = {_EditKind.MODEL_SQL: "sql", _EditKind.SCHEMA_YML: "yml"}.get(kind)
+        return None if suffix is None else f"models/staging/stg_{model}.{suffix}"
+
+    def editing_surface(self) -> list[str]:
+        """The project's configured model and macro paths, read from the view.
+
+        Read rather than assumed: a project that configures ``model-paths`` away
+        from ``models`` moves its editing surface with it, and the containment
+        check has always honored that. This returns what the engine computed for
+        itself before the seam existed, so routing dbt through the seam changes
+        nothing about which paths dbt admits.
+
+        The root manifests ``contained_path`` allows by name are not listed here.
+        They are a dbt fact about dbt's own project root rather than a region of
+        the surface, and the check keeps applying them on the dbt path.
+        """
+
+        view = self.load()
+        return list(view.model_paths) + list(view.macro_paths)

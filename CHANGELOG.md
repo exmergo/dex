@@ -42,6 +42,205 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   Implemented across every connector (DuckDB, BigQuery, Snowflake,
   Databricks, Redshift, Postgres); gated on no PII flag at all, at any
   confidence, the same rule #204's declared-type checks already use.
+## [1.6.4] - 2026-08-13
+
+### Added
+
+- **A verified join with a catastrophic orphan rate is now a finding, not
+  only a demoted confidence** ([#207]). `explore relationships --verify`
+  already measured an overlap probe per inferred join and stored the
+  result as `orphan_fraction`, but when two "matching" columns shared zero
+  actual values the only consequence was a lower confidence number buried
+  in a list of edges: nothing in `notes`, `warnings`, or a dataset's
+  `data_quality` said "these two columns are named alike and are not the
+  same key." That is the exact failure a reader skimming several edges
+  misses, and the cost is specific: a model joins on the same-named
+  column, every parent-side attribute comes back `NULL`, and it looks like
+  it worked.
+
+  A verified inferred join at or above a 90% orphan rate now produces a
+  finding naming both sides and the measured fraction, in `notes` (so a
+  caller reading only the summary still sees it) and mirrored onto the
+  child dataset's `data_quality` (so it survives into the cache for
+  anything reading profiles later, not only this one command's output).
+  90% sits well above the confidence-demotion tier (which already starts
+  at 20%), so this fires only for the catastrophic case, not every
+  weakened guess; a join that was never verified reports nothing, since
+  nothing was measured. No change to inference or to the confidence
+  arithmetic itself, purely surfacing what was already computed.
+- **A project format can say where its edits land, and which paths it owns**
+  ([#257], [#258]). `maintain reconcile` read the project seam's write tier and
+  then narrowed again on `isinstance(editable, DbtProject)`, so a format that
+  implemented tier 3 in full and passed the shipped conformance suite got exactly
+  what a format declining the tier got. Underneath that, the paths reconcile
+  proposed were literals (`models/staging/stg_<table>.sql` and its `.yml`) built
+  before the format was consulted, so a second format was handed edits naming
+  files it does not have. The two are one seam: those paths are keys into the
+  view the format's own `load()` returned, so a format that answers where an edit
+  goes supplies both halves.
+
+  `PlacingProject` is that seam, beside `EditableProject` rather than on it: the
+  tiers are `runtime_checkable`, so a method added to tier 3 would demote every
+  format that has not implemented it yet, closing the write path for exactly the
+  implementers who were already passing. `edit_path(kind, model)` answers where
+  an edit of a kind lands and may answer `None` to decline that kind, which is
+  the honest answer for a format whose models are reduced from a running graph
+  (no authored staging model) but whose declared keys are hand-written files
+  (a `unique` test lands fine). `editing_surface()` declares the region those
+  paths must stay inside. The write gate now asks for the capability instead of
+  the class.
+
+  dbt reaches identical behaviour by the new route: `edit_path` returns the
+  scaffold convention reconcile hard-coded, and `editing_surface` returns the
+  project's configured model and macro paths, which is what containment checked
+  directly before.
+
+- **`transform plan` warns when a model's authored columns diverge from its
+  declared schema.yml contract** ([#214]). A model's schema.yml entry is the
+  closest thing a dbt project has to a column contract, and plan time is the
+  cheapest moment to check it, but nothing did: a model authored with a
+  different column set than its declaration passed silently. `transform plan`
+  now compares the authored SELECT list against the declared columns for
+  every model actually being planned, and warns in both directions: a
+  declared column the SELECT does not produce, and a produced column the
+  declaration does not name.
+
+  The check never refuses. The declaration is often the side that is stale,
+  and the caller is often deliberately changing the model, so a warning in
+  the same envelope as the diff is what matters, not a block. A model with no
+  declared columns produces no warning, since there is no contract to check
+  against. Where the SELECT list cannot be resolved statically (a bare
+  `select *`, a qualified `t.*`, or a macro standing in for a whole column
+  with no alias), the warning says so instead of guessing; an aliased macro
+  call is still resolved by its own alias. Declared columns are read with
+  this same plan's own schema.yml edits overlaid on the project, so a model
+  and its documentation edited together in one plan are compared against
+  each other, not against a stale on-disk file.
+
+### Changed
+
+- **Containment validates an edit against the surface its own format declared**
+  ([#257], [#258]). `transform plan` validated every edit path against dbt's
+  `model_paths` whatever format produced it, so a second format placing a
+  declaration sidecar was refused at plan time even with the two gates above
+  resolved. Containment stays a safety property and stays mandatory; what moved
+  is who declares the surface. A format that declares none is unaffected and
+  validates against dbt's as before, and dbt's own path is unchanged, including
+  the root manifests allowed by name and the checks that a macro and a model each
+  live where dbt will find them. Escapes (absolute paths, `..`) are refused ahead
+  of the surface and are not a format's to permit.
+
+  The file an edit is pinned against now comes from the same view as the surface
+  it is checked in. Those two disagreeing is not a refusal but a quiet defect:
+  an existing file hashes as absent, the reviewable diff renders a one-line
+  change as a whole-file create, and the apply that follows reports a conflict on
+  a file nobody edited.
+
+  That holds for agent-authored edits too, which is the whole write surface
+  outside reconcile: `transform plan`, `transform macro`, and every
+  `semantic define|update|plan` share one call, and it asked the engine for dbt's
+  directory unconditionally. A format declaring a surface now supplies the
+  directory from its own view, so a repository with no `dbt_project.yml` can
+  reach those commands at all, and one with a dbt project elsewhere in the tree
+  no longer pins an edit against a file the apply will not write. dbt is on the
+  same path either way: its view loads the directory the engine would have named.
+
+- **A plan is applied through the format it was planned against** ([#257]).
+  `transform apply` wrote every plan with dbt's writer, which resolves each edit
+  under the dbt project and re-hashes what it finds on disk, so a plan a second
+  format could now store would still have been refused one stage later and the
+  `write_edits` that format implemented to reach tier 3 would never have been
+  called. Plans planned against dbt are written by dbt exactly as before.
+
+  `EditableProject.write_edits` now documents that its return has to report
+  `written` and `conflicts`, and `EditableProjectContract` asserts it. The apply
+  path reads both to tell a refusal from a write, and a result answering neither
+  fails in both directions at once: a plan recorded as applied that wrote
+  nothing, or a conflict that never reaches the person it was raised for. This is
+  a widening of the tier-3 contract, and a format returning
+  `dbt_project.ApplyResult` (or anything exposing those two) already satisfies
+  it.
+
+- **Reconcile matches the model a format declares, not dbt's spelling of it**
+  ([#258]). The `stg_` convention leaked through file contents as well as
+  through paths: the `unique` test edit looked for a model named `stg_<table>`
+  inside the YAML, so a format that placed its sidecar correctly and named its
+  model `orders` was missed one line before the edit was built, silently. The
+  model is now read from the file the format chose, which is the same string for
+  dbt, whose scaffold path is `models/staging/stg_<table>.yml`. A file declaring
+  no matching column entry now says so in `warnings` instead of skipping in
+  silence, which was indistinguishable from dex deciding the test was already
+  there.
+
+### Fixed
+
+- **The PII firewall decides again without a warehouse connection.** Since 1.6.3,
+  `explore query` opened a connection before the guard ran: the object-gap probe
+  added with the auto-profiling work took an already-open adapter, and the
+  acquisition ahead of it was unguarded. Every query naming a relation therefore
+  needed a reachable warehouse before the firewall could refuse anything, so a
+  caller holding a profiled cache and no connector got a connector error where
+  1.6.2 returned a refusal. That reaches further than an inconvenience: the guard
+  reads cached PII flags and needs no warehouse to decide, so gating it on a
+  connection turns a policy decision into a connectivity one and closes the
+  firewall in exactly the offline environments that cannot bill for a mistake.
+
+  The acquisition is now as tolerant as the use one level below it, where an
+  unreadable column signature already "settles nothing" and falls through. A
+  failed open settles nothing either. Drift detection is unchanged wherever a
+  connection exists, and nothing is swallowed: a statement that passes the guard
+  reaches the same opener afterwards and raises there, which is where a caller
+  about to run SQL wants to hear it.
+
+- **`explore cluster` refuses from the cache again without a connection.** The
+  same probe was added to `cluster` in the same change, in front of the two
+  things that command decides from the cache alone: that there is no cache at
+  all, and that the named object is not in it. Both refusals sat below the
+  acquisition, so both became connector errors. `auto_profile` defaults to
+  `true`, which made this the ordinary path rather than an opt-in one, and
+  `--no-auto-profile` the only remaining way to reach either refusal offline.
+  The same fall-through applies, with the same limit: an object that *is*
+  profiled still needs a connection to build its sample, so it reaches the
+  opener at the bottom of `cluster` and raises there.
+
+### Fixed
+
+- **A BigQuery profile estimate reserves for an escalation query only where the
+  probe could actually issue one, and says how much of itself is reserve**
+  ([#299]). Since 1.6.0 the estimate held three per-table 10 MB floors rather
+  than two: the value-domain probe added in that release
+  ([#203]) took a reserve beside the near-unique and composite ones. The reserve
+  scales with object count rather than data size, so on a warehouse of many
+  small tables the release moved a 12-object `explore map` estimate by 125.8 MB
+  in one step and started refusing a nightly refresh that had run for months.
+
+  Three of the reserves were provably unspendable rather than merely unlikely,
+  and are now dropped. A view has no row count (BigQuery reports none, and the
+  profiling aggregate's own `COUNT(*)` is read per batch and never written back
+  to the object), and all three probes return early without one, so a view held
+  three floors no run could ever spend. Nested and repeated columns get no
+  approximate distinct in the aggregate batch, and every probe's eligibility
+  starts from one, so a table of nothing else can no more escalate than a blob
+  column already excluded from the scan; the composite reserve was already
+  conditioned on having two columns, but counted columns that can never join a
+  pair. And a value domain needs at least one distinct value within a tenth of
+  the non-null rows, so no column of a table below ten rows can qualify. The
+  thresholds that imply that floor moved next to `ValueDomainSample` so the
+  estimator and the probe cannot drift apart. Nothing else was narrowed: the
+  reserve is dropped only where a probe's own guard already rules the query out,
+  because an estimate that reserves for a query that cannot run is merely loose,
+  while one that skips a query that can is the defect [#107] closed.
+
+  That leaves the common case, a warehouse of small flat tables, reserving
+  exactly as much as before, which is the second half of this. The confirm
+  handshake and the over-ceiling refusal now split the estimate into measured
+  dry-run scan and held reserve, in prose and in `reserved_bytes` /
+  `reserved_queries`. A refusal previously said only "raise the budget or narrow
+  the work" about a number that could be three quarters reserve, leaving the
+  operator to reconstruct the split from `.dex/spend.jsonl` afterwards to find
+  out whether the estimate grew because the warehouse did or because dex added a
+  probe. Over-ceiling refusals reach the connector's own description of the
+  estimate for the first time; before this only the confirmation payload did.
 
 ## [1.6.3] - 2026-08-10
 

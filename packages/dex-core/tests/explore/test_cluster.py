@@ -20,6 +20,8 @@ from exmergo_dex_core.explore import cluster as cluster_mod
 from exmergo_dex_core.explore import commands
 from exmergo_dex_core.guards.sql_guard import assert_select_only
 
+from .conftest import unreachable_warehouse
+
 _HAS_SKLEARN = importlib.util.find_spec("sklearn") is not None
 requires_sklearn = pytest.mark.skipif(
     not _HAS_SKLEARN, reason="needs the [cluster] extra (scikit-learn)"
@@ -182,6 +184,67 @@ def test_cluster_without_cache_is_refused_with_the_fix(
     assert not (repo / ".dex").exists(), "a refused gate writes nothing"
     # A machine-readable reason alongside the prose.
     assert payload["reason"] == "prerequisite"
+
+
+@requires_sklearn
+def test_a_cluster_prerequisite_refusal_needs_no_connection(
+    clusterable_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The second site of the same #269 hoist, and the reason this file changed
+    alongside `test_query.py`.
+
+    `cluster` decides from the cache twice -- "no cache at all" and "that object
+    is not in it" -- and both refusals moved *behind* `engine._adapter` when the
+    object-gap probe was added. `auto_profile` defaults to True, so this is the
+    ordinary path rather than an opt-in one, and the refusal a caller holding
+    only a cache used to get became a connectivity error instead.
+
+    Measured, not read: at 1.6.2 this returned `reason: prerequisite`; at 1.6.3
+    the same invocation returns a connector failure.
+    """
+
+    repo = _mapped_repo(clusterable_duckdb, tmp_path, capsys)
+    unreachable_warehouse(monkeypatch)
+
+    rc = main(
+        [
+            "explore",
+            "cluster",
+            "not_a_table",
+            "--path",
+            str(clusterable_duckdb),
+            "--repo-root",
+            str(repo),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1 and payload["status"] == "error", payload
+    message = payload["errors"][0]
+    assert "not a profiled object" in message, (
+        "the cache-decided refusal did not survive an unreachable warehouse; it "
+        f"is being gated on a connection it does not need. Got: {message!r}"
+    )
+    assert payload["reason"] == "prerequisite", payload["reason"]
+
+
+@requires_sklearn
+def test_a_cluster_that_passes_the_cache_gate_still_reports_an_unreachable_warehouse(
+    clusterable_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The control for the test above, and the reason it is not a swallowed error.
+
+    Tolerating a failed open is worth nothing if it hides the failure from a
+    caller about to scan. It does not: only a refusal returns without a
+    connection, and a profiled object still needs one to build its sample, so it
+    reaches the opener at the bottom of `cluster` and raises there.
+    """
+
+    repo = _mapped_repo(clusterable_duckdb, tmp_path, capsys)
+    unreachable_warehouse(monkeypatch)
+
+    payload = _cluster(clusterable_duckdb, repo, capsys=capsys, expect_error=True)
+    assert "connector extra is not installed" in payload["errors"][0]
 
 
 @requires_sklearn

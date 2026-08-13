@@ -40,6 +40,15 @@ implementation is complete rather than partial.
 `isinstance` rather than declared, so a format cannot claim a tier it has not
 implemented.
 
+One protocol sits beside the tiers rather than in them, `PlacingProject`, and
+reaching `reconcile`'s write path means implementing it as well as tier 3. It is
+described under [Where an edit lands](#where-an-edit-lands-and-what-you-own)
+below. It is beside rather than on tier 3 because these protocols are
+`runtime_checkable`: a method added to tier 3 would demote every format that has
+not implemented it yet, so `tier_of` would start answering 2 where it answered 3
+and the write path would close for exactly the implementers who were already
+passing.
+
 **Tier 1 is where the value is concentrated, and it is easy to underestimate.**
 Declared keys and declared joins reach dex through `definitions()` and through no
 other channel: not through the layers, not through a content hash. A format that
@@ -70,13 +79,13 @@ proposal, with no edits and no stored plan, and a warning naming the format and 
 tier it declined. The findings themselves are still surfaced: declining the write
 tier removes dex's authority to author an edit, not your need to see the drift.
 
-That used to hold by accident. Reconcile's two mechanical write paths gate on the
-`models/staging/stg_<table>.*` scaffold convention and fail closed, so a generated
+That used to hold by accident. Reconcile's two mechanical write paths gated on the
+`models/staging/stg_<table>.*` scaffold convention and failed closed, so a generated
 tree was safe as long as its own directory naming happened not to collide, and a
-format whose layers used that vocabulary would have been written into. The
-convention checks are still there as a second line; what changed is that the tier is
-asked first, so the guarantee rests on what your format declared rather than on what
-it happened to be called.
+format whose layers used that vocabulary would have been written into. The guarantee
+now rests on what your format declared rather than on what it happened to be called:
+the tier is asked first, and the paths themselves come from the format rather than
+from that convention.
 
 **If you do implement tier 3, two parameters carry the whole safety story.**
 
@@ -99,6 +108,66 @@ With `confirmed=True` that someone has looked and said to go ahead. A write path
 cannot receive `confirmed` silently overwrites the work, which is the failure this
 seam exists to prevent, so `EditableProjectContract` asserts the behavior rather than
 trusting it: no check on the shape of your class can see it.
+
+**What you return has to say what happened.** `transform apply` reads `written` to
+decide whether the plan is now applied and `conflicts` to decide whether to show a
+human the divergence and ask. A result answering neither fails in both directions at
+once: a plan recorded as applied that wrote nothing, or a conflict that never reaches
+the person it was raised for. Return `dbt_project.ApplyResult`, or anything exposing
+those two.
+
+## Where an edit lands, and what you own
+
+Tier 3 says your format *can* receive an edit. It does not say where the edit goes,
+and reconcile decides that before it consults you. `PlacingProject` is where you
+answer, and reaching the write path means implementing both of its methods.
+
+```python
+from exmergo_dex_core.transform.plans import EditKind
+
+
+class MyProject:  # ... tier 3 methods as above
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        if kind is EditKind.SCHEMA_YML:
+            return f"declarations/{model}.yml"
+        return None  # no authored staging model in this format
+
+    def editing_surface(self) -> list[str]:
+        return ["declarations"]
+```
+
+`edit_path(kind, model)` says where an edit of that kind for that table lives. Two
+things about it are easy to get wrong. `model` is the warehouse table the finding is
+about, not a model name in your vocabulary: the `stg_` prefix is dbt's own scaffold
+convention and dex does not apply it here. And the return is a key into whatever your
+`load()` returns rather than a filesystem path, because your format already owns that
+keyspace.
+
+**Answering `None` for a kind is a complete answer, not a degenerate one.** The kinds
+are not equally receivable and you are expected to differ across them. `SCHEMA_YML`
+is a mutation of a file you already have. `MODEL_SQL` carries dbt SQL that dex
+generates alongside the path, so placement alone cannot open that channel: a format
+that places a staging model elsewhere gets the proposal as advice rather than having
+dbt written into its tree. One `None` and one path is the shape this exists for.
+
+`editing_surface()` declares the region those paths must stay inside, and it is a
+different question with a different caller. `transform plan` validates edits an agent
+authored, where there is no `(kind, model)` pair to ask `edit_path` about and no
+prior answer to compare against, only a path and the question of whether it is inside
+what you admit to owning. Prefixes are matched by path segment, so `declarations`
+admits `declarations/orders.yml` and does not admit `declarations_backup/orders.yml`.
+Absolute paths and paths climbing out through `..` are refused ahead of this and are
+not yours to permit. An empty list is coherent: it refuses every edit rather than
+admitting all of them, which is the same statement declining tier 3 makes.
+
+This is containment, which is a safety property and stays mandatory. What the seam
+moved is who declares the surface, not whether there is one.
+
+**One thing dex still spells its own way.** The `unique` test edit finds your model
+inside the placed file by the file's own name (`declarations/orders.yml` means a
+model named `orders`). If you pack several models into one file, no entry matches and
+you get a warning instead of an edit, which is a refusal to guess rather than a wrong
+write.
 
 ## The one rule that is not visible in the signatures
 
@@ -195,7 +264,8 @@ class TestMyProject(ExploreProjectContract):
 pytest collects the inherited assertions and runs the contract against your format.
 Use `MaintainProjectContract` instead if you reach tier 2, `EditableProjectContract`
 if you reach tier 3, mix `DeclaringProjectContract` and `SemanticProjectContract`
-beside it for the content your format declares, and mix
+beside it for the content your format declares, mix `PlacingProjectContract` beside
+it if you implement placement, and mix
 `ProjectFactoryContract` in front of it if dex will build your format from a name
 rather than be handed an instance. Construction is a separate contract, so a format
 that passes the behavioral suite can still be unreachable from configuration; "the
@@ -276,6 +346,18 @@ rather than skipping because the excuse that justifies skipping
 unparseable state, but a format that reached tier 3 writes into a source of truth a
 human can also edit, so the case where the human got there first exists for all of
 them.
+
+`PlacingProjectContract`, mixed in beside it, has one hook that is likewise not
+optional. `placeable_model()` returns a warehouse table your format would place an
+edit for, spelled as the warehouse spells it rather than as your format names the
+model derived from it, because that is how reconcile's findings arrive and it is the
+thing `edit_path` is most often gotten wrong on. The assertions are cheap and mostly
+about your two answers agreeing: at least one kind places somewhere, every path
+`edit_path` returns is inside `editing_surface()`, and the surface itself stays
+within the project. The middle one is the reason the contract exists, since a
+placement outside your own declared surface builds a proposal the plan store then
+refuses, and from the outside that reads as dex declining rather than as the format
+contradicting itself.
 
 The suite needs only pytest: no dialect engine, no connector. A packaging test keeps
 it that way.
