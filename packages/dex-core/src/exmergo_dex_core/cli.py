@@ -44,7 +44,7 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "cluster",
         "semantic",
     ],
-    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro"],
+    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro", "test"],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
@@ -294,6 +294,11 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                if group == "transform" and name == "test":
+                    # `test` is scaffold-only for now: the model to derive a
+                    # unit_tests: skeleton from. No bare `transform test`
+                    # mode exists yet, unlike `macro`'s list-when-bare shape.
+                    sp.add_argument("--scaffold", default=None)
                 if group == "semantic":
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
@@ -419,6 +424,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "deps"): "cmd_deps",
         ("transform", "plans"): "cmd_plans",
         ("transform", "macro"): "cmd_macro",
+        ("transform", "test"): "cmd_test",
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
