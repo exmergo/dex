@@ -15,6 +15,8 @@ from exmergo_dex_core.config import DexConfig, QueryLimits, save_config
 from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.storage.filesystem import QUERIES_FILE
 
+from .conftest import unreachable_warehouse
+
 
 def _run(argv: list[str], capsys, *, expect_error: bool = False) -> dict:
     rc = main(argv)
@@ -384,6 +386,62 @@ def test_pii_carrying_query_is_refused_and_logged(
     entries = _log_entries(repo)
     assert entries[-1]["decision"] == "refused"
     assert "NAME" in entries[-1]["reason"]
+
+
+def test_a_pii_refusal_needs_no_connection(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The firewall decides from cached flags, so it must decide with the
+    warehouse unreachable.
+
+    Regression: the object-gap probe added in #269 opened a connection before
+    this guard ran, which turned a policy refusal into a connectivity error and
+    closed the firewall wherever no connector is installed -- CI, an offline
+    box, any caller holding only a cache. `_object_gap` already treats an
+    unreadable column signature as settling nothing; an absent connection is the
+    same kind of doubt and now falls through the same way.
+    """
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    unreachable_warehouse(monkeypatch)
+
+    payload = _query(
+        "SELECT MIN(NAME) FROM RAW_HOSTS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+
+    message = payload["errors"][0]
+    assert "query refused" in message, (
+        "the PII refusal did not survive an unreachable warehouse; the guard is "
+        f"being gated on a connection it does not need. Got: {message!r}"
+    )
+    assert "RAW_HOSTS.NAME" in message and "(name)" in message
+    assert _log_entries(repo)[-1]["decision"] == "refused"
+
+
+def test_a_query_that_passes_the_guard_still_reports_an_unreachable_warehouse(
+    airbnb_duckdb: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The control for the test above, and the reason it is not a swallowed error.
+
+    Tolerating a failed open would be worth nothing if it hid the failure from a
+    caller about to run SQL. It does not: only a refusal returns without a
+    connection, and anything still live reaches the opener again and raises there.
+    """
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    unreachable_warehouse(monkeypatch)
+
+    payload = _query(
+        "SELECT COUNT(*) FROM RAW_HOSTS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+        expect_error=True,
+    )
+
+    assert "connector extra is not installed" in payload["errors"][0]
 
 
 def test_write_and_pragma_are_refused(airbnb_duckdb: Path, tmp_path: Path, capsys):

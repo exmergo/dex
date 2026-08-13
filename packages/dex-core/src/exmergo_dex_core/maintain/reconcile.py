@@ -19,9 +19,12 @@ writes to the project and human edits stay authoritative at apply time.
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 import yaml
 from pydantic import BaseModel, Field
 
+from ..adapters.project import PlacingProject
 from ..cache import ColumnProfile, Dataset, DexCache
 from ..config import PIIOverrideMatcher
 from ..dbt_project import DbtProjectView
@@ -53,6 +56,25 @@ class Proposal(BaseModel):
 _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_changed"}
 
 
+def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
+    """Where an edit of ``kind`` for ``table`` goes, asking the format first.
+
+    ``None`` placement is the dbt scaffold convention, which keeps every caller
+    that predates the seam on the paths it already had. A format that answers
+    ``None`` for a kind is declining that kind, and the caller turns it into the
+    same advisory a missing scaffold file produces.
+    """
+
+    if placement is None:
+        # The same two kinds `DbtProject.edit_path` resolves, declined the same
+        # way for the rest: this branch is that method's convention inlined for
+        # callers holding no format, so answering a path where it answers `None`
+        # would make the shim and the format disagree about the same input.
+        suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
+        return None if suffix is None else f"models/staging/stg_{table}.{suffix}"
+    return placement.edit_path(kind, table)
+
+
 def build(
     findings: list[DriftFinding],
     snap: Snapshot,
@@ -60,6 +82,7 @@ def build(
     view: DbtProjectView | None,
     *,
     pii_overrides: PIIOverrideMatcher | None = None,
+    placement: PlacingProject | None = None,
 ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
     """Map findings to proposals and plan edits. Pure: writes nothing.
 
@@ -71,7 +94,11 @@ def build(
 
     ``pii_overrides`` carries the config's reviewed non-PII column paths, so a
     drift-added column a human already cleared is not re-flagged into the
-    scaffolded meta."""
+    scaffolded meta.
+
+    ``placement`` is the format answering where each edit lands. ``None`` keeps
+    the dbt scaffold convention this module hard-coded before the seam existed,
+    so a caller that does not pass one is unaffected."""
 
     proposals: list[Proposal] = []
     edits: list[PlanEdit] = []
@@ -90,13 +117,20 @@ def build(
     for identifier, table_findings in sorted(schema_patches.items()):
         table = identifier.rsplit(".", 1)[-1]
         base = _base_dataset(identifier, cache, snap)
-        model_path = f"models/staging/stg_{table}.sql"
-        if view is None or base is None or model_path not in view.files:
+        model_path = _placed(placement, EditKind.MODEL_SQL, table)
+        if (
+            view is None
+            or base is None
+            or model_path is None
+            or (model_path not in view.files)
+        ):
             reason = (
                 "this project format cannot receive edits"
                 if view is None
                 else "no profiled baseline to rebuild from"
                 if base is None
+                else "this project format has nowhere for a staging model to land"
+                if model_path is None
                 else f"no dex-scaffolded staging model at {model_path}"
             )
             proposals.extend(
@@ -116,6 +150,32 @@ def build(
             continue
         patched = _patched_dataset(base, table_findings, pii_overrides or set())
         table_edits = model_edits(patched)
+        # The scaffold generates both the path and the dbt SQL inside it, so a
+        # format that places a staging model somewhere else would receive dbt
+        # content written to a path the generator did not agree to. Placement
+        # alone cannot close this channel; authoring the content is the larger
+        # design the seam deliberately does not attempt. Refuse rather than
+        # write the mismatch, and say which of the two is missing.
+        misplaced = any(
+            edit.path != _placed(placement, edit.kind, table) for edit in table_edits
+        )
+        if misplaced:
+            proposals.extend(
+                Proposal(
+                    axis="schema",
+                    kind="advisory",
+                    finding_code=finding.code,
+                    identifier=identifier,
+                    column=finding.column,
+                    action=(
+                        "this project format places a staging model somewhere "
+                        "dex cannot author one for it; re-scaffold "
+                        f"stg_{table} wherever that model is defined"
+                    ),
+                )
+                for finding in table_findings
+            )
+            continue
         edits.extend(table_edits)
         changes = ", ".join(
             f"{f.code.replace('_', ' ')} ({f.column})" for f in table_findings
@@ -135,7 +195,7 @@ def build(
             )
         )
 
-    grain_edits, grain_warnings = _grain_test_edits(proposals, view)
+    grain_edits, grain_warnings = _grain_test_edits(proposals, view, placement)
     edits.extend(grain_edits)
     warnings.extend(grain_warnings)
 
@@ -276,7 +336,9 @@ def _patched_dataset(
 
 
 def _grain_test_edits(
-    proposals: list[Proposal], view: DbtProjectView | None
+    proposals: list[Proposal],
+    view: DbtProjectView | None,
+    placement: PlacingProject | None = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Back key_lost_uniqueness proposals with a `unique` test edit when the
     scaffolded YAML exists and does not already alert. The duplicates
@@ -296,7 +358,14 @@ def _grain_test_edits(
         if proposal.finding_code != "key_lost_uniqueness" or proposal.column is None:
             continue
         table = (proposal.identifier or "").rsplit(".", 1)[-1]
-        path = f"models/staging/stg_{table}.yml"
+        path = _placed(placement, EditKind.SCHEMA_YML, table)
+        if path is None:
+            warnings.append(
+                f"this project format has nowhere for a test on {proposal.identifier} "
+                "to land, so the lost unique key has no test edit; add a `unique` "
+                "test wherever that model is defined"
+            )
+            continue
         source = view.files.get(path)
         if source is None:
             warnings.append(
@@ -312,18 +381,44 @@ def _grain_test_edits(
             continue
         if not isinstance(parsed, dict):
             continue
+        # The convention leaks through content as well as through paths, and
+        # placement only closes the path half. This matched `stg_{table}` inside
+        # the YAML, so a format that placed the file correctly and names its
+        # model `orders` was still missed, silently, one line before the edit.
+        #
+        # The model is named after the file the format chose. For dbt that is the
+        # same string it always matched, because the scaffold path is
+        # `models/staging/stg_{table}.yml` and its stem is `stg_{table}`; for a
+        # format placing `declarations/orders.yml` it is `orders`. The format
+        # already answered "where does this table's declaration live", and this
+        # reads the answer instead of asserting dbt's spelling over it. A format
+        # that packs many models into one file finds no entry and is warned
+        # below, which is a refusal to guess rather than a wrong write.
+        declared = PurePosixPath(path).stem
         entry = next(
             (
                 column
                 for model in parsed.get("models") or []
-                if isinstance(model, dict) and model.get("name") == f"stg_{table}"
+                if isinstance(model, dict) and model.get("name") == declared
                 for column in model.get("columns") or []
                 if isinstance(column, dict) and column.get("name") == proposal.column
             ),
             None,
         )
-        if entry is None or "unique" in (entry.get("tests") or []):
-            continue  # already alerting (or no scaffolded column entry to extend)
+        if entry is None:
+            # Split from the "already alerting" skip below, which is silent
+            # because it is correct. This one is a miss: the file resolved and
+            # the column entry did not, and a reader looking at the proposal
+            # would otherwise have no way to tell that from dex declining.
+            warnings.append(
+                f"{path} declares no column '{proposal.column}' under a model "
+                f"named '{declared}', so the lost unique key on "
+                f"{proposal.identifier} has no test edit; add a `unique` test "
+                "there by hand"
+            )
+            continue
+        if "unique" in (entry.get("tests") or []):
+            continue  # already alerting
         entry.setdefault("tests", []).append("unique")
         edits.append(
             PlanEdit(

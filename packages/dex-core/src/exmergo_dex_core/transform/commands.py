@@ -398,7 +398,15 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
 
     repo_root = engine.require_repo_root("applying a plan to the dbt project")
     outcome: PlanApplyResult = plans_mod.apply(
-        plan_id, repo_root, store=store, confirmed=engine.confirmed
+        plan_id,
+        repo_root,
+        store=store,
+        confirmed=engine.confirmed,
+        # A plan is applied through the format it was planned against, so a
+        # format that placed an edit into its own keyspace is the one that writes
+        # it. `None` here is a format declining the write tier, and falls back to
+        # dbt's writer, which is where every plan went before the seam.
+        project_format=engine.editable_project(),
     )
     conflicts = [c.model_dump(mode="json") for c in outcome.conflicts]
     if outcome.conflicts and not outcome.written:
@@ -946,12 +954,28 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
 
 def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
     repo_root = engine.require_repo_root("storing a transform plan")
+    editable = engine.editable_project()
+    # The directory these edits are pinned against has to name the same project
+    # as the surface they are checked in, or an existing file hashes as absent
+    # and the apply that follows conflicts on a file nobody edited. A format
+    # declaring a surface answers both from its own view, so the directory is
+    # left to `plans.plan` to read there rather than asserted from dbt's here.
+    # Everything else predates the seam and keeps dbt's configured pin, which
+    # that function's own fallback (discovery from the repo root) would not
+    # honor. For dbt the two agree by construction: its view loads the same
+    # resolved directory `project_dir()` returns.
+    declares_surface = getattr(editable, "editing_surface", None) is not None
     stored, diffs, warnings = plans_mod.plan(
         intent,
         edits,
-        engine.project_dir(),
+        None if declares_surface else engine.project_dir(),
         repo_root,
         store=engine.require_full_store("storing a semantic plan"),
+        # Agent-authored edits, which is the caller `editing_surface` exists for:
+        # there is no placement to compare a path against here, only the surface
+        # the format admits to owning. A format declining the write tier is
+        # `None` and validates against dbt's surface as before.
+        project_format=editable,
     )
     return PlanResult(
         plan_id=stored.plan_id,
