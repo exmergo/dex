@@ -35,7 +35,8 @@ intent.
 
 **`dex` is analytics engineering** for Claude Code and **any agent**: **data warehouse
 exploration**, **dbt transformation** and **semantic modeling**, and **schema-drift
-maintenance** on dbt. Point it at your warehouse (or a local DuckDB file) and your
+maintenance** on dbt. Point it at your warehouse (or a local DuckDB file, or the one
+`dex demo` generates for you) and your
 dbt project; it learns the landscape, writes and refactors your dbt transformations
 and semantic models, and tells you what to fix when anything drifts. The dbt
 project is the source of truth; every change is a reviewable diff. Read-only
@@ -75,6 +76,52 @@ time. `dex` owns exactly that loop.
 
 <img width="484" height="344" alt="image" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
 
+## Try it in three commands, on your laptop
+
+No warehouse, no credentials, no cloud account, no network. `dex demo` generates a
+small e-commerce DuckDB warehouse locally and points the following commands at it.
+
+```
+pip install "exmergo-dex-core[duckdb]"
+dex demo
+dex explore map
+```
+
+`dex demo` writes two files in the directory you are standing in, and refuses rather
+than overwrite anything: `dex_demo.duckdb` (7 tables, 29,512 rows) and a
+`.dex/config.yml` so everything after it runs with no flags. The data is generated
+from a pinned seed, so what you see is what is written here.
+
+It is seeded to be **realistically broken**, because a first run that reports a clean
+bill of health teaches you nothing. `explore map` flags 6 columns as personal data,
+infers 5 joins, and reports 5 data-quality findings. Then:
+
+```
+dex explore profile order_items products
+dex explore relationships --verify
+dex explore query "select email from customers"
+```
+
+- **A broken grain.** `order_item_id is not unique: 13000 distinct over 14000 rows`,
+  because a batch was loaded twice. Any join on it silently fans out.
+- **A key that mixes id schemes.** `sku` is `90% numeric, 10% 32-character
+  hexadecimal (md5-shaped)`, from a merged catalogue. Cast it to a number and you
+  drop 10% of your rows without an error.
+- **A join that looks right and is not.** `web_events.customer_id` shares the CRM's
+  column name and type, so it is inferred; verification finds **100% of values have
+  no match**, so the inference collapses instead of shipping a join that returns all
+  NULLs and looks like it worked.
+- **A refusal.** The query firewall declines to project `customers.email` into
+  context. `select count(distinct email) from customers` runs, because a statistic
+  is not a value.
+- Plus a table an interrupted load left empty, two columns whose declared type
+  contradicts their content, and two PII **false positives** on a distribution
+  centre's city and coordinates, which are a designed behaviour and worth meeting
+  early.
+
+DuckDB is free and local, so nothing here asks you to confirm a spend. On BigQuery
+or Snowflake the same commands return an estimate first and run only once you agree
+to it.
 
 ## Benchmark
 

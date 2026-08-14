@@ -11,6 +11,81 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`dex demo` generates a seeded local warehouse, so a first run needs no
+  credentials** ([#301]). The packaging has described a "zero-credential DuckDB
+  on-ramp" since the extras were laid out, and it delivers one: a base install
+  pulls no cloud client stack. The on-ramp just had no content. To see dex do
+  anything at all, a stranger had to supply a warehouse, discover credentials,
+  and accept a cost estimate against real data, which is the highest-friction
+  possible starting point and, for a read that touches a metered connector, the
+  one a cautious person is least willing to take on faith. The first run was
+  doing double duty as an evaluation.
+
+  `dex demo` builds a small e-commerce DuckDB warehouse (7 tables, 29,512 rows)
+  in the directory you are standing in, plus a `.dex/config.yml` beside it, so
+  everything after it runs with no flags. One command, no credentials, no cloud
+  account, no network. It also lands in `dex --help`, which is where #296
+  measured first contact actually happening.
+
+  **It is seeded to be realistically broken**, because a first run that reports
+  a clean bill of health teaches nothing. `order_item_id` lost its uniqueness to
+  a batch loaded twice, so grain has a verdict to give; `products.sku` mixes
+  numeric and md5-shaped ids from a merged catalogue, so a cast to a number
+  would silently drop a tenth of the rows; `web_events.customer_id` shares the
+  CRM's column name and type but none of its values, so inference proposes the
+  join and `--verify` collapses it at 100% orphans rather than shipping a join
+  that returns all-NULL parents and looks like it worked; `returns` is the table
+  an interrupted load left empty; `orders.placed_at` is a VARCHAR holding
+  timestamps and `web_events.occurred_at` a BIGINT holding epoch milliseconds,
+  the two shapes #204 detects. `customers.email` and `full_name` are personal
+  data the query firewall refuses to project, and `warehouse_locations.city` and
+  its coordinates are PII false positives on a building, which are a designed
+  behavior and cheapest to meet on data nobody minds. Five minutes in, a new
+  user has seen dex refuse something and report a finding they did not know to
+  look for.
+
+  **Deterministic, because the documentation quotes it.** One pinned seed, a
+  random stream restricted to primitives stable across CPython releases, and no
+  wall clock anywhere: every date is measured back from a fixed anchor, so the
+  file does not change overnight. A test pins a sha256 over every generated
+  cell, so an edit that would move a count printed in a README fails CI instead
+  of shipping documentation that disagrees with what the user sees. For a tool
+  whose claim is precision, that disagreement is worse than having no quickstart.
+
+  **Create-only, and structurally off the connector write path.** An existing
+  file at the target is a refusal with no `--confirm` that can talk past it,
+  because a confirmable overwrite would put a real warehouse one typo away from
+  being replaced and naming another path costs nothing. No parent directory is
+  ever created. A `.dex/config.yml` at or above the target is left untouched
+  with a warning, and the printed commands switch to the explicit `--path`
+  form, so a demo run inside someone's project cannot shadow their config with a
+  second one. `--path` itself is refused rather than honored or ignored: it
+  names the warehouse dex *reads* everywhere else, and this is the one command
+  that writes one. The generator sits in its own module, imports `duckdb`
+  directly, and reaches neither the adapter nor the SQL guard, so
+  `test_read_only_duckdb_refuses_writes` keeps no branch it could have taken;
+  two new safety-spine tests hold that mechanically rather than by argument, one
+  scanning the package for every `duckdb.connect(` and requiring
+  `read_only=True` outside the generator, the other opening a freshly generated
+  file through the adapter and confirming a write is still refused.
+
+  Deliberately not done: no `.duckdb` committed to git (the storage format has
+  broken backward compatibility before, so a stale file would fail on the first
+  command a stranger runs, and binary blobs do not delta-compress, so every
+  regeneration would be permanent history weight); no fixture shipped as data in
+  the wheel, which the skills would then fetch per version per environment; no
+  second repository to clone, which is exactly the friction this removes; and no
+  download on first use, since corporate proxies are common in the environments
+  this is meant to reassure and the first run is the one place that cannot
+  afford to fail. A dbt project is out of scope: `transform init` already
+  bootstraps one, and `dex demo` can chain into it when the demo needs to cover
+  authoring or drift.
+
+  `generate_demo_warehouse` is exported from the package, and
+  `examples/quickstart.py` now builds its warehouse with it, so the library
+  example and the CLI on-ramp show the same data and the packaging suite
+  verifies the generator against a freshly built wheel.
+
 - **`transform test --scaffold <model>` derives a dbt unit test from a
   model's own inputs** ([#215]). Writing a unit test by hand means restating
   every input's column set with correctly typed values before the assertion
