@@ -31,7 +31,7 @@ from ..dbt_project import ApplyResult as PlanApplyResult
 from ..dbt_project import EditOp
 from ..errors import DexError
 from ..results import to_envelope
-from ..storage import Store
+from ..storage import Store, readable_cache
 from . import plans as plans_mod
 from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit
@@ -397,7 +397,7 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
 
     project = engine.project_dir()
     view = load_project(project)
-    cache = engine.store.load_cache()
+    cache = readable_cache(engine.store)
     edits, inputs = test_scaffold_mod.unit_test_scaffold_edits(view, cache, model_name)
 
     from .build import shadow_parse
@@ -546,6 +546,7 @@ def build(
     from ..guards.cost_guard import (
         ConfirmationRequiredError,
         no_session_ceiling_warning,
+        skipped_handshake_warning,
         unserialized_ledger_warning,
     )
 
@@ -576,24 +577,28 @@ def build(
         connection=engine.connection,
     )
 
-    # Free/local (DuckDB): nothing bills, so there is nothing to price. The
-    # engine runs the dev-target check and the confirm handshake itself.
+    # Free/local (DuckDB): nothing bills, so there is nothing to price and no
+    # confirmation to ask for (issue #197); the engine runs the dev-target
+    # check and gates the ceiling/ready-to-run checks that still apply.
     if paradigm is Paradigm.FREE_LOCAL:
-        try:
-            summary, cost = run_build(
-                project,
-                target=target,
-                configured_target=config.dbt_target,
-                select=select,
-                ceiling=ceiling,
-                confirmed=engine.confirmed,
-                paradigm=paradigm,
-                dev_target_check=dev_check,
-            )
-        except ConfirmationRequiredError as exc:
-            exc.request = _build_confirmation(target, exc.cost)
-            raise
-        return _shape_build_result(summary, cost, paradigm, connector, store)
+        summary, cost = run_build(
+            project,
+            target=target,
+            configured_target=config.dbt_target,
+            select=select,
+            ceiling=ceiling,
+            confirmed=engine.confirmed,
+            paradigm=paradigm,
+            dev_target_check=dev_check,
+        )
+        return _shape_build_result(
+            summary,
+            cost,
+            paradigm,
+            connector,
+            store,
+            extra_notes=skipped_handshake_warning(paradigm, engine.confirmed),
+        )
 
     dev_warnings = dev_check()
     estimate, per_node, price_notes, adapter = _price_build(

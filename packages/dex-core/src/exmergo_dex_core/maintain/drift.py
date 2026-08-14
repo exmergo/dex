@@ -45,14 +45,14 @@ from .snapshot import SemanticLayer, Snapshot, TransformLayer
 #: does not recognize therefore has a cheap correct answer (rebuild) that the
 #: baseline does not have.
 #:
-#: What is *not* yet handled, and is a real gap rather than a decision: a drift
-#: report that fails to parse still raises out of `load_drift` uncaught and is
-#: classified as a request error, exactly the defect `_require_baseline` fixes
-#: for the baseline. The argument above is about versioning, not about
-#: corruption, and it does not cover that. Left out of the change for #243
-#: because the right remedy differs (treat it as absent and rebuild, rather than
-#: refuse), which deserves its own decision rather than symmetry with the
-#: baseline.
+#: Corruption is handled separately from versioning, and the remedy the paragraph
+#: above predicted is the one that shipped. A drift report that fails to parse
+#: used to raise out of `load_drift` uncaught and be classified as a request
+#: error, telling an operator they typed something wrong; `_stored_drift` now
+#: catches that and treats it as absent, so both callers take the rebuild path
+#: they already had for a missing report. Deliberately NOT the baseline's
+#: refusal: the argument above is exactly why the same input deserves opposite
+#: answers on the two documents.
 DRIFT_SCHEMA_VERSION = 1
 
 FREE_AXES = ("schema", "volume")

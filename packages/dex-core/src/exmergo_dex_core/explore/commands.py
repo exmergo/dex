@@ -63,7 +63,7 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
-from ..storage import Document, ExploreStore
+from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
 from . import cluster as cluster_mod
 from . import diagram as diagram_mod
 from . import inventory as inventory_mod
@@ -489,7 +489,7 @@ def profile(
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
-    prior = store.load_cache()
+    prior = readable_cache(store)
 
     identifiers = _resolve_identifiers(adapter, objects)
     connector = adapter.name
@@ -596,7 +596,7 @@ def relationships(
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
-    prior = store.load_cache()
+    prior = readable_cache(store)
     accumulated: list[Dataset] = []
     over_ceiling = False
     verify_pending: ConfirmationRequest | None = None
@@ -999,7 +999,7 @@ def _run_statements(
     limits = config.query
     now = datetime.now(UTC)
     at = now.isoformat()
-    cache = store.load_cache()
+    cache = readable_cache(store)
     # The firewall parses in the active connector's dialect, so BigQuery SQL
     # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
     dialect = get_dialect(engine.connector or config.connector)
@@ -1542,7 +1542,7 @@ def map(
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
-    prior = store.load_cache()
+    prior = readable_cache(store)
     accumulated: list[Dataset] = []
     over_ceiling = False
     verify_pending: ConfirmationRequest | None = None
@@ -1856,7 +1856,7 @@ def cluster(
 
     store = engine.store
     config = engine.config
-    cache = store.load_cache()
+    cache = readable_cache(store)
     now = datetime.now(UTC)
     auto = config.auto_profile if auto_profile is None else auto_profile
 
@@ -2091,7 +2091,7 @@ def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
     nothing and a diagram of an unexplored warehouse look identical.
     """
 
-    cache = engine.store.load_cache()
+    cache = readable_cache(engine.store)
     if cache is None:
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` first so there is a "
@@ -2122,7 +2122,7 @@ def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
 def cmd_diagram(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(diagram(engine, full=getattr(args, "full", False)))
-    except (CacheRequiredError, ValueError) as exc:
+    except (CacheRequiredError, CacheUnreadableError, ValueError) as exc:
         return env.error_for(exc)
 
 
@@ -2139,6 +2139,7 @@ def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         )
     except (
         CacheRequiredError,
+        CacheUnreadableError,
         ValueError,
         cluster_mod.ClusterError,
         cluster_mod.ClusterDependencyError,
