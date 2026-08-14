@@ -139,6 +139,115 @@ def test_no_connector_anywhere_refuses_instead_of_defaulting():
         eng.inventory()
 
 
+# --- the run-directory DuckDB auto-detect (issue #199) -------------------------
+
+
+def _make_duckdb(path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE t (id INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.close()
+
+
+def test_lone_duckdb_file_in_run_directory_is_used_and_warned(tmp_path: Path):
+    """Acceptance: one .duckdb present, no config: the command runs and warns,
+    naming the file."""
+
+    lone = tmp_path / "lone.duckdb"
+    _make_duckdb(lone)
+
+    with DexEngine(repo_root=str(tmp_path)) as eng:
+        mapped = eng.inventory()
+        assert len(mapped.objects) == 1
+        assert len(eng.connection_warnings) == 1
+        assert "lone.duckdb" in eng.connection_warnings[0]
+        assert eng.connector == "duckdb"
+        assert eng.path == str(lone)
+
+
+def test_two_duckdb_files_in_run_directory_still_refuses_naming_both(
+    tmp_path: Path,
+):
+    """Acceptance: two present: refused, both listed."""
+
+    a = tmp_path / "a.duckdb"
+    b = tmp_path / "b.duckdb"
+    _make_duckdb(a)
+    _make_duckdb(b)
+
+    with (
+        DexEngine(repo_root=str(tmp_path)) as eng,
+        pytest.raises(ValueError, match="more than one DuckDB file") as refusal,
+    ):
+        eng.inventory()
+    assert "a.duckdb" in str(refusal.value)
+    assert "b.duckdb" in str(refusal.value)
+    # Never a silent guess: a refusal carries no warning to act on.
+    assert eng.connection_warnings == []
+
+
+def test_zero_duckdb_files_in_run_directory_is_the_existing_refusal_unchanged(
+    tmp_path: Path,
+):
+    """Acceptance: zero present: the existing refusal, unchanged."""
+
+    with (
+        DexEngine(repo_root=str(tmp_path)) as eng,
+        pytest.raises(ValueError, match=r"no \.dex/config\.yml found"),
+    ):
+        eng.inventory()
+    assert eng.connection_warnings == []
+
+
+def test_config_present_is_unchanged_even_naming_a_different_file(tmp_path: Path):
+    """Acceptance: config present: unchanged, even if it names a different file.
+
+    A lone real .duckdb file sits right there, but a config was declared (even
+    one naming a relation that does not exist), so the auto-detect must never
+    override it: the failure is a connection failure on the configured path,
+    never a silent switch to the file that happens to be lying around.
+    """
+
+    _make_duckdb(tmp_path / "lone.duckdb")
+    config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path="elsewhere.duckdb"))
+
+    # The configured (nonexistent) file is what fails to open, not a silent
+    # switch to the real lone file sitting right there.
+    with (
+        DexEngine(repo_root=str(tmp_path), config=config) as eng,
+        pytest.raises(Exception, match=r"elsewhere\.duckdb"),
+    ):
+        eng.inventory()
+    assert eng.connection_warnings == []
+
+
+def test_explicit_path_is_unchanged_even_with_a_lone_duckdb_file_present(
+    tmp_path: Path,
+):
+    """Acceptance: --path present: unchanged (no auto-detect note, since
+    nothing was guessed)."""
+
+    lone = tmp_path / "lone.duckdb"
+    _make_duckdb(lone)
+
+    with DexEngine(repo_root=str(tmp_path), connector="duckdb", path=str(lone)) as eng:
+        mapped = eng.inventory()
+        assert len(mapped.objects) == 1
+    assert eng.connection_warnings == []
+
+
+def test_lone_duckdb_auto_detect_does_not_apply_with_no_repo_root_at_all():
+    """A library caller holding no repo concept (``repo_root=None``) is the
+    other spelling of this same refusal, and has no run directory to look in;
+    it must keep refusing exactly as before, never scanning the process's own
+    cwd for a stray .duckdb file that has nothing to do with the caller."""
+
+    with DexEngine() as eng, pytest.raises(ValueError, match="no connector selected"):
+        eng.inventory()
+    assert eng.connection_warnings == []
+
+
 def test_commands_needing_the_project_refuse_without_a_repo_root():
     """The dbt project is a filesystem artifact by design, so the commands that
     read or write it say which operation needed a root rather than failing with
