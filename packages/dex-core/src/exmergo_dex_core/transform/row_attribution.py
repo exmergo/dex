@@ -38,6 +38,7 @@ from ..dbt_project import EditOp
 from ..dbt_project import load as load_project
 from ..errors import DexError
 from ..guards.query_firewall import QueryRefusedError, inspect_query
+from ..storage import readable_cache
 from .plans import EditKind
 
 if TYPE_CHECKING:
@@ -900,7 +901,7 @@ def attribute(
     # reading the same SQL. The cache is loaded only when counting, so the
     # named-only path stays free of both the store read and the connection.
     resolver = (
-        cache_resolver(engine.store.load_cache(), dialect)
+        cache_resolver(readable_cache(engine.store), dialect)
         if counting
         else naming_resolver
     )
@@ -1048,7 +1049,7 @@ def _count(
     """
 
     records = [m.record for m in models]
-    cache = engine.store.load_cache()
+    cache = readable_cache(engine.store)
     statements: list[_Statement] = []
 
     for index, model in enumerate(models):

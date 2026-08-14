@@ -126,7 +126,15 @@ class Relationship(BaseModel):
     """A join between two datasets, declared (FK / dbt) or inferred (heuristic).
 
     ``verified`` and ``orphan_fraction`` are set only by the opt-in ``--verify``
-    overlap probe: an inferred join stays a name-based guess until measured.
+    overlap probe, on either kind: an inferred join stays a name-based guess
+    until measured, and a declared one is a claim the project makes about the
+    data, which is measurable for the same reason.
+
+    ``confidence`` means "how sure is dex that this join exists", so a
+    measurement moves it only on an inferred join. A declared one sits at 1.0
+    and stays there; when its probe disagrees, that is a finding about the
+    warehouse or the declaration, not weaker evidence for the edge (issue
+    #163).
     """
 
     from_dataset: str
