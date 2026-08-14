@@ -67,7 +67,12 @@ _EXPORTS = {
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
     "CredentialDiscoveryError": "connect",
+    "DEMO_FILENAME": "demo",
     "Dataset": "cache",
+    "DemoDependencyError": "demo",
+    "DemoError": "demo",
+    "DemoPathError": "demo",
+    "DemoTargetExistsError": "demo",
     "DexCache": "cache",
     "DexConfig": "config",
     "DexEngine": "engine",
@@ -103,6 +108,7 @@ _EXPORTS = {
     "StoreContext": "storage",
     "StoreFactory": "storage",
     "StoreRequiredError": "errors",
+    "generate_demo_warehouse": "demo",
     "render_er_mermaid": "explore.diagram",
     "to_envelope": "results",
 }
@@ -115,6 +121,14 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         CredentialDiscoveryError,
         ScopeError,
         SemanticSource,
+    )
+    from .demo import (
+        DEMO_FILENAME,
+        DemoDependencyError,
+        DemoError,
+        DemoPathError,
+        DemoTargetExistsError,
+        generate_demo_warehouse,
     )
     from .engine import DexEngine
     from .envelope import Cost, Paradigm
@@ -176,6 +190,7 @@ except PackageNotFoundError:
 # checker) sees the public surface without executing anything. `tests/
 # test_engine.py` asserts the two stay in step and that every name resolves.
 __all__ = [
+    "DEMO_FILENAME",
     "BaselineUnreadableError",
     "BudgetExhaustedError",
     "CacheRequiredError",
@@ -192,6 +207,10 @@ __all__ = [
     "CostGuardError",
     "CredentialDiscoveryError",
     "Dataset",
+    "DemoDependencyError",
+    "DemoError",
+    "DemoPathError",
+    "DemoTargetExistsError",
     "DexCache",
     "DexConfig",
     "DexEngine",
@@ -228,6 +247,7 @@ __all__ = [
     "StoreFactory",
     "StoreRequiredError",
     "__version__",
+    "generate_demo_warehouse",
     "render_er_mermaid",
     "to_envelope",
 ]
