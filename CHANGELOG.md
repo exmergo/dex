@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.5] - 2026-08-14
+
 ### Added
 
 - **`dex demo` generates a seeded local warehouse, so a first run needs no
