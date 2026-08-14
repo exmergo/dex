@@ -36,6 +36,62 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   shape. dbt's own parser gates the plan before it is ever stored, the same
   layering `transform macro` already uses.
 
+- **A run directory holding exactly one `*.duckdb` file, and no config
+  anywhere, is used instead of refused** ([#199]). The first two commands a
+  new user tries against a bare DuckDB file both refused: no `.dex/config.yml`
+  found, and `--connector duckdb` alone has no path either. Neither refusal
+  was wrong on its own terms (dex must never invent a connection target), but
+  one real file sitting in the directory the command was run from is not a
+  phantom target; it is the single most likely thing meant, and it is the
+  first thirty seconds of the zero-credential on-ramp.
+
+  The exception stays as narrow as the rule it sits inside: only when nothing
+  else named a connector at all (no config, no `--connector`, no `--path`) is
+  the run directory (never recursive, never a walk up) checked for `*.duckdb`
+  files. Exactly one is used, and the choice always warns, naming the file and
+  the `--path`/`duckdb.path` that would make it explicit; two or more still
+  refuses, now naming every candidate instead of leaving the caller to guess
+  why; zero keeps today's refusal, unchanged; and a config, even one naming a
+  different file, or an explicit `--connector`/`--path`, is never
+  second-guessed, since something already made the honest choice this
+  exception exists only to stand in for.
+
+- **`explore profile` flags a candidate-key column that mixes value shapes**
+  ([#205]). A string id column carrying two different value schemes (numeric
+  ids alongside opaque hashes, or two id schemes left over from a partial
+  migration or a merged upstream) profiled identically to a homogeneous one:
+  nothing distinguished it. The failure mode is specific and severe, not
+  cosmetic: a downstream cast to a number, or a numeric comparison, silently
+  drops exactly the rows from the group it can't parse. Row counts fall by a
+  few percent, every test still passes, and the loss is invisible until
+  someone reconciles a total.
+
+  A candidate-key column (single-column or a proven composite member) now
+  reports its value-shape partition (numeric, UUID, fixed-length hex, or an
+  unclassified remainder) when two or more shapes each hold a meaningful
+  share, naming the fractions, the hex length (recognizing md5/sha1/sha256
+  by their length) when it's fixed, and the consequence: casting to a number
+  or comparing numerically will silently drop the non-numeric group(s). A
+  homogeneous key (all one shape) or a non-key free-text column produces no
+  note, matching the issue's acceptance criteria exactly.
+
+  Computed the same way #204's declared-type checks are: fractions inside
+  the already-scanned aggregate batch, at zero extra cost, gated on no PII
+  flag at all, at any confidence. The hex bucket explicitly excludes
+  anything the numeric pattern already claimed (a pure-digit string is valid
+  hex-charset input too), which is what keeps `numeric_string_fraction`
+  directly reusable unchanged and keeps the two buckets from double-counting
+  the same value. Implemented across every connector (DuckDB, BigQuery,
+  Snowflake, Databricks, Redshift, Postgres).
+
+  Scoped to the issue's candidate-key eligibility branch only: the
+  relationship-membership branch ("or one participating in a detected
+  relationship") is only decidable after every table in a batch is profiled
+  and cross-compared, in a step that runs in a different order in `map` vs.
+  `relationships` and not at all in a bare `explore profile`, so it needs
+  new persisted state and a new cross-command annotation pass. Filed as a
+  follow-up rather than folded in here.
+  
 ## [1.6.4] - 2026-08-13
 
 ### Added

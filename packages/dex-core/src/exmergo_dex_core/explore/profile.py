@@ -472,6 +472,81 @@ def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | No
     )
 
 
+# Below this, a second shape reads as a handful of typos/outliers, not a
+# second real population; the issue's own worked example floors here at 10%,
+# so 5% catches a genuine minority scheme with margin to spare while staying
+# on this codebase's side of under- rather over-reporting.
+_HETEROGENEOUS_KEY_MIN_SHARE = 0.05
+
+# Friendly names for the hash lengths this shape recurs as in practice;
+# anything else is reported by its bare length instead of guessing further.
+_HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def _is_candidate_key(
+    col_name: str, agg: ColumnAggregate | None, composite_members: set[str]
+) -> bool:
+    """A single-column proven key, or a member of a proven composite key --
+    the same predicate `relationships.candidate_keys` applies to
+    `ColumnProfile` after the fact, evaluated here instead against the live
+    aggregate because that's the only place `key_shape` fractions exist.
+    """
+
+    if col_name in composite_members:
+        return True
+    if agg is None:
+        return False
+    return bool(agg.is_unique) and agg.null_fraction in (0.0, None)
+
+
+def _hex_shape_label(agg: ColumnAggregate) -> str:
+    lo, hi = agg.hex_string_min_length, agg.hex_string_max_length
+    if lo is None or hi is None:
+        return "hexadecimal"
+    if lo == hi:
+        name = _HEX_LENGTH_NAMES.get(lo)
+        return (
+            f"{lo}-character hexadecimal ({name}-shaped)"
+            if name
+            else f"{lo}-character hexadecimal"
+        )
+    return f"hexadecimal ({lo}-{hi} characters, mixed length)"
+
+
+def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str | None:
+    """A candidate-key column that mixes two or more value shapes (numeric,
+    UUID, fixed-length hex, or an unclassified remainder) in a meaningful
+    share each -- the shape that survives a partial migration or a merged
+    upstream, where a downstream cast or numeric comparison silently drops
+    the group it can't parse. Fractions and a length-derived shape label
+    only; never a value.
+    """
+
+    if agg is None:
+        return None
+    numeric = agg.numeric_string_fraction or 0.0
+    uuid = agg.uuid_string_fraction or 0.0
+    hexed = agg.hex_string_fraction or 0.0
+    other = max(0.0, 1.0 - numeric - uuid - hexed)
+    buckets = [
+        ("numeric", numeric),
+        ("uuid", uuid),
+        (_hex_shape_label(agg), hexed),
+        ("other", other),
+    ]
+    present = [
+        (name, frac) for name, frac in buckets if frac >= _HETEROGENEOUS_KEY_MIN_SHARE
+    ]
+    if len(present) < 2:
+        return None
+    parts = ", ".join(f"{frac:.0%} {name}" for name, frac in present)
+    return (
+        f"{col_name} is a candidate key but mixes value shapes: {parts}; "
+        "casting to a number or comparing numerically will silently drop "
+        "the non-numeric group(s)"
+    )
+
+
 def profile(
     adapter: Adapter,
     identifiers: list[str],
@@ -544,6 +619,14 @@ def profile(
             if prelim_pii[c.name] is None
             and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
         }
+        # Heterogeneous-key-shape checks (#205) are string-only, unlike
+        # type_stats above: a UUID/hex check is meaningless on a column SQL
+        # already stores as a number.
+        key_shape_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None and _is_string_type(c.data_type)
+        }
 
         # Blob-type columns can only ever yield a null fraction and a distinct
         # estimate, yet a columnar engine bills for the whole column once it is
@@ -565,6 +648,7 @@ def profile(
                 safe_min_max=safe,
                 shape_stats=shape,
                 type_stats=type_stats,
+                key_shape_stats=key_shape_stats,
             )
         }
         # Re-read the metadata after the aggregate scan: adapters whose
@@ -582,6 +666,7 @@ def profile(
         value_domains = _probe_value_domains(
             adapter, identifier, meta.row_count, aggregates, prelim_pii, composite_keys
         )
+        composite_members = {c for pair in composite_keys for c in pair}
 
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
@@ -617,6 +702,10 @@ def profile(
                 data_quality.extend(
                     _type_contradiction_notes(col.name, col.data_type, agg)
                 )
+                if _is_candidate_key(col.name, agg, composite_members):
+                    key_note = _heterogeneous_key_note(col.name, agg)
+                    if key_note is not None:
+                        data_quality.append(key_note)
             profiles.append(
                 ColumnProfile(
                     name=col.name,
