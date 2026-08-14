@@ -107,6 +107,36 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **A confirmation handshake is emitted only where spend is possible**
+  ([#197], subsumes [#136]). `transform build --target dev` against DuckDB
+  asked the caller to confirm spending nothing: the estimate was always
+  zero, the paradigm was `free_local`, and nothing was billable, yet an
+  unconfirmed run still stopped for `needs_confirmation`. A confirmation
+  prompt is a scarce attention budget, human or automated, and asking for
+  one where there is nothing to confirm trains a caller to click through the
+  next one too, which is the one that gates real spend.
+
+  `FREE_LOCAL` no longer reaches the confirmation or ceiling-required checks
+  in the cost guard's own preflight, at every point that could raise them
+  (the module-level gate `transform build` calls directly, and the stateful
+  gate every other billed command shares); an unconfirmed run now proceeds
+  and the envelope carries a warning naming why nothing was asked. Passing
+  `--confirm` anyway is harmless and adds no note, since nothing was
+  actually skipped that is worth remarking on. Over-ceiling still blocks
+  regardless of paradigm: an estimate that contradicts an explicitly
+  configured ceiling is the caller's own contradiction to resolve, not a
+  spend question, so that check keeps running unconditionally, exactly as
+  before. No metered paradigm is affected.
+
+  `maintain semantic`/`maintain check` already returned their free findings
+  as `ok` on DuckDB by construction (no adapter attaches a cost gate to a
+  free connector, so the two-phase confirmation those commands build never
+  triggers there); [#136]'s own scenario, a mixed free/billed result on a
+  *billed* connector reading as `needs_confirmation` even with real findings
+  already attached, is a distinct, larger change to the envelope's own
+  pending-confirmation handling and is not made by this fix. Filed as a
+  follow-up rather than folded in here.
+
 - **A corrupt exploration cache no longer reports as a bad request** ([#249]).
   `load_cache` raises on a document it cannot parse, and pydantic's
   `ValidationError` subclasses `ValueError`, so an unreadable cache fell through
