@@ -410,34 +410,33 @@ def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Pa
     claim as much as an engine one, which is why it is asserted here: the demo
     has to be inside the wheel, reachable from the console script, and satisfied
     by `[duckdb]` alone.
+
+    Both commands run in one isolated interpreter rather than two. Building the
+    environment is what this file pays for, and doing it twice buys nothing here:
+    what is under test is that `[duckdb]` alone satisfies the on-ramp, not that
+    the two commands are separate processes, which every other suite already
+    covers by calling `main` repeatedly.
     """
 
     import json
 
-    demo = _run_isolated(
+    done = _run_isolated(
         wheel,
-        "from exmergo_dex_core.cli import main; raise SystemExit(main(['demo']))",
+        "import json;from exmergo_dex_core.cli import main;"
+        "main(['demo']);main(['explore', 'map'])",
         extras=["duckdb"],
         cwd=tmp_path,
     )
-    assert demo.returncode == 0, demo.stderr
-    envelope = json.loads(demo.stdout)
-    assert envelope["status"] == "ok"
-    assert envelope["data"]["created"] == ["dex_demo.duckdb", ".dex/config.yml"]
-    assert envelope["data"]["row_count"] == 29512
+    assert done.returncode == 0, done.stderr
 
-    mapped = _run_isolated(
-        wheel,
-        "from exmergo_dex_core.cli import main;"
-        "raise SystemExit(main(['explore', 'map']))",
-        extras=["duckdb"],
-        cwd=tmp_path,
-    )
-    assert mapped.returncode == 0, mapped.stderr
-    payload = json.loads(mapped.stdout)
-    assert payload["status"] == "ok"
-    assert payload["data"]["object_count"] == 7
-    assert payload["data"]["pii_column_count"] == 6
+    created, mapped = (json.loads(line) for line in done.stdout.splitlines())
+    assert created["status"] == "ok"
+    assert created["data"]["created"] == ["dex_demo.duckdb", ".dex/config.yml"]
+    assert created["data"]["row_count"] == 29512
+    # The second command found the config the first one wrote, with no flags.
+    assert mapped["status"] == "ok"
+    assert mapped["data"]["object_count"] == 7
+    assert mapped["data"]["pii_column_count"] == 6
 
 
 def test_the_installed_console_script_speaks_the_command_contract(wheel: str):

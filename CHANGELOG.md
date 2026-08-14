@@ -71,6 +71,18 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `read_only=True` outside the generator, the other opening a freshly generated
   file through the adapter and confirming a write is still refused.
 
+  Rows are staged through a CSV and bulk-loaded with `COPY` rather than
+  inserted as bound values, which is not a micro-optimization: DuckDB's
+  per-value binding measures about 1.7k rows/s on 1.5.5 against 90k on 1.5.4,
+  so an insert-based load made this command take anywhere from one second to
+  eighteen depending on which release the user happened to resolve, with the
+  slow number being the one a fresh install gets today. `COPY` reads at ~680k
+  rows/s on both, so the command lands at ~0.2s regardless. `COPY` into an
+  existing table uses that table's declared types, so nothing restates a
+  schema, the staging file lives in the system temp directory rather than
+  beside the target, and the loaded data is asserted cell-for-cell identical to
+  the generated rows.
+
   Deliberately not done: no `.duckdb` committed to git (the storage format has
   broken backward compatibility before, so a stale file would fail on the first
   command a stranger runs, and binary blobs do not delta-compress, so every

@@ -5,8 +5,9 @@ exception, and it is deliberately its own path so that exception stays visible:
 it imports ``duckdb`` directly and never :mod:`..adapters.duckdb`, so the
 read-only open in the adapter has no branch that could ever be relaxed, and it
 never touches the SQL guard, because the statements here are ``CREATE TABLE`` and
-parameterized ``INSERT`` rather than anything an agent authored. A safety-spine
-test asserts both of those mechanically rather than trusting this paragraph.
+a ``COPY`` off a file this module just wrote, rather than anything an agent
+authored. A safety-spine test asserts both of those mechanically rather than
+trusting this paragraph.
 
 Creating a file is not writing to a user's data. The rule that keeps those two
 apart is create-only: a target that already exists is refused outright, with no
@@ -30,8 +31,10 @@ a test pins so drift fails CI instead of shipping.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import random
+import tempfile
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
@@ -495,6 +498,19 @@ def generate_demo_warehouse(
     nothing. On any failure after the file exists it is removed again, so a
     half-written warehouse is never left behind for the read-only adapter to
     find and report as real.
+
+    Rows are staged through a CSV in a temporary directory and bulk-loaded with
+    ``COPY``, rather than inserted as bound values, purely for speed: DuckDB's
+    per-value binding costs about 1.7k rows/s on 1.5.5 and 90k on 1.5.4, so an
+    insert-based load put this command anywhere between one second and eighteen
+    depending on which release the user happened to resolve. ``COPY`` reads at
+    ~680k rows/s on both, which is the difference between the on-ramp feeling
+    instant and feeling broken. ``COPY`` into an existing table also uses that
+    table's declared types, so nothing here restates or re-sniffs a schema, and
+    the staging file lives in the system temp directory (never beside the
+    target) so the command still creates exactly the one artifact it reports.
+    Worth knowing if this data ever grows a nullable column: CSV cannot tell an
+    empty string from NULL, and every column generated here is non-null.
     """
 
     target = Path(path)
@@ -526,18 +542,22 @@ def generate_demo_warehouse(
     connection = duckdb.connect(str(target))
     try:
         # Table and column names are module constants a few lines above, never
-        # caller input, and every value goes in as a bound parameter, so the only
-        # interpolation here is the shape of a statement this file wrote itself.
-        for table in tables:
-            columns = ", ".join(f"{name} {sql}" for name, sql in table.columns)
-            connection.execute(f"CREATE TABLE {table.name} ({columns})")
-            if not table.rows:
-                continue
-            placeholders = ", ".join("?" for _ in table.columns)
-            connection.executemany(
-                f"INSERT INTO {table.name} VALUES ({placeholders})",  # noqa: S608
-                [list(row) for row in table.rows],
-            )
+        # caller input, so the only interpolation is the shape of a statement
+        # this file wrote itself; the one value that varies, the staging path,
+        # binds as a parameter.
+        with tempfile.TemporaryDirectory(prefix="dex-demo-") as staging:
+            for table in tables:
+                columns = ", ".join(f"{name} {sql}" for name, sql in table.columns)
+                connection.execute(f"CREATE TABLE {table.name} ({columns})")
+                if not table.rows:
+                    continue
+                rows_csv = Path(staging) / f"{table.name}.csv"
+                with rows_csv.open("w", newline="", encoding="utf-8") as handle:
+                    csv.writer(handle).writerows(table.rows)
+                connection.execute(
+                    f"COPY {table.name} FROM ? (FORMAT CSV, HEADER FALSE)",
+                    [str(rows_csv)],
+                )
         # Fold the write-ahead log into the database file before closing, so the
         # command leaves exactly the one artifact it reported creating.
         connection.execute("CHECKPOINT")
