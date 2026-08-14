@@ -152,6 +152,72 @@ def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
     assert "90% numeric" in notes and "md5-shaped" in notes
 
 
+# `dex demo` is the one verb that creates a data file, so the read-only rule has
+# to hold around it in a way a reader can check rather than take on trust. Two
+# tests do that: the generator is structurally sealed off from the connector, and
+# the file it produces is opened read-only like any other the moment it exists.
+
+
+def test_the_demo_generator_is_the_only_writable_duckdb_open():
+    """No writable DuckDB connection exists in the engine outside the generator.
+
+    Asserted over the source rather than at runtime because the claim is about
+    what the code can do, not about what one path happened to do: a future
+    `read_only=False` anywhere in the adapter tree is the regression, and it
+    would pass every behavioral test until someone pointed dex at a warehouse
+    they cared about.
+    """
+
+    import exmergo_dex_core
+
+    package_root = Path(exmergo_dex_core.__file__).parent
+    generator = package_root / "demo" / "warehouse.py"
+    openers = [
+        path
+        for path in package_root.rglob("*.py")
+        if "duckdb.connect(" in path.read_text(encoding="utf-8")
+    ]
+    assert generator in openers, "the generator is the one that writes"
+    for path in openers:
+        if path == generator:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "read_only=True" in source, f"{path} opens DuckDB without read_only"
+        assert "read_only=False" not in source, f"{path} opens DuckDB writable"
+
+    # And the generator imports neither the adapter nor the guards, so the
+    # read-only open and the SELECT-only guard have no branch it could take.
+    # Read off the import statements rather than the file text, so the prose
+    # explaining the separation cannot be mistaken for a violation of it.
+    import ast
+
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(generator.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not any("adapters" in name or "guards" in name for name in imported), (
+        f"the generator must stay off the connector path: {sorted(imported)}"
+    )
+
+
+def test_a_generated_demo_warehouse_is_opened_read_only(tmp_path: Path):
+    """The loop closed: the moment the demo file exists it is user data, and the
+    adapter treats it exactly like a warehouse dex did not create."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import generate_demo_warehouse
+
+    warehouse = generate_demo_warehouse(tmp_path / "demo.duckdb")
+    adapter = DuckDBAdapter(warehouse.path)
+    try:
+        with pytest.raises(Exception):
+            adapter._conn.execute("DELETE FROM customers")
+    finally:
+        adapter.close()
+
+
 def test_combination_probe_sql_is_select_only_in_every_dialect():
     # The composite-key probe shares one SQL builder across the adapters; the
     # statement must parse as a single read-only SELECT in each dialect.
@@ -1460,6 +1526,69 @@ def test_init_refuses_where_a_project_already_exists(dbt_project_dir: Path):
         transform.init_project(
             "fresh", "duckdb", path=str(repo / "warehouse.duckdb"), repo_root=repo
         )
+
+
+def test_demo_refuses_to_overwrite_an_existing_warehouse(tmp_path: Path, capsys):
+    """`dex demo` is create-only, and deliberately not confirmable.
+
+    The sibling of the init refusal above, for the one verb that writes a data
+    file rather than a project file. It is stricter than init on purpose: a
+    `--confirm` that could talk past this would put a real warehouse one typo
+    away from being replaced, and the fix (name another path) costs nothing.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    existing = tmp_path / "production.duckdb"
+    existing.write_bytes(b"someone else's warehouse")
+
+    for argv in (["demo", str(existing)], ["demo", str(existing), "--confirm"]):
+        assert main(argv) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert payload["reason"] == "guard"
+        assert existing.read_bytes() == b"someone else's warehouse"
+
+
+def test_demo_creates_only_what_it_names_and_never_a_second_config(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Two artifacts, both reported, and never one that shadows a real project.
+
+    A `.dex/config.yml` written into a subdirectory of someone's repo would
+    silently capture every command run there, which is the same class of harm as
+    overwriting a file: a change they did not ask for and would not see.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["demo"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    on_disk = sorted(
+        str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()
+    )
+    assert on_disk == sorted(payload["data"]["created"])
+
+    # Now with a project config already above the target: the warehouse is still
+    # created, the config is not, and the envelope says which happened.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "scratch").mkdir()
+    committed = tmp_path / ".dex" / "config.yml"
+    before = committed.read_text(encoding="utf-8")
+
+    assert main(["demo", "scratch/second.duckdb"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["created"] == ["scratch/second.duckdb"]
+    assert not (tmp_path / "scratch" / ".dex").exists()
+    assert committed.read_text(encoding="utf-8") == before
+    assert any("left untouched" in w for w in payload["warnings"])
 
 
 def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys):
