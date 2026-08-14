@@ -92,6 +92,114 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   new persisted state and a new cross-command annotation pass. Filed as a
   follow-up rather than folded in here.
   
+- **`CacheUnreadableError`**, exported from the package root and from
+  `exmergo_dex_core.storage`. The sibling of `CacheRequiredError` that
+  `BaselineUnreadableError` is of `NoBaselineError`: both remediate the same way,
+  so the status is identical, but "nothing has been explored here" and "what was
+  explored will not parse" are different facts about a deployment and only one of
+  them suggests something went wrong. A host can page on the second without
+  matching on prose.
+
+  It carries no `schema_version`, unlike the baseline's, and the asymmetry is the
+  one already reasoned out in `maintain/snapshot.py`: the cache's version drives a
+  `<` comparison that *degrades*, where the baseline's is a membership test that
+  *refuses*. A degrading version leaves no refusal for the attribute to carry.
+
+### Fixed
+
+- **A corrupt exploration cache no longer reports as a bad request** ([#249]).
+  `load_cache` raises on a document it cannot parse, and pydantic's
+  `ValidationError` subclasses `ValueError`, so an unreadable cache fell through
+  to the CLI catch-all and was classified as `reason: request`. That tells an
+  operator they typed something wrong, and tells a host to retry with different
+  arguments, when the fix is a command nobody has run. It is the same defect
+  `_require_baseline` fixed for the baseline in 1.6.3, on the load the storage
+  contract had already flagged: *"this load has no such wrapper yet [...] raise a
+  `ValueError` so the load is classifiable when it gets one."* All thirteen
+  engine call sites, across `explore`, `maintain` and `transform`, now go through
+  `readable_cache`, including the one `transform test --scaffold` added above:
+  it types every value in a `given` row from the cache, so an unreadable one
+  reached the catch-all there too.
+
+  `explore/semantic/local.py` is deliberately **not** routed through it. Its bare
+  `except Exception: return None` is documented as intentional, because a metric
+  query is governed by dimension name before any SQL exists and a repo that never
+  ran `explore map` can still query metrics. Routing it would make
+  `explore semantic query` refuse where it currently degrades.
+
+- **An unreadable drift report is rebuilt instead of refused** ([#249]). Same
+  root cause, deliberately opposite remedy, and the one the note beside
+  `DRIFT_SCHEMA_VERSION` pre-committed to: a baseline is *vouched for* and
+  nothing else reproduces it, while a drift report is *derived* and
+  `maintain check` regenerates it from the baseline on demand. `_stored_drift`
+  treats a document that will not parse as absent, so `_record_axes` rebuilds it
+  exactly as it already did for a report measured against a different baseline,
+  and `reconcile` raises the `NoBaselineError` naming `maintain check` that it
+  already raised for a missing one. No new error class, because neither caller
+  needed one.
+
+- **A declared join is measured, and the measurement does not revise the
+  declaration** ([#163]). A relationship the project declares could not be
+  verified at any budget, by any flag, from any caller: verify selected its
+  probes by `kind`, and the skip happened *upstream* of `--verify`, so asking for
+  verification spent nothing extra and covered nothing extra. `fanout_pairs` was
+  permanently empty for a project that declares its joins, and `maintain grain`
+  returned a result indistinguishable from a clean join graph. The same `kind`
+  gate had since spread: the catastrophic orphan-rate finding added in 1.6.4
+  ([#207]) was unreachable for exactly the cooperative case it was written for,
+  because inference finds no edges where the project already declares them.
+
+  The split this turns on is that a declaration is a claim *about the data*, and
+  the overlap SQL does not care how the relationship was learned. **Measurement**
+  (`verified`, `orphan_fraction`) now applies to both kinds. **Confidence
+  arithmetic stays inferred-only**: demoting a declared 1.0 on a measured 0.2
+  orphan rate would report a data defect as though dex had grown less sure of an
+  edge the project stated. The disagreement surfaces through `orphan_findings`
+  instead, with its own wording, because "the project and the warehouse disagree"
+  is a different and more actionable claim than a shared name that turned out not
+  to be a shared key.
+
+  Two things this needed beyond lifting the filter. `declared_relationships()`
+  was called *after* the verify handshake, so lifting the filter alone would have
+  changed nothing on `explore relationships` or `explore map`; both now verify the
+  merged set, which also means no measurement can be discarded by the merge rule
+  that prefers a declared edge over the same inferred one, since at merge time
+  nothing has been measured yet. And `probe_candidates` is now the single
+  definition of what verify runs on, shared by `verify_relationships`,
+  `probe_statements` and `_verify_estimate`, which previously agreed only by each
+  hard-coding the same filter. Pricing N probes and issuing N+M under-reports
+  spend *before* it happens, which is the one thing the cost preflight exists to
+  prevent.
+
+  Cost and scope. `--verify` now costs one additional probe per declared edge on
+  a billed connector, covered by the existing handshake precisely because the
+  estimate and the run select through the same function. The declared channel
+  only exists under `--use-project`, so this is invisible in any fixture that
+  maps without the flag. Composite keys stay excluded, explicitly rather than by
+  omission: `_overlap_probe_sql` joins on the first column of each side, which
+  answers about a *different* relationship and would report its orphan count as
+  the join's, so composites stay unverified until the probe itself spans a key.
+  And the fix is **not retroactive**, since `grain_plan` reads the baseline
+  snapshot and existing snapshots hold declared joins at `verified: false`;
+  fanout drift on a declared join needs a fresh `maintain snapshot` taken after
+  the join was declared.
+
+### Changed
+
+- **`readable_cache` classifies rather than requires**, which is why there is no
+  `_require_cache` mirroring `_require_baseline`. Every `load_snapshot` caller
+  needs a baseline, so that helper can refuse on `None`. Absence is *legal* at
+  most cache call sites: `explore profile`, `explore relationships` and
+  `explore map` read a prior cache only to merge pre-run state and a first run
+  has none, `maintain snapshot` falls back to a metadata capture, and
+  `_baseline_warnings` merely skips a warning. `None` is returned unchanged and
+  every caller keeps the absence policy it already had.
+
+- The refusal names the cost. `maintain snapshot` is free on every connector, so
+  the baseline's remedy can say "just re-run it"; `explore map` re-profiles the
+  warehouse and **bills**. An operator choosing between investigating a corrupt
+  document and replacing it needs that said before they run it.
+
 ## [1.6.4] - 2026-08-13
 
 ### Added
