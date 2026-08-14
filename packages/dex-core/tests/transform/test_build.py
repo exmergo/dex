@@ -64,17 +64,47 @@ def forbid_dbt(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(build_module, "_default_runner", exploded)
 
 
-def test_unconfirmed_build_needs_confirmation(
-    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+def test_unconfirmed_build_on_free_local_runs_and_warns_instead_of_asking(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """Issue #197: a confirm handshake is emitted only where spend is possible.
+    DuckDB is free, so an unconfirmed build runs rather than asking the caller
+    to confirm spending nothing, and the envelope says so instead of staying
+    silent about the skipped ask."""
+
+    _fake_runner_factory(monkeypatch, returncode=0)
     rc, envelope = _run(
         ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"], capsys
     )
-    assert rc == 0
-    assert envelope["status"] == "needs_confirmation"
-    # DuckDB is free, but the gate still runs: the cost is surfaced before spend.
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
     assert envelope["cost"]["paradigm"] == "free_local"
     assert envelope["cost"]["estimate"] == 0.0
+    assert any("no confirm handshake" in w for w in envelope["warnings"])
+
+
+def test_confirmed_build_on_free_local_carries_no_skipped_handshake_note(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Passing --confirm on a free connector does no harm, and nothing was
+    actually skipped that is worth a note about."""
+
+    _fake_runner_factory(monkeypatch, returncode=0)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert not any("no confirm handshake" in w for w in envelope["warnings"])
 
 
 @pytest.mark.parametrize("target", ["prod", "production", "PRD", "live"])
