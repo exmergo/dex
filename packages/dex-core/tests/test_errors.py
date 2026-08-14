@@ -105,6 +105,7 @@ INTERNAL_REFUSALS = {
     "InitError",
     "ProdTargetRefusedError",
     "ScaffoldError",
+    "TestScaffoldError",
 }
 
 

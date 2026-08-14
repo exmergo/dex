@@ -64,6 +64,10 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
 dex transform macro [name]        -> list the shipped dbt macros, or plan scaffolding one into the
                                      project's macro directory (dbt-parse-checked; apply like any plan)
+dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
+                                     ref()/source() input with only the columns <m> reads, typed from
+                                     the exploration cache; expect: is an empty stub that fails until
+                                     filled in (dbt-parse-checked; apply like any plan)
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan

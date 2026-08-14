@@ -11,6 +11,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform test --scaffold <model>` derives a dbt unit test from a
+  model's own inputs** ([#215]). Writing a unit test by hand means restating
+  every input's column set with correctly typed values before the assertion
+  that is the actual point of the test even starts, and that restatement is
+  mechanical: the model's own `ref()`/`source()` calls name the inputs, the
+  model's own SQL names which of each input's columns it reads, and the
+  exploration cache already knows their types. The scaffold now derives all
+  three and emits a `unit_tests:` skeleton, planned like any other
+  schema.yml edit: a `given` block per input, holding only the columns that
+  input's data actually feeds into the model, not every column it has.
+
+  Two things this deliberately never does. It never invents the expected
+  output: the `expect:` block is an empty stub, on purpose, that fails until
+  a human fills it in, because a fabricated expectation would pass by
+  construction, which is worse than no test. And it never guesses a
+  column's type: every value in a `given` row is typed from the exploration
+  cache, and an input the cache does not know yet is a refusal naming it
+  (`explore map` first), not a placeholder. A `select *`/`t.*` over a single
+  resolvable source is expanded against the cache instead of refused, since
+  that is the ordinary shape of a staging model's own source read; over more
+  than one joined source, or an unqualified column with more than one in
+  scope, it is refused rather than guessed at, same as an unsupported query
+  shape. dbt's own parser gates the plan before it is ever stored, the same
+  layering `transform macro` already uses.
+
 - **A run directory holding exactly one `*.duckdb` file, and no config
   anywhere, is used instead of refused** ([#199]). The first two commands a
   new user tries against a bare DuckDB file both refused: no `.dex/config.yml`

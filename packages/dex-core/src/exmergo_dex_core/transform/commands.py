@@ -44,6 +44,7 @@ from .results import (
     MacroResult,
     PlanListResult,
     PlanResult,
+    TestScaffoldResult,
 )
 
 if TYPE_CHECKING:
@@ -373,6 +374,63 @@ def cmd_macro(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     if result.up_to_date:
         return to_envelope(result)
     return to_envelope(result, hints=_plan_hint(result))
+
+
+def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResult:
+    """Plan a ``unit_tests:`` skeleton scaffolded from a model's own
+    ref()/source() inputs: a ``given`` block per input holding only the
+    columns the model actually reads, typed from the exploration cache.
+
+    Never invents the expected output: the ``expect:`` block is a deliberate,
+    empty stub that fails until a human fills it in. dbt's own parser is the
+    gate (same as ``macro()``), so a malformed fixture is caught before the
+    plan is ever stored, not left to `transform build`.
+    """
+
+    if not model_name:
+        raise ValueError(
+            "transform test needs a model: `transform test --scaffold <model>`"
+        )
+
+    from ..dbt_project import load as load_project
+    from . import test_scaffold as test_scaffold_mod
+
+    project = engine.project_dir()
+    view = load_project(project)
+    cache = engine.store.load_cache()
+    edits, inputs = test_scaffold_mod.unit_test_scaffold_edits(view, cache, model_name)
+
+    from .build import shadow_parse
+
+    parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
+    warnings: list[str] = []
+    if not parse_result["available"]:
+        warnings.append(parse_result["reason"])
+    elif not parse_result["success"]:
+        raise DbtParseError(
+            _failure_message("dbt parse failed", parse_result["messages"]),
+            warnings=parse_result["messages"][1:],
+        )
+
+    planned = _make_plan(engine, f"scaffold unit test for {model_name}", edits)
+    planned.warnings.extend(warnings)
+    planned.warnings.append(
+        "expect: is a stub with no rows; this unit test fails until you fill "
+        "in the model's actual expected output for the given fixtures above"
+    )
+    return TestScaffoldResult(**planned.model_dump(), model=model_name, inputs=inputs)
+
+
+def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from .test_scaffold import TestScaffoldError
+
+    try:
+        result = test_scaffold(engine, getattr(args, "scaffold", None))
+        return to_envelope(result, hints=_plan_hint(result))
+    except DbtParseError as exc:
+        return env.error_for(exc, warnings=exc.warnings)
+    except (ValueError, TestScaffoldError) as exc:
+        return env.error_for(exc)
 
 
 def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
