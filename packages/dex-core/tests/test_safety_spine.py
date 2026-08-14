@@ -60,6 +60,7 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
             safe={"id", "signup_date"},
             shape={"email"},
             type_req={"id", "email"},
+            key_shape_req={"email"},
             temporal_req={"signup_date"},
         )
     finally:
@@ -72,6 +73,8 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # string-eligible fractions on the VARCHAR column, epoch fractions on both.
     assert "ts_ns_1" in sql and "ts_sl1_1" in sql
     assert "ts_ep_s_0" in sql and "ts_ep_s_1" in sql
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_1" in sql and "ks_hex_1" in sql
     # Temporal-continuity statistics (#206) ride the same statement too: the
     # alignment fractions and all three granularity variants for the date column.
     assert "tc_da_2" in sql and "tc_ma_2" in sql
@@ -115,6 +118,46 @@ def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
         )
     # The translated calendar date is what appears, not the integer.
     assert "2023-11-14" in notes
+
+
+def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
+    """#205: neither a concrete numeric id nor a concrete hash string may
+    reach the generated data-quality note text -- only fractions and a
+    length-derived shape label."""
+
+    import hashlib
+
+    import duckdb
+
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "heterogeneous_key.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY)")
+    rows = [(str(1000 + i),) for i in range(90)]
+    # md5-shaped test fixture data only, not a security use.
+    hashes = [
+        hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
+        for i in range(10)
+    ]
+    rows += [(h,) for h in hashes]
+    conn.executemany("INSERT INTO t VALUES (?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (dataset,) = profile(adapter, ["heterogeneous_key.main.t"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "mixes value shapes" in notes
+    for i in range(90):
+        assert str(1000 + i) not in notes, "no concrete numeric id in note text"
+    for h in hashes:
+        assert h not in notes, "no concrete hash value in note text"
+    # Only the fraction and the length-derived shape label appear.
+    assert "90% numeric" in notes and "md5-shaped" in notes
 
 
 def test_combination_probe_sql_is_select_only_in_every_dialect():
@@ -1787,14 +1830,23 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}, shape, type_req, temporal_req
+        "test-proj.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     # Declared-type-vs-content statistics (#204) ride the same statement too.
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too,
     # using TIMESTAMP_TRUNC/TIMESTAMP_DIFF (BigQuery's reversed argument
     # order and type-specific truncation family).
@@ -2205,13 +2257,21 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     temporal_req = {"SIGNUP_TS"}
     sql, _plan = adapter._build_aggregate_sql(
-        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req, temporal_req
+        "SHOP.PUBLIC.CUSTOMERS",
+        columns,
+        {"ID"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
     assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
@@ -2491,13 +2551,21 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "shop.core.customers", columns, {"id"}, shape, type_req, temporal_req
+        "shop.core.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
     assert "date_trunc" in sql and "TIMESTAMPDIFF" in sql
@@ -2711,13 +2779,21 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req, temporal_req
+        "dexdb.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
     assert "date_trunc" in sql and "EXTRACT(EPOCH" in sql
@@ -2961,13 +3037,21 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req, temporal_req
+        "dexdb.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
     assert "DATE_TRUNC" in sql and "DATEDIFF" in sql

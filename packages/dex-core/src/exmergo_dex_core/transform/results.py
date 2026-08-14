@@ -100,6 +100,23 @@ class MacroResult(PlanResult):
         return {**payload, **super().data()}
 
 
+class TestScaffoldResult(PlanResult):
+    """A ``unit_tests:`` skeleton, scaffolded from a model's own ref()/source()
+    inputs and planned like any other schema.yml edit.
+
+    A :class:`PlanResult` for the same reason :class:`MacroResult` is one:
+    scaffolding a unit test *is* planning an edit. ``inputs`` are the bare
+    names of every input a ``given`` block was built for, in the order the
+    model reads them.
+    """
+
+    model: str = ""
+    inputs: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        return {"model": self.model, "inputs": self.inputs, **super().data()}
+
+
 class ApplyResult(Result):
     """What applying a plan wrote, or the conflicts that stopped it.
 

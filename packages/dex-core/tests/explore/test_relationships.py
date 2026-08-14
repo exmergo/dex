@@ -764,6 +764,94 @@ def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):
     assert rel["confidence"] < 0.5, "measured non-containment demotes the guess"
 
 
+# --- issue #163: a declared join is measurable too --------------------------
+
+
+def test_probe_statements_and_verify_cover_the_same_set():
+    """The estimate and the run must select identically.
+
+    `probe_statements` prices what `verify_relationships` will spend, so a
+    filter that admits a join to one and not the other under-reports cost
+    *before* it is incurred, which no later reconciliation can catch. Both go
+    through `probe_candidates`; this asserts the three stay one decision rather
+    than three that currently agree.
+    """
+
+    from exmergo_dex_core.explore.relationships import (
+        probe_candidates,
+        probe_statements,
+    )
+
+    mixed = [
+        _rel(kind=RelationshipKind.INFERRED, verified=False),
+        _rel(kind=RelationshipKind.DECLARED, verified=False),
+        _rel(
+            kind=RelationshipKind.DECLARED,
+            from_columns=["order_id", "line_no"],
+            to_columns=["order_id", "line_no"],
+            verified=False,
+        ),
+    ]
+
+    candidates = probe_candidates(mixed)
+    assert len(probe_statements(mixed, "duckdb")) == len(candidates)
+
+    # The composite is the one excluded, and deliberately: the probe SQL joins
+    # on a single column pair, so measuring it would answer about a different
+    # relationship than the one declared.
+    assert [len(r.from_columns) for r in candidates] == [1, 1]
+    assert {r.kind for r in candidates} == {
+        RelationshipKind.INFERRED,
+        RelationshipKind.DECLARED,
+    }
+
+
+def test_verify_measures_a_declared_join_without_touching_its_confidence(
+    tmp_path: Path,
+):
+    """The design split at the spine of #163.
+
+    Same warehouse and same 0.6 orphan rate as the inferred demotion test
+    above, but with the join declared by the project. The measurement lands;
+    the confidence does not move. A declared join is not a name-based guess
+    whose credibility is up for revision -- the project asserted it, and a
+    disagreement is a fact about the data, reported as a finding rather than
+    smuggled into the number that means "how sure is dex".
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "declared_orphans.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute(
+        "INSERT INTO orders VALUES (10, 1), (11, 2), (12, 7), (13, 8), (14, 9)"
+    )
+    conn.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.relationships import verify_relationships
+
+    declared = _rel(
+        from_dataset="declared_orphans.main.orders",
+        to_dataset="declared_orphans.main.customers",
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    declared.confidence = 1.0
+
+    adapter = DuckDBAdapter(str(path))
+    try:
+        verify_relationships(adapter, [declared])
+    finally:
+        adapter.close()
+
+    assert declared.verified is True
+    assert declared.orphan_fraction == 0.6
+    assert declared.confidence == 1.0, "a declaration is not demoted by measurement"
+
+
 # --- orphan findings (#207): a complete orphan rate is a finding, not just a
 # demoted confidence -------------------------------------------------------
 
@@ -800,7 +888,16 @@ def _rel(
         (_rel(orphan_fraction=0.0), False),
         (_rel(orphan_fraction=None), False),  # verified but nothing measured
         (_rel(verified=False, orphan_fraction=1.0), False),  # nothing measured
-        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0), False),
+        # Issue #163: a declared join is probed now, so it reaches this
+        # decision at all. It qualifies on the same measured threshold as an
+        # inferred one -- see the wording split below for why it is not the
+        # same finding.
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0), True),
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.6), False),
+        (
+            _rel(kind=RelationshipKind.DECLARED, verified=False, orphan_fraction=1.0),
+            False,
+        ),
     ],
 )
 def test_orphan_findings_decisions(rel: Relationship, expect_finding: bool):
@@ -813,9 +910,33 @@ def test_orphan_findings_decisions(rel: Relationship, expect_finding: bool):
         assert found_rel is rel
         assert "db.s.orders.customer_id" in text
         assert "db.s.customers.id" in text
-        assert "not evidence of a shared key" in text
     else:
         assert findings == []
+
+
+def test_orphan_finding_text_differs_by_kind():
+    """The two kinds are different findings, not one finding on two inputs.
+
+    An inferred edge's suspect claim is dex's own name match, so the text
+    disclaims it. A declared edge has no name coincidence to disclaim: the
+    project asserted the key and the data contradicts it. Emitting the
+    inferred wording for a declared join would tell a reader their dbt
+    relationship test was a dex guess.
+    """
+
+    from exmergo_dex_core.explore.relationships import orphan_findings
+
+    ((_, inferred_text),) = orphan_findings([_rel(orphan_fraction=1.0)])
+    ((_, declared_text),) = orphan_findings(
+        [_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0)]
+    )
+
+    assert "shares a column name" in inferred_text
+    assert "not evidence of a shared key" in inferred_text
+
+    assert "declared as a foreign key" in declared_text
+    assert "the project and the warehouse disagree" in declared_text
+    assert "shares a column name" not in declared_text
 
 
 def test_verify_reports_a_complete_orphan_edge_as_a_finding(tmp_path: Path, capsys):

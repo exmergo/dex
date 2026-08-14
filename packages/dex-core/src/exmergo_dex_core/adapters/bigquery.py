@@ -38,6 +38,8 @@ from .base import (
     is_integer_type,
     is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
@@ -436,6 +438,7 @@ class BigQueryAdapter:
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
         temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         if self._unqueryable(identifier):
@@ -443,6 +446,7 @@ class BigQueryAdapter:
         safe = safe_min_max or set()
         shape = shape_stats or set()
         type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
         temporal_req = temporal_stats or set()
         sample_percent = self._sample_percent(identifier)
         results: list[ColumnAggregate] = []
@@ -454,6 +458,7 @@ class BigQueryAdapter:
                 safe,
                 shape,
                 type_req,
+                key_shape_req,
                 temporal_req,
                 sample_percent=sample_percent,
             )
@@ -516,33 +521,38 @@ class BigQueryAdapter:
         safe: set[str],
         shape: set[str],
         type_req: set[str],
+        key_shape_req: set[str],
         temporal_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
+    ) -> tuple[
+        str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]]
+    ]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape/type-contradiction/temporal-continuity fractions only
-        # where requested. Pure (no client), so the SELECT-only property is
-        # testable without a connection. Repeated (ARRAY) columns get no
-        # aggregates at all: they cannot be NULL in BigQuery and COUNT/DISTINCT
-        # are invalid on them; other nested types get a COUNTIF non-null count
-        # only.
+        # and value-shape/type-contradiction/key-shape/temporal-continuity
+        # fractions only where requested. Pure (no client), so the SELECT-only
+        # property is testable without a connection. Repeated (ARRAY) columns
+        # get no aggregates at all: they cannot be NULL in BigQuery and
+        # COUNT/DISTINCT are invalid on them; other nested types get a
+        # COUNTIF non-null count only.
         source = self._quote(identifier)
         if sample_percent is not None:
             source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
+        plan: list[
+            tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]
+        ] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             repeated = col.data_type.upper().startswith("ARRAY")
             nested = repeated or self._is_nested(col.data_type)
             if repeated:
-                plan.append((i, col, False, False, False, False, False, False))
+                plan.append((i, col, False, False, False, False, False, False, False))
                 continue
             if nested:
                 select_parts.append(f"COUNTIF({qcol} IS NOT NULL) AS nn_{i}")
-                plan.append((i, col, True, False, False, False, False, False))
+                plan.append((i, col, True, False, False, False, False, False, False))
                 continue
             select_parts.append(f"COUNT({qcol}) AS nn_{i}")
             select_parts.append(f"APPROX_COUNT_DISTINCT({qcol}) AS nd_{i}")
@@ -565,6 +575,9 @@ class BigQueryAdapter:
                         bigint_type=_BIGINT_TYPE,
                     )
                 )
+            wants_key_shape = col.name in key_shape_req
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
             wants_temporal = col.name in temporal_req
             if wants_temporal:
                 dtype = col.data_type
@@ -593,6 +606,7 @@ class BigQueryAdapter:
                     wants_min_max,
                     wants_shape,
                     wants_type,
+                    wants_key_shape,
                     wants_temporal,
                 )
             )
@@ -611,7 +625,7 @@ class BigQueryAdapter:
     def _read_aggregates(
         self,
         row: Any,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
@@ -625,6 +639,7 @@ class BigQueryAdapter:
             wants_min_max,
             wants_shape,
             wants_type,
+            wants_key_shape,
             wants_temporal,
         ) in plan:
             nn = row[f"nn_{i}"] if has_count else None
@@ -652,6 +667,7 @@ class BigQueryAdapter:
                     person_shape_fraction=shape_stat_value(row, f"sp_{i}", wants_shape),
                     avg_token_count=shape_stat_value(row, f"st_{i}", wants_shape),
                     **type_contradiction_aggregate_kwargs(row, i, wants_type),
+                    **key_shape_aggregate_kwargs(row, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(row, i, wants_temporal),
                 )
             )
@@ -821,12 +837,13 @@ class BigQueryAdapter:
                 if not is_blob_type(c.data_type)
                 or f"{identifier}.{c.name}".lower() in blob_paths
             ]
-            # min/max, shape, type-contradiction, and temporal-continuity
-            # fractions add no scanned bytes: columnar billing already
-            # charges the whole column.
+            # min/max, shape, type-contradiction, key-shape, and
+            # temporal-continuity fractions add no scanned bytes: columnar
+            # billing already charges the whole column.
             safe: set[str] = set()
             shape: set[str] = set()
             type_req: set[str] = set()
+            key_shape_req: set[str] = set()
             temporal_req: set[str] = set()
             sample_percent = self._sample_percent(identifier)
             total = 0.0
@@ -837,6 +854,7 @@ class BigQueryAdapter:
                     safe,
                     shape,
                     type_req,
+                    key_shape_req,
                     temporal_req,
                     sample_percent=sample_percent,
                 )

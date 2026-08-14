@@ -25,6 +25,8 @@ from .base import (
     is_integer_type,
     is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     shape_stat_expressions,
     shape_stat_value,
     temporal_alignment_expressions,
@@ -229,11 +231,13 @@ class DuckDBAdapter:
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
         temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
         type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
         temporal_req = temporal_stats or set()
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
@@ -244,6 +248,7 @@ class DuckDBAdapter:
                     safe,
                     shape,
                     type_req,
+                    key_shape_req,
                     temporal_req,
                 )
             )
@@ -256,10 +261,11 @@ class DuckDBAdapter:
         safe: set[str],
         shape: set[str],
         type_req: set[str],
+        key_shape_req: set[str],
         temporal_req: set[str],
     ) -> list[ColumnAggregate]:
         sql, plan = self._build_aggregate_sql(
-            identifier, columns, safe, shape, type_req, temporal_req
+            identifier, columns, safe, shape, type_req, key_shape_req, temporal_req
         )
         row = self._run_select(sql)[0]
         # Re-read by alias name via the cursor description so we never rely on
@@ -276,6 +282,7 @@ class DuckDBAdapter:
             wants_min_max,
             wants_shape,
             wants_type,
+            wants_key_shape,
             wants_temporal,
         ) in plan:
             nn = int(values[f"nn_{i}"])
@@ -304,6 +311,7 @@ class DuckDBAdapter:
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
+                    **key_shape_aggregate_kwargs(values, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
                 )
             )
@@ -397,18 +405,19 @@ class DuckDBAdapter:
         safe: set[str],
         shape: set[str],
         type_req: set[str],
+        key_shape_req: set[str],
         temporal_req: set[str],
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate query for the whole batch: COUNT(*) once, plus per column a
         # non-null count, an approximate distinct, min/max only where allowed, and
-        # value-shape/type-contradiction/temporal-continuity fractions only where
-        # requested. Returns the SQL and a plan mapping each column to which
-        # aggregates it got, so results read back by alias unambiguously. Pure:
-        # builds no connection, so it is unit-testable (SELECT-only) without
+        # value-shape/type-contradiction/key-shape/temporal-continuity fractions
+        # only where requested. Returns the SQL and a plan mapping each column to
+        # which aggregates it got, so results read back by alias unambiguously.
+        # Pure: builds no connection, so it is unit-testable (SELECT-only) without
         # touching the database.
         table_sql = self._quote(identifier)
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -435,6 +444,9 @@ class DuckDBAdapter:
                         bigint_type=_BIGINT_TYPE,
                     )
                 )
+            wants_key_shape = (col.name in key_shape_req) and not nested
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
             wants_temporal = (col.name in temporal_req) and not nested
             if wants_temporal:
                 select_parts.extend(
@@ -459,6 +471,7 @@ class DuckDBAdapter:
                     wants_min_max,
                     wants_shape,
                     wants_type,
+                    wants_key_shape,
                     wants_temporal,
                 )
             )

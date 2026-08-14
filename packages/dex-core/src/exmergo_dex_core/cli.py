@@ -44,7 +44,7 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "cluster",
         "semantic",
     ],
-    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro"],
+    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro", "test"],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
@@ -294,6 +294,11 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                if group == "transform" and name == "test":
+                    # `test` is scaffold-only for now: the model to derive a
+                    # unit_tests: skeleton from. No bare `transform test`
+                    # mode exists yet, unlike `macro`'s list-when-bare shape.
+                    sp.add_argument("--scaffold", default=None)
                 if group == "semantic":
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
@@ -419,6 +424,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "deps"): "cmd_deps",
         ("transform", "plans"): "cmd_plans",
         ("transform", "macro"): "cmd_macro",
+        ("transform", "test"): "cmd_test",
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
@@ -476,6 +482,11 @@ def main(argv: list[str] | None = None) -> int:
     # adapter; a name is enough, and unlike an adapter it survives a connection
     # that could not be opened. Stays None when nothing selected a connector.
     paradigm: env.Paradigm | None = None
+    # Read back after dispatch, not just after construction: the run-directory
+    # DuckDB auto-detect (issue #199) only fires on the first `_adapter()` call
+    # inside the handler, so a read taken right after `from_repo` would still
+    # see no connector even on a run that went on to pick one.
+    engine: DexEngine | None = None
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -499,10 +510,14 @@ def main(argv: list[str] | None = None) -> int:
             budget=getattr(args, "budget", None),
             confirmed=getattr(args, "confirm", False),
         )
-        paradigm = engine.paradigm
         try:
             envelope = dispatch(args, engine)
         finally:
+            # Unlike an adapter, the paradigm survives a connection that could
+            # not be opened, so this still gives a refusal envelope something
+            # to name; taken in the `finally` so it reflects whatever the
+            # handler resolved, auto-detect included, not just construction.
+            paradigm = engine.paradigm
             engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
@@ -515,6 +530,14 @@ def main(argv: list[str] | None = None) -> int:
         if paradigm is None and getattr(args, "connector", None):
             paradigm = paradigm_for(args.connector)
         envelope = env.error_for(exc, env.redact(str(exc)))
+
+    # A guess the engine made on the caller's behalf (issue #199's run-directory
+    # DuckDB auto-detect) must never be silent, so it rides into every envelope
+    # this way rather than through whatever warnings a handler happened to
+    # collect; an engine that never got this far (construction itself refused)
+    # has nothing to carry.
+    if engine is not None and engine.connection_warnings:
+        envelope.warnings = list(engine.connection_warnings) + list(envelope.warnings)
 
     # Every command runs against a connector or against none, so every envelope
     # can name the paradigm a later billed command would spend in. Filled only
