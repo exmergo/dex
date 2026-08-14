@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 
 def test_clean_warehouse_reports_no_grain_drift(maintain_repo):
     maintain_repo.snapshot()
@@ -57,6 +59,94 @@ def test_new_orphans_move_the_verified_join(maintain_repo):
     assert finding["data"]["orphan_fraction_before"] == 0.0
     assert finding["data"]["orphan_fraction_after"] > 0.0
     assert finding["severity"] == "medium"
+
+
+# --- issue #163: the declared channel reaches the fanout axis ---------------
+
+_STG_ORDERS_WITH_DECLARED_FK = (
+    "version: 2\n"
+    "\n"
+    "models:\n"
+    "  - name: stg_orders\n"
+    "    columns:\n"
+    "      - name: order_id\n"
+    "        tests: [unique, not_null]\n"
+    "      - name: customer_id\n"
+    "        tests:\n"
+    "          - not_null\n"
+    "          - relationships:\n"
+    "              to: source('main', 'customers')\n"
+    "              field: id\n"
+)
+
+
+def _declare_the_customer_fk(repo):
+    """State the join in the project, then rebuild the map that pins it.
+
+    The declaration has to exist before the `--verify` pass for the baseline to
+    carry a measurement for it, which is the whole bootstrap this issue turns
+    on: the fix is not retroactive over a snapshot taken before the join was
+    declared.
+    """
+
+    repo.edit("models/staging/stg_orders.yml", _STG_ORDERS_WITH_DECLARED_FK)
+    # --use-project is what folds the project's declared joins in at all; the
+    # baseline fixture maps without it, so every edge there is inferred.
+    rc, payload = repo.dex("explore", "map", "--verify", "--use-project")
+    assert rc == 0 and payload["status"] == "ok", payload
+    return payload
+
+
+def test_a_declared_join_is_verified_and_reaches_the_baseline(maintain_repo):
+    """The precondition #163 says is unreachable: `verified: true` on a
+    declared edge. Asserted on the cache rather than the envelope, because the
+    baseline is what `maintain grain` later reads."""
+
+    _declare_the_customer_fk(maintain_repo)
+
+    cache = json.loads(
+        (maintain_repo.root / ".dex" / "cache.json").read_text(encoding="utf-8")
+    )
+    declared = [
+        r
+        for r in cache["relationships"]
+        if r["kind"] == "declared" and r["from_columns"] == ["customer_id"]
+    ]
+    assert declared, "the project's relationships test produced no declared edge"
+    for rel in declared:
+        assert rel["verified"] is True
+        assert rel["orphan_fraction"] == 0.0
+        # The measurement must not have rewritten the declaration's own claim:
+        # a declared join is asserted at 1.0 and stays there.
+        assert rel["confidence"] == 1.0
+
+
+def test_declared_join_fanout_regression_is_a_finding(maintain_repo):
+    """#163's live consequence, end to end: a project that declares its joins
+    used to lose the axis that validates them, and `maintain grain` returned a
+    result indistinguishable from a clean join graph."""
+
+    _declare_the_customer_fk(maintain_repo)
+    maintain_repo.snapshot()
+    # Orphan the *declared* edge specifically: it is stg_orders.customer_id ->
+    # customers, so the rows have to land in stg_orders rather than in orders.
+    maintain_repo.sql(
+        "INSERT INTO stg_orders SELECT 200 + i, 900 + i, 1.0, 'placed', "
+        "DATE '2024-03-01' FROM range(1, 6) t(i)"
+    )
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok"
+    findings = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "join_orphans_increased"
+        and f["identifier"] == "warehouse.main.stg_orders"
+        and f["column"] == "customer_id"
+    ]
+    assert len(findings) == 1, payload["data"]["findings"]
+    assert findings[0]["data"]["orphan_fraction_before"] == 0.0
+    assert findings[0]["data"]["orphan_fraction_after"] > 0.0
 
 
 def test_dropped_key_column_is_left_to_the_schema_axis(maintain_repo):
