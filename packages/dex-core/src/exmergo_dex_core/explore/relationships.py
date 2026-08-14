@@ -5,9 +5,11 @@ uniqueness signals) and never scans data, which keeps it free at the cost of
 confidence, so every inferred join carries a confidence the agent can weigh. The
 one deliberate exception is the opt-in ``--verify`` pass
 (:func:`verify_relationships`), which runs one bounded, engine-authored aggregate
-probe per inferred join to measure the actual key overlap. Declared joins come
-from the dbt project; absent one, they are simply empty (explore is designed to
-work without a dbt project).
+probe per join to measure the actual key overlap. Declared joins come from the
+dbt project; absent one, they are simply empty (explore is designed to work
+without a dbt project). They are probed too: a declaration is a claim about the
+data, so it is measurable, and only what the measurement may *change* differs by
+kind (see :func:`verify_relationships`).
 """
 
 from __future__ import annotations
@@ -391,30 +393,78 @@ _ORPHAN_FINDING_THRESHOLD = 0.9
 def orphan_findings(
     relationships: list[Relationship],
 ) -> list[tuple[Relationship, str]]:
-    """A verified inferred join whose orphan fraction clears
-    `_ORPHAN_FINDING_THRESHOLD`, paired with the finding text a caller (or a
-    future drift-sweep detector) needs: both sides, named, plus the measured
-    fraction. Declared joins and anything not verified (nothing was
-    measured) never qualify; confidence arithmetic is unchanged, this only
-    reports what `verify_relationships` already measured.
+    """A verified join whose orphan fraction clears `_ORPHAN_FINDING_THRESHOLD`,
+    paired with the finding text a caller (or a future drift-sweep detector)
+    needs: both sides, named, plus the measured fraction. Anything not verified
+    (nothing was measured) never qualifies; confidence arithmetic is unchanged,
+    this only reports what `verify_relationships` already measured.
+
+    The two kinds get different text because they are different findings. For
+    an inferred join the claim under suspicion is dex's own: a shared column
+    name turned out not to be a shared key. For a declared one the name is not
+    the evidence at all, so there is nothing to disclaim; the project states
+    this foreign key and the warehouse disagrees, which is a defect in the data
+    or in the declaration rather than a weak guess (issue #163).
     """
 
     findings = []
     for rel in relationships:
-        if rel.kind is not RelationshipKind.INFERRED or not rel.verified:
+        if not rel.verified:
             continue
         if rel.orphan_fraction is None:
             continue  # verified but zero non-null FK values: nothing measured
         if rel.orphan_fraction < _ORPHAN_FINDING_THRESHOLD:
             continue
-        text = (
+        edge = (
             f"{rel.from_dataset}.{rel.from_columns[0]} -> "
-            f"{rel.to_dataset}.{rel.to_columns[0]} shares a column name but "
-            f"{rel.orphan_fraction:.0%} of values have no match; the shared "
-            "name is not evidence of a shared key"
+            f"{rel.to_dataset}.{rel.to_columns[0]}"
         )
+        if rel.kind is RelationshipKind.DECLARED:
+            text = (
+                f"{edge} is declared as a foreign key but "
+                f"{rel.orphan_fraction:.0%} of values have no match in the "
+                "parent; the project and the warehouse disagree"
+            )
+        else:
+            text = (
+                f"{edge} shares a column name but "
+                f"{rel.orphan_fraction:.0%} of values have no match; the shared "
+                "name is not evidence of a shared key"
+            )
         findings.append((rel, text))
     return findings
+
+
+def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
+    """The joins an overlap probe would measure, declared and inferred alike.
+
+    The single definition of "what verify runs on". :func:`verify_relationships`
+    and :func:`probe_statements` both select through here so the set that gets
+    priced and the set that gets run cannot drift apart: pricing N probes and
+    then issuing N+M under-reports spend before it happens, which is the one
+    thing the cost guardrail exists to prevent.
+
+    A declared join is included because the overlap SQL does not care how the
+    relationship was learned. Declaring a foreign key is a claim about the data,
+    and a claim is exactly the kind of thing worth measuring (issue #163). What
+    the measurement is *allowed to change* still depends on the kind: see
+    :func:`verify_relationships` on confidence.
+
+    A composite join is excluded, and the exclusion is load-bearing rather than
+    an oversight. :func:`_overlap_probe_sql` joins on ``from_columns[0]`` and
+    ``to_columns[0]`` only, which was total coverage while inference was the
+    sole source (it emits single-column edges by construction) and stops being
+    so now that declared edges qualify. Probing the first column of a composite
+    key measures a different relationship than the one declared and would
+    report its orphan count as though it were the join's: silently wrong beats
+    unmeasured, so these stay unverified until the probe itself spans a key.
+    """
+
+    return [
+        rel
+        for rel in relationships
+        if len(rel.from_columns) == 1 and len(rel.to_columns) == 1
+    ]
 
 
 def verify_relationships(
@@ -424,23 +474,29 @@ def verify_relationships(
     timeout_seconds: float = 30.0,
     progress: ProgressReporter | None = None,
 ) -> None:
-    """Measure each inferred join with one overlap probe and adjust in place.
+    """Measure each join with one overlap probe and adjust in place.
 
     The probe counts non-null foreign-key values and how many have no match in
-    the parent (orphans). Full containment raises confidence; a high orphan rate
-    is strong evidence the name-based guess was wrong and demotes it well below
-    the emission threshold rather than deleting it, so the agent still sees what
-    was tried. Aggregate counts only; no key value ever leaves the engine.
+    the parent (orphans). Aggregate counts only; no key value ever leaves the
+    engine.
+
+    **Measurement applies to every candidate; confidence arithmetic does not.**
+    For an inferred join, full containment raises confidence and a high orphan
+    rate demotes it well below the emission threshold rather than deleting it,
+    so the agent still sees what was tried. A declared join is not a name-based
+    guess whose confidence is up for revision: the dbt project asserts it at
+    1.0, and a measurement that disagrees is a finding about the *data*, not
+    weaker evidence for the join. So ``verified`` and ``orphan_fraction`` are
+    set for both kinds and ``confidence`` moves only for inferred ones (issue
+    #163); a declared join that fails its probe surfaces through
+    :func:`orphan_findings`, where the disagreement can be stated plainly.
 
     An optional ``progress`` reporter emits a throttled stderr line per probed
-    join. It advances only on iterations that actually ran a probe, never on the
-    declared-join skip, so its counts match the reporter's ``total`` of inferred
-    joins; ``None`` (the default) keeps existing callers silent and unchanged.
+    join, so its counts match a ``total`` taken from :func:`probe_candidates`;
+    ``None`` (the default) keeps existing callers silent and unchanged.
     """
 
-    for rel in relationships:
-        if rel.kind is not RelationshipKind.INFERRED:
-            continue
+    for rel in probe_candidates(relationships):
         sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
         result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
         values = dict(zip(result.columns, result.cells[0], strict=True))
@@ -456,16 +512,17 @@ def verify_relationships(
         fraction = orphans / nonnull
         rel.orphan_fraction = round(fraction, 4)
 
-        confidence = rel.confidence or 0.5
-        if fraction == 0.0:
-            confidence += 0.1
-        elif fraction <= 0.02:
-            confidence += 0.05
-        elif fraction >= 0.2:
-            confidence -= 0.25
-        else:
-            confidence -= 0.1
-        rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
+        if rel.kind is RelationshipKind.INFERRED:
+            confidence = rel.confidence or 0.5
+            if fraction == 0.0:
+                confidence += 0.1
+            elif fraction <= 0.02:
+                confidence += 0.05
+            elif fraction >= 0.2:
+                confidence -= 0.25
+            else:
+                confidence -= 0.1
+            rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
 
         if progress is not None:
             progress.advance()
@@ -473,13 +530,12 @@ def verify_relationships(
 
 def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`verify_relationships` will run, one statement per
-    inferred join, in the adapter's dialect. Exists so a billed caller can
+    probed join, in the adapter's dialect. Exists so a billed caller can
     dry-run the probes for a cost estimate before confirming the spend."""
 
     return [
         _transpile_probe(_overlap_probe_sql(rel), dialect)
-        for rel in relationships
-        if rel.kind is RelationshipKind.INFERRED
+        for rel in probe_candidates(relationships)
     ]
 
 

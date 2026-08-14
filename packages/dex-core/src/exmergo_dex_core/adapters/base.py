@@ -108,6 +108,17 @@ class ColumnAggregate:
     epoch_seconds_max_value: int | None = None
     epoch_millis_min_value: int | None = None
     epoch_millis_max_value: int | None = None
+    #: Heterogeneous-key-shape statistics, computed only for columns the
+    #: engine requested via ``key_shape_stats`` (non-PII string columns).
+    #: The numeric bucket reuses ``numeric_string_fraction`` above unchanged;
+    #: ``hex_string_fraction`` explicitly excludes anything numeric already
+    #: claimed, so the two never double-count the same value. ``None`` means
+    #: not computed (not requested, ineligible type, or the dialect could
+    #: not).
+    uuid_string_fraction: float | None = None
+    hex_string_fraction: float | None = None
+    hex_string_min_length: int | None = None
+    hex_string_max_length: int | None = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +379,23 @@ EPOCH_SECONDS_HIGH = 4102444800  # 2100-01-01T00:00:00Z
 EPOCH_MILLIS_LOW = EPOCH_SECONDS_LOW * 1000
 EPOCH_MILLIS_HIGH = EPOCH_SECONDS_HIGH * 1000
 
+# Canonical dashed form only (8-4-4-4-12 hex groups). A UUID stripped of its
+# dashes is indistinguishable from a same-length hex string, so that form
+# falls through to HEX_PATTERN below rather than being claimed here.
+UUID_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# Charset-only: length is measured separately (MIN/MAX in
+# key_shape_expressions), not baked into the pattern, since a real hash
+# column is fixed-length but this predicate must still catch a *mixed*-length
+# hex column so there is something to report on.
+HEX_PATTERN = r"^[0-9a-fA-F]+$"
+
+# Friendly names for the hash lengths this shape recurs as in practice;
+# anything else is reported by its bare length instead of guessing further.
+_HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
+
 
 def type_contradiction_expressions(
     qcol: str,
@@ -485,6 +513,59 @@ def type_contradiction_aggregate_kwargs(
     }
 
 
+def key_shape_expressions(
+    qcol: str, i: int, regexp_predicate: Callable[[str, str], str]
+) -> list[str]:
+    """Heterogeneous-key-shape aggregate expressions for one column.
+
+    Every non-null value falls into exactly one of numeric / uuid / hex /
+    other by construction: the hex bucket explicitly excludes anything the
+    numeric pattern already claimed (a pure-digit string like ``"123456"``
+    is valid input to a hex-charset pattern too), which is what keeps
+    ``numeric_string_fraction`` directly reusable here unchanged and keeps
+    the two buckets from double-counting the same value. Plain boolean
+    predicates ANDed together carry none of the CAST-ordering risk
+    ``type_contradiction_expressions`` has to guard against; nothing here
+    can raise. ``qcol`` must already be quoted/escaped by the calling
+    adapter.
+    """
+
+    numeric_pred = regexp_predicate(qcol, NUMERIC_PATTERN)
+    hex_pred = regexp_predicate(qcol, HEX_PATTERN)
+    hex_not_numeric = f"({hex_pred} AND NOT {numeric_pred})"
+    return [
+        f"AVG(CASE WHEN {regexp_predicate(qcol, UUID_PATTERN)} THEN 1.0 "
+        f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS ks_uuid_{i}",
+        f"AVG(CASE WHEN {hex_not_numeric} THEN 1.0 "
+        f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS ks_hex_{i}",
+        f"MIN(CASE WHEN {hex_not_numeric} THEN LENGTH({qcol}) END) AS ks_hexmn_{i}",
+        f"MAX(CASE WHEN {hex_not_numeric} THEN LENGTH({qcol}) END) AS ks_hexmx_{i}",
+    ]
+
+
+def key_shape_aggregate_kwargs(
+    values: dict[str, object], i: int, wanted: bool
+) -> dict[str, float | int | None]:
+    """Every key-shape field for one column, ready to splat into a
+    ``ColumnAggregate(...)`` call: ``**key_shape_aggregate_kwargs(values, i,
+    wants_key_shape)``."""
+
+    def frac(alias: str) -> float | None:
+        v = values.get(alias) if wanted else None
+        return float(v) if v is not None else None
+
+    def length(alias: str) -> int | None:
+        v = values.get(alias) if wanted else None
+        return int(v) if v is not None else None
+
+    return {
+        "uuid_string_fraction": frac(f"ks_uuid_{i}"),
+        "hex_string_fraction": frac(f"ks_hex_{i}"),
+        "hex_string_min_length": length(f"ks_hexmn_{i}"),
+        "hex_string_max_length": length(f"ks_hexmx_{i}"),
+    }
+
+
 @runtime_checkable
 class Adapter(Protocol):
     """Behavioral contract for a connector adapter.
@@ -525,6 +606,7 @@ class Adapter(Protocol):
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
@@ -532,7 +614,9 @@ class Adapter(Protocol):
         ``shape_stats`` is the set of string column names for which the value-shape
         fractions are computed (in the same scan); all others keep them ``None``.
         ``type_stats`` is the set of non-PII string/integer column names for which
-        the declared-type-vs-content fractions (#204) are computed, same scan."""
+        the declared-type-vs-content fractions (#204) are computed, same scan.
+        ``key_shape_stats`` is the set of non-PII string column names for which
+        the heterogeneous-key-shape fractions (#205) are computed, same scan."""
         ...
 
     def exact_distinct_counts(
