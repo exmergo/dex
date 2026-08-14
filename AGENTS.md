@@ -43,8 +43,13 @@ silently: with no `.dex/config.yml` anywhere up the tree and no explicit
 DuckDB target, so a command run from a subdirectory of your project resolves the
 project's real config instead of a wrong default.
 
+With no warehouse to point at yet, `demo` generates one and writes the config for
+it, so `demo` then `explore map` is a working first run on a machine with no
+credentials and no network.
+
 | Subcommand | Returns |
 |---|---|
+| `demo [path]` | generates a seeded local DuckDB warehouse (7 tables, 29,512 rows) plus a `.dex/config.yml` beside it, so a first run needs no warehouse, no credentials, and no network; both artifacts are listed in `data.created` and `data.next_steps` names the commands worth running next. The path is positional and resolves against the working directory, defaulting to `dex_demo.duckdb`; `--path` is refused here rather than honored, since everywhere else it names the warehouse dex *reads*. Create-only, with no `--confirm` that can talk past it: an existing file at the target is a refusal (`reason: guard`), a missing parent directory is a refusal (`reason: request`), no directories are ever created, and a `.dex/config.yml` at or above the target is left untouched with a warning rather than shadowed by a second one. The data is generated from a pinned seed, so the counts quoted in the docs are the counts a user sees, and it is deliberately flawed: a key that lost uniqueness to a double-loaded batch, a key mixing two id schemes, a join whose columns share a name and none of their values, an empty table, two columns whose declared type contradicts their content, and personal data alongside two designed false positives. Needs the `[duckdb]` extra and says so by name when it is absent (`reason: prerequisite`) |
 | `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
@@ -72,8 +77,8 @@ project's real config instead of a wrong default.
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
-Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
-fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
+Skill-to-subcommand mapping: `explore` fronts `demo`/`connect`/`explore`;
+`transform` fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, detection (`check`, `schema`, `volume`,
 `grain`, `semantic`) is read-only; only `reconcile` emits diffs, and applying
 them is `transform apply`. Detection is read-only on every connector, but read-only
@@ -140,7 +145,14 @@ them.
 2. Profile, don't exfiltrate. Understanding is built from aggregates, not raw rows.
 3. Read-only against data; writes confined to the repo. DuckDB opens read-only;
    generated SQL is SELECT-only; agent-authored SQL runs only through the query
-   firewall; builds run against a dev target only, never prod.
+   firewall; builds run against a dev target only, never prod. `dex demo` is the
+   one verb that creates a data file, and the exception is narrower than the rule
+   it sits inside: it only ever creates, refusing rather than overwriting and with
+   no confirmation flag that can override that, so it cannot open, inspect, or
+   replace a warehouse it did not make. The generator sits on its own path and
+   never reaches a connector, which is why the read-only open above has no branch
+   it could take; the moment the file exists it is user data and is read like any
+   other warehouse.
 4. Cost-aware by connector. Nothing dex runs touches the warehouse without a
    ceiling. The source allowlist in `.dex/config.yml` is a committed cost
    boundary: `--scope` narrows it for one command and can never widen it, and a

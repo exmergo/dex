@@ -25,12 +25,20 @@ from profiled, PII-cleared columns, bounded and capped by the query firewall.
 
 ## The command surface
 
-Capabilities, not final spelling. Implemented incrementally: `connect test`, the
-`explore` group, the authoring surface (`transform`, `semantic`), and the
+Capabilities, not final spelling. Implemented incrementally: `demo`, `connect test`,
+the `explore` group, the authoring surface (`transform`, `semantic`), and the
 `maintain` group are live; `viz preview` returns a valid `not_implemented`
 envelope until the Viz integration lands.
 
 ```
+dex demo [path]                   -> generate a seeded local DuckDB warehouse (7 tables,
+                                     29,512 rows) plus a .dex/config.yml beside it, so a
+                                     first run needs no warehouse and no credentials;
+                                     reports both under data.created and names what to
+                                     run next under data.next_steps. Create-only and not
+                                     confirmable: an existing target refuses, no
+                                     directory is ever created, and an existing config
+                                     at or above the target is left alone with a warning
 dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings

@@ -61,6 +61,11 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "reconcile",
     ],
     "viz": ["preview"],
+    # demo: the on-ramp. No subcommands, because there is exactly one thing to
+    # do and it is the first command a new user runs. It is also the only verb
+    # that creates a data file, which is why it lives on its own path (see
+    # `demo/warehouse.py`) rather than anywhere near a connector.
+    "demo": [],
 }
 
 
@@ -163,7 +168,23 @@ def _build_parser() -> argparse.ArgumentParser:
     common = _sub_connection_options()
     groups = parser.add_subparsers(dest="group", required=True)
     for group, subcommands in COMMAND_SURFACE.items():
-        gp = groups.add_parser(group, parents=[common])
+        # `demo` is the only group carrying help text, and deliberately so: the
+        # top-level --help is where a stranger's first contact lands, and the one
+        # thing worth saying there is what to run when you have no warehouse yet.
+        gp = groups.add_parser(
+            group,
+            parents=[common],
+            help=(
+                "create a seeded local DuckDB warehouse to try dex against "
+                "(no credentials, no network)"
+                if group == "demo"
+                else None
+            ),
+        )
+        if group == "demo":
+            # Positional rather than --path: --path names the warehouse dex
+            # reads, everywhere, and this is the one command that writes one.
+            gp.add_argument("target", nargs="?", default=None)
         if subcommands:
             sub = gp.add_subparsers(dest="subcommand", required=True)
             for name in subcommands:
@@ -363,6 +384,14 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    # First, and without `ensure_dialect_available`: demo authors no SQL a guard
+    # has to clear, and it must stay reachable on the lightest install that can
+    # run it, which is the one a first-time user has.
+    if args.group == "demo":
+        from .demo.commands import cmd_demo
+
+        return cmd_demo(args, engine)
+
     if args.group == "connect" and args.subcommand == "test":
         from .results import to_envelope
 
