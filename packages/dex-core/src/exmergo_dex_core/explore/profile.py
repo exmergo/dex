@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from ..adapters.base import (
     VALUE_DOMAIN_CAP,
@@ -22,6 +22,7 @@ from ..adapters.base import (
     ColumnAggregate,
     is_blob_type,
     is_integer_type,
+    is_temporal_type,
     json_safe,
 )
 from ..adapters.base import is_string_type as _base_is_string_type
@@ -547,6 +548,78 @@ def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str |
     )
 
 
+def _parse_temporal(value: object) -> date | datetime:
+    """Normalize a temporal min/max back to a comparable object. Adapters
+    disagree about when they call ``json_safe`` on these two fields (see the
+    module docstring's note on #206): DuckDB/BigQuery hand back a native
+    ``date``/``datetime``, Snowflake/Databricks/Redshift/Postgres an ISO
+    8601 ``str``. Both must resolve to the same shape before date
+    arithmetic, since subtracting a ``date`` from a ``datetime`` raises."""
+
+    if isinstance(value, str):
+        return (
+            datetime.fromisoformat(value)
+            if ("T" in value or " " in value)
+            else date.fromisoformat(value)
+        )
+    return value  # already date or datetime
+
+
+def _temporal_granularity(agg: ColumnAggregate) -> str:
+    """Day is the default; month wins only when the data is clearly at that
+    grain (values sit on month boundaries), and hour is reported instead of
+    day when day-truncation would actually lose information (real
+    sub-day variation, so a bare DATE column -- always day-aligned by
+    construction -- never lands here)."""
+
+    day_aligned = agg.day_aligned_fraction or 0.0
+    month_aligned = agg.month_aligned_fraction or 0.0
+    if day_aligned < _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return "hour"
+    if month_aligned >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return "month"
+    return "day"
+
+
+def _temporal_continuity(
+    agg: ColumnAggregate | None,
+) -> tuple[str, int, int, int, int] | None:
+    """Span, distinct periods, missing periods, and the largest gap, at the
+    detected granularity. Neutral by design: a genuinely sparse column (an
+    event timestamp on a rare event) reports large numbers here without
+    being characterized as broken -- interpretation belongs to the caller,
+    including a future drift-sweep detector this only lands the statistics
+    for (issue #226, not built here). ``None`` when there isn't enough
+    evidence (no aggregate, no min/max, or the adapter could not compute
+    the granularity-matched pair)."""
+
+    if agg is None or agg.min_value is None or agg.max_value is None:
+        return None
+    # Not a temporal-eligible column at all (no alignment evidence was ever
+    # requested for it): min/max exist but are not dates, so there is
+    # nothing to do date arithmetic on.
+    if agg.day_aligned_fraction is None and agg.month_aligned_fraction is None:
+        return None
+    granularity = _temporal_granularity(agg)
+    lo, hi = _parse_temporal(agg.min_value), _parse_temporal(agg.max_value)
+    if granularity == "month":
+        span = (hi.year - lo.year) * 12 + (hi.month - lo.month) + 1
+        distinct_periods = agg.month_distinct_periods
+        largest_gap = agg.month_largest_gap
+    elif granularity == "hour":
+        span = int((hi - lo).total_seconds() // 3600) + 1
+        distinct_periods = agg.hour_distinct_periods
+        largest_gap = agg.hour_largest_gap
+    else:
+        span = (hi - lo).days + 1
+        distinct_periods = agg.day_distinct_periods
+        largest_gap = agg.day_largest_gap
+    if distinct_periods is None:
+        return None
+    missing = max(0, span - distinct_periods)
+    return granularity, span, distinct_periods, missing, largest_gap or 0
+
+
 def profile(
     adapter: Adapter,
     identifiers: list[str],
@@ -627,6 +700,13 @@ def profile(
             for c in columns
             if prelim_pii[c.name] is None and _is_string_type(c.data_type)
         }
+        # Temporal-continuity checks (#206): non-PII date/timestamp columns
+        # only, same eligibility rule as above.
+        temporal_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None and is_temporal_type(c.data_type)
+        }
 
         # Blob-type columns can only ever yield a null fraction and a distinct
         # estimate, yet a columnar engine bills for the whole column once it is
@@ -649,6 +729,7 @@ def profile(
                 shape_stats=shape,
                 type_stats=type_stats,
                 key_shape_stats=key_shape_stats,
+                temporal_stats=temporal_stats,
             )
         }
         # Re-read the metadata after the aggregate scan: adapters whose
@@ -706,6 +787,9 @@ def profile(
                     key_note = _heterogeneous_key_note(col.name, agg)
                     if key_note is not None:
                         data_quality.append(key_note)
+            continuity = (
+                _temporal_continuity(agg) if col.name in temporal_stats else None
+            )
             profiles.append(
                 ColumnProfile(
                     name=col.name,
@@ -720,6 +804,11 @@ def profile(
                     pii=pii,
                     pii_overridden=overridden.get(col.name),
                     value_domain=value_domains.get(col.name),
+                    temporal_granularity=continuity[0] if continuity else None,
+                    temporal_span=continuity[1] if continuity else None,
+                    temporal_distinct_periods=continuity[2] if continuity else None,
+                    temporal_missing_periods=continuity[3] if continuity else None,
+                    temporal_largest_gap=continuity[4] if continuity else None,
                 )
             )
 

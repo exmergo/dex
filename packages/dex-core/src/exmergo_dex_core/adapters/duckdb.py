@@ -29,6 +29,10 @@ from .base import (
     key_shape_expressions,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
 )
@@ -38,6 +42,14 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     # regexp_full_match ignores anchors' redundancy; the shared patterns carry
     # them for the substring-matching dialects.
     return f"regexp_full_match({qcol}, '{pattern}')"
+
+
+def _date_trunc_expr(qcol: str, unit: str) -> str:
+    return f"date_trunc('{unit}', {qcol})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
+    return f"date_diff('{unit}', {earlier}, {later})"
 
 
 # Conservative defaults so auto-invoked profiling cannot exhaust the machine.
@@ -220,11 +232,13 @@ class DuckDBAdapter:
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
         key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
         type_req = type_stats or set()
         key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             results.extend(
@@ -235,6 +249,7 @@ class DuckDBAdapter:
                     shape,
                     type_req,
                     key_shape_req,
+                    temporal_req,
                 )
             )
         return results
@@ -247,9 +262,10 @@ class DuckDBAdapter:
         shape: set[str],
         type_req: set[str],
         key_shape_req: set[str],
+        temporal_req: set[str],
     ) -> list[ColumnAggregate]:
         sql, plan = self._build_aggregate_sql(
-            identifier, columns, safe, shape, type_req, key_shape_req
+            identifier, columns, safe, shape, type_req, key_shape_req, temporal_req
         )
         row = self._run_select(sql)[0]
         # Re-read by alias name via the cursor description so we never rely on
@@ -267,6 +283,7 @@ class DuckDBAdapter:
             wants_shape,
             wants_type,
             wants_key_shape,
+            wants_temporal,
         ) in plan:
             nn = int(values[f"nn_{i}"])
             null_fraction = (1 - nn / n_total) if n_total > 0 else None
@@ -295,6 +312,7 @@ class DuckDBAdapter:
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
                     **key_shape_aggregate_kwargs(values, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
                 )
             )
         return aggregates
@@ -388,15 +406,18 @@ class DuckDBAdapter:
         shape: set[str],
         type_req: set[str],
         key_shape_req: set[str],
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]]]:
+        temporal_req: set[str],
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate query for the whole batch: COUNT(*) once, plus per column a
         # non-null count, an approximate distinct, min/max only where allowed, and
-        # value-shape/type-contradiction/key-shape fractions only where requested.
-        # Returns the SQL and a plan mapping each column to which aggregates it got,
-        # so results read back by alias unambiguously. Pure: builds no connection,
-        # so it is unit-testable (SELECT-only) without touching the database.
+        # value-shape/type-contradiction/key-shape/temporal-continuity fractions
+        # only where requested. Returns the SQL and a plan mapping each column to
+        # which aggregates it got, so results read back by alias unambiguously.
+        # Pure: builds no connection, so it is unit-testable (SELECT-only) without
+        # touching the database.
+        table_sql = self._quote(identifier)
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -426,6 +447,22 @@ class DuckDBAdapter:
             wants_key_shape = (col.name in key_shape_req) and not nested
             if wants_key_shape:
                 select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = (col.name in temporal_req) and not nested
+            if wants_temporal:
+                select_parts.extend(
+                    temporal_alignment_expressions(qcol, i, _date_trunc_expr)
+                )
+                for unit in temporal_units_for(col.data_type):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol,
+                            i,
+                            unit,
+                            table_sql,
+                            _date_trunc_expr,
+                            _date_diff_expr,
+                        )
+                    )
             plan.append(
                 (
                     i,
@@ -435,12 +472,13 @@ class DuckDBAdapter:
                     wants_shape,
                     wants_type,
                     wants_key_shape,
+                    wants_temporal,
                 )
             )
         # Interpolated parts are quoted+escaped identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         cols_sql = ", ".join(select_parts)
-        sql = f"SELECT {cols_sql} FROM {self._quote(identifier)}"  # noqa: S608
+        sql = f"SELECT {cols_sql} FROM {table_sql}"  # noqa: S608
         return assert_select_only(sql, dialect=self.dialect), plan
 
     @staticmethod
