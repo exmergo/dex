@@ -417,6 +417,31 @@ class DexEngine:
             return None
         return connect.paradigm_for(self.connector or self.config.connector)
 
+    def settled_spend(self) -> dict | None:
+        """What the command that just ran actually billed, settled and read
+        back from the gate, or ``None`` when nothing billed anything.
+
+        The success path reaches this through ``stamp_spend`` on the result;
+        this is the same number for a caller holding an exception instead,
+        which is why it lives on the engine rather than inside a command. An
+        adapter that was never opened has no gate and so no spend.
+        """
+
+        from .guards.cost_guard import spend_field
+
+        adapter = self._adapter_instance
+        gate = None if adapter is None else command_args.cost_gate(adapter)
+        if adapter is None or gate is None:
+            return None
+        spend = command_args.settled_spend(adapter)
+        # Nothing billed, nothing to report: a refusal that stopped before the
+        # first statement is free, and a spend block of zeroes on it would read
+        # as a claim about money where the honest answer is silence. The day's
+        # cumulative total rides along only when this command contributed to it.
+        if not spend or not spend.get(spend_field(gate.paradigm)):
+            return None
+        return spend
+
     def project_dir(self) -> Path:
         """The dbt project directory: the config pin wins, discovery is the default."""
 

@@ -34,6 +34,21 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   assumption about lazy `CASE` evaluation is gone from all six adapters, and an
   offline invariant test asserts the shape on every one of them.
 
+- **A statement the warehouse refuses is classified, names its object, and
+  reports what it spent** ([#310]). A server-side SQL error escaped the
+  adapters untranslated. Not being a `DexError`, it fell through every reason
+  override and arrived as `reason: internal` ("not a deliberate dex refusal")
+  with `data: {}`: nothing to branch on, no object named, and no spend, on a
+  connector that had already billed the seconds the statement ran before it
+  died. Every adapter now raises a typed `WarehouseQueryError` (exported from
+  the package root, `reason: execution_failure`) carrying the server's own
+  message and error code, trimmed to one line and capped; profiling names the
+  object the refused statement was reading; and an error envelope from a
+  metered connector reports the spend the ledger recorded, as the
+  budget-exhaustion path already did. The live suites now assert with a helper
+  that prints `errors` rather than an envelope repr pytest truncates, which is
+  what kept the Redshift message out of sixteen CI logs.
+
 - **`maintain check` carries each axis's findings in the command envelope**
   ([#279]). The top-level `data.findings` ranking could report drift while the
   adjacent per-axis result did not carry those findings, making an axis look
