@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.6] - 2026-08-15
+
 ### Fixed
 
 - **`maintain check` carries each axis's findings in the command envelope**
