@@ -7,14 +7,18 @@ runs without explicit confirmation. The check order is deliberate:
    ``--confirm``.
 2. A billed paradigm (bytes-scanned, compute-time, DB load) with no ceiling at all
    is refused: nothing runs without a ceiling.
-3. An unconfirmed command raises :class:`ConfirmationRequiredError` carrying the cost,
-   which the command layer maps to a ``needs_confirmation`` envelope.
+3. An unconfirmed command on a billed paradigm raises
+   :class:`ConfirmationRequiredError` carrying the cost, which the command layer
+   maps to a ``needs_confirmation`` envelope.
 
-``FREE_LOCAL`` (DuckDB) requires only confirmation: the spend is zero, so a
-numeric budget is optional, but the confirm handshake still runs so the gating
-path is exercised on every connector. Billed paradigms require both a ceiling and
-confirmation. DuckDB resource bounds (memory, threads, read-only) are enforced by
-the adapter, not here.
+``FREE_LOCAL`` (DuckDB) skips step 3 (issue #197): the confirm handshake exists to
+gate spend, and a connector that cannot bill has none to gate, so asking for
+confirmation there confirms nothing and trains a caller to click through a
+handshake that, on every other connector, does. It still skips the ceiling
+requirement in step 2, for the same reason (the spend is always zero, so a
+numeric budget is meaningless), and DuckDB resource bounds (memory, threads,
+read-only) are enforced by the adapter, not here. Billed paradigms are
+unaffected: both steps still bind exactly as before.
 
 **The cumulative ceiling is settled against the ledger, so admitting a command
 has to be atomic with booking its headroom.** Reading the day's spend and then
@@ -218,6 +222,14 @@ def preflight(
 
     ``estimate`` and ``ceiling`` are paradigm-relative magnitudes (bytes, credits,
     DBUs, a load score); the unit travels with ``paradigm``.
+
+    Over-ceiling blocks regardless of paradigm, unconditionally, even for
+    ``FREE_LOCAL``: an estimate that exceeds an explicitly configured ceiling is
+    the caller's own contradiction to resolve, not a spend question. Everything
+    after it is a confirmation handshake is emitted only where spend is
+    possible (issue #197): ``FREE_LOCAL`` cannot bill, so neither the
+    ceiling-required nor the confirmation check applies to it, confirmed or
+    not. Every other paradigm is unaffected.
     """
 
     cost = Cost(paradigm=paradigm, estimate=estimate, ceiling=ceiling)
@@ -228,7 +240,9 @@ def preflight(
             f"({paradigm.value}); raise the budget or narrow the work",
             cost=cost,
         )
-    if paradigm is not Paradigm.FREE_LOCAL and ceiling is None:
+    if paradigm is Paradigm.FREE_LOCAL:
+        return cost
+    if ceiling is None:
         raise CeilingRequiredError(
             f"no ceiling set for a {paradigm.value} connector; pass --budget or "
             "set one in .dex/config.yml",
@@ -237,6 +251,26 @@ def preflight(
     if not confirmed:
         raise ConfirmationRequiredError(cost)
     return cost
+
+
+def skipped_handshake_warning(paradigm: Paradigm, confirmed: bool) -> list[str]:
+    """The warning a command carries when the confirm handshake would have
+    fired but the paradigm cannot bill, so nothing needed confirming
+    (issue #197).
+
+    Empty when the caller already confirmed: passing ``--confirm`` on a free
+    connector does no harm and asking why it was unnecessary would only be
+    noise, so this is reserved for the case that would otherwise have been a
+    silent, meaningless ask. Empty on a billed paradigm too, since there the
+    handshake still gates real spend and nothing was skipped.
+    """
+
+    if paradigm is not Paradigm.FREE_LOCAL or confirmed:
+        return []
+    return [
+        "no confirm handshake: this connector cannot bill, so there was "
+        "nothing to confirm and the command ran without asking"
+    ]
 
 
 class CostGate:
@@ -405,6 +439,15 @@ class CostGate:
         branch below leaves through the exception, so an unconfirmed handshake
         (much the most common outcome, since it is how every billed command
         starts) touches the ledger not at all.
+
+        ``FREE_LOCAL`` skips the ceiling-required and confirmation checks
+        (issue #197): no adapter attaches a gate for a connector that cannot
+        bill, so a caller cannot actually construct one with this paradigm
+        today, but the same rule binds here too rather than leaving a gate one
+        misuse away from asking for confirmation of zero spend. Over-ceiling
+        still blocks regardless of paradigm: an estimate that exceeds an
+        explicitly configured ceiling is the caller's own contradiction to
+        resolve, not a spend question.
         """
 
         self._command_estimate = estimate
@@ -418,14 +461,15 @@ class CostGate:
                     "work",
                     cost=cost,
                 )
-            if not self.confirmed:
-                raise ConfirmationRequiredError(cost)
-            if self.paradigm is not Paradigm.FREE_LOCAL and ceiling is None:
-                raise CeilingRequiredError(
-                    f"no ceiling set for a {self.paradigm.value} connector; pass "
-                    "--budget or set one in .dex/config.yml",
-                    cost=cost,
-                )
+            if self.paradigm is not Paradigm.FREE_LOCAL:
+                if not self.confirmed:
+                    raise ConfirmationRequiredError(cost)
+                if ceiling is None:
+                    raise CeilingRequiredError(
+                        f"no ceiling set for a {self.paradigm.value} connector; "
+                        "pass --budget or set one in .dex/config.yml",
+                        cost=cost,
+                    )
             self._reserve_to(estimate)
         return cost
 
@@ -443,13 +487,21 @@ class CostGate:
         An admitted phase extends the reservation rather than adding a second
         one, because the command holds one hold for its whole life and the
         phase raises what that hold is worth.
+
+        ``FREE_LOCAL`` never asks here either (issue #197), even if a numeric
+        ceiling happens to be configured for it: the phase spends nothing to
+        fit against.
         """
 
         with self._admission():
             ceiling = self.effective_ceiling()
             needed = self._estimated + estimate
             cost = Cost(paradigm=self.paradigm, estimate=needed, ceiling=ceiling)
-            if ceiling is not None and needed > ceiling:
+            if (
+                self.paradigm is not Paradigm.FREE_LOCAL
+                and ceiling is not None
+                and needed > ceiling
+            ):
                 raise ConfirmationRequiredError(cost)
             self._reserve_to(needed)
         return cost

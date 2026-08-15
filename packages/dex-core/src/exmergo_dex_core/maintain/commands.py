@@ -39,7 +39,7 @@ from ..adapters.base import name_list
 from ..config import pii_override_paths
 from ..errors import PrerequisiteError, ProjectError, RepoRootRequiredError
 from ..results import ConfirmationRequest, to_envelope
-from ..storage import Document, FilesystemStore, MaintainStore
+from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
 from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
@@ -234,6 +234,39 @@ def _require_baseline(store: MaintainStore) -> snapshot_mod.Snapshot:
     return snap
 
 
+def _stored_drift(store: MaintainStore) -> drift_mod.DriftReport | None:
+    """The stored drift report, treating one that will not parse as absent.
+
+    The opposite policy from :func:`_require_baseline`, and the reason is the one
+    already written down beside ``DRIFT_SCHEMA_VERSION`` in :mod:`.drift`: the
+    baseline is *vouched for* and nothing else reproduces it, while a drift
+    report is *derived* and `maintain check` regenerates it from the baseline on
+    demand. So a document this engine cannot read has a cheap correct answer here
+    that the baseline does not have, and that note pre-committed to this one:
+    "treat it as absent and rebuild, rather than refuse".
+
+    Both callers already have an absent path, so this widens a handled state
+    rather than adding one. ``_record_axes`` discards a report measured against a
+    different baseline wholesale, which is the same "throw it away and remeasure"
+    it now does for an unparseable one; ``reconcile`` raises
+    :class:`NoBaselineError` naming `maintain check`, which is the correct remedy
+    for a report that cannot be read as much as for one that was never written.
+
+    ⚠️ Deliberately silent about *which* of the two happened, unlike the cache and
+    the baseline. Rebuilding is free and automatic here, so an operator has
+    nothing to decide and a warning would be noise on a path that self-heals.
+    """
+
+    try:
+        return store.load_drift()
+    except ValueError:
+        # Same convention as `_require_baseline` and `readable_cache`: a backend
+        # signals "this document will not parse" with a ValueError, whatever its
+        # own deserializer raises. Swallowed rather than classified because the
+        # remedy runs itself on the very next line of both callers.
+        return None
+
+
 def snapshot(engine: DexEngine) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
@@ -247,7 +280,7 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
     config = engine.config
     warnings: list[str] = []
 
-    cache = store.load_cache()
+    cache = readable_cache(store)
     requested = engine.connector or config.connector
     usable = cache is not None and bool(cache.datasets)
     if usable and cache.provenance.connector not in (None, requested):
@@ -696,13 +729,13 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import DbtProject
+    from ..adapters.project import PlacingProject
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
     store = engine.store
     snap = _require_baseline(store)
-    report = store.load_drift()
+    report = _stored_drift(store)
     if report is None:
         raise NoBaselineError(
             "no drift report yet; run `maintain check` (or a focused detector) "
@@ -739,12 +772,15 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             "Reconcile what these findings describe wherever your models are "
             "actually defined"
         )
-    elif not isinstance(editable, DbtProject):
+    elif not isinstance(editable, PlacingProject):
         warnings.append(
             f"the '{editable.name}' project format implements the write tier, but "
-            "reconcile's mechanical edits are dbt artifacts (a staging model and "
-            "its schema YAML) and dex cannot yet author them for another format, "
-            "so every proposal below is advisory"
+            "does not say where a proposed edit lands, so reconcile has no path to "
+            "plan an edit against and every proposal below is advisory. A format "
+            "reaches this path by implementing `PlacingProject`: `edit_path` "
+            "answers where an edit of a given kind goes and may decline a kind by "
+            "answering None, and `editing_surface` declares the region those "
+            "paths must stay inside"
         )
     else:
         try:
@@ -752,12 +788,17 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         except (ProjectError, ValueError) as exc:
             raise ProjectError(f"reconcile edits a project: {exc}") from exc
 
+    # Hoisted rather than inlined into the call: this load can now refuse, and a
+    # refusal raised from inside an argument list reads as though `build` did it.
+    cache = readable_cache(store)
+
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
-        store.load_cache(),
+        cache,
         view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        placement=editable if isinstance(editable, PlacingProject) else None,
     )
     warnings.extend(build_warnings)
 
@@ -773,7 +814,17 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             f"maintain reconcile {drift_class}" if drift_class else "maintain reconcile"
         )
         plan, diffs, plan_warnings = plans_mod.plan(
-            intent, edits, project_dir=view.root, repo_root=repo_root, store=store
+            intent,
+            edits,
+            project_dir=view.root,
+            repo_root=repo_root,
+            store=store,
+            # The format that placed these edits also validates them. Passing it
+            # is what keeps the two halves of the check on the same project: the
+            # surface each path must land in, and the file each edit is pinned
+            # against. dbt reaches the identical checks through this argument as
+            # it did without it, and reuses the view it already loaded.
+            project_format=editable,
         )
         result.diffs = diffs
         result.warnings.extend(plan_warnings)
@@ -876,7 +927,7 @@ def _record_axes(
     a focused detector refreshes only itself, but never across baselines:
     findings measured against an older snapshot are dropped wholesale."""
 
-    report = store.load_drift()
+    report = _stored_drift(store)
     if report is None or report.snapshot_created_at != snap.created_at:
         report = drift_mod.DriftReport()
     report.connector = connector
@@ -1068,7 +1119,7 @@ def _baseline_warnings(
     """
 
     warnings: list[str] = []
-    cache = store.load_cache()
+    cache = readable_cache(store)
     if (
         cache is not None
         and cache.provenance.updated_at

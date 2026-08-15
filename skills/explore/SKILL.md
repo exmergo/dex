@@ -19,6 +19,13 @@ nothing else; read the envelope and decide the next step.
 uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
+If the user has no warehouse to point at and wants to see what dex does, `demo`
+generates one: a seeded local DuckDB warehouse plus the `.dex/config.yml` for it,
+with no credentials and no network, so every subcommand below then runs with no
+flags. It only ever creates, so it refuses rather than touch a file that already
+exists. Offer it rather than assuming it: a user who does have a warehouse wants
+that one read, not a fixture built beside it.
+
 Subcommands, in the usual order:
 
 1. `connect test --path <file.duckdb>` confirms a read-only connection and
@@ -194,6 +201,14 @@ paradigm's unit. Never invent a budget the user did not agree to, and never
 retry with a raised budget on an over-ceiling refusal without asking.
 Metadata is free (`connect test`, `inventory` run immediately), and OK
 envelopes report actual spend under `data.spend`.
+
+On BigQuery a profiling estimate holds a 10 MB floor per table for each
+escalation query a profile may still issue after its aggregate scan, so on a
+warehouse of many small tables most of the number can be reserve for work that
+never happens. Both the handshake and the over-ceiling refusal report that split
+(`reserved_bytes` and `reserved_queries`, and in the prose). Pass it on when you
+surface the estimate: whether a number is scan or reserve changes whether
+raising the budget is buying work or headroom.
 
 When an estimate is larger than the work deserves, narrow the scope rather than
 raise the budget. `--scope` (repeatable) bounds a command to part of the

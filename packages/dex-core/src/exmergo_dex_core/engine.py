@@ -171,6 +171,12 @@ class DexEngine:
         self.repo_root: str | None = None if repo_root is None else str(repo_root)
         self.connector = connector
         self.path = path
+        # Populated only by the run-directory DuckDB auto-detect (issue #199);
+        # empty otherwise. A caller must never miss a guess dex made on its
+        # behalf, so this is read back and folded into every envelope, not just
+        # the one that happened to trigger it (`_adapter` may be called once and
+        # cached, with later commands in the same process never re-resolving).
+        self.connection_warnings: list[str] = []
         self.scopes = scopes
         self.project = project
         self.datasets = datasets
@@ -299,6 +305,11 @@ class DexEngine:
         confirmed = self.confirmed if confirmed is None else confirmed
 
         if self._adapter_instance is None:
+            # Resolved first, as its own statement: it may auto-detect a
+            # connector and path (issue #199), and `self.connector`/`self.path`
+            # below must see that resolution, not the pre-resolution values a
+            # single call's keyword arguments would read in write order.
+            resolved_config = self._config_for_open()
             self._adapter_instance = connect.open_adapter(
                 connector=self.connector,
                 path=self.path,
@@ -306,7 +317,7 @@ class DexEngine:
                 datasets=self.datasets,
                 scopes=self.scopes,
                 repo_root="." if self.repo_root is None else self.repo_root,
-                config=self._config_for_open(),
+                config=resolved_config,
                 store=self.store,
                 budget=budget,
                 confirmed=confirmed,
@@ -336,10 +347,43 @@ class DexEngine:
         The refusal that would otherwise live down there is raised here instead,
         where the engine knows all three inputs that could have named a
         connector.
+
+        Before refusing outright, one narrow exception (issue #199): with no
+        config anywhere and nothing explicit, a run directory holding exactly
+        one ``*.duckdb`` file is not a phantom target, it is the one thing the
+        caller almost certainly meant, and reading it is the first thirty
+        seconds of the zero-credential on-ramp. Two or more is exactly the
+        ambiguity this whole gate exists to refuse, so that still raises, now
+        naming both. The exception is deliberately this narrow: an explicit
+        ``--connector``/``--path`` or any config, even one naming a different
+        file, already took one of the three inputs above non-None and never
+        reaches this method at all. A ``repo_root`` of ``None`` is the other
+        spelling this method already had (a library caller holding no repo
+        concept at all, not merely one that defaults to "."), and has no run
+        directory to look in, so it keeps its original, unconditional refusal
+        rather than scanning whatever the process's own cwd happens to be.
         """
 
         if self._declared is None and self.connector is None and self.path is None:
-            raise connect.no_connector_selected(self.repo_root)
+            if self.repo_root is None:
+                raise connect.no_connector_selected(None)
+            candidates = connect.duckdb_candidates(self.repo_root)
+            if len(candidates) > 1:
+                raise connect.no_connector_selected(
+                    self.repo_root, ambiguous_duckdb=candidates
+                )
+            if len(candidates) == 1:
+                found = candidates[0]
+                self.connector = "duckdb"
+                self.path = str(found)
+                self.connection_warnings.append(
+                    f"no connector configured; using the one DuckDB file in "
+                    f"this directory ({found.name}) since nothing else named a "
+                    "target. Make this explicit with --path "
+                    f"{found} or duckdb.path: {found} in .dex/config.yml"
+                )
+            else:
+                raise connect.no_connector_selected(self.repo_root)
         return self.config
 
     @property

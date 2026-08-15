@@ -17,6 +17,7 @@ simply calls no mutating client API, and the docs recommend read-only roles
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import BigQueryTarget
@@ -25,6 +26,7 @@ from ..errors import ConnectorError, PrerequisiteError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
+    VALUE_DOMAIN_MIN_ROWS,
     ColumnAggregate,
     ColumnMeta,
     ObjectMeta,
@@ -36,6 +38,8 @@ from .base import (
     is_integer_type,
     is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
@@ -61,6 +65,25 @@ _MIN_BILLED_BYTES = 10 * 1024 * 1024
 # min/max, and non-null counting via COUNTIF (COUNT DISTINCT is invalid on
 # them and plain COUNT is not supported for every one of these types).
 _NESTED_FIELD_TYPES = {"RECORD", "STRUCT", "JSON", "GEOGRAPHY", "RANGE", "INTERVAL"}
+
+
+@dataclass(frozen=True)
+class _EstimateComposition:
+    """What a profile estimate is made of: measured dry-run scan versus
+    escalation reserve.
+
+    The two halves answer different questions and a caller deciding whether to
+    raise a budget needs them apart. The scan half is a dry-run of statements
+    that will certainly run; the reserve half is headroom held for probes that
+    may never be issued (see :meth:`BigQueryAdapter.profile_estimate`). Quoting
+    only the sum is what left a refused nightly run unable to tell a warehouse
+    that had grown from a release that had added a reserve (issue #299).
+    """
+
+    scan_bytes: float
+    scan_queries: int
+    reserved_bytes: float
+    reserved_queries: int
 
 
 def _regexp_predicate(qcol: str, pattern: str) -> str:
@@ -130,6 +153,10 @@ class BigQueryAdapter:
         self._tables: dict[str, Any] = {}
         self._resolved_datasets: list[str] | None = None
         self._notes: dict[str, list[str]] = {}
+        # What the last profile estimate was made of, so the handshake and the
+        # over-ceiling refusal can attribute the number they quote. Per command,
+        # like `_notes`: one command builds at most one profile estimate.
+        self._composition: _EstimateComposition | None = None
 
     # --- capabilities ---------------------------------------------------------
 
@@ -375,18 +402,26 @@ class BigQueryAdapter:
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         if self._unqueryable(identifier):
             return [self._empty_aggregate(col) for col in columns]
         safe = safe_min_max or set()
         shape = shape_stats or set()
         type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
         sample_percent = self._sample_percent(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, type_req, sample_percent=sample_percent
+                identifier,
+                batch,
+                safe,
+                shape,
+                type_req,
+                key_shape_req,
+                sample_percent=sample_percent,
             )
             try:
                 _job, iterator = self._execute(sql)
@@ -447,28 +482,29 @@ class BigQueryAdapter:
         safe: set[str],
         shape: set[str],
         type_req: set[str],
+        key_shape_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape/type-contradiction fractions only where requested.
-        # Pure (no client), so the SELECT-only property is testable without a
-        # connection. Repeated (ARRAY) columns get no aggregates at all: they
-        # cannot be NULL in BigQuery and COUNT/DISTINCT are invalid on them;
-        # other nested types get a COUNTIF non-null count only.
+        # and value-shape/type-contradiction/key-shape fractions only where
+        # requested. Pure (no client), so the SELECT-only property is testable
+        # without a connection. Repeated (ARRAY) columns get no aggregates at
+        # all: they cannot be NULL in BigQuery and COUNT/DISTINCT are invalid
+        # on them; other nested types get a COUNTIF non-null count only.
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             repeated = col.data_type.upper().startswith("ARRAY")
             nested = repeated or self._is_nested(col.data_type)
             if repeated:
-                plan.append((i, col, False, False, False, False, False))
+                plan.append((i, col, False, False, False, False, False, False))
                 continue
             if nested:
                 select_parts.append(f"COUNTIF({qcol} IS NOT NULL) AS nn_{i}")
-                plan.append((i, col, True, False, False, False, False))
+                plan.append((i, col, True, False, False, False, False, False))
                 continue
             select_parts.append(f"COUNT({qcol}) AS nn_{i}")
             select_parts.append(f"APPROX_COUNT_DISTINCT({qcol}) AS nd_{i}")
@@ -491,7 +527,21 @@ class BigQueryAdapter:
                         bigint_type=_BIGINT_TYPE,
                     )
                 )
-            plan.append((i, col, True, True, wants_min_max, wants_shape, wants_type))
+            wants_key_shape = col.name in key_shape_req
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            plan.append(
+                (
+                    i,
+                    col,
+                    True,
+                    True,
+                    wants_min_max,
+                    wants_shape,
+                    wants_type,
+                    wants_key_shape,
+                )
+            )
         source = self._quote(identifier)
         if sample_percent is not None:
             source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
@@ -510,7 +560,7 @@ class BigQueryAdapter:
     def _read_aggregates(
         self,
         row: Any,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
@@ -524,6 +574,7 @@ class BigQueryAdapter:
             wants_min_max,
             wants_shape,
             wants_type,
+            wants_key_shape,
         ) in plan:
             nn = row[f"nn_{i}"] if has_count else None
             has_counts = nn is not None
@@ -550,6 +601,7 @@ class BigQueryAdapter:
                     person_shape_fraction=shape_stat_value(row, f"sp_{i}", wants_shape),
                     avg_token_count=shape_stat_value(row, f"st_{i}", wants_shape),
                     **type_contradiction_aggregate_kwargs(row, i, wants_type),
+                    **key_shape_aggregate_kwargs(row, i, wants_key_shape),
                 )
             )
         return aggregates
@@ -684,18 +736,18 @@ class BigQueryAdapter:
         what BigQuery actually bills, and an unfloored estimate would send the
         agent into a ladder of budget rejections.
 
-        The total also reserves one floor per table for each of the two
-        possible escalation queries (``exact_distinct_counts`` for a
-        near-unique column, ``distinct_combination_counts`` for a composite
-        key candidate): whether either actually runs depends on the aggregate
-        batch's own approximate results, which do not exist yet at estimate
-        time, so there is no way to dry-run them here. Reserving their floor
-        unconditionally keeps this total a ceiling profiling will not exceed,
-        rather than a number a run that does escalate blows past -- the exact
-        gap this estimator used to leave open (issue #107). Skipped only when
-        a table is provably empty (``row_count == 0``); an unknown row count
-        (views, whose count is never known before the aggregate that reveals
-        it) still reserves, since escalation is not ruled out.
+        The total also reserves one floor per table for each of the three
+        escalation queries a profile may still issue after that batch
+        (:meth:`exact_distinct_counts`, :meth:`value_domain_counts`,
+        :meth:`distinct_combination_counts`). Whether any of them runs depends
+        on the batch's own approximate results, which do not exist yet at
+        estimate time, so there is no way to dry-run them here. Holding their
+        floor keeps this total a ceiling profiling will not exceed rather than
+        a number a run that does escalate blows past, which is the gap this
+        estimator used to leave open (issue #107). See
+        :meth:`_escalation_reserve` for what narrows each one, and
+        :attr:`_composition` for how the reserve is reported apart from the
+        scan it rides with.
 
         Blob-type columns are excluded from the batches the same way
         ``explore.profile.profile`` excludes them from the scan itself
@@ -704,6 +756,9 @@ class BigQueryAdapter:
 
         blob_paths = include_blobs or set()
         per_table: dict[str, float] = {}
+        scan_bytes = 0.0
+        scan_queries = 0
+        reserved_queries = 0
         for identifier in identifiers:
             meta, columns = self.table_metadata(identifier)
             if self._unqueryable(identifier):
@@ -715,11 +770,13 @@ class BigQueryAdapter:
                 if not is_blob_type(c.data_type)
                 or f"{identifier}.{c.name}".lower() in blob_paths
             ]
-            # min/max, shape, and type-contradiction fractions add no scanned
-            # bytes: columnar billing already charges the whole column.
+            # min/max, shape, type-contradiction, and key-shape fractions add
+            # no scanned bytes: columnar billing already charges the whole
+            # column.
             safe: set[str] = set()
             shape: set[str] = set()
             type_req: set[str] = set()
+            key_shape_req: set[str] = set()
             sample_percent = self._sample_percent(identifier)
             total = 0.0
             for start in range(0, len(scan_columns), _COLUMN_BATCH):
@@ -729,23 +786,71 @@ class BigQueryAdapter:
                     safe,
                     shape,
                     type_req,
+                    key_shape_req,
                     sample_percent=sample_percent,
                 )
                 try:
-                    total += max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+                    batch = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
                 except self._api_exceptions.BadRequest:
                     self._note(
                         identifier,
                         "could not estimate an aggregate scan (dry-run failed); "
                         "the object is skipped",
                     )
-            if scan_columns and meta.row_count != 0:
-                total += float(_MIN_BILLED_BYTES)  # exact_distinct_counts
-                total += float(_MIN_BILLED_BYTES)  # value_domain_counts
-                if len(scan_columns) >= 2:
-                    total += float(_MIN_BILLED_BYTES)  # distinct_combination_counts
+                    continue
+                total += batch
+                scan_bytes += batch
+                scan_queries += 1
+            reserved = self._escalation_reserve(meta, scan_columns)
+            total += reserved * float(_MIN_BILLED_BYTES)
+            reserved_queries += reserved
             per_table[identifier] = total
+        self._composition = _EstimateComposition(
+            scan_bytes=scan_bytes,
+            scan_queries=scan_queries,
+            reserved_bytes=reserved_queries * float(_MIN_BILLED_BYTES),
+            reserved_queries=reserved_queries,
+        )
         return sum(per_table.values()), per_table
+
+    def _escalation_reserve(
+        self, meta: ObjectMeta, scan_columns: list[ColumnMeta]
+    ) -> int:
+        """How many escalation queries to hold a billing floor for on one table.
+
+        A reserve is dropped only where the probe's own guard already rules the
+        query out from metadata alone, never as a guess about what is likely: an
+        estimate that reserves for a query that cannot run is merely loose, while
+        one that skips a query that can is the defect issue #107 closed. So each
+        condition below mirrors one in ``explore.profile``, and moving one
+        without the other is the bug to watch for.
+
+        - Nothing at all without a row count. All three probes return early on a
+          falsy one, and a BigQuery view never has one: ``_object_meta`` nulls it
+          and the aggregate's own ``COUNT(*)`` is read per batch, never written
+          back to the object. So a view provably cannot escalate, and the reserve
+          it used to hold was money no run could spend.
+        - Nothing for columns BigQuery cannot count distinctly. Nested and
+          repeated fields get no approximate distinct in the aggregate batch, and
+          every probe's eligibility starts from one, so they can no more trigger
+          an escalation than a blob column already excluded from the scan.
+        - No value domain below :data:`VALUE_DOMAIN_MIN_ROWS` rows, which is what
+          the probe's row-relative fraction implies once a domain needs at least
+          one distinct value.
+        - No composite probe below two countable columns, since a combination
+          needs two members. This was already conditioned, but on the raw column
+          count, which counts columns that can never join a pair.
+        """
+
+        countable = [c for c in scan_columns if not self._is_nested(c.data_type)]
+        if not countable or not meta.row_count:
+            return 0
+        reserved = 1  # exact_distinct_counts
+        if meta.row_count >= VALUE_DOMAIN_MIN_ROWS:
+            reserved += 1  # value_domain_counts
+        if len(countable) >= 2:
+            reserved += 1  # distinct_combination_counts
+        return reserved
 
     def query_estimate(self, sql: str) -> float:
         """The dry-run byte estimate for one firewall-approved query, floored to
@@ -761,20 +866,14 @@ class BigQueryAdapter:
         """The bytes-scanned handshake payload: names the per-query billing
         floor baked into every number here, so a small-table estimate reads as
         a trustworthy ceiling instead of one the actual bill will exceed
-        (issue #107). The escalation-reserve clause only applies to a
-        multi-table call (``per_table`` set, i.e. a profile-shaped estimate);
-        a single ad-hoc query or cluster sample has no such reserve to explain.
+        (issue #107).
+
+        Deliberately a pure function of its arguments. What a *profile* estimate
+        is made of is answered by :meth:`profile_reserve` instead, because this
+        method also describes estimates that carry no reserve (an ad-hoc query,
+        a mid-command verify checkpoint) and it cannot tell which it was handed.
         """
 
-        note = (
-            f"BigQuery bills at least {_MIN_BILLED_BYTES:,} bytes (10 MB) per "
-            "query; every number here already reflects that floor"
-        )
-        if per_table:
-            note += (
-                ", including a reserve for the escalation queries a "
-                "multi-table profile may still add after its initial scan"
-            )
         data: dict[str, object] = {
             "estimated_bytes": estimate,
             "hint": (
@@ -782,11 +881,49 @@ class BigQueryAdapter:
                 "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
                 "$0.06 on-demand)"
             ),
-            "notes": [note],
+            "notes": [
+                f"BigQuery bills at least {_MIN_BILLED_BYTES:,} bytes (10 MB) "
+                "per query; every number here already reflects that floor"
+            ],
         }
         if per_table:
             data["per_table_bytes"] = per_table
         return data
+
+    def profile_reserve(self, estimate: float) -> dict | None:
+        """How much of ``estimate`` is escalation reserve rather than measured
+        scan, as a sentence plus the two numbers behind it. ``None`` when this
+        command priced no profile, so there is nothing to attribute.
+
+        The confirm handshake and the over-ceiling refusal both reach for this,
+        which is the point of it existing: a refusal that quotes a number
+        without saying what it is made of leaves the operator to reconstruct
+        the split from the spend ledger by hand, which is what issue #299
+        reported doing. Only the command-level handshake asks, because only
+        that estimate is the one :meth:`profile_estimate` built.
+
+        The remainder is described rather than the recorded scan half quoted,
+        because a caller may have added statement estimates of its own to the
+        total (``explore query`` prices an auto-profile and its statements in
+        one handshake) and those are dry-run figures too.
+        """
+
+        composition = self._composition
+        if composition is None or not composition.reserved_queries:
+            return None
+        return {
+            "note": (
+                f"{composition.reserved_bytes:,.0f} bytes of this estimate is "
+                f"escalation reserve: {composition.reserved_queries} queries at "
+                f"BigQuery's {_MIN_BILLED_BYTES:,}-byte per-query minimum, held "
+                "for probes a profile may add after its aggregate scan and may "
+                "never issue. The remaining "
+                f"{estimate - composition.reserved_bytes:,.0f} bytes is dry-run "
+                "scan"
+            ),
+            "reserved_bytes": composition.reserved_bytes,
+            "reserved_queries": composition.reserved_queries,
+        }
 
     def _min_billed_floor(self, sql: str) -> float:
         """BigQuery bills at least ``_MIN_BILLED_BYTES`` per table a query

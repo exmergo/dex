@@ -41,6 +41,12 @@ declared join actually reach the engine, which is the whole reason a project is
 read on the explore path: those two arrive through ``definitions()`` and through no
 other channel.
 
+**If you reach tier 3 you also want** :class:`PlacingProjectContract`, because
+placement is what carries a proposal from reconcile to your write path, and its two
+methods have to agree with each other: a format that places an edit outside the
+surface it declares builds a proposal the plan store then refuses, which reads as
+dex declining rather than as the format contradicting itself.
+
 **If dex is going to build your format rather than be handed one**, mix
 :class:`ProjectFactoryContract` in front. Construction is a separate contract from
 the tiers for the same reason it is separate in storage, and a format that passes
@@ -74,6 +80,7 @@ __all__ = [
     "EditableProjectContract",
     "ExploreProjectContract",
     "MaintainProjectContract",
+    "PlacingProjectContract",
     "ProjectFactoryContract",
     "SemanticProjectContract",
 ]
@@ -676,6 +683,157 @@ class EditableProjectContract(MaintainProjectContract):
             "override is what a human reaches for after reading the conflict "
             "diffs, so a format that refuses either way has no apply path"
         )
+
+    def test_the_write_result_reports_what_happened(self) -> None:
+        """The caller has to be able to tell a refusal from an apply.
+
+        ``transform apply`` reads ``written`` to decide whether the plan is now
+        applied and ``conflicts`` to decide whether to surface the divergence for
+        a human to confirm. Both readings fail closed on a result that answers
+        neither, and they fail in opposite directions: a plan recorded as applied
+        that wrote nothing, or a conflict that never reaches the person it was
+        raised for.
+
+        Asserted on the refusing case because that is the one where the two
+        fields disagree, and so the one a result that reports nothing gets wrong.
+        """
+
+        project, project_dir, edits, _read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+
+        result = project.write_edits(edits, project_dir)
+
+        assert hasattr(result, "written") and hasattr(result, "conflicts"), (
+            "write_edits() returned an object exposing no `written` and "
+            "`conflicts`, so the caller applying a plan cannot tell whether it "
+            "was written or refused. Return an ApplyResult, or something "
+            "answering both"
+        )
+        assert not result.written, (
+            "write_edits() reported paths in `written` while refusing an "
+            "unconfirmed conflict. The apply is what did not happen, so the "
+            "caller marks the plan applied and no one is asked about the "
+            "conflict"
+        )
+        assert result.conflicts, (
+            "write_edits() refused the write but reported no `conflicts`, so the "
+            "divergence it refused over never reaches a human and the apply "
+            "looks like a clean no-op"
+        )
+
+
+class PlacingProjectContract:
+    """Beside tier 3: where an edit lands, and the surface it must land in.
+
+    Mix it in beside :class:`EditableProjectContract`. Placement is what carries a
+    reconcile proposal to your write path, so a format that implements tier 3 and
+    not this one gets advisory proposals and no stored plan, which is the same
+    outcome as declining the tier.
+
+    **What this asserts is that your two answers agree.** Each is checkable alone
+    and neither is interesting alone: ``edit_path`` names a file, and
+    ``editing_surface`` says which region files may be named in. A format placing
+    an edit outside its own declared surface builds a proposal the plan store then
+    refuses, and the refusal reads as dex declining rather than as the format
+    contradicting itself, which is a bad afternoon to debug from the outside.
+    """
+
+    def placeable_model(self) -> str:
+        """A warehouse table your format would place an edit for.
+
+        The table name as the warehouse spells it, not as your format names the
+        model derived from it. Reconcile passes what the finding is about, and the
+        distinction is the one ``edit_path`` is most often gotten wrong on.
+        """
+
+        raise NotImplementedError(
+            "a PlacingProjectContract subclass must implement placeable_model() "
+            "-> str, naming a warehouse table this format would place an edit "
+            "for. Reconcile's findings arrive keyed by table, and placement is "
+            "asked per table"
+        )
+
+    def test_satisfies_the_placing_protocol(self) -> None:
+        from .project import PlacingProject
+
+        assert isinstance(self.make_project(), PlacingProject), (
+            "the format does not satisfy PlacingProject, so reconcile has no path "
+            "to plan an edit against and every proposal it makes stays advisory. "
+            "Both `edit_path` and `editing_surface` are required"
+        )
+
+    def test_it_places_at_least_one_kind(self) -> None:
+        """A format that declines every kind has implemented nothing.
+
+        ``None`` per kind is a complete answer and the protocol exists to allow
+        it, but ``None`` for all of them is the format saying it has nowhere for
+        any edit to go, which is what declining tier 3 already says more directly.
+        """
+
+        from ..transform.plans import EditKind
+
+        project = self.make_project()
+        model = self.placeable_model()
+        placed = {
+            kind: project.edit_path(kind, model)
+            for kind in EditKind
+            if project.edit_path(kind, model) is not None
+        }
+
+        assert placed, (
+            f"edit_path() answered None for every kind on '{model}', so no "
+            "proposal can ever reach this format's write path. A format with "
+            "nowhere for any edit to land should decline tier 3 instead"
+        )
+
+    def test_every_placement_lands_inside_the_declared_surface(self) -> None:
+        """The two methods have to describe the same project.
+
+        Containment is checked against ``editing_surface`` at plan time, whatever
+        ``edit_path`` returned, so a placement outside it is an edit built and
+        then refused.
+        """
+
+        from ..transform.plans import EditKind, PlanError, contained_key
+
+        project = self.make_project()
+        model = self.placeable_model()
+        surface = list(project.editing_surface())
+
+        for kind in EditKind:
+            path = project.edit_path(kind, model)
+            if path is None:
+                continue
+            try:
+                contained_key(path, surface)
+            except PlanError as exc:
+                raise AssertionError(
+                    f"edit_path({kind.value}, {model!r}) placed the edit at "
+                    f"'{path}', which editing_surface() does not admit "
+                    f"({', '.join(surface) or 'nothing'}). The plan store checks "
+                    f"the path against the surface, so this proposal would be "
+                    f"built and then refused: {exc}"
+                ) from exc
+
+    def test_the_declared_surface_cannot_reach_outside_the_project(self) -> None:
+        """A surface is a region of the project, not a way out of it.
+
+        Escapes are refused ahead of the surface no matter what is declared, so
+        this cannot widen anything; declaring one means the format believes it
+        owns something it does not, and the belief is worth catching here rather
+        than as a refusal on the first edit that uses it.
+        """
+
+        from pathlib import PurePosixPath
+
+        for prefix in self.make_project().editing_surface():
+            candidate = PurePosixPath(str(prefix).replace("\\", "/"))
+            assert not candidate.is_absolute() and ".." not in candidate.parts, (
+                f"editing_surface() declares '{prefix}', which is absolute or "
+                "climbs out of the project. dex refuses those regardless, so "
+                "every edit placed under this prefix is refused"
+            )
 
 
 class ProjectFactoryContract:

@@ -31,7 +31,7 @@ from ..dbt_project import ApplyResult as PlanApplyResult
 from ..dbt_project import EditOp
 from ..errors import DexError
 from ..results import to_envelope
-from ..storage import Store
+from ..storage import Store, readable_cache
 from . import plans as plans_mod
 from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit
@@ -44,6 +44,7 @@ from .results import (
     MacroResult,
     PlanListResult,
     PlanResult,
+    TestScaffoldResult,
 )
 
 if TYPE_CHECKING:
@@ -375,6 +376,63 @@ def cmd_macro(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(result, hints=_plan_hint(result))
 
 
+def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResult:
+    """Plan a ``unit_tests:`` skeleton scaffolded from a model's own
+    ref()/source() inputs: a ``given`` block per input holding only the
+    columns the model actually reads, typed from the exploration cache.
+
+    Never invents the expected output: the ``expect:`` block is a deliberate,
+    empty stub that fails until a human fills it in. dbt's own parser is the
+    gate (same as ``macro()``), so a malformed fixture is caught before the
+    plan is ever stored, not left to `transform build`.
+    """
+
+    if not model_name:
+        raise ValueError(
+            "transform test needs a model: `transform test --scaffold <model>`"
+        )
+
+    from ..dbt_project import load as load_project
+    from . import test_scaffold as test_scaffold_mod
+
+    project = engine.project_dir()
+    view = load_project(project)
+    cache = readable_cache(engine.store)
+    edits, inputs = test_scaffold_mod.unit_test_scaffold_edits(view, cache, model_name)
+
+    from .build import shadow_parse
+
+    parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
+    warnings: list[str] = []
+    if not parse_result["available"]:
+        warnings.append(parse_result["reason"])
+    elif not parse_result["success"]:
+        raise DbtParseError(
+            _failure_message("dbt parse failed", parse_result["messages"]),
+            warnings=parse_result["messages"][1:],
+        )
+
+    planned = _make_plan(engine, f"scaffold unit test for {model_name}", edits)
+    planned.warnings.extend(warnings)
+    planned.warnings.append(
+        "expect: is a stub with no rows; this unit test fails until you fill "
+        "in the model's actual expected output for the given fixtures above"
+    )
+    return TestScaffoldResult(**planned.model_dump(), model=model_name, inputs=inputs)
+
+
+def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from .test_scaffold import TestScaffoldError
+
+    try:
+        result = test_scaffold(engine, getattr(args, "scaffold", None))
+        return to_envelope(result, hints=_plan_hint(result))
+    except DbtParseError as exc:
+        return env.error_for(exc, warnings=exc.warnings)
+    except (ValueError, TestScaffoldError) as exc:
+        return env.error_for(exc)
+
+
 def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
     """Write a stored plan's edits into the dbt project.
 
@@ -398,7 +456,15 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
 
     repo_root = engine.require_repo_root("applying a plan to the dbt project")
     outcome: PlanApplyResult = plans_mod.apply(
-        plan_id, repo_root, store=store, confirmed=engine.confirmed
+        plan_id,
+        repo_root,
+        store=store,
+        confirmed=engine.confirmed,
+        # A plan is applied through the format it was planned against, so a
+        # format that placed an edit into its own keyspace is the one that writes
+        # it. `None` here is a format declining the write tier, and falls back to
+        # dbt's writer, which is where every plan went before the seam.
+        project_format=engine.editable_project(),
     )
     conflicts = [c.model_dump(mode="json") for c in outcome.conflicts]
     if outcome.conflicts and not outcome.written:
@@ -480,6 +546,7 @@ def build(
     from ..guards.cost_guard import (
         ConfirmationRequiredError,
         no_session_ceiling_warning,
+        skipped_handshake_warning,
         unserialized_ledger_warning,
     )
 
@@ -510,24 +577,28 @@ def build(
         connection=engine.connection,
     )
 
-    # Free/local (DuckDB): nothing bills, so there is nothing to price. The
-    # engine runs the dev-target check and the confirm handshake itself.
+    # Free/local (DuckDB): nothing bills, so there is nothing to price and no
+    # confirmation to ask for (issue #197); the engine runs the dev-target
+    # check and gates the ceiling/ready-to-run checks that still apply.
     if paradigm is Paradigm.FREE_LOCAL:
-        try:
-            summary, cost = run_build(
-                project,
-                target=target,
-                configured_target=config.dbt_target,
-                select=select,
-                ceiling=ceiling,
-                confirmed=engine.confirmed,
-                paradigm=paradigm,
-                dev_target_check=dev_check,
-            )
-        except ConfirmationRequiredError as exc:
-            exc.request = _build_confirmation(target, exc.cost)
-            raise
-        return _shape_build_result(summary, cost, paradigm, connector, store)
+        summary, cost = run_build(
+            project,
+            target=target,
+            configured_target=config.dbt_target,
+            select=select,
+            ceiling=ceiling,
+            confirmed=engine.confirmed,
+            paradigm=paradigm,
+            dev_target_check=dev_check,
+        )
+        return _shape_build_result(
+            summary,
+            cost,
+            paradigm,
+            connector,
+            store,
+            extra_notes=skipped_handshake_warning(paradigm, engine.confirmed),
+        )
 
     dev_warnings = dev_check()
     estimate, per_node, price_notes, adapter = _price_build(
@@ -946,12 +1017,28 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
 
 def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
     repo_root = engine.require_repo_root("storing a transform plan")
+    editable = engine.editable_project()
+    # The directory these edits are pinned against has to name the same project
+    # as the surface they are checked in, or an existing file hashes as absent
+    # and the apply that follows conflicts on a file nobody edited. A format
+    # declaring a surface answers both from its own view, so the directory is
+    # left to `plans.plan` to read there rather than asserted from dbt's here.
+    # Everything else predates the seam and keeps dbt's configured pin, which
+    # that function's own fallback (discovery from the repo root) would not
+    # honor. For dbt the two agree by construction: its view loads the same
+    # resolved directory `project_dir()` returns.
+    declares_surface = getattr(editable, "editing_surface", None) is not None
     stored, diffs, warnings = plans_mod.plan(
         intent,
         edits,
-        engine.project_dir(),
+        None if declares_surface else engine.project_dir(),
         repo_root,
         store=engine.require_full_store("storing a semantic plan"),
+        # Agent-authored edits, which is the caller `editing_surface` exists for:
+        # there is no placement to compare a path against here, only the surface
+        # the format admits to owning. A format declining the write tier is
+        # `None` and validates against dbt's surface as before.
+        project_format=editable,
     )
     return PlanResult(
         plan_id=stored.plan_id,

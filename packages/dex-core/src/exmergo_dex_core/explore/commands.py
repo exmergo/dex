@@ -38,7 +38,6 @@ from ..cache import (
     Dataset,
     DexCache,
     Relationship,
-    RelationshipKind,
     match_identifier,
     relation_verdict,
 )
@@ -49,7 +48,7 @@ from ..config import (
     blob_override_paths,
     pii_override_paths,
 )
-from ..errors import PrerequisiteError, RequestError
+from ..errors import DexError, PrerequisiteError, RequestError
 from ..guards.cost_guard import (
     ConfirmationRequiredError,
     CostGuardError,
@@ -64,7 +63,7 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
-from ..storage import Document, ExploreStore
+from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
 from . import cluster as cluster_mod
 from . import diagram as diagram_mod
 from . import inventory as inventory_mod
@@ -189,9 +188,13 @@ def _verify_estimate(
 ) -> tuple[float, int, int]:
     """Free dry-run pricing of the overlap probes verify would run, plus the
     candidate/object counts for the checkpoint payload; zero-cost on free
-    adapters or when inference found nothing to probe."""
+    adapters or when nothing qualifies to probe.
 
-    candidates = [r for r in relationships if r.kind is RelationshipKind.INFERRED]
+    Selects through `probe_candidates`, the same function `verify_relationships`
+    iterates, so the priced set and the run set are the same set by
+    construction rather than by two filters agreeing."""
+
+    candidates = rel_mod.probe_candidates(relationships)
     objects = {r.from_dataset for r in candidates} | {r.to_dataset for r in candidates}
     query_estimate = getattr(adapter, "query_estimate", None)
     if query_estimate is None or not candidates:
@@ -486,7 +489,7 @@ def profile(
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
-    prior = store.load_cache()
+    prior = readable_cache(store)
 
     identifiers = _resolve_identifiers(adapter, objects)
     connector = adapter.name
@@ -593,7 +596,7 @@ def relationships(
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
-    prior = store.load_cache()
+    prior = readable_cache(store)
     accumulated: list[Dataset] = []
     over_ceiling = False
     verify_pending: ConfirmationRequest | None = None
@@ -682,35 +685,6 @@ def relationships(
     datasets = profiled + list(fresh_reused.values())
     suppressed: list[rel_mod.SuppressedMatch] = []
     inferred = rel_mod.infer_relationships(datasets, suppressed=suppressed)
-    if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
-        verify_pending = command_args.verify_handshake(
-            "explore relationships",
-            adapter,
-            probe_cost,
-            candidate_count=candidates,
-            object_count=objects,
-        )
-        if verify_pending is None:
-            verify_reporter = _reporter(len(inferred), "verified", "joins")
-            try:
-                rel_mod.verify_relationships(
-                    adapter,
-                    inferred,
-                    timeout_seconds=config.query.timeout_seconds,
-                    progress=verify_reporter,
-                )
-                verify_reporter.done()
-            except OverCeilingError:
-                # Estimate drift mid-loop; the relationship set itself is
-                # complete, so finish with a warning (see map).
-                done = sum(1 for r in inferred if r.verified)
-                verify_warning = (
-                    f"budget exhausted after verifying {done} of "
-                    f"{len(inferred)} candidate join(s); verified "
-                    "results are saved; raise --budget and re-run to "
-                    "finish verification"
-                )
 
     # Annotate before persisting so cached datasets carry candidate_keys and
     # grain, the same shape a `map`-written cache has. Only the freshly profiled
@@ -729,6 +703,44 @@ def relationships(
         defs, [d.identifier for d in datasets]
     )
     rels, confirmed = _merge_relationships(declared, inferred)
+
+    # Verify the *merged* set, not the inferred one. Declared joins are probe
+    # candidates now (issue #163) and are only born at the merge above, so
+    # verifying earlier would price and measure a set that excludes exactly the
+    # joins a cooperative project cares most about. Merging first also means no
+    # measurement can be lost to the "declared wins over the same inferred edge"
+    # rule: at merge time nothing has been measured yet.
+    if verify:
+        probe_cost, candidates, objects = _verify_estimate(adapter, rels)
+        verify_pending = command_args.verify_handshake(
+            "explore relationships",
+            adapter,
+            probe_cost,
+            candidate_count=candidates,
+            object_count=objects,
+        )
+        if verify_pending is None:
+            probed = rel_mod.probe_candidates(rels)
+            verify_reporter = _reporter(len(probed), "verified", "joins")
+            try:
+                rel_mod.verify_relationships(
+                    adapter,
+                    rels,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
+                )
+                verify_reporter.done()
+            except OverCeilingError:
+                # Estimate drift mid-loop; the relationship set itself is
+                # complete, so finish with a warning (see map).
+                done = sum(1 for r in probed if r.verified)
+                verify_warning = (
+                    f"budget exhausted after verifying {done} of "
+                    f"{len(probed)} candidate join(s); verified "
+                    "results are saved; raise --budget and re-run to "
+                    "finish verification"
+                )
+
     # Prior relationships are only reusable when they came from the same
     # connector, same as the profiles below.
     reusable = prior if prior and prior.provenance.connector == connector else None
@@ -747,6 +759,17 @@ def relationships(
         notes.append(
             f"verified {len(inferred)} inferred join(s) with aggregate overlap probes"
         )
+    # A verified join at a catastrophic orphan rate is a finding, not just a
+    # demoted confidence (issue #207): named here so a caller reading only
+    # notes sees it, and mirrored onto the child dataset's data_quality so
+    # it survives into the cache for anything reading profiles later.
+    orphan_findings = rel_mod.orphan_findings(rels)
+    notes.extend(text for _rel, text in orphan_findings)
+    datasets_by_id = {d.identifier: d for d in datasets}
+    for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
     if fresh_reused:
         window = config.profile_freshness_hours
         notes.append(
@@ -976,7 +999,7 @@ def _run_statements(
     limits = config.query
     now = datetime.now(UTC)
     at = now.isoformat()
-    cache = store.load_cache()
+    cache = readable_cache(store)
     # The firewall parses in the active connector's dialect, so BigQuery SQL
     # (backticks, COUNTIF) is inspected as BigQuery, not as DuckDB.
     dialect = get_dialect(engine.connector or config.connector)
@@ -1014,7 +1037,24 @@ def _run_statements(
 
         named = list(dict.fromkeys(name for names in reads.values() for name in names))
         if named:
-            shared.adapter = engine._adapter("explore query")
+            try:
+                shared.adapter = engine._adapter("explore query")
+            except DexError:
+                # No connection settles nothing, exactly as an unreadable column
+                # signature settles nothing inside `_object_gap`. That tolerance
+                # already exists one level down; it was missing here, at the
+                # acquisition, and the difference is not cosmetic: the guard below
+                # decides from cached PII flags and needs no warehouse at all, so
+                # letting an absent connector stop it turns a policy decision into
+                # a connectivity one and closes the firewall in exactly the
+                # offline environments that cannot bill for a mistake.
+                #
+                # Nothing is swallowed. A statement that PASSES the guard reaches
+                # the same opener below and raises there, which is where a caller
+                # who is about to run SQL wants to hear that the warehouse is
+                # unreachable. Only a refusal now returns without it.
+                shared.adapter = None
+        if shared.adapter is not None:
             gap = _object_gap(shared.adapter, cache, named)
             if gap.absent:
                 # Only the statements that named a missing object are refused; a
@@ -1502,7 +1542,7 @@ def map(
     # Capture pre-run cache state before any checkpoint write, so the success-path
     # compose reads the pre-run cache rather than a checkpoint this run wrote.
     now = datetime.now(UTC)
-    prior = store.load_cache()
+    prior = readable_cache(store)
     accumulated: list[Dataset] = []
     over_ceiling = False
     verify_pending: ConfirmationRequest | None = None
@@ -1594,37 +1634,6 @@ def map(
     _annotate_grain(profiled, defs, orphaned=orphaned)
     suppressed: list[rel_mod.SuppressedMatch] = []
     inferred = rel_mod.infer_relationships(all_selected, suppressed=suppressed)
-    if verify:
-        probe_cost, candidates, objects = _verify_estimate(adapter, inferred)
-        verify_pending = command_args.verify_handshake(
-            "explore map",
-            adapter,
-            probe_cost,
-            candidate_count=candidates,
-            object_count=objects,
-        )
-        if verify_pending is None:
-            verify_reporter = _reporter(len(inferred), "verified", "joins")
-            try:
-                rel_mod.verify_relationships(
-                    adapter,
-                    inferred,
-                    timeout_seconds=config.query.timeout_seconds,
-                    progress=verify_reporter,
-                )
-                verify_reporter.done()
-            except OverCeilingError:
-                # The upfront probe pricing fit, but per-statement estimates
-                # drifted past the ceiling mid-loop. The map itself is
-                # complete, so finish with a warning instead of the profiling
-                # phase's partial-completion error.
-                done = sum(1 for r in inferred if r.verified)
-                verify_warning = (
-                    f"budget exhausted after verifying {done} of "
-                    f"{len(inferred)} candidate join(s); verified "
-                    "results are saved; raise --budget and re-run to "
-                    "finish verification"
-                )
 
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
@@ -1637,6 +1646,42 @@ def map(
         defs, [m.identifier for m in metas]
     )
     relationship_set, confirmed = _merge_relationships(declared, inferred)
+
+    # Verify the merged set: declared joins are probe candidates (issue #163)
+    # and only exist from the merge above. Same ordering as `relationships`.
+    if verify:
+        probe_cost, candidates, objects = _verify_estimate(adapter, relationship_set)
+        verify_pending = command_args.verify_handshake(
+            "explore map",
+            adapter,
+            probe_cost,
+            candidate_count=candidates,
+            object_count=objects,
+        )
+        if verify_pending is None:
+            probed = rel_mod.probe_candidates(relationship_set)
+            verify_reporter = _reporter(len(probed), "verified", "joins")
+            try:
+                rel_mod.verify_relationships(
+                    adapter,
+                    relationship_set,
+                    timeout_seconds=config.query.timeout_seconds,
+                    progress=verify_reporter,
+                )
+                verify_reporter.done()
+            except OverCeilingError:
+                # The upfront probe pricing fit, but per-statement estimates
+                # drifted past the ceiling mid-loop. The map itself is
+                # complete, so finish with a warning instead of the profiling
+                # phase's partial-completion error.
+                done = sum(1 for r in probed if r.verified)
+                verify_warning = (
+                    f"budget exhausted after verifying {done} of "
+                    f"{len(probed)} candidate join(s); verified "
+                    "results are saved; raise --budget and re-run to "
+                    "finish verification"
+                )
+
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
     examined = {d.identifier for d in all_selected}
@@ -1652,6 +1697,16 @@ def map(
         observed_namespaces=observed_namespaces,
     )
 
+    # A verified join at a catastrophic orphan rate is a finding, not just a
+    # demoted confidence (issue #207): mirrored onto the child dataset's
+    # data_quality (persisted below) and surfaced in notes further down.
+    orphan_findings = rel_mod.orphan_findings(relationship_set)
+    datasets_by_id = {d.identifier: d for d in datasets}
+    for rel, text in orphan_findings:
+        child = datasets_by_id.get(rel.from_dataset)
+        if child is not None:
+            child.data_quality.append(text)
+
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
     cache.provenance.created_at = (
@@ -1664,6 +1719,7 @@ def map(
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
     notes.extend(defs.notes)
+    notes.extend(text for _rel, text in orphan_findings)
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared tests; kept as declared"
@@ -1800,7 +1856,7 @@ def cluster(
 
     store = engine.store
     config = engine.config
-    cache = store.load_cache()
+    cache = readable_cache(store)
     now = datetime.now(UTC)
     auto = config.auto_profile if auto_profile is None else auto_profile
 
@@ -1811,7 +1867,22 @@ def cluster(
     warnings: list[str] = []
     profiled_names: list[str] = []
     if auto:
-        adapter = engine._adapter("explore cluster")
+        try:
+            adapter = engine._adapter("explore cluster")
+        except DexError:
+            # The same tolerance the query path applies, at the second site the
+            # object-gap probe was added to. `cluster` decides two things from
+            # the cache alone -- "there is no cache" and "that object is not in
+            # it" -- and both refusals sit below this acquisition, so gating it
+            # here made them unreachable wherever no connector is installed.
+            #
+            # `auto_profile` defaults to True, so this is the ordinary path and
+            # not an opt-in one; `--no-auto-profile` was the only way left to
+            # reach either refusal offline. Nothing is swallowed: an object that
+            # IS profiled still needs a connection to build its sample, reaches
+            # the opener at the bottom of this function, and raises there.
+            adapter = None
+    if adapter is not None:
         gap = _object_gap(adapter, cache, [obj])
         if gap.absent:
             raise RequestError(gap.refusal())
@@ -2020,7 +2091,7 @@ def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
     nothing and a diagram of an unexplored warehouse look identical.
     """
 
-    cache = engine.store.load_cache()
+    cache = readable_cache(engine.store)
     if cache is None:
         raise CacheRequiredError(
             "no exploration cache yet; run `explore map` first so there is a "
@@ -2051,7 +2122,7 @@ def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
 def cmd_diagram(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(diagram(engine, full=getattr(args, "full", False)))
-    except (CacheRequiredError, ValueError) as exc:
+    except (CacheRequiredError, CacheUnreadableError, ValueError) as exc:
         return env.error_for(exc)
 
 
@@ -2068,6 +2139,7 @@ def cmd_cluster(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         )
     except (
         CacheRequiredError,
+        CacheUnreadableError,
         ValueError,
         cluster_mod.ClusterError,
         cluster_mod.ClusterDependencyError,

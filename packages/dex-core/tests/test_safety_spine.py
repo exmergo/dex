@@ -59,6 +59,7 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
             safe={"id"},
             shape={"email"},
             type_req={"id", "email"},
+            key_shape_req={"email"},
         )
     finally:
         adapter.close()
@@ -70,6 +71,8 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # string-eligible fractions on the VARCHAR column, epoch fractions on both.
     assert "ts_ns_1" in sql and "ts_sl1_1" in sql
     assert "ts_ep_s_0" in sql and "ts_ep_s_1" in sql
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_1" in sql and "ks_hex_1" in sql
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
 
@@ -107,6 +110,112 @@ def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
         )
     # The translated calendar date is what appears, not the integer.
     assert "2023-11-14" in notes
+
+
+def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
+    """#205: neither a concrete numeric id nor a concrete hash string may
+    reach the generated data-quality note text -- only fractions and a
+    length-derived shape label."""
+
+    import hashlib
+
+    import duckdb
+
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "heterogeneous_key.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY)")
+    rows = [(str(1000 + i),) for i in range(90)]
+    # md5-shaped test fixture data only, not a security use.
+    hashes = [
+        hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
+        for i in range(10)
+    ]
+    rows += [(h,) for h in hashes]
+    conn.executemany("INSERT INTO t VALUES (?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (dataset,) = profile(adapter, ["heterogeneous_key.main.t"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "mixes value shapes" in notes
+    for i in range(90):
+        assert str(1000 + i) not in notes, "no concrete numeric id in note text"
+    for h in hashes:
+        assert h not in notes, "no concrete hash value in note text"
+    # Only the fraction and the length-derived shape label appear.
+    assert "90% numeric" in notes and "md5-shaped" in notes
+
+
+# `dex demo` is the one verb that creates a data file, so the read-only rule has
+# to hold around it in a way a reader can check rather than take on trust. Two
+# tests do that: the generator is structurally sealed off from the connector, and
+# the file it produces is opened read-only like any other the moment it exists.
+
+
+def test_the_demo_generator_is_the_only_writable_duckdb_open():
+    """No writable DuckDB connection exists in the engine outside the generator.
+
+    Asserted over the source rather than at runtime because the claim is about
+    what the code can do, not about what one path happened to do: a future
+    `read_only=False` anywhere in the adapter tree is the regression, and it
+    would pass every behavioral test until someone pointed dex at a warehouse
+    they cared about.
+    """
+
+    import exmergo_dex_core
+
+    package_root = Path(exmergo_dex_core.__file__).parent
+    generator = package_root / "demo" / "warehouse.py"
+    openers = [
+        path
+        for path in package_root.rglob("*.py")
+        if "duckdb.connect(" in path.read_text(encoding="utf-8")
+    ]
+    assert generator in openers, "the generator is the one that writes"
+    for path in openers:
+        if path == generator:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "read_only=True" in source, f"{path} opens DuckDB without read_only"
+        assert "read_only=False" not in source, f"{path} opens DuckDB writable"
+
+    # And the generator imports neither the adapter nor the guards, so the
+    # read-only open and the SELECT-only guard have no branch it could take.
+    # Read off the import statements rather than the file text, so the prose
+    # explaining the separation cannot be mistaken for a violation of it.
+    import ast
+
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(generator.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not any("adapters" in name or "guards" in name for name in imported), (
+        f"the generator must stay off the connector path: {sorted(imported)}"
+    )
+
+
+def test_a_generated_demo_warehouse_is_opened_read_only(tmp_path: Path):
+    """The loop closed: the moment the demo file exists it is user data, and the
+    adapter treats it exactly like a warehouse dex did not create."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import generate_demo_warehouse
+
+    warehouse = generate_demo_warehouse(tmp_path / "demo.duckdb")
+    adapter = DuckDBAdapter(warehouse.path)
+    try:
+        with pytest.raises(Exception):
+            adapter._conn.execute("DELETE FROM customers")
+    finally:
+        adapter.close()
 
 
 def test_combination_probe_sql_is_select_only_in_every_dialect():
@@ -1419,6 +1528,69 @@ def test_init_refuses_where_a_project_already_exists(dbt_project_dir: Path):
         )
 
 
+def test_demo_refuses_to_overwrite_an_existing_warehouse(tmp_path: Path, capsys):
+    """`dex demo` is create-only, and deliberately not confirmable.
+
+    The sibling of the init refusal above, for the one verb that writes a data
+    file rather than a project file. It is stricter than init on purpose: a
+    `--confirm` that could talk past this would put a real warehouse one typo
+    away from being replaced, and the fix (name another path) costs nothing.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    existing = tmp_path / "production.duckdb"
+    existing.write_bytes(b"someone else's warehouse")
+
+    for argv in (["demo", str(existing)], ["demo", str(existing), "--confirm"]):
+        assert main(argv) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert payload["reason"] == "guard"
+        assert existing.read_bytes() == b"someone else's warehouse"
+
+
+def test_demo_creates_only_what_it_names_and_never_a_second_config(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Two artifacts, both reported, and never one that shadows a real project.
+
+    A `.dex/config.yml` written into a subdirectory of someone's repo would
+    silently capture every command run there, which is the same class of harm as
+    overwriting a file: a change they did not ask for and would not see.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["demo"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    on_disk = sorted(
+        str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()
+    )
+    assert on_disk == sorted(payload["data"]["created"])
+
+    # Now with a project config already above the target: the warehouse is still
+    # created, the config is not, and the envelope says which happened.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "scratch").mkdir()
+    committed = tmp_path / ".dex" / "config.yml"
+    before = committed.read_text(encoding="utf-8")
+
+    assert main(["demo", "scratch/second.duckdb"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["created"] == ["scratch/second.duckdb"]
+    assert not (tmp_path / "scratch" / ".dex").exists()
+    assert committed.read_text(encoding="utf-8") == before
+    assert any("left untouched" in w for w in payload["warnings"])
+
+
 def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys):
     # Init bakes the connector into a durable artifact (the generated
     # profiles.yml), so the engine-wide DuckDB default does not apply: bare init
@@ -1774,13 +1946,16 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}, shape, type_req
+        "test-proj.shop.customers", columns, {"id"}, shape, type_req, key_shape_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     # Declared-type-vs-content statistics (#204) ride the same statement too.
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
@@ -1846,6 +2021,58 @@ def test_bigquery_over_ceiling_cannot_be_confirmed_through(fake_bq_client):
             timeout_seconds=30,
         )
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_bigquery_a_narrowed_reserve_still_bounds_what_profiling_bills():
+    # Family 2: the estimate is a ceiling actual spend will not exceed (#107),
+    # and that has to survive every reserve the estimator declines to hold
+    # (#299). A view is the sharpest case: it has no row count, so all three
+    # escalation probes bail and the estimator now reserves nothing at all for
+    # it. If any of them could still run, this is where the quoted number would
+    # turn out to be less than the bill.
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="customers_v",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER"),
+                    bigquery.SchemaField("tier", "STRING"),
+                ],
+                num_rows=100,  # nulled out for a view, which is the point
+                num_bytes=5_000,
+                table_type="VIEW",
+            )
+        ],
+        row_resolver=lambda sql: [
+            {
+                "n_total": 100,
+                "nn_0": 100,
+                "nd_0": 100,
+                "mn_0": 1,
+                "mx_0": 100,
+                "nn_1": 100,
+                "nd_1": 3,
+                "d_0": 100,
+                "d_1": 3,
+            }
+        ],
+    )
+    adapter = _bq_adapter(client)
+    estimate, _per_table = adapter.profile_estimate(["test-proj.shop.customers_v"])
+    profile_mod.profile(adapter, ["test-proj.shop.customers_v"])
+    billed = adapter.cost_gate.spend_summary()["bytes_billed"]
+    assert billed <= estimate
+    # And no escalation was attempted, which is why nothing was reserved.
+    executed = [c for c in client.query_calls if not c.dry_run]
+    assert len(executed) == 1
 
 
 def test_bigquery_every_executed_job_is_server_capped(fake_bq_client):
@@ -2129,12 +2356,14 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     sql, _plan = adapter._build_aggregate_sql(
-        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req
+        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req, key_shape_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     assert assert_select_only(sql, dialect="snowflake") == sql
 
 
@@ -2406,12 +2635,14 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     sql, _plan = adapter._build_aggregate_sql(
-        "shop.core.customers", columns, {"id"}, shape, type_req
+        "shop.core.customers", columns, {"id"}, shape, type_req, key_shape_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
 
 
@@ -2617,12 +2848,14 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req
+        "dexdb.shop.customers", columns, {"id"}, shape, type_req, key_shape_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
 
 
@@ -2858,12 +3091,14 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req
+        "dexdb.shop.customers", columns, {"id"}, shape, type_req, key_shape_req
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
     assert assert_select_only(sql, dialect="redshift") == sql
 
 

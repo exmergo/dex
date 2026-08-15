@@ -408,6 +408,7 @@ def test_shape_stats_requested_only_for_generic_name_string_columns():
             safe_min_max=None,
             shape_stats=None,
             type_stats=None,
+            key_shape_stats=None,
         ):
             self.shape_requests.append(set(shape_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -462,6 +463,7 @@ def test_type_stats_requested_only_for_eligible_non_pii_columns():
             safe_min_max=None,
             shape_stats=None,
             type_stats=None,
+            key_shape_stats=None,
         ):
             self.type_requests.append(set(type_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -599,6 +601,191 @@ def test_pii_flagged_column_gets_no_type_contradiction_note(tmp_path: Path):
     assert dataset.data_quality == []
 
 
+# --- heterogeneous-key-shape notes (#205) ---------------------------------------
+
+
+def test_key_shape_stats_requested_only_for_eligible_non_pii_string_columns():
+    """#205: string-only, unlike #204's type_stats -- a UUID/hex check is
+    meaningless on a column SQL already stores as a number -- and never a
+    PII-flagged column, at any confidence."""
+
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.key_shape_requests: list[set[str]] = []
+            self.columns = [
+                ColumnMeta("id", "VARCHAR", False, 0),
+                ColumnMeta("count", "INTEGER", True, 1),
+                ColumnMeta("email", "VARCHAR", True, 2),
+            ]
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=1,
+                byte_size=None,
+                column_count=len(self.columns),
+            )
+            return meta, self.columns
+
+        def column_aggregates(
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+        ):
+            self.key_shape_requests.append(set(key_shape_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.key_shape_requests == [{"id"}]
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "expect_substring"),
+    [
+        # The issue's own worked example: 90% numeric, 10% md5-shaped hex.
+        (
+            {
+                "numeric_string_fraction": 0.9,
+                "hex_string_fraction": 0.1,
+                "hex_string_min_length": 32,
+                "hex_string_max_length": 32,
+            },
+            "md5-shaped",
+        ),
+        # Homogeneous numeric: only one bucket clears the floor, no note.
+        ({"numeric_string_fraction": 1.0}, None),
+        # Homogeneous UUID: same, no note.
+        ({"uuid_string_fraction": 1.0}, None),
+        # Below the minority-share floor (4% < 5%): reads as noise, not a
+        # second real population.
+        ({"numeric_string_fraction": 0.96, "hex_string_fraction": 0.04}, None),
+        # Mixed-length hex: reported as a range, not a false fixed length.
+        (
+            {
+                "numeric_string_fraction": 0.5,
+                "hex_string_fraction": 0.5,
+                "hex_string_min_length": 24,
+                "hex_string_max_length": 64,
+            },
+            "24-64 characters, mixed length",
+        ),
+        # Three-way mix: numeric, uuid, and hex all present in meaningful share.
+        (
+            {
+                "numeric_string_fraction": 0.4,
+                "uuid_string_fraction": 0.3,
+                "hex_string_fraction": 0.3,
+                "hex_string_min_length": 40,
+                "hex_string_max_length": 40,
+            },
+            "sha1-shaped",
+        ),
+        # No evidence at all: fail closed.
+        ({}, None),
+    ],
+)
+def test_heterogeneous_key_note_decisions(agg_kwargs: dict, expect_substring):
+    from exmergo_dex_core.explore.profile import _heterogeneous_key_note
+
+    note = _heterogeneous_key_note("id", _aggregate(**agg_kwargs))
+    if expect_substring is None:
+        assert note is None, note
+    else:
+        assert note is not None and expect_substring in note, note
+
+
+def test_heterogeneous_key_note_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _heterogeneous_key_note
+
+    assert _heterogeneous_key_note("id", None) is None
+
+
+@pytest.mark.parametrize(
+    ("col_name", "agg_kwargs", "composite_members", "expected"),
+    [
+        # Single-column, proven unique, non-null: a candidate key.
+        ("id", {"is_unique": True, "null_fraction": 0.0}, set(), True),
+        # A composite-key member, even though not itself unique alone.
+        ("order_id", {"is_unique": False}, {"order_id", "line_no"}, True),
+        # Unique-looking but nullable: not a proven key (the same rule
+        # relationships.candidate_keys applies).
+        ("maybe_unique", {"is_unique": True, "null_fraction": 0.1}, set(), False),
+        # Plain non-unique string column: never a key, straight from the
+        # issue's own acceptance criteria ("a free-text column is not
+        # treated as key-shaped").
+        ("comments", {"is_unique": False, "null_fraction": 0.0}, set(), False),
+    ],
+)
+def test_is_candidate_key_matches_relationships_candidate_keys_rule(
+    col_name, agg_kwargs, composite_members, expected
+):
+    from exmergo_dex_core.explore.profile import _is_candidate_key
+
+    agg = _aggregate(name=col_name, **agg_kwargs)
+    assert _is_candidate_key(col_name, agg, composite_members) is expected
+
+
+def test_heterogeneous_key_end_to_end_real_duckdb(tmp_path: Path):
+    """A unique string id column mixing 90 numeric-shaped and 10 md5-shaped
+    values names both shapes and the consequence; a sibling homogeneous-UUID
+    key and a non-key free-text column with the same mixed content produce
+    no note (the issue's own three acceptance scenarios, in one table)."""
+
+    import hashlib
+    import uuid as uuid_lib
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "heterogeneous_key.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE t (id VARCHAR PRIMARY KEY, uid VARCHAR, comments VARCHAR)"
+    )
+    rows = [
+        (str(1000 + i), str(uuid_lib.uuid4()), "a mixed comment") for i in range(90)
+    ]
+    for i in range(10):
+        # md5-shaped test fixture data only, not a security use.
+        h = hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
+        rows.append((h, str(uuid_lib.uuid4()), "a mixed comment"))
+    conn.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["heterogeneous_key.main.t"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "id is a candidate key but mixes value shapes" in notes
+    assert "90% numeric" in notes and "10% 32-character hexadecimal" in notes
+    assert "md5-shaped" in notes
+    assert "casting to a number or comparing numerically" in notes
+    # The homogeneous UUID key and the non-key free-text column (not unique:
+    # "a mixed comment" repeats) both stay silent.
+    assert "uid" not in notes
+    assert "comments" not in notes
+
+
 # --- pii_overrides: the durable human decision ---------------------------------
 
 
@@ -728,6 +915,7 @@ def test_pii_override_pattern_clears_across_multiple_tables():
             safe_min_max=None,
             shape_stats=None,
             type_stats=None,
+            key_shape_stats=None,
         ):
             self.shape_requests.append(set(shape_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -1302,6 +1490,7 @@ class _StubAdapter:
         safe_min_max=None,
         shape_stats=None,
         type_stats=None,
+        key_shape_stats=None,
     ):
         from exmergo_dex_core.adapters.base import ColumnAggregate
 
@@ -1589,6 +1778,32 @@ def test_value_domain_excluded_when_fraction_exceeds_cutoff_on_small_table():
     assert datasets[0].columns[0].value_domain is None
 
 
+def test_no_column_can_have_a_value_domain_below_the_minimum_row_count():
+    """The fraction implies a floor on rows, and a metered adapter reserves
+    budget against that floor rather than against the fraction it cannot
+    evaluate before the scan (issue #299). This pins the two together: below
+    VALUE_DOMAIN_MIN_ROWS not even the narrowest possible column qualifies, so
+    an estimator that skips the reserve there skips a query that cannot run."""
+
+    from exmergo_dex_core.adapters.base import (
+        VALUE_DOMAIN_MIN_ROWS,
+        ValueDomainSample,
+    )
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    below = _StubAdapter(rows=VALUE_DOMAIN_MIN_ROWS - 1, approx={"code": 1})
+    profile_mod.profile(below, ["db.s.t"])
+    assert below.domain_calls == []
+
+    at_bar = _StubAdapter(
+        rows=VALUE_DOMAIN_MIN_ROWS,
+        approx={"code": 1},
+        domains={"code": ValueDomainSample(values=[("x", 10)], total_distinct=1)},
+    )
+    profile_mod.profile(at_bar, ["db.s.t"])
+    assert at_bar.domain_calls == [["code"]]
+
+
 def test_value_domain_excluded_for_composite_key_member():
     """`line_no` is well within the cap and fraction on its own, but it is a
     proven composite-key member, so it must report no domain even though the
@@ -1745,6 +1960,7 @@ def test_row_count_refreshes_after_the_aggregate_scan():
             safe_min_max=None,
             shape_stats=None,
             type_stats=None,
+            key_shape_stats=None,
         ):
             self.scanned = True
             return [
