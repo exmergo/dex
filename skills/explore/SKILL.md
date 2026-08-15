@@ -19,6 +19,13 @@ nothing else; read the envelope and decide the next step.
 uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
+dex runs its engine through `uv`, which is a prerequisite and is not installed by
+Claude Code. If the shell reports `uv: command not found`, stop and tell the user
+to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
+`brew install uv`, or `pipx install uv`), then re-run. Never fall back to raw
+Python, `pip`, or a database CLI to do the work another way: the guardrails live in
+the engine, so any other path is unguarded.
+
 If the user has no warehouse to point at and wants to see what dex does, `demo`
 generates one: a seeded local DuckDB warehouse plus the `.dex/config.yml` for it,
 with no credentials and no network, so every subcommand below then runs with no

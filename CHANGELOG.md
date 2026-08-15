@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.6.6] - 2026-08-15
+
 ### Fixed
 
 - **Profiling a non-PII string column no longer kills the statement on
@@ -88,7 +90,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   Implemented across every connector (DuckDB, BigQuery, Snowflake,
   Databricks, Redshift, Postgres); gated on no PII flag at all, at any
   confidence, the same rule #204's declared-type checks already use.
-  
+
+- **A missing `uv` is a refusal that names the fix, not a traceback** ([#310]).
+  The skill wrappers shell into `uv run` to install and run the engine, and did so
+  with no guard, so on a machine without `uv` on `PATH` a first run ended in a raw
+  `FileNotFoundError`. Nothing said `uv` was required either: not the plugin
+  manifest, not the skill frontmatter, not the install sections of the READMEs. The
+  documented Claude Code path is two `/plugin` commands and then "the skills appear
+  and auto-trigger", so a user who followed it exactly could land on a stack trace,
+  and the person most likely to hit it is a Claude Code user rather than a Python
+  developer. dex collects no telemetry by design, which is what makes this worth
+  fixing pre-emptively: every user who hit it churned invisibly, and no report was
+  ever going to arrive.
+
+  The wrapper now checks for `uv` before it execs and, when it is absent, prints the
+  same envelope shape every other refusal uses (`status: error`,
+  `reason: prerequisite`) carrying the install command, and exits 1. It is the one
+  envelope built by hand rather than through `exmergo_dex_core.envelope`, since the
+  engine that would build it is exactly what has not been installed yet; a test
+  holds the two shapes in step. Invoked through `uv run`, the shell still fails
+  first with `command not found`, which no guard inside the script can catch, so
+  each `SKILL.md` now tells the agent what that message means, what to tell the user
+  to install, and not to reach for raw Python or a database CLI instead: the
+  guardrails live in the engine, so every other path is unguarded. The prerequisite
+  is stated up front in the README and in `AGENTS.md` for the any-agent path.
+
 ## [1.6.5] - 2026-08-14
 
 ### Added
@@ -180,7 +206,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   example and the CLI on-ramp show the same data and the packaging suite
   verifies the generator against a freshly built wheel.
 
-
 - **`transform test --scaffold <model>` derives a dbt unit test from a
   model's own inputs** ([#215]). Writing a unit test by hand means restating
   every input's column set with correctly typed values before the assertion
@@ -261,7 +286,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `relationships` and not at all in a bare `explore profile`, so it needs
   new persisted state and a new cross-command annotation pass. Filed as a
   follow-up rather than folded in here.
-
+  
 - **`CacheUnreadableError`**, exported from the package root and from
   `exmergo_dex_core.storage`. The sibling of `CacheRequiredError` that
   `BaselineUnreadableError` is of `NoBaselineError`: both remediate the same way,
