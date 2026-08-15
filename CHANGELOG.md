@@ -11,6 +11,29 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **Profiling a non-PII string column no longer kills the statement on
+  Redshift** ([#310]). The declared-type-vs-content probe (#204) guarded every
+  `CAST` behind a length-bounded shape predicate inside a `CASE`, on the
+  premise that a dialect without `TRY_CAST` would then never evaluate the cast
+  for a row the `WHEN` excluded. Postgres honors that premise; Redshift does
+  not, and evaluates the branch for rows it never selects, so one ordinary
+  varchar status or category column was enough to fail the whole profiling
+  statement with `Invalid digit, Value 'p', Pos 0, Type: Long`. The probe
+  shipped in 1.6.2, so on Redshift that took down `explore profile`,
+  `explore relationships`, and `explore map`, plus the commands that profile
+  the object they name before running (`explore query`, `explore cluster`).
+
+  Every `CAST` the probe builds is now total: the argument is a `CASE` that
+  yields a digit-only string on every row of the column, so no evaluation
+  order can reach a cast with something it cannot parse, and the sentinel it
+  falls back to is rejected by every predicate built on the cast. The
+  measurements are unchanged, denominators included; the "shaped versus not
+  shaped" distinction the fractions need now comes from a separate uncast
+  expression instead of from the cast result being NULL. The fix is
+  dialect-agnostic and lands in the shared expression builder, so the standing
+  assumption about lazy `CASE` evaluation is gone from all six adapters, and an
+  offline invariant test asserts the shape on every one of them.
+
 - **`maintain check` carries each axis's findings in the command envelope**
   ([#279]). The top-level `data.findings` ranking could report drift while the
   adjacent per-axis result did not carry those findings, making an axis look
