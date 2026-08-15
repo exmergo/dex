@@ -27,6 +27,7 @@ from math import ceil
 from typing import Protocol, runtime_checkable
 
 from ..envelope import Paradigm
+from ..errors import WarehouseQueryError
 
 
 @dataclass(frozen=True)
@@ -240,6 +241,30 @@ def blame(origin: str, error: type[Exception]):
         yield
     except error as exc:
         raise error(f"{exc} [from {origin}]") from exc
+
+
+# How much of a driver's error text survives into the envelope. Generous
+# enough for any real server message, short enough that a driver which appends
+# the whole statement (or a stack of context lines) cannot turn one refusal
+# into a wall of stdout.
+_SERVER_DETAIL_CAP = 400
+
+
+def warehouse_refusal(message: str, *, code: str | None = None) -> WarehouseQueryError:
+    """The typed error for one server-side statement failure.
+
+    Every adapter funnels through here so the envelope reads the same whichever
+    warehouse said no, and so the server's words get the same trim: first line
+    only (drivers append the statement, a caret diagram, or their whole error
+    payload after it) and capped. ``code`` is the connector's own error code
+    where it has one, which is what a caller looking the failure up needs.
+    """
+
+    first = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
+    detail = first or "the server gave no message"
+    if len(detail) > _SERVER_DETAIL_CAP:
+        detail = detail[:_SERVER_DETAIL_CAP].rstrip() + "..."
+    return WarehouseQueryError(f"{detail} [{code}]" if code else detail)
 
 
 def json_safe(value: object | None) -> object | None:

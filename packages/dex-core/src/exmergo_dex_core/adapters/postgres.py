@@ -66,6 +66,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "db_load"
@@ -1056,6 +1057,17 @@ class PostgresAdapter:
                 "the statement attempted a write and the session is read-only "
                 "by construction; dex never mutates the database"
             ) from exc
+        except self._pg_errors.DatabaseError as exc:
+            # Everything else the server refused, after the two failures with
+            # a better answer above. `sqlstate` is what separates a server
+            # answer from a connection that died mid-statement (psycopg raises
+            # OperationalError with none for the latter), and only the first
+            # is an execution failure; a dead connection stays untyped so it
+            # is not reported as SQL the server rejected.
+            self._record_elapsed(started, sql)
+            if getattr(exc, "sqlstate", None) is None:
+                raise
+            raise warehouse_refusal(str(exc), code=exc.sqlstate) from exc
         self._record_elapsed(started, sql)
         labels = [str(d.name) for d in cursor.description]
         types = [self._description_type(d) for d in cursor.description]

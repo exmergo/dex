@@ -71,6 +71,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "compute_time"
@@ -1198,7 +1199,16 @@ class RedshiftAdapter:
         message = str(exc).lower()
         timed_out = payload.get("C") == "57014" or "statement timeout" in message
         if not timed_out:
-            return exc
+            # Everything else the server refused. Typed rather than handed
+            # back unchanged: a driver exception is not a DexError, so it used
+            # to fall through every reason override and land on `internal`,
+            # which reads as a dex crash and buries the server's own diagnosis
+            # in an envelope with no reason, no object, and no spend. The
+            # payload's M and C are the message and the SQLSTATE; str(exc) is
+            # the whole payload dict, which is not for reading.
+            return warehouse_refusal(
+                str(payload.get("M") or exc), code=payload.get("C")
+            )
         if budget_bound:
             return OverCeilingError(
                 "the statement hit the server-side statement_timeout derived "

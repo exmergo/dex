@@ -113,6 +113,62 @@ class ConnectorError(DexError):
     """
 
 
+class WarehouseQueryError(DexError):
+    """A statement dex built ran against the warehouse and the server refused it.
+
+    Neither a refusal dex made nor a bug in dex: the guards cleared the
+    statement, the connection was open, and the server answered with an error.
+    For an engine whose whole job is issuing SQL to somebody else's warehouse
+    that is a first-class outcome, so it classifies as ``execution_failure``
+    (the operation ran and failed) instead of falling through ``reason_for``
+    to ``internal``, which says "not a deliberate dex refusal" and sends
+    whoever reads it looking for a crash. Every adapter raises this for a
+    server-side statement failure it cannot translate into something more
+    specific (a budget-derived timeout, a read-only violation), so a caller
+    branching on the reason gets the same answer from every connector.
+
+    ``detail`` is the server's own words, which is the whole diagnostic value:
+    the adapter trims them to one line and caps their length before they get
+    here, because a driver will happily append the statement, a caret diagram,
+    or its entire error payload. They can still quote the fragment of a value
+    that offended the server (``Invalid digit, Value 'p'``), the same way an
+    agent SQL failure's message already does; that is a diagnostic the server
+    volunteered, not a profile of the column, and suppressing it is what made
+    this class of failure undiagnosable in the first place.
+
+    The adapter knows the server's words but not what the statement was for;
+    only the caller that built it knows which object it was reading. So the
+    object is attached afterwards, by :meth:`naming`, rather than threaded
+    down through every adapter's execution seam.
+
+    It lives here rather than beside the code that raises it, which is this
+    module's usual rule, because six adapters raise this one class (there is no
+    "the code that raises it") and because ``envelope._reason_overrides`` has to
+    classify it from the tier of imports that works on an install with no
+    connector extra at all.
+    """
+
+    def __init__(self, detail: str, *, reading: str | None = None):
+        self.detail = detail
+        self.reading = reading
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        about = f" while reading {self.reading}" if self.reading else ""
+        return f"the warehouse refused a statement dex built{about}: {self.detail}"
+
+    def naming(self, identifier: str) -> WarehouseQueryError:
+        """This failure with the object it was reading named.
+
+        The first name wins: the innermost caller that knows one is the most
+        specific, so an outer handler re-naming it cannot make it vaguer.
+        """
+
+        if self.reading is not None:
+            return self
+        return WarehouseQueryError(self.detail, reading=identifier)
+
+
 class NoConnectorSelectedError(ConfigurationError):
     """Nothing named a connector: not a flag, not a path, not a config file.
 

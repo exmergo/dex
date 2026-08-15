@@ -49,6 +49,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "bytes_scanned"
@@ -1091,7 +1092,12 @@ class BigQueryAdapter:
                     "(server-side maximum_bytes_billed); raise --budget or "
                     "narrow the query"
                 ) from exc
-            raise
+            # Every other BadRequest is BigQuery refusing the statement itself
+            # (an invalid query, a type it will not coerce). Typed, so the
+            # envelope carries `execution_failure` and BigQuery's own words
+            # rather than the `internal` an untyped API exception falls
+            # through to.
+            raise warehouse_refusal(str(exc)) from exc
         except TimeoutError as exc:
             # concurrent.futures.TimeoutError is the builtin on Python 3.11+.
             self._cancel(job)
