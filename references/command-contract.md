@@ -12,7 +12,11 @@ logic.
   against the pinned engine version, installing the connector extra it resolves at
   runtime (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
   found by walking up from the run directory to the git root, then DuckDB), so the
-  pin stays connector-neutral.
+  pin stays connector-neutral. `uv` is therefore a prerequisite, and the wrapper
+  holds the envelope contract even there: with no `uv` on `PATH` it refuses with a
+  `reason: prerequisite` error envelope naming the install command, rather than
+  failing the exec. It is the one refusal built by hand, because the engine that
+  would otherwise build it is what is missing.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.

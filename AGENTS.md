@@ -31,6 +31,14 @@ uv run python -m exmergo_dex_core <subcommand> [flags]
 uv run scripts/run.py <subcommand> [flags]
 ```
 
+Both forms need [`uv`](https://docs.astral.sh/uv/) on `PATH`: it is what installs
+and runs the engine, and no agent host installs it for you. Without it the shell
+reports `uv: command not found`, and the shipped wrapper run directly refuses with
+an error envelope (`reason: prerequisite`) naming the fix. The install is one line
+(`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`, or
+`pipx install uv`); relay it to the user rather than reaching for another way to do
+the work, since every guardrail below lives in the engine.
+
 Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
 `[postgres]`, `[redshift]`, or `[all]` for every optional capability at once. The shipped wrapper pins
