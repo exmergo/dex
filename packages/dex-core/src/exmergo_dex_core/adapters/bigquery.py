@@ -43,6 +43,10 @@ from .base import (
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
 )
@@ -90,6 +94,38 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     # Raw string literal; REGEXP_CONTAINS matches substrings, so the shared
     # patterns' anchors make it a full match.
     return f"REGEXP_CONTAINS({qcol}, r'{pattern}')"
+
+
+def _trunc_family(data_type: str) -> str:
+    # BigQuery has three truncation functions, one per temporal type, unlike
+    # every other dialect's single date_trunc: DATE_TRUNC only accepts DATE,
+    # and only DATE_TRUNC has no HOUR unit -- which is moot here since
+    # temporal_units_for already skips hour for a bare DATE column.
+    upper = data_type.upper()
+    if "TIMESTAMP" in upper:
+        return "TIMESTAMP_TRUNC"
+    if "DATETIME" in upper:
+        return "DATETIME_TRUNC"
+    return "DATE_TRUNC"
+
+
+def _diff_family(data_type: str) -> str:
+    upper = data_type.upper()
+    if "TIMESTAMP" in upper:
+        return "TIMESTAMP_DIFF"
+    if "DATETIME" in upper:
+        return "DATETIME_DIFF"
+    return "DATE_DIFF"
+
+
+def _date_trunc_expr(qcol: str, unit: str, data_type: str) -> str:
+    # Reversed argument order and a bare unquoted unit keyword: the one
+    # dialect that differs from every other adapter's date_trunc(unit, col).
+    return f"{_trunc_family(data_type)}({qcol}, {unit.upper()})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str, data_type: str) -> str:
+    return f"{_diff_family(data_type)}({later}, {earlier}, {unit.upper()})"
 
 
 class BigQueryConnectionError(ConnectorError):
@@ -403,6 +439,7 @@ class BigQueryAdapter:
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
         key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         if self._unqueryable(identifier):
             return [self._empty_aggregate(col) for col in columns]
@@ -410,6 +447,7 @@ class BigQueryAdapter:
         shape = shape_stats or set()
         type_req = type_stats or set()
         key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         sample_percent = self._sample_percent(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
@@ -421,6 +459,7 @@ class BigQueryAdapter:
                 shape,
                 type_req,
                 key_shape_req,
+                temporal_req,
                 sample_percent=sample_percent,
             )
             try:
@@ -483,28 +522,37 @@ class BigQueryAdapter:
         shape: set[str],
         type_req: set[str],
         key_shape_req: set[str],
+        temporal_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
+    ) -> tuple[
+        str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]]
+    ]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape/type-contradiction/key-shape fractions only where
-        # requested. Pure (no client), so the SELECT-only property is testable
-        # without a connection. Repeated (ARRAY) columns get no aggregates at
-        # all: they cannot be NULL in BigQuery and COUNT/DISTINCT are invalid
-        # on them; other nested types get a COUNTIF non-null count only.
+        # and value-shape/type-contradiction/key-shape/temporal-continuity
+        # fractions only where requested. Pure (no client), so the SELECT-only
+        # property is testable without a connection. Repeated (ARRAY) columns
+        # get no aggregates at all: they cannot be NULL in BigQuery and
+        # COUNT/DISTINCT are invalid on them; other nested types get a
+        # COUNTIF non-null count only.
+        source = self._quote(identifier)
+        if sample_percent is not None:
+            source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
+        plan: list[
+            tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]
+        ] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             repeated = col.data_type.upper().startswith("ARRAY")
             nested = repeated or self._is_nested(col.data_type)
             if repeated:
-                plan.append((i, col, False, False, False, False, False, False))
+                plan.append((i, col, False, False, False, False, False, False, False))
                 continue
             if nested:
                 select_parts.append(f"COUNTIF({qcol} IS NOT NULL) AS nn_{i}")
-                plan.append((i, col, True, False, False, False, False, False))
+                plan.append((i, col, True, False, False, False, False, False, False))
                 continue
             select_parts.append(f"COUNT({qcol}) AS nn_{i}")
             select_parts.append(f"APPROX_COUNT_DISTINCT({qcol}) AS nd_{i}")
@@ -530,6 +578,25 @@ class BigQueryAdapter:
             wants_key_shape = col.name in key_shape_req
             if wants_key_shape:
                 select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = col.name in temporal_req
+            if wants_temporal:
+                dtype = col.data_type
+
+                def date_trunc(q: str, u: str, dtype: str = dtype) -> str:
+                    return _date_trunc_expr(q, u, dtype)
+
+                def date_diff(
+                    u: str, later: str, earlier: str, dtype: str = dtype
+                ) -> str:
+                    return _date_diff_expr(u, later, earlier, dtype)
+
+                select_parts.extend(temporal_alignment_expressions(qcol, i, date_trunc))
+                for unit in temporal_units_for(dtype):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol, i, unit, source, date_trunc, date_diff
+                        )
+                    )
             plan.append(
                 (
                     i,
@@ -540,11 +607,9 @@ class BigQueryAdapter:
                     wants_shape,
                     wants_type,
                     wants_key_shape,
+                    wants_temporal,
                 )
             )
-        source = self._quote(identifier)
-        if sample_percent is not None:
-            source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         sql = f"SELECT {', '.join(select_parts)} FROM {source}"  # noqa: S608
@@ -560,7 +625,7 @@ class BigQueryAdapter:
     def _read_aggregates(
         self,
         row: Any,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
@@ -575,6 +640,7 @@ class BigQueryAdapter:
             wants_shape,
             wants_type,
             wants_key_shape,
+            wants_temporal,
         ) in plan:
             nn = row[f"nn_{i}"] if has_count else None
             has_counts = nn is not None
@@ -602,6 +668,7 @@ class BigQueryAdapter:
                     avg_token_count=shape_stat_value(row, f"st_{i}", wants_shape),
                     **type_contradiction_aggregate_kwargs(row, i, wants_type),
                     **key_shape_aggregate_kwargs(row, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(row, i, wants_temporal),
                 )
             )
         return aggregates
@@ -770,13 +837,14 @@ class BigQueryAdapter:
                 if not is_blob_type(c.data_type)
                 or f"{identifier}.{c.name}".lower() in blob_paths
             ]
-            # min/max, shape, type-contradiction, and key-shape fractions add
-            # no scanned bytes: columnar billing already charges the whole
-            # column.
+            # min/max, shape, type-contradiction, key-shape, and
+            # temporal-continuity fractions add no scanned bytes: columnar
+            # billing already charges the whole column.
             safe: set[str] = set()
             shape: set[str] = set()
             type_req: set[str] = set()
             key_shape_req: set[str] = set()
+            temporal_req: set[str] = set()
             sample_percent = self._sample_percent(identifier)
             total = 0.0
             for start in range(0, len(scan_columns), _COLUMN_BATCH):
@@ -787,6 +855,7 @@ class BigQueryAdapter:
                     shape,
                     type_req,
                     key_shape_req,
+                    temporal_req,
                     sample_percent=sample_percent,
                 )
                 try:

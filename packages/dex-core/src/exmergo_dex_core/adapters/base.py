@@ -119,6 +119,24 @@ class ColumnAggregate:
     hex_string_fraction: float | None = None
     hex_string_min_length: int | None = None
     hex_string_max_length: int | None = None
+    #: Temporal-continuity statistics, computed only for columns the engine
+    #: requested via ``temporal_stats`` (non-PII date/timestamp columns).
+    #: ``day_aligned_fraction``/``month_aligned_fraction`` decide the
+    #: reported granularity; the three ``{day,month,hour}_distinct_periods``/
+    #: ``{day,month,hour}_largest_gap`` pairs are computed for all three
+    #: units unconditionally (the granularity is only known after these
+    #: fractions come back, so the engine can't pick a unit before the scan
+    #: runs) and the engine reads only the pair matching what it decided.
+    #: Counts and one integer gap only; never a value. ``None`` means not
+    #: computed (not requested, ineligible type, or the dialect could not).
+    day_aligned_fraction: float | None = None
+    month_aligned_fraction: float | None = None
+    day_distinct_periods: int | None = None
+    day_largest_gap: int | None = None
+    month_distinct_periods: int | None = None
+    month_largest_gap: int | None = None
+    hour_distinct_periods: int | None = None
+    hour_largest_gap: int | None = None
 
 
 @dataclass(frozen=True)
@@ -356,6 +374,43 @@ def is_integer_type(data_type: str) -> bool:
     return "INT" in upper
 
 
+def is_temporal_type(data_type: str) -> bool:
+    """A column with a date component, eligible for span/gap analysis --
+    excludes a bare time-of-day (``TIME``, no date to span) and
+    ``INTERVAL`` (a duration, not a point in time). ``TIMESTAMP`` matches
+    on its own substring, not the generic ``"TIME"`` check that would also
+    catch the bare time-of-day type."""
+
+    upper = data_type.upper()
+    if "INTERVAL" in upper:
+        return False
+    return "DATE" in upper or "TIMESTAMP" in upper
+
+
+def is_date_only_type(data_type: str) -> bool:
+    """A bare calendar date with no time-of-day component. Hour granularity
+    is meaningless on one (there is nothing to truncate to an hour), and on
+    BigQuery ``DATE_TRUNC`` does not even accept an ``HOUR`` unit -- so
+    every adapter skips the hour-grain computation for this shape rather
+    than relying on another dialect's implicit date-to-timestamp cast."""
+
+    upper = data_type.upper()
+    return "DATE" in upper and "TIMESTAMP" not in upper
+
+
+TEMPORAL_UNITS_WITH_TIME = ("day", "month", "hour")
+TEMPORAL_UNITS_DATE_ONLY = ("day", "month")
+
+
+def temporal_units_for(data_type: str) -> tuple[str, ...]:
+    """Which granularities are worth computing for one column's declared
+    type: hour is skipped for a bare date (see `is_date_only_type`)."""
+
+    if is_date_only_type(data_type):
+        return TEMPORAL_UNITS_DATE_ONLY
+    return TEMPORAL_UNITS_WITH_TIME
+
+
 # Declared-type-vs-content patterns (issue #204). No `\d`, no lookaround: the
 # shared regex predicates must parse identically across every dialect's regex
 # engine (see each adapter's `_regexp_predicate`).
@@ -566,6 +621,102 @@ def key_shape_aggregate_kwargs(
     }
 
 
+_TEMPORAL_UNIT_ALIAS = {"day": "d", "month": "m", "hour": "h"}
+
+
+def temporal_alignment_expressions(
+    qcol: str, i: int, date_trunc: Callable[[str, str], str]
+) -> list[str]:
+    """Fraction of non-null values that are already truncated to day/month --
+    the evidence `explore.profile._temporal_granularity` decides the
+    reported granularity from. A column whose values are all exactly
+    midnight is day-aligned; one whose values are all the 1st of the month
+    is also month-aligned."""
+
+    def fraction(condition: str, alias: str) -> str:
+        return (
+            f"AVG(CASE WHEN {condition} THEN 1.0 "
+            f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS {alias}"
+        )
+
+    return [
+        fraction(f"{qcol} = {date_trunc(qcol, 'day')}", f"tc_da_{i}"),
+        fraction(f"{qcol} = {date_trunc(qcol, 'month')}", f"tc_ma_{i}"),
+    ]
+
+
+def temporal_continuity_sql(
+    qcol: str,
+    i: int,
+    unit: str,
+    table_sql: str,
+    date_trunc: Callable[[str, str], str],
+    date_diff: Callable[[str, str, str], str],
+) -> list[str]:
+    """Distinct-period count and largest gap for one column at one
+    granularity, as two scalar subqueries spliced into the caller's flat
+    SELECT (the same "subquery inside the SELECT list" shape
+    ``distinct_combination_sql`` already uses for composite-key probes).
+
+    The gap is measured between consecutive *present* periods via
+    ``LAG() OVER (ORDER BY period)``, diffed by the caller's own date-diff
+    idiom (there is no universal ``DATEDIFF`` across dialects -- Postgres
+    has none), minus one: a diff of 1 between neighbors means no missing
+    period between them, so the reported gap is the count of missing
+    periods in the widest run, not the raw diff. ``COALESCE(..., 0)``
+    covers both the single-period and the empty-column case, where the
+    inner aggregate has nothing (or only a NULL first-row lag) to compare.
+    Only two integers ever leave the engine through this path.
+    """
+
+    # Interpolated parts are a quoted/escaped column (by the calling
+    # adapter), fixed aggregate keywords, and the caller's own quoted table
+    # identifier -- never a value; the caller guards the assembled statement
+    # as read-only SELECT before it runs.
+    alias = _TEMPORAL_UNIT_ALIAS[unit]
+    periods = (
+        f"(SELECT DISTINCT {date_trunc(qcol, unit)} AS period "  # noqa: S608
+        f"FROM {table_sql} WHERE {qcol} IS NOT NULL)"
+    )
+    lagged = (
+        f"(SELECT period, LAG(period) OVER (ORDER BY period) AS prev_period "  # noqa: S608
+        f"FROM {periods} AS periods_{alias}_{i})"
+    )
+    gap_expr = date_diff(unit, "period", "prev_period")
+    return [
+        f"(SELECT COUNT(*) FROM {periods} AS count_{alias}_{i}) AS tp_{alias}_{i}",  # noqa: S608
+        f"(SELECT COALESCE(MAX({gap_expr} - 1), 0) FROM {lagged} "  # noqa: S608
+        f"AS gaps_{alias}_{i}) AS tg_{alias}_{i}",
+    ]
+
+
+def temporal_continuity_aggregate_kwargs(
+    values: dict[str, object], i: int, wanted: bool
+) -> dict[str, float | int | None]:
+    """Every temporal-continuity field for one column, ready to splat into a
+    ``ColumnAggregate(...)`` call:
+    ``**temporal_continuity_aggregate_kwargs(values, i, wants_temporal)``."""
+
+    def frac(alias: str) -> float | None:
+        v = values.get(alias) if wanted else None
+        return float(v) if v is not None else None
+
+    def count(alias: str) -> int | None:
+        v = values.get(alias) if wanted else None
+        return int(v) if v is not None else None
+
+    return {
+        "day_aligned_fraction": frac(f"tc_da_{i}"),
+        "month_aligned_fraction": frac(f"tc_ma_{i}"),
+        "day_distinct_periods": count(f"tp_d_{i}"),
+        "day_largest_gap": count(f"tg_d_{i}"),
+        "month_distinct_periods": count(f"tp_m_{i}"),
+        "month_largest_gap": count(f"tg_m_{i}"),
+        "hour_distinct_periods": count(f"tp_h_{i}"),
+        "hour_largest_gap": count(f"tg_h_{i}"),
+    }
+
+
 @runtime_checkable
 class Adapter(Protocol):
     """Behavioral contract for a connector adapter.
@@ -607,6 +758,7 @@ class Adapter(Protocol):
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
         key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         """Profile every column of one object in as few aggregate queries as
         possible. ``safe_min_max`` is the set of column names for which min/max may
@@ -616,7 +768,10 @@ class Adapter(Protocol):
         ``type_stats`` is the set of non-PII string/integer column names for which
         the declared-type-vs-content fractions (#204) are computed, same scan.
         ``key_shape_stats`` is the set of non-PII string column names for which
-        the heterogeneous-key-shape fractions (#205) are computed, same scan."""
+        the heterogeneous-key-shape fractions (#205) are computed, same scan.
+        ``temporal_stats`` is the set of non-PII date/timestamp column names for
+        which the temporal-continuity fractions/counts (#206) are computed, same
+        scan."""
         ...
 
     def exact_distinct_counts(

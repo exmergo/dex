@@ -65,6 +65,10 @@ from .base import (
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
 )
@@ -154,6 +158,14 @@ _SIZE_FACTS_NOTE = (
 def _regexp_predicate(qcol: str, pattern: str) -> str:
     # ~ matches substrings; the shared patterns' anchors make it a full match.
     return f"{qcol} ~ '{pattern}'"
+
+
+def _date_trunc_expr(qcol: str, unit: str) -> str:
+    return f"DATE_TRUNC('{unit}', {qcol})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
+    return f"DATEDIFF({unit}, {earlier}, {later})"
 
 
 class RedshiftConnectionError(ConnectorError):
@@ -762,17 +774,19 @@ class RedshiftAdapter:
         shape_stats: set[str] | None = None,
         type_stats: set[str] | None = None,
         key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
         type_req = type_stats or set()
         key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         meta, _ = self.table_metadata(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, type_req, key_shape_req
+                identifier, batch, safe, shape, type_req, key_shape_req, temporal_req
             )
             rows, labels = self._execute(
                 sql, estimate=self._scan_seconds(meta.byte_size)
@@ -790,18 +804,20 @@ class RedshiftAdapter:
         shape: set[str],
         type_req: set[str],
         key_shape_req: set[str],
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]]]:
+        temporal_req: set[str],
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate statement per batch, a single pass: COUNT(*) once,
         # then per column a non-null count, an approximate distinct (HLL),
         # min/max only where allowed, and value-shape/type-contradiction/
-        # key-shape fractions only where requested. Pure (no connection), so
-        # the SELECT-only property is testable offline. Degraded types get
-        # the non-null count only: a distinct count over serialized SUPER or
-        # geometry values is not a meaningful cardinality even where the
-        # server accepts it (verified live: it does), and MIN/MAX would
-        # carry values.
+        # key-shape/temporal-continuity fractions only where requested. Pure
+        # (no connection), so the SELECT-only property is testable offline.
+        # Degraded types get the non-null count only: a distinct count over
+        # serialized SUPER or geometry values is not a meaningful
+        # cardinality even where the server accepts it (verified live: it
+        # does), and MIN/MAX would carry values.
+        table_sql = self._quote(identifier)
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             degraded = self._is_degraded(col.data_type)
@@ -835,6 +851,22 @@ class RedshiftAdapter:
             wants_key_shape = (col.name in key_shape_req) and not degraded
             if wants_key_shape:
                 select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = (col.name in temporal_req) and not degraded
+            if wants_temporal:
+                select_parts.extend(
+                    temporal_alignment_expressions(qcol, i, _date_trunc_expr)
+                )
+                for unit in temporal_units_for(col.data_type):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol,
+                            i,
+                            unit,
+                            table_sql,
+                            _date_trunc_expr,
+                            _date_diff_expr,
+                        )
+                    )
             plan.append(
                 (
                     i,
@@ -844,11 +876,12 @@ class RedshiftAdapter:
                     wants_shape,
                     wants_type,
                     wants_key_shape,
+                    wants_temporal,
                 )
             )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
-        sql = f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}"  # noqa: S608
+        sql = f"SELECT {', '.join(select_parts)} FROM {table_sql}"  # noqa: S608
         return assert_select_only(sql, dialect=self.dialect), plan
 
     @staticmethod
@@ -858,7 +891,7 @@ class RedshiftAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
@@ -870,6 +903,7 @@ class RedshiftAdapter:
             wants_shape,
             wants_type,
             wants_key_shape,
+            wants_temporal,
         ) in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
@@ -901,6 +935,7 @@ class RedshiftAdapter:
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
                     **key_shape_aggregate_kwargs(values, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
                 )
             )
         return aggregates
