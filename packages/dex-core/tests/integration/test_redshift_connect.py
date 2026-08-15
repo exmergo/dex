@@ -17,6 +17,8 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
+from .conftest import assert_ok
+
 pytestmark = [pytest.mark.integration, pytest.mark.redshift]
 
 
@@ -57,7 +59,7 @@ def test_connect_test_discovers_connection_and_reports_read_only(
 ):
     seed_repo(tmp_path)
     rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["connector"] == "redshift"
     assert data["dialect"] == "redshift"

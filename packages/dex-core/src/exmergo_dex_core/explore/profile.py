@@ -35,6 +35,7 @@ from ..cache import (
     ValueDomain,
 )
 from ..config import PIIOverrideMatcher
+from ..errors import WarehouseQueryError
 from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
@@ -720,33 +721,46 @@ def profile(
         ]
         scan_columns = [c for c in columns if c.name not in blob_excluded]
 
-        aggregates = {
-            a.name: a
-            for a in adapter.column_aggregates(
-                identifier,
-                scan_columns,
-                safe_min_max=safe,
-                shape_stats=shape,
-                type_stats=type_stats,
-                key_shape_stats=key_shape_stats,
-                temporal_stats=temporal_stats,
+        # The adapter knows what the server said and this loop knows which
+        # object it said it about, so a server-side refusal picks up the
+        # identifier on its way past: an envelope reading "the warehouse
+        # refused a statement dex built" is only actionable when it names the
+        # object, and a map run has a dozen of them in flight.
+        try:
+            aggregates = {
+                a.name: a
+                for a in adapter.column_aggregates(
+                    identifier,
+                    scan_columns,
+                    safe_min_max=safe,
+                    shape_stats=shape,
+                    type_stats=type_stats,
+                    key_shape_stats=key_shape_stats,
+                    temporal_stats=temporal_stats,
+                )
+            }
+            # Re-read the metadata after the aggregate scan: adapters whose
+            # inventory row counts are planner estimates (Postgres reltuples)
+            # upgrade to the exact COUNT(*) the scan just paid for, so
+            # uniqueness proofs and the dataset row count are exact. Free
+            # everywhere (cached or trivially cheap on the other adapters).
+            meta, _ = adapter.table_metadata(identifier)
+            aggregates = _escalate_near_unique(
+                adapter, identifier, meta.row_count, aggregates
             )
-        }
-        # Re-read the metadata after the aggregate scan: adapters whose
-        # inventory row counts are planner estimates (Postgres reltuples)
-        # upgrade to the exact COUNT(*) the scan just paid for, so uniqueness
-        # proofs and the dataset row count are exact. Free everywhere (cached
-        # or trivially cheap on the other adapters).
-        meta, _ = adapter.table_metadata(identifier)
-        aggregates = _escalate_near_unique(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        composite_keys = _probe_composite_keys(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        value_domains = _probe_value_domains(
-            adapter, identifier, meta.row_count, aggregates, prelim_pii, composite_keys
-        )
+            composite_keys = _probe_composite_keys(
+                adapter, identifier, meta.row_count, aggregates
+            )
+            value_domains = _probe_value_domains(
+                adapter,
+                identifier,
+                meta.row_count,
+                aggregates,
+                prelim_pii,
+                composite_keys,
+            )
+        except WarehouseQueryError as exc:
+            raise exc.naming(identifier) from exc
         composite_members = {c for pair in composite_keys for c in pair}
 
         profiles: list[ColumnProfile] = []

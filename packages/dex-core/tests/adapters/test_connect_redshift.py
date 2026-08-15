@@ -486,9 +486,18 @@ def test_wall_clock_timeout_translates_to_timeout_error(fake_redshift_connection
 def test_a_wlm_cancel_is_not_blamed_on_the_budget(fake_redshift_connection):
     """WLM query-monitoring rules and admin kills also say "canceled"; only a
     statement_timeout kill (SQLSTATE 57014) may be translated into budget
-    advice, or the user is told to raise --budget for a refusal it cannot fix."""
+    advice, or the user is told to raise --budget for a refusal it cannot fix.
+
+    It is still a server-side refusal, so it comes back typed (#310) with the
+    server's own message and SQLSTATE, rather than as the raw driver exception
+    that used to classify as `internal`.
+    """
 
     from redshift_connector import error as rs_errors
+
+    from exmergo_dex_core.envelope import Reason, reason_for
+    from exmergo_dex_core.errors import WarehouseQueryError
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
 
     def resolve(sql):
         raise rs_errors.ProgrammingError(
@@ -501,12 +510,65 @@ def test_a_wlm_cancel_is_not_blamed_on_the_budget(fake_redshift_connection):
 
     fake_redshift_connection.row_resolver = resolve
     adapter = make_adapter(fake_redshift_connection, ceiling=600.0)
-    with pytest.raises(rs_errors.ProgrammingError, match="WLM"):
+    with pytest.raises(WarehouseQueryError, match="WLM") as caught:
         adapter.run_query(
             "SELECT count(*) FROM dexdb.shop.customers",
             max_rows=10,
             timeout_seconds=30.0,
         )
+    assert not isinstance(caught.value, (OverCeilingError, TimeoutError))
+    assert "XX000" in str(caught.value)
+    assert reason_for(caught.value) is Reason.EXECUTION_FAILURE
+
+
+def test_a_refused_profiling_statement_is_typed_named_and_still_billed(
+    fake_redshift_connection,
+):
+    """#310: the shape of the failure the invalid-digit bug produced live.
+
+    A server-side refusal mid-profile has to arrive as three things at once:
+    typed (so the envelope says `execution_failure`, not `internal`), carrying
+    the server's own diagnosis and SQLSTATE (so it can be read at all), and
+    named with the object being profiled (a map run has a dozen statements in
+    flight). The seconds it burned before dying are billed either way, and the
+    ledger has to hold them.
+    """
+
+    from redshift_connector import error as rs_errors
+
+    from exmergo_dex_core.envelope import Reason, reason_for
+    from exmergo_dex_core.errors import WarehouseQueryError
+    from exmergo_dex_core.explore.profile import profile
+
+    clock = fake_redshift_connection.clock
+
+    def resolve(sql):
+        if "n_total" not in sql:  # catalog lookups answer normally
+            return None
+        clock.now += 12.0
+        raise rs_errors.ProgrammingError(
+            {
+                "S": "ERROR",
+                "C": "22P02",
+                "M": "Invalid digit, Value 'p', Pos 0, Type: Long",
+            }
+        )
+
+    entries: list[dict] = []
+    fake_redshift_connection.row_resolver = resolve
+    adapter = make_adapter(fake_redshift_connection, record=entries.append)
+    with pytest.raises(WarehouseQueryError) as caught:
+        profile(adapter, ["dexdb.shop.customers"])
+
+    assert reason_for(caught.value) is Reason.EXECUTION_FAILURE
+    message = str(caught.value)
+    assert "Invalid digit" in message and "22P02" in message
+    assert "dexdb.shop.customers" in message
+    # str(exc) on the driver error is the whole payload dict; the envelope gets
+    # the server's message, not the driver's bookkeeping.
+    assert "'S':" not in message
+    assert adapter.cost_gate.spend_summary()["seconds_billed"] == pytest.approx(12.0)
+    assert [e["billed_seconds"] for e in entries] == [pytest.approx(12.0)]
 
 
 def test_a_dropped_connection_still_records_billed_seconds(

@@ -109,6 +109,7 @@ _EXPORTS = {
     "StoreContext": "storage",
     "StoreFactory": "storage",
     "StoreRequiredError": "errors",
+    "WarehouseQueryError": "errors",
     "generate_demo_warehouse": "demo",
     "render_er_mermaid": "explore.diagram",
     "to_envelope": "results",
@@ -143,6 +144,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         RepoRootRequiredError,
         RequestError,
         StoreRequiredError,
+        WarehouseQueryError,
     )
     from .explore.cluster import ClusterDependencyError, ClusterError
     from .explore.commands import CacheRequiredError
@@ -249,6 +251,7 @@ __all__ = [
     "StoreContext",
     "StoreFactory",
     "StoreRequiredError",
+    "WarehouseQueryError",
     "__version__",
     "generate_demo_warehouse",
     "render_er_mermaid",

@@ -60,6 +60,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "compute_time"
@@ -143,6 +144,22 @@ def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
     # TIMESTAMPDIFF (not the days-only datediff) covers day/month/hour in one
     # spelling, unlike Spark SQL's native datediff (days only).
     return f"TIMESTAMPDIFF({unit.upper()}, {earlier}, {later})"
+
+
+def _is_server_error(exc: Exception) -> bool:
+    """Whether the driver labelled this "the warehouse answered with an error".
+
+    Matched on the class name along the MRO rather than with ``isinstance``:
+    the SQL driver is injected into this adapter rather than imported by it
+    (which is what lets the offline suite build the adapter without the
+    library installed), so there is no class object here to compare against.
+    ``ServerOperationError`` is databricks-sql-connector's class for a
+    server-side statement failure; its transport failures (``RequestError``,
+    ``OperationalError``) are deliberately excluded, because a connection that
+    died is not a statement the server refused.
+    """
+
+    return any(cls.__name__ == "ServerOperationError" for cls in type(exc).__mro__)
 
 
 def warehouse_http_path(value: str) -> str:
@@ -1293,6 +1310,13 @@ class DatabricksAdapter:
                 "remaining budget (STATEMENT_TIMEOUT); raise --budget or "
                 "narrow the work"
             )
+        if _is_server_error(exc):
+            # The warehouse answered with an error. Typed, so the envelope
+            # carries `execution_failure` and Databricks' own words rather
+            # than the `internal` an untyped driver exception falls through
+            # to. Transport failures are left alone deliberately: a connection
+            # that died is not a statement the server refused.
+            return warehouse_refusal(str(exc))
         return exc
 
     # --- helpers ------------------------------------------------------------------

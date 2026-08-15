@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 
 from ..envelope import Paradigm
-from ..errors import ConnectorError
+from ..errors import ConnectorError, WarehouseQueryError
 from ..guards.sql_guard import assert_select_only
 from .base import (
     ColumnAggregate,
@@ -35,6 +35,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 
@@ -528,7 +529,10 @@ class DuckDBAdapter:
                     f"query exceeded {timeout_seconds:g}s and was interrupted; "
                     "narrow it (tighter filter, fewer columns) and retry"
                 ) from exc
-            raise
+            refusal = _refusal(exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
         finally:
             watchdog.cancel()
 
@@ -545,12 +549,35 @@ class DuckDBAdapter:
         # Single read-only door for every query: parsed and refused if it is not a
         # SELECT, on top of the read-only connection.
         assert_select_only(sql, dialect=self.dialect)
-        return self._conn.execute(sql, params or []).fetchall()
+        try:
+            return self._conn.execute(sql, params or []).fetchall()
+        except Exception as exc:
+            refusal = _refusal(exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
 
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+def _refusal(exc: Exception) -> WarehouseQueryError | None:
+    """The typed refusal for a statement DuckDB itself rejected, or ``None``
+    when the failure did not come from the database at all.
+
+    The local engine is still an engine that answers with errors, and it gets
+    the same treatment as the cloud connectors: a refused statement reads as
+    ``execution_failure`` carrying DuckDB's own words rather than falling
+    through to ``internal``. Anything that is not a ``duckdb.Error`` (an
+    interrupt, an out-of-memory kill) is left alone, so the caller re-raises it
+    as itself.
+    """
+
+    import duckdb
+
+    return warehouse_refusal(str(exc)) if isinstance(exc, duckdb.Error) else None
 
 
 def _quote_ident(name: str) -> str:

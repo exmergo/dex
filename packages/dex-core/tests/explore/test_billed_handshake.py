@@ -1030,3 +1030,117 @@ def test_duckdb_never_warns_about_a_cumulative_cap(duckdb_file: Path, capsys):
     assert main(["explore", "profile", "customers", "--path", str(duckdb_file)]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert _session_warning(payload["warnings"]) == []
+
+
+# --- a statement the server refused (#310) ----------------------------------------
+#
+# Three defects met on this path and each hid the next: profiling built a CAST
+# Redshift refused, the driver's exception escaped untranslated so the envelope
+# said `internal` with no reason and no object, and the seconds already billed
+# were reported nowhere, so a failed metered command read as a free one. The
+# first is fixed in the SQL (see test_safety_spine); these pin the envelope the
+# other two produce, which is what makes any future one diagnosable from stdout.
+
+
+def test_a_refused_statement_reports_its_reason_its_object_and_its_spend(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        # Cached on the engine the way the real funnel does it: the settlement
+        # that reads spend back on the way out reads the engine's held adapter,
+        # so an opener that handed out a fresh one per call would test nothing.
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(100 * MB)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    fake_bq_client.row_resolver = _aggregate_resolver
+
+    # The first object profiles and bills; the second meets a server refusal,
+    # which is the ordinary shape of this failure (one bad column in one table
+    # of many, on a run that has already spent).
+    original = BigQueryAdapter.column_aggregates
+
+    def refuse_the_second(self, identifier, columns, **kwargs):
+        if identifier.endswith("events"):
+            fake_bq_client.result_error = api_exceptions.BadRequest(
+                "Bad int64 value: pending"
+            )
+        return original(self, identifier, columns, **kwargs)
+
+    monkeypatch.setattr(BigQueryAdapter, "column_aggregates", refuse_the_second)
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "profile",
+            "customers",
+            "events",
+            "--confirm",
+            "--budget",
+            str(float(100 * MB)),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["status"] == "error"
+    # Classified: the server ran the statement and refused it, which is not the
+    # `internal` an untyped driver exception used to fall through to.
+    assert payload["reason"] == Reason.EXECUTION_FAILURE.value
+    error = payload["errors"][0]
+    assert "Bad int64 value" in error  # the server's own diagnosis, verbatim
+    assert "test-proj.shop.events" in error  # and which object it was about
+    # Metered and failed is not the same as free: the first object's scan was
+    # billed and the envelope says so.
+    assert payload["data"]["spend"]["bytes_billed"] > 0
+    assert payload["cost"]["paradigm"] == Paradigm.BYTES_SCANNED.value
+
+
+def test_a_refusal_that_never_reached_the_warehouse_reports_no_spend(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    """The other side of it: a command refused before the first statement
+    spent nothing, and a spend block of zeroes on that envelope would read as a
+    claim about money where silence is the honest answer."""
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(1)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "profile",
+            "customers",
+            "--confirm",
+            "--budget",
+            "1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["reason"] == Reason.GUARD.value
+    assert "spend" not in payload["data"]

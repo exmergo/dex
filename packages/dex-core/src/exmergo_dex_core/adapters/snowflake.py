@@ -59,6 +59,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "compute_time"
@@ -1187,7 +1188,13 @@ class SnowflakeAdapter:
                 f"query exceeded {timeout_seconds:g}s and was cancelled; "
                 "narrow it (tighter filter, fewer columns) and retry"
             )
-        return exc
+        # Everything else the server refused (a compilation error, a missing
+        # grant, an unsupported construct). Typed, so the envelope carries
+        # `execution_failure` and Snowflake's own words rather than the
+        # `internal` an untyped driver exception falls through to. No separate
+        # code: the driver already prefixes its message with the error number
+        # and the SQLSTATE.
+        return warehouse_refusal(message)
 
     @staticmethod
     def _description_type(description: Any) -> str:

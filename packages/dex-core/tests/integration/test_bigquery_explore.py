@@ -13,7 +13,7 @@ import pytest
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.storage import FilesystemStore
 
-from .conftest import MAX_BYTES
+from .conftest import MAX_BYTES, assert_ok
 from .test_bigquery_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.bigquery]
@@ -29,7 +29,7 @@ def test_inventory_is_free_and_ranked(tmp_path: Path, capsys, bq_project: str):
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "inventory", "--rank"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     identifiers = {o["identifier"] for o in envelope["data"]["objects"]}
     assert SHAKESPEARE in identifiers
     assert envelope["cost"]["paradigm"] == "bytes_scanned"
@@ -180,7 +180,7 @@ def test_unnest_of_a_function_derived_array_runs_live(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert envelope["data"]["row_count"] == 3
 
     # The smuggle shape is refused statically, before any job is created.
