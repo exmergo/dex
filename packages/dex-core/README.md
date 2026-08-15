@@ -16,7 +16,7 @@ every change is a reviewable diff.
 pip install "exmergo-dex-core"
 ```
 
-Connector client libraries live behind extras. DuckDB is an in-memory data warehouse,
+Connector client libraries live behind extras. DuckDB is an embedded data warehouse,
 so you can start from there if you want to test Dex locally. We aim to support all major
 data warehouses. Please suggest any missing connectors on [GitHub](https://github.com/exmergo/dex)!
 
@@ -40,6 +40,36 @@ hosted semantic layer needs no connector, no dbt-core, and no SQL parser. Every
 other command validates SQL before running it, which is why the connector extras
 carry the dialect engine; run one without a connector installed and dex refuses
 with the install to use rather than guessing.
+
+## First run, with nothing to point it at
+
+`[duckdb]` is also what carries the on-ramp, so a fresh install has something to
+work against before you have wired up a warehouse:
+
+```
+pip install "exmergo-dex-core[duckdb]"
+dex demo
+dex explore map
+```
+
+`dex demo` generates a small e-commerce warehouse (7 tables, 29,512 rows) in the
+current directory and a `.dex/config.yml` beside it, so everything after it runs
+with no flags. No credentials, no cloud account, no network. The data comes from a
+pinned seed, so every run produces the same rows and the numbers quoted here are the
+numbers you get.
+
+It is seeded to be realistically broken rather than tidy: a key that lost its
+uniqueness to a double-loaded batch, a key mixing two id schemes from a merged
+catalogue, a join whose columns share a name and none of their values, a table an
+interrupted load left empty, two columns whose declared type contradicts their
+content, and personal data alongside two deliberate false positives. `explore map`
+finds 6 PII columns, 5 joins, and 5 data-quality findings; `explore query "select
+email from customers"` is refused, and the same count over the same column is not.
+
+The generation is create-only: it writes a new file and refuses rather than replace
+one, with no confirmation flag that can talk past that, and it will not write a
+`.dex/config.yml` where a project already has one. `generate_demo_warehouse` is
+public, so the Python API can build the same fixture.
 
 ## Two surfaces, one engine
 
@@ -69,9 +99,10 @@ instead, and a backend published as its own package is selectable by name from
 [`references/storage.md`](../../references/storage.md).
 
 [`examples/quickstart.py`](examples/quickstart.py) is the whole flow in one
-runnable file: map a warehouse, read the inferred joins, see PII flagged, ask a
-question, and watch the firewall refuse one it should. It builds its own
-throwaway DuckDB file, so it runs anywhere:
+runnable file: map a warehouse, read the inferred joins and the data-quality
+findings, see PII flagged, ask a question, and watch the firewall refuse one it
+should. It generates the same demo warehouse `dex demo` builds, into a throwaway
+directory, so it runs anywhere and reports the same findings:
 
 ```
 pip install "exmergo-dex-core[duckdb]"
@@ -158,6 +189,14 @@ subcommands are stateless and the agent orchestrates multi-step flows.
 dex connect test --path data.duckdb
 ```
 
+With nothing to point at yet, `dex demo` builds one and every command after it needs
+no flags:
+
+```
+dex demo
+dex connect test
+```
+
 The CLI is the API's first consumer rather than a parallel implementation: it
 parses arguments, builds an engine, and wraps the result it gets back. See
 [`references/command-contract.md`](../../references/command-contract.md) for the
@@ -171,6 +210,14 @@ BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres, through either
 the command contract or the Python API.
 
 ### Commands
+
+`demo`: generates a seeded local DuckDB warehouse and wires it up, so a first run
+needs no warehouse and no credentials. One command, no network, and deterministic:
+the row counts and column names the documentation quotes are the ones you get. It is
+the only verb that creates a data file, and it is create-only by construction, so it
+never opens, inspects, or replaces a warehouse you already have. The generator lives
+on its own path, never through a connector, which is what keeps the read-only rule
+true everywhere else.
 
 `explore`: ranks what matters in an unfamiliar warehouse, profiles columns
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins

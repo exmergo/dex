@@ -38,6 +38,11 @@ profiles.yml
 # .dex/ is just local-testing residue. Anchored to root so test fixtures that
 # intentionally include a .dex/ deeper in the tree are preserved.
 /.dex/
+# The demo warehouse `dex demo` generates. Same reasoning: it belongs in an
+# end-user's directory, and in this repo it is only ever dogfooding residue.
+# Anchored to root, and the wal sibling covers a run interrupted mid-write.
+/dex_demo.duckdb
+/dex_demo.duckdb.wal
 
 # ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/

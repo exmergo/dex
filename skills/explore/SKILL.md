@@ -19,6 +19,13 @@ nothing else; read the envelope and decide the next step.
 uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
+If the user has no warehouse to point at and wants to see what dex does, `demo`
+generates one: a seeded local DuckDB warehouse plus the `.dex/config.yml` for it,
+with no credentials and no network, so every subcommand below then runs with no
+flags. It only ever creates, so it refuses rather than touch a file that already
+exists. Offer it rather than assuming it: a user who does have a warehouse wants
+that one read, not a fixture built beside it.
+
 Subcommands, in the usual order:
 
 1. `connect test --path <file.duckdb>` confirms a read-only connection and

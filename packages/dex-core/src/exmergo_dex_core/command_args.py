@@ -23,7 +23,7 @@ from .results import ConfirmationRequest, Result
 from .storage import DEX_DIR
 
 
-def _resolve_dex_root(start: Path) -> Path | None:
+def resolve_dex_root(start: Path) -> Path | None:
     """Nearest ancestor of ``start`` holding a ``.dex/config.yml``, or None.
 
     dex is used like git or dbt: the config lives at the project root, but
@@ -59,7 +59,7 @@ def repo_root(args: argparse.Namespace) -> str:
     ``open_adapter``) behave as designed."""
 
     raw = getattr(args, "repo_root", ".")
-    resolved = _resolve_dex_root(Path(raw))
+    resolved = resolve_dex_root(Path(raw))
     return str(resolved) if resolved is not None else raw
 
 

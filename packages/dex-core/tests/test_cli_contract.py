@@ -36,6 +36,11 @@ def _all_commands() -> list[list[str]]:
                 if group == "explore" and sub == "cluster":
                     argv += ["some_table", "--repo-root", "missing-dex-fixture-dir"]
                 argvs.append(argv)
+        elif group == "demo":
+            # The one verb that creates a file. Pointed at a directory that does
+            # not exist so the contract is exercised through its clean refusal
+            # rather than by seeding a warehouse into the checkout.
+            argvs.append([group, "missing-dex-fixture-dir/demo.duckdb"])
         else:
             argvs.append([group])
     return argvs

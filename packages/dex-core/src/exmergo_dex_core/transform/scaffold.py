@@ -23,7 +23,7 @@ from importlib import resources
 from ..cache import Dataset
 from ..dbt_project import DbtProjectView
 from ..errors import DexError
-from ..storage import ExploreStore
+from ..storage import ExploreStore, readable_cache
 from .plans import EditKind, PlanEdit
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
@@ -50,7 +50,7 @@ class ScaffoldError(DexError):
 def scaffold_edits(tables: list[str], store: ExploreStore) -> list[PlanEdit]:
     """Build the plan edits that scaffold staging models for the named tables."""
 
-    cache = store.load_cache()
+    cache = readable_cache(store)
     if cache is None:
         raise ScaffoldError(
             "no exploration cache yet; run `explore map` first so the scaffold has "
