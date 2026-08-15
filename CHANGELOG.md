@@ -11,6 +11,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`maintain check` carries each axis's findings in the command envelope**
+  ([#279]). The top-level `data.findings` ranking could report drift while the
+  adjacent per-axis result did not carry those findings, making an axis look
+  clean to callers that grouped the report by axis. Each `data.axes` entry now
+  includes its `run_at`, `scope`, `finding_count`, and `findings`. The merged
+  top-level list remains ranked by severity, and a contract test proves that it
+  contains exactly the same findings as the per-axis lists.
+
 - **A missing `uv` is a refusal that names the fix, not a traceback** ([#310]).
   The skill wrappers shell into `uv run` to install and run the engine, and did so
   with no guard, so on a machine without `uv` on `PATH` a first run ended in a raw

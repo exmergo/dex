@@ -413,9 +413,9 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
-    _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
     result = _drift_result(
-        {"schema": ranked},
+        by_axis,
         snap,
         store,
         warnings=warnings
@@ -478,9 +478,9 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
 
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
-    _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
     result = _drift_result(
-        {"grain": ranked},
+        by_axis,
         snap,
         store,
         warnings=_grain_baseline_warnings(snap)
@@ -556,15 +556,15 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
         )
 
     ranked = drift_mod.rank_findings(free_findings + billed_findings)
-    _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
     if pending is not None:
         # The free half is complete and real, so it returns alongside the ask
         # for the scanning half rather than being discarded and re-derived.
-        result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
+        result = _drift_result(by_axis, snap, store, warnings=warnings)
         result.pending_confirmation = pending
         return result
     result = _drift_result(
-        {"semantic": ranked},
+        by_axis,
         snap,
         store,
         warnings=warnings
@@ -670,10 +670,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         }
         if project_available:
             by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-        _record_axes(
+        axis_results = _record_axes(
             store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
         )
-        result = _drift_result(by_axis, snap, store, warnings=warnings)
+        result = _drift_result(axis_results, snap, store, warnings=warnings)
         result.pending_confirmation = pending
         return result
 
@@ -692,11 +692,11 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     }
     if project_available:
         by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-    _record_axes(
+    axis_results = _record_axes(
         store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
     )
     result = _drift_result(
-        by_axis,
+        axis_results,
         snap,
         store,
         warnings=warnings
@@ -875,9 +875,9 @@ def _detect_free_axis(
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
-    _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
     result = _drift_result(
-        {axis: ranked},
+        by_axis,
         snap,
         store,
         warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours),
@@ -922,7 +922,7 @@ def _record_axes(
     snap: snapshot_mod.Snapshot,
     connector: str | None,
     results: dict[str, tuple[list[drift_mod.DriftFinding], list[str]]],
-) -> None:
+) -> dict[str, drift_mod.AxisResult]:
     """Merge this run's axes into the stored drift report. Axes merge across runs so
     a focused detector refreshes only itself, but never across baselines:
     findings measured against an older snapshot are dropped wholesale."""
@@ -933,15 +933,18 @@ def _record_axes(
     report.connector = connector
     report.snapshot_created_at = snap.created_at
     run_at = datetime.now(UTC).isoformat()
+    current: dict[str, drift_mod.AxisResult] = {}
     for axis, (findings, scope_names) in results.items():
-        report.axes[axis] = drift_mod.AxisResult(
+        current[axis] = drift_mod.AxisResult(
             run_at=run_at, scope=scope_names or None, findings=findings
         )
+        report.axes[axis] = current[axis]
     store.save_drift(report)
+    return current
 
 
 def _drift_result(
-    by_axis: dict[str, list[drift_mod.DriftFinding]],
+    by_axis: dict[str, drift_mod.AxisResult],
     snap: snapshot_mod.Snapshot,
     store: MaintainStore,
     *,
@@ -949,9 +952,9 @@ def _drift_result(
 ) -> DriftResult:
     return DriftResult(
         findings=drift_mod.rank_findings(
-            [finding for findings in by_axis.values() for finding in findings]
+            [finding for result in by_axis.values() for finding in result.findings]
         ),
-        by_axis={axis: len(findings) for axis, findings in by_axis.items()},
+        by_axis=by_axis,
         snapshot_created_at=snap.created_at,
         warehouse_from=snap.warehouse_from,
         drift_path=store.locator(Document.DRIFT),

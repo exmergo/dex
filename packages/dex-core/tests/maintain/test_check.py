@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from exmergo_dex_core.storage import FilesystemStore
 
 from .conftest import SEMANTIC_YAML
@@ -20,12 +22,15 @@ def test_clean_world_reports_every_axis_clean(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "check")
     assert rc == 0 and payload["status"] == "ok"
     assert payload["data"]["finding_count"] == 0
-    assert payload["data"]["axes"] == {
+    axes = payload["data"]["axes"]
+    assert {axis: result["finding_count"] for axis, result in axes.items()} == {
         "schema": 0,
         "volume": 0,
         "grain": 0,
         "semantic": 0,
     }
+    assert all(result["findings"] == [] for result in axes.values())
+    assert all(result["scope"] is None for result in axes.values())
     assert payload["data"]["axes_run"] == ["grain", "schema", "semantic", "volume"]
 
 
@@ -44,14 +49,24 @@ def test_check_sweeps_all_axes_and_ranks_by_blast_radius(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "check")
     assert rc == 0 and payload["status"] == "ok"
     axes = payload["data"]["axes"]
-    assert axes["schema"] == 1
-    assert axes["volume"] == 1
+    assert axes["schema"]["finding_count"] == 1
+    assert axes["volume"]["finding_count"] == 1
     # Emptying most of stg_orders also orphans the verified orders -> stg_orders
     # join, so grain reports the lost key and the moved joins.
-    assert axes["grain"] >= 2
-    assert axes["semantic"] == 1
+    assert axes["grain"]["finding_count"] >= 2
+    assert axes["semantic"]["finding_count"] == 1
 
     findings = payload["data"]["findings"]
+    axis_findings = [
+        finding for result in axes.values() for finding in result["findings"]
+    ]
+
+    assert sorted(json.dumps(finding, sort_keys=True) for finding in axis_findings) == (
+        sorted(json.dumps(finding, sort_keys=True) for finding in findings)
+    )
+    assert all(
+        result["finding_count"] == len(result["findings"]) for result in axes.values()
+    )
     codes = {f["code"] for f in findings}
     assert codes == {
         "column_added",
@@ -100,9 +115,11 @@ def test_scope_narrows_every_axis_including_the_paid_ones(maintain_repo):
     rc, payload = maintain_repo.dex("maintain", "check", "customers")
     assert rc == 0 and payload["status"] == "ok"
     axes = payload["data"]["axes"]
-    assert axes["schema"] == 0
-    assert axes["semantic"] == 0
-    assert axes["grain"] >= 1
+    assert axes["schema"]["finding_count"] == 0
+    assert axes["semantic"]["finding_count"] == 0
+    assert axes["grain"]["finding_count"] >= 1
+    assert all(result["scope"] == ["customers"] for result in axes.values())
+    assert len({result["run_at"] for result in axes.values()}) == 1
 
     codes = {f["code"] for f in payload["data"]["findings"]}
     assert "key_lost_uniqueness" in codes
