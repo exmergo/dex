@@ -9,6 +9,43 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A PII refusal names the exact override entry that would clear the
+  column** ([#217]). The firewall's refusal was correct, and so is a name
+  detector flagging `account_name` on a table of companies or a team name in
+  a sports dataset; the false positive is the design working, and a human
+  reviewing it is the intended next step. But the message offered only two
+  routes, a measuring aggregate or dropping the column, both of which mean
+  not getting the answer. The third route, a reviewed `pii_overrides` entry,
+  existed and was never mentioned, and the cost of that omission was not the
+  override itself but the interval before anyone learned it existed: in
+  practice the caller opened a raw SQL client instead, where neither the
+  firewall nor the PII policy applies at all.
+
+  The refusal now says, for each blocking column, the exact entry that would
+  clear it, in flow-mapping YAML ready to paste under `pii_overrides:` in
+  `.dex/config.yml`: the fully qualified form always, and a scope-glob
+  pattern form alongside it when the same column name is flagged at the same
+  category on another dataset, which is the actual evidence a wider scope is
+  worth suggesting rather than a guess at how far a naming convention
+  reaches. The suggested scope is never wider than the schema that evidence
+  came from; a caller who knows it reaches further widens the glob
+  themselves. Both forms are text in the message, exactly like the existing
+  aggregate guidance beside them: nothing is applied, nothing changes about
+  what the query returns, and the entry is built from the column's identity
+  (dataset, column, category) alone, the same structural guarantee
+  `PIIFlag` itself already makes, so no value can appear in it by
+  construction.
+
+  The open question the issue posed, whether to suppress the suggestion for
+  the highest-severity categories, is answered no: nothing in the engine
+  ranks `PIICategory` by severity today, the block threshold is deliberately
+  uniform across every category on record, and the suggestion is inert text
+  a human must still copy, edit, and commit, exactly as much friction for
+  `credential` as for `name`. Inventing a severity tier to special-case here
+  would be new, untested policy with no existing basis, not a fix.
+
 ## [1.6.6] - 2026-08-15
 
 ### Fixed
