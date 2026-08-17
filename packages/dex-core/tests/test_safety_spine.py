@@ -30,6 +30,50 @@ def _memory_engine(**kwargs) -> DexEngine:
     return DexEngine(config=DexConfig(), store=MemoryStore(), **kwargs)
 
 
+def cast_arguments(sql: str) -> list[str]:
+    """Every CAST argument in one generated statement.
+
+    Matched by parenthesis balance rather than by regex: the arguments nest
+    (a CASE holding a SUBSTR), so a non-greedy match would stop at the wrong
+    close paren.
+    """
+
+    arguments = []
+    for start in (i for i in range(len(sql)) if sql.startswith("CAST(", i)):
+        depth, i = 1, start + len("CAST(")
+        while depth:
+            depth += {"(": 1, ")": -1}.get(sql[i], 0)
+            i += 1
+        arguments.append(sql[start + len("CAST(") : i - 1].rsplit(" AS ", 1)[0])
+    return arguments
+
+
+def assert_every_cast_is_total(sql: str) -> None:
+    """#310: every CAST in a generated aggregate must be castable for every row
+    of the column, not only for the rows a surrounding CASE would select.
+
+    Redshift evaluates a CASE branch's cast for rows the WHEN never selects,
+    so the shape that reads as safe (``CASE WHEN <digits> THEN CAST(col AS
+    BIGINT) END``) died server-side on any table with one non-numeric string
+    in a profiled column. The invariant that replaced it is structural and
+    dialect-independent: the cast's argument is itself a CASE that yields
+    digits on every row, so no evaluation order can reach the cast with
+    something it cannot parse.
+    """
+
+    from exmergo_dex_core.adapters.base import _CAST_SENTINEL
+
+    for argument in cast_arguments(sql):
+        assert argument.startswith("CASE WHEN "), (
+            f"a CAST argument is not shape-guarded, so a row that fails the "
+            f"shape predicate reaches it raw: {argument}"
+        )
+        assert argument.endswith(f"ELSE {_CAST_SENTINEL} END"), (
+            f"a CAST argument has no digit fallback, so it is NULL-or-value "
+            f"rather than total: {argument}"
+        )
+
+
 # --- Family 1: read-only against data; SELECT-only; prod-target refused -------
 
 
@@ -55,10 +99,13 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
             [
                 ColumnMeta("id", "INTEGER", True, 0),
                 ColumnMeta("email", "VARCHAR", True, 1),
+                ColumnMeta("signup_date", "TIMESTAMP", True, 2),
             ],
-            safe={"id"},
+            safe={"id", "signup_date"},
             shape={"email"},
             type_req={"id", "email"},
+            key_shape_req={"email"},
+            temporal_req={"signup_date"},
         )
     finally:
         adapter.close()
@@ -70,8 +117,73 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # string-eligible fractions on the VARCHAR column, epoch fractions on both.
     assert "ts_ns_1" in sql and "ts_sl1_1" in sql
     assert "ts_ep_s_0" in sql and "ts_ep_s_1" in sql
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_1" in sql and "ks_hex_1" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too: the
+    # alignment fractions and all three granularity variants for the date column.
+    assert "tc_da_2" in sql and "tc_ma_2" in sql
+    assert "tp_d_2" in sql and "tg_d_2" in sql
+    assert "tp_m_2" in sql and "tg_m_2" in sql
+    assert "tp_h_2" in sql and "tg_h_2" in sql
+    assert_every_cast_is_total(sql)
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
+
+
+def test_a_shape_gated_cast_never_reaches_a_non_numeric_value(tmp_path: Path):
+    """#310: the profiling aggregate must not depend on lazy CASE evaluation.
+
+    Redshift evaluates a CASE branch's cast for rows the WHEN never selects,
+    which killed `explore map` and `explore profile` on any table holding one
+    ordinary varchar status column, and no offline test could catch it because
+    every other dialect honors the guard. This reproduces that engine here: it
+    lifts each CAST argument out of the generated statement and casts it over
+    every row, which is exactly the work Redshift does eagerly. A raise is the
+    bug; the fixed shape casts digits on every row and cannot raise anywhere.
+    """
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    path = tmp_path / "statuses.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE orders (id INTEGER, status VARCHAR)")
+    conn.executemany(
+        "INSERT INTO orders VALUES (?, ?)",
+        [(1, "pending"), (2, "shipped"), (3, None), (4, "1700000000")],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        sql, _plan = adapter._build_aggregate_sql(
+            "statuses.main.orders",
+            [
+                ColumnMeta("id", "INTEGER", True, 0),
+                ColumnMeta("status", "VARCHAR", True, 1),
+            ],
+            safe={"id"},
+            shape=set(),
+            type_req={"id", "status"},
+            key_shape_req={"status"},
+            temporal_req=set(),
+        )
+        arguments = cast_arguments(sql)
+        assert arguments, "the aggregate should carry the epoch/slash casts to check"
+        for argument in arguments:
+            # No CASE around it: every row of the column reaches the cast, the
+            # way the hostile dialect does it. The interpolation is the
+            # generator's own output, which is what this asserts about (S608).
+            adapter._run_select(f"SELECT CAST({argument} AS BIGINT) FROM orders")  # noqa: S608
+        # The statement itself still runs, and still measures: 1 of the 3
+        # non-null values is epoch-shaped and in range.
+        (row,) = adapter._run_select(sql)
+        values = dict(zip([d[0] for d in adapter._conn.description], row, strict=True))
+        assert values["ts_ep_s_1"] == 1.0  # of the epoch-shaped rows, all in range
+        assert values["ts_ns_1"] == pytest.approx(1 / 3)  # of the non-null rows
+    finally:
+        adapter.close()
 
 
 def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
@@ -107,6 +219,112 @@ def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
         )
     # The translated calendar date is what appears, not the integer.
     assert "2023-11-14" in notes
+
+
+def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
+    """#205: neither a concrete numeric id nor a concrete hash string may
+    reach the generated data-quality note text -- only fractions and a
+    length-derived shape label."""
+
+    import hashlib
+
+    import duckdb
+
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "heterogeneous_key.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY)")
+    rows = [(str(1000 + i),) for i in range(90)]
+    # md5-shaped test fixture data only, not a security use.
+    hashes = [
+        hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
+        for i in range(10)
+    ]
+    rows += [(h,) for h in hashes]
+    conn.executemany("INSERT INTO t VALUES (?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (dataset,) = profile(adapter, ["heterogeneous_key.main.t"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "mixes value shapes" in notes
+    for i in range(90):
+        assert str(1000 + i) not in notes, "no concrete numeric id in note text"
+    for h in hashes:
+        assert h not in notes, "no concrete hash value in note text"
+    # Only the fraction and the length-derived shape label appear.
+    assert "90% numeric" in notes and "md5-shaped" in notes
+
+
+# `dex demo` is the one verb that creates a data file, so the read-only rule has
+# to hold around it in a way a reader can check rather than take on trust. Two
+# tests do that: the generator is structurally sealed off from the connector, and
+# the file it produces is opened read-only like any other the moment it exists.
+
+
+def test_the_demo_generator_is_the_only_writable_duckdb_open():
+    """No writable DuckDB connection exists in the engine outside the generator.
+
+    Asserted over the source rather than at runtime because the claim is about
+    what the code can do, not about what one path happened to do: a future
+    `read_only=False` anywhere in the adapter tree is the regression, and it
+    would pass every behavioral test until someone pointed dex at a warehouse
+    they cared about.
+    """
+
+    import exmergo_dex_core
+
+    package_root = Path(exmergo_dex_core.__file__).parent
+    generator = package_root / "demo" / "warehouse.py"
+    openers = [
+        path
+        for path in package_root.rglob("*.py")
+        if "duckdb.connect(" in path.read_text(encoding="utf-8")
+    ]
+    assert generator in openers, "the generator is the one that writes"
+    for path in openers:
+        if path == generator:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "read_only=True" in source, f"{path} opens DuckDB without read_only"
+        assert "read_only=False" not in source, f"{path} opens DuckDB writable"
+
+    # And the generator imports neither the adapter nor the guards, so the
+    # read-only open and the SELECT-only guard have no branch it could take.
+    # Read off the import statements rather than the file text, so the prose
+    # explaining the separation cannot be mistaken for a violation of it.
+    import ast
+
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(generator.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not any("adapters" in name or "guards" in name for name in imported), (
+        f"the generator must stay off the connector path: {sorted(imported)}"
+    )
+
+
+def test_a_generated_demo_warehouse_is_opened_read_only(tmp_path: Path):
+    """The loop closed: the moment the demo file exists it is user data, and the
+    adapter treats it exactly like a warehouse dex did not create."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import generate_demo_warehouse
+
+    warehouse = generate_demo_warehouse(tmp_path / "demo.duckdb")
+    adapter = DuckDBAdapter(warehouse.path)
+    try:
+        with pytest.raises(Exception):
+            adapter._conn.execute("DELETE FROM customers")
+    finally:
+        adapter.close()
 
 
 def test_combination_probe_sql_is_select_only_in_every_dialect():
@@ -1419,6 +1637,69 @@ def test_init_refuses_where_a_project_already_exists(dbt_project_dir: Path):
         )
 
 
+def test_demo_refuses_to_overwrite_an_existing_warehouse(tmp_path: Path, capsys):
+    """`dex demo` is create-only, and deliberately not confirmable.
+
+    The sibling of the init refusal above, for the one verb that writes a data
+    file rather than a project file. It is stricter than init on purpose: a
+    `--confirm` that could talk past this would put a real warehouse one typo
+    away from being replaced, and the fix (name another path) costs nothing.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    existing = tmp_path / "production.duckdb"
+    existing.write_bytes(b"someone else's warehouse")
+
+    for argv in (["demo", str(existing)], ["demo", str(existing), "--confirm"]):
+        assert main(argv) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert payload["reason"] == "guard"
+        assert existing.read_bytes() == b"someone else's warehouse"
+
+
+def test_demo_creates_only_what_it_names_and_never_a_second_config(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Two artifacts, both reported, and never one that shadows a real project.
+
+    A `.dex/config.yml` written into a subdirectory of someone's repo would
+    silently capture every command run there, which is the same class of harm as
+    overwriting a file: a change they did not ask for and would not see.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["demo"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    on_disk = sorted(
+        str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()
+    )
+    assert on_disk == sorted(payload["data"]["created"])
+
+    # Now with a project config already above the target: the warehouse is still
+    # created, the config is not, and the envelope says which happened.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "scratch").mkdir()
+    committed = tmp_path / ".dex" / "config.yml"
+    before = committed.read_text(encoding="utf-8")
+
+    assert main(["demo", "scratch/second.duckdb"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["created"] == ["scratch/second.duckdb"]
+    assert not (tmp_path / "scratch" / ".dex").exists()
+    assert committed.read_text(encoding="utf-8") == before
+    assert any("left untouched" in w for w in payload["warnings"])
+
+
 def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys):
     # Init bakes the connector into a durable artifact (the generated
     # profiles.yml), so the engine-wide DuckDB default does not apply: bare init
@@ -1757,11 +2038,16 @@ def _bq_adapter(fake_bq_client, *, ceiling=500 * 1024 * 1024, confirmed=True):
 def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     # Family 1: every statement the adapter generates passes the SELECT-only
     # guard in the bigquery dialect (asserted at build time, no client needed).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _bq_adapter(fake_bq_client)
     _meta, columns = adapter.table_metadata("test-proj.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -1774,13 +2060,31 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}, shape, type_req
+        "test-proj.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     # Declared-type-vs-content statistics (#204) ride the same statement too.
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too,
+    # using TIMESTAMP_TRUNC/TIMESTAMP_DIFF (BigQuery's reversed argument
+    # order and type-specific truncation family).
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "TIMESTAMP_TRUNC" in sql and "TIMESTAMP_DIFF" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
@@ -2164,11 +2468,16 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _sf_adapter(fake_sf_connection)
     _meta, columns = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
+    columns = [*columns, ColumnMeta("SIGNUP_TS", "TIMESTAMP_NTZ", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2181,12 +2490,27 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"SIGNUP_TS"}
     sql, _plan = adapter._build_aggregate_sql(
-        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape, type_req
+        "SHOP.PUBLIC.CUSTOMERS",
+        columns,
+        {"ID"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
     assert assert_select_only(sql, dialect="snowflake") == sql
 
 
@@ -2441,11 +2765,16 @@ def _dbx_adapter(fake_databricks, *, ceiling=600.0, confirmed=True):
 def test_databricks_generated_sql_is_select_only(fake_databricks):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the databricks dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _dbx_adapter(fake_databricks)
     _meta, columns = adapter.table_metadata("shop.core.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2458,12 +2787,27 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "shop.core.customers", columns, {"id"}, shape, type_req
+        "shop.core.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "date_trunc" in sql and "TIMESTAMPDIFF" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
 
 
@@ -2652,11 +2996,16 @@ def _pg_adapter(fake_pg_connection, *, ceiling=600.0, confirmed=True):
 def test_postgres_generated_sql_is_select_only(fake_pg_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the postgres dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _pg_adapter(fake_pg_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2669,12 +3018,27 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req
+        "dexdb.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "date_trunc" in sql and "EXTRACT(EPOCH" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
 
 
@@ -2893,11 +3257,16 @@ def _redshift_adapter(fake_redshift_connection, *, ceiling=600.0, confirmed=True
 def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the redshift dialect (asserted at build time).
-    from exmergo_dex_core.adapters.base import is_integer_type, is_string_type
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _redshift_adapter(fake_redshift_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2910,12 +3279,27 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         for c in columns
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape, type_req
+        "dexdb.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
     assert assert_select_only(sql, dialect="redshift") == sql
 
 

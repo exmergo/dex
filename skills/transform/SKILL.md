@@ -17,6 +17,13 @@ writes only to the repo, as reviewable diffs, and runs against a dev target only
 uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
+dex runs its engine through `uv`, which is a prerequisite and is not installed by
+Claude Code. If the shell reports `uv: command not found`, stop and tell the user
+to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
+`brew install uv`, or `pipx install uv`), then re-run. Never fall back to editing
+the dbt project by hand instead: the validation, the diffs, and the dev-target
+gating live in the engine, so any other path is unguarded.
+
 You author the dbt file content; the engine validates it, computes the diffs,
 and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 (or `-` to read stdin), a JSON payload:

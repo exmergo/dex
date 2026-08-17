@@ -231,20 +231,30 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
     # Always safe: no imports of their own (`errors.py`) or explicitly
     # designed to import without the dialect engine (`guards/dialect.py` is
     # the module that checks whether sqlglot is even installed).
+    from .demo.warehouse import (
+        DemoDependencyError,
+        DemoPathError,
+        DemoTargetExistsError,
+    )
     from .errors import (
         ConfigurationError,
         ConnectorError,
         DexError,
         PrerequisiteError,
         RequestError,
+        WarehouseQueryError,
     )
     from .guards.dialect import DialectDependencyError
 
     overrides: list[tuple[type[BaseException], Reason]] = [
+        (DemoTargetExistsError, Reason.GUARD),
+        (DemoDependencyError, Reason.PREREQUISITE),
+        (DemoPathError, Reason.REQUEST),
         (DialectDependencyError, Reason.PREREQUISITE),
         (PrerequisiteError, Reason.PREREQUISITE),  # CacheRequiredError, NoBaselineError
         (ConnectorError, Reason.CONNECTION),  # every *ConnectionError subclass
         (ConfigurationError, Reason.CONFIGURATION),
+        (WarehouseQueryError, Reason.EXECUTION_FAILURE),  # the server said no
         (RequestError, Reason.REQUEST),
         (DexError, Reason.REQUEST),  # generic fallback for any other deliberate refusal
         (ValueError, Reason.REQUEST),  # the pre-typed-error convention: bad input
@@ -281,6 +291,11 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
     # isinstance, so a new DexError subclass only needs an entry when its own
     # reason diverges from its parent's.
     _reason_overrides_cache = [
+        # A demo target that already exists is a safety refusal, not bad input:
+        # the command declines to touch a warehouse it did not create.
+        (DemoTargetExistsError, Reason.GUARD),
+        (DemoDependencyError, Reason.PREREQUISITE),
+        (DemoPathError, Reason.REQUEST),
         (SemanticQueryRefusedError, Reason.GUARD),  # policy, not backend failure
         (ClusterDependencyError, Reason.PREREQUISITE),  # install the extra, retry
         (DialectDependencyError, Reason.PREREQUISITE),
@@ -297,6 +312,9 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         (SemanticBackendError, Reason.CONFIGURATION),  # after SemanticQueryRefusedError
         (BuildFailedError, Reason.EXECUTION_FAILURE),
         (DbtRunError, Reason.EXECUTION_FAILURE),
+        # The statement ran and the server refused it: an execution failure for
+        # the same reason a failed dbt run is one, and never `internal`.
+        (WarehouseQueryError, Reason.EXECUTION_FAILURE),
         (RequestError, Reason.REQUEST),
         (DbtParseError, Reason.REQUEST),
         (PlanError, Reason.REQUEST),  # PlanNotFoundError

@@ -3,14 +3,17 @@
 The wrapper is a stdlib-only PEP 723 script that runs before the engine is
 installed and decides which `exmergo-dex-core[<extra>]` to install. These tests
 guard the decoupling of the version pin from the connector extra: the version is
-pinned, the extra is resolved at runtime from the active connector. The script is
-not importable as a package module, so it is loaded via importlib (its
+pinned, the extra is resolved at runtime from the active connector. They also guard
+the missing-`uv` refusal, which is the one refusal the wrapper has to build itself
+because it happens before the engine (and so `exmergo_dex_core.envelope`) exists.
+The script is not importable as a package module, so it is loaded via importlib (its
 `if __name__ == "__main__"` guard means importing does not run `main()`).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -51,6 +54,102 @@ def test_pin_carries_no_extra(wrapper):
     assert "[" not in version and "]" not in version
     assert "@" not in version
     assert version.strip() == version and version
+
+
+# --- the missing-uv refusal --------------------------------------------------
+#
+# Parametrized over all three wrappers rather than resting on the byte-identity
+# test above: this guard is exactly the kind of thing a refactor drops from one
+# copy, and proving the behavior in each one costs nothing.
+
+
+def _run_without_uv(skill, monkeypatch, argv):
+    """Drive `main()` on a machine where uv is absent, and return (code, stdout).
+
+    `subprocess.call` is replaced with a raiser rather than a stub, so a guard
+    that let execution through fails loudly here instead of quietly shelling out
+    to a `uv` that is not there.
+    """
+
+    module = _load(skill)
+    monkeypatch.setattr(module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        module.subprocess,
+        "call",
+        lambda *a, **k: pytest.fail("the guard let execution reach uv"),
+    )
+    monkeypatch.setattr(module.sys, "argv", ["run.py", *argv])
+    code = module.main()
+    return code, module
+
+
+@pytest.mark.parametrize("skill", _SKILLS)
+def test_missing_uv_refuses_with_one_error_envelope(skill, monkeypatch, capsys):
+    code, _module = _run_without_uv(skill, monkeypatch, ["explore", "inventory"])
+    assert code == 1  # the engine's own exit code for an error envelope
+
+    out = capsys.readouterr().out
+    envelope = json.loads(out)  # exactly one object, or this raises
+    assert envelope["status"] == "error"
+    assert envelope["reason"] == "prerequisite"
+    assert set(envelope) == {
+        "status",
+        "data",
+        "cost",
+        "warnings",
+        "diffs",
+        "errors",
+        "reason",
+    }
+    assert envelope["cost"] == {"paradigm": None, "estimate": None, "ceiling": None}
+    assert envelope["data"] == {}
+
+
+@pytest.mark.parametrize("skill", _SKILLS)
+def test_missing_uv_message_names_uv_and_how_to_install_it(skill, monkeypatch, capsys):
+    # The whole point of the refusal: a user who is not a Python developer has to
+    # be able to act on it without reading our source.
+    _run_without_uv(skill, monkeypatch, ["connect", "test"])
+    message = json.loads(capsys.readouterr().out)["errors"][0]
+    assert "uv" in message
+    assert "astral.sh/uv/install.sh" in message
+
+
+def test_uv_present_still_execs_the_engine(monkeypatch, capsys):
+    # The guard must not fire on the ordinary path, and must not print anything
+    # of its own onto the single-envelope stdout the engine owns.
+    module = _load()
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "/usr/local/bin/uv")
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        module.subprocess, "call", lambda cmd, **_kwargs: seen.append(cmd) or 0
+    )
+    monkeypatch.setattr(module.sys, "argv", ["run.py", "explore", "inventory"])
+
+    assert module.main() == 0
+    assert capsys.readouterr().out == ""
+    assert seen and seen[0][:2] == ["uv", "run"]
+    assert seen[0][-2:] == ["explore", "inventory"]
+
+
+def test_refusal_matches_the_engines_envelope_shape(monkeypatch, capsys):
+    """The hand-built envelope must stay in step with the one the engine emits.
+
+    Skipped where the engine is not installed, which includes CI's
+    `uvx pytest evals -q` job: this is a local-dev and synced-environment guard
+    against the two shapes drifting apart, not a gate.
+    """
+
+    envelope_module = pytest.importorskip("exmergo_dex_core.envelope")
+
+    _run_without_uv("explore", monkeypatch, ["explore", "inventory"])
+    refusal = json.loads(capsys.readouterr().out)
+    engine_built = envelope_module.Envelope(
+        status=envelope_module.Status.ERROR,
+        errors=refusal["errors"],
+        reason=envelope_module.Reason.PREREQUISITE,
+    ).model_dump(mode="json")
+    assert refusal == engine_built
 
 
 # --- connector resolution (mirrors the engine's flag > config > duckdb order) ---

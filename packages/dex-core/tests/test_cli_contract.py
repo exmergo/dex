@@ -36,6 +36,11 @@ def _all_commands() -> list[list[str]]:
                 if group == "explore" and sub == "cluster":
                     argv += ["some_table", "--repo-root", "missing-dex-fixture-dir"]
                 argvs.append(argv)
+        elif group == "demo":
+            # The one verb that creates a file. Pointed at a directory that does
+            # not exist so the contract is exercised through its clean refusal
+            # rather than by seeding a warehouse into the checkout.
+            argvs.append([group, "missing-dex-fixture-dir/demo.duckdb"])
         else:
             argvs.append([group])
     return argvs
@@ -100,6 +105,27 @@ def test_connect_test_without_path_is_clean_error(capsys, tmp_path):
     assert rc == 1
     assert payload["status"] == "error"
     assert payload["errors"]
+
+
+def test_a_lone_duckdb_file_in_the_run_directory_is_used_and_warned_in_the_envelope(
+    capsys, tmp_path
+):
+    """Issue #199, end to end through the CLI: the auto-detect's warning has to
+    reach the actual envelope a caller reads, not just the engine that resolved
+    it, since a guess dex makes on a caller's behalf must never be silent."""
+
+    duckdb = pytest.importorskip("duckdb")
+    lone = tmp_path / "lone.duckdb"
+    conn = duckdb.connect(str(lone))
+    conn.execute("CREATE TABLE t (id INTEGER)")
+    conn.close()
+
+    rc = main(["--repo-root", str(tmp_path), "explore", "inventory"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0, payload
+    assert payload["status"] == "ok"
+    assert any("lone.duckdb" in w for w in payload["warnings"])
+    assert payload["cost"]["paradigm"] == "free_local"
 
 
 @pytest.mark.parametrize(

@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from ..adapters.base import (
     VALUE_DOMAIN_CAP,
@@ -22,6 +22,7 @@ from ..adapters.base import (
     ColumnAggregate,
     is_blob_type,
     is_integer_type,
+    is_temporal_type,
     json_safe,
 )
 from ..adapters.base import is_string_type as _base_is_string_type
@@ -34,6 +35,7 @@ from ..cache import (
     ValueDomain,
 )
 from ..config import PIIOverrideMatcher
+from ..errors import WarehouseQueryError
 from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
@@ -472,6 +474,153 @@ def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | No
     )
 
 
+# Below this, a second shape reads as a handful of typos/outliers, not a
+# second real population; the issue's own worked example floors here at 10%,
+# so 5% catches a genuine minority scheme with margin to spare while staying
+# on this codebase's side of under- rather over-reporting.
+_HETEROGENEOUS_KEY_MIN_SHARE = 0.05
+
+# Friendly names for the hash lengths this shape recurs as in practice;
+# anything else is reported by its bare length instead of guessing further.
+_HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def _is_candidate_key(
+    col_name: str, agg: ColumnAggregate | None, composite_members: set[str]
+) -> bool:
+    """A single-column proven key, or a member of a proven composite key --
+    the same predicate `relationships.candidate_keys` applies to
+    `ColumnProfile` after the fact, evaluated here instead against the live
+    aggregate because that's the only place `key_shape` fractions exist.
+    """
+
+    if col_name in composite_members:
+        return True
+    if agg is None:
+        return False
+    return bool(agg.is_unique) and agg.null_fraction in (0.0, None)
+
+
+def _hex_shape_label(agg: ColumnAggregate) -> str:
+    lo, hi = agg.hex_string_min_length, agg.hex_string_max_length
+    if lo is None or hi is None:
+        return "hexadecimal"
+    if lo == hi:
+        name = _HEX_LENGTH_NAMES.get(lo)
+        return (
+            f"{lo}-character hexadecimal ({name}-shaped)"
+            if name
+            else f"{lo}-character hexadecimal"
+        )
+    return f"hexadecimal ({lo}-{hi} characters, mixed length)"
+
+
+def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str | None:
+    """A candidate-key column that mixes two or more value shapes (numeric,
+    UUID, fixed-length hex, or an unclassified remainder) in a meaningful
+    share each -- the shape that survives a partial migration or a merged
+    upstream, where a downstream cast or numeric comparison silently drops
+    the group it can't parse. Fractions and a length-derived shape label
+    only; never a value.
+    """
+
+    if agg is None:
+        return None
+    numeric = agg.numeric_string_fraction or 0.0
+    uuid = agg.uuid_string_fraction or 0.0
+    hexed = agg.hex_string_fraction or 0.0
+    other = max(0.0, 1.0 - numeric - uuid - hexed)
+    buckets = [
+        ("numeric", numeric),
+        ("uuid", uuid),
+        (_hex_shape_label(agg), hexed),
+        ("other", other),
+    ]
+    present = [
+        (name, frac) for name, frac in buckets if frac >= _HETEROGENEOUS_KEY_MIN_SHARE
+    ]
+    if len(present) < 2:
+        return None
+    parts = ", ".join(f"{frac:.0%} {name}" for name, frac in present)
+    return (
+        f"{col_name} is a candidate key but mixes value shapes: {parts}; "
+        "casting to a number or comparing numerically will silently drop "
+        "the non-numeric group(s)"
+    )
+
+
+def _parse_temporal(value: object) -> date | datetime:
+    """Normalize a temporal min/max back to a comparable object. Adapters
+    disagree about when they call ``json_safe`` on these two fields (see the
+    module docstring's note on #206): DuckDB/BigQuery hand back a native
+    ``date``/``datetime``, Snowflake/Databricks/Redshift/Postgres an ISO
+    8601 ``str``. Both must resolve to the same shape before date
+    arithmetic, since subtracting a ``date`` from a ``datetime`` raises."""
+
+    if isinstance(value, str):
+        return (
+            datetime.fromisoformat(value)
+            if ("T" in value or " " in value)
+            else date.fromisoformat(value)
+        )
+    return value  # already date or datetime
+
+
+def _temporal_granularity(agg: ColumnAggregate) -> str:
+    """Day is the default; month wins only when the data is clearly at that
+    grain (values sit on month boundaries), and hour is reported instead of
+    day when day-truncation would actually lose information (real
+    sub-day variation, so a bare DATE column -- always day-aligned by
+    construction -- never lands here)."""
+
+    day_aligned = agg.day_aligned_fraction or 0.0
+    month_aligned = agg.month_aligned_fraction or 0.0
+    if day_aligned < _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return "hour"
+    if month_aligned >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return "month"
+    return "day"
+
+
+def _temporal_continuity(
+    agg: ColumnAggregate | None,
+) -> tuple[str, int, int, int, int] | None:
+    """Span, distinct periods, missing periods, and the largest gap, at the
+    detected granularity. Neutral by design: a genuinely sparse column (an
+    event timestamp on a rare event) reports large numbers here without
+    being characterized as broken -- interpretation belongs to the caller,
+    including a future drift-sweep detector this only lands the statistics
+    for (issue #226, not built here). ``None`` when there isn't enough
+    evidence (no aggregate, no min/max, or the adapter could not compute
+    the granularity-matched pair)."""
+
+    if agg is None or agg.min_value is None or agg.max_value is None:
+        return None
+    # Not a temporal-eligible column at all (no alignment evidence was ever
+    # requested for it): min/max exist but are not dates, so there is
+    # nothing to do date arithmetic on.
+    if agg.day_aligned_fraction is None and agg.month_aligned_fraction is None:
+        return None
+    granularity = _temporal_granularity(agg)
+    lo, hi = _parse_temporal(agg.min_value), _parse_temporal(agg.max_value)
+    if granularity == "month":
+        span = (hi.year - lo.year) * 12 + (hi.month - lo.month) + 1
+        distinct_periods = agg.month_distinct_periods
+        largest_gap = agg.month_largest_gap
+    elif granularity == "hour":
+        span = int((hi - lo).total_seconds() // 3600) + 1
+        distinct_periods = agg.hour_distinct_periods
+        largest_gap = agg.hour_largest_gap
+    else:
+        span = (hi - lo).days + 1
+        distinct_periods = agg.day_distinct_periods
+        largest_gap = agg.day_largest_gap
+    if distinct_periods is None:
+        return None
+    missing = max(0, span - distinct_periods)
+    return granularity, span, distinct_periods, missing, largest_gap or 0
+
+
 def profile(
     adapter: Adapter,
     identifiers: list[str],
@@ -544,6 +693,21 @@ def profile(
             if prelim_pii[c.name] is None
             and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
         }
+        # Heterogeneous-key-shape checks (#205) are string-only, unlike
+        # type_stats above: a UUID/hex check is meaningless on a column SQL
+        # already stores as a number.
+        key_shape_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None and _is_string_type(c.data_type)
+        }
+        # Temporal-continuity checks (#206): non-PII date/timestamp columns
+        # only, same eligibility rule as above.
+        temporal_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None and is_temporal_type(c.data_type)
+        }
 
         # Blob-type columns can only ever yield a null fraction and a distinct
         # estimate, yet a columnar engine bills for the whole column once it is
@@ -557,31 +721,47 @@ def profile(
         ]
         scan_columns = [c for c in columns if c.name not in blob_excluded]
 
-        aggregates = {
-            a.name: a
-            for a in adapter.column_aggregates(
-                identifier,
-                scan_columns,
-                safe_min_max=safe,
-                shape_stats=shape,
-                type_stats=type_stats,
+        # The adapter knows what the server said and this loop knows which
+        # object it said it about, so a server-side refusal picks up the
+        # identifier on its way past: an envelope reading "the warehouse
+        # refused a statement dex built" is only actionable when it names the
+        # object, and a map run has a dozen of them in flight.
+        try:
+            aggregates = {
+                a.name: a
+                for a in adapter.column_aggregates(
+                    identifier,
+                    scan_columns,
+                    safe_min_max=safe,
+                    shape_stats=shape,
+                    type_stats=type_stats,
+                    key_shape_stats=key_shape_stats,
+                    temporal_stats=temporal_stats,
+                )
+            }
+            # Re-read the metadata after the aggregate scan: adapters whose
+            # inventory row counts are planner estimates (Postgres reltuples)
+            # upgrade to the exact COUNT(*) the scan just paid for, so
+            # uniqueness proofs and the dataset row count are exact. Free
+            # everywhere (cached or trivially cheap on the other adapters).
+            meta, _ = adapter.table_metadata(identifier)
+            aggregates = _escalate_near_unique(
+                adapter, identifier, meta.row_count, aggregates
             )
-        }
-        # Re-read the metadata after the aggregate scan: adapters whose
-        # inventory row counts are planner estimates (Postgres reltuples)
-        # upgrade to the exact COUNT(*) the scan just paid for, so uniqueness
-        # proofs and the dataset row count are exact. Free everywhere (cached
-        # or trivially cheap on the other adapters).
-        meta, _ = adapter.table_metadata(identifier)
-        aggregates = _escalate_near_unique(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        composite_keys = _probe_composite_keys(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        value_domains = _probe_value_domains(
-            adapter, identifier, meta.row_count, aggregates, prelim_pii, composite_keys
-        )
+            composite_keys = _probe_composite_keys(
+                adapter, identifier, meta.row_count, aggregates
+            )
+            value_domains = _probe_value_domains(
+                adapter,
+                identifier,
+                meta.row_count,
+                aggregates,
+                prelim_pii,
+                composite_keys,
+            )
+        except WarehouseQueryError as exc:
+            raise exc.naming(identifier) from exc
+        composite_members = {c for pair in composite_keys for c in pair}
 
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
@@ -617,6 +797,13 @@ def profile(
                 data_quality.extend(
                     _type_contradiction_notes(col.name, col.data_type, agg)
                 )
+                if _is_candidate_key(col.name, agg, composite_members):
+                    key_note = _heterogeneous_key_note(col.name, agg)
+                    if key_note is not None:
+                        data_quality.append(key_note)
+            continuity = (
+                _temporal_continuity(agg) if col.name in temporal_stats else None
+            )
             profiles.append(
                 ColumnProfile(
                     name=col.name,
@@ -631,6 +818,11 @@ def profile(
                     pii=pii,
                     pii_overridden=overridden.get(col.name),
                     value_domain=value_domains.get(col.name),
+                    temporal_granularity=continuity[0] if continuity else None,
+                    temporal_span=continuity[1] if continuity else None,
+                    temporal_distinct_periods=continuity[2] if continuity else None,
+                    temporal_missing_periods=continuity[3] if continuity else None,
+                    temporal_largest_gap=continuity[4] if continuity else None,
                 )
             )
 

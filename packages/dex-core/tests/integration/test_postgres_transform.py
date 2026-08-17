@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import assert_unpivot_build, unpivot_fixture_edits
+from .conftest import assert_ok, assert_unpivot_build, unpivot_fixture_edits
 from .test_postgres_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
@@ -54,7 +54,7 @@ def test_init_and_build_write_only_the_dev_schema(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
     profile = yaml.safe_load(rendered)["analytics"]["outputs"]["dev"]
@@ -84,7 +84,7 @@ def test_init_and_build_write_only_the_dev_schema(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["success"] is True
     assert any(n["name"] == "stg_orders" for n in data["nodes"])
@@ -117,13 +117,13 @@ def test_unpivot_json_object_macro_builds_live(tmp_path: Path, capsys, dev_dsn):
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     edits_file = tmp_path / "edits.json"
     edits_file.write_text(
@@ -184,7 +184,7 @@ def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "build", "--target", "dev"], capsys

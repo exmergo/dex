@@ -4,6 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/exmergo-dex-core?logo=pypi&logoColor=white&color=165dfc)](https://pypi.org/project/exmergo-dex-core/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-165dfc)](LICENSE)
+[![data-eng-bench](https://img.shields.io/badge/data--eng--bench-57%25-33cf56)](benchmarks/data-eng-bench/README.md)
 [![ADE-bench](https://img.shields.io/badge/ADE--bench-76%25-33cf56)](benchmarks/ade_bench/README.md)
 [![CI](https://github.com/exmergo/dex/actions/workflows/ci.yml/badge.svg)](https://github.com/exmergo/dex/actions/workflows/ci.yml)
 
@@ -35,7 +36,8 @@ intent.
 
 **`dex` is analytics engineering** for Claude Code and **any agent**: **data warehouse
 exploration**, **dbt transformation** and **semantic modeling**, and **schema-drift
-maintenance** on dbt. Point it at your warehouse (or a local DuckDB file) and your
+maintenance** on dbt. Point it at your warehouse (or a local DuckDB file, or the one
+`dex demo` generates for you) and your
 dbt project; it learns the landscape, writes and refactors your dbt transformations
 and semantic models, and tells you what to fix when anything drifts. The dbt
 project is the source of truth; every change is a reviewable diff. Read-only
@@ -75,20 +77,101 @@ time. `dex` owns exactly that loop.
 
 <img width="484" height="344" alt="image" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
 
+## Try it in three commands, on your laptop
 
-## Benchmark
+No warehouse, no credentials, no cloud account, no network. `dex demo` generates a
+small e-commerce DuckDB warehouse locally and points the following commands at it.
 
-On ADE-bench (75 analytics-engineering tasks: fix, build, and extend dbt
-projects on DuckDB), `dex` reaches **76% task resolution with Claude Sonnet 5**,
-at **2.5x lower cost than Claude Fable 5**.
+```
+pip install "exmergo-dex-core[duckdb]"
+dex demo
+dex explore map
+```
+
+`dex demo` writes two files in the directory you are standing in, and refuses rather
+than overwrite anything: `dex_demo.duckdb` (7 tables, 29,512 rows) and a
+`.dex/config.yml` so everything after it runs with no flags. The data is generated
+from a pinned seed, so what you see is what is written here.
+
+It is seeded to be **realistically broken**, because a first run that reports a clean
+bill of health teaches you nothing. `explore map` flags 6 columns as personal data,
+infers 5 joins, and reports 5 data-quality findings. Then:
+
+```
+dex explore profile order_items products
+dex explore relationships --verify
+dex explore query "select email from customers"
+```
+
+- **A broken grain.** `order_item_id is not unique: 13000 distinct over 14000 rows`,
+  because a batch was loaded twice. Any join on it silently fans out.
+- **A key that mixes id schemes.** `sku` is `90% numeric, 10% 32-character
+  hexadecimal (md5-shaped)`, from a merged catalogue. Cast it to a number and you
+  drop 10% of your rows without an error.
+- **A join that looks right and is not.** `web_events.customer_id` shares the CRM's
+  column name and type, so it is inferred; verification finds **100% of values have
+  no match**, so the inference collapses instead of shipping a join that returns all
+  NULLs and looks like it worked.
+- **A refusal.** The query firewall declines to project `customers.email` into
+  context. `select count(distinct email) from customers` runs, because a statistic
+  is not a value.
+- Plus a table an interrupted load left empty, two columns whose declared type
+  contradicts their content, and two PII **false positives** on a distribution
+  centre's city and coordinates, which are a designed behaviour and worth meeting
+  early.
+
+DuckDB is free and local, so nothing here asks you to confirm a spend. On BigQuery
+or Snowflake the same commands return an estimate first and run only once you agree
+to it.
+
+## Prerequisite: `uv`
+
+dex installs and runs its engine through [`uv`](https://docs.astral.sh/uv/), so you
+need it on your `PATH` before either install below. Neither Claude Code nor the
+plugin installs it for you.
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+`brew install uv` and `pipx install uv` work too. Nothing else is required: `uv`
+supplies the Python and the engine, with the connector extra chosen for you at
+runtime.
+
+## Benchmarks
+
+We run `dex` on two public analytics-engineering benchmarks. Every run's raw
+per-task results are committed, including the ones that flatter us least.
+
+### data-eng-bench (Snowflake, 103 tasks)
+
+Each task hands the agent a **2,356-model dbt project on a 489 MB DuckDB
+warehouse** and a prescriptive ticket, then runs a hidden pytest suite after a
+cold `dbt run`. Scoring is binary and total: one failed assertion is a zero.
+
+`dex` + **Claude Sonnet 5** resolves **59 of 103 tasks (57.3%)**, with dex firing
+on **98% of trials**. That is nominally the highest published Sonnet 5 figure and
+statistically indistinguishable from the 56.6% Snowflake published for both Claude
+Code and their own CoCo harness, since 0.7 points on 103 tasks is less than one
+task. Read it as parity, not as a win.
+
+Because the reward is all-or-nothing, we also publish assertion-level results:
+**89.7% of assertions pass** (task-weighted), and 19 of the 44 unresolved tasks
+missed by exactly one assertion. Full methodology and the per-check record are in
+the [data-eng-bench README](benchmarks/data-eng-bench/README.md).
+
+### ADE-bench (dbt Labs, 75 tasks)
+
+Fix, build, and extend dbt projects on DuckDB. `dex` + **Claude Sonnet 5** reaches
+**76% task resolution**, at **2.5x lower cost than Claude Fable 5**.
 
 <img width="719" height="283" alt="image" src="https://github.com/user-attachments/assets/9f8bca64-6508-4590-9fa7-bb1ac077263d" />
 
 
 With `dex`, accuracy clusters tightly across models (72-76%) while cost does not,
-so you can run an inexpensive model and still get top-tier results. Full
-methodology, per-model cost, and the raw `results.json` for every run are in the
-[benchmark README](benchmarks/ade_bench/README.md).
+so you can run an inexpensive model and still get top-tier results. One honest
+caveat on this one: dex was actually invoked in only 15 of the 75 Sonnet 5 trials,
+and on those 15 it netted a single extra task, so the 76% is mostly a statement
+about the model rather than about `dex`. Per-model cost and the raw `results.json`
+for every run are in the [ADE-bench README](benchmarks/ade_bench/README.md).
 
 ### On benchmarks
 
@@ -97,7 +180,14 @@ measures whether tests pass; it does not measure what matters most in practice:
 the experience of the human engineer working with the agent. Trust in a diff,
 clarity of the proposed change, cost surfaced before spend, and sensitive data
 kept out of context never show up in a pass rate. We optimize for that
-experience first and treat the benchmark as a floor, not the goal.
+experience first and treat these scores as guide posts, not as the goal.
+
+Two habits follow from that. We report **how often `dex` actually ran** next to
+the accuracy, because a score with the tool firing on 98% of trials and the same
+score with it firing on 20% are different claims and only the first says anything
+about `dex`. And we do not turn a gap smaller than the noise into a headline: a
+single run, one attempt per task, tells you roughly where a setup stands, not that
+it is better than the one a point below it.
 
 ## Connectors
 

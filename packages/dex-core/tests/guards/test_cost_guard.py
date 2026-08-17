@@ -26,17 +26,29 @@ def test_billed_paradigm_requires_a_ceiling():
 
 def test_unconfirmed_raises_with_the_cost_attached():
     with pytest.raises(ConfirmationRequiredError) as exc_info:
-        preflight(0.0, 1.0, paradigm=Paradigm.FREE_LOCAL, confirmed=False)
+        preflight(5, 10, paradigm=Paradigm.BYTES_SCANNED, confirmed=False)
     cost = exc_info.value.cost
-    assert cost.paradigm is Paradigm.FREE_LOCAL
-    assert cost.estimate == 0.0
-    assert cost.ceiling == 1.0
+    assert cost.paradigm is Paradigm.BYTES_SCANNED
+    assert cost.estimate == 5
+    assert cost.ceiling == 10
 
 
 def test_free_local_confirmed_passes_without_a_budget():
     cost = preflight(0.0, None, paradigm=Paradigm.FREE_LOCAL, confirmed=True)
     assert cost.paradigm is Paradigm.FREE_LOCAL
     assert cost.ceiling is None
+
+
+def test_free_local_unconfirmed_never_raises():
+    """Issue #197: a confirmation handshake is emitted only where spend is
+    possible. FREE_LOCAL cannot bill, so an unconfirmed call passes exactly
+    like a confirmed one, with or without a ceiling configured."""
+
+    cost = preflight(0.0, None, paradigm=Paradigm.FREE_LOCAL, confirmed=False)
+    assert cost.paradigm is Paradigm.FREE_LOCAL
+
+    cost = preflight(0.0, 1.0, paradigm=Paradigm.FREE_LOCAL, confirmed=False)
+    assert cost.paradigm is Paradigm.FREE_LOCAL
 
 
 def test_billed_paradigm_within_ceiling_and_confirmed_passes():
@@ -121,6 +133,50 @@ def test_gate_phase_within_remaining_headroom_passes():
     cost = gate.preflight_phase(300.0)
     assert cost.estimate == 900.0
     assert cost.ceiling == 1_000.0
+
+
+# --- issue #197: no confirmation handshake where nothing can bill --------------
+#
+# No adapter attaches a CostGate for a free connector today (DuckDB has none),
+# so these are the defensive half of the rule: even a gate misattached to
+# FREE_LOCAL must never ask for confirmation of spend that cannot happen.
+
+
+def test_gate_free_local_command_handshake_never_raises_unconfirmed():
+    gate = _gate(
+        paradigm=Paradigm.FREE_LOCAL,
+        ceiling=None,
+        session_ceiling=None,
+        confirmed=False,
+    )
+    cost = gate.preflight_command(0.0)
+    assert cost.paradigm is Paradigm.FREE_LOCAL
+
+
+def test_gate_free_local_command_handshake_skips_ceiling_required_too():
+    # A ceiling is optional on FREE_LOCAL: unset, unconfirmed, still passes.
+    gate = _gate(
+        paradigm=Paradigm.FREE_LOCAL,
+        ceiling=None,
+        session_ceiling=None,
+        confirmed=False,
+    )
+    cost = gate.preflight_command(0.0)
+    assert cost.ceiling is None
+
+
+def test_gate_free_local_command_handshake_still_blocks_over_a_configured_ceiling():
+    # Over-ceiling binds regardless of paradigm: an estimate that contradicts
+    # an explicitly configured ceiling is refused even though nothing bills.
+    gate = _gate(paradigm=Paradigm.FREE_LOCAL, ceiling=1.0, confirmed=False)
+    with pytest.raises(OverCeilingError):
+        gate.preflight_command(1_000_000.0)
+
+
+def test_gate_free_local_phase_handshake_never_raises():
+    gate = _gate(paradigm=Paradigm.FREE_LOCAL, ceiling=1.0, confirmed=True)
+    cost = gate.preflight_phase(1_000_000.0)
+    assert cost.paradigm is Paradigm.FREE_LOCAL
 
 
 def test_gate_phase_beyond_remaining_headroom_asks_for_confirmation():

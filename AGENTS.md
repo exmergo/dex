@@ -31,6 +31,14 @@ uv run python -m exmergo_dex_core <subcommand> [flags]
 uv run scripts/run.py <subcommand> [flags]
 ```
 
+Both forms need [`uv`](https://docs.astral.sh/uv/) on `PATH`: it is what installs
+and runs the engine, and no agent host installs it for you. Without it the shell
+reports `uv: command not found`, and the shipped wrapper run directly refuses with
+an error envelope (`reason: prerequisite`) naming the fix. The install is one line
+(`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`, or
+`pipx install uv`); relay it to the user rather than reaching for another way to do
+the work, since every guardrail below lives in the engine.
+
 Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
 `[postgres]`, `[redshift]`, or `[all]` for every optional capability at once. The shipped wrapper pins
@@ -43,12 +51,17 @@ silently: with no `.dex/config.yml` anywhere up the tree and no explicit
 DuckDB target, so a command run from a subdirectory of your project resolves the
 project's real config instead of a wrong default.
 
+With no warehouse to point at yet, `demo` generates one and writes the config for
+it, so `demo` then `explore map` is a working first run on a machine with no
+credentials and no network.
+
 | Subcommand | Returns |
 |---|---|
+| `demo [path]` | generates a seeded local DuckDB warehouse (7 tables, 29,512 rows) plus a `.dex/config.yml` beside it, so a first run needs no warehouse, no credentials, and no network; both artifacts are listed in `data.created` and `data.next_steps` names the commands worth running next. The path is positional and resolves against the working directory, defaulting to `dex_demo.duckdb`; `--path` is refused here rather than honored, since everywhere else it names the warehouse dex *reads*. Create-only, with no `--confirm` that can talk past it: an existing file at the target is a refusal (`reason: guard`), a missing parent directory is a refusal (`reason: request`), no directories are ever created, and a `.dex/config.yml` at or above the target is left untouched with a warning rather than shadowed by a second one. The data is generated from a pinned seed, so the counts quoted in the docs are the counts a user sees, and it is deliberately flawed: a key that lost uniqueness to a double-loaded batch, a key mixing two id schemes, a join whose columns share a name and none of their values, an empty table, two columns whose declared type contradicts their content, and personal data alongside two designed false positives. Needs the `[duckdb]` extra and says so by name when it is absent (`reason: prerequisite`) |
 | `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
-| `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe; `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge) |
+| `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe, declared and inferred alike (a composite-key join is not probed: the probe spans one column pair); `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge). A measurement never revises a declared join's confidence, which stays at the 1.0 the project asserts; a declared join whose probe finds the parent largely missing is reported as a finding instead |
 | `explore map [--verify] [--use-project]` | writes/updates the `.dex/` map; prints a summary; `--use-project` additionally applies declared grain and ranks metric-backing models higher |
 | `explore diagram [--full]` | the `.dex/` map serialized as a Mermaid `erDiagram` under `data.mermaid`, plus an `entities` legend mapping each entity name back to its fully-qualified identifier. Free and connectionless: it reads the cache and never opens the warehouse, so it needs no credential and cannot spend. Declared joins are solid, inferred joins dotted, and a cardinality is drawn only where the cache proved it (an unverified inference never claims "exactly one"). The default draws profiled objects that participate in a join, with their grain, key, join, and PII-flagged columns; `--full` widens to every eligible object and column. An entity cap always binds and every elision is counted in `notes`. No column value ever appears; PII renders as category and confidence. dex writes no file: reproduce the string in a fenced ```mermaid block, or save it yourself |
 | `explore query "<SELECT ...>" [more...]` | runs agent-authored SELECTs through the query firewall: columnar, capped results; values only from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); the FROM clause may unnest JSON/array columns in the connector's native idiom (UNNEST, LATERAL FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL) when the unnested value derives from a queried table's column, with the outputs inheriting that column's flags. The positional is variadic, so a chain of questions is one call: each argument is one statement, adjudicated, executed, and ledgered on its own, and `--sql-file <path>` reads a larger batch from a file (one statement per line, or semicolon-separated). Several statements in one string is still refused, so batching never widens what a call may do. One statement returns the envelope described here; two or more return `data.results`, one entry per statement carrying this same `columns`/`types`/`cells`/`row_count`/`truncated` shape plus its own `status` (`ok`, `refused`, `failed`, `skipped`) and `error`, so a refusal on the third does not discard the first two, and the envelope's own status is `error` whenever any statement failed. `query.max_payload_bytes` is the budget for the whole call rather than for one statement, and `query.max_statements` (default 10) refuses an oversized batch. An object a statement names that the connection has but the cache cannot adjudicate (never profiled, inventoried without column detail, or profiled against a column signature the warehouse has since changed) is profiled first and the statement then runs, with a warning naming what was profiled and `data.profiled_on_demand` listing it; that profile is a full one, so the flags governing the query are the flags a deliberate `explore profile` would have produced. On a metered connector it is priced, not implied: one handshake covers the profiles and every statement together, itemized per table and per statement, and the objects a whole batch needs are scanned once rather than once per statement. An object the connection does not have refuses only the statements that named it, naming the connection rather than the cache. `--no-auto-profile` (or `auto_profile: false` in `.dex/config.yml`) restores the strict prerequisite, and on that path nothing opens a connection before the firewall has spoken |
@@ -72,8 +85,8 @@ project's real config instead of a wrong default.
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
-Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
-fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
+Skill-to-subcommand mapping: `explore` fronts `demo`/`connect`/`explore`;
+`transform` fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, detection (`check`, `schema`, `volume`,
 `grain`, `semantic`) is read-only; only `reconcile` emits diffs, and applying
 them is `transform apply`. Detection is read-only on every connector, but read-only
@@ -140,7 +153,14 @@ them.
 2. Profile, don't exfiltrate. Understanding is built from aggregates, not raw rows.
 3. Read-only against data; writes confined to the repo. DuckDB opens read-only;
    generated SQL is SELECT-only; agent-authored SQL runs only through the query
-   firewall; builds run against a dev target only, never prod.
+   firewall; builds run against a dev target only, never prod. `dex demo` is the
+   one verb that creates a data file, and the exception is narrower than the rule
+   it sits inside: it only ever creates, refusing rather than overwriting and with
+   no confirmation flag that can override that, so it cannot open, inspect, or
+   replace a warehouse it did not make. The generator sits on its own path and
+   never reaches a connector, which is why the read-only open above has no branch
+   it could take; the moment the file exists it is user data and is read like any
+   other warehouse.
 4. Cost-aware by connector. Nothing dex runs touches the warehouse without a
    ceiling. The source allowlist in `.dex/config.yml` is a committed cost
    boundary: `--scope` narrows it for one command and can never widen it, and a

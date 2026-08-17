@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import MAX_BYTES, assert_unpivot_build, unpivot_fixture_edits
+from .conftest import MAX_BYTES, assert_ok, assert_unpivot_build, unpivot_fixture_edits
 from .test_bigquery_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.bigquery]
@@ -43,7 +43,7 @@ def test_init_plan_apply_build_into_the_scratch_dataset(
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "init", "analytics"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     profiles = yaml.safe_load(
         (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
     )
@@ -139,13 +139,13 @@ def test_unpivot_json_object_macro_builds_live(
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "init", "analytics"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     edits_file = tmp_path / "edits.json"
     edits_file.write_text(
@@ -220,7 +220,7 @@ def test_a_missing_dev_dataset_warns_rather_than_refusing(
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "init", "analytics"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     # No model is authored, so the build creates nothing: the preflight's warning
     # is what is under test, not dbt's dataset creation.

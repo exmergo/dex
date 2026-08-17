@@ -12,7 +12,11 @@ logic.
   against the pinned engine version, installing the connector extra it resolves at
   runtime (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
   found by walking up from the run directory to the git root, then DuckDB), so the
-  pin stays connector-neutral.
+  pin stays connector-neutral. `uv` is therefore a prerequisite, and the wrapper
+  holds the envelope contract even there: with no `uv` on `PATH` it refuses with a
+  `reason: prerequisite` error envelope naming the install command, rather than
+  failing the exec. It is the one refusal built by hand, because the engine that
+  would otherwise build it is what is missing.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.
@@ -25,12 +29,20 @@ from profiled, PII-cleared columns, bounded and capped by the query firewall.
 
 ## The command surface
 
-Capabilities, not final spelling. Implemented incrementally: `connect test`, the
-`explore` group, the authoring surface (`transform`, `semantic`), and the
+Capabilities, not final spelling. Implemented incrementally: `demo`, `connect test`,
+the `explore` group, the authoring surface (`transform`, `semantic`), and the
 `maintain` group are live; `viz preview` returns a valid `not_implemented`
 envelope until the Viz integration lands.
 
 ```
+dex demo [path]                   -> generate a seeded local DuckDB warehouse (7 tables,
+                                     29,512 rows) plus a .dex/config.yml beside it, so a
+                                     first run needs no warehouse and no credentials;
+                                     reports both under data.created and names what to
+                                     run next under data.next_steps. Create-only and not
+                                     confirmable: an existing target refuses, no
+                                     directory is ever created, and an existing config
+                                     at or above the target is left alone with a warning
 dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
@@ -64,6 +76,10 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
 dex transform macro [name]        -> list the shipped dbt macros, or plan scaffolding one into the
                                      project's macro directory (dbt-parse-checked; apply like any plan)
+dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
+                                     ref()/source() input with only the columns <m> reads, typed from
+                                     the exploration cache; expect: is an empty stub that fails until
+                                     filled in (dbt-parse-checked; apply like any plan)
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan

@@ -39,7 +39,7 @@ from ..adapters.base import name_list
 from ..config import pii_override_paths
 from ..errors import PrerequisiteError, ProjectError, RepoRootRequiredError
 from ..results import ConfirmationRequest, to_envelope
-from ..storage import Document, FilesystemStore, MaintainStore
+from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
 from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
@@ -234,6 +234,39 @@ def _require_baseline(store: MaintainStore) -> snapshot_mod.Snapshot:
     return snap
 
 
+def _stored_drift(store: MaintainStore) -> drift_mod.DriftReport | None:
+    """The stored drift report, treating one that will not parse as absent.
+
+    The opposite policy from :func:`_require_baseline`, and the reason is the one
+    already written down beside ``DRIFT_SCHEMA_VERSION`` in :mod:`.drift`: the
+    baseline is *vouched for* and nothing else reproduces it, while a drift
+    report is *derived* and `maintain check` regenerates it from the baseline on
+    demand. So a document this engine cannot read has a cheap correct answer here
+    that the baseline does not have, and that note pre-committed to this one:
+    "treat it as absent and rebuild, rather than refuse".
+
+    Both callers already have an absent path, so this widens a handled state
+    rather than adding one. ``_record_axes`` discards a report measured against a
+    different baseline wholesale, which is the same "throw it away and remeasure"
+    it now does for an unparseable one; ``reconcile`` raises
+    :class:`NoBaselineError` naming `maintain check`, which is the correct remedy
+    for a report that cannot be read as much as for one that was never written.
+
+    ⚠️ Deliberately silent about *which* of the two happened, unlike the cache and
+    the baseline. Rebuilding is free and automatic here, so an operator has
+    nothing to decide and a warning would be noise on a path that self-heals.
+    """
+
+    try:
+        return store.load_drift()
+    except ValueError:
+        # Same convention as `_require_baseline` and `readable_cache`: a backend
+        # signals "this document will not parse" with a ValueError, whatever its
+        # own deserializer raises. Swallowed rather than classified because the
+        # remedy runs itself on the very next line of both callers.
+        return None
+
+
 def snapshot(engine: DexEngine) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
@@ -247,7 +280,7 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
     config = engine.config
     warnings: list[str] = []
 
-    cache = store.load_cache()
+    cache = readable_cache(store)
     requested = engine.connector or config.connector
     usable = cache is not None and bool(cache.datasets)
     if usable and cache.provenance.connector not in (None, requested):
@@ -380,9 +413,9 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
-    _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
     result = _drift_result(
-        {"schema": ranked},
+        by_axis,
         snap,
         store,
         warnings=warnings
@@ -445,9 +478,9 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
 
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
-    _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
     result = _drift_result(
-        {"grain": ranked},
+        by_axis,
         snap,
         store,
         warnings=_grain_baseline_warnings(snap)
@@ -523,15 +556,15 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
         )
 
     ranked = drift_mod.rank_findings(free_findings + billed_findings)
-    _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
     if pending is not None:
         # The free half is complete and real, so it returns alongside the ask
         # for the scanning half rather than being discarded and re-derived.
-        result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
+        result = _drift_result(by_axis, snap, store, warnings=warnings)
         result.pending_confirmation = pending
         return result
     result = _drift_result(
-        {"semantic": ranked},
+        by_axis,
         snap,
         store,
         warnings=warnings
@@ -637,10 +670,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         }
         if project_available:
             by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-        _record_axes(
+        axis_results = _record_axes(
             store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
         )
-        result = _drift_result(by_axis, snap, store, warnings=warnings)
+        result = _drift_result(axis_results, snap, store, warnings=warnings)
         result.pending_confirmation = pending
         return result
 
@@ -659,11 +692,11 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     }
     if project_available:
         by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-    _record_axes(
+    axis_results = _record_axes(
         store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
     )
     result = _drift_result(
-        by_axis,
+        axis_results,
         snap,
         store,
         warnings=warnings
@@ -702,7 +735,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
 
     store = engine.store
     snap = _require_baseline(store)
-    report = store.load_drift()
+    report = _stored_drift(store)
     if report is None:
         raise NoBaselineError(
             "no drift report yet; run `maintain check` (or a focused detector) "
@@ -755,10 +788,14 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         except (ProjectError, ValueError) as exc:
             raise ProjectError(f"reconcile edits a project: {exc}") from exc
 
+    # Hoisted rather than inlined into the call: this load can now refuse, and a
+    # refusal raised from inside an argument list reads as though `build` did it.
+    cache = readable_cache(store)
+
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
-        store.load_cache(),
+        cache,
         view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
         placement=editable if isinstance(editable, PlacingProject) else None,
@@ -838,9 +875,9 @@ def _detect_free_axis(
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
-    _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
     result = _drift_result(
-        {axis: ranked},
+        by_axis,
         snap,
         store,
         warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours),
@@ -885,26 +922,29 @@ def _record_axes(
     snap: snapshot_mod.Snapshot,
     connector: str | None,
     results: dict[str, tuple[list[drift_mod.DriftFinding], list[str]]],
-) -> None:
+) -> dict[str, drift_mod.AxisResult]:
     """Merge this run's axes into the stored drift report. Axes merge across runs so
     a focused detector refreshes only itself, but never across baselines:
     findings measured against an older snapshot are dropped wholesale."""
 
-    report = store.load_drift()
+    report = _stored_drift(store)
     if report is None or report.snapshot_created_at != snap.created_at:
         report = drift_mod.DriftReport()
     report.connector = connector
     report.snapshot_created_at = snap.created_at
     run_at = datetime.now(UTC).isoformat()
+    current: dict[str, drift_mod.AxisResult] = {}
     for axis, (findings, scope_names) in results.items():
-        report.axes[axis] = drift_mod.AxisResult(
+        current[axis] = drift_mod.AxisResult(
             run_at=run_at, scope=scope_names or None, findings=findings
         )
+        report.axes[axis] = current[axis]
     store.save_drift(report)
+    return current
 
 
 def _drift_result(
-    by_axis: dict[str, list[drift_mod.DriftFinding]],
+    by_axis: dict[str, drift_mod.AxisResult],
     snap: snapshot_mod.Snapshot,
     store: MaintainStore,
     *,
@@ -912,9 +952,9 @@ def _drift_result(
 ) -> DriftResult:
     return DriftResult(
         findings=drift_mod.rank_findings(
-            [finding for findings in by_axis.values() for finding in findings]
+            [finding for result in by_axis.values() for finding in result.findings]
         ),
-        by_axis={axis: len(findings) for axis, findings in by_axis.items()},
+        by_axis=by_axis,
         snapshot_created_at=snap.created_at,
         warehouse_from=snap.warehouse_from,
         drift_path=store.locator(Document.DRIFT),
@@ -1079,7 +1119,7 @@ def _baseline_warnings(
     """
 
     warnings: list[str] = []
-    cache = store.load_cache()
+    cache = readable_cache(store)
     if (
         cache is not None
         and cache.provenance.updated_at

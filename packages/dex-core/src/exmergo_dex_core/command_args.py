@@ -23,7 +23,7 @@ from .results import ConfirmationRequest, Result
 from .storage import DEX_DIR
 
 
-def _resolve_dex_root(start: Path) -> Path | None:
+def resolve_dex_root(start: Path) -> Path | None:
     """Nearest ancestor of ``start`` holding a ``.dex/config.yml``, or None.
 
     dex is used like git or dbt: the config lives at the project root, but
@@ -59,7 +59,7 @@ def repo_root(args: argparse.Namespace) -> str:
     ``open_adapter``) behave as designed."""
 
     raw = getattr(args, "repo_root", ".")
-    resolved = _resolve_dex_root(Path(raw))
+    resolved = resolve_dex_root(Path(raw))
     return str(resolved) if resolved is not None else raw
 
 
@@ -340,15 +340,34 @@ def stamp_spend(result: Result, adapter: Adapter) -> Result:
 
     gate = cost_gate(adapter)
     if gate is not None:
-        gate.settle()
+        spend = settled_spend(adapter)
         if result.cost.estimate is None:
             result.cost = gate.cost()
-        spend = gate.spend_summary()
-        display = getattr(adapter, "spend_display", None)
-        if display is not None:
-            spend.update(display())
         result.spend = spend
         # Settlement is the honest moment to say what did not bind: the command
         # has spent, and the caller is looking at the number.
         result.warnings = [*result.warnings, *gate.warnings()]
     return result
+
+
+def settled_spend(adapter: Adapter) -> dict | None:
+    """Settle the gate and read back what this command actually billed, in the
+    connector's own unit plus whatever translation the adapter adds.
+
+    Split out of :func:`stamp_spend` because the failure path needs the same
+    number and has no ``Result`` to stamp it onto: a command that died partway
+    still burned the seconds it burned, and an error envelope reporting nothing
+    tells a caller on a metered connector that its failure was free. ``None``
+    on a free connector, which has no gate and so no spend to report rather
+    than a row of zeroes.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None:
+        return None
+    gate.settle()
+    spend = gate.spend_summary()
+    display = getattr(adapter, "spend_display", None)
+    if display is not None:
+        spend.update(display())
+    return spend

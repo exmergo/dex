@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from .conftest import assert_ok
 from .test_postgres_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
@@ -26,7 +27,7 @@ def test_inventory_is_free_and_scoped(tmp_path: Path, capsys):
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "inventory"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     identifiers = {o["identifier"] for o in envelope["data"]["objects"]}
     assert any(i.endswith("app.customers") for i in identifiers)
     assert all(".app." in i for i in identifiers)
@@ -73,7 +74,7 @@ def test_confirmed_map_profiles_flags_pii_and_infers_the_missing_fk(
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "map", "--confirm"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["profiled_count"] >= 6
     assert data["pii_column_count"] >= 3  # email, names, phone, address
@@ -117,7 +118,7 @@ def test_query_firewall_allows_measuring_and_refuses_pii_values(tmp_path: Path, 
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert envelope["data"]["row_count"] >= 1
 
     rc, envelope = run_cli(
@@ -160,7 +161,7 @@ def test_query_firewall_unnests_the_seeded_jsonb_column(tmp_path: Path, capsys):
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     keys = {row[0] for row in envelope["data"]["cells"]}
     assert {"weight_g", "in_stock"} <= keys
 

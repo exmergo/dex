@@ -8,6 +8,12 @@ The skill never re-implements logic. It forwards its arguments to the pinned
 `dex-core` engine and lets the engine print the sanitized JSON envelope. Run it
 with `uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <dex subcommand> ...`.
 
+`uv` is a hard prerequisite: it is what installs and runs the engine. When it is
+absent this wrapper refuses with an error envelope naming the install command,
+rather than letting the exec fail with a traceback. Invoked through `uv run` the
+shell fails first (`uv: command not found`), which is why each SKILL.md also tells
+the agent what that message means.
+
 Two execution modes, chosen automatically:
   - Monorepo checkout (this repo): `packages/dex-core` is found above the skill,
     so the engine runs from an editable local install. This is what makes the
@@ -35,7 +41,9 @@ scripts/prepare_release.sh before the tag; nothing else here changes per release
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -43,7 +51,7 @@ from pathlib import Path
 # Rewritten by scripts/prepare_release.sh to the tagged version. The connector
 # extra is deliberately NOT part of this pin: it is chosen at runtime (see
 # _resolve_connector), so a release artifact is connector-neutral.
-DEX_CORE_VERSION = "1.6.4"
+DEX_CORE_VERSION = "1.6.6"
 
 # Connector id -> packaging extra. The engine's connector ids and the pyproject
 # extras share names, so this is the identity set today. An unknown or unset
@@ -161,6 +169,33 @@ def _engine_spec(extras: str, skill_dir: Path | None = None) -> list[str]:
 
 def main() -> int:
     argv = sys.argv[1:]
+    if shutil.which("uv") is None:
+        # The one refusal that happens before the engine exists, so the envelope
+        # is hand-built: `exmergo_dex_core.envelope` is precisely what is not
+        # installed yet. The keys mirror Envelope/Cost and have to stay in step
+        # with them, and `prerequisite` is the engine's own classification for a
+        # missing dependency the user installs and retries (the same one
+        # DemoDependencyError and DialectDependencyError carry). A caller reads
+        # this exactly like any other refusal instead of parsing a traceback.
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "data": {},
+                    "cost": {"paradigm": None, "estimate": None, "ceiling": None},
+                    "warnings": [],
+                    "diffs": [],
+                    "errors": [
+                        "dex runs its engine through uv, which was not found on "
+                        "PATH. Install it with: "
+                        "curl -LsSf https://astral.sh/uv/install.sh | sh "
+                        "(or `brew install uv`, or `pipx install uv`), then re-run."
+                    ],
+                    "reason": "prerequisite",
+                }
+            )
+        )
+        return 1
     connector = _resolve_connector(argv, Path.cwd())
     # The connector extra is always installed; `explore cluster` adds the
     # scikit-learn [cluster] extra so the light default install stays light.

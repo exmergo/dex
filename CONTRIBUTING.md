@@ -25,6 +25,17 @@ Everything is deterministic and free: no cloud account is needed. The live
 cloud integration tests under `tests/integration/` collect as skipped with
 the enabling variables named in the skip reason.
 
+To try a change by hand rather than through the suite, generate the demo
+warehouse in a scratch directory outside the checkout and drive the CLI against
+it. It is the same seeded fixture the documentation quotes, so what you see there
+is what a user sees:
+
+```
+mkdir /tmp/dex-scratch && cd /tmp/dex-scratch
+uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core demo
+uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core explore map
+```
+
 ## Live BigQuery integration tests
 
 `tests/integration/` runs the real loop against BigQuery: ADC discovery, the

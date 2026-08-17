@@ -248,13 +248,32 @@ def new_cost_gate(
     )
 
 
-def no_connector_selected(repo_root: str | Path | None) -> NoConnectorSelectedError:
+def duckdb_candidates(directory: str | Path) -> list[Path]:
+    """Every ``*.duckdb`` file directly in ``directory``, sorted for a stable
+    answer. No recursion and no walk up: this is the narrow, run-directory-only
+    substrate the single-unambiguous-file on-ramp (issue #199) and its
+    ambiguous-refusal both read; a config or an explicit ``--connector``/
+    ``--path`` is never overridden by what this finds.
+    """
+
+    return sorted(Path(directory).glob("*.duckdb"))
+
+
+def no_connector_selected(
+    repo_root: str | Path | None, *, ambiguous_duckdb: list[Path] | None = None
+) -> NoConnectorSelectedError:
     """The connector-selection half of "no silent connector default".
 
     Nothing resolved a connector and nothing explicit was passed, so there is no
     honest choice left: defaulting to duckdb here would connect a user to a
     target they never named. The two spellings address the two callers, a CLI run
     from a directory and a library caller holding no repo at all.
+
+    ``ambiguous_duckdb`` names the case a bare run directory almost resolves on
+    its own: more than one ``*.duckdb`` file sits there, so which one the caller
+    meant is exactly the thing dex must not guess at (issue #199). Naming both
+    is what turns the refusal into something the caller can act on instead of
+    rerunning the same command.
     """
 
     if repo_root is None:
@@ -262,6 +281,13 @@ def no_connector_selected(repo_root: str | Path | None) -> NoConnectorSelectedEr
             "no connector selected: pass connector= (with path= for duckdb) or a "
             "config= that declares one, or build from a project on disk with "
             "DexEngine.from_repo(repo_root)"
+        )
+    if ambiguous_duckdb:
+        names = ", ".join(str(p) for p in ambiguous_duckdb)
+        return NoConnectorSelectedError(
+            f"no .dex/config.yml found searching from '{repo_root}' up to the "
+            f"git root, and more than one DuckDB file sits in this directory "
+            f"({names}); pass --path <file> to pick one, or --repo-root"
         )
     return NoConnectorSelectedError(
         f"no .dex/config.yml found searching from '{repo_root}' up to the git "
