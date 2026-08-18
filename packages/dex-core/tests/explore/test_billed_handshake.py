@@ -840,6 +840,84 @@ def test_verify_handshake_uses_the_adapters_estimate_description():
     assert pending.cost.estimate == 13.0
 
 
+def test_cumulative_handshake_uses_the_adapters_estimate_description():
+    # `--check-cumulative`'s phase checkpoint, exercised the same way as
+    # `verify_handshake` above: a connector that speaks credits/seconds
+    # describes its own estimate, and the checkpoint payload keeps that shape
+    # while overlaying the check-cumulative phase fields.
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore profile",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+                "notes": ["seconds are a coarse translation"],
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.cumulative_handshake(
+        "explore profile", StubAdapter(), 5.0, candidate_count=2, object_count=2
+    )
+    # A request, not a raise: the profiles this phase follows are already paid for.
+    assert pending is not None
+    assert pending.data["estimated_seconds"] == 5.0
+    assert pending.data["per_table_seconds"] == {"(cumulative-measure probes)": 5.0}
+    assert pending.data["phase"] == "check-cumulative"
+    assert pending.data["candidate_count"] == 2
+    assert pending.data["object_count"] == 2
+    assert "notes" in pending.data
+    assert pending.cost.estimate == 13.0
+
+
+def test_cumulative_handshake_stays_none_on_a_free_connector_or_no_candidates():
+    from exmergo_dex_core import command_args
+
+    class FreeAdapter:
+        cost_gate = None
+
+    assert (
+        command_args.cumulative_handshake(
+            "explore profile", FreeAdapter(), 5.0, candidate_count=1, object_count=1
+        )
+        is None
+    )
+
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore profile",
+    )
+
+    class BilledAdapter:
+        cost_gate = gate
+
+    # Nothing eligible to probe: no checkpoint to ask for even on a billed
+    # connector, so this never blocks a run whose profile found no candidate.
+    assert (
+        command_args.cumulative_handshake(
+            "explore profile", BilledAdapter(), 5.0, candidate_count=0, object_count=0
+        )
+        is None
+    )
+
+
 def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
     from exmergo_dex_core.cli import main
 
