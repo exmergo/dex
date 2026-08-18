@@ -9,6 +9,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore profile` flags a boolean-shaped column with more than two
+  values** ([#218]). A column named like a two-valued flag (`is_*`, `has_*`,
+  `*_flag`, `*_yn`, `*_ind`) whose content holds more than two distinct
+  non-null values is a mixed-encoding defect, and it went unreported: on the
+  public ADE-bench `helixops_saas.duckdb`, `raw_workspaces.primary_ws_yn`
+  holds five distinct values under a name that promises two. Every
+  `where flag = 'Y'` written against a column like that is quietly wrong for
+  some share of rows, and the share was invisible without asking for the
+  domain directly.
+
+  A data-quality observation now fires when a boolean-ish name and a
+  non-null distinct count above two coincide, naming the encodings and their
+  counts wherever the value domain ([#203]) is already known for that
+  column, and falling back to the count alone where it is not (a column that
+  failed one of that feature's own eligibility gates is not evidence there
+  are only two values, only that the tool cannot name them). A genuinely
+  `BOOLEAN`-typed column is excluded outright, whatever its name: it cannot
+  hold more than two values by construction. The check does not, and is not
+  asked to, tell a data-quality defect apart from a genuine third state; the
+  tool cannot make that call, and naming what it found is what lets the
+  caller make it instead.
+
 ## [1.6.6] - 2026-08-15
 
 ### Fixed
