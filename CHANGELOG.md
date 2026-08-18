@@ -9,6 +9,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`get_dialect` now raises on an unrecognized connector instead of
+  silently parsing every subsequent statement as DuckDB** ([#319]). A
+  hyphenated BigQuery project id, the shape BigQuery itself hands out and
+  the exact form `explore query` and `explore inventory` print back, parses
+  as subtraction under the DuckDB dialect. `explore query` and the query
+  firewall already resolve and thread the connector's own dialect into
+  every parse, so a hyphenated project id has parsed correctly in the
+  BigQuery dialect since early in the project. The one remaining way to
+  still hit that failure was a connector-name mismatch: `.dex/config.yml`'s
+  `connector` field is a plain string with no enum validation, and
+  `get_dialect` silently fell back to DuckDB on anything it did not
+  recognize, producing a policy-refusal-shaped message that actually points
+  at a SQL parser and names neither the mismatch nor the fix.
+
+  `get_dialect` now raises the same way `get_adapter` already does for the
+  same condition, so a connector-name mismatch fails loudly at the point it
+  happens instead of silently picking the wrong dialect. Regression tests
+  lock in that a hyphenated project id (fully-quoted-per-part, backtick-
+  wrapped-as-one-identifier, and the bare unquoted form copied verbatim
+  from an `explore query` `tables` entry or an `explore inventory`
+  `identifier`) parses correctly in every spelling and reaches the cost
+  handshake.
+
 ## [1.6.6] - 2026-08-15
 
 ### Fixed
