@@ -641,11 +641,16 @@ class DexEngine:
         *objects: str,
         refresh: bool = False,
         use_project: bool = False,
+        check_cumulative: bool = False,
     ) -> ProfileResult:
         from .explore import commands as explore
 
         return explore.profile(
-            self, list(objects), refresh=refresh, use_project=use_project
+            self,
+            list(objects),
+            refresh=refresh,
+            use_project=use_project,
+            check_cumulative=check_cumulative,
         )
 
     def relationships(

@@ -259,6 +259,16 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
+                # A running total or point-in-time snapshot profiles identically
+                # to a per-row increment; telling them apart needs a window-
+                # function scan over the table, so it is opt-in and priced like
+                # --verify rather than part of the always-free base profile.
+                if group == "explore" and name == "profile":
+                    sp.add_argument(
+                        "--check-cumulative",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                    )
                 # Force a full re-profile even when the cache holds a fresh,
                 # schema-matching profile for a requested object (the default is
                 # skip-if-cached; --refresh is the escape hatch when the source

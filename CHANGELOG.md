@@ -117,6 +117,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   a human must still copy, edit, and commit, exactly as much friction for
   `credential` as for `name`. Inventing a severity tier to special-case here
   would be new, untested policy with no existing basis, not a fix.
+  
+- **`explore profile --check-cumulative` detects a running total or
+  point-in-time snapshot measure** ([#219]). A numeric column holding a
+  running total, an account balance, or a subscription's current MRR
+  profiles identically to one holding a per-row increment: same type, same
+  null fraction, same uniqueness. Summing it across rows is a common and
+  severely damaging misreading, and it silently inflates every aggregate
+  built on top of it.
+
+  The signal is structural: within an entity (a repeating, id-shaped column
+  that is not itself the table's own key) ordered by a temporal column, a
+  cumulative or snapshot measure almost never decreases from one observation
+  to the next, while a genuine per-row increment has natural ups and downs.
+  Measuring that needs a window-function scan over the table, so it sits on
+  the gated side of the free-versus-gated split: opt-in via
+  `--check-cumulative`, priced and confirmed the same way `--verify` prices
+  relationship overlap probes. The base profile always completes and is
+  returned first; the check runs as a second, individually skippable phase
+  against what the base scan already proved, and never blocks it. A table
+  missing an entity key or a temporal column is skipped with a note, not
+  silently reported as clean, and only fractions and observation counts ever
+  leave the engine, never a measure's value.
 
 ## [1.6.6] - 2026-08-15
 
