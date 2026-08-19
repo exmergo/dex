@@ -11,6 +11,27 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **`explore query` no longer fails inside its own confirmed budget on
+  BigQuery** ([#320]). The server-side `maximum_bytes_billed` cap was set to
+  this command's own reservation against the cumulative session ceiling
+  (sized to the dry-run estimate), not the wider per-command budget the
+  operator actually confirmed. BigQuery's own execution-time rounding of
+  bytes billed can exceed any dry-run estimate regardless of how accurate
+  that estimate was, so a multi-table statement confirmed at a budget six
+  times its estimate still failed with `bytesBilledLimitExceeded`, a
+  self-imposed cap the error message never named as the cause.
+
+  BigQuery's own refusal already states the exact byte count it needed
+  (`"163595928. 164626432 or higher required."`), so a statement that hits
+  the cap now widens its charge to precisely that number and retries once,
+  rather than guessing at a margin or handing the warehouse a cap wider than
+  what this command actually reserved. A retry that still can't fit the
+  confirmed ceiling refuses on the real number, exactly as it would have
+  without the retry; the concurrency guarantee a cumulative session ceiling
+  depends on (two commands sharing one ceiling can never jointly overspend
+  it, [#159]) is unaffected, since the widening goes through the same locked
+  admission path an estimate drifting past its booking already used.
+
 - **`get_dialect` now raises on an unrecognized connector instead of
   silently parsing every subsequent statement as DuckDB** ([#319]). A
   hyphenated BigQuery project id, the shape BigQuery itself hands out and
