@@ -867,6 +867,39 @@ def test_firewall_threshold_boundary_and_warning_carry_no_values():
     assert "AFRICA" not in warning and "@" not in warning
 
 
+def test_pii_refusal_s_suggested_override_carries_no_value():
+    # Issue #217: the refusal now names the exact pii_overrides entry that
+    # would clear the column. That entry is built from the dataset identifier,
+    # the column name, and the category only, the same structural guarantee
+    # PIIFlag itself makes (no value field exists anywhere to leak one).
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.region",
+                columns=[
+                    ColumnProfile(
+                        name="r_name",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.9),
+                    ),
+                ],
+            )
+        ]
+    )
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query("SELECT r_name FROM region", cache, QueryLimits())
+    message = str(excinfo.value)
+    assert "column: db.main.region.r_name" in message
+    assert "AFRICA" not in message and "@" not in message
+
+
 def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     # A hand-edit to the cache is overwritten by the next profile; only the
     # committed config entry durably clears a reviewed column, and the clear is
