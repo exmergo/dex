@@ -351,6 +351,38 @@ def blob_override_paths(overrides: list[BlobOverride]) -> set[str]:
     return {entry.column.strip().lower() for entry in overrides}
 
 
+class EntityAffixes(BaseModel):
+    """Table-name prefixes and suffixes entity matching strips as a
+    lower-confidence fallback, tried only once an exact entity-name match
+    fails (see ``explore.relationships._match_parent``).
+
+    These are the default output of CDC history modes, landing-zone
+    conventions (``_data``/``_raw``/``_stg``), and layered-warehouse naming
+    (``stg_``/``dim_``/``fct_``), not exotic house choices, but house
+    conventions still vary enough that the list is overridable. Deliberately
+    small by default: an ordered set covers the common cases without turning
+    entity matching into a grab-bag of guesses. A trailing version marker
+    (``_v2``, ``_v3``, ...) is always stripped and is not part of this list,
+    since it is a structural convention rather than a house-specific word.
+    """
+
+    prefixes: list[str] = Field(
+        default_factory=lambda: [
+            "stg",
+            "src",
+            "raw",
+            "dim",
+            "fct",
+            "fact",
+            "int",
+            "base",
+        ]
+    )
+    suffixes: list[str] = Field(
+        default_factory=lambda: ["history", "data", "raw", "snapshot", "current"]
+    )
+
+
 class SemanticConfig(BaseModel):
     """How ``explore semantic`` reaches the semantic layer.
 
@@ -485,6 +517,11 @@ class DexConfig(BaseModel):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
+    # Affixes entity matching strips as a lower-confidence fallback when an
+    # exact entity name misses (issue #208). The default list is small on
+    # purpose; house-specific conventions (a shop's own `_bak`/`ods_`) are the
+    # reason this is overridable rather than fixed.
+    entity_affixes: EntityAffixes = Field(default_factory=EntityAffixes)
     query: QueryLimits = Field(default_factory=QueryLimits)
     cluster: ClusterLimits = Field(default_factory=ClusterLimits)
     # How many top-ranked objects `explore map` deep-profiles on a large

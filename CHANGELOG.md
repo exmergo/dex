@@ -33,6 +33,90 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   from an `explore query` `tables` entry or an `explore inventory`
   `identifier`) parses correctly in every spelling and reaches the cost
   handshake.
+  
+- **Entity matching survives table-name suffixes and layer prefixes**
+  ([#208]). A foreign key matched a parent by comparing the singularized
+  column stem against the parent table's name, layer prefix stripped, so a
+  parent named plainly for its entity matched
+  (`inventory_transactions.product_id -> products.id`), but a parent whose
+  name also carried a CDC history suffix or a landing-zone suffix did not:
+  singularizing `conversation_id` yields `conversation`, and nothing
+  recovered `conversation` from `conversation_history_data`, so inference
+  fell back to a child-to-child edge between two tables that merely shared
+  the FK's name, measured at an orphan fraction of 1.0.
+
+  Entity matching now also compares against the parent's name with a small,
+  ordered set of prefixes (`stg_`, `src_`, `raw_`, `dim_`, `fct_`, `fact_`,
+  `int_`, `base_`) and suffixes (`_history`, `_data`, `_raw`, `_snapshot`,
+  `_current`) stripped, repeated until none remain, plus a table-version
+  suffix (`_v2`, `_v3`, ...) always stripped. A match that needed stripping
+  scores below an exact match to the same key, so an unambiguous case is
+  never re-ranked behind a guess that needed help, and `explore
+  relationships`/`explore map`'s notes say when a join relied on it. Where
+  stripping resolves more than one candidate parent, both are proposed
+  instead of the matcher picking one, and `--verify` decides between them.
+  The affix list lives in `.dex/config.yml` under `entity_affixes`
+  (`prefixes`/`suffixes`), small by default and overridable for a house
+  convention it doesn't already cover.
+  
+### Added
+
+- **`explore profile` flags a boolean-shaped column with more than two
+  values** ([#218]). A column named like a two-valued flag (`is_*`, `has_*`,
+  `*_flag`, `*_yn`, `*_ind`) whose content holds more than two distinct
+  non-null values is a mixed-encoding defect, and it went unreported: on the
+  public ADE-bench `helixops_saas.duckdb`, `raw_workspaces.primary_ws_yn`
+  holds five distinct values under a name that promises two. Every
+  `where flag = 'Y'` written against a column like that is quietly wrong for
+  some share of rows, and the share was invisible without asking for the
+  domain directly.
+
+  A data-quality observation now fires when a boolean-ish name and a
+  non-null distinct count above two coincide, naming the encodings and their
+  counts wherever the value domain ([#203]) is already known for that
+  column, and falling back to the count alone where it is not (a column that
+  failed one of that feature's own eligibility gates is not evidence there
+  are only two values, only that the tool cannot name them). A genuinely
+  `BOOLEAN`-typed column is excluded outright, whatever its name: it cannot
+  hold more than two values by construction. The check does not, and is not
+  asked to, tell a data-quality defect apart from a genuine third state; the
+  tool cannot make that call, and naming what it found is what lets the
+  caller make it instead.
+  
+- **A PII refusal names the exact override entry that would clear the
+  column** ([#217]). The firewall's refusal was correct, and so is a name
+  detector flagging `account_name` on a table of companies or a team name in
+  a sports dataset; the false positive is the design working, and a human
+  reviewing it is the intended next step. But the message offered only two
+  routes, a measuring aggregate or dropping the column, both of which mean
+  not getting the answer. The third route, a reviewed `pii_overrides` entry,
+  existed and was never mentioned, and the cost of that omission was not the
+  override itself but the interval before anyone learned it existed: in
+  practice the caller opened a raw SQL client instead, where neither the
+  firewall nor the PII policy applies at all.
+
+  The refusal now says, for each blocking column, the exact entry that would
+  clear it, in flow-mapping YAML ready to paste under `pii_overrides:` in
+  `.dex/config.yml`: the fully qualified form always, and a scope-glob
+  pattern form alongside it when the same column name is flagged at the same
+  category on another dataset, which is the actual evidence a wider scope is
+  worth suggesting rather than a guess at how far a naming convention
+  reaches. The suggested scope is never wider than the schema that evidence
+  came from; a caller who knows it reaches further widens the glob
+  themselves. Both forms are text in the message, exactly like the existing
+  aggregate guidance beside them: nothing is applied, nothing changes about
+  what the query returns, and the entry is built from the column's identity
+  (dataset, column, category) alone, the same structural guarantee
+  `PIIFlag` itself already makes, so no value can appear in it by
+  construction.
+
+  The open question the issue posed, whether to suppress the suggestion for
+  the highest-severity categories, is answered no: nothing in the engine
+  ranks `PIICategory` by severity today, the block threshold is deliberately
+  uniform across every category on record, and the suggestion is inert text
+  a human must still copy, edit, and commit, exactly as much friction for
+  `credential` as for `name`. Inventing a severity tier to special-case here
+  would be new, untested policy with no existing basis, not a fix.
 
 ## [1.6.6] - 2026-08-15
 
