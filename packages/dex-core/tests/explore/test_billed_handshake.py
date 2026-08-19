@@ -413,6 +413,32 @@ def test_unconfirmed_query_returns_estimate_and_logs(
     assert json.loads(log_lines[-1])["decision"] == "needs_confirmation"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Issue #319: a hyphenated project id, both fully-quoted-per-part and
+        # backtick-wrapped-as-one-identifier, plus the bare unquoted form
+        # copied verbatim out of an `explore inventory` identifier or an
+        # `explore query` `tables` entry. All three must parse in the
+        # connector's own dialect and reach the cost handshake rather than
+        # a "could not parse query" refusal on the hyphen.
+        "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+        "SELECT COUNT(*) AS n FROM `test-proj.shop.customers`",
+        "SELECT COUNT(*) AS n FROM test-proj.shop.customers",
+    ],
+)
+def test_a_hyphenated_project_id_parses_in_every_spelling(
+    fake_bq_client, route_adapter, tmp_path, sql
+):
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(tmp_path, subcommand="query", sql=sql)
+    # A parse failure on the hyphen would come back as an `error` envelope
+    # (`reason: guard`) naming a SQL parser, not this cost checkpoint.
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.cost.estimate == 10 * MB
+
+
 def _clusterable_client():
     """A fake warehouse whose `customers` carries numeric non-key columns.
 

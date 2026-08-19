@@ -845,7 +845,17 @@ def test_get_adapter_wires_bigquery(fake_bq_client):
 def test_get_dialect_resolves_without_clients():
     assert get_dialect("bigquery") == "bigquery"
     assert get_dialect("duckdb") == "duckdb"
-    assert get_dialect("nonsense") == "duckdb"
+
+
+def test_get_dialect_raises_on_an_unrecognized_connector():
+    """A silent fallback to DuckDB here would misparse every subsequent SQL
+    statement in the wrong dialect (issue #319: a hyphenated BigQuery project
+    id reads as subtraction under the DuckDB dialect) while reporting a
+    generic parse error that never names the real cause. Raising matches
+    `get_adapter`'s existing convention for the same condition."""
+
+    with pytest.raises(ValueError, match="unknown connector 'nonsense'"):
+        get_dialect("nonsense")
 
 
 # --- project resolution (connect.py) -----------------------------------------------
