@@ -877,6 +877,251 @@ def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
     assert "phase" not in payload["data"]
 
 
+# --- the overlap-sweep checkpoint (issue #220) ------------------------------------
+#
+# Mirrors the verify-phase checkpoint section above: the sweep's candidate pool
+# can only be priced after inference has run and found nothing to match, so
+# the confirm handshake cannot cover it upfront either. A budget that covers
+# profiling and the probes runs in one pass; one that does not gets
+# needs_confirmation after inference, with the profile already persisted.
+
+
+@pytest.fixture
+def overlap_bq_client():
+    """A fake warehouse where inference finds *nothing*: both tables' own key
+    is named the bare `id`, which `_fk_stem` never turns into a stem, so the
+    per-column inference loop skips it entirely. Both columns are still
+    established as proven unique keys by the aggregate resolver (column
+    index 0 of every table), which is exactly the "key or near-key, no name
+    signal" shape the overlap sweep exists for."""
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    tables = [
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="accounts",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("plan", "STRING"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="billing_profiles",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("payment_method", "STRING"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+    ]
+    client = FakeBigQueryClient(project="test-proj", tables=tables)
+    client.row_resolver = _aggregate_resolver
+    return client
+
+
+def test_overlap_within_budget_runs_in_one_pass(
+    overlap_bq_client, route_adapter, tmp_path
+):
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert "phase" not in envelope.data
+    assert _probe_executed(overlap_bq_client)
+    cache = FilesystemStore(tmp_path).load_cache()
+    assert cache.relationships
+    assert cache.relationships[0].kind.value == "overlap_inferred"
+    assert cache.relationships[0].verified
+
+
+def test_overlap_beyond_budget_checkpoints_before_any_probe(
+    overlap_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """The sweep's own probe cost can only be priced after inference runs,
+    so it needs its own checkpoint distinct from the base-profile handshake.
+    Forcing the estimate (rather than engineering exact escalation timing,
+    which the fake client's byte accounting makes fragile) pins the
+    checkpoint deterministically on a budget that comfortably covers
+    profiling alone."""
+
+    monkeypatch.setattr(
+        explore_cmds,
+        "_overlap_estimate",
+        lambda adapter, candidates: (999.0 * MB, 1, 2),
+    )
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "overlap"
+    assert envelope.data["candidate_count"] == 1
+    assert envelope.data["object_count"] == 2
+    assert envelope.data["per_table_bytes"] == {"(overlap sweep probes)": 999.0 * MB}
+    assert envelope.data["cap"] == 50
+    assert envelope.data["elided"] == 0
+    assert "--budget" in envelope.data["hint"]
+    assert not _probe_executed(overlap_bq_client)
+    # The map itself completed and persisted, unswept: no relationship yet,
+    # since nothing was found before the sweep's own checkpoint.
+    assert envelope.data["relationship_count"] == 0
+    assert Path(envelope.data["cache_path"]).exists()
+    assert any("unswept" in note for note in envelope.data["notes"])
+
+
+def test_relationships_overlap_beyond_budget_checkpoints(
+    overlap_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        explore_cmds,
+        "_overlap_estimate",
+        lambda adapter, candidates: (999.0 * MB, 1, 2),
+    )
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="relationships",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "overlap"
+    assert envelope.data["command"] == "explore relationships"
+    assert not _probe_executed(overlap_bq_client)
+
+
+def test_overlap_defers_behind_a_pending_verify_checkpoint(
+    overlap_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """--verify and --infer-by-overlap together: a still-pending verify
+    checkpoint must defer the sweep entirely, so it is never even priced.
+    Forced deterministically (this fixture's tables share no name at all,
+    so real verify has nothing to be pending about) by making
+    verify_handshake itself always return a pending request."""
+
+    from exmergo_dex_core.envelope import Cost
+    from exmergo_dex_core.results import ConfirmationRequest
+
+    def fake_verify_handshake(
+        command, adapter, estimate, *, candidate_count, object_count
+    ):
+        return ConfirmationRequest(
+            cost=Cost(paradigm=Paradigm.BYTES_SCANNED, estimate=1.0),
+            data={"phase": "verify", "hint": "confirm verify first"},
+        )
+
+    monkeypatch.setattr(
+        explore_cmds.command_args, "verify_handshake", fake_verify_handshake
+    )
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        verify=True,
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "verify"
+    # The sweep never got priced at all, since verify's own checkpoint was
+    # still pending; the note says so rather than silently skipping.
+    assert any("deferred" in n for n in envelope.data["notes"])
+
+
+def test_overlap_with_no_candidates_skips_the_checkpoint(
+    fake_bq_client, route_adapter, tmp_path
+):
+    # The shared fixture's tables share no foreign-key stem and neither
+    # column is key-or-near-key shaped per the aggregate resolver's
+    # defaults, so the sweep finds nothing to probe.
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert "phase" not in envelope.data
+
+
+def test_overlap_handshake_uses_the_adapters_estimate_description():
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore map",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+                "notes": ["seconds are a coarse translation"],
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.overlap_handshake(
+        "explore map",
+        StubAdapter(),
+        5.0,
+        candidate_count=3,
+        object_count=2,
+        cap=50,
+        elided=0,
+    )
+    assert pending is not None
+    assert pending.data["estimated_seconds"] == 5.0
+    assert pending.data["per_table_seconds"] == {"(overlap sweep probes)": 5.0}
+    assert pending.data["phase"] == "overlap"
+    assert pending.data["candidate_count"] == 3
+    assert pending.data["object_count"] == 2
+    assert pending.data["cap"] == 50
+    assert pending.data["elided"] == 0
+    assert "notes" in pending.data
+    assert pending.cost.estimate == 13.0
+
+
+def test_duckdb_map_overlap_stays_confirmation_free(duckdb_file: Path, capsys):
+    from exmergo_dex_core.cli import main
+
+    rc = main(["explore", "map", "--infer-by-overlap", "--path", str(duckdb_file)])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["status"] == "ok"
+    assert payload["cost"]["paradigm"] == "free_local"
+    assert "phase" not in payload["data"]
+
+
 # --- what a refusal reports ------------------------------------------------------
 #
 # A refusal is the most consequential message the cost guard emits, and it used

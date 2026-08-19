@@ -131,21 +131,34 @@ class Dataset(BaseModel):
 class RelationshipKind(str, Enum):
     DECLARED = "declared"
     INFERRED = "inferred"
+    #: Proposed by the opt-in ``--infer-by-overlap`` sweep (issue #220): no
+    #: column name matched on either side, so the edge exists only because a
+    #: probe measured real value containment between two key-shaped columns.
+    #: Kept distinct from INFERRED, which always carries a name-based signal,
+    #: so an edge with no naming evidence at all is never presented as
+    #: equivalent to one that has some.
+    OVERLAP_INFERRED = "overlap_inferred"
 
 
 class Relationship(BaseModel):
-    """A join between two datasets, declared (FK / dbt) or inferred (heuristic).
+    """A join between two datasets: declared (FK / dbt), inferred (a name-based
+    heuristic), or overlap-inferred (a name-blind value-containment probe).
 
-    ``verified`` and ``orphan_fraction`` are set only by the opt-in ``--verify``
-    overlap probe, on either kind: an inferred join stays a name-based guess
-    until measured, and a declared one is a claim the project makes about the
-    data, which is measurable for the same reason.
+    ``verified`` and ``orphan_fraction`` are set by the opt-in ``--verify``
+    overlap probe on a DECLARED or INFERRED edge: a name-based join stays a
+    guess until measured, and a declared one is a claim the project makes
+    about the data, which is measurable for the same reason. An
+    OVERLAP_INFERRED edge carries both from the moment it is proposed, since
+    the measurement that found it *is* the evidence for its existence; there
+    is no unmeasured, name-based prior state for it to start from.
 
-    ``confidence`` means "how sure is dex that this join exists", so a
-    measurement moves it only on an inferred join. A declared one sits at 1.0
-    and stays there; when its probe disagrees, that is a finding about the
-    warehouse or the declaration, not weaker evidence for the edge (issue
-    #163).
+    ``confidence`` means "how sure is dex that this join exists", so a later
+    ``--verify`` measurement moves it only on an INFERRED edge. A declared one
+    sits at 1.0 and stays there; when its probe disagrees, that is a finding
+    about the warehouse or the declaration, not weaker evidence for the edge
+    (issue #163). An OVERLAP_INFERRED edge's confidence is set once, from the
+    containment the discovery probe measured, and a later ``--verify`` pass
+    leaves it alone the same way it leaves a declared edge's 1.0 alone.
     """
 
     from_dataset: str

@@ -259,6 +259,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
                     )
+                    # A column no name-based rule matched still gets a chance:
+                    # opt-in and priced like --verify, this sweeps key-shaped
+                    # columns for real value containment (issue #220).
+                    sp.add_argument(
+                        "--infer-by-overlap",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                    )
                 # Force a full re-profile even when the cache holds a fresh,
                 # schema-matching profile for a requested object (the default is
                 # skip-if-cached; --refresh is the escape hatch when the source

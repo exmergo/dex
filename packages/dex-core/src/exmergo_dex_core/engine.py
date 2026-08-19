@@ -652,13 +652,18 @@ class DexEngine:
         self,
         *,
         verify: bool = False,
+        infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
     ) -> RelationshipsResult:
         from .explore import commands as explore
 
         return explore.relationships(
-            self, verify=verify, refresh=refresh, use_project=use_project
+            self,
+            verify=verify,
+            infer_by_overlap=infer_by_overlap,
+            refresh=refresh,
+            use_project=use_project,
         )
 
     def map(
@@ -666,13 +671,19 @@ class DexEngine:
         *,
         full: bool = False,
         verify: bool = False,
+        infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
     ) -> MapResult:
         from .explore import commands as explore
 
         return explore.map(
-            self, full=full, verify=verify, refresh=refresh, use_project=use_project
+            self,
+            full=full,
+            verify=verify,
+            infer_by_overlap=infer_by_overlap,
+            refresh=refresh,
+            use_project=use_project,
         )
 
     def query(self, sql: str, *, auto_profile: bool | None = None) -> QueryResult:
