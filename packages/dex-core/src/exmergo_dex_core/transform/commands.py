@@ -838,6 +838,7 @@ def _record_build_spend(
             "at": datetime.now(UTC).isoformat(),
             "connector": connector,
             "command": "transform build",
+            "entry": "settlement",
             field: float(billed),
             "job_id": None,
             "statement_sha256": None,
