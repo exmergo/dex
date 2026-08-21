@@ -11,6 +11,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **A mid-batch `explore query` refusal states exactly how much more budget
+  finishes the batch** ([#321]). BigQuery bills at least its per-query floor
+  no matter how little a statement reads, so an N-statement call needs at
+  least `N x 10,485,760` bytes of headroom; the multi-statement estimate
+  already reserves that (summed per-statement, since each floors on its own
+  distinct tables), and confirming at that estimate already completes every
+  statement for a batch that genuinely reads almost nothing. What can still
+  strand the tail is the same execution-time variance [#320] fixes within
+  one statement, here compounding across several: each statement's real
+  bill sits just far enough above its own floor that the shortfall only
+  surfaces once several statements have already run and billed.
+
+  A refusal partway through a batch already keeps and reports every
+  statement that completed, since it has been paid for; it now also states,
+  in the same refusal, exactly how many bytes finishing the remaining
+  statements needs, computed the same way the original estimate was, so a
+  caller re-running with a wider `--budget` picks the right number the
+  first time rather than guessing again after a second partial run.
+
 - **`get_dialect` now raises on an unrecognized connector instead of
   silently parsing every subsequent statement as DuckDB** ([#319]). A
   hyphenated BigQuery project id, the shape BigQuery itself hands out and
