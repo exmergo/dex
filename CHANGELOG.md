@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-25
+
 ### Added
 
 - **ClickHouse connector, self-hosted** ([#188]). The seventh connector, and the
@@ -91,7 +93,94 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   shipped `unpivot_json_object` macro, whose ClickHouse implementation uses
   `ARRAY JOIN` because there is no lateral join.
 
+- **A project format's write tier is asserted at the strength it is used, and
+  `load()` is declared** ([#328]). A second format reached tier 3 and
+  `PlacingProject` in full, passed the whole conformance suite, and still could
+  not have completed a single `maintain reconcile`. Two gaps, one seam: what the
+  write tier requires was not what its contract asserted.
+
+  **`load()` is now a declared member of `PlacingProject`**, with the shape its
+  callers need stated on it: `ProjectView` (`root`, and `files` keyed the way
+  `edit_path` keys) and `SourceFileView` (`content`, `sha256`). Nothing declared
+  it before, and two callers used it anyway, so a format implementing the four
+  declared methods and omitting this one passed conformance and raised
+  `AttributeError: load` on the first real reconcile, after the tier said 3 and
+  after the gate let it through. It sits beside the two methods that share its
+  keyspace rather than on tier 3, for the reason `PlacingProject` is beside the
+  tiers at all: these protocols are `runtime_checkable`, so a method added to
+  tier 3 demotes every format that has not implemented it, and this requirement
+  is not tier 3's to state. Nothing outside the placement path calls `load()`,
+  so a format that receives edits and does not place them never needed a view.
+
+  The two view protocols are deliberately not `runtime_checkable` and nothing
+  calls `isinstance` against them: on a data protocol that only asks whether the
+  attribute names exist, which reads as a type check and is not one. The
+  conformance suite makes that check instead, with a message naming the missing
+  member and what it costs. `isinstance(view, DbtProjectView)` stays where it is,
+  because it asks whether a view is dbt's surface rather than whether it is a
+  view.
+
+  **Three assertions join the write contract**, each catching a defect that
+  passed it before, and all three are silent failures where the apply reports
+  success. A conflict now has to refuse the whole edit set rather than the
+  conflicting edit within it, which is the worst of them: landing the clean half
+  leaves the project matching neither the proposal nor what the human had, while
+  the apply reports itself refused, so nothing records which half arrived. A
+  create pinned to no prior content has to be refused when a file has appeared at
+  that path since, rather than overwriting whole the file somebody wrote during
+  review. And `write_edits` has to honor the surface its format declared,
+  asserted on the case a string-prefix comparison gets wrong, where
+  `declarations` admits `declarations_backup/`.
+
+  The first of those is worth an optional hook, `a_clean_edit(project)`, which
+  returns an unconflicted edit and a callable reading its target. Without it the
+  assertion can only ask what `write_edits` reported, so a writer that lands half
+  a set and reports nothing written still passes; with it, the project itself is
+  read. No new mandatory hook, so a downstream suite that was green stays
+  runnable, and the new assertions compose from what implementers already supply.
+
+  **A format holding part of `PlacingProject` is now told which member it is
+  missing.** The gate asks for the protocol structurally rather than probing for
+  one method, so the answer for a partial format is the advisory degradation a
+  narrower format has always got, on the `transform plan` path as well as
+  reconcile's, and the message names `load()` rather than sending the implementer
+  back to the two methods they already wrote.
+
+### Changed
+
+- **`transform apply` re-checks containment against the surface the format
+  declares, before the plan reaches the writer** ([#328]). The hashes are
+  re-checked at apply because a plan is a stored artifact that sits through a
+  human review, and the surface is exactly as much a plan-time fact as they are.
+  The shipped format re-checks inside its own writer; a second format was
+  trusted to. A stored edit whose path falls outside the declared surface is now
+  a `PlanError` naming the path and the surface, and `--confirm` is not a way
+  past it: confirmation is the handshake for a human edit somebody can look at
+  and accept, and nobody accepts a write outside the region the format itself
+  declared.
+
+- **The dbt format declares the four root manifests it authors, not just its
+  model and macro paths** ([#328]). `editing_surface()` omitted `packages.yml`,
+  `dependencies.yml`, `dbt_project.yml` and `profiles.yml` on the grounds that
+  dbt's own writer allowed them by name. With a second consumer re-checking that
+  declaration at apply, a surface narrower than the writer is not a modest claim:
+  it refuses the project config, the profiles and the package manifests, every
+  one of which is a path dex authors through a plan. What a format declares has
+  to be what its writer will take.
+
 ### Fixed
+
+- **A project format that places an edit and cannot be read no longer raises
+  from inside a command** ([#328]). `plans.plan` and `transform`'s authored-plan
+  path both decided whether to route through the format by probing for
+  `editing_surface`, then called `load()`, which no protocol declared. A format
+  holding one without the other reached that line and raised `AttributeError`
+  mid-command. Both now ask for `PlacingProject` structurally, so the format
+  falls back to the pre-seam behavior and carries a warning naming the member it
+  is missing. On the plan path that fallback is dbt's project and dbt's surface,
+  which refuses an edit the format placed in its own keyspace while naming dbt's
+  paths, so the gap rides along on the refusal to explain why dbt's surface was
+  the one consulted.
 
 - **A `DATETIME` column no longer reports its hour continuity as clean when it
   was never measured** ([#188]). `is_date_only_type` claimed any type containing

@@ -1515,6 +1515,108 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
 
 
+def test_one_conflict_refuses_the_whole_plan_not_the_conflicting_edit(
+    dbt_project_dir: Path,
+):
+    """An apply is all-or-nothing across the plan, and the edit set is the unit.
+
+    Landing the clean edits beside a refused one leaves the project matching
+    neither the proposal nor what the human had, while the apply reports itself
+    refused, so nothing records which half arrived. The single-file refusal above
+    cannot see that: with one edit in the plan there is no clean half to land.
+    """
+
+    from exmergo_dex_core import transform
+
+    touched = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    untouched = dbt_project_dir / "models" / "marts" / "fct_orders.sql"
+    edits = [
+        transform.PlanEdit(
+            path="models/marts/fct_orders.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as order_id\n",
+        ),
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as id\n",
+        ),
+    ]
+    planned, _diffs, _warnings = transform.plan(
+        "two edits, one of which a human will touch",
+        edits,
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    model_existed = untouched.exists()
+    touched.write_text("select 99 as id -- hand-tuned\n", encoding="utf-8")
+
+    result = transform.apply(
+        planned.plan_id,
+        dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+
+    assert result.written == []
+    assert result.conflicts
+    assert touched.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
+    assert untouched.exists() == model_existed, (
+        "the clean edit landed while the conflicting one beside it was refused"
+    )
+
+
+def test_a_stored_plan_cannot_escape_the_surface_its_format_declares(
+    dbt_project_dir: Path,
+):
+    """Containment is re-checked at apply, and confirmation does not override it.
+
+    A plan is a stored artifact that sits through a human review, so what it was
+    validated against at plan time is not what it is being written into. The
+    hashes are re-checked for that reason and the surface now is too: a path
+    outside what the format declares is refused before anything reaches the
+    writer, and unlike a conflict there is nobody who can accept it.
+    """
+
+    import json as _json
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.adapters.project import DbtProject
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    planned, _diffs, _warnings = transform.plan(
+        "a plan to tamper with",
+        [
+            transform.PlanEdit(
+                path="models/staging/stg_customers.sql",
+                kind=transform.EditKind.MODEL_SQL,
+                new_content="select 1 as id\n",
+            )
+        ],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=store,
+    )
+    # The plan is rewritten where it sits, which is the only way to reach apply
+    # with a path plan-time containment would have refused.
+    stored_path = dbt_project_dir.parent / ".dex" / "plans" / f"{planned.plan_id}.json"
+    stored = _json.loads(stored_path.read_text(encoding="utf-8"))
+    stored["edits"][0]["path"] = "models_backup/stg_customers.sql"
+    stored_path.write_text(_json.dumps(stored), encoding="utf-8")
+    escaped = dbt_project_dir / "models_backup" / "stg_customers.sql"
+
+    for confirmed in (False, True):
+        with pytest.raises(transform.PlanError, match="editing surface"):
+            transform.apply(
+                planned.plan_id,
+                dbt_project_dir.parent,
+                store=store,
+                confirmed=confirmed,
+                project_format=DbtProject(dbt_project_dir.parent, dbt_project_dir),
+            )
+    assert not escaped.exists()
+
+
 def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):
     # Propose-don't-impose extends to removal: a delete never silently drops a
     # file a human touched after the plan was made.

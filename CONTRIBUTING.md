@@ -373,6 +373,18 @@ the code that produced the graph is, so an edit written into the reduction is
 overwritten on the next run. `maintain reconcile` reads that declaration, and your
 format gets advisory proposals and no stored plan, by contract rather than by luck.
 
+If you do serve it, `PlacingProject` is what carries a proposal to your write path,
+and it is three methods rather than two: `load()` reads the keyspace an edit is
+pinned against, `edit_path()` names a key in it, and `editing_surface()` declares the
+region those keys may fall in. They go together because none of them answers
+anything alone, and a format holding two of the three places nothing at all. Mix
+`PlacingProjectContract` in beside your tier-3 contract: it checks that the three
+agree, that the view carries the `root`, `content` and `sha256` a pinned edit needs,
+and that your own writer refuses a path outside the surface you declared, including
+the sibling case a string-prefix comparison lets through. Supplying its optional
+`a_clean_edit(project)` hook is what upgrades the all-or-nothing assertion from
+asking what your writer reported to reading what your project holds.
+
 Decide it by asking which artifact an edit would land in, not where your project came
 from. Those questions come apart more often than the graph example suggests: an asset
 graph carries neither column names nor join keys, so a format over one reads its
@@ -384,7 +396,10 @@ serve this tier for that channel while still refusing to author a model.
 that are not obvious from the signatures.
 
 Formats contributed here run the same suite: see
-`packages/dex-core/tests/adapters/test_project_parity.py`.
+`packages/dex-core/tests/adapters/test_project_parity.py` for the shipped format, and
+`packages/dex-core/tests/adapters/test_project_conformance.py` for a format that is
+neither dbt nor a directory, driven through the contract and then broken on purpose,
+one defect per assertion.
 
 ## Linting and formatting (Ruff)
 

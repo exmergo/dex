@@ -226,6 +226,35 @@ def test_reapply_is_a_noop(dbt_project_dir: Path, tmp_path: Path, capsys):
     assert envelope["data"]["written"] == []
 
 
+def test_apply_refuses_a_stored_plan_that_escapes_the_editing_surface(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The refusal reaches the caller as a named refusal, not a stack trace.
+
+    Containment is re-checked before the plan reaches the writer, and the failure
+    is a `PlanError`, which this command has to report the way it reports every
+    other refusal: an error envelope naming the path and the surface. It is not a
+    conflict, so `--confirm` is not a way past it.
+    """
+
+    plan_id = _make_plan(
+        tmp_path, capsys, "models/staging/stg_customers.sql", "select 1 as id\n"
+    )
+    stored_path = tmp_path / ".dex" / "plans" / f"{plan_id}.json"
+    stored = json.loads(stored_path.read_text(encoding="utf-8"))
+    stored["edits"][0]["path"] = "models_backup/stg_customers.sql"
+    stored_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply", plan_id, "--confirm"],
+        capsys,
+    )
+
+    assert rc != 0 and envelope["status"] == "error"
+    assert "editing surface" in json.dumps(envelope["errors"])
+    assert not (dbt_project_dir / "models_backup" / "stg_customers.sql").exists()
+
+
 def test_apply_conflict_needs_confirmation_then_confirm_overrides(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

@@ -61,16 +61,17 @@ running the suite needs.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 import pytest
 
-from ..dbt_project import ProjectDefinitions
+from ..dbt_project import EditOp, ProjectDefinitions
 from ..maintain.snapshot import Snapshot
 from .project import ExploreProject, ProjectContext, tier_of
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from typing import Any
 
     from ..maintain.snapshot import SemanticLayer, TransformLayer
@@ -84,6 +85,38 @@ __all__ = [
     "ProjectFactoryContract",
     "SemanticProjectContract",
 ]
+
+
+def _probe_content(path: str) -> str:
+    """Content for an edit that must never land, commented for the file it names.
+
+    A refusal is what is being asserted, so nothing should ever read this. It is
+    still written as a comment in the target's own language, because a format
+    that parses what it is handed before refusing it should refuse it for the
+    reason under test rather than for being unparseable.
+    """
+
+    marker = "-- " if path.endswith(".sql") else "# "
+    return f"{marker}dex conformance probe: this must never be written\n"
+
+
+def _edit_like(template: Any, **changes: Any) -> Any:
+    """A copy of an edit the format was handed, with fields replaced.
+
+    The assertions below vary one field of a real edit (its path, or the hash it
+    is pinned to) rather than constructing one, so what reaches ``write_edits``
+    is the same shape dex passes it everywhere. Every caller in the engine passes
+    ``Edit`` or ``PlanEdit``, which is what makes this safe to assume.
+    """
+
+    copier = getattr(template, "model_copy", None)
+    assert copier is not None, (
+        "the edits returned by an_edit_against_a_changed_target() are not dex's "
+        f"`Edit`/`PlanEdit` models but {type(template).__name__}. write_edits() is "
+        "called with those models from every path in the engine, so the hook has "
+        "to stage what the format will really be handed"
+    )
+    return copier(update=changes)
 
 
 class ExploreProjectContract:
@@ -600,9 +633,20 @@ class EditableProjectContract(MaintainProjectContract):
     stage that scenario cannot detect it either, and a format that cannot detect it
     overwrites work silently, which is the one failure this seam exists to prevent.
 
-    **The two write assertions have to be read as a pair.** Refusing an unconfirmed
-    conflict is satisfied trivially by a ``write_edits`` that never writes anything,
-    so the confirmed case is what rules that out. Neither is worth much alone.
+    **The first two write assertions have to be read as a pair.** Refusing an
+    unconfirmed conflict is satisfied trivially by a ``write_edits`` that never
+    writes anything, so the confirmed case is what rules that out. Neither is worth
+    much alone.
+
+    **The pair rules out a writer that never writes. It does not rule out a writer
+    that writes too much**, which is the direction the rest of the assertions
+    cover: an apply that lands the clean half of a refused edit set, and a create
+    pinned to no prior content that overwrites a file which appeared during
+    review. Both leave the project holding something nobody proposed, both report
+    themselves as a clean refusal, and neither is visible to a contract that
+    stages one edit and asks only what came back. Supplying
+    :meth:`a_clean_edit` upgrades the first from checking what the writer said to
+    checking what the project holds.
 
     **Deliberately not asserted here: which directory the edits land in.**
     ``project_dir`` is a slot for the formats keyed by one, so an assertion about it
@@ -637,6 +681,33 @@ class EditableProjectContract(MaintainProjectContract):
             "read_target), staging the case the write tier exists to get right: a "
             "human edited the target after the plan pinned its content"
         )
+
+    def a_clean_edit(self, project: Any) -> tuple[Any, Any] | None:
+        """An edit that is *not* in conflict, and a callable reading its target.
+
+        Optional, and worth supplying. It is the oracle for
+        :meth:`test_a_refused_apply_leaves_every_target_alone`: without it that
+        assertion can only ask what ``write_edits`` *reported*, so a writer that
+        writes half an edit set and says it wrote nothing still passes. With it,
+        the target is read directly and the claim is checked against the project.
+
+        Return ``(edit, read_target)``, where ``edit`` is pinned truthfully
+        against current content (it must be clean, since the conflict under test
+        is the other one) and ``read_target`` is a zero-argument callable
+        returning what its target holds right now. Any value that compares equal
+        to itself will do.
+
+        ``project`` is the one :meth:`an_edit_against_a_changed_target` just
+        staged, and the edit has to be valid against *that* project rather than
+        against a fresh one: both edits are written through it in a single call,
+        and the reader has to be looking at the same place the write lands.
+
+        Returning ``None`` falls back to an edit derived from the staged
+        conflict's own path, which is inside your surface by construction (it is
+        a sibling of a path you already accept) and needs nothing from you.
+        """
+
+        return None
 
     def test_satisfies_the_editable_tier(self) -> None:
         assert tier_of(self.make_project()) >= 3
@@ -682,6 +753,115 @@ class EditableProjectContract(MaintainProjectContract):
             "write_edits() left the target unchanged with confirmed=True. The "
             "override is what a human reaches for after reading the conflict "
             "diffs, so a format that refuses either way has no apply path"
+        )
+
+    def test_a_refused_apply_leaves_every_target_alone(self) -> None:
+        """A conflict refuses the apply, not the conflicting edit within it.
+
+        ``write_edits`` is all-or-nothing, and the edit set is the unit. A writer
+        that lands the clean edits and holds back the conflicting one leaves the
+        project in a state neither the proposal nor the human intended, with no
+        record of which half arrived: the plan reads as refused, the tree does
+        not match it, and the diffs a reviewer was shown describe a change that
+        partly happened.
+
+        It is the failure worth catching most and the one a single-edit set
+        cannot see, which is why this stages two. The clean edit goes first, so a
+        writer working through the set in order reaches it before it discovers
+        the conflict.
+        """
+
+        project, project_dir, edits, read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+        staged = list(edits)
+        assert staged, (
+            "an_edit_against_a_changed_target() returned no edits, so there is no "
+            "conflict staged and nothing here can be asserted"
+        )
+        supplied = self.a_clean_edit(project)
+        if supplied is None:
+            template = staged[0]
+            sibling = PurePosixPath(template.path)
+            clean_path = str(sibling.with_name(f"dex_conformance_clean_{sibling.name}"))
+            clean = _edit_like(
+                template,
+                path=clean_path,
+                old_content_hash=None,
+                op=EditOp.UPSERT,
+                new_content=_probe_content(clean_path),
+            )
+            read_clean = None
+        else:
+            clean, read_clean = supplied
+
+        before = read_target()
+        before_clean = read_clean() if read_clean is not None else None
+
+        result = project.write_edits([clean, *staged], project_dir)
+
+        assert read_target() == before, (
+            "write_edits() overwrote the conflicting target inside a mixed edit "
+            "set, with confirmed left at its default"
+        )
+        assert not getattr(result, "written", []), (
+            "write_edits() refused an unconfirmed conflict and still reported "
+            f"{list(getattr(result, 'written', []))} as written. The apply is "
+            "all-or-nothing: one conflict refuses the whole set, so the clean "
+            "edits beside it do not land either"
+        )
+        if read_clean is not None:
+            assert read_clean() == before_clean, (
+                "write_edits() wrote the clean edit while refusing the "
+                "conflicting one beside it. That leaves the project matching "
+                "neither the proposal nor what the human had, and the apply "
+                "reports itself as refused, so nothing records which half landed"
+            )
+
+    def test_a_create_pinned_absent_refuses_a_target_that_now_exists(self) -> None:
+        """``old_content_hash=None`` is a claim about the target, and it is checked.
+
+        A create is pinned to nothing because there was nothing there when the
+        plan was made. If a file has appeared at that path since, the claim is
+        false and the write is exactly the overwrite this tier exists to refuse:
+        the human who created it during review loses the whole file rather than
+        the lines that diverged.
+
+        A writer that reads ``None`` as "nothing to compare, go ahead" passes
+        every other assertion here, because in the staged conflict the pinned
+        hash is a real one.
+        """
+
+        project, project_dir, edits, read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+        staged = list(edits)
+        assert staged, (
+            "an_edit_against_a_changed_target() returned no edits, so there is no "
+            "target to re-pin and nothing here can be asserted"
+        )
+        template = staged[0]
+        before = read_target()
+        create = _edit_like(
+            template,
+            old_content_hash=None,
+            op=EditOp.UPSERT,
+            new_content=_probe_content(template.path),
+        )
+
+        result = project.write_edits([create], project_dir)
+
+        assert read_target() == before, (
+            "write_edits() honored an edit pinned to no prior content over a "
+            "target that exists, overwriting it whole. A pin of None says the "
+            "file was absent at plan time; a file being there now is a conflict, "
+            "not a create. (If the target your hook stages does not exist, the "
+            "hook is not staging the case it documents.)"
+        )
+        assert not getattr(result, "written", []), (
+            "write_edits() reported the create as written over an existing "
+            "target, so the caller marks the plan applied and no one is asked "
+            "about the file that appeared"
         )
 
     def test_the_write_result_reports_what_happened(self) -> None:
@@ -731,13 +911,146 @@ class PlacingProjectContract:
     not this one gets advisory proposals and no stored plan, which is the same
     outcome as declining the tier.
 
-    **What this asserts is that your two answers agree.** Each is checkable alone
-    and neither is interesting alone: ``edit_path`` names a file, and
-    ``editing_surface`` says which region files may be named in. A format placing
-    an edit outside its own declared surface builds a proposal the plan store then
-    refuses, and the refusal reads as dex declining rather than as the format
-    contradicting itself, which is a bad afternoon to debug from the outside.
+    **What this asserts is that your three answers agree.** Each is checkable
+    alone and none is interesting alone: ``load`` reads a keyspace, ``edit_path``
+    names a key in it, and ``editing_surface`` says which region those keys may
+    fall in. A format placing an edit outside its own declared surface builds a
+    proposal the plan store then refuses, and the refusal reads as dex declining
+    rather than as the format contradicting itself, which is a bad afternoon to
+    debug from the outside.
+
+    **Placement presupposes tier 3, and this checks that first**, the way
+    :class:`SemanticProjectContract` checks tier 2. Every assertion below needs
+    either the write path or the staged conflict that
+    :class:`EditableProjectContract` stages, so a format mixing this in alone
+    would meet an error about a missing attribute where the thing to say is that
+    the contract is missing its other half.
     """
+
+    def _staged_conflict(self) -> tuple[Any, Any, Any, Any]:
+        """The tier-3 hook, with a message when this mixin is used on its own."""
+
+        hook = getattr(self, "an_edit_against_a_changed_target", None)
+        assert hook is not None, (
+            "the assertions here write through your format, so they need the "
+            "tier-3 hook an_edit_against_a_changed_target(). Mix "
+            "EditableProjectContract in beside this contract, which is how "
+            "placement is meant to be run: a format that places and cannot "
+            "receive an edit has nowhere for the placement to lead"
+        )
+        return hook()
+
+    def test_placement_presupposes_the_editable_tier(self) -> None:
+        assert tier_of(self.make_project()) >= 3, (
+            "a format that places an edit has to reach tier 3, because placement "
+            "is where a proposal is carried to `write_edits`. Implement the write "
+            "tier, or drop this mixin: placing an edit a format cannot receive "
+            "describes a path that stops halfway"
+        )
+
+    def test_the_view_pins_what_an_edit_is_written_against(self) -> None:
+        """``load()`` answers with the keyspace the other two members describe.
+
+        This is what ``transform plan`` pins each edit against and what
+        ``reconcile`` reads before it extends a declaration. Three things are
+        needed and each fails silently in its own way when it is absent:
+        ``root``, which the plan records as the directory it was pinned against;
+        ``content``, which the diff a human reviews is built from; and
+        ``sha256``, without which every existing file pins as a create, so a
+        one-line change is rendered as a whole-file overwrite and the apply that
+        follows conflicts on a file nobody touched.
+
+        The hash need only be consistent with what your own writer re-checks. It
+        is your keyspace, and dex compares your value against your value.
+        """
+
+        view = self.make_project().load()
+
+        root = getattr(view, "root", None)
+        assert isinstance(root, str) and root, (
+            "load() returned a view with no `root`. A plan records the directory "
+            "its edits were pinned against, and reads it from here"
+        )
+        files = getattr(view, "files", None)
+        assert isinstance(files, Mapping), (
+            "load() returned a view whose `files` is not a mapping. It has to be "
+            "keyed the way edit_path() keys, because that is how a placed edit is "
+            f"looked up: got {type(files).__name__}"
+        )
+
+        project, _project_dir, edits, _read_target = self._staged_conflict()
+        staged = list(edits)
+        assert staged, "an_edit_against_a_changed_target() returned no edits"
+        target = staged[0].path
+        entry = project.load().files.get(target)
+        assert entry is not None, (
+            f"load().files has no entry for '{target}', which is the path your own "
+            "hook staged an edit against. dex looks a placed path up in this "
+            "mapping: absent, it pins the edit as a create, renders a whole-file "
+            "diff, and conflicts at apply on a file nobody edited"
+        )
+        assert isinstance(getattr(entry, "content", None), str), (
+            f"the entry for '{target}' carries no `content` string, so no diff "
+            "can be built for a human to review"
+        )
+        sha = getattr(entry, "sha256", None)
+        assert isinstance(sha, str) and sha, (
+            f"the entry for '{target}' carries no `sha256`, so the edit pinned "
+            "against it pins nothing. A create is what a pin of None means, and "
+            "an existing file that pins as a create is one an apply overwrites "
+            "whole"
+        )
+
+    def test_write_edits_refuses_a_path_outside_the_declared_surface(self) -> None:
+        """Your writer honors the surface you declared, not just your placements.
+
+        Containment is checked at plan time and re-checked before dex hands a
+        stored plan to your writer, but ``write_edits`` is a public method of
+        your format and is reachable directly, so the surface has to hold there
+        too. What is asserted is the case a prefix comparison gets wrong: a
+        sibling that merely starts with the same characters. ``declarations``
+        admits ``declarations/orders.yml`` and does not admit
+        ``declarations_backup/orders.yml``, and a format matching by string
+        prefix accepts both while passing every other assertion here.
+
+        Refusing by raising and refusing by writing nothing are both refusals.
+        """
+
+        project, project_dir, edits, read_target = self._staged_conflict()
+        surface = [str(prefix) for prefix in project.editing_surface()]
+        if not surface:
+            pytest.skip(
+                "this format declares no editing surface, so it already refuses "
+                "every edit and there is no sibling prefix to probe"
+            )
+        staged = list(edits)
+        assert staged, "an_edit_against_a_changed_target() returned no edits"
+        outside = f"{surface[0]}_dex_conformance_outside/probe.yml"
+        before = read_target()
+        escaping = _edit_like(
+            staged[0],
+            path=outside,
+            old_content_hash=None,
+            op=EditOp.UPSERT,
+            new_content=_probe_content(outside),
+        )
+
+        try:
+            result = project.write_edits([escaping], project_dir)
+        except Exception:
+            return
+
+        assert not getattr(result, "written", []), (
+            f"write_edits() wrote '{outside}', which editing_surface() does not "
+            f"admit ({', '.join(surface)}). Prefixes match by path segment, so a "
+            "sibling that shares the first characters is outside the surface. A "
+            "format matching by string prefix admits the whole neighborhood of "
+            "every region it owns"
+        )
+        assert read_target() == before, (
+            f"write_edits() left '{outside}' unwritten but moved another target "
+            "while doing it"
+        )
 
     def placeable_model(self) -> str:
         """A warehouse table your format would place an edit for.
@@ -757,10 +1070,13 @@ class PlacingProjectContract:
     def test_satisfies_the_placing_protocol(self) -> None:
         from .project import PlacingProject
 
-        assert isinstance(self.make_project(), PlacingProject), (
+        project = self.make_project()
+        from .project import placement_gap
+
+        assert isinstance(project, PlacingProject), placement_gap(project) or (
             "the format does not satisfy PlacingProject, so reconcile has no path "
             "to plan an edit against and every proposal it makes stays advisory. "
-            "Both `edit_path` and `editing_surface` are required"
+            "All three of `load`, `edit_path` and `editing_surface` are required"
         )
 
     def test_it_places_at_least_one_kind(self) -> None:

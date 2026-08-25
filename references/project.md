@@ -41,13 +41,18 @@ implementation is complete rather than partial.
 implemented.
 
 One protocol sits beside the tiers rather than in them, `PlacingProject`, and
-reaching `reconcile`'s write path means implementing it as well as tier 3. It is
-described under [Where an edit lands](#where-an-edit-lands-and-what-you-own)
-below. It is beside rather than on tier 3 because these protocols are
-`runtime_checkable`: a method added to tier 3 would demote every format that has
-not implemented it yet, so `tier_of` would start answering 2 where it answered 3
-and the write path would close for exactly the implementers who were already
-passing.
+reaching `reconcile`'s write path means implementing it as well as tier 3. Its three
+methods are `load()`, `edit_path()` and `editing_surface()`, and they are described
+under [Where an edit lands](#where-an-edit-lands-and-what-you-own) below. It is
+beside rather than on tier 3 because these protocols are `runtime_checkable`: a
+method added to tier 3 would demote every format that has not implemented it yet, so
+`tier_of` would start answering 2 where it answered 3 and the write path would close
+for exactly the implementers who were already passing.
+
+That is also why `load()` is there rather than on tier 3, which is where you would
+look for it first. Nothing outside the placement path calls it: both callers reach it
+only for a format that places, so asking it of tier 3 would demote formats that never
+needed it in order to state a requirement that is not theirs.
 
 **Tier 1 is where the value is concentrated, and it is easy to underestimate.**
 Declared keys and declared joins reach dex through `definitions()` and through no
@@ -120,13 +125,17 @@ those two.
 
 Tier 3 says your format *can* receive an edit. It does not say where the edit goes,
 and reconcile decides that before it consults you. `PlacingProject` is where you
-answer, and reaching the write path means implementing both of its methods.
+answer, and reaching the write path means implementing all three of its methods.
 
 ```python
+from exmergo_dex_core.adapters.project import ProjectView
 from exmergo_dex_core.transform.plans import EditKind
 
 
 class MyProject:  # ... tier 3 methods as above
+    def load(self) -> ProjectView:
+        return MyView(root=self.root, files=self.declarations())
+
     def edit_path(self, kind: EditKind, model: str) -> str | None:
         if kind is EditKind.SCHEMA_YML:
             return f"declarations/{model}.yml"
@@ -135,6 +144,35 @@ class MyProject:  # ... tier 3 methods as above
     def editing_surface(self) -> list[str]:
         return ["declarations"]
 ```
+
+The three describe one keyspace, and none of them is answerable alone. A key is a key
+into a view; a surface is a region of the same space; and a view nobody places into is
+a read dex has no use for on this path. A format holding two of the three places
+nothing at all, and dex says which one is missing rather than leaving it to surface as
+`AttributeError` from inside a command the tier check already let through.
+
+`load()` reads the keyspace, once per command, and returns a `ProjectView`:
+
+| member | type | what breaks without it |
+|---|---|---|
+| `root` | `str` | the plan has no directory to record its edits as pinned against |
+| `files` | `Mapping[str, SourceFileView]` | a placed path resolves to nothing |
+| `files[k].content` | `str` | no diff can be built for a human to review |
+| `files[k].sha256` | `str` | every existing file pins as a create, so a one-line change renders as a whole-file overwrite and the next apply conflicts on a file nobody touched |
+
+`files` is keyed exactly the way `edit_path` keys and `editing_surface` prefixes,
+which is the whole point of the type. `root` is what the plan records as the directory
+it was pinned against, relative to the repository root where that subtraction is
+possible and verbatim where it is not, so a format keyed by something other than a
+directory returns whatever identifies its root and the plan carries that. The hash need
+only be consistent with what your own writer re-checks: it is your keyspace, and dex
+compares your value against your value.
+
+`ProjectView` and `SourceFileView` are declared protocols and neither is
+`runtime_checkable`. Nothing calls `isinstance` against them, because an isinstance
+check on a data protocol only asks whether the attribute names exist, which reads as a
+type check and is not one. `PlacingProjectContract` makes that check instead, with a
+message naming the missing member and what it costs.
 
 `edit_path(kind, model)` says where an edit of that kind for that table lives. Two
 things about it are easy to get wrong. `model` is the warehouse table the finding is
@@ -162,6 +200,22 @@ admitting all of them, which is the same statement declining tier 3 makes.
 
 This is containment, which is a safety property and stays mandatory. What the seam
 moved is who declares the surface, not whether there is one.
+
+**Honor it in your writer too, and expect dex to re-check it.** Containment is
+checked when a plan is stored, and re-checked against this declaration before dex
+hands a stored plan to `write_edits`, for the same reason the hashes are re-checked:
+a plan is a stored artifact that sits through a human review, so what it was
+validated against then is not what it is being written into. That refusal is a hard
+one, and `confirmed` is not a way past it. Nobody accepts a write outside the surface
+the format itself declared. Your own writer still has to check, because `write_edits`
+is a public method of your format and dex is not its only caller, and the conformance
+suite asserts the case a prefix comparison gets wrong.
+
+**Declare what your writer accepts, not less.** The shipped dbt format lists its
+model and macro paths *and* the four root manifests it authors by name, because a
+declaration narrower than the writer is not a modest one: it refuses the project
+config, the profiles and the package manifests at apply, every one of which is a path
+dex authors through a plan.
 
 **One thing dex still spells its own way.** The `unique` test edit finds your model
 inside the placed file by the file's own name (`declarations/orders.yml` means a
@@ -338,26 +392,64 @@ Two hooks are worth overriding beyond `make_project`:
 Tier 3 adds one more hook, and unlike the two above it is **not optional**.
 `an_edit_against_a_changed_target()` returns a project, a directory, an edit set
 pinned to content that has since moved, and a callable reading what the target holds
-now. Two assertions use it: an unconfirmed write must leave the target alone, and a
-confirmed one must go through. They only mean something as a pair, since a
-`write_edits` that never writes satisfies the first on its own. The hook raises
-rather than skipping because the excuse that justifies skipping
+now. It raises rather than skipping because the excuse that justifies skipping
 `make_unreadable_project` does not apply here. A format may genuinely have no
 unparseable state, but a format that reached tier 3 writes into a source of truth a
 human can also edit, so the case where the human got there first exists for all of
 them.
+
+Four assertions are built from it. An unconfirmed write must leave the target alone
+and a confirmed one must go through, and those two only mean something as a pair,
+since a `write_edits` that never writes satisfies the first on its own. **That pair
+rules out a writer that never writes; it does not rule out a writer that writes too
+much**, which is what the other two are for:
+
+- **A conflict refuses the apply, not the conflicting edit within it.** The edit set
+  is the unit. A writer that lands the clean edits and holds back the conflicting one
+  leaves the project matching neither the proposal nor what the human had, while the
+  apply reports itself refused, so nothing records which half arrived. A single-edit
+  set cannot see this, which is why the assertion stages two.
+- **A create pinned to no prior content is refused when the target now exists.**
+  `old_content_hash=None` is a claim that the file was absent at plan time. If one is
+  there now, the claim is false and honoring it costs the human who created it during
+  review the whole file rather than the lines that diverged. A writer reading `None`
+  as "nothing to compare, go ahead" passes every other assertion, because in the
+  staged conflict the pinned hash is a real one.
+
+One optional hook is worth supplying beside them. **`a_clean_edit(project)`** returns
+an edit that is not in conflict, pinned truthfully against the project the conflict
+hook just staged, and a callable reading its target. Without it the all-or-nothing
+assertion can only ask what `write_edits` *reported*, so a writer that lands half an
+edit set and reports nothing written still passes; with it, the target is read
+directly and the claim is checked against the project. Returning `None` falls back to
+an edit derived from the staged conflict's own path, which is inside your surface by
+construction and needs nothing from you.
 
 `PlacingProjectContract`, mixed in beside it, has one hook that is likewise not
 optional. `placeable_model()` returns a warehouse table your format would place an
 edit for, spelled as the warehouse spells it rather than as your format names the
 model derived from it, because that is how reconcile's findings arrive and it is the
 thing `edit_path` is most often gotten wrong on. The assertions are cheap and mostly
-about your two answers agreeing: at least one kind places somewhere, every path
+about your three answers agreeing: at least one kind places somewhere, every path
 `edit_path` returns is inside `editing_surface()`, and the surface itself stays
-within the project. The middle one is the reason the contract exists, since a
+within the project. That middle one is a reason the contract exists, since a
 placement outside your own declared surface builds a proposal the plan store then
 refuses, and from the outside that reads as dex declining rather than as the format
 contradicting itself.
+
+Two more come from `load()` being part of the same keyspace. The view has to carry
+`root` and `files`, and the entry behind a path your own hook staged an edit against
+has to carry `content` and `sha256`, each of which fails silently in its own way
+when it is absent. And `write_edits` has to refuse a path outside the surface you
+declared: what is asserted is the case a prefix comparison gets wrong, a sibling that
+merely starts with the same characters, since a format matching by string prefix
+admits the whole neighborhood of every region it owns while passing everything else.
+Refusing by raising and refusing by writing nothing both count.
+
+Placement presupposes tier 3, and the contract checks that first, the way
+`SemanticProjectContract` checks tier 2. Mix it in beside `EditableProjectContract`:
+the assertions here write through your format, and placing an edit a format cannot
+receive describes a path that stops halfway.
 
 The suite needs only pytest: no dialect engine, no connector. A packaging test keeps
 it that way.
@@ -467,3 +559,14 @@ reduced from a running graph has no directory, a hosted one has service coordina
 and a contract shaped around dbt would have left both unbuildable. The nullable
 slots plus verbatim `options` are what let a format that is keyed by nothing at all
 be named the same way.
+
+**Declaring `load()` on tier 3.** It is where a reader looks for it, and it is the
+protocol the method's callers are typed against, so it was the obvious home. It is
+the wrong one twice over. These protocols are `runtime_checkable`, so a method added
+to tier 3 demotes every format that has not implemented it, which is the argument
+that put `PlacingProject` beside the tiers in the first place; and the requirement is
+not tier 3's to state, because nothing outside the placement path calls `load()`. A
+format that receives edits and does not place them never needed a view, and would
+have been demoted to say otherwise. Beside the two methods that share its keyspace,
+it demotes only formats that were already going to fail, and it fails them into the
+advisory degradation the gate was written to give.
