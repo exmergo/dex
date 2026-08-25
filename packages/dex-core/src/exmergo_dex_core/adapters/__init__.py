@@ -1,5 +1,5 @@
-"""Connector adapters: DuckDB, BigQuery, Snowflake, Databricks, Postgres, and
-Redshift.
+"""Connector adapters: DuckDB, BigQuery, Snowflake, Databricks, Postgres,
+Redshift, and ClickHouse.
 
 ``get_adapter`` is the single entry point so callers never import a connector
 client directly; the client libraries stay behind their extras and are imported
@@ -21,6 +21,7 @@ _DIALECTS = {
     "databricks": "databricks",
     "postgres": "postgres",
     "redshift": "redshift",
+    "clickhouse": "clickhouse",
 }
 
 
@@ -51,6 +52,10 @@ def get_adapter(connector: str, **kwargs: Any):
         from .redshift import RedshiftAdapter
 
         return RedshiftAdapter(**kwargs)
+    if connector == "clickhouse":
+        from .clickhouse import ClickHouseAdapter
+
+        return ClickHouseAdapter(**kwargs)
     raise ValueError(f"unknown connector '{connector}'")
 
 
