@@ -33,6 +33,7 @@ from . import (
     SemanticQuery,
     SemanticQueryRefusedError,
     cap_columnar,
+    merge_element_fields,
     requested_dimension_refs,
     screen_dimension_refs,
     unadjudicated_refs,
@@ -45,6 +46,16 @@ _HOSTED_COST_WARNING = (
     "warehouse connection and executes this query server-side, so dex applies no "
     "cost estimate or ceiling here. Spend is governed by the dbt Cloud "
     "environment's own limits, not by dex."
+)
+
+# What a hosted catalog cannot answer, said where the reader of the catalog is.
+# Local lists carry entity labels; this backend structurally cannot, and a silent
+# absence would read as a dbt project that declared none.
+_HOSTED_ENTITY_LABEL_NOTE = (
+    "hosted list: the dbt Cloud Semantic Layer API exposes no label on entities "
+    "(its Entity type has no such field), so an entity here carries a "
+    "description at most; list with --local to read the labels the dbt project "
+    "declares"
 )
 
 _MISSING_EXTRA = (
@@ -203,37 +214,57 @@ class HostedDbtCloudBackend:
     # ---- discovery ---------------------------------------------------------
 
     def list_definitions(self) -> SemanticCatalog:
+        # `label` and `description` on the nested dimensions, and `description` on
+        # the nested entities, come free with the catalog query dex already
+        # issues: one round trip either way. Never add `label` to the entity
+        # selection set. The schema has no such field and the server rejects the
+        # entire query, so the metrics list goes down with it.
         query = (
             "{ metrics(environmentId: " + self._env + ") "
             "{ name type label description "
-            "dimensions { name type } entities { name type } } }"
+            "dimensions { name type label description } "
+            "entities { name type description } } }"
         )
         data = self._post(query)
         metrics: list[MetricInfo] = []
-        dim_types: dict[str, str] = {}
-        ent_types: dict[str, str] = {}
+        dims: dict[str, dict[str, Any]] = {}
+        ents: dict[str, dict[str, Any]] = {}
         for m in data.get("metrics") or []:
-            dims = [d.get("name") for d in (m.get("dimensions") or [])]
+            metric_dims = [d.get("name") for d in (m.get("dimensions") or [])]
             for d in m.get("dimensions") or []:
-                dim_types.setdefault(d.get("name"), (d.get("type") or "").lower())
+                merge_element_fields(dims, d.get("name"), d)
             for e in m.get("entities") or []:
-                ent_types.setdefault(e.get("name"), (e.get("type") or "").lower())
+                merge_element_fields(ents, e.get("name"), e)
             metrics.append(
                 MetricInfo(
                     name=m.get("name"),
                     type=(m.get("type") or "").lower(),
                     label=m.get("label"),
                     description=m.get("description"),
-                    dimensions=dims,
+                    dimensions=metric_dims,
                 )
             )
         return SemanticCatalog(
             backend=self.name,
             metrics=metrics,
             dimensions=[
-                DimensionInfo(name=n, type=t) for n, t in sorted(dim_types.items())
+                DimensionInfo(
+                    name=name,
+                    type=fields.get("type") or "",
+                    label=fields.get("label"),
+                    description=fields.get("description"),
+                )
+                for name, fields in sorted(dims.items())
             ],
-            entities=[EntityInfo(name=n, type=t) for n, t in sorted(ent_types.items())],
+            entities=[
+                EntityInfo(
+                    name=name,
+                    type=fields.get("type") or "",
+                    description=fields.get("description"),
+                )
+                for name, fields in sorted(ents.items())
+            ],
+            notes=[_HOSTED_ENTITY_LABEL_NOTE] if ents else [],
         )
 
     # ---- query -------------------------------------------------------------

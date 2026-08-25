@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
+from typing import Any
 
 from ... import command_args
 from ... import envelope as env
@@ -40,6 +41,7 @@ from . import (
     SemanticQuery,
     SemanticQueryRefusedError,
     cap_columnar,
+    merge_element_fields,
     requested_dimension_refs,
     screen_dimension_refs,
 )
@@ -156,31 +158,36 @@ class LocalMetricFlowBackend:
                 "(or query a hosted deployment with --api)"
             )
 
-        entities: dict[str, str] = {}
-        dimensions: dict[str, str] = {}
+        entities: dict[str, dict[str, Any]] = {}
+        dimensions: dict[str, dict[str, Any]] = {}
         model_dims: dict[str, list[str]] = {}
         measure_model: dict[str, str] = {}
         for model in manifest.get("semantic_models") or []:
             model_name = model.get("name")
             primary = None
             for entity in model.get("entities") or []:
-                entities.setdefault(
-                    entity.get("name"), (entity.get("type") or "").lower()
-                )
+                # One entity is declared in every semantic model that joins on
+                # it, and only some of those declarations may describe it, so the
+                # merge keeps the first description any of them carries.
+                merge_element_fields(entities, entity.get("name"), entity)
                 if str(entity.get("type", "")).lower() == "primary":
                     primary = entity.get("name")
             qualified: list[str] = []
             for dim in model.get("dimensions") or []:
                 # Entity-qualified name, the form a metric query groups by
                 # (session__created_at). Cross-model joined dimensions resolve
-                # only at query time, hence the catalog note below.
+                # only at query time, hence the catalog note below. The label and
+                # description stay the project's own text, unqualified: they
+                # describe the dimension, not the path a query reaches it by.
                 name = f"{primary}__{dim.get('name')}" if primary else dim.get("name")
                 qualified.append(name)
-                dimensions.setdefault(name, (dim.get("type") or "").lower())
+                merge_element_fields(dimensions, name, dim)
             model_dims[model_name] = qualified
             for measure in model.get("measures") or []:
                 measure_model[measure.get("name")] = model_name
-        dimensions.setdefault("metric_time", "time")
+        # dex's own synthesis, not a manifest entry, so it carries no label or
+        # description: every word in the catalog is the dbt project's.
+        dimensions.setdefault("metric_time", {"type": "time"})
 
         metrics: list[MetricInfo] = []
         for metric in manifest.get("metrics") or []:
@@ -212,9 +219,23 @@ class LocalMetricFlowBackend:
             backend=self.name,
             metrics=metrics,
             dimensions=[
-                DimensionInfo(name=n, type=t) for n, t in sorted(dimensions.items())
+                DimensionInfo(
+                    name=name,
+                    type=fields.get("type") or "",
+                    label=fields.get("label"),
+                    description=fields.get("description"),
+                )
+                for name, fields in sorted(dimensions.items())
             ],
-            entities=[EntityInfo(name=n, type=t) for n, t in sorted(entities.items())],
+            entities=[
+                EntityInfo(
+                    name=name,
+                    type=fields.get("type") or "",
+                    label=fields.get("label"),
+                    description=fields.get("description"),
+                )
+                for name, fields in sorted(entities.items())
+            ],
             notes=[
                 "local list: a metric's dimensions are those of its owning "
                 "semantic model(s), entity-qualified; dimensions reachable only "
