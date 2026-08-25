@@ -132,6 +132,19 @@ _MACRO_OPEN = re.compile(r"\{%-?\s*macro\s+\w+\s*\(")
 _MACRO_CLOSE = re.compile(r"\{%-?\s*endmacro\s*-?%\}")
 _MACRO_BLOCK = re.compile(r"\{%-?\s*macro\s.*?\{%-?\s*endmacro\s*-?%\}", re.DOTALL)
 
+# Generic test definitions, which are macros under another keyword and may live
+# under the test paths as well as the macro paths. Their presence is what tells
+# a `test_sql` edit apart from a singular test: same directory, two shapes, and
+# only the file's own content says which one the caller wrote.
+_TEST_OPEN = re.compile(r"\{%-?\s*test\s+\w+\s*\(")
+_TEST_CLOSE = re.compile(r"\{%-?\s*endtest\s*-?%\}")
+_TEST_BLOCK = re.compile(r"\{%-?\s*test\s.*?\{%-?\s*endtest\s*-?%\}", re.DOTALL)
+
+# A test that names no table always passes, which is worse than no test at all,
+# so a singular test with neither call is warned about rather than refused: a
+# fixture-free assertion against a literal is unusual but not wrong.
+_REF_OR_SOURCE = re.compile(r"\{\{-?\s*(?:ref|source)\s*\(")
+
 # Snapshot delimiters, on the same principle as the macro ones. A snapshot file
 # holds exactly one block: dbt names the snapshot after the block, not the file,
 # and a second block in one file is a build-time surprise nobody reading the
@@ -202,6 +215,71 @@ def strip_jinja(sql: str) -> str:
 # needs a bigger reference table wants a warehouse table, not a seed.
 MAX_SEED_ROWS = 5_000
 MAX_SEED_BYTES = 1 << 20
+
+
+def assert_definitions_only(
+    path: str,
+    content: str,
+    *,
+    keyword: str,
+    open_re: re.Pattern[str],
+    close_re: re.Pattern[str],
+    block_re: re.Pattern[str],
+) -> None:
+    """Refuse a jinja definition file that is not only definitions.
+
+    Macros and generic tests are the same document shape under two keywords: a
+    file of ``{% keyword name(...) %}`` blocks, balanced, with nothing loose
+    between them but jinja comments. It is a structural check rather than a SQL
+    one because the file is jinja, not SQL, and the body is a template that only
+    becomes a query once dbt renders it against a model.
+
+    Refusals name the delimiter at fault, so the caller reads what to write
+    rather than which rule they broke.
+    """
+
+    opens = len(open_re.findall(content))
+    closes = len(close_re.findall(content))
+    if opens == 0:
+        raise EditValidationError(
+            f"{path}: a {keyword}_sql edit needs at least one "
+            f"{{% {keyword} name(...) %}} definition"
+        )
+    if opens != closes:
+        raise EditValidationError(
+            f"{path}: unbalanced {keyword} definitions "
+            f"({opens} {keyword}, {closes} end{keyword})"
+        )
+    outside = _JINJA_COMMENT.sub("", block_re.sub("", content))
+    if outside.strip():
+        raise EditValidationError(
+            f"{path}: a {keyword} file holds only {keyword} definitions and "
+            "jinja comments; found loose content outside them"
+        )
+
+
+def _assert_query_only(path: str, content: str, noun: str) -> list[str]:
+    """Refuse SQL that is not a single read-only SELECT, once jinja is stripped.
+
+    The check every authored query gets, whatever dbt will do with it: a model
+    that materializes, a singular test dbt runs and counts the rows of, an
+    analysis dbt only compiles. Read-only against data is a guarantee dex makes
+    about its own writes, so it does not soften for the kinds dbt runs less
+    often.
+
+    ``noun`` names the kind in the one warning this raises: a file that is
+    entirely jinja has no SQL left to check, which is legitimate for a macro-
+    driven query and worth saying out loud rather than passing silently.
+    """
+
+    stripped = strip_jinja(content)
+    if not stripped:
+        return [f"{path}: {noun} is entirely jinja; SELECT-only check skipped"]
+    try:
+        assert_select_only(stripped)
+    except Exception as exc:
+        raise EditValidationError(f"{path}: {exc}") from exc
+    return []
 
 
 def validate_snapshot(path: str, content: str) -> None:
@@ -535,24 +613,48 @@ def validate_edit(
 
     warnings: list[str] = []
     if edit.kind is EditKind.MACRO_SQL:
-        opens = len(_MACRO_OPEN.findall(edit.new_content))
-        closes = len(_MACRO_CLOSE.findall(edit.new_content))
-        if opens == 0:
-            raise EditValidationError(
-                f"{edit.path}: a macro_sql edit needs at least one "
-                "{% macro name(...) %} definition"
+        assert_definitions_only(
+            edit.path,
+            edit.new_content,
+            keyword="macro",
+            open_re=_MACRO_OPEN,
+            close_re=_MACRO_CLOSE,
+            block_re=_MACRO_BLOCK,
+        )
+    elif edit.kind is EditKind.TEST_SQL:
+        # Two shapes share the test paths and only the content tells them apart.
+        # A generic test is a macro under another keyword, so it gets the
+        # structural check; anything else is a singular test, which is a query
+        # and gets a model's. Reading the close delimiter too means an unclosed
+        # or orphaned block is refused as the broken definition it is rather
+        # than as a query that fails to parse.
+        if _TEST_OPEN.search(edit.new_content) or _TEST_CLOSE.search(edit.new_content):
+            assert_definitions_only(
+                edit.path,
+                edit.new_content,
+                keyword="test",
+                open_re=_TEST_OPEN,
+                close_re=_TEST_CLOSE,
+                block_re=_TEST_BLOCK,
             )
-        if opens != closes:
-            raise EditValidationError(
-                f"{edit.path}: unbalanced macro definitions "
-                f"({opens} macro, {closes} endmacro)"
-            )
-        outside = _JINJA_COMMENT.sub("", _MACRO_BLOCK.sub("", edit.new_content))
-        if outside.strip():
-            raise EditValidationError(
-                f"{edit.path}: a macro file holds only macro definitions and "
-                "jinja comments; found loose content outside them"
-            )
+        else:
+            unreadable = _assert_query_only(edit.path, edit.new_content, "test")
+            warnings.extend(unreadable)
+            # Only when the query was readable. A test that is entirely jinja
+            # builds itself inside a macro dex does not follow, so "names no
+            # ref()" would be a guess about content the warning above has just
+            # said could not be read.
+            if not unreadable and not _REF_OR_SOURCE.search(edit.new_content):
+                warnings.append(
+                    f"{edit.path}: this test names no ref() or source(), so it "
+                    "runs against nothing and passes unconditionally"
+                )
+    elif edit.kind is EditKind.ANALYSIS_SQL:
+        # An analysis is compiled and never run, so dbt asks less of it than of
+        # a model. dex does not: the SELECT-only guard is a safety guarantee,
+        # not a dbt requirement, and a DELETE sitting in analyses/ is one
+        # copy-paste away from being run by hand.
+        warnings.extend(_assert_query_only(edit.path, edit.new_content, "analysis"))
     elif edit.kind is EditKind.SNAPSHOT_SQL:
         validate_snapshot(edit.path, edit.new_content)
     elif edit.kind is EditKind.SEED_CSV:
@@ -570,16 +672,7 @@ def validate_edit(
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:
-        stripped = strip_jinja(edit.new_content)
-        if not stripped:
-            warnings.append(
-                f"{edit.path}: model is entirely jinja; SELECT-only check skipped"
-            )
-        else:
-            try:
-                assert_select_only(stripped)
-            except Exception as exc:
-                raise EditValidationError(f"{edit.path}: {exc}") from exc
+        warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
     else:
         try:
             parsed = yaml.safe_load(edit.new_content)
