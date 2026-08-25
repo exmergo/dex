@@ -229,6 +229,74 @@ def fake_pg_connection():
     return FakePostgresConnection(tables=tables, database="dexdb")
 
 
+@pytest.fixture
+def fake_clickhouse_connection():
+    """The standard populated fake ClickHouse client (see
+    tests/fakes/clickhouse.py).
+
+    Requires the real clickhouse-connect library (the [clickhouse] extra) for
+    its error types; skipped when absent, but CI and the release gate install
+    the extra, so the ClickHouse safety families run everywhere that matters.
+
+    The shape mirrors the other connectors' fixtures (a small ``customers``, a
+    large ``events``) and adds the two things only ClickHouse has: a
+    ``LowCardinality(Nullable(String))`` column, so the type unwrapper is
+    exercised in both nesting orders by default, and a ``ReplacingMergeTree``
+    table, so the engine note that keeps a duplicate count from reading as a
+    grain defect is on by default rather than opt-in.
+    """
+
+    pytest.importorskip("clickhouse_connect")
+    from fakes.clickhouse import (
+        FakeClickHouseConnection,
+        FakeClickHouseTable,
+        FakeGrant,
+    )
+
+    tables = [
+        FakeClickHouseTable(
+            database="shop",
+            name="customers",
+            columns=[
+                ("id", "UInt64", True),
+                ("email", "String", False),
+                ("city", "LowCardinality(Nullable(String))", False),
+                ("tags", "Array(String)", False),
+                ("created_at", "DateTime", False),
+            ],
+            total_rows=100,
+            total_bytes=5_000_000_000,  # 5 GB -> a non-trivial seconds estimate
+        ),
+        FakeClickHouseTable(
+            database="shop",
+            name="events",
+            columns=[
+                ("id", "UInt64", True),
+                ("payload", "String", False),
+                ("occurred_at", "Date", False),
+            ],
+            total_rows=1000,
+            total_bytes=50_000_000_000,  # 50 GB
+        ),
+        FakeClickHouseTable(
+            database="shop",
+            name="order_events_raw",
+            columns=[("order_id", "UInt64", True), ("state", "String", False)],
+            total_rows=300,
+            total_bytes=1_000_000,
+            engine="ReplacingMergeTree",
+            primary_key="order_id",
+        ),
+    ]
+    grants = [
+        FakeGrant(user_name="dbt_dev", access_type="SELECT", database="shop"),
+        FakeGrant(user_name="dbt_dev", access_type="CREATE", database="dbt_dev"),
+        FakeGrant(user_name="dbt_dev", access_type="INSERT", database="dbt_dev"),
+        FakeGrant(user_name="dbt_dev", access_type="SELECT", database="dbt_dev"),
+    ]
+    return FakeClickHouseConnection(tables=tables, grants=grants)
+
+
 def write_manifest(
     project: Path,
     *,

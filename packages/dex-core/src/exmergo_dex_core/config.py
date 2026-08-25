@@ -191,6 +191,68 @@ class RedshiftTarget(BaseModel):
     rpu_price_usd: float | None = None
 
 
+class ClickHouseTarget(BaseModel):
+    """Non-secret ClickHouse connection target. Credentials are never here:
+    auth is discovered at runtime by connect.py (CLICKHOUSE_URL, the
+    CLICKHOUSE_* environment, this committed target plus CLICKHOUSE_PASSWORD,
+    or a dbt profile), and passwords are never written or logged.
+
+    ClickHouse namespaces are two-part, ``database.table``: there is no
+    catalog level, and dbt-clickhouse's ``schema:`` *is* the ClickHouse
+    database. So ``databases`` is the source allowlist and ``dev_database``
+    is where dbt dev builds write, refused as a source so reads and writes
+    never share a database.
+
+    ``deployment`` declares which ClickHouse this is, and is a cost decision
+    rather than a connection one. Self-hosted bills no currency, so dex
+    guards it as database-seconds (``db_load``); ClickHouse Cloud bills
+    compute-unit-hours, which dex does not yet model, so ``cloud`` is
+    accepted here and refused at connect rather than silently guarded with a
+    number that cannot bound it. The field and ``compute_unit_price_usd``
+    exist now so the committed config surface does not have to change shape
+    when Cloud lands; ``compute_unit_price_usd`` is refused under
+    ``self_hosted``, where it would be accepted and ignored.
+
+    ``max_full_profile_bytes`` opts large tables into sampled profiling.
+    ClickHouse's ``SAMPLE`` clause only works where the table declared a
+    sampling expression in its MergeTree key, which is uncommon, so the
+    sampled path is ``ORDER BY rand() LIMIT n`` and is not repeatable.
+    """
+
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    user: str | None = None
+    secure: bool | None = None
+    databases: list[str] = Field(default_factory=list)
+    dev_database: str | None = None
+    deployment: str = "self_hosted"
+    compute_unit_price_usd: float | None = None
+    max_full_profile_bytes: int | None = None
+
+    @model_validator(mode="after")
+    def _check_deployment(self) -> ClickHouseTarget:
+        allowed = ("self_hosted", "cloud")
+        if self.deployment not in allowed:
+            raise ValueError(
+                f"clickhouse.deployment must be one of {', '.join(allowed)}, "
+                f"got '{self.deployment}'"
+            )
+        # Refused rather than ignored: a price per compute unit under a
+        # paradigm that counts seconds would read as a configured dollar
+        # translation and produce none, which is the accepted-and-ignored
+        # shape this codebase refuses everywhere else.
+        if self.deployment == "self_hosted" and self.compute_unit_price_usd is not None:
+            raise ValueError(
+                "clickhouse.compute_unit_price_usd applies to "
+                "deployment: cloud, which bills compute-unit-hours. A "
+                "self-hosted server bills no currency, so dex guards it in "
+                "database-seconds and would never spend this number. Remove "
+                "it, or set deployment: cloud"
+            )
+        return self
+
+
 class QueryLimits(BaseModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
@@ -496,6 +558,7 @@ class DexConfig(BaseModel):
     databricks: DatabricksTarget | None = None
     postgres: PostgresTarget | None = None
     redshift: RedshiftTarget | None = None
+    clickhouse: ClickHouseTarget | None = None
     dbt_target: str | None = None
     # Which format owns the source of truth. Defaults to dbt, so a repo that
     # selects nothing behaves exactly as it did before this setting existed.

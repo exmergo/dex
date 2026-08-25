@@ -161,7 +161,9 @@ column"): BigQuery `t, UNNEST(JSON_KEYS(doc)) AS k`, Snowflake
 `t, LATERAL FLATTEN(input => doc) f`, Databricks
 `t LATERAL VIEW EXPLODE(json_object_keys(doc)) x AS k`, Postgres
 `t, jsonb_object_keys(doc) AS k`, Redshift `t, UNPIVOT t.doc AS v AT k`,
-DuckDB `t, UNNEST(json_keys(doc)) AS u(k)`. The unnested value must come from
+DuckDB `t, UNNEST(json_keys(doc)) AS u(k)`, ClickHouse
+`t ARRAY JOIN JSONExtractKeysAndValuesRaw(doc) AS kv` (there is no lateral
+join; ARRAY JOIN is the expansion). The unnested value must come from
 a column of a table in the query (bare, or through a JSON/array function);
 unnesting a subquery, another table, a literal, or a generator is refused,
 and the unnest's outputs inherit the source column's PII flags. A column whose flag was de-rated below the 0.5
@@ -173,7 +175,7 @@ querying immediately, survives re-profiles, and is reviewable in git. Never
 hand-edit `.dex/cache.json` to clear a flag. Never fall back to raw Python or a
 database CLI to run SQL; the firewall path is the only sanctioned one.
 
-## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift)
+## Cloud and database targets (BigQuery, Snowflake, Databricks, Postgres, Redshift, ClickHouse)
 
 A remote warehouse or database replaces `--path` with connector config. Start
 with `connect test --connector <name>` (or set `connector:` plus the matching
@@ -201,7 +203,10 @@ warehouse-seconds on Databricks (DBUs alongside; it sharpens itself inside
 the confirmed budget), a heuristic in compute-seconds on Redshift (RPU-hours
 alongside; Serverless estimates carry the 60-second wake minimum once), and
 database-seconds on Postgres (no dollars; the guarded quantity is load on
-the operational database). Surface the
+the operational database) and on ClickHouse (self-hosted, also no dollars;
+estimated free by the non-executing `EXPLAIN ESTIMATE`, which prices after
+primary-key pruning, and reporting `estimate_basis` so you can tell a pruned
+plan estimate from a whole-relation fallback). Surface the
 estimate to the user in human units, get an explicit budget from them, and
 re-issue the same command with `--confirm` and `--budget <magnitude>` in the
 paradigm's unit. Never invent a budget the user did not agree to, and never
@@ -221,7 +226,9 @@ When an estimate is larger than the work deserves, narrow the scope rather than
 raise the budget. `--scope` (repeatable) bounds a command to part of the
 configured source allowlist, in the connector's own vocabulary: a dataset on
 BigQuery, a `schema` or `database.schema` on Snowflake, a `catalog.schema` on
-Databricks, a schema on Postgres or Redshift. It is free to resolve, it can only narrow what
+Databricks, a schema on Postgres or Redshift, a database on ClickHouse (whose
+identifiers are two-part `database.table`: there is no catalog level). It is
+free to resolve, it can only narrow what
 `.dex/config.yml` already allows, and a scope that names nothing is refused with
 the schemas that do exist listed. So `explore map --scope <schema>` is the first
 thing to reach for on a warehouse whose full map would be expensive.

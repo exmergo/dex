@@ -76,8 +76,9 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
     # Connector-specific connection failures. A host catches the ConnectorError
-    # family instead of importing six names, one per warehouse it does not use.
+    # family instead of importing seven names, one per warehouse it does not use.
     "BigQueryConnectionError",
+    "ClickHouseConnectionError",
     "DatabricksConnectionError",
     "DuckDBReadOnlyError",
     "PostgresConnectionError",

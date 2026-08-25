@@ -1062,3 +1062,103 @@ def test_init_scaffold_apply_build_round_trips(
     assert envelope["status"] == "ok"
     assert envelope["data"]["success"] is True
     assert "stg_customers" in {n["name"] for n in envelope["data"]["nodes"]}
+
+
+def _seed_clickhouse_config(repo: Path, **target) -> None:
+    (repo / ".dex").mkdir(parents=True, exist_ok=True)
+    (repo / ".dex" / "config.yml").write_text(
+        yaml.safe_dump({"clickhouse": target}), encoding="utf-8"
+    )
+
+
+def test_init_clickhouse_bootstraps_a_two_part_namespace_profile(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """dbt-clickhouse has no `database` key: its `schema` is the ClickHouse
+    database, which is the same two-part-namespace fact the adapter encodes."""
+
+    pytest.importorskip("clickhouse_connect")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "hunter2-never-rendered")
+    for var in ("CLICKHOUSE_URL", "CLICKHOUSE_DSN", "CLICKHOUSE_HOST"):
+        monkeypatch.delenv(var, raising=False)
+    _seed_clickhouse_config(
+        tmp_path, host="ch.internal", port=8123, database="app", user="dbt"
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "clickhouse"), capsys)
+    assert rc == 0, envelope
+    assert envelope["data"]["connector"] == "clickhouse"
+
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    output = yaml.safe_load(rendered)["analytics"]["outputs"]["dev"]
+    assert output["type"] == "clickhouse"
+    assert output["host"] == "ch.internal"
+    assert output["port"] == 8123
+    assert output["user"] == "dbt"
+    assert output["schema"] == "dbt_dev"
+    assert "database" not in output, "dbt-clickhouse has no database key"
+    assert output["threads"] == 1
+    assert "hunter2" not in rendered
+    assert "CLICKHOUSE_PASSWORD" in output["password"]
+
+    config = yaml.safe_load(
+        (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    )
+    assert config["clickhouse"]["dev_database"] == "dbt_dev"
+
+
+def test_init_clickhouse_renders_a_cap_the_build_can_tighten(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """The non-degraded path, asserted so the degradation test below cannot pass
+    for the wrong reason.
+
+    The env_var references are how `transform build` winds the confirmed budget
+    down into a per-statement server-side cap. They have to survive the yaml
+    round trip *intact*: an f-string would silently collapse the closing `}}` to
+    a single brace, rendering a profile that parses, applies, and caps nothing.
+    """
+
+    pytest.importorskip("clickhouse_connect")
+    from exmergo_dex_core.transform import init
+
+    monkeypatch.delenv("CLICKHOUSE_URL", raising=False)
+    _seed_clickhouse_config(tmp_path, host="ch.internal", database="app")
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "clickhouse"), capsys)
+    assert rc == 0, envelope
+
+    rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
+    settings = yaml.safe_load(rendered)["analytics"]["outputs"]["dev"][
+        "custom_settings"
+    ]
+    assert settings["max_execution_time"] == (
+        "{{ env_var('" + init.CH_MAX_EXECUTION_TIME_ENV + "', '300') }}"
+    )
+    assert settings["max_bytes_to_read"].startswith(
+        "{{ env_var('" + init.CH_MAX_BYTES_TO_READ_ENV + "'"
+    )
+    assert settings["max_bytes_to_read"].endswith(") }}")
+    # Both overflow modes are explicit so a server default of `break` could not
+    # turn a cap into a silently truncated result, which is a wrong answer
+    # rather than a refusal.
+    assert settings["timeout_overflow_mode"] == "throw"
+    assert settings["read_overflow_mode"] == "throw"
+    # The literal defaults are real caps, not 0: in ClickHouse 0 means *no
+    # limit*, so a zero default would render a profile that silently removes the
+    # backstop the moment anyone runs dbt by hand.
+    assert "'0'" not in settings["max_execution_time"]
+
+
+def test_init_clickhouse_refuses_dev_database_source_collision(
+    tmp_path: Path, capsys, monkeypatch
+):
+    """dbt builds must write where dex does not read."""
+
+    pytest.importorskip("clickhouse_connect")
+    monkeypatch.delenv("CLICKHOUSE_URL", raising=False)
+    _seed_clickhouse_config(
+        tmp_path, host="ch.internal", databases=["app"], dev_database="app"
+    )
+    rc, envelope = _run(_init_argv(tmp_path, "--connector", "clickhouse"), capsys)
+    assert rc == 1
+    assert "dev_database" in envelope["errors"][0]
+    assert "clickhouse.databases" in envelope["errors"][0]

@@ -117,8 +117,39 @@ _MEASURING = frozenset(
         "entropy",
         "kurtosis",
         "skewness",
+        # ClickHouse spellings. sqlglot canonicalizes `uniq` to ApproxDistinct
+        # and `countIf` to CountIf, both already above, but the rest of the
+        # family parses to AnonymousAggFunc carrying its own lowered name.
+        # Every one of these reduces a column to a single number: the distinct
+        # sketches (uniq*), and the dispersion functions ClickHouse spells
+        # without the underscore the ANSI names use. Deliberately absent, and
+        # therefore carrying: `any`, `argMin`/`argMax`, `topK`, `groupArray`,
+        # `median`/`quantile*` and every other order statistic, all of which
+        # return values from rows.
+        "uniqexact",
+        "uniqcombined",
+        "uniqcombined64",
+        "uniqhll12",
+        "uniqtheta",
+        "uniqupto",
+        "stddevpop",
+        "stddevsamp",
+        "varpop",
+        "varsamp",
+        "covarpop",
+        "covarsamp",
     }
 )
+
+# ClickHouse aggregate combinators that wrap a base aggregate without changing
+# whether it measures: `-If` appends a condition, which is a filter exactly as
+# `FILTER (WHERE ...)` is; `-OrNull` and `-OrDefault` only change what an empty
+# input returns; `-Distinct` de-duplicates the input. So `sumIf` measures
+# because `sum` does, and `maxIf` carries because `max` does. Combinators that
+# change the *shape* of the result are deliberately absent, so `-Array`,
+# `-Map`, `-ForEach`, `-State`, `-Merge` and `-Resample` all fall through to
+# the fail-closed carrying rule.
+_AGG_COMBINATORS = ("ifornull", "ifordefault", "if", "ornull", "ordefault", "distinct")
 
 # JSON/array functions whose result a FROM clause may unnest, per dialect:
 # key enumeration (JSON_KEYS, OBJECT_KEYS, jsonb_object_keys), array-element
@@ -170,6 +201,23 @@ _UNNEST_FUNCS: dict[str, tuple[tuple[type, ...], frozenset[str]]] = {
         ),
     ),
     "redshift": ((), frozenset()),
+    # ClickHouse stores JSON as String and navigates it with the JSONExtract*
+    # family; mapKeys/mapValues reach into a Map column. arrayJoin is the
+    # function spelling of ARRAY JOIN and parses to exp.Explode.
+    "clickhouse": (
+        (exp.Explode, exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON),
+        frozenset(
+            {
+                "jsonextractkeysandvaluesraw",
+                "jsonextractkeys",
+                "jsonextractraw",
+                "jsonextractarrayraw",
+                "mapkeys",
+                "mapvalues",
+                "arrayzip",
+            }
+        ),
+    ),
     "duckdb": (
         (exp.JSONKeys, exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON),
         frozenset({"json_each"}),
@@ -510,12 +558,33 @@ def _resolve_sources(
     from_clause = select.args.get("from_") or select.args.get("from")
     if from_clause is not None:
         source_nodes.append(from_clause.this)
-    source_nodes.extend(join.this for join in select.args.get("joins") or [])
+    # ClickHouse's ARRAY JOIN is a join by grammar and an unnest by meaning: it
+    # expands one row per element of an array *already read from the tables in
+    # scope*, so it reshapes without reaching anything new. It is collected
+    # separately because its node is a bare aliased expression rather than one
+    # of the FROM-source classes, and because the taint rule differs: the
+    # produced column inherits whatever the array it came from carries.
+    array_joins = [
+        join
+        for join in select.args.get("joins") or []
+        if str(join.args.get("kind") or "").upper() == "ARRAY"
+    ]
+    source_nodes.extend(
+        join.this for join in select.args.get("joins") or [] if join not in array_joins
+    )
     # LATERAL VIEW (Databricks/Hive) hangs off the select, not the join list.
     source_nodes.extend(select.args.get("laterals") or [])
 
     sources: dict[str, _Source] = {}
-    for node in source_nodes:
+    for raw in source_nodes:
+        # ClickHouse's FROM <table> FINAL wraps the table in exp.Final. It is a
+        # read modifier (collapse the merge tree's duplicate rows before
+        # reading), so it changes which rows a query sees and nothing about
+        # which columns it may project. Unwrapping here rather than adding a
+        # branch keeps every rule below reading the table it always did;
+        # without it an ordinary ClickHouse query is refused as an unsupported
+        # FROM source.
+        node = raw.this if isinstance(raw, exp.Final) else raw
         alias = node.alias_or_name.lower()
         if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
             dotted = ".".join(p for p in (node.catalog, node.db, node.name) if p)
@@ -541,7 +610,71 @@ def _resolve_sources(
                 f"unsupported FROM source: {type(node).__name__}; query cached "
                 "tables and views only"
             )
+    for join in array_joins:
+        merged = env | sources
+        key, outputs = _array_join_source(join.this, merged, known, tables, dialect)
+        if key in sources:
+            raise QueryRefusedError(
+                f"duplicate source alias '{key}'; give each ARRAY JOIN its own alias"
+            )
+        sources[key] = outputs
     return sources
+
+
+def _array_join_source(
+    node: exp.Expression,
+    sources: dict[str, _Source],
+    known: dict[str, Dataset],
+    tables: set[str],
+    dialect: str,
+) -> tuple[str, _Outputs]:
+    """Admit one ClickHouse ``ARRAY JOIN`` element, or refuse it.
+
+    The rule is the one every other dialect's unnest already follows: an
+    unnest reshapes what the query can already read, and cannot launder. So the
+    expression must derive from columns of tables in scope (bare, or through a
+    JSON/array function this dialect allows), and the column it produces
+    inherits the full taint of whatever it derived from. A PII-flagged array
+    exploded into rows is still PII, one value per row instead of one array per
+    row, which is if anything the more exposed shape.
+    """
+
+    if not isinstance(node, exp.Alias):
+        raise QueryRefusedError(
+            "alias the ARRAY JOIN so its output has a column name, e.g. "
+            "ARRAY JOIN tags AS tag"
+        )
+    inner = node.this
+    # An unnest reshapes what the query can already read; it is not a second
+    # way to reach something. A subquery or a bare relation inside one is a
+    # laundering path (the taint of a value read through a nested SELECT is not
+    # the taint the outer resolution computed), and a literal or generator
+    # synthesizes rows from nothing. Every other dialect's unnest refuses these
+    # in `_unnest_source`; ARRAY JOIN reaches this code by a different route and
+    # owes the same refusal.
+    if any(inner.find(cls) for cls in (exp.Subquery, exp.Select, exp.Table)):
+        raise QueryRefusedError(
+            "ARRAY JOIN over a subquery or relation is not allowed; unnest a "
+            "column of a table the query already reads"
+        )
+    if not inner.find(exp.Column):
+        raise QueryRefusedError(
+            "ARRAY JOIN over a literal or generated array is not allowed; "
+            "unnest a column of a table the query already reads"
+        )
+    _classes, names = _UNNEST_FUNCS.get(dialect, ((), frozenset()))
+    if isinstance(inner, exp.Func):
+        name = _func_name(inner)
+        if not (isinstance(inner, _classes) if _classes else False) and (
+            name not in names
+        ):
+            raise QueryRefusedError(
+                f"ARRAY JOIN over '{name}' is not allowed; unnest a column of a "
+                "table the query already reads, bare or through an allowed "
+                "JSON/array function"
+            )
+    taint = _expr_taint(inner, sources, known, tables, dialect)
+    return node.alias.lower(), {node.alias.lower(): taint}
 
 
 def _resolve_dataset(
@@ -628,7 +761,7 @@ def _expr_taint(
     if isinstance(node, exp.Window):
         # PARTITION BY / ORDER BY route rows; only the function's output crosses.
         return _expr_taint(node.this, sources, known, tables, dialect)
-    if isinstance(node, exp.Func) and _func_name(node) in _MEASURING:
+    if isinstance(node, exp.Func) and _measures(node):
         return set()
     # Everything else (carrying/unknown functions, operators, CASE, casts)
     # passes taint through from all children: fail closed.
@@ -831,9 +964,41 @@ def _source_column_taint(source: _Source, name: str) -> set[_Taint]:
 
 
 def _func_name(node: exp.Func) -> str:
-    if isinstance(node, exp.Anonymous):
+    # AnonymousAggFunc and CombinedAggFunc are how sqlglot parses every
+    # ClickHouse aggregate it has no canonical class for; like Anonymous they
+    # carry the written name in `this`, and their own sql_name() is the class
+    # name ("anonymous_agg_func"), which would match nothing and silently make
+    # every such aggregate carry.
+    if isinstance(node, (exp.Anonymous, exp.AnonymousAggFunc, exp.CombinedAggFunc)):
         return str(node.this).lower()
     return node.sql_name().lower()
+
+
+def _measures(node: exp.Func) -> bool:
+    """Whether a function cuts the value path from its arguments to its result.
+
+    A named measuring aggregate does. So does a ClickHouse combinator over one,
+    which is why the suffixes are peeled here rather than enumerated as names:
+    the family is open (`sumIfOrNull`), and enumerating it would leave the next
+    spelling refused for no reason while stripping unknown suffixes would leave
+    it accepted for no reason. Peeling only the suffixes that provably preserve
+    the base's measuring property keeps the fail-closed default intact.
+    """
+
+    name = _func_name(node)
+    if name in _MEASURING:
+        return True
+    if not isinstance(node, exp.CombinedAggFunc):
+        return False
+    peeled = True
+    while peeled:
+        peeled = False
+        for suffix in _AGG_COMBINATORS:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                name = name[: -len(suffix)]
+                peeled = True
+                break
+    return name in _MEASURING
 
 
 # --- LIMIT clamp ---------------------------------------------------------------

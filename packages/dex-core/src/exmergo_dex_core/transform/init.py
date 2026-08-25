@@ -51,6 +51,7 @@ VALID_CONNECTORS = (
     "databricks",
     "postgres",
     "redshift",
+    "clickhouse",
 )
 
 
@@ -116,7 +117,7 @@ def init_project(
         raise InitError(
             f"connector '{connector}' is not yet supported for init; run "
             "`transform init <name> --connector "
-            "duckdb|bigquery|snowflake|databricks|postgres|redshift`"
+            "duckdb|bigquery|snowflake|databricks|postgres|redshift|clickhouse`"
         )
 
     # ``.`` or --in-place scaffolds at the run root using the directory name.
@@ -712,6 +713,150 @@ def _redshift_profile(
     )
 
 
+DEFAULT_CH_DEV_DATABASE = "dbt_dev"
+
+# The env var `transform build` winds down to the remaining budget, referenced
+# from the rendered profile so dex can tighten the cap per invocation without
+# rewriting the file. The literal defaults are what a hand-run `dbt build`
+# outside dex gets, and they are real caps rather than 0: in ClickHouse 0 means
+# *no limit* on both settings, so a zero default would render a profile that
+# silently removes the backstop the moment anyone runs dbt directly.
+CH_MAX_EXECUTION_TIME_ENV = "DEX_CLICKHOUSE_MAX_EXECUTION_TIME"
+CH_MAX_BYTES_TO_READ_ENV = "DEX_CLICKHOUSE_MAX_BYTES_TO_READ"
+_CH_DEFAULT_MAX_EXECUTION_TIME = "300"
+_CH_DEFAULT_MAX_BYTES_TO_READ = "100000000000"
+
+
+def clickhouse_custom_settings() -> dict[str, Any]:
+    """The `custom_settings` block a dex-rendered ClickHouse profile carries.
+
+    Shared with the dev-target preflight, which reads the profile back and
+    warns when these references are absent: a hand-written profile is welcome,
+    but one dex cannot tighten is a build with no server-side cap, and the
+    caller sizing a budget has to be told which of the two they have.
+    """
+
+    # Built by concatenation, not by an f-string: `}}` is an escape for a
+    # single `}` inside an f-string, so the Jinja close would silently become
+    # one brace and dbt would read the whole thing as a literal string. That
+    # renders a profile which parses, applies, and caps nothing.
+    def env_ref(name: str, default: str) -> str:
+        return "{{ env_var('" + name + "', '" + default + "') }}"
+
+    return {
+        "max_execution_time": env_ref(
+            CH_MAX_EXECUTION_TIME_ENV, _CH_DEFAULT_MAX_EXECUTION_TIME
+        ),
+        "timeout_overflow_mode": "throw",
+        "max_bytes_to_read": env_ref(
+            CH_MAX_BYTES_TO_READ_ENV, _CH_DEFAULT_MAX_BYTES_TO_READ
+        ),
+        "read_overflow_mode": "throw",
+    }
+
+
+def _clickhouse_connection_fields(params: dict, target: Any) -> dict:
+    """The non-secret connection parts of whatever won discovery.
+
+    A DSN is one string to dex and four fields to dbt, so it is parsed rather
+    than refused. Values stay inside the engine except the ones rendered into
+    the profile, and the password is never among them.
+    """
+
+    fields: dict[str, Any] = {
+        key: params[key]
+        for key in ("host", "port", "username", "secure")
+        if params.get(key) is not None
+    }
+    dsn = params.get("dsn")
+    if dsn:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(dsn)
+        fields.setdefault("host", parsed.hostname)
+        if parsed.port:
+            fields.setdefault("port", parsed.port)
+        if parsed.username:
+            fields.setdefault("username", parsed.username)
+        fields.setdefault("secure", parsed.scheme in ("https", "clickhouses"))
+    fields.setdefault("host", target.host)
+    fields.setdefault("port", target.port)
+    fields.setdefault("username", target.user)
+    if target.secure is not None:
+        fields.setdefault("secure", target.secure)
+    return {k: v for k, v in fields.items() if v is not None}
+
+
+def _clickhouse_profile(
+    project_name: str, path: str | None, config: DexConfig, root: Path
+) -> str:
+    """A single dbt-clickhouse ``dev`` target from the discovered connection,
+    with no secret ever rendered: the password is an ``env_var`` reference
+    (``CLICKHOUSE_PASSWORD``, empty default so a passwordless local server
+    still works at dbt runtime).
+
+    dbt-clickhouse has no ``database`` key: its ``schema`` *is* the ClickHouse
+    database, which is the same two-part-namespace fact the adapter encodes.
+    Writes go to a dedicated dev database, never to a source database dex
+    reads from.
+    """
+
+    from ..config import ClickHouseTarget
+    from ..connect import CredentialDiscoveryError, resolve_clickhouse_connection
+
+    target = config.clickhouse or ClickHouseTarget()
+    try:
+        params, _method = resolve_clickhouse_connection(target, os.environ, root)
+    except CredentialDiscoveryError as exc:
+        raise InitError(str(exc)) from exc
+
+    # dbt-clickhouse wants the parts spelled out, while dex is happy with a DSN,
+    # so a DSN-discovered connection is split here rather than refused: making
+    # the user restate coordinates they already gave once is the kind of
+    # friction that gets worked around with a hand-edited profile.
+    fields = _clickhouse_connection_fields(params, target)
+    host = fields.get("host")
+    if not host:
+        raise InitError(
+            "the discovered ClickHouse connection does not name a host, which "
+            "dbt-clickhouse requires; set CLICKHOUSE_HOST or commit "
+            "clickhouse.host in .dex/config.yml"
+        )
+
+    dev_database = target.dev_database or DEFAULT_CH_DEV_DATABASE
+    if dev_database in set(target.databases):
+        raise InitError(
+            f"dev_database '{dev_database}' is also a source database in "
+            "clickhouse.databases; dbt builds must write where dex does not "
+            "read (set clickhouse.dev_database to a dedicated database)"
+        )
+
+    target.dev_database = dev_database
+    config.clickhouse = target
+
+    output: dict[str, Any] = {
+        "type": "clickhouse",
+        "host": str(host),
+        "port": int(fields.get("port") or 8123),
+        "user": str(fields.get("username") or "default"),
+        # Never persist a password: the profile reads it from the environment
+        # at dbt runtime (a Jinja reference, not a value).
+        "password": "{{ env_var('CLICKHOUSE_PASSWORD', '') }}",
+        # dbt-clickhouse's `schema` is the ClickHouse database.
+        "schema": dev_database,
+        "secure": bool(fields.get("secure") or False),
+        # One thread keeps a shared analytical server from parallel bursts; the
+        # per-statement load is the guarded quantity on db-load gating.
+        "threads": 1,
+        "connect_timeout": 10,
+        "custom_settings": clickhouse_custom_settings(),
+    }
+    return yaml.safe_dump(
+        {project_name: {"target": "dev", "outputs": {"dev": output}}},
+        sort_keys=False,
+    )
+
+
 _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]] = {
     "duckdb": _duckdb_profile,
     "bigquery": _bigquery_profile,
@@ -719,6 +864,7 @@ _PROFILE_RENDERERS: dict[str, Callable[[str, str | None, DexConfig, Path], str]]
     "databricks": _databricks_profile,
     "postgres": _postgres_profile,
     "redshift": _redshift_profile,
+    "clickhouse": _clickhouse_profile,
 }
 
 

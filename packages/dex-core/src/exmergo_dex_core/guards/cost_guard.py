@@ -32,6 +32,7 @@ releases it when it settles, both under the store's spend lock. See
 from __future__ import annotations
 
 import hashlib
+import math
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -559,16 +560,37 @@ class CostGate:
         bind when an estimate is wrong ends up permitting the pair to overspend
         together. :meth:`charge` widens the booking when the estimate genuinely
         drifts, so this tightens the cap without capping honest work.
+
+        **A 0 here is a refusal, so only the ceiling may produce one.** The
+        result is an integer because every connector's cap setting takes one,
+        and on the time-paradigm connectors a cap of 0 does not mean "spend
+        nothing" but *no limit* (Postgres ``statement_timeout``, ClickHouse
+        ``max_execution_time``), so the adapters refuse when this returns under
+        one unit rather than handing the server a 0.
+
+        That makes which term produced a sub-unit value load-bearing, and
+        conflating the two was a real defect. ``effective_ceiling`` minus what
+        has actually been *billed* running low means the budget is genuinely
+        nearly gone, and refusing is right. The booking is a different thing: it
+        is headroom this command reserved for work that has not happened, and a
+        cheap statement legitimately books a fraction of a unit. Letting that
+        truncate to 0 refused perfectly affordable work, and it fired on every
+        small query the moment ``session_ceiling`` was set, since that is what
+        creates a reservation at all. So the exhaustion test reads the ceiling,
+        and the booking is only ever allowed to *tighten* the cap, never to turn
+        it into a refusal.
         """
 
         ceiling = self.effective_ceiling()
+        remaining = None if ceiling is None else ceiling - self._billed
+        if remaining is not None and remaining < 1:
+            return 0
         if self._reserved:
-            ceiling = (
-                self._reserved if ceiling is None else min(ceiling, self._reserved)
-            )
-        if ceiling is None:
+            booked = self._reserved - self._billed
+            remaining = booked if remaining is None else min(remaining, booked)
+        if remaining is None:
             return None
-        return max(int(ceiling - self._billed), 0)
+        return max(math.ceil(remaining), 1)
 
     def ledger_field(self) -> str:
         """The ledger key actual spend is recorded under. Paradigm-specific so

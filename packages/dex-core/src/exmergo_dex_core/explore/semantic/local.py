@@ -551,10 +551,17 @@ class LocalMetricFlowBackend:
     def _sql_client(self) -> _RendererOnlySqlClient:
         spec = _RENDERERS.get(self._connector)
         if spec is None:
+            # An inert capability declares itself rather than degrading:
+            # falling back to another dialect's renderer would emit SQL that
+            # parses and returns wrong numbers, which is the worst of the three
+            # available behaviors. MetricFlow ships no ClickHouse renderer, so
+            # the connector is named here rather than silently missing.
+            supported = ", ".join(sorted(_RENDERERS))
             raise SemanticBackendError(
-                f"no MetricFlow renderer for connector '{self._connector}'; local "
-                "metric queries support duckdb, bigquery, snowflake, databricks, "
-                "postgres, and redshift"
+                f"no MetricFlow renderer for connector '{self._connector}'; "
+                f"local metric queries support {supported}. dex will not "
+                "render a metric through another dialect's renderer, because "
+                "the SQL would run and the numbers would be wrong"
             )
         module_name, class_name, engine_name = spec
         from metricflow.protocols.sql_client import SqlEngine

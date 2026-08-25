@@ -24,6 +24,9 @@
     "agent",
     "metricflow",
     "schema-drift",
-    "data-contracts"
+    "data-contracts",
+    "redshift",
+    "postgres",
+    "clickhouse"
   ]
 }

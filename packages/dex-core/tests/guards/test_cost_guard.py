@@ -583,3 +583,68 @@ def test_the_ledger_and_envelope_spellings_stay_distinct():
     ):
         assert ledger_field(paradigm) == ledger
         assert spend_field(paradigm) == envelope
+
+
+def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
+    """A cheap command under a cumulative ceiling must still be runnable.
+
+    `remaining_for_statement` is an integer because every connector's cap
+    setting takes one, and on the time-paradigm connectors a cap of 0 means *no
+    limit* rather than "spend nothing", so the adapters refuse rather than send
+    a 0. Truncating a fractional remainder therefore turned into a refusal of
+    affordable work: setting `session_ceiling` creates a reservation, a cheap
+    command books less than a second, and `int(0.5)` is 0, so every small query
+    was refused with "the remaining budget is under one database-second" against
+    an untouched 60-second budget.
+
+    The discriminator is which term produced the sub-unit value, so all three
+    cases are asserted together: a booking under one unit still yields a usable
+    cap, a genuinely exhausted ceiling still reads as exhausted, and the booking
+    still tightens the cap when it is the smaller of the two. Dropping any one of
+    them would trade a false refusal for a missing one, or the reverse.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=Paradigm.DB_LOAD,
+        connector="clickhouse",
+        command="explore query",
+        ceiling=60.0,
+        confirmed=True,
+        session_ceiling=900.0,
+        session_spent=0.0,
+    )
+    gate.preflight_command(0.5)
+    gate.charge(0.5)
+    assert gate.remaining_for_statement() == 1
+
+    spent = CostGate(
+        paradigm=Paradigm.DB_LOAD,
+        connector="clickhouse",
+        command="explore query",
+        ceiling=60.0,
+        confirmed=True,
+        session_ceiling=None,
+        session_spent=0.0,
+    )
+    spent.record_billed(59.5, job_id=None, statement="prior")
+    assert spent.remaining_for_statement() == 0, (
+        "a ceiling with under a unit left is genuinely exhausted and must still "
+        "refuse, which is the half the booking fix must not break"
+    )
+
+    # And the booking still tightens: 5 booked against a 60-second ceiling caps
+    # the statement at 5, not 60.
+    tight = CostGate(
+        paradigm=Paradigm.DB_LOAD,
+        connector="clickhouse",
+        command="explore query",
+        ceiling=60.0,
+        confirmed=True,
+        session_ceiling=900.0,
+        session_spent=0.0,
+    )
+    tight.preflight_command(5.0)
+    assert tight.remaining_for_statement() == 5

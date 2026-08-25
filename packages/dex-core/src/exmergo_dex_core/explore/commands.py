@@ -268,6 +268,7 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
             config.databricks.dev_schema if config.databricks else None,
             config.postgres.dev_schema if config.postgres else None,
             config.redshift.dev_schema if config.redshift else None,
+            config.clickhouse.dev_database if config.clickhouse else None,
         ]
         if name
     )

@@ -9,7 +9,132 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **ClickHouse connector, self-hosted** ([#188]). The seventh connector, and the
+  second to bill nothing in dollars. Installed as `exmergo-dex-core[clickhouse]`
+  (the `clickhouse-connect` driver plus `dbt-clickhouse`), it runs the whole ETM
+  loop: inventory, profiling with PII flags, relationship inference and
+  verification, firewalled ad-hoc SQL, k-means clustering, `transform init`,
+  plan/apply, dev-target builds, and all four drift axes.
+
+  Identifiers are **two-part** `database.table`. ClickHouse has no catalog level
+  and dbt-clickhouse's `schema:` *is* the ClickHouse database, so a synthesized
+  third component would be a name that appears in the cache, the inventory and
+  every drift finding while being untypeable in `clickhouse-client`. Every
+  shared consumer of an identifier was already arity-agnostic, so nothing
+  downstream needed the fiction.
+
+  The paradigm is **database load**, expressed as database-seconds, exactly like
+  Postgres. Self-hosted ClickHouse bills no currency, but a scan is real load on
+  a server that is usually shared, and `free_local` would have removed the
+  handshake from a connector where an unbudgeted scan of a ten-billion-row table
+  is the exact failure the gate exists to stop. The lifecycle is unusually good:
+  the estimate comes from `EXPLAIN ESTIMATE`, which is free, executes nothing,
+  and prices a statement *after* primary-key and partition pruning, with a
+  `system.tables` fallback for the relations it does not cover and an
+  `estimate_basis` field saying which of the two priced a given command;
+  settlement is free and exact, because every response carries the server's own
+  elapsed nanoseconds in the `X-ClickHouse-Summary` header, so the ledger records
+  what the server spent rather than what the client waited.
+
+  Every billed statement carries **two** server-side caps, not one.
+  `max_execution_time` is checked at block boundaries and a single fast block can
+  overshoot it, so `max_bytes_to_read` rides alongside, derived by inverting the
+  same throughput constant the estimate used. Both overflow modes are set to
+  `throw` explicitly, so a server default of `break` could never turn a cap into
+  a silently truncated result: a refusal is recoverable, a wrong answer is not.
+  `max_result_rows` is deliberately not set, because with `throw` it refuses the
+  one-extra-row fetch that detects truncation and with `break` it was measured
+  not to bind at all.
+
+  Read-only is enforced in depth: `readonly = 2` and `allow_ddl = 0` sent as
+  settings on every statement rather than set once on the client (so a
+  host-supplied client cannot lose them), the SELECT-only guard in the ClickHouse
+  dialect through one execution door, an adapter that issues no mutating
+  statement, and a documented least-privilege user. `connect test` reports
+  `session_read_only` from the server's own setting rather than assuming it, and
+  the reference page states the honest limit: `readonly = 2` permits a session to
+  raise its own settings, so the cap is self-imposed exactly as Postgres's
+  `SET statement_timeout` is, and the unraisable form is a server-side settings
+  constraint.
+
+  Nullability comes from the type rather than a column flag, since
+  `system.columns` has no `is_nullable`: `Nullable(...)` and
+  `LowCardinality(...)` are unwrapped in either nesting order before any type
+  reasoning happens. `ORDER BY` is treated as a sort key and never as a
+  uniqueness constraint, and tables on `ReplacingMergeTree` and its relatives
+  carry a note saying rows sharing the sorting key survive until a merge
+  collapses them, so a duplicate count there reads as engine behavior rather than
+  as a grain defect. `max_full_profile_bytes` is honored only where the table
+  declared a sampling expression in its MergeTree key, and refused out loud with
+  a note where it cannot be, rather than silently producing a full scan the user
+  believed was sampled.
+
+  ClickHouse Cloud bills compute-unit-hours, which dex does not model, so
+  `clickhouse.deployment: cloud` is **refused at connect** naming the gap rather
+  than guarded with a database-seconds number that could not bound the spend. The
+  field and `compute_unit_price_usd` are accepted now so the committed config
+  surface will not change shape when Cloud lands, and
+  `compute_unit_price_usd` is refused under `self_hosted`, where it would be
+  accepted and ignored. Deployment is a declaration, never a sniff: the server's
+  `cloud_mode` setting is checked only to catch a declaration that does not match
+  reality.
+
+  The five safety families are extended to the new connector against a stateful
+  fake (`tests/fakes/clickhouse.py`), and `references/clickhouse.md` documents the
+  cost story, the two-part namespace, and the grant shape. The live suite runs
+  against a container `scripts/setup_clickhouse_dev.sh` stands up, and CI runs
+  that same script rather than a second copy of the seed, so the dogfood target
+  and the CI target cannot drift apart. The whole loop was verified live against
+  ClickHouse 25.3, including a real `dbt build` into the dev database and the
+  shipped `unpivot_json_object` macro, whose ClickHouse implementation uses
+  `ARRAY JOIN` because there is no lateral join.
+
 ### Fixed
+
+- **A `DATETIME` column no longer reports its hour continuity as clean when it
+  was never measured** ([#188]). `is_date_only_type` claimed any type containing
+  `DATE` and not `TIMESTAMP`, which is true of ClickHouse `DateTime` and
+  `DateTime64` **and of BigQuery `DATETIME`**. Those columns were read as bare
+  calendar dates, so the hour-grain half of temporal continuity was silently
+  skipped: the column reported day and month gaps and simply never reported an
+  hour gap, which reads as a clean result rather than a missing one. `DATETIME`
+  is now excluded alongside `TIMESTAMP`. Verified live: a ClickHouse `DateTime`
+  column now reports 2,088 distinct hours and a 3-hour largest gap where it
+  previously reported nothing at that grain.
+
+- **A cheap command is no longer refused for having a sub-unit budget
+  remainder** ([#188]). `remaining_for_statement` returns an integer, because
+  every connector's cap setting takes one, and on the time-paradigm connectors a
+  cap of 0 does not mean "spend nothing" but *no limit* (Postgres
+  `statement_timeout`, ClickHouse `max_execution_time`), so the adapters refuse
+  rather than hand the server a 0. That makes which term produced a sub-unit
+  value load-bearing, and the two were conflated: a ceiling with under a unit
+  left is genuinely nearly spent and refusing is right, but the per-command
+  *booking* is headroom reserved for work that has not happened, and a cheap
+  statement legitimately books a fraction of a unit. Truncating that to 0
+  refused affordable work, and it fired on every small query the moment
+  `budget.session_ceiling` was set, since that setting is what creates a
+  reservation at all: `explore query` against a 60-second budget was refused
+  with "the remaining budget is under one database-second" having spent
+  nothing. The exhaustion test now reads the ceiling, and the booking is only
+  ever allowed to tighten the cap rather than turn it into a refusal.
+  **This affected Postgres identically** and was found by dogfooding the new
+  connector.
+
+- **`transform build` no longer claims a server-side cap it did not inject**
+  ([#188]). `_build_env` keyed the db-load cap on the paradigm alone and set
+  `PGOPTIONS`, and the build result asserted that each statement had been capped
+  by a `statement_timeout` injected through it. That was true while Postgres was
+  the only db-load connector and false the moment a second one existed:
+  ClickHouse ignores `PGOPTIONS` entirely, so the build would have run uncapped
+  while the envelope reported otherwise, which is a false cost-safety claim
+  rather than a missing feature. Both the environment injection and the note now
+  dispatch on the connector, a connector with no registered mechanism gets no
+  cap **and says the build was uncapped**, and a test asserts the two tables
+  cover exactly the same connectors so they cannot drift into claiming a cap
+  that was never applied.
 
 - **`explore query` no longer fails inside its own confirmed budget on
   BigQuery** ([#320]). The server-side `maximum_bytes_billed` cap was set to
