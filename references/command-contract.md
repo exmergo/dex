@@ -116,14 +116,16 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
   {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
   {"path": "snapshots/snap_orders.sql", "kind": "snapshot_sql", "content": "..."},
   {"path": "seeds/country_vat.csv", "kind": "seed_csv", "content": "..."},
+  {"path": "tests/assert_totals_reconcile.sql", "kind": "test_sql", "content": "..."},
+  {"path": "analyses/email_skew.sql", "kind": "analysis_sql", "content": "..."},
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
-`macro_sql`, `snapshot_sql`, `seed_csv`, `project_yml`, or `profiles_yml`. Each
-edit also has an `op`:
+`macro_sql`, `snapshot_sql`, `seed_csv`, `test_sql`, `analysis_sql`,
+`project_yml`, or `profiles_yml`. Each edit also has an `op`:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
@@ -144,7 +146,12 @@ single read-only SELECT, and must target the project's snapshot paths; a
 `seed_csv` edit must parse as CSV with a named, duplicate-free header and one
 field per column on every row, must stay under 5,000 data rows and 1 MiB, must
 not name columns that look like personal data, and must target the project's
-seed paths; a `project_yml` edit targets the project-root
+seed paths; a `test_sql` edit must target the project's test paths and must be
+either a generic test definition (only `{% test %}` blocks and jinja comments,
+balanced) or a singular test that is a single read-only SELECT once its jinja is
+stripped; an `analysis_sql` edit must target the project's analysis paths and be
+a single read-only SELECT on the same terms; a `project_yml` edit targets the
+project-root
 `dbt_project.yml` and must keep a `name`; a `profiles_yml` edit targets the
 project-root `profiles.yml` and must reference every secret via
 `{{ env_var('NAME') }}`, never a literal), pins it to the sha256 of the file it
@@ -163,6 +170,28 @@ seed's column types and a snapshot's tests and docs to be declared. `dbt build`
 runs seeds and snapshots natively, so nothing new has to be run after an apply;
 a snapshot writes a table and is priced in the cost handshake, while a seed
 loads a local CSV, scans nothing, and is deliberately unpriced.
+
+`test_sql` and `analysis_sql` do the same for the two remaining families
+(`test-paths` and `analysis-paths`, again with dbt's defaults). A singular test
+is an arbitrary SELECT that must return no rows, which is where most
+project-specific assertions live, and generic test definitions share the same
+directory, so `test_sql` reads the file to tell them apart: a `{% test %}` block
+is checked structurally like a macro, anything else is checked like a model. A
+singular test naming no `ref()` or `source()` warns rather than refuses, since it
+runs against nothing and passes unconditionally. An analysis is held to the same
+read-only SELECT even though dbt only ever compiles it, because read-only against
+data describes what dex writes rather than what dbt runs. `schema_yml` is
+accepted beside each. Neither kind builds a relation and nothing can `ref()`
+either, so neither is a node: neither enters the drift baseline, and deleting one
+raises no dangling-reference guard. `dbt build` runs a singular test natively and
+prices it like any other test; an analysis is compiled by `dbt compile`, never
+built, and costs nothing.
+
+**Three different things here are called a test.** Generic tests are declared
+inside a `schema.yml` (`data_tests:` on a model or a column). Unit tests are
+scaffolded by `transform test --scaffold <model>` into a `unit_tests:` block,
+also `schema_yml`. Singular tests and generic test *definitions* are files under
+`test-paths`, and those are what `test_sql` authors.
 
 `seed_csv` is the first kind that puts **values**, not logic, into a reviewable
 diff, and a diff goes into git and stays there. So a seed's header is checked
