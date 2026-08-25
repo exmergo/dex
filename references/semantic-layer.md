@@ -10,8 +10,13 @@ difference between them is load-bearing, so it is spelled out here.
 
 - `explore semantic list` returns the catalog in one shape from either backend:
   metrics (name, type, label, description, and the dimensions each can be grouped
-  by), dimensions, and entities. This is the discovery surface an agent reads to
-  decide what to query.
+  by), dimensions (name, type, label, description), and entities (name, type,
+  label, description). This is the discovery surface an agent reads to decide what
+  to query. Every label and description is the dbt project's own words, so an
+  undocumented project returns identifiers and types alone; an unset field is
+  omitted from the payload rather than returned as a null. One divergence: the dbt
+  Cloud API exposes no label on entities, so an entity label arrives only from
+  `--local`, and a hosted catalog that has entities says so in a note.
 - `explore semantic query` runs a metric query and returns a capped, row-major
   result, the same envelope shape as `explore query`. It takes a metric
   positionally after the explicit `query` mode, keeps `--metric <m>` as a
@@ -160,4 +165,5 @@ heuristic at once) wants retrying.
 | Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations |
 | Credentials | the connector's, never in context | a dbt Cloud service token, never in context |
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
+| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, noted on the catalog |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |
