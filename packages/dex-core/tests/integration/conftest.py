@@ -54,6 +54,17 @@ use:
 
     DEX_TEST_REDSHIFT_WORKGROUP=dex-ci DEX_TEST_REDSHIFT_DATABASE=dev \
         uv run pytest tests/integration -q
+
+ClickHouse (bills nothing: a local container; db-load gating is exercised for
+real, server-side caps and all). The DSN should be the read-only user from
+scripts/clickhouse_seed.sql; transform additionally needs the dbt_dev user's
+password in DEX_TEST_CH_DEV_PASSWORD. One script stands the whole thing up and
+is the same one CI runs, so the local target and the CI target cannot drift:
+
+    scripts/setup_clickhouse_dev.sh
+    DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+        DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
+        uv run pytest tests/integration -q -m clickhouse
 """
 
 from __future__ import annotations
@@ -71,6 +82,8 @@ SF_MAX_SECONDS = float(os.environ.get("DEX_TEST_SNOWFLAKE_MAX_SECONDS", "60"))
 DBX_MAX_SECONDS = float(os.environ.get("DEX_TEST_DATABRICKS_MAX_SECONDS", "60"))
 
 RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
+
+CH_MAX_SECONDS = float(os.environ.get("DEX_TEST_CH_MAX_SECONDS", "60"))
 
 
 def _snowflake_enabled() -> bool:
@@ -123,6 +136,14 @@ def _require_cloud_env(request):
                 "plus REDSHIFT_* credentials"
             )
         pytest.importorskip("redshift_connector")
+        return
+    if request.node.get_closest_marker("clickhouse"):
+        if not os.environ.get("DEX_TEST_CH_DSN"):
+            pytest.skip(
+                "ClickHouse integration disabled: set DEX_TEST_CH_DSN (run "
+                "scripts/setup_clickhouse_dev.sh for a seeded local container)"
+            )
+        pytest.importorskip("clickhouse_connect")
         return
     missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
     if missing:
@@ -266,3 +287,13 @@ def assert_unpivot_build(built: dict) -> None:
     assert statuses.get("stg_entities") == "success"
     assert statuses.get("entity_relations") == "success"
     assert all(s in {"success", "pass"} for s in statuses.values()), statuses
+
+
+@pytest.fixture
+def ch_dsn() -> str:
+    return os.environ["DEX_TEST_CH_DSN"]
+
+
+@pytest.fixture
+def ch_dev_password() -> str:
+    return os.environ.get("DEX_TEST_CH_DEV_PASSWORD", "dbt_dev")
