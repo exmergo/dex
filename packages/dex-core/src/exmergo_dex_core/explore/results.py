@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from ..cache import Dataset, DexCache, Relationship
 from ..results import Result
 from .semantic import SemanticCatalog
+from .summary import MapObject
 
 
 class InventoryEntry(BaseModel):
@@ -103,11 +104,23 @@ class RankedObject(BaseModel):
 class MapResult(Result):
     """The whole landscape in one pass: inventory, profiles, and relationships.
 
+    The payload is the map itself, budgeted: what each top-ranked object is, what
+    identifies it, what is wrong with it, and how it joins. The counts stay
+    alongside it unchanged, so a caller reading them today reads the same numbers
+    tomorrow. What the payload never carries is the whole cache, which on a real
+    warehouse is megabytes of stdout, and never a column value; see
+    :mod:`.summary` for the budget and what it deliberately omits.
+
+    ``notes`` is always reported, like ``diagram`` and ``query``: an empty list is
+    the positive statement "nothing was elided", and without it a caller cannot
+    tell a complete map from a capped one.
+
     ``cache`` is the composed cache this run wrote, handed back so a library
     caller has the datasets and relationships without a second read. It stays out
-    of the payload deliberately: the envelope reports the shape of the map and
-    the top objects, and a full cache would be megabytes of stdout.
+    of the payload for the same reason it always did.
     """
+
+    always_reports_notes: ClassVar[bool] = True
 
     cache: DexCache | None = None
     cache_path: str = ""
@@ -123,9 +136,20 @@ class MapResult(Result):
     pii_column_count: int = 0
     data_quality_note_count: int = 0
     top_objects: list[RankedObject] = Field(default_factory=list)
+    objects: list[MapObject] = Field(default_factory=list)
+    edges: list[Relationship] = Field(default_factory=list)
+    elided_object_count: int = 0
+    elided_column_count: int = 0
+    elided_edge_count: int = 0
     updated_at: str = ""
 
     def data(self) -> dict[str, Any]:
+        # `objects` and `edges` are lists of records rather than objects keyed by
+        # identifier, for the reason spelled out on `DiagramResult.data`: a
+        # warehouse object name must never become a JSON key, because the
+        # envelope sanitizer matches key names against secret-like substrings and
+        # a table legitimately called `access_tokens` would take the whole
+        # command down on the way out.
         return {
             "cache_path": self.cache_path,
             "object_count": self.object_count,
@@ -140,6 +164,11 @@ class MapResult(Result):
             "pii_column_count": self.pii_column_count,
             "data_quality_note_count": self.data_quality_note_count,
             "top_objects": [o.model_dump(mode="json") for o in self.top_objects],
+            "objects": [o.model_dump(mode="json") for o in self.objects],
+            "edges": [e.model_dump(mode="json") for e in self.edges],
+            "elided_object_count": self.elided_object_count,
+            "elided_column_count": self.elided_column_count,
+            "elided_edge_count": self.elided_edge_count,
             "updated_at": self.updated_at,
         }
 
