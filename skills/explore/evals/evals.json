@@ -38,12 +38,12 @@
     {
       "id": 0,
       "prompt": "I just connected a DuckDB file with a few dozen tables. Help me understand what's in it and which tables are worth my attention.",
-      "expected_output": "A ranked landscape from inventory and a draft .dex/ map, reported as counts and a ranked shortlist, without dumping the full schema into context.",
+      "expected_output": "A ranked landscape from inventory and a draft .dex/ map, reported as counts plus the map's own budgeted findings, without dumping the full schema into context.",
       "files": [],
       "assertions": [
         "Drives the engine via the wrapper (explore inventory --rank and/or explore map) and reads the JSON envelope; does not invent results",
         "Reports a ranked shortlist of objects, not all of them; no per-column listing appears for the full warehouse (sense-making, not enumeration)",
-        "When map is run, it reports the cache summary by counts (object_count, profiled_count, relationship_count, pii_column_count), not by pasting the cache contents",
+        "When map is run, it relays what the envelope returned: the counts (object_count, profiled_count, relationship_count, pii_column_count) and the budgeted findings the payload carries, without pasting the cache contents or re-listing every column",
         "No raw rows and no credentials appear anywhere in the output (clean envelope)"
       ]
     },

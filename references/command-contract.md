@@ -47,7 +47,13 @@ dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
-dex explore map                   -> write/update the .dex cache; print a summary
+dex explore map [--detail]        -> write/update the .dex cache, and return the map:
+                                     per top-ranked object its grain, key, notable
+                                     columns, PII flags and data-quality findings,
+                                     plus the join edges, alongside the counts. Every
+                                     cap binds in every mode and every elision is
+                                     counted in notes; --detail widens the selection,
+                                     never the caps. No column value ever appears
 dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
                                      free and connectionless (a store read, no warehouse);
                                      declared joins solid, inferred dotted, and a cardinality
@@ -316,6 +322,39 @@ models reachable from metric definitions rank higher alongside the configured
 `ranking_hints`. The compiled manifest resolves names exactly when present;
 an uncompiled project falls back to name-based resolution and says so. A
 stale manifest (older than the model sources) is noted, not trusted silently.
+
+**`explore map` returns the map, not a receipt for it.** Alongside the counts,
+`data.objects` carries each top-ranked object's row count, detected grain,
+candidate key, notable columns (each with the role that earned it a place:
+`grain`, `key`, `join`, or a PII flag) and data-quality findings, and `data.edges`
+carries the join edges in exactly the shape `explore relationships` returns them.
+It is budgeted the way `explore diagram` is budgeted: at most 25 objects kept by
+rank, 12 columns per object, 40 edges, and 5 data-quality findings per object.
+Every cap binds in every mode, `elided_object_count` / `elided_column_count` /
+`elided_edge_count` report what each one cut, and `notes` names the count, the cap
+and the way to read the rest, so a truncated answer never reads as a complete one.
+`notes` is always present, so an empty list is the positive statement "nothing was
+elided".
+
+Which objects are eligible differs from `explore diagram` on purpose, and the two
+commands share only the *column* selection. Every profiled object is eligible here,
+including one that joins to nothing, because an isolated lookup table carrying PII
+flags and an empty-table warning is exactly a finding; the diagram drops those,
+since a box with no edge draws nothing. So a map can report more objects than the
+diagram of the same cache draws, and the counts in the envelope always reconcile
+with the objects printed beside them.
+
+`--detail` widens what is *eligible*: every column rather than the notable ones,
+and objects that were inventoried but never profiled. It lifts none of the caps.
+It is deliberately not spelled `--full`, which on this command decides how much
+gets scanned and therefore what the run costs; `--detail` decides only how much of
+what was found comes back, and spends nothing.
+
+**No column value crosses this envelope.** The cache holds `min_value`,
+`max_value` and a value domain for the columns that earned them, and this command
+does not read them: `explore profile` is where a caller asks for a value domain,
+deliberately and one object at a time. PII is category and confidence, as
+everywhere.
 
 `explore map` never caps silently: past 50 objects it profiles the top
 `profile_top_n` (default 25) by rank and announces the cutoff in `notes`
