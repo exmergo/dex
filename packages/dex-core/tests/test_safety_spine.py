@@ -918,6 +918,130 @@ def test_pii_refusal_s_suggested_override_carries_no_value():
     assert "AFRICA" not in message and "@" not in message
 
 
+def test_a_seed_s_pii_refusal_fires_before_any_diff_is_built(dbt_project_dir: Path):
+    """A seed is the first edit kind that puts **values** into a reviewable diff,
+    and a diff goes into git and stays there.
+
+    Two things have to hold, and only one of them is the refusal. The other is
+    its position: ``plan`` validates every edit before it builds a single diff,
+    because the envelope sanitizer walks ``data`` and never ``diffs``. If the
+    order were the other way round, a refused seed's values would already be in
+    the diff list, and from there in the transcript. So this asserts the
+    ordering, not just the outcome: nothing was stored, nothing was written, and
+    the message that comes back carries the column name and never a value.
+    """
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import EditValidationError
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    a_person = "someone@example.com"
+    with pytest.raises(EditValidationError) as excinfo:
+        transform.plan(
+            "a lookup built from customer data",
+            [
+                transform.PlanEdit(
+                    path="seeds/contacts.csv",
+                    kind=transform.EditKind.SEED_CSV,
+                    new_content=f"id,email\n1,{a_person}\n",
+                )
+            ],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=store,
+        )
+    message = str(excinfo.value)
+    assert "'email' looks like email" in message
+    assert a_person not in message
+    # Nothing was stored (the plan never got made) and nothing was written.
+    assert store.list_plans() == []
+    assert not (dbt_project_dir / "seeds" / "contacts.csv").exists()
+
+
+def test_a_refused_seed_never_reaches_a_dbt_subprocess(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    """The PII gate runs before the parse, not after it.
+
+    `transform plan` hands snapshots, seeds and the config kinds to dbt's own
+    parser before it stores anything, and that parser reads a *copy of the
+    project with the edit written into it*. Parsing first would put a refused
+    seed's values on disk and through a subprocess before the gate ever fired,
+    which is the same failure the profiles secret-guard is ordered against.
+
+    Found by dogfooding, not by the suite: every unit test called the validator
+    directly and so could not see what the command layer did first.
+    """
+
+    import importlib
+    import json as _json
+
+    from exmergo_dex_core.cli import main
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def refuse_to_run(*args, **kwargs):
+        raise AssertionError("dbt was handed the seed before it was refused")
+
+    monkeypatch.setattr(build_mod, "shadow_parse", refuse_to_run)
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        _json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "seeds/contacts.csv",
+                        "kind": "seed_csv",
+                        "content": "id,email\n1,someone@example.com\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "a lookup built from customer data",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    envelope = _json.loads(capsys.readouterr().out)
+    assert rc != 0
+    assert "'email' looks like email" in envelope["errors"][0]
+    assert "someone@example.com" not in _json.dumps(envelope)
+
+
+def test_a_seed_over_the_size_cap_refuses_rather_than_writes(dbt_project_dir: Path):
+    # The other half of "a seed is data entering git": a multi-megabyte CSV is
+    # unreadable in review, which is the one thing a reviewable diff is for.
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import MAX_SEED_ROWS, EditValidationError
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    with pytest.raises(EditValidationError, match="row cap"):
+        transform.plan(
+            "far too much data",
+            [
+                transform.PlanEdit(
+                    path="seeds/big.csv",
+                    kind=transform.EditKind.SEED_CSV,
+                    new_content="code\n" + "x\n" * (MAX_SEED_ROWS + 1),
+                )
+            ],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=store,
+        )
+    assert store.list_plans() == []
+    assert not (dbt_project_dir / "seeds" / "big.csv").exists()
+
+
 def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     # A hand-edit to the cache is overwritten by the next profile; only the
     # committed config entry durably clears a reviewed column, and the clear is
@@ -1698,6 +1822,45 @@ def test_a_stored_plan_cannot_escape_the_surface_its_format_declares(
                 project_format=DbtProject(dbt_project_dir.parent, dbt_project_dir),
             )
     assert not escaped.exists()
+
+
+def test_an_authored_kind_cannot_land_outside_its_own_path_family(
+    dbt_project_dir: Path,
+):
+    """Writes are confined to the repo, and within the repo to the part of the
+    dbt surface the kind belongs to.
+
+    Containment alone is not enough once there are four families: a snapshot
+    written into ``models/`` is inside the surface and still wrong, because dbt
+    parses it as a model and the build fails. So the kind and its location have
+    to agree, in both directions, and neither confirmation nor a re-plan can
+    talk past it.
+    """
+
+    from exmergo_dex_core import transform
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    misplaced = [
+        (
+            transform.EditKind.SNAPSHOT_SQL,
+            "models/staging/snap_customers.sql",
+            "snapshot paths",
+        ),
+        (transform.EditKind.SEED_CSV, "models/staging/lookup.csv", "seed paths"),
+        (transform.EditKind.SEED_CSV, "macros/lookup.csv", "seed paths"),
+        (transform.EditKind.SNAPSHOT_SQL, "seeds/snap.sql", "snapshot paths"),
+    ]
+    for kind, path, named in misplaced:
+        with pytest.raises(transform.PlanError, match=named):
+            transform.plan(
+                "misfiled",
+                [transform.PlanEdit(path=path, kind=kind, new_content="id\n1\n")],
+                dbt_project_dir,
+                repo_root=dbt_project_dir.parent,
+                store=store,
+            )
+        assert not (dbt_project_dir / path).exists()
+    assert store.list_plans() == []
 
 
 def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):
