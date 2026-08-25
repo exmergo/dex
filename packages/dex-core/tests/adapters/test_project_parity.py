@@ -368,6 +368,10 @@ def test_the_dbt_editing_surface_admits_everything_its_writer_accepts(tmp_path: 
         "snapshots/snap_customers.sql",
         "seeds/country_vat.csv",
         "seeds/schema.yml",
+        "tests/assert_totals_reconcile.sql",
+        "tests/generic/not_negative.sql",
+        "analyses/email_skew.sql",
+        "analyses/schema.yml",
         *dbt_project._ALLOWED_ROOT_FILES,
     ):
         contained_key(path, surface)
