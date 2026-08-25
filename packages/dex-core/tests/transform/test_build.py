@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1080,17 +1081,75 @@ def test_build_env_caps_postgres_statements_via_pgoptions(monkeypatch):
     from exmergo_dex_core.transform.build import _build_env
 
     monkeypatch.delenv("PGOPTIONS", raising=False)
-    env = _build_env(Paradigm.DB_LOAD, 120.0)
+    env = _build_env("postgres", Paradigm.DB_LOAD, 120.0)
     assert env is not None
     assert env["PGOPTIONS"] == "-c statement_timeout=120s"
 
     monkeypatch.setenv("PGOPTIONS", "-c search_path=app")
-    env = _build_env(Paradigm.DB_LOAD, 120.0)
+    env = _build_env("postgres", Paradigm.DB_LOAD, 120.0)
     assert env["PGOPTIONS"] == "-c search_path=app -c statement_timeout=120s"
 
-    assert _build_env(Paradigm.DB_LOAD, None) is None
-    assert _build_env(Paradigm.FREE_LOCAL, 120.0) is None
-    assert _build_env(Paradigm.BYTES_SCANNED, 120.0) is None
+    assert _build_env("postgres", Paradigm.DB_LOAD, None) is None
+    assert _build_env("postgres", Paradigm.FREE_LOCAL, 120.0) is None
+    assert _build_env("postgres", Paradigm.BYTES_SCANNED, 120.0) is None
+
+
+def test_build_env_caps_clickhouse_statements_via_custom_settings(monkeypatch):
+    """The second db-load connector caps by a different mechanism, and the cap
+    is two settings rather than one.
+
+    ClickHouse ignores PGOPTIONS entirely, so a paradigm-keyed lookup would hand
+    it a libpq variable and leave the build uncapped while the envelope claimed
+    otherwise. Both settings are asserted because max_execution_time alone is
+    checked at block boundaries: the byte cap is what binds on a fast scan.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform import init
+    from exmergo_dex_core.transform.build import (
+        _CH_SCAN_BYTES_PER_SECOND,
+        _build_env,
+    )
+
+    env = _build_env("clickhouse", Paradigm.DB_LOAD, 120.0)
+    assert env is not None
+    assert env[init.CH_MAX_EXECUTION_TIME_ENV] == "120"
+    assert env[init.CH_MAX_BYTES_TO_READ_ENV] == str(120 * _CH_SCAN_BYTES_PER_SECOND)
+    assert "PGOPTIONS" not in _build_env("clickhouse", Paradigm.DB_LOAD, 120.0) or (
+        env.get("PGOPTIONS") == os.environ.get("PGOPTIONS")
+    )
+
+    assert _build_env("clickhouse", Paradigm.DB_LOAD, None) is None
+    assert _build_env("clickhouse", Paradigm.FREE_LOCAL, 120.0) is None
+
+
+def test_an_uncapped_db_load_connector_gets_no_cap_and_claims_none(monkeypatch):
+    """The degradation and the non-degraded path, asserted together.
+
+    A db-load connector with no cap mechanism registered must inherit the plain
+    environment rather than another connector's variable, and the build note
+    must say the build was uncapped instead of naming a cap that was never
+    applied. The Postgres assertion above it is the non-degraded sibling:
+    without it, a dispatch table that returned None for everything would make
+    this test pass while silently removing every connector's cap.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.build import _build_env
+    from exmergo_dex_core.transform.commands import (
+        _DB_LOAD_CAP_NOTES,
+        _UNCAPPED_BUILD_NOTE,
+    )
+
+    assert _build_env("some-future-db", Paradigm.DB_LOAD, 120.0) is None
+    assert _DB_LOAD_CAP_NOTES.get("some-future-db", _UNCAPPED_BUILD_NOTE) == (
+        _UNCAPPED_BUILD_NOTE
+    )
+    # And every connector that does register a mechanism has a note describing
+    # it, so the pair can never drift into claiming a cap it did not inject.
+    from exmergo_dex_core.transform.build import _CAP_ENV_BUILDERS
+
+    assert set(_CAP_ENV_BUILDERS) == set(_DB_LOAD_CAP_NOTES)
 
 
 def test_dev_target_check_runs_before_the_cost_gate(

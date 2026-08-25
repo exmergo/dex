@@ -613,6 +613,7 @@ def _no_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
         "resolve_databricks_connection",
         "resolve_postgres_connection",
         "resolve_redshift_connection",
+        "resolve_clickhouse_connection",
     ):
         monkeypatch.setattr(connect_mod, name, unreachable)
 
@@ -971,7 +972,7 @@ def test_importing_the_package_pulls_in_no_connector_library():
         "before={m.split('.')[0] for m in sys.modules};"
         "import exmergo_dex_core;"
         "libs={'google','snowflake','databricks','psycopg','redshift_connector',"
-        "'sklearn','httpx','metricflow','duckdb','sqlglot'};"
+        "'clickhouse_connect','sklearn','httpx','metricflow','duckdb','sqlglot'};"
         "print(sorted(({m.split('.')[0] for m in sys.modules} - before) & libs))"
     )
     out = subprocess.run(  # noqa: S603  (this interpreter, a literal probe)

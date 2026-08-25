@@ -25,6 +25,7 @@ ADAPTER_PREFIXES = (
     "databricks",
     "postgres",
     "redshift",
+    "clickhouse",
     "duckdb",
 )
 
