@@ -28,6 +28,7 @@ import yaml
 from .. import command_args
 from .. import envelope as env
 from ..adapters.project import PlacingProject, placement_gap
+from ..config import pii_override_paths
 from ..dbt_project import ApplyResult as PlanApplyResult
 from ..dbt_project import EditOp
 from ..errors import DexError
@@ -206,9 +207,11 @@ def plan(
     """Turn authored edits into a stored plan of reviewable diffs.
 
     ``scaffold`` prepends staging skeletons built from the exploration cache.
-    Deletes and project/profile edits are gated by dbt's own parser here rather
-    than at build time, because a broken ``dbt_project.yml`` breaks everything
-    and an orphaning delete is cheaper to catch before it is stored.
+    Deletes, project and profile edits, snapshots and seeds are gated by dbt's
+    own parser here rather than at build time, because a broken
+    ``dbt_project.yml`` breaks everything, an orphaning delete is cheaper to
+    catch before it is stored, and a snapshot's config and a seed's CSV are
+    shapes dbt's parser knows and a regex only approximates.
 
     ``attribute_rows`` controls the row-population report (see
     :mod:`.row_attribution`), which runs after the plan is stored so that nothing
@@ -229,10 +232,22 @@ def plan(
 
     parse_notes: list[str] = []
     has_delete = any(e.op is EditOp.DELETE for e in edits)
-    has_config = any(
-        e.kind in (EditKind.PROJECT_YML, EditKind.PROFILES_YML) for e in edits
+    # dbt's own parser is a far better gate than a regex on the two kinds whose
+    # shape it fully owns: it resolves a snapshot's config against the project
+    # and reads a seed's CSV the way it will at build time. It is the
+    # authoritative check behind the structural one in `validate`, and it
+    # degrades to a warning where dbt is not installed.
+    parser_owned = any(
+        e.kind
+        in (
+            EditKind.PROJECT_YML,
+            EditKind.PROFILES_YML,
+            EditKind.SNAPSHOT_SQL,
+            EditKind.SEED_CSV,
+        )
+        for e in edits
     )
-    if has_delete or has_config:
+    if has_delete or parser_owned:
         # The secret-guard runs first, so an inlined credential is never handed
         # to the dbt subprocess.
         from ..dbt_project import load as load_project
@@ -242,6 +257,23 @@ def plan(
         project = engine.project_dir()
         view = load_project(project)
         assert_profiles_safe(view, edits)
+        # dex's own refusals run before the subprocess, for the same reason the
+        # secret-guard above does: the parse copies the project with these edits
+        # written into it, so a seed refused for carrying personal data must not
+        # reach disk or a subprocess first, and dbt's message for a misfiled
+        # snapshot ("Encountered unknown tag 'snapshot'") must not stand in for
+        # the one that names the fix. Warnings are dropped here on purpose;
+        # `plans.plan` produces them again and is what the caller sees.
+        overrides = pii_override_paths(engine.config.pii_overrides)
+        cache = readable_cache(engine.store) if _has_seed(edits) else None
+        for edit in edits:
+            plans_mod.admit_edit(
+                edit,
+                view,
+                project,
+                cache=cache if edit.kind is EditKind.SEED_CSV else None,
+                pii_overrides=overrides,
+            )
         # Refuse an orphaning delete with a precise, dbt-independent message
         # before the subprocess runs (which would otherwise report the same
         # danglers as a lower-level parse error). This is the always-available
@@ -1067,6 +1099,10 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
             None if places else engine.project_dir(),
             repo_root,
             store=engine.require_full_store("storing a semantic plan"),
+            # The reviewed columns a human has already cleared, so the seed
+            # gate's refusal can be lifted the same documented way every other
+            # PII refusal is.
+            pii_overrides=pii_override_paths(engine.config.pii_overrides),
             # Agent-authored edits, which is the caller `editing_surface` exists
             # for: there is no placement to compare a path against here, only the
             # surface the format admits to owning. A format declining the write
@@ -1166,6 +1202,16 @@ def _semantic_plan(
         result.warnings.append(parse_warning)
     result.warnings.extend(parse_deprecations)
     return result
+
+
+def _has_seed(edits: list[PlanEdit]) -> bool:
+    """Whether the exploration cache is worth reading for this payload.
+
+    The cache is a stored document and only the seed gate has any use for it, so
+    a plan with no seed in it never pays to load one.
+    """
+
+    return any(e.kind is EditKind.SEED_CSV and e.op is EditOp.UPSERT for e in edits)
 
 
 def _edits_from_payload(

@@ -260,9 +260,7 @@ def shadow_parse(
             ),
         )
         for edit in edits:
-            edit_path = contained_path(
-                shadow, edit.path, view.model_paths, view.macro_paths
-            )
+            edit_path = contained_path(shadow, edit.path, view)
             if edit.op is EditOp.DELETE:
                 # Remove it from the copy so the parse runs against the true
                 # post-deletion tree: a surviving ref() to it fails dbt's parse.
