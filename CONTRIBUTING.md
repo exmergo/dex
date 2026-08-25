@@ -213,6 +213,40 @@ fork-runnable, kept in the integration workflow for pattern parity with the
 cloud connectors rather than as a cost decision. There is no
 `setup_postgres_ci.sh`; there is nothing to provision.
 
+## Live ClickHouse integration tests
+
+The same `tests/integration/` directory carries the ClickHouse suite:
+connection discovery, the database-seconds handshake, the over-ceiling
+refusal, PII flag-not-surface, relationship inference on the seeded orphans,
+temporal continuity over a deliberate gap, a firewalled query using ClickHouse
+idioms (`countIf`, `FINAL`, `ARRAY JOIN`), the dev-target grant preflight, and
+a dbt build into the dedicated dev database. Like the Postgres suite it bills
+nothing and needs no account: the target is a local Docker container.
+
+Unlike Postgres it has only one seeding path, and CI uses it too. The seed is
+multi-statement and the ClickHouse HTTP interface refuses multi-statement
+bodies, so it has to go through `clickhouse-client` inside the container, which
+means the same script serves both places:
+
+```
+scripts/setup_clickhouse_dev.sh
+DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+    DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
+    uv run pytest tests/integration -q -m clickhouse
+scripts/setup_clickhouse_dev.sh --down
+```
+
+There is no `setup_clickhouse_ci.sh`; there is nothing to provision.
+
+Two assertions in that suite are load-bearing and worth understanding before
+changing the seed. The seed puts exactly 40 of 5,000 `order_items` rows on
+products that do not exist, so an orphan probe reporting zero has lost the
+`join_use_nulls` session setting rather than found clean data. And
+`events.occurred_at` is missing exactly three consecutive days out of ninety,
+so a continuity check reporting no gap has the window function wrong. Both
+failures are silent by nature: they produce a clean result rather than an
+error.
+
 ## Agent evals (`evals/`)
 
 The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from
