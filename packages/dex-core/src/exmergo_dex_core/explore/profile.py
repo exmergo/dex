@@ -35,6 +35,7 @@ from ..cache import (
     ValueDomain,
 )
 from ..config import PIIOverrideMatcher
+from ..errors import WarehouseQueryError
 from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
@@ -143,6 +144,13 @@ _NONPERSON_NAME_QUALIFIERS = frozenset(
 _FREE_TEXT = re.compile(
     r"(^|_)(comments?|notes?|message|body|feedback|review_text|bio|about)(_|$)"
 )
+
+# A column name that promises exactly two states (issue #218): the `is_`/`has_`
+# prefixes and `_flag`/`_yn`/`_ind` suffixes a data-quality check reads as
+# "boolean, by convention" even on a connector with no native BOOLEAN type.
+# Matched as a whole underscore-delimited token, same discipline as the PII
+# patterns above, so "is_active" matches but "history"/"island" do not.
+_BOOLEAN_NAME = re.compile(r"(^|_)(is|has|flag|yn|ind)(_|$)")
 
 # "FIXED" is Snowflake's SHOW COLUMNS token for every integer and NUMBER type
 # (surfaced by snowflake._render_type); without it no Snowflake integer column
@@ -548,6 +556,56 @@ def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str |
     )
 
 
+def _boolean_shaped_flag_note(
+    col_name: str,
+    data_type: str,
+    agg: ColumnAggregate | None,
+    domain: ValueDomain | None,
+) -> str | None:
+    """A column named like a two-valued flag (``is_*``, ``has_*``, ``*_flag``,
+    ``*_yn``, ``*_ind``) whose non-null content holds more than two distinct
+    values -- a mixed-encoding defect invisible to anyone who does not ask for
+    the domain (issue #218). Firing does not require telling a data-quality
+    defect apart from a genuine third state; the tool cannot make that call,
+    and naming the count (and the values, when known) is what lets the caller
+    make it instead.
+
+    A genuinely ``BOOLEAN``-typed column can only ever hold two values (plus
+    null) by construction and is excluded outright, whatever its name.
+
+    Where the value domain (#203) is available, the note names the
+    encodings and their counts. Where it is not, because the column failed
+    one of that feature's own eligibility gates (PII-flagged, a candidate
+    key, or too many distinct values to report), the note still fires on the
+    count alone: the tool not being able to name the values is not evidence
+    there are only two of them.
+    """
+
+    if not _BOOLEAN_NAME.search(_normalize(col_name)):
+        return None
+    if any(hint in data_type.upper() for hint in _BOOLEAN_HINTS):
+        return None
+    if agg is None or agg.distinct_count is None or agg.distinct_count <= 2:
+        return None
+
+    if domain is not None and domain.values:
+        total = len(domain.values) + domain.elided
+        encodings = ", ".join(f"{v.value}={v.count}" for v in domain.values)
+        if domain.elided:
+            encodings += f", +{domain.elided} more"
+        return (
+            f"{col_name} looks boolean-shaped by name but holds {total} "
+            f"distinct non-null values: {encodings}; a two-valued read of "
+            "it will misclassify some rows"
+        )
+    marker = "" if agg.distinct_count_exact else "~"
+    return (
+        f"{col_name} looks boolean-shaped by name but holds "
+        f"{marker}{agg.distinct_count} distinct non-null values; a "
+        "two-valued read of it will misclassify some rows"
+    )
+
+
 def _parse_temporal(value: object) -> date | datetime:
     """Normalize a temporal min/max back to a comparable object. Adapters
     disagree about when they call ``json_safe`` on these two fields (see the
@@ -720,33 +778,46 @@ def profile(
         ]
         scan_columns = [c for c in columns if c.name not in blob_excluded]
 
-        aggregates = {
-            a.name: a
-            for a in adapter.column_aggregates(
-                identifier,
-                scan_columns,
-                safe_min_max=safe,
-                shape_stats=shape,
-                type_stats=type_stats,
-                key_shape_stats=key_shape_stats,
-                temporal_stats=temporal_stats,
+        # The adapter knows what the server said and this loop knows which
+        # object it said it about, so a server-side refusal picks up the
+        # identifier on its way past: an envelope reading "the warehouse
+        # refused a statement dex built" is only actionable when it names the
+        # object, and a map run has a dozen of them in flight.
+        try:
+            aggregates = {
+                a.name: a
+                for a in adapter.column_aggregates(
+                    identifier,
+                    scan_columns,
+                    safe_min_max=safe,
+                    shape_stats=shape,
+                    type_stats=type_stats,
+                    key_shape_stats=key_shape_stats,
+                    temporal_stats=temporal_stats,
+                )
+            }
+            # Re-read the metadata after the aggregate scan: adapters whose
+            # inventory row counts are planner estimates (Postgres reltuples)
+            # upgrade to the exact COUNT(*) the scan just paid for, so
+            # uniqueness proofs and the dataset row count are exact. Free
+            # everywhere (cached or trivially cheap on the other adapters).
+            meta, _ = adapter.table_metadata(identifier)
+            aggregates = _escalate_near_unique(
+                adapter, identifier, meta.row_count, aggregates
             )
-        }
-        # Re-read the metadata after the aggregate scan: adapters whose
-        # inventory row counts are planner estimates (Postgres reltuples)
-        # upgrade to the exact COUNT(*) the scan just paid for, so uniqueness
-        # proofs and the dataset row count are exact. Free everywhere (cached
-        # or trivially cheap on the other adapters).
-        meta, _ = adapter.table_metadata(identifier)
-        aggregates = _escalate_near_unique(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        composite_keys = _probe_composite_keys(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        value_domains = _probe_value_domains(
-            adapter, identifier, meta.row_count, aggregates, prelim_pii, composite_keys
-        )
+            composite_keys = _probe_composite_keys(
+                adapter, identifier, meta.row_count, aggregates
+            )
+            value_domains = _probe_value_domains(
+                adapter,
+                identifier,
+                meta.row_count,
+                aggregates,
+                prelim_pii,
+                composite_keys,
+            )
+        except WarehouseQueryError as exc:
+            raise exc.naming(identifier) from exc
         composite_members = {c for pair in composite_keys for c in pair}
 
         profiles: list[ColumnProfile] = []
@@ -787,6 +858,11 @@ def profile(
                     key_note = _heterogeneous_key_note(col.name, agg)
                     if key_note is not None:
                         data_quality.append(key_note)
+                flag_note = _boolean_shaped_flag_note(
+                    col.name, col.data_type, agg, value_domains.get(col.name)
+                )
+                if flag_note is not None:
+                    data_quality.append(flag_note)
             continuity = (
                 _temporal_continuity(agg) if col.name in temporal_stats else None
             )

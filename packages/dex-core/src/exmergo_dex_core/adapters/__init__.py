@@ -60,10 +60,20 @@ def get_adapter(connector: str, **kwargs: Any):
 
 
 def get_dialect(connector: str) -> str:
-    """The SQLGlot dialect for ``connector``, defaulting to DuckDB for unknown
-    names so parsing has a deterministic fallback."""
+    """The SQLGlot dialect for ``connector``.
 
-    return _DIALECTS.get(connector, "duckdb")
+    Raises rather than defaulting to DuckDB on an unrecognized name: a silent
+    fallback here means every subsequent SQL parse silently reads the wrong
+    dialect (a hyphenated BigQuery project id parses as subtraction, for
+    example), producing a confusing parse-error refusal that never mentions
+    the real cause. ``get_adapter`` already raises on the same condition; this
+    matches it instead of being the one caller that stays lenient.
+    """
+
+    try:
+        return _DIALECTS[connector]
+    except KeyError:
+        raise ValueError(f"unknown connector '{connector}'") from None
 
 
 # Connectors that bill nothing for a scan. Kept beside the dialect map and for

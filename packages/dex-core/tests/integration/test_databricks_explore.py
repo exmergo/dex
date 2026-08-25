@@ -13,7 +13,7 @@ import pytest
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.storage import FilesystemStore
 
-from .conftest import DBX_MAX_SECONDS
+from .conftest import DBX_MAX_SECONDS, assert_ok
 from .test_databricks_connect import SAMPLE_SCOPE, run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.databricks]
@@ -31,7 +31,7 @@ def test_inventory_is_free_and_ranked(
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "inventory", "--rank"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     identifiers = {o["identifier"] for o in envelope["data"]["objects"]}
     assert REGION in identifiers
     assert envelope["cost"]["paradigm"] == "compute_time"
@@ -145,7 +145,7 @@ def test_firewalled_query_round_trip(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert envelope["data"]["cells"] == [[5]]
     assert envelope["data"]["spend"]["seconds_billed"] >= 0
 
@@ -186,7 +186,7 @@ def test_lateral_view_explode_runs_live(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert envelope["data"]["cells"] == [["a", 5], ["b", 5]]
 
 

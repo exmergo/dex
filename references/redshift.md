@@ -158,6 +158,19 @@ no TABLESAMPLE, so a sampling knob would be a lie; the budget is the only
 bound. Empty tables are inventoried from `pg_class` even though
 `SVV_TABLE_INFO` omits them.
 
+**Every `CAST` in a generated aggregate is total, and has to stay that way.**
+Redshift evaluates a `CASE` branch's cast for rows the `WHEN` never selects,
+so guarding a cast behind a shape predicate inside a `CASE` does not protect
+it: the declared-type-vs-content probe did exactly that and died on any table
+with one non-numeric string in a profiled column (`Invalid digit, Value 'p',
+Pos 0, Type: Long`). There is no `TRY_CAST` here and the Python UDF escape
+hatch is end-of-support after 2026-06-30, so the discipline is in the
+expression shape: a cast's argument is itself a `CASE` yielding a digit-only
+string on every row, with a sentinel every predicate built on the cast
+rejects. It is enforced offline for all six adapters (see
+`assert_every_cast_is_total`), because no unit test can catch a dialect that
+disagrees with the standard about evaluation order.
+
 ## dbt builds
 
 `transform init` renders a `type: redshift` dev profile from whichever

@@ -335,6 +335,81 @@ def test_server_side_cap_translates_when_the_estimate_drifts(fake_bq_client):
     assert "budget" in str(exc_info.value)
 
 
+# --- issue #320: the server-side cap must not be pinned below the confirmed
+# budget by BigQuery's own execution-time billing rounding, which no dry run
+# predicts. The bug's actual trigger is a `session_ceiling`: without one,
+# `remaining_for_statement()` already equals the confirmed ceiling directly
+# (see `test_every_executed_job_carries_maximum_bytes_billed` above); with
+# one, the per-statement cap is additionally bounded by this command's own
+# reservation (booked at confirm time, sized to the dry-run estimate), which
+# a dry run cannot widen for a gap execution alone reveals.
+
+
+def test_billing_rounding_retries_once_within_the_confirmed_budget(fake_bq_client):
+    # Dry run is accurate to within 1%: nothing was wrong with the estimate at
+    # dry-run time, but the real bill still exceeds the tight reservation a
+    # session_ceiling books it against, the way BigQuery's own execution-time
+    # rounding can regardless of how accurate the dry run was.
+    fake_bq_client.dry_run_underestimate = 0.99
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 160 * MB
+    adapter = make_adapter(
+        fake_bq_client,
+        ceiling=1_000 * MB,  # roughly 6x the estimate, like the reported budget
+        session_ceiling=10_000 * MB,
+    )
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    adapter.cost_gate.preflight_command(
+        adapter.query_estimate(sql)
+    )  # confirm handshake
+
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+
+    non_dry = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(non_dry) == 2  # the too-tight attempt, then the retry
+    first_cap = non_dry[0].job_config.maximum_bytes_billed
+    second_cap = non_dry[1].job_config.maximum_bytes_billed
+    assert first_cap < 160 * MB  # pinned to the reservation, not the ceiling
+    assert second_cap == 160 * MB  # widened to exactly what BigQuery required
+
+
+def test_billing_rounding_retry_still_refuses_past_the_confirmed_ceiling(
+    fake_bq_client,
+):
+    # The real bill (200 MB) exceeds not just the reservation but the
+    # confirmed per-command ceiling itself (120 MB): the retry's own widening
+    # must refuse here, on the real number, rather than silently granting more
+    # than the operator confirmed.
+    fake_bq_client.dry_run_underestimate = 0.5
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 200 * MB
+    adapter = make_adapter(fake_bq_client, ceiling=120 * MB, session_ceiling=1_000 * MB)
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    adapter.cost_gate.preflight_command(adapter.query_estimate(sql))
+
+    with pytest.raises(OverCeilingError) as exc_info:
+        adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    assert "budget" in str(exc_info.value)
+    # No second server-side attempt: the widening itself refused before a
+    # retry could even be issued.
+    non_dry = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(non_dry) == 1
+
+
+def test_parse_bytes_billed_required_reads_bigquerys_own_number():
+    from exmergo_dex_core.adapters.bigquery import _parse_bytes_billed_required
+
+    message = (
+        "Query exceeded limit for bytes billed: 163595928. "
+        "164626432 or higher required."
+    )
+    assert _parse_bytes_billed_required(message) == 164626432.0
+
+
+def test_parse_bytes_billed_required_degrades_to_none_on_an_unexpected_message():
+    from exmergo_dex_core.adapters.bigquery import _parse_bytes_billed_required
+
+    assert _parse_bytes_billed_required("bytesBilledLimitExceeded") is None
+
+
 def test_timeout_cancels_the_job(fake_bq_client):
     fake_bq_client.result_error = TimeoutError("deadline")
     adapter = make_adapter(fake_bq_client)
@@ -845,7 +920,17 @@ def test_get_adapter_wires_bigquery(fake_bq_client):
 def test_get_dialect_resolves_without_clients():
     assert get_dialect("bigquery") == "bigquery"
     assert get_dialect("duckdb") == "duckdb"
-    assert get_dialect("nonsense") == "duckdb"
+
+
+def test_get_dialect_raises_on_an_unrecognized_connector():
+    """A silent fallback to DuckDB here would misparse every subsequent SQL
+    statement in the wrong dialect (issue #319: a hyphenated BigQuery project
+    id reads as subtraction under the DuckDB dialect) while reporting a
+    generic parse error that never names the real cause. Raising matches
+    `get_adapter`'s existing convention for the same condition."""
+
+    with pytest.raises(ValueError, match="unknown connector 'nonsense'"):
+        get_dialect("nonsense")
 
 
 # --- project resolution (connect.py) -----------------------------------------------

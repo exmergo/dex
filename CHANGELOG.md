@@ -136,6 +136,217 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   cover exactly the same connectors so they cannot drift into claiming a cap
   that was never applied.
 
+- **`explore query` no longer fails inside its own confirmed budget on
+  BigQuery** ([#320]). The server-side `maximum_bytes_billed` cap was set to
+  this command's own reservation against the cumulative session ceiling
+  (sized to the dry-run estimate), not the wider per-command budget the
+  operator actually confirmed. BigQuery's own execution-time rounding of
+  bytes billed can exceed any dry-run estimate regardless of how accurate
+  that estimate was, so a multi-table statement confirmed at a budget six
+  times its estimate still failed with `bytesBilledLimitExceeded`, a
+  self-imposed cap the error message never named as the cause.
+
+  BigQuery's own refusal already states the exact byte count it needed
+  (`"163595928. 164626432 or higher required."`), so a statement that hits
+  the cap now widens its charge to precisely that number and retries once,
+  rather than guessing at a margin or handing the warehouse a cap wider than
+  what this command actually reserved. A retry that still can't fit the
+  confirmed ceiling refuses on the real number, exactly as it would have
+  without the retry; the concurrency guarantee a cumulative session ceiling
+  depends on (two commands sharing one ceiling can never jointly overspend
+  it, [#159]) is unaffected, since the widening goes through the same locked
+  admission path an estimate drifting past its booking already used.
+  
+- **A mid-batch `explore query` refusal states exactly how much more budget
+  finishes the batch** ([#321]). BigQuery bills at least its per-query floor
+  no matter how little a statement reads, so an N-statement call needs at
+  least `N x 10,485,760` bytes of headroom; the multi-statement estimate
+  already reserves that (summed per-statement, since each floors on its own
+  distinct tables), and confirming at that estimate already completes every
+  statement for a batch that genuinely reads almost nothing. What can still
+  strand the tail is the same execution-time variance [#320] fixes within
+  one statement, here compounding across several: each statement's real
+  bill sits just far enough above its own floor that the shortfall only
+  surfaces once several statements have already run and billed.
+
+  A refusal partway through a batch already keeps and reports every
+  statement that completed, since it has been paid for; it now also states,
+  in the same refusal, exactly how many bytes finishing the remaining
+  statements needs, computed the same way the original estimate was, so a
+  caller re-running with a wider `--budget` picks the right number the
+  first time rather than guessing again after a second partial run.
+
+- **`get_dialect` now raises on an unrecognized connector instead of
+  silently parsing every subsequent statement as DuckDB** ([#319]). A
+  hyphenated BigQuery project id, the shape BigQuery itself hands out and
+  the exact form `explore query` and `explore inventory` print back, parses
+  as subtraction under the DuckDB dialect. `explore query` and the query
+  firewall already resolve and thread the connector's own dialect into
+  every parse, so a hyphenated project id has parsed correctly in the
+  BigQuery dialect since early in the project. The one remaining way to
+  still hit that failure was a connector-name mismatch: `.dex/config.yml`'s
+  `connector` field is a plain string with no enum validation, and
+  `get_dialect` silently fell back to DuckDB on anything it did not
+  recognize, producing a policy-refusal-shaped message that actually points
+  at a SQL parser and names neither the mismatch nor the fix.
+
+  `get_dialect` now raises the same way `get_adapter` already does for the
+  same condition, so a connector-name mismatch fails loudly at the point it
+  happens instead of silently picking the wrong dialect. Regression tests
+  lock in that a hyphenated project id (fully-quoted-per-part, backtick-
+  wrapped-as-one-identifier, and the bare unquoted form copied verbatim
+  from an `explore query` `tables` entry or an `explore inventory`
+  `identifier`) parses correctly in every spelling and reaches the cost
+  handshake.
+  
+- **Entity matching survives table-name suffixes and layer prefixes**
+  ([#208]). A foreign key matched a parent by comparing the singularized
+  column stem against the parent table's name, layer prefix stripped, so a
+  parent named plainly for its entity matched
+  (`inventory_transactions.product_id -> products.id`), but a parent whose
+  name also carried a CDC history suffix or a landing-zone suffix did not:
+  singularizing `conversation_id` yields `conversation`, and nothing
+  recovered `conversation` from `conversation_history_data`, so inference
+  fell back to a child-to-child edge between two tables that merely shared
+  the FK's name, measured at an orphan fraction of 1.0.
+
+  Entity matching now also compares against the parent's name with a small,
+  ordered set of prefixes (`stg_`, `src_`, `raw_`, `dim_`, `fct_`, `fact_`,
+  `int_`, `base_`) and suffixes (`_history`, `_data`, `_raw`, `_snapshot`,
+  `_current`) stripped, repeated until none remain, plus a table-version
+  suffix (`_v2`, `_v3`, ...) always stripped. A match that needed stripping
+  scores below an exact match to the same key, so an unambiguous case is
+  never re-ranked behind a guess that needed help, and `explore
+  relationships`/`explore map`'s notes say when a join relied on it. Where
+  stripping resolves more than one candidate parent, both are proposed
+  instead of the matcher picking one, and `--verify` decides between them.
+  The affix list lives in `.dex/config.yml` under `entity_affixes`
+  (`prefixes`/`suffixes`), small by default and overridable for a house
+  convention it doesn't already cover.
+  
+### Added
+
+- **`explore profile` flags a boolean-shaped column with more than two
+  values** ([#218]). A column named like a two-valued flag (`is_*`, `has_*`,
+  `*_flag`, `*_yn`, `*_ind`) whose content holds more than two distinct
+  non-null values is a mixed-encoding defect, and it went unreported: on the
+  public ADE-bench `helixops_saas.duckdb`, `raw_workspaces.primary_ws_yn`
+  holds five distinct values under a name that promises two. Every
+  `where flag = 'Y'` written against a column like that is quietly wrong for
+  some share of rows, and the share was invisible without asking for the
+  domain directly.
+
+  A data-quality observation now fires when a boolean-ish name and a
+  non-null distinct count above two coincide, naming the encodings and their
+  counts wherever the value domain ([#203]) is already known for that
+  column, and falling back to the count alone where it is not (a column that
+  failed one of that feature's own eligibility gates is not evidence there
+  are only two values, only that the tool cannot name them). A genuinely
+  `BOOLEAN`-typed column is excluded outright, whatever its name: it cannot
+  hold more than two values by construction. The check does not, and is not
+  asked to, tell a data-quality defect apart from a genuine third state; the
+  tool cannot make that call, and naming what it found is what lets the
+  caller make it instead.
+  
+- **A PII refusal names the exact override entry that would clear the
+  column** ([#217]). The firewall's refusal was correct, and so is a name
+  detector flagging `account_name` on a table of companies or a team name in
+  a sports dataset; the false positive is the design working, and a human
+  reviewing it is the intended next step. But the message offered only two
+  routes, a measuring aggregate or dropping the column, both of which mean
+  not getting the answer. The third route, a reviewed `pii_overrides` entry,
+  existed and was never mentioned, and the cost of that omission was not the
+  override itself but the interval before anyone learned it existed: in
+  practice the caller opened a raw SQL client instead, where neither the
+  firewall nor the PII policy applies at all.
+
+  The refusal now says, for each blocking column, the exact entry that would
+  clear it, in flow-mapping YAML ready to paste under `pii_overrides:` in
+  `.dex/config.yml`: the fully qualified form always, and a scope-glob
+  pattern form alongside it when the same column name is flagged at the same
+  category on another dataset, which is the actual evidence a wider scope is
+  worth suggesting rather than a guess at how far a naming convention
+  reaches. The suggested scope is never wider than the schema that evidence
+  came from; a caller who knows it reaches further widens the glob
+  themselves. Both forms are text in the message, exactly like the existing
+  aggregate guidance beside them: nothing is applied, nothing changes about
+  what the query returns, and the entry is built from the column's identity
+  (dataset, column, category) alone, the same structural guarantee
+  `PIIFlag` itself already makes, so no value can appear in it by
+  construction.
+
+  The open question the issue posed, whether to suppress the suggestion for
+  the highest-severity categories, is answered no: nothing in the engine
+  ranks `PIICategory` by severity today, the block threshold is deliberately
+  uniform across every category on record, and the suggestion is inert text
+  a human must still copy, edit, and commit, exactly as much friction for
+  `credential` as for `name`. Inventing a severity tier to special-case here
+  would be new, untested policy with no existing basis, not a fix.
+  
+- **`explore profile --check-cumulative` detects a running total or
+  point-in-time snapshot measure** ([#219]). A numeric column holding a
+  running total, an account balance, or a subscription's current MRR
+  profiles identically to one holding a per-row increment: same type, same
+  null fraction, same uniqueness. Summing it across rows is a common and
+  severely damaging misreading, and it silently inflates every aggregate
+  built on top of it.
+
+  The signal is structural: within an entity (a repeating, id-shaped column
+  that is not itself the table's own key) ordered by a temporal column, a
+  cumulative or snapshot measure almost never decreases from one observation
+  to the next, while a genuine per-row increment has natural ups and downs.
+  Measuring that needs a window-function scan over the table, so it sits on
+  the gated side of the free-versus-gated split: opt-in via
+  `--check-cumulative`, priced and confirmed the same way `--verify` prices
+  relationship overlap probes. The base profile always completes and is
+  returned first; the check runs as a second, individually skippable phase
+  against what the base scan already proved, and never blocks it. A table
+  missing an entity key or a temporal column is skipped with a note, not
+  silently reported as clean, and only fractions and observation counts ever
+  leave the engine, never a measure's value.
+
+## [1.6.6] - 2026-08-15
+
+### Fixed
+
+- **Profiling a non-PII string column no longer kills the statement on
+  Redshift** ([#310]). The declared-type-vs-content probe (#204) guarded every
+  `CAST` behind a length-bounded shape predicate inside a `CASE`, on the
+  premise that a dialect without `TRY_CAST` would then never evaluate the cast
+  for a row the `WHEN` excluded. Postgres honors that premise; Redshift does
+  not, and evaluates the branch for rows it never selects, so one ordinary
+  varchar status or category column was enough to fail the whole profiling
+  statement with `Invalid digit, Value 'p', Pos 0, Type: Long`. The probe
+  shipped in 1.6.2, so on Redshift that took down `explore profile`,
+  `explore relationships`, and `explore map`, plus the commands that profile
+  the object they name before running (`explore query`, `explore cluster`).
+
+  Every `CAST` the probe builds is now total: the argument is a `CASE` that
+  yields a digit-only string on every row of the column, so no evaluation
+  order can reach a cast with something it cannot parse, and the sentinel it
+  falls back to is rejected by every predicate built on the cast. The
+  measurements are unchanged, denominators included; the "shaped versus not
+  shaped" distinction the fractions need now comes from a separate uncast
+  expression instead of from the cast result being NULL. The fix is
+  dialect-agnostic and lands in the shared expression builder, so the standing
+  assumption about lazy `CASE` evaluation is gone from all six adapters, and an
+  offline invariant test asserts the shape on every one of them.
+
+- **A statement the warehouse refuses is classified, names its object, and
+  reports what it spent** ([#310]). A server-side SQL error escaped the
+  adapters untranslated. Not being a `DexError`, it fell through every reason
+  override and arrived as `reason: internal` ("not a deliberate dex refusal")
+  with `data: {}`: nothing to branch on, no object named, and no spend, on a
+  connector that had already billed the seconds the statement ran before it
+  died. Every adapter now raises a typed `WarehouseQueryError` (exported from
+  the package root, `reason: execution_failure`) carrying the server's own
+  message and error code, trimmed to one line and capped; profiling names the
+  object the refused statement was reading; and an error envelope from a
+  metered connector reports the spend the ledger recorded, as the
+  budget-exhaustion path already did. The live suites now assert with a helper
+  that prints `errors` rather than an envelope repr pytest truncates, which is
+  what kept the Redshift message out of sixteen CI logs.
+
 - **`maintain check` carries each axis's findings in the command envelope**
   ([#279]). The top-level `data.findings` ranking could report drift while the
   adjacent per-axis result did not carry those findings, making an axis look
@@ -175,7 +386,31 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   Implemented across every connector (DuckDB, BigQuery, Snowflake,
   Databricks, Redshift, Postgres); gated on no PII flag at all, at any
   confidence, the same rule #204's declared-type checks already use.
-  
+
+- **A missing `uv` is a refusal that names the fix, not a traceback** ([#310]).
+  The skill wrappers shell into `uv run` to install and run the engine, and did so
+  with no guard, so on a machine without `uv` on `PATH` a first run ended in a raw
+  `FileNotFoundError`. Nothing said `uv` was required either: not the plugin
+  manifest, not the skill frontmatter, not the install sections of the READMEs. The
+  documented Claude Code path is two `/plugin` commands and then "the skills appear
+  and auto-trigger", so a user who followed it exactly could land on a stack trace,
+  and the person most likely to hit it is a Claude Code user rather than a Python
+  developer. dex collects no telemetry by design, which is what makes this worth
+  fixing pre-emptively: every user who hit it churned invisibly, and no report was
+  ever going to arrive.
+
+  The wrapper now checks for `uv` before it execs and, when it is absent, prints the
+  same envelope shape every other refusal uses (`status: error`,
+  `reason: prerequisite`) carrying the install command, and exits 1. It is the one
+  envelope built by hand rather than through `exmergo_dex_core.envelope`, since the
+  engine that would build it is exactly what has not been installed yet; a test
+  holds the two shapes in step. Invoked through `uv run`, the shell still fails
+  first with `command not found`, which no guard inside the script can catch, so
+  each `SKILL.md` now tells the agent what that message means, what to tell the user
+  to install, and not to reach for raw Python or a database CLI instead: the
+  guardrails live in the engine, so every other path is unguarded. The prerequisite
+  is stated up front in the README and in `AGENTS.md` for the any-agent path.
+
 ## [1.6.5] - 2026-08-14
 
 ### Added
@@ -267,7 +502,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   example and the CLI on-ramp show the same data and the packaging suite
   verifies the generator against a freshly built wheel.
 
-
 - **`transform test --scaffold <model>` derives a dbt unit test from a
   model's own inputs** ([#215]). Writing a unit test by hand means restating
   every input's column set with correctly typed values before the assertion
@@ -348,7 +582,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `relationships` and not at all in a bare `explore profile`, so it needs
   new persisted state and a new cross-command annotation pass. Filed as a
   follow-up rather than folded in here.
-
+  
 - **`CacheUnreadableError`**, exported from the package root and from
   `exmergo_dex_core.storage`. The sibling of `CacheRequiredError` that
   `BaselineUnreadableError` is of `NoBaselineError`: both remediate the same way,

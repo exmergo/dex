@@ -413,6 +413,32 @@ def test_unconfirmed_query_returns_estimate_and_logs(
     assert json.loads(log_lines[-1])["decision"] == "needs_confirmation"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Issue #319: a hyphenated project id, both fully-quoted-per-part and
+        # backtick-wrapped-as-one-identifier, plus the bare unquoted form
+        # copied verbatim out of an `explore inventory` identifier or an
+        # `explore query` `tables` entry. All three must parse in the
+        # connector's own dialect and reach the cost handshake rather than
+        # a "could not parse query" refusal on the hyphen.
+        "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+        "SELECT COUNT(*) AS n FROM `test-proj.shop.customers`",
+        "SELECT COUNT(*) AS n FROM test-proj.shop.customers",
+    ],
+)
+def test_a_hyphenated_project_id_parses_in_every_spelling(
+    fake_bq_client, route_adapter, tmp_path, sql
+):
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(tmp_path, subcommand="query", sql=sql)
+    # A parse failure on the hyphen would come back as an `error` envelope
+    # (`reason: guard`) naming a SQL parser, not this cost checkpoint.
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.cost.estimate == 10 * MB
+
+
 def _clusterable_client():
     """A fake warehouse whose `customers` carries numeric non-key columns.
 
@@ -597,6 +623,99 @@ def test_a_cold_batch_prices_the_shared_scan_and_every_statement_together(
     ]
     assert len([key for key in itemized if key.startswith("test-proj")]) == 1
     assert any("no usable profile" in note for note in envelope.data["notes"])
+
+
+# --- issue #321: the multi-statement per-query floor, and a mid-batch shortfall --
+#
+# BigQuery bills at least its per-query floor no matter how little a statement
+# reads, so an N-statement call needs at least N x that floor of headroom.
+# These tests pin that the estimate already reserves it (acceptance criterion
+# 1), that confirming at exactly that estimate completes every statement in
+# the "reads almost nothing" case the issue describes (acceptance criterion
+# 2), and that a real per-statement billing overage that still strands the
+# tail states the exact extra budget needed to finish, rather than leaving a
+# caller to guess a second time.
+
+
+def _seven_statements_against_customers() -> list[str]:
+    table = "`test-proj`.`shop`.`customers`"
+    return [f"SELECT COUNT(*) AS n{i} FROM {table}" for i in range(7)]  # noqa: S608
+
+
+def test_a_seven_statement_batch_reserves_at_least_n_times_the_floor(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path, subcommand="query", sql=_seven_statements_against_customers()
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.cost.estimate >= 7 * 10 * MB
+    assert envelope.cost.estimate == 70 * MB
+
+
+def test_confirming_at_that_estimate_completes_every_statement(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _seed_query_cache(tmp_path)
+    fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
+    route_adapter(fake_bq_client)
+    statements = _seven_statements_against_customers()
+    unconfirmed = _dispatch(tmp_path, subcommand="query", sql=statements)
+    estimate = unconfirmed.cost.estimate
+
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=statements,
+        confirm=True,
+        budget=estimate,
+    )
+    assert envelope.status.value == "ok"
+    assert [r["status"] for r in envelope.data["results"]] == ["ok"] * 7
+
+
+def test_a_mid_batch_shortfall_states_the_exact_extra_budget_needed(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Each statement's real bill sits just above its own floor, and the dry
+    run under-reports enough that the *estimate* floors to exactly the
+    per-query minimum (masking the gap) while the *real* bill stays above
+    it -- the same execution-time variance issue #320 hits within one
+    statement, compounding here across a batch until the tail is stranded.
+    """
+
+    _seed_query_cache(tmp_path)
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = int(10.6 * MB)
+    fake_bq_client.dry_run_underestimate = 0.98
+    fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
+    route_adapter(fake_bq_client)
+    statements = _seven_statements_against_customers()
+    unconfirmed = _dispatch(tmp_path, subcommand="query", sql=statements)
+    estimate = unconfirmed.cost.estimate
+
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=statements,
+        confirm=True,
+        budget=estimate,
+    )
+    assert envelope.status.value == "error"
+    results = envelope.data["results"]
+    statuses = [r["status"] for r in results]
+    # Earlier statements completed and are saved; only the tail is stranded.
+    assert statuses.count("ok") >= 1
+    assert "failed" in statuses
+    failed = next(r for r in results if r["status"] == "failed")
+    assert "is below BigQuery's" in failed["error"]
+    assert "needs at least" in failed["error"]
+    assert "bytes_scanned" in failed["error"]
+    assert "does not re-pay for them" in failed["error"]
+    # The already-completed statements' real results are still there.
+    ok_results = [r for r in results if r["status"] == "ok"]
+    assert all(r["cells"] == [[1]] for r in ok_results)
 
 
 def test_duckdb_explore_stays_confirmation_free(duckdb_file: Path, capsys):
@@ -840,6 +959,84 @@ def test_verify_handshake_uses_the_adapters_estimate_description():
     assert pending.cost.estimate == 13.0
 
 
+def test_cumulative_handshake_uses_the_adapters_estimate_description():
+    # `--check-cumulative`'s phase checkpoint, exercised the same way as
+    # `verify_handshake` above: a connector that speaks credits/seconds
+    # describes its own estimate, and the checkpoint payload keeps that shape
+    # while overlaying the check-cumulative phase fields.
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore profile",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+                "notes": ["seconds are a coarse translation"],
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.cumulative_handshake(
+        "explore profile", StubAdapter(), 5.0, candidate_count=2, object_count=2
+    )
+    # A request, not a raise: the profiles this phase follows are already paid for.
+    assert pending is not None
+    assert pending.data["estimated_seconds"] == 5.0
+    assert pending.data["per_table_seconds"] == {"(cumulative-measure probes)": 5.0}
+    assert pending.data["phase"] == "check-cumulative"
+    assert pending.data["candidate_count"] == 2
+    assert pending.data["object_count"] == 2
+    assert "notes" in pending.data
+    assert pending.cost.estimate == 13.0
+
+
+def test_cumulative_handshake_stays_none_on_a_free_connector_or_no_candidates():
+    from exmergo_dex_core import command_args
+
+    class FreeAdapter:
+        cost_gate = None
+
+    assert (
+        command_args.cumulative_handshake(
+            "explore profile", FreeAdapter(), 5.0, candidate_count=1, object_count=1
+        )
+        is None
+    )
+
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore profile",
+    )
+
+    class BilledAdapter:
+        cost_gate = gate
+
+    # Nothing eligible to probe: no checkpoint to ask for even on a billed
+    # connector, so this never blocks a run whose profile found no candidate.
+    assert (
+        command_args.cumulative_handshake(
+            "explore profile", BilledAdapter(), 5.0, candidate_count=0, object_count=0
+        )
+        is None
+    )
+
+
 def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
     from exmergo_dex_core.cli import main
 
@@ -1030,3 +1227,117 @@ def test_duckdb_never_warns_about_a_cumulative_cap(duckdb_file: Path, capsys):
     assert main(["explore", "profile", "customers", "--path", str(duckdb_file)]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert _session_warning(payload["warnings"]) == []
+
+
+# --- a statement the server refused (#310) ----------------------------------------
+#
+# Three defects met on this path and each hid the next: profiling built a CAST
+# Redshift refused, the driver's exception escaped untranslated so the envelope
+# said `internal` with no reason and no object, and the seconds already billed
+# were reported nowhere, so a failed metered command read as a free one. The
+# first is fixed in the SQL (see test_safety_spine); these pin the envelope the
+# other two produce, which is what makes any future one diagnosable from stdout.
+
+
+def test_a_refused_statement_reports_its_reason_its_object_and_its_spend(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        # Cached on the engine the way the real funnel does it: the settlement
+        # that reads spend back on the way out reads the engine's held adapter,
+        # so an opener that handed out a fresh one per call would test nothing.
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(100 * MB)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    fake_bq_client.row_resolver = _aggregate_resolver
+
+    # The first object profiles and bills; the second meets a server refusal,
+    # which is the ordinary shape of this failure (one bad column in one table
+    # of many, on a run that has already spent).
+    original = BigQueryAdapter.column_aggregates
+
+    def refuse_the_second(self, identifier, columns, **kwargs):
+        if identifier.endswith("events"):
+            fake_bq_client.result_error = api_exceptions.BadRequest(
+                "Bad int64 value: pending"
+            )
+        return original(self, identifier, columns, **kwargs)
+
+    monkeypatch.setattr(BigQueryAdapter, "column_aggregates", refuse_the_second)
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "profile",
+            "customers",
+            "events",
+            "--confirm",
+            "--budget",
+            str(float(100 * MB)),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["status"] == "error"
+    # Classified: the server ran the statement and refused it, which is not the
+    # `internal` an untyped driver exception used to fall through to.
+    assert payload["reason"] == Reason.EXECUTION_FAILURE.value
+    error = payload["errors"][0]
+    assert "Bad int64 value" in error  # the server's own diagnosis, verbatim
+    assert "test-proj.shop.events" in error  # and which object it was about
+    # Metered and failed is not the same as free: the first object's scan was
+    # billed and the envelope says so.
+    assert payload["data"]["spend"]["bytes_billed"] > 0
+    assert payload["cost"]["paradigm"] == Paradigm.BYTES_SCANNED.value
+
+
+def test_a_refusal_that_never_reached_the_warehouse_reports_no_spend(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    """The other side of it: a command refused before the first statement
+    spent nothing, and a spend block of zeroes on that envelope would read as a
+    claim about money where silence is the honest answer."""
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(1)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "profile",
+            "customers",
+            "--confirm",
+            "--budget",
+            "1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["reason"] == Reason.GUARD.value
+    assert "spend" not in payload["data"]

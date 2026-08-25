@@ -40,6 +40,13 @@ mistaken for a clean bill.
 uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
+dex runs its engine through `uv`, which is a prerequisite and is not installed by
+Claude Code. If the shell reports `uv: command not found`, stop and tell the user
+to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
+`brew install uv`, or `pipx install uv`), then re-run. Never fall back to diffing
+the warehouse against the project by hand instead: the drift axes and the baseline
+comparison live in the engine, so any other path is guesswork.
+
 - `maintain snapshot` captures or refreshes the baseline. Run it after a clean
   explore or transform session so later runs have a known-good reference. It pins
   the current `.dex/cache.json` (so the grain baseline is the exact-distinct

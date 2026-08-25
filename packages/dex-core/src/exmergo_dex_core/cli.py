@@ -21,6 +21,7 @@ so the contract, the wrappers, and the eval harness stay exercisable.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 
 from . import command_args
@@ -257,6 +258,16 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "explore" and name in {"relationships", "map"}:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
+                    )
+                # A running total or point-in-time snapshot profiles identically
+                # to a per-row increment; telling them apart needs a window-
+                # function scan over the table, so it is opt-in and priced like
+                # --verify rather than part of the always-free base profile.
+                if group == "explore" and name == "profile":
+                    sp.add_argument(
+                        "--check-cumulative",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
                     )
                 # Force a full re-profile even when the cache holds a fresh,
                 # schema-matching profile for a requested object (the default is
@@ -516,6 +527,10 @@ def main(argv: list[str] | None = None) -> int:
     # inside the handler, so a read taken right after `from_repo` would still
     # see no connector even on a run that went on to pick one.
     engine: DexEngine | None = None
+    # What the command actually billed, captured on the way out for the same
+    # reason the paradigm is: `close()` drops the adapter the gate hangs off,
+    # and it runs before the handlers below.
+    spend: dict | None = None
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -547,6 +562,12 @@ def main(argv: list[str] | None = None) -> int:
             # to name; taken in the `finally` so it reflects whatever the
             # handler resolved, auto-detect included, not just construction.
             paradigm = engine.paradigm
+            # Best-effort by design: a ledger that cannot be read must not
+            # replace the exception on its way out with a bookkeeping failure,
+            # which would lose the reason the command failed to report a
+            # number about it.
+            with contextlib.suppress(Exception):
+                spend = engine.settled_spend()
             engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
@@ -559,6 +580,18 @@ def main(argv: list[str] | None = None) -> int:
         if paradigm is None and getattr(args, "connector", None):
             paradigm = paradigm_for(args.connector)
         envelope = env.error_for(exc, env.redact(str(exc)))
+
+    # A command that failed still spent what it spent. Only the two-phase
+    # refusals used to say so (budget exhaustion carries its own spend), so a
+    # statement that died mid-scan on a metered connector reported `data: {}`
+    # and read as a failure that cost nothing. Filled only where the handler
+    # did not already report it, so the richer partial-completion payload wins.
+    if (
+        envelope.status is env.Status.ERROR
+        and spend is not None
+        and "spend" not in envelope.data
+    ):
+        envelope.data["spend"] = spend
 
     # A guess the engine made on the caller's behalf (issue #199's run-directory
     # DuckDB auto-detect) must never be silent, so it rides into every envelope

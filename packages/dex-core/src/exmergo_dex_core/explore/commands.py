@@ -65,6 +65,7 @@ from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
 from . import cluster as cluster_mod
+from . import cumulative as cumulative_mod
 from . import diagram as diagram_mod
 from . import inventory as inventory_mod
 from . import profile as profile_mod
@@ -202,6 +203,45 @@ def _verify_estimate(
     total = sum(
         query_estimate(sql)
         for sql in rel_mod.probe_statements(candidates, adapter.dialect)
+    )
+    return total, len(candidates), len(objects)
+
+
+def _cumulative_candidates(
+    datasets: list[Dataset],
+) -> tuple[list[tuple[Dataset, cumulative_mod.CumulativeCandidate]], list[str]]:
+    """Every dataset with an eligible entity/temporal/measure shape, paired
+    with the one candidate :func:`cumulative.find_candidate` chose for it, plus
+    the notes (skips, untested alternatives) each dataset contributed."""
+
+    candidates: list[tuple[Dataset, cumulative_mod.CumulativeCandidate]] = []
+    notes: list[str] = []
+    for dataset in datasets:
+        candidate, dataset_notes = cumulative_mod.find_candidate(dataset)
+        notes.extend(f"{dataset.identifier}: {note}" for note in dataset_notes)
+        if candidate is not None:
+            candidates.append((dataset, candidate))
+    return candidates, notes
+
+
+def _cumulative_estimate(
+    adapter: Adapter,
+    candidates: list[tuple[Dataset, cumulative_mod.CumulativeCandidate]],
+) -> tuple[float, int, int]:
+    """Free dry-run pricing of the window-function probes ``--check-cumulative``
+    would run, plus the candidate/object counts for the checkpoint payload;
+    zero-cost on free adapters or when nothing qualifies to probe.
+
+    Mirrors :func:`_verify_estimate`'s shape so the two opt-in probe phases
+    report cost the same way."""
+
+    objects = {dataset.identifier for dataset, _ in candidates}
+    query_estimate = getattr(adapter, "query_estimate", None)
+    if query_estimate is None or not candidates:
+        return 0.0, len(candidates), len(objects)
+    total = sum(
+        query_estimate(sql)
+        for sql in cumulative_mod.probe_statements(candidates, adapter.dialect)
     )
     return total, len(candidates), len(objects)
 
@@ -473,13 +513,18 @@ def profile(
     *,
     refresh: bool = False,
     use_project: bool = False,
+    check_cumulative: bool = False,
 ) -> ProfileResult:
     """Profile the named objects, reusing fresh cached profiles where they exist.
 
     Raises :class:`~..results.ConfirmationRequired` on a billed connector before
     anything is scanned. ``refresh`` forces a re-scan of objects the cache would
     otherwise serve; ``use_project`` folds the dbt project's declared joins,
-    grain, and metric lineage into the result.
+    grain, and metric lineage into the result. With ``check_cumulative``, every
+    profiled dataset with an eligible entity/temporal shape is probed for
+    measures that look like a running total or point-in-time snapshot; this
+    probe is priced only after profiling knows what to test, which is why it
+    can come back as ``pending_confirmation`` rather than raising.
     """
 
     store = engine.store
@@ -531,7 +576,7 @@ def profile(
     # query` on that table must work without a second warehouse scan. Only the
     # freshly profiled are merged; the reused already live in the cache untouched,
     # and prior relationships are preserved because profile runs no inference pass.
-    profiled, _cache, locator, persist_note = _profile_into_cache(
+    profiled, cache, locator, persist_note = _profile_into_cache(
         store, adapter, config, defs, stale, prior, now
     )
 
@@ -550,6 +595,75 @@ def profile(
             f"unchanged, profiled within {window:g}h); pass --refresh to force "
             "re-profiling"
         )
+
+    # Cumulative-measure check: opt-in and priced only once profiling knows
+    # what to test, so it runs after the base profile is already saved and can
+    # come back pending rather than discarding it.
+    cumulative_pending: ConfirmationRequest | None = None
+    if check_cumulative:
+        candidates, candidate_notes = _cumulative_candidates(datasets)
+        notes.extend(candidate_notes)
+        if candidates:
+            probe_cost, candidate_count, object_count = _cumulative_estimate(
+                adapter, candidates
+            )
+            cumulative_pending = command_args.cumulative_handshake(
+                "explore profile",
+                adapter,
+                probe_cost,
+                candidate_count=candidate_count,
+                object_count=object_count,
+            )
+            if cumulative_pending is None:
+                # A fresh-cached dataset here is `_split_fresh_stale`'s deep
+                # copy, not the object `cache.datasets` carries forward, so a
+                # note appended only to `dataset` would show in this result
+                # but never reach the save below. Resolve the cache's own
+                # object by identifier and append there too, guarding against
+                # a double append on the freshly profiled path, where they are
+                # the same object.
+                cache_by_id = {d.identifier: d for d in cache.datasets}
+                measured = 0
+                try:
+                    for dataset, candidate in candidates:
+                        fractions = cumulative_mod.measure_fractions(
+                            adapter,
+                            dataset.identifier,
+                            candidate,
+                            timeout_seconds=config.query.timeout_seconds,
+                        )
+                        cache_entry = cache_by_id.get(dataset.identifier)
+                        for text in cumulative_mod.cumulative_measure_notes(
+                            candidate, fractions
+                        ):
+                            # Idempotent: re-running the check on a dataset a
+                            # prior run already flagged must not pile up the
+                            # same sentence again.
+                            if text not in dataset.data_quality:
+                                dataset.data_quality.append(text)
+                            if (
+                                cache_entry is not None
+                                and cache_entry is not dataset
+                                and text not in cache_entry.data_quality
+                            ):
+                                cache_entry.data_quality.append(text)
+                            notes.append(f"{dataset.identifier}: {text}")
+                        measured += 1
+                except OverCeilingError:
+                    notes.append(
+                        f"budget exhausted after checking {measured} of "
+                        f"{len(candidates)} candidate(s) for cumulative "
+                        "measures; checked results are saved; raise --budget "
+                        "and re-run to finish (a re-run re-profiles first)"
+                    )
+                finally:
+                    locator = store.save_cache(cache, now=now)
+            else:
+                notes.append(
+                    "cumulative-measure check saved unverified; the check "
+                    "awaits confirmation (see hint)"
+                )
+
     result = ProfileResult(
         datasets=datasets,
         profiled_count=len(profiled),
@@ -558,6 +672,7 @@ def profile(
         updated_at=now.isoformat(),
         notes=notes,
         warnings=_override_mismatches(datasets, config.pii_overrides),
+        pending_confirmation=cumulative_pending,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -569,6 +684,7 @@ def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             args.objects,
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
+            check_cumulative=getattr(args, "check_cumulative", False),
         )
     )
 
@@ -685,7 +801,13 @@ def relationships(
     # this run or reused. Inference and merge fold by identifier over the union.
     datasets = profiled + list(fresh_reused.values())
     suppressed: list[rel_mod.SuppressedMatch] = []
-    inferred = rel_mod.infer_relationships(datasets, suppressed=suppressed)
+    affix_matches: list[rel_mod.AffixMatch] = []
+    inferred = rel_mod.infer_relationships(
+        datasets,
+        suppressed=suppressed,
+        affixes=config.entity_affixes,
+        affix_matches=affix_matches,
+    )
 
     # Annotate before persisting so cached datasets carry candidate_keys and
     # grain, the same shape a `map`-written cache has. Only the freshly profiled
@@ -792,6 +914,7 @@ def relationships(
             "dataset mapped alongside its source)"
         )
     notes.extend(_generic_name_notes(suppressed))
+    notes.extend(_affix_match_notes(affix_matches))
     if carried_relationships > 0:
         notes.append(
             f"carried forward {carried_relationships} prior relationship(s) "
@@ -1228,6 +1351,8 @@ def _execute(
         except ConfirmationRequiredError:
             raise
         except Exception as exc:
+            if isinstance(exc, OverCeilingError):
+                exc = _with_batch_shortfall(exc, shared.adapter, batch, statement)
             entry = {
                 "sql": statement.inspected.sql,
                 "decision": "failed",
@@ -1274,6 +1399,49 @@ def _execute(
         if statement.inspected.warnings:
             entry["pii_warnings"] = statement.inspected.warnings
         ledger(statement, entry)
+
+
+def _with_batch_shortfall(
+    exc: OverCeilingError,
+    adapter: Adapter,
+    batch: list[_Statement],
+    statement: _Statement,
+) -> OverCeilingError:
+    """Name exactly how much more this batch needs to finish, not just why
+    this one statement hit the wall (issue #321).
+
+    BigQuery bills at least its per-query floor no matter how little a
+    statement reads, so an N-statement call needs at least ``N x`` that floor
+    of headroom; that arithmetic is fully knowable the moment inference finds
+    the remaining statements, which is exactly what this recomputes. A caller
+    who otherwise has to raise ``--budget`` and guess again now sees the
+    number the first guess would have needed. Already-completed statements
+    are unaffected: their results are kept exactly as :func:`_execute`
+    already keeps them, so a wider budget on re-run does not re-pay for them.
+
+    A no-op (returns ``exc`` unchanged) for a lone, non-batch statement,
+    where "the remaining budget is below the floor" already says everything
+    there is to say, and when the adapter cannot price a dry run at all.
+    """
+
+    if len(batch) == 1:
+        return exc
+    remaining = [s for s in batch if s.index >= statement.index and s.live]
+    query_estimate = getattr(adapter, "query_estimate", None)
+    if query_estimate is None or not remaining:
+        return exc
+    extra = sum(query_estimate(s.inspected.sql) for s in remaining)
+    gate = command_args.cost_gate(adapter)
+    unit = gate.paradigm.value if gate is not None else "bytes"
+    wrapped = OverCeilingError(
+        f"{exc}. Completing the remaining {len(remaining)} statement(s) in "
+        f"this batch needs at least {extra:,.0f} more {unit}; the "
+        "statement(s) already run above are saved, so a wider --budget on "
+        "re-run does not re-pay for them",
+        cost=exc.cost,
+    )
+    wrapped.__cause__ = exc
+    return wrapped
 
 
 def _batch_marks(statement: _Statement, size: int) -> dict:
@@ -1634,7 +1802,13 @@ def map(
     all_selected = profiled + list(fresh_reused.values())
     _annotate_grain(profiled, defs, orphaned=orphaned)
     suppressed: list[rel_mod.SuppressedMatch] = []
-    inferred = rel_mod.infer_relationships(all_selected, suppressed=suppressed)
+    affix_matches: list[rel_mod.AffixMatch] = []
+    inferred = rel_mod.infer_relationships(
+        all_selected,
+        suppressed=suppressed,
+        affixes=config.entity_affixes,
+        affix_matches=affix_matches,
+    )
 
     # Fold same-lineage duplicates before they reach the cache: a dev/replica
     # dataset mapped alongside its source otherwise inflates one real foreign key
@@ -1778,6 +1952,7 @@ def map(
             "dataset mapped alongside its source)"
         )
     notes.extend(_generic_name_notes(suppressed))
+    notes.extend(_affix_match_notes(affix_matches))
     if verify_pending is not None:
         notes.append(
             "relationships saved unverified; verification awaits confirmation "
@@ -2753,6 +2928,25 @@ def _generic_name_notes(suppressed: list[rel_mod.SuppressedMatch]) -> list[str]:
         f"({shown}{more}); a name shared this widely (the norm for Firestore/"
         "Mongo/DynamoDB-style CDC exports) is a naming convention, not evidence "
         "of a relationship, so these never reached --verify"
+    ]
+
+
+def _affix_match_notes(affix_matches: list[rel_mod.AffixMatch]) -> list[str]:
+    """Explain when a join matched only after stripping a configured entity
+    affix (see `EntityAffixes`), so the lower confidence these joins carry
+    doesn't read as an unexplained demotion (issue #208)."""
+
+    if not affix_matches:
+        return []
+    examples = ", ".join(
+        f"{m.child_column} -> {m.parent} (stripped to {m.stripped_to})"
+        for m in affix_matches[:5]
+    )
+    more = f", +{len(affix_matches) - 5} more" if len(affix_matches) > 5 else ""
+    return [
+        f"matched {len(affix_matches)} join(s) to a parent name only after "
+        f"stripping a configured prefix/suffix ({examples}{more}); scored below "
+        "an exact entity-name match to the same key"
     ]
 
 

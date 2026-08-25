@@ -13,7 +13,7 @@ import pytest
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.storage import FilesystemStore
 
-from .conftest import SF_MAX_SECONDS
+from .conftest import SF_MAX_SECONDS, assert_ok
 from .test_snowflake_connect import SAMPLE_SCOPE, run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.snowflake]
@@ -32,7 +32,7 @@ def test_inventory_is_free_and_ranked(
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "inventory", "--rank"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     identifiers = {o["identifier"] for o in envelope["data"]["objects"]}
     assert REGION in identifiers
     assert envelope["cost"]["paradigm"] == "compute_time"
@@ -157,7 +157,7 @@ def test_firewalled_query_round_trip(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert envelope["data"]["cells"] == [[5]]
     assert envelope["data"]["spend"]["seconds_billed"] >= 0
 
@@ -185,7 +185,7 @@ def test_flatten_of_a_parsed_json_literal_runs_live(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert [row[0] for row in envelope["data"]["cells"]] == ["a", "b"]
 
 

@@ -1036,6 +1036,149 @@ def test_heterogeneous_key_end_to_end_real_duckdb(tmp_path: Path):
     assert "comments" not in notes
 
 
+# --- boolean-shaped flag with more than two values (#218) ----------------------
+
+
+def test_boolean_shaped_flag_note_names_the_domain_when_known():
+    """The issue's own worked example: a *_yn column with five values, named
+    with counts once the domain (#203) is known."""
+
+    from exmergo_dex_core.cache import ValueCount, ValueDomain
+    from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
+
+    agg = _aggregate(name="primary_ws_yn", distinct_count=5, distinct_count_exact=True)
+    domain = ValueDomain(
+        values=[
+            ValueCount(value="Y", count=40),
+            ValueCount(value="N", count=38),
+            ValueCount(value="Yes", count=10),
+            ValueCount(value="No", count=8),
+            ValueCount(value="1", count=4),
+        ]
+    )
+    note = _boolean_shaped_flag_note("primary_ws_yn", "VARCHAR", agg, domain)
+    assert note is not None
+    assert "primary_ws_yn" in note and "5 distinct non-null values" in note
+    assert "Y=40" in note and "No=8" in note
+
+
+@pytest.mark.parametrize(
+    ("col_name", "data_type", "agg_kwargs", "expect_note"),
+    [
+        # A *_yn column with more than two values but no domain known (it
+        # failed one of #203's own eligibility gates) still fires, on the
+        # count alone: not being able to name the values is not evidence
+        # there are only two of them.
+        (
+            "primary_ws_yn",
+            "VARCHAR",
+            {"distinct_count": 5, "distinct_count_exact": True},
+            True,
+        ),
+        # A clean two-value flag: no note.
+        (
+            "has_discount",
+            "VARCHAR",
+            {"distinct_count": 2, "distinct_count_exact": True},
+            False,
+        ),
+        # A three-valued flag: still fires, even though a third value could
+        # be a genuine third state rather than a defect -- the tool cannot
+        # tell those apart, and the acceptance criteria says it should not
+        # try.
+        (
+            "is_active",
+            "VARCHAR",
+            {"distinct_count": 3, "distinct_count_exact": True},
+            True,
+        ),
+        # A genuinely BOOLEAN-typed column: excluded outright, whatever its
+        # distinct count claims (it cannot really exceed two).
+        (
+            "is_active",
+            "BOOLEAN",
+            {"distinct_count": 5},
+            False,
+        ),
+        # A column whose name does not match any boolean-ish pattern: no
+        # note, however many values it holds.
+        (
+            "ws_stat_cd",
+            "VARCHAR",
+            {"distinct_count": 6},
+            False,
+        ),
+        # An approximate (not yet escalated) distinct count still fires,
+        # marked accordingly by the caller-visible "~".
+        (
+            "has_flag",
+            "VARCHAR",
+            {"distinct_count": 4, "distinct_count_exact": False},
+            True,
+        ),
+    ],
+)
+def test_boolean_shaped_flag_note_decisions(
+    col_name, data_type, agg_kwargs, expect_note
+):
+    from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
+
+    agg = _aggregate(name=col_name, **agg_kwargs)
+    note = _boolean_shaped_flag_note(col_name, data_type, agg, None)
+    if expect_note:
+        assert note is not None and col_name in note
+    else:
+        assert note is None
+
+
+def test_boolean_shaped_flag_note_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
+
+    assert _boolean_shaped_flag_note("is_active", "VARCHAR", None, None) is None
+
+
+def test_boolean_shaped_flag_end_to_end_real_duckdb(tmp_path: Path):
+    """The issue's own four acceptance scenarios, in one table: a *_yn column
+    with five values names them; a clean two-value flag and a genuinely
+    BOOLEAN column stay silent; a three-valued flag still fires."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "boolean_flag.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE raw_workspaces ("
+        "primary_ws_yn VARCHAR, has_discount VARCHAR, is_native_bool BOOLEAN, "
+        "onboarding_stage_flag VARCHAR)"
+    )
+    yn_values = ["Y", "N", "Yes", "No", "1"]
+    stage_values = ["new", "active", "churned"]
+    rows = [
+        (yn_values[i % 5], "Y" if i % 2 == 0 else "N", True, stage_values[i % 3])
+        for i in range(100)
+    ]
+    conn.executemany("INSERT INTO raw_workspaces VALUES (?, ?, ?, ?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["boolean_flag.main.raw_workspaces"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "primary_ws_yn looks boolean-shaped by name" in notes
+    assert "5 distinct non-null values" in notes
+    assert "Y=" in notes and "Yes=" in notes
+    assert "onboarding_stage_flag looks boolean-shaped by name" in notes
+    assert "3 distinct non-null values" in notes
+    assert "has_discount" not in notes
+    assert "is_native_bool" not in notes
+
+
 # --- pii_overrides: the durable human decision ---------------------------------
 
 

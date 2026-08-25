@@ -124,6 +124,18 @@ DuckDB is free and local, so nothing here asks you to confirm a spend. On BigQue
 or Snowflake the same commands return an estimate first and run only once you agree
 to it.
 
+## Prerequisite: `uv`
+
+dex installs and runs its engine through [`uv`](https://docs.astral.sh/uv/), so you
+need it on your `PATH` before either install below. Neither Claude Code nor the
+plugin installs it for you.
+```
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+`brew install uv` and `pipx install uv` work too. Nothing else is required: `uv`
+supplies the Python and the engine, with the connector extra chosen for you at
+runtime.
+
 ## Benchmarks
 
 We run `dex` on two public analytics-engineering benchmarks. Every run's raw

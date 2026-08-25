@@ -16,6 +16,7 @@ simply calls no mutating client API, and the docs recommend read-only roles
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,7 @@ from .base import (
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "bytes_scanned"
@@ -64,6 +66,16 @@ _BIGINT_TYPE = "INT64"
 # A remaining budget below it can never cover a statement, so we refuse with
 # the math instead of letting the server fail the job after the fact.
 _MIN_BILLED_BYTES = 10 * 1024 * 1024
+
+# BigQuery's own refusal names the exact byte count it needed (issue #320):
+# "Query exceeded limit for bytes billed: <cap>. <required> or higher
+# required." No dry run predicts this number, since it reflects the server's
+# own execution-time rounding of bytes billed (observed per table scanned,
+# not per query), which is exactly the gap between a dry-run-based estimate
+# and what the job actually needed. Parsed rather than guessed at with a
+# margin, so the retry below asks for precisely what BigQuery says it needs,
+# whatever the underlying rounding rule turns out to be.
+_BYTES_BILLED_REQUIRED_RE = re.compile(r"(\d+) or higher required")
 
 # Field types whose values are nested or non-scalar: no approx-distinct, no
 # min/max, and non-null counting via COUNTIF (COUNT DISTINCT is invalid on
@@ -704,7 +716,7 @@ class BigQueryAdapter:
                 "not cover the extra scan; uniqueness verdicts stay approximate",
             )
             return {}
-        _job, iterator = self._run(sql)
+        _job, iterator = self._run(sql, floored)
         rows = list(iterator)
         return {name: int(rows[0][f"d_{i}"]) for i, name in enumerate(columns)}
 
@@ -736,7 +748,7 @@ class BigQueryAdapter:
                 "cover the extra scan; grain stays unknown",
             )
             return {}
-        _job, iterator = self._run(sql)
+        _job, iterator = self._run(sql, floored)
         rows = list(iterator)
         return {
             tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(combinations)
@@ -778,7 +790,7 @@ class BigQueryAdapter:
                 "cover the extra scan; no value domain reported",
             )
             return {}
-        _job, iterator = self._run(sql)
+        _job, iterator = self._run(sql, floored)
         rows = list(iterator)
         return {
             name: ValueDomainSample(
@@ -1053,19 +1065,30 @@ class BigQueryAdapter:
         """SELECT-only guard, free dry-run, gate charge, then the capped run."""
 
         assert_select_only(sql, dialect=self.dialect)
-        self.cost_gate.charge(self._dry_run(sql))
-        return self._run(sql, timeout_seconds=timeout_seconds, max_results=max_results)
+        estimate = self._dry_run(sql)
+        self.cost_gate.charge(estimate)
+        return self._run(
+            sql, estimate, timeout_seconds=timeout_seconds, max_results=max_results
+        )
 
     def _run(
         self,
         sql: str,
+        dry_run_estimate: float,
         *,
         timeout_seconds: float | None = None,
         max_results: int | None = None,
+        _retried: bool = False,
     ) -> tuple[Any, Any]:
         """The single billed door past the gate: run with the server-side byte
         cap, wait for completion (bounded when a timeout is given), account the
-        actual billed bytes, and return (job, row iterator)."""
+        actual billed bytes, and return (job, row iterator).
+
+        ``dry_run_estimate`` is what :meth:`_execute` already charged for this
+        exact statement; a bytes-billed refusal below widens the charge by the
+        gap between that estimate and what BigQuery says it actually needed,
+        rather than charging the full requirement a second time on top of it.
+        """
 
         cap = self.cost_gate.remaining_for_statement()
         if cap is not None and cap < _MIN_BILLED_BYTES:
@@ -1086,12 +1109,38 @@ class BigQueryAdapter:
             iterator = job.result(timeout=timeout_seconds, max_results=max_results)
         except self._api_exceptions.BadRequest as exc:
             if "bytes billed" in str(exc) or "bytesBilledLimitExceeded" in str(exc):
+                required = _parse_bytes_billed_required(str(exc))
+                if required is not None and not _retried:
+                    # No dry run predicts BigQuery's own execution-time
+                    # rounding of bytes billed (issue #320), so the estimate
+                    # this command already charged for the statement can be
+                    # a genuine underestimate even though nothing was wrong
+                    # with it at dry-run time. BigQuery's own refusal names
+                    # exactly what it needed; widen the charge by the gap and
+                    # retry once with that as the new cap. Raises the same
+                    # OverCeilingError/ConfirmationRequiredError this would
+                    # raise anyway if the confirmed ceiling itself can't
+                    # cover the real requirement, so a genuine over-budget
+                    # query still refuses, correctly, on the real number.
+                    self.cost_gate.charge(required - dry_run_estimate)
+                    return self._run(
+                        sql,
+                        required,
+                        timeout_seconds=timeout_seconds,
+                        max_results=max_results,
+                        _retried=True,
+                    )
                 raise OverCeilingError(
                     "the query would bill more than the remaining budget "
                     "(server-side maximum_bytes_billed); raise --budget or "
                     "narrow the query"
                 ) from exc
-            raise
+            # Every other BadRequest is BigQuery refusing the statement itself
+            # (an invalid query, a type it will not coerce). Typed, so the
+            # envelope carries `execution_failure` and BigQuery's own words
+            # rather than the `internal` an untyped API exception falls
+            # through to.
+            raise warehouse_refusal(str(exc)) from exc
         except TimeoutError as exc:
             # concurrent.futures.TimeoutError is the builtin on Python 3.11+.
             self._cancel(job)
@@ -1149,3 +1198,12 @@ def _quote_ident(name: str) -> str:
 
     escaped = name.replace("`", "\\`")
     return f"`{escaped}`"
+
+
+def _parse_bytes_billed_required(message: str) -> float | None:
+    """The byte count BigQuery's own bytes-billed refusal names as required,
+    or ``None`` if the message doesn't have the expected shape (a future
+    wording change should degrade to the old flat refusal, not a crash)."""
+
+    match = _BYTES_BILLED_REQUIRED_RE.search(message)
+    return float(match.group(1)) if match else None

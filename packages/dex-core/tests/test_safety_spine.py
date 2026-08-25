@@ -30,6 +30,50 @@ def _memory_engine(**kwargs) -> DexEngine:
     return DexEngine(config=DexConfig(), store=MemoryStore(), **kwargs)
 
 
+def cast_arguments(sql: str) -> list[str]:
+    """Every CAST argument in one generated statement.
+
+    Matched by parenthesis balance rather than by regex: the arguments nest
+    (a CASE holding a SUBSTR), so a non-greedy match would stop at the wrong
+    close paren.
+    """
+
+    arguments = []
+    for start in (i for i in range(len(sql)) if sql.startswith("CAST(", i)):
+        depth, i = 1, start + len("CAST(")
+        while depth:
+            depth += {"(": 1, ")": -1}.get(sql[i], 0)
+            i += 1
+        arguments.append(sql[start + len("CAST(") : i - 1].rsplit(" AS ", 1)[0])
+    return arguments
+
+
+def assert_every_cast_is_total(sql: str) -> None:
+    """#310: every CAST in a generated aggregate must be castable for every row
+    of the column, not only for the rows a surrounding CASE would select.
+
+    Redshift evaluates a CASE branch's cast for rows the WHEN never selects,
+    so the shape that reads as safe (``CASE WHEN <digits> THEN CAST(col AS
+    BIGINT) END``) died server-side on any table with one non-numeric string
+    in a profiled column. The invariant that replaced it is structural and
+    dialect-independent: the cast's argument is itself a CASE that yields
+    digits on every row, so no evaluation order can reach the cast with
+    something it cannot parse.
+    """
+
+    from exmergo_dex_core.adapters.base import _CAST_SENTINEL
+
+    for argument in cast_arguments(sql):
+        assert argument.startswith("CASE WHEN "), (
+            f"a CAST argument is not shape-guarded, so a row that fails the "
+            f"shape predicate reaches it raw: {argument}"
+        )
+        assert argument.endswith(f"ELSE {_CAST_SENTINEL} END"), (
+            f"a CAST argument has no digit fallback, so it is NULL-or-value "
+            f"rather than total: {argument}"
+        )
+
+
 # --- Family 1: read-only against data; SELECT-only; prod-target refused -------
 
 
@@ -81,8 +125,65 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     assert "tp_d_2" in sql and "tg_d_2" in sql
     assert "tp_m_2" in sql and "tg_m_2" in sql
     assert "tp_h_2" in sql and "tg_h_2" in sql
+    assert_every_cast_is_total(sql)
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
+
+
+def test_a_shape_gated_cast_never_reaches_a_non_numeric_value(tmp_path: Path):
+    """#310: the profiling aggregate must not depend on lazy CASE evaluation.
+
+    Redshift evaluates a CASE branch's cast for rows the WHEN never selects,
+    which killed `explore map` and `explore profile` on any table holding one
+    ordinary varchar status column, and no offline test could catch it because
+    every other dialect honors the guard. This reproduces that engine here: it
+    lifts each CAST argument out of the generated statement and casts it over
+    every row, which is exactly the work Redshift does eagerly. A raise is the
+    bug; the fixed shape casts digits on every row and cannot raise anywhere.
+    """
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    path = tmp_path / "statuses.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE orders (id INTEGER, status VARCHAR)")
+    conn.executemany(
+        "INSERT INTO orders VALUES (?, ?)",
+        [(1, "pending"), (2, "shipped"), (3, None), (4, "1700000000")],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        sql, _plan = adapter._build_aggregate_sql(
+            "statuses.main.orders",
+            [
+                ColumnMeta("id", "INTEGER", True, 0),
+                ColumnMeta("status", "VARCHAR", True, 1),
+            ],
+            safe={"id"},
+            shape=set(),
+            type_req={"id", "status"},
+            key_shape_req={"status"},
+            temporal_req=set(),
+        )
+        arguments = cast_arguments(sql)
+        assert arguments, "the aggregate should carry the epoch/slash casts to check"
+        for argument in arguments:
+            # No CASE around it: every row of the column reaches the cast, the
+            # way the hostile dialect does it. The interpolation is the
+            # generator's own output, which is what this asserts about (S608).
+            adapter._run_select(f"SELECT CAST({argument} AS BIGINT) FROM orders")  # noqa: S608
+        # The statement itself still runs, and still measures: 1 of the 3
+        # non-null values is epoch-shaped and in range.
+        (row,) = adapter._run_select(sql)
+        values = dict(zip([d[0] for d in adapter._conn.description], row, strict=True))
+        assert values["ts_ep_s_1"] == 1.0  # of the epoch-shaped rows, all in range
+        assert values["ts_ns_1"] == pytest.approx(1 / 3)  # of the non-null rows
+    finally:
+        adapter.close()
 
 
 def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
@@ -782,6 +883,39 @@ def test_firewall_threshold_boundary_and_warning_carry_no_values():
     # nothing shaped like a cell value can appear in it by construction.
     assert "region.r_name" in warning and "(name)" in warning
     assert "AFRICA" not in warning and "@" not in warning
+
+
+def test_pii_refusal_s_suggested_override_carries_no_value():
+    # Issue #217: the refusal now names the exact pii_overrides entry that
+    # would clear the column. That entry is built from the dataset identifier,
+    # the column name, and the category only, the same structural guarantee
+    # PIIFlag itself makes (no value field exists anywhere to leak one).
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.region",
+                columns=[
+                    ColumnProfile(
+                        name="r_name",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.9),
+                    ),
+                ],
+            )
+        ]
+    )
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query("SELECT r_name FROM region", cache, QueryLimits())
+    message = str(excinfo.value)
+    assert "column: db.main.region.r_name" in message
+    assert "AFRICA" not in message and "@" not in message
 
 
 def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
@@ -1992,6 +2126,9 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     # Declared-type-vs-content statistics (#204) ride the same statement too.
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
     # Heterogeneous-key-shape statistics (#205) ride the same statement too.
     assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too,
@@ -2418,6 +2555,9 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
     assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
@@ -2712,6 +2852,9 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
     assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
@@ -2940,6 +3083,9 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
     assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
@@ -3198,6 +3344,9 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
     assert "ks_uuid_" in sql and "ks_hex_" in sql
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql

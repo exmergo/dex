@@ -271,6 +271,79 @@ def verify_handshake(
     return None
 
 
+def cumulative_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    candidate_count: int,
+    object_count: int,
+) -> ConfirmationRequest | None:
+    """The mid-command checkpoint for the cumulative-measure phase on billed
+    connectors, ``--check-cumulative``'s analogue of :func:`verify_handshake`.
+
+    The window-function probe can only be priced once profiling finds an
+    entity/temporal pair to test, so this runs after inference on an
+    already-confirmed command: the probes are dry-run priced (free), and only
+    when that estimate does not fit what remains of the confirmed budget does
+    it return the request, which the caller carries on its result as
+    ``pending_confirmation``. Otherwise the confirmed budget already covers
+    the check and the command proceeds in one pass.
+
+    A request rather than a raise, unlike :func:`billed_handshake`: the
+    profiles up to this point are already paid for, and raising would discard
+    them and bill the user twice for the same scan.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None or candidate_count == 0:
+        return None
+    try:
+        gate.preflight_phase(estimate)
+    except ConfirmationRequiredError as exc:
+        per_table = {"(cumulative-measure probes)": estimate}
+        describe = getattr(adapter, "describe_estimate", None)
+        if describe is not None:
+            data = {"command": command, **describe(estimate, per_table)}
+        else:
+            data = {
+                "command": command,
+                "estimated_bytes": estimate,
+                "per_table_bytes": per_table,
+            }
+        data.update(
+            {
+                "phase": "check-cumulative",
+                "candidate_count": candidate_count,
+                "object_count": object_count,
+                "hint": (
+                    f"found {candidate_count} entity/temporal candidate(s) "
+                    f"across {object_count} object(s); checking them all for "
+                    f"cumulative measures is estimated at {estimate:.0f} "
+                    f"{gate.paradigm.value} beyond what remains of the "
+                    "confirmed budget. Profiles are already saved to the "
+                    "exploration cache; re-run the same command with "
+                    f"--confirm --budget {math.ceil(exc.cost.estimate)} to "
+                    "profile and check in one pass (a re-run re-profiles "
+                    "first)"
+                ),
+            }
+        )
+        if (
+            gate.session_ceiling is not None
+            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
+        ):
+            data.setdefault("notes", [])
+            data["notes"] = [
+                *data["notes"],
+                "the session budget is the binding ceiling; raising --budget "
+                "alone will not unlock this, raise the session budget in "
+                ".dex/config.yml instead",
+            ]
+        return ConfirmationRequest(cost=exc.cost, data=data)
+    return None
+
+
 def sample_handshake(
     command: str,
     adapter: Adapter,
@@ -340,15 +413,34 @@ def stamp_spend(result: Result, adapter: Adapter) -> Result:
 
     gate = cost_gate(adapter)
     if gate is not None:
-        gate.settle()
+        spend = settled_spend(adapter)
         if result.cost.estimate is None:
             result.cost = gate.cost()
-        spend = gate.spend_summary()
-        display = getattr(adapter, "spend_display", None)
-        if display is not None:
-            spend.update(display())
         result.spend = spend
         # Settlement is the honest moment to say what did not bind: the command
         # has spent, and the caller is looking at the number.
         result.warnings = [*result.warnings, *gate.warnings()]
     return result
+
+
+def settled_spend(adapter: Adapter) -> dict | None:
+    """Settle the gate and read back what this command actually billed, in the
+    connector's own unit plus whatever translation the adapter adds.
+
+    Split out of :func:`stamp_spend` because the failure path needs the same
+    number and has no ``Result`` to stamp it onto: a command that died partway
+    still burned the seconds it burned, and an error envelope reporting nothing
+    tells a caller on a metered connector that its failure was free. ``None``
+    on a free connector, which has no gate and so no spend to report rather
+    than a row of zeroes.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None:
+        return None
+    gate.settle()
+    spend = gate.spend_summary()
+    display = getattr(adapter, "spend_display", None)
+    if display is not None:
+        spend.update(display())
+    return spend

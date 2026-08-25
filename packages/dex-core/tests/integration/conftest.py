@@ -86,6 +86,25 @@ RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
 CH_MAX_SECONDS = float(os.environ.get("DEX_TEST_CH_MAX_SECONDS", "60"))
 
 
+def assert_ok(rc: int, envelope: dict) -> dict:
+    """Assert a live command succeeded, and say what the warehouse said if it
+    did not. Returns the envelope, so it reads inline.
+
+    The obvious spelling is ``assert rc == 0, envelope``, and it is why a live
+    Redshift failure cost sixteen CI runs to diagnose instead of five minutes
+    (#310): pytest elides the middle of a long assertion message, and the
+    middle of a profiling envelope is exactly where ``errors`` sits, so the
+    server's own message never once reached a CI log. Putting the errors
+    first, alone, makes the surviving line the one worth reading.
+    """
+
+    assert rc == 0, (
+        f"errors={envelope.get('errors')} reason={envelope.get('reason')} "
+        f"warnings={envelope.get('warnings')}"
+    )
+    return envelope
+
+
 def _snowflake_enabled() -> bool:
     return bool(
         os.environ.get("DEX_TEST_SNOWFLAKE_DATABASE")

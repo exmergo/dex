@@ -41,11 +41,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import sqlglot
 from sqlglot import expressions as exp
 
-from ..cache import CACHE_SCHEMA_VERSION, Dataset, DexCache, match_identifier
+from ..cache import (
+    CACHE_SCHEMA_VERSION,
+    Dataset,
+    DexCache,
+    PIICategory,
+    match_identifier,
+)
 from ..config import QueryLimits
 from ..errors import DexError
 from . import PII_BLOCK_CONFIDENCE
@@ -241,12 +248,28 @@ _QUERY_ROOTS = tuple(
     if isinstance(c, type)
 )
 
+
 # A derived source (CTE, subquery, set operation) is represented by its output
 # taints: output column name (lowered) -> the flagged columns whose values can
-# reach it, each a (label, confidence) pair. Presence taints; whether a taint
-# blocks or merely warns is decided once, at the projection root, against
-# PII_BLOCK_CONFIDENCE. A physical source is the cached Dataset itself.
-_Taint = tuple[str, float]
+# reach it. Presence taints; whether a taint blocks or merely warns is decided
+# once, at the projection root, against PII_BLOCK_CONFIDENCE. A physical source
+# is the cached Dataset itself.
+#
+# `identifier` and `column` (alongside the display `label` and `confidence`)
+# are what let a blocking refusal name the exact `pii_overrides` entry that
+# would clear the column (issue #217): the label alone is the short table name
+# only, which is not enough to build a fully-qualified override safely (two
+# datasets can share a short name), so the fully-qualified identifier has to
+# ride along on the taint itself rather than being reconstructed later from a
+# string two datasets could both match.
+class _Taint(NamedTuple):
+    label: str
+    confidence: float
+    identifier: str
+    column: str
+    category: PIICategory
+
+
 _Outputs = dict[str, set[_Taint]]
 _Source = Dataset | dict
 
@@ -309,6 +332,51 @@ def recovery_hints(offending: list[str], cache: DexCache) -> list[str]:
     return sorted(suggestions)
 
 
+def _recurs_elsewhere(cache: DexCache, taint: _Taint) -> bool:
+    """Whether another dataset in the cache also flags a same-named column at
+    the same category, which is the evidence that a pattern override (a scope
+    glob, not one entry per table) is worth suggesting rather than a guess at
+    how far a naming convention actually reaches."""
+
+    return any(
+        dataset.identifier != taint.identifier
+        and any(
+            col.name.lower() == taint.column.lower()
+            and col.pii is not None
+            and col.pii.category == taint.category
+            for col in dataset.columns
+        )
+        for dataset in cache.datasets
+    )
+
+
+def _override_suggestion(taint: _Taint, cache: DexCache) -> str:
+    """The exact ``pii_overrides`` entry that would clear ``taint``'s column,
+    ready to paste into ``.dex/config.yml`` (issue #217).
+
+    Column identity only, in flow-mapping YAML so it fits inline in the
+    refusal's own prose: a fully-qualified path for the exact form, a bare
+    name and scope for the pattern form. Never a value: the taint carries
+    only what :class:`~..cache.PIIFlag` itself does (category and
+    confidence), the same structural guarantee that flag makes.
+
+    The pattern form is offered only when :func:`_recurs_elsewhere` finds the
+    same column name flagged at the same category on another dataset; the
+    suggested scope is that dataset's own schema (its identifier with the
+    table segment replaced by ``*``), never wider than what was actually
+    observed, so a caller who wants it to reach further widens the glob
+    themselves rather than dex guessing a blast radius nothing here proves.
+    """
+
+    exact = f"`- {{column: {taint.identifier}.{taint.column}}}`"
+    clause = f"for {taint.label}: {exact}"
+    if _recurs_elsewhere(cache, taint):
+        scope = taint.identifier.rsplit(".", 1)[0] + ".*"
+        pattern = f"`- {{column_name: {taint.column}, scope: {scope}}}`"
+        clause += f" (or, since it recurs across tables, {pattern})"
+    return clause
+
+
 def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
     """Prove a statement is one read-only SELECT and return its parsed root.
 
@@ -354,9 +422,11 @@ def inspect_query(
     outputs = _query_outputs(root, {}, known, tables, dialect)
 
     flagged = {taint for taints in outputs.values() for taint in taints}
-    offending = sorted(
-        {label for label, conf in flagged if conf >= PII_BLOCK_CONFIDENCE}
+    blocking = sorted(
+        (t for t in flagged if t.confidence >= PII_BLOCK_CONFIDENCE),
+        key=lambda t: t.label,
     )
+    offending = [t.label for t in blocking]
     if offending:
         message = (
             "the projection would carry values from PII-flagged column(s): "
@@ -374,7 +444,9 @@ def inspect_query(
             )
         message += (
             " A column reviewed as not PII can be cleared durably with a "
-            "pii_overrides entry in .dex/config.yml."
+            "pii_overrides entry in .dex/config.yml, e.g. "
+            + "; ".join(_override_suggestion(t, cache) for t in blocking)
+            + "."
         )
         if cache.schema_version < CACHE_SCHEMA_VERSION and any(
             "(name)" in label for label in offending
@@ -386,11 +458,11 @@ def inspect_query(
         raise QueryRefusedError(message)
 
     warnings = [
-        f"{label} is PII-flagged at confidence {conf:g}, below the "
+        f"{t.label} is PII-flagged at confidence {t.confidence:g}, below the "
         f"{PII_BLOCK_CONFIDENCE:g} block threshold, so the projection ran. If "
         "its values are personal data, drop the column; if it is reviewed as "
         "not PII, record a pii_overrides entry in .dex/config.yml."
-        for label, conf in sorted(flagged)
+        for t in sorted(flagged, key=lambda t: t.label)
     ]
 
     new_sql, row_cap, capped = _apply_limit(root, limits.max_rows, dialect)
@@ -645,7 +717,15 @@ def _column_taint(dataset: Dataset, column_name: str) -> set[_Taint]:
                 return set()
             table = dataset.identifier.rsplit(".", 1)[-1]
             label = f"{table}.{col.name} ({col.pii.category.value})"
-            return {(label, col.pii.confidence)}
+            return {
+                _Taint(
+                    label,
+                    col.pii.confidence,
+                    dataset.identifier,
+                    col.name,
+                    col.pii.category,
+                )
+            }
     raise QueryRefusedError(
         f"column '{column_name}' is not in the profiled cache for "
         f"'{dataset.identifier}'; the cache may be stale, re-run `explore map`"
