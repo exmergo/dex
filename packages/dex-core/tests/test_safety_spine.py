@@ -1131,6 +1131,89 @@ def test_the_er_diagram_marks_pii_and_carries_no_column_value():
         assert "pii:government_id 0.90" in mermaid
 
 
+def test_the_map_payload_marks_pii_and_carries_no_column_value():
+    """`explore map` returns findings rather than a receipt (issue #202), which
+    puts profile content into the envelope for the first time. The rule the
+    diagram obeys has to hold here for the same reason and in the same strict
+    form: the cache retains min/max and a value domain for every column that
+    earned one, and this payload must never reach for them. The PII flag IS
+    reported, because flagged-not-hidden is the posture, and it is (category,
+    confidence) as it is everywhere.
+    """
+
+    import json as _json
+
+    from exmergo_dex_core.cache import (
+        Dataset,
+        DexCache,
+        PIICategory,
+        Relationship,
+        ValueCount,
+        ValueDomain,
+    )
+    from exmergo_dex_core.explore.summary import summarize_map
+
+    customers = Dataset(
+        identifier="shop.main.customers",
+        columns=[
+            ColumnProfile(
+                name="customer_id",
+                data_type="INTEGER",
+                is_unique=True,
+                min_value=1,
+                max_value=987654,
+            ),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                min_value="aaron@example.com",
+                max_value="zoe@example.com",
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+            ),
+            ColumnProfile(
+                name="tier",
+                data_type="VARCHAR",
+                value_domain=ValueDomain(
+                    values=[ValueCount(value="platinum", count=3)]
+                ),
+            ),
+        ],
+        candidate_keys=[["customer_id"]],
+        grain=["customer_id"],
+    )
+    orders = Dataset(
+        identifier="shop.main.orders",
+        columns=[
+            ColumnProfile(name="order_id", data_type="INTEGER", is_unique=True),
+            ColumnProfile(name="customer_id", data_type="INTEGER"),
+        ],
+    )
+    cache = DexCache(
+        datasets=[customers, orders],
+        relationships=[
+            Relationship(
+                from_dataset="shop.main.orders",
+                from_columns=["customer_id"],
+                to_dataset="shop.main.customers",
+                to_columns=["customer_id"],
+            )
+        ],
+    )
+
+    for detail in (False, True):
+        view = summarize_map(cache, detail=detail)
+        blob = _json.dumps(
+            [o.model_dump(mode="json") for o in view.objects], sort_keys=True
+        )
+        for value in ("987654", "aaron@example.com", "zoe@example.com", "platinum"):
+            assert value not in blob, "a column value reached the map payload"
+        for key in ("min_value", "max_value", "value_domain"):
+            assert key not in blob
+        flagged = next(c for o in view.objects for c in o.columns if c.name == "email")
+        assert flagged.pii is not None
+        assert set(flagged.pii.model_dump()) == {"category", "confidence"}
+
+
 # --- Family 4: propose-don't-impose ------------------------------------------
 
 
