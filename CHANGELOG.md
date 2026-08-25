@@ -340,11 +340,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 - **An unset optional field is omitted from the `explore semantic list` payload
   rather than emitted as a null** ([#333]). `SemanticCatalog.to_data()` was an
   unconditional `asdict` per element, so widening dimensions and entities would
-  have billed every caller for placeholders: measured against our own deployment
-  (27 metrics, 65 dimensions, 11 entities, populating `label` on 0 of 65
-  dimensions and `description` on 1 of 65), those two blocks grew 61% and almost
-  all of the growth was the word `null`. A catalog is agent context, and a
-  project that documents nothing should pay nothing for the fields it left blank.
+  have billed every caller for placeholders.
 
   The rule is the same on all three lists, metrics included, so the metrics block
   no longer emits `"label": null` or `"description": null` as it did before.
