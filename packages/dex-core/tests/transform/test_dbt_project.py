@@ -259,10 +259,13 @@ def test_write_edits_all_or_nothing_across_a_delete_and_an_upsert(
     [
         "../outside.sql",
         "models/../../escape.sql",
-        "seeds/data.yml",
+        # Inside the project, outside every authored family: the surface is the
+        # four path families plus the root manifests, not the whole repo.
+        "analyses/scratch.sql",
+        "target/compiled.sql",
     ],
 )
-def test_write_edits_refuses_paths_outside_model_paths(
+def test_write_edits_refuses_paths_outside_the_authored_families(
     dbt_project_dir: Path, bad_path: str
 ):
     edit = Edit(path=bad_path, new_content="x\n", old_content_hash=None)

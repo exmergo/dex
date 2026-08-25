@@ -312,4 +312,8 @@ def test_the_no_format_fallback_answers_exactly_what_dbt_answers():
     staged = "models/staging/stg_orders"
     assert _placed(None, EditKind.MODEL_SQL, "orders") == f"{staged}.sql"
     assert _placed(None, EditKind.SCHEMA_YML, "orders") == f"{staged}.yml"
-    assert _placed(None, EditKind.MACRO_SQL, "orders") is None
+    # `None` is a complete answer, not a gap: reconcile proposes staging models
+    # and their schema.yml, and a kind it does not propose gets no path this
+    # class would be inventing.
+    for unplaced in (EditKind.MACRO_SQL, EditKind.SNAPSHOT_SQL, EditKind.SEED_CSV):
+        assert _placed(None, unplaced, "orders") is None
