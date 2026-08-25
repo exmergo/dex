@@ -99,6 +99,15 @@ redshift = [
   "dbt-redshift>=1.9",
   "exmergo-dex-core[sql]",
 ]
+# Like [duckdb], the extra carries the dbt adapter (which pulls dbt-core) so
+# transform can build against a ClickHouse dev database with one install.
+# clickhouse-connect is the official driver and speaks the HTTP interface,
+# which is also the one dbt-clickhouse defaults to.
+clickhouse = [
+  "clickhouse-connect>=0.8",
+  "dbt-clickhouse>=1.8",
+  "exmergo-dex-core[sql]",
+]
 # The local semantic-layer query backend (`explore semantic query --local`):
 # MetricFlow renders metric SQL via explain(), and dex executes it through its own
 # connector and cost guard. Just the metricflow library (not dbt-metricflow, whose
@@ -151,10 +160,10 @@ project-conformance = ["pytest>=8"]
 # does mean this reference list is the part that rots, so a test asserts it covers
 # every extra. Excludes dev and storage-conformance, both contributor tooling rather
 # than a capability: nobody installing "everything dex can do" wants a test runner.
-# This is the heaviest install there is (six dbt adapters, MetricFlow, and
+# This is the heaviest install there is (seven dbt adapters, MetricFlow, and
 # scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
 all = [
-  "exmergo-dex-core[bigquery,cluster,databricks,duckdb,postgres,redshift,semantic,semantic-api,snowflake,sql]",
+  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,postgres,redshift,semantic,semantic-api,snowflake,sql]",
 ]
 # Contributor tooling, plus the optional libraries the suite exercises directly
 # (the clustering tests need scikit-learn, the firewall tests need the dialect
@@ -199,5 +208,6 @@ markers = [
   "databricks: Databricks-specific integration tests",
   "postgres: PostgreSQL-specific integration tests",
   "redshift: Redshift-specific integration tests",
+  "clickhouse: ClickHouse-specific integration tests",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]
