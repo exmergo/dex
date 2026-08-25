@@ -1350,6 +1350,8 @@ def _execute(
         except ConfirmationRequiredError:
             raise
         except Exception as exc:
+            if isinstance(exc, OverCeilingError):
+                exc = _with_batch_shortfall(exc, shared.adapter, batch, statement)
             entry = {
                 "sql": statement.inspected.sql,
                 "decision": "failed",
@@ -1396,6 +1398,49 @@ def _execute(
         if statement.inspected.warnings:
             entry["pii_warnings"] = statement.inspected.warnings
         ledger(statement, entry)
+
+
+def _with_batch_shortfall(
+    exc: OverCeilingError,
+    adapter: Adapter,
+    batch: list[_Statement],
+    statement: _Statement,
+) -> OverCeilingError:
+    """Name exactly how much more this batch needs to finish, not just why
+    this one statement hit the wall (issue #321).
+
+    BigQuery bills at least its per-query floor no matter how little a
+    statement reads, so an N-statement call needs at least ``N x`` that floor
+    of headroom; that arithmetic is fully knowable the moment inference finds
+    the remaining statements, which is exactly what this recomputes. A caller
+    who otherwise has to raise ``--budget`` and guess again now sees the
+    number the first guess would have needed. Already-completed statements
+    are unaffected: their results are kept exactly as :func:`_execute`
+    already keeps them, so a wider budget on re-run does not re-pay for them.
+
+    A no-op (returns ``exc`` unchanged) for a lone, non-batch statement,
+    where "the remaining budget is below the floor" already says everything
+    there is to say, and when the adapter cannot price a dry run at all.
+    """
+
+    if len(batch) == 1:
+        return exc
+    remaining = [s for s in batch if s.index >= statement.index and s.live]
+    query_estimate = getattr(adapter, "query_estimate", None)
+    if query_estimate is None or not remaining:
+        return exc
+    extra = sum(query_estimate(s.inspected.sql) for s in remaining)
+    gate = command_args.cost_gate(adapter)
+    unit = gate.paradigm.value if gate is not None else "bytes"
+    wrapped = OverCeilingError(
+        f"{exc}. Completing the remaining {len(remaining)} statement(s) in "
+        f"this batch needs at least {extra:,.0f} more {unit}; the "
+        "statement(s) already run above are saved, so a wider --budget on "
+        "re-run does not re-pay for them",
+        cost=exc.cost,
+    )
+    wrapped.__cause__ = exc
+    return wrapped
 
 
 def _batch_marks(statement: _Statement, size: int) -> dict:
