@@ -75,6 +75,9 @@ __all__ = [
     "ProjectAdapter",
     "ProjectContext",
     "ProjectFactory",
+    "ProjectView",
+    "SourceFileView",
+    "placement_gap",
     "tier_of",
 ]
 
@@ -211,9 +214,60 @@ class EditableProject(MaintainProject, Protocol):
         ...
 
 
+class SourceFileView(Protocol):
+    """One entry in a project view: the content an edit is pinned against.
+
+    Two members, because two are what the callers read. ``sha256`` is what an
+    edit is pinned to at plan time and re-checked against at apply time, so a
+    view that omits it hashes every existing file as absent, which renders a
+    one-line change as a whole-file create and turns the next apply into a
+    conflict on a file nobody touched. ``content`` is what the diff is built
+    against and what ``reconcile`` reads before it extends a declaration.
+
+    A format is free to carry more (the shipped ``SourceFile`` also carries its
+    own ``path``); nothing here reads it.
+    """
+
+    content: str
+    sha256: str
+
+
+class ProjectView(Protocol):
+    """What :meth:`PlacingProject.load` returns: the format's keyspace, read once.
+
+    ``files`` is keyed exactly the way :meth:`PlacingProject.edit_path` keys and
+    :meth:`PlacingProject.editing_surface` prefixes. That is the whole point of
+    the type: the three members describe one keyspace, and a format whose view
+    is keyed differently from its placements pins every edit as a create.
+
+    ``root`` is what the plan records as the directory its edits were pinned
+    against, relative to the repository root where that subtraction is possible
+    and verbatim where it is not (``transform.plans`` falls back to the string).
+    A format keyed by a directory returns it; a format keyed by something else
+    returns whatever identifies its root, and the plan carries that.
+
+    **Neither this nor** :class:`SourceFileView` **is** ``runtime_checkable``,
+    and nothing calls ``isinstance`` against them. An isinstance check on a data
+    protocol only asks whether the attribute names exist, which is exactly the
+    check :class:`~.conformance.PlacingProjectContract` makes with a message
+    naming the missing member and what breaks without it. These exist to be
+    read and to annotate, not to gate.
+    """
+
+    root: str
+    files: Mapping[str, SourceFileView]
+
+
 @runtime_checkable
 class PlacingProject(Protocol):
-    """Optional beside tier 3: where a proposed edit lands.
+    """Optional beside tier 3: the keyspace a proposed edit lands in.
+
+    Three members describing one thing: :meth:`load` reads the keyspace,
+    :meth:`edit_path` names a key in it, :meth:`editing_surface` says which
+    region of it the format owns. They are here together because none of them
+    is answerable alone. A key is a key into a view; a surface is a region of
+    the same space; and a view nobody places into is a read dex has no use for
+    on this path.
 
     Tier 3 says a format *can* receive an edit. It does not say where the edit
     goes, and ``maintain reconcile`` decides that before it consults the format:
@@ -233,14 +287,48 @@ class PlacingProject(Protocol):
     PlacingProject)`` is checkable, and a format that cannot place an edit
     cannot accidentally claim it can.
 
-    **Separate from** :class:`EditableProject` **rather than a method on it.**
+    **Separate from** :class:`EditableProject` **rather than methods on it.**
     The tiers are ``runtime_checkable``, so a method added to tier 3 silently
     demotes every format that has not implemented it yet: ``tier_of`` would
     start answering 2 where it answered 3, and the write path would close for
     exactly the implementers who were already passing. Beside it, the answer for
     a format that has not implemented this is "tier 3, placement unknown", which
     is the truth and is what the caller warns about.
+
+    That is also why :meth:`load` is here rather than on tier 3, which is where
+    a reader first looks for it. Nothing calls it outside this path: both
+    callers reach it only for a format that places, so requiring it of tier 3
+    would demote formats that never needed it, to state a requirement that is
+    not theirs. A format holding some of these three and not the others places
+    nothing at all, and :func:`placement_gap` is what names the one that is
+    missing instead of leaving it to surface as ``AttributeError`` from inside
+    a command the tier check already let through.
     """
+
+    def load(self) -> ProjectView:
+        """Read the project into the keyspace the other two members describe.
+
+        Two callers, and between them they need every member of
+        :class:`ProjectView`. ``transform.plans`` pins each edit to the
+        ``sha256`` of the file at ``files[edit_path(...)]``, and records
+        ``root`` as the directory the plan was pinned against.
+        ``maintain.reconcile`` reads ``files[...].content`` to extend a
+        declaration it is about to propose an edit to, and refuses to guess
+        where the key is absent.
+
+        **Cheap enough to call once per command, and fresh enough to be worth
+        calling.** A project is an artifact a previous command may have just
+        rewritten, so a view cached across commands is a wrong drift report.
+        Memoizing within one instance is the shipped format's answer (see
+        :meth:`DbtProject.load`), and it is a good one precisely because dex
+        builds one project per command.
+
+        Raising is the honest answer when there is no project to read, and the
+        callers handle it: ``reconcile`` turns it into a refusal naming the
+        format. Tier 1 is the channel with the never-raises promise, and this
+        is not it.
+        """
+        ...
 
     def edit_path(self, kind: EditKind, model: str) -> str | None:
         """Where an edit of ``kind`` for ``model`` lives, or ``None``.
@@ -405,6 +493,64 @@ def tier_of(project: object) -> int:
     return 0
 
 
+#: Each :class:`PlacingProject` member, and the one clause that says what dex
+#: cannot do without it. Read by :func:`placement_gap`, which names only the
+#: members a format is actually missing.
+_PLACEMENT_MEMBERS = {
+    "load": (
+        "`load()` returns the view an edit is pinned against: `root`, and "
+        "`files` keyed the way `edit_path` keys, each entry carrying `content` "
+        "and `sha256`"
+    ),
+    "edit_path": (
+        "`edit_path(kind, model)` answers where an edit of that kind for that "
+        "warehouse table lives, or None to decline the kind"
+    ),
+    "editing_surface": (
+        "`editing_surface()` declares the prefixes those paths must stay inside"
+    ),
+}
+
+
+def placement_gap(project: object) -> str | None:
+    """Which :class:`PlacingProject` member a nearly-placing format is missing.
+
+    Placement is satisfied structurally, so a format holding two of the three
+    members places nothing, and the warning its caller would otherwise reach for
+    ("this format does not say where a proposed edit lands") is false of a
+    format that answers ``edit_path`` and cannot be read. Worse, it sends the
+    implementer to the member they already wrote.
+
+    ``None`` in the two cases where there is nothing to add: a format that
+    places has no gap, and a format declaring none of the three is declining
+    placement outright, which is a complete answer the caller already describes.
+
+    This exists because of what the alternative was. A format implementing the
+    declared members and omitting the undeclared one passed the whole
+    conformance suite and then raised ``AttributeError`` on the first real
+    reconcile: after the tier said 3, after the gate let it through, in a
+    command someone ran.
+    """
+
+    if isinstance(project, PlacingProject):
+        return None
+    missing = [
+        member
+        for member in _PLACEMENT_MEMBERS
+        if getattr(project, member, None) is None
+    ]
+    if len(missing) == len(_PLACEMENT_MEMBERS):
+        return None
+    named = getattr(project, "name", type(project).__name__)
+    listed = ", ".join(f"`{member}()`" for member in missing)
+    details = " ".join(f"{_PLACEMENT_MEMBERS[member]}." for member in missing)
+    return (
+        f"the '{named}' project format implements part of PlacingProject and is "
+        f"missing {listed}, so it places no edit at all and every proposal stays "
+        f"advisory. {details}"
+    )
+
+
 class DbtProject:
     """The dbt implementation of the project seam.
 
@@ -478,6 +624,10 @@ class DbtProject:
     def load(self) -> DbtProjectView:
         """Load the project into an in-memory view, once per instance.
 
+        ``DbtProjectView`` is the shipped :class:`ProjectView`: its ``files`` are
+        keyed by the project-relative paths :meth:`edit_path` returns, and its
+        ``SourceFile`` entries are the shipped :class:`SourceFileView`.
+
         Raises ``DbtProjectError`` when there is no project to load, which is what
         every caller of ``dbt_project.load`` already expects. Tier 1 is the channel
         with the never-raises promise.
@@ -544,18 +694,25 @@ class DbtProject:
         return None if suffix is None else f"models/staging/stg_{model}.{suffix}"
 
     def editing_surface(self) -> list[str]:
-        """The project's configured model and macro paths, read from the view.
+        """Everything dbt's own writer accepts: the model and macro paths, and
+        the four root manifests it admits by name.
 
         Read rather than assumed: a project that configures ``model-paths`` away
         from ``models`` moves its editing surface with it, and the containment
-        check has always honored that. This returns what the engine computed for
-        itself before the seam existed, so routing dbt through the seam changes
-        nothing about which paths dbt admits.
+        check has always honored that.
 
-        The root manifests ``contained_path`` allows by name are not listed here.
-        They are a dbt fact about dbt's own project root rather than a region of
-        the surface, and the check keeps applying them on the dbt path.
+        The root manifests are listed even though they are files rather than
+        regions, because ``transform.plans`` re-checks a stored plan against this
+        declaration before handing it to the writer. A declaration narrower than
+        what the writer accepts is not a modest one: it refuses the project
+        config, the profiles, and the package manifests at apply, every one of
+        which is a path dex authors through a plan. What a format declares here
+        has to be what its writer will take.
         """
 
         view = self.load()
-        return list(view.model_paths) + list(view.macro_paths)
+        return (
+            list(view.model_paths)
+            + list(view.macro_paths)
+            + sorted(dbt_project._ALLOWED_ROOT_FILES)
+        )
