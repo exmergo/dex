@@ -114,13 +114,16 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 {"edits": [
   {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
   {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
+  {"path": "snapshots/snap_orders.sql", "kind": "snapshot_sql", "content": "..."},
+  {"path": "seeds/country_vat.csv", "kind": "seed_csv", "content": "..."},
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
-`macro_sql`, `project_yml`, or `profiles_yml`. Each edit also has an `op`:
+`macro_sql`, `snapshot_sql`, `seed_csv`, `project_yml`, or `profiles_yml`. Each
+edit also has an `op`:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
@@ -134,7 +137,14 @@ parse; semantic YAML must satisfy MetricFlow's schemas; a `packages_yml` edit
 must carry a `packages:` or `dependencies:` list and targets the project-root
 `packages.yml` or `dependencies.yml`; a `macro_sql` edit must hold only macro
 definitions and jinja comments and must target the project's macro paths, where
-no other kind may go; a `project_yml` edit targets the project-root
+no other kind may go; a `snapshot_sql` edit must hold exactly one
+`{% snapshot %}` block whose `config()` names a `unique_key` and a `strategy` of
+`timestamp` (with `updated_at`) or `check` (with `check_cols`), whose body is a
+single read-only SELECT, and must target the project's snapshot paths; a
+`seed_csv` edit must parse as CSV with a named, duplicate-free header and one
+field per column on every row, must stay under 5,000 data rows and 1 MiB, must
+not name columns that look like personal data, and must target the project's
+seed paths; a `project_yml` edit targets the project-root
 `dbt_project.yml` and must keep a `name`; a `profiles_yml` edit targets the
 project-root `profiles.yml` and must reference every secret via
 `{{ env_var('NAME') }}`, never a literal), pins it to the sha256 of the file it
@@ -144,7 +154,26 @@ would change, computes the diffs, and stores the plan under
 reviewable diff like any other edit, then `transform deps` (or the automatic
 deps step in `transform build`) installs them. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path
-for the macros dex ships. `project_yml` and `profiles_yml` bring the two
+for the macros dex ships. `snapshot_sql` and `seed_csv` bring slowly-changing
+dimension capture and small reference tables into the same flow, each confined to
+its own path family (`snapshot-paths` and `seed-paths` in `dbt_project.yml`, read
+with dbt's own defaults) and each gated by dbt's parser at plan time. A
+`schema_yml` edit is accepted beside either one, which is where dbt expects a
+seed's column types and a snapshot's tests and docs to be declared. `dbt build`
+runs seeds and snapshots natively, so nothing new has to be run after an apply;
+a snapshot writes a table and is priced in the cost handshake, while a seed
+loads a local CSV, scans nothing, and is deliberately unpriced.
+
+`seed_csv` is the first kind that puts **values**, not logic, into a reviewable
+diff, and a diff goes into git and stays there. So a seed's header is checked
+both against the PII detector `explore` profiles warehouse columns with and
+against the flags already in the `.dex/` cache. A column at or above the block
+threshold is refused, and the refusal names the `pii_overrides` entry that would
+clear it (never a value). The standing limit is worth knowing: dex detects PII
+from names and types and never from values, everywhere, so a seed column named
+`code` full of email addresses passes this gate.
+
+`project_yml` and `profiles_yml` bring the two
 project-root config files into the same plan/diff/apply flow; because they carry
 project-wide settings and connection targets, they are gated by dbt's own parser
 at plan time, and a `profiles_yml` edit is refused if it (or the file it would
