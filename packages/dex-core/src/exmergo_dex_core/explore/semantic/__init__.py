@@ -94,12 +94,64 @@ class MetricInfo:
 class DimensionInfo:
     name: str
     type: str
+    # The dbt project's own words for this dimension, when it wrote any. Both
+    # backends carry both fields: the compiled semantic manifest declares them,
+    # and the hosted API returns them in the catalog query dex already issues.
+    label: str | None = None
+    description: str | None = None
 
 
 @dataclass
 class EntityInfo:
     name: str
     type: str
+    # Local-only. The hosted GraphQL schema has no `label` on its Entity type,
+    # and asking for one fails the whole catalog query ("Cannot query field
+    # 'label' on type 'Entity'"), taking the metrics list down with it, so it
+    # must never enter that selection set. A hosted catalog says so in a note
+    # rather than letting the absence read as "the project declared none".
+    label: str | None = None
+    description: str | None = None
+
+
+def merge_element_fields(
+    store: dict[str, dict[str, Any]], key: str, element: dict[str, Any]
+) -> None:
+    """Fold one dimension or entity into a catalog accumulator keyed by ``key``.
+
+    Both backends meet the same element more than once: the hosted API nests a
+    dimension under every metric that can group by it, and locally the same
+    entity appears in every semantic model that declares it. The copies need not
+    agree, so each field takes the first non-null value seen rather than the
+    first copy outright. Under a plain ``setdefault`` on the whole element,
+    whichever copy happened to come first could blank out a description another
+    one carried.
+
+    ``key`` is passed rather than read off the element because the local backend
+    files a dimension under its entity-qualified name (``session__created_at``)
+    while the element itself carries the bare one.
+    """
+
+    fields = store.setdefault(key, {})
+    if not fields.get("type"):
+        fields["type"] = (element.get("type") or "").lower()
+    for name in ("label", "description"):
+        if fields.get(name) is None:
+            fields[name] = element.get(name)
+
+
+def _element_data(element: Any) -> dict[str, Any]:
+    """One catalog element as a dict, with its unset optional fields omitted.
+
+    A catalog is agent context, so a project that declares no labels should not
+    pay for null placeholders: measured against our own deployment (which
+    populates ``label`` on 0 of 65 dimensions and ``description`` on 1 of 65),
+    they were most of the dimensions and entities blocks. Absent means unset,
+    the same rule on metrics, dimensions and entities alike. An empty list
+    survives, because "no groupable dimensions" is an answer where None is not.
+    """
+
+    return {k: v for k, v in asdict(element).items() if v is not None}
 
 
 @dataclass
@@ -116,9 +168,9 @@ class SemanticCatalog:
     def to_data(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
-            "metrics": [asdict(m) for m in self.metrics],
-            "dimensions": [asdict(d) for d in self.dimensions],
-            "entities": [asdict(e) for e in self.entities],
+            "metrics": [_element_data(m) for m in self.metrics],
+            "dimensions": [_element_data(d) for d in self.dimensions],
+            "entities": [_element_data(e) for e in self.entities],
             "notes": self.notes,
         }
 
