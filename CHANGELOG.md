@@ -9,6 +9,62 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`explore map` returns the map, not a receipt for it** ([#202]). The command
+  wrote the `.dex/` cache and printed fourteen integers and five identifiers. To
+  learn what the joins were, what the PII flags were, or what the data-quality
+  findings said, a caller ran `explore profile` and `explore relationships`
+  afterwards: three round trips, and more total context than one budgeted answer
+  costs. "Sense-making, not enumeration" is a rule against dumping a schema, not
+  a rule against answering the question, and read literally it had inverted.
+
+  `data.objects` now carries each top-ranked object's row count, detected grain,
+  candidate key, notable columns and data-quality findings, and `data.edges`
+  carries the join edges in exactly the shape `explore relationships` already
+  returns them, so a caller learns one shape rather than two. Every column
+  carries the `role` that earned it a place (`grain`, `key`, `join`, or a PII
+  flag), which is the same predicate `explore diagram` draws from: both commands
+  now read one selection, so the picture and the payload can never disagree about
+  what matters. Every existing count field keeps its name and its meaning.
+
+  It is budgeted the way the diagram is: 25 objects by rank, 12 columns per
+  object, 40 edges, 5 findings per object. Every cap binds in every mode, each
+  elision is reported both as a count and as a note naming the cap and the way to
+  read the rest, and `notes` is now always present, so an empty list is the
+  positive statement "nothing was elided". The new `--detail` widens what is
+  eligible (every column, and objects inventoried but never profiled) and lifts
+  no cap. It is deliberately not `--full`, which on this command decides how much
+  gets *scanned* and therefore what the run costs; `--detail` decides only how
+  much of what was found comes back, and spends nothing.
+
+  **No column value crosses this envelope.** The cache holds `min_value`,
+  `max_value` and a value domain for the columns that earned them, and this
+  command does not read them: `explore profile` is where a caller asks for a
+  value domain, deliberately and one object at a time. A safety-spine assertion
+  pins that, alongside PII staying category and confidence.
+
+  Objects are selected differently from the diagram's, on purpose. A diagram
+  drops an object that participates in no join, because a box with no edge draws
+  nothing. A findings payload must not: an isolated lookup table carrying four
+  PII flags and an empty-table warning is exactly a finding, and dropping it left
+  the envelope's own `pii_column_count` contradicting the objects printed beside
+  it. Found by dogfooding the demo warehouse, and now asserted: every count in
+  the payload reconciles with the objects it sits next to.
+
+### Fixed
+
+- **Databricks: `explore profile` and `explore map` crashed on any real value
+  domain.** The value-domain probe reads back a `collect_list`, which is an
+  ARRAY, and the Databricks driver materializes one through pyarrow as a numpy
+  `ndarray`, whose `__bool__` raises above a single element. An `x or []`
+  guarding the empty case therefore took the whole command down with
+  "The truth value of an array with more than one element is ambiguous" against
+  any table holding more than one value in a screened column, which on a real
+  warehouse is most of them. The suite never saw it because every fake fed a
+  plain Python list. Now an explicit `is None` check, with a test that feeds the
+  ndarray the driver actually returns.
+
 ## [1.7.0] - 2026-08-25
 
 ### Added
