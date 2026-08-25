@@ -69,7 +69,7 @@ records `connector`, `dbt_project_dir`, and `dbt_target: dev` in
 connector: it errors rather than defaulting, so always pass the user's confirmed
 choice (a `connector:` already committed in `.dex/config.yml` also counts).
 Every connector is supported: DuckDB, BigQuery, Snowflake, Databricks,
-Postgres, and Redshift. DuckDB needs a warehouse path (`--path`, or the
+Postgres, Redshift, and ClickHouse. DuckDB needs a warehouse path (`--path`, or the
 `duckdb.path` config). BigQuery needs a GCP project (usually
 `bigquery.project` in `.dex/config.yml`; confirm it with the user) and writes
 builds to a dedicated dev dataset (`bigquery.dev_dataset`, default
@@ -85,8 +85,14 @@ reaching dbt only through the `PGPASSWORD` environment variable. Redshift
 writes builds to a dedicated `redshift.dev_schema` (default `dbt_dev`): with
 a `redshift.workgroup` pinned the profile renders IAM auth (temporary
 credentials from the AWS chain, nothing persisted), otherwise the password
-reaches dbt only through the `REDSHIFT_PASSWORD` environment variable. All
-of them discover their connections and refuse with the fix named when none
+reaches dbt only through the `REDSHIFT_PASSWORD` environment variable.
+ClickHouse writes builds to a dedicated `clickhouse.dev_database` (default
+`dbt_dev`), rendered as the profile's `schema:` because dbt-clickhouse has no
+`database:` key, with the password reaching dbt only through the
+`CLICKHOUSE_PASSWORD` environment variable; the rendered profile also carries
+a `custom_settings` block whose `env_var` references are how `transform build`
+turns the confirmed budget into a per-statement server-side cap, so do not
+strip them from a profile you edit. All of them discover their connections and refuse with the fix named when none
 resolves. Init refuses if any dbt project already exists.
 
 When the user wants staging/intermediate/marts isolated in their own
@@ -174,11 +180,12 @@ check" note just means no connection was reachable at init time.
   The contract on every connector: one row per top-level key, `key` a plain
   string, `value` the warehouse's native semi-structured type (BigQuery JSON,
   Snowflake VARIANT, Databricks VARIANT, Postgres jsonb, Redshift SUPER,
-  DuckDB JSON), a NULL object yields no rows, and a nested object's own field
+  DuckDB JSON, ClickHouse raw JSON text in a String), a NULL object yields no
+  rows, and a nested object's own field
   names never surface as top-level keys. For a string-typed source column
   pass the parse expression as `json_column` (`parse_json(payload)` on
   BigQuery, Snowflake, and Databricks; `json_parse(payload)` on Redshift);
-  Postgres and DuckDB accept JSON-bearing text directly. Databricks needs
+  Postgres, DuckDB, and ClickHouse accept JSON-bearing text directly. Databricks needs
   VARIANT support (DBR 15.3+ or a current SQL warehouse). Two BigQuery quirks
   are absorbed by the macro, so do not "fix" them back in: a JSON path
   argument must be a compile-time literal (the macro reads values with the
@@ -203,9 +210,12 @@ and both files. Edit one to match the other. The engine never rewrites
 **A dev target that does not exist.** On Snowflake, dbt creates schemas but never
 databases, so a missing `dev_database` is refused with the `CREATE DATABASE`
 statement to run; dex will not create it for you, because its only writes are
-reviewable diffs inside the repo. On Postgres and Redshift, dbt creates the dev
-schema but only if the profile's user may, so the missing privilege is what gets
-refused, with the `CREATE SCHEMA`/`GRANT` statement to run. On DuckDB the dev target is a database file,
+reviewable diffs inside the repo. On Postgres, Redshift, and ClickHouse, dbt creates the dev
+namespace but only if the profile's user may, so the missing privilege is what
+gets refused, with the `CREATE SCHEMA`/`GRANT` statement to run. On ClickHouse
+that check can also come back with no verdict, because a server may not let dex
+read another user's grants; it then warns instead of guessing, and the build
+proceeds with dbt's own error as the backstop. On DuckDB the dev target is a database file,
 and dbt would happily create an empty one, then fail every `source()` relation
 with a confusing catalog error. The convention there: copy the shared source
 warehouse to the dev target path (for example

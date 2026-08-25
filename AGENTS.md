@@ -33,7 +33,7 @@ uv run scripts/run.py <subcommand> [flags]
 
 Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
-`[postgres]`, `[redshift]`, or `[all]` for every optional capability at once. The shipped wrapper pins
+`[postgres]`, `[redshift]`, `[clickhouse]`, or `[all]` for every optional capability at once. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
 connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
 found by walking up from the run directory to the git root, then DuckDB), so a
@@ -50,7 +50,7 @@ credentials and no network.
 | Subcommand | Returns |
 |---|---|
 | `demo [path]` | generates a seeded local DuckDB warehouse (7 tables, 29,512 rows) plus a `.dex/config.yml` beside it, so a first run needs no warehouse, no credentials, and no network; both artifacts are listed in `data.created` and `data.next_steps` names the commands worth running next. The path is positional and resolves against the working directory, defaulting to `dex_demo.duckdb`; `--path` is refused here rather than honored, since everywhere else it names the warehouse dex *reads*. Create-only, with no `--confirm` that can talk past it: an existing file at the target is a refusal (`reason: guard`), a missing parent directory is a refusal (`reason: request`), no directories are ever created, and a `.dex/config.yml` at or above the target is left untouched with a warning rather than shadowed by a second one. The data is generated from a pinned seed, so the counts quoted in the docs are the counts a user sees, and it is deliberately flawed: a key that lost uniqueness to a double-loaded batch, a key mixing two id schemes, a join whose columns share a name and none of their values, an empty table, two columns whose declared type contradicts their content, and personal data alongside two designed false positives. Needs the `[duckdb]` extra and says so by name when it is absent (`reason: prerequisite`) |
-| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
+| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (a bare database on ClickHouse, whose identifiers are two-part `database.table`) (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
 | `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
 | `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
 | `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe, declared and inferred alike (a composite-key join is not probed: the probe spans one column pair); `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge). A measurement never revises a declared join's confidence, which stays at the 1.0 the project asserts; a declared join whose probe finds the parent largely missing is reported as a finding instead |
@@ -112,7 +112,8 @@ Every command prints exactly one JSON object and nothing else:
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that
 would spend requires an explicit `--confirm` and a session budget: on a
-metered connector (BigQuery, Snowflake, Databricks, Redshift, and Postgres)
+metered connector (BigQuery, Snowflake, Databricks, Redshift, Postgres, and
+ClickHouse)
 the first call returns `needs_confirmation` with a free estimate, and the
 same command is re-issued with `--confirm --budget <magnitude>` once the user
 has agreed to the spend. The magnitude is paradigm-relative: **bytes** on
@@ -124,8 +125,12 @@ with a DBU translation alongside), **compute-seconds** on Redshift (a
 heuristic with an RPU-hour translation alongside; Serverless estimates carry
 the 60-second wake minimum once), **database-seconds** on Postgres (nothing
 is billed in dollars; the guarded quantity is load on the operational
-database, estimated free via EXPLAIN). On every time paradigm the budget
-still binds exactly via a server-side statement timeout. Actual spend comes
+database, estimated free via EXPLAIN) and on ClickHouse (self-hosted, also
+billing no dollars; estimated free via the non-executing EXPLAIN ESTIMATE,
+which prices after primary-key pruning). On every time paradigm the budget
+still binds exactly via a server-side statement timeout, except on ClickHouse,
+where it binds via `max_execution_time` **and** `max_bytes_to_read`, because
+time alone is checked only at block boundaries there. Actual spend comes
 back under `data.spend` (`bytes_billed` or `seconds_billed`) and accumulates
 in the `.dex/spend.jsonl` ledger per connector. Credentials never appear in
 `data` (BigQuery authenticates via discovered Application Default
@@ -133,7 +138,9 @@ Credentials, Snowflake via a discovered `connections.toml` entry,
 environment, or dbt profile, Databricks via the SDK's unified chain, Redshift
 via the AWS credential chain (a pinned Serverless workgroup mints IAM
 temporary database credentials) or the `REDSHIFT_*` environment, Postgres via
-`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile, and
+`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile,
+ClickHouse via `CLICKHOUSE_URL`, the `CLICKHOUSE_*` environment, a committed
+non-secret target, or a dbt profile, and
 the hosted semantic layer via `DBT_SL_TOKEN` or `~/.dbt/dbt_cloud.yml`; never a
 pasted key or token), and result values appear only in
 `explore query`'s columnar payload after the query firewall has cleared

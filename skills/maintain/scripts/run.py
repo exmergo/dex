@@ -56,6 +56,7 @@ _KNOWN_CONNECTORS = (
     "databricks",
     "postgres",
     "redshift",
+    "clickhouse",
 )
 _DEFAULT_CONNECTOR = "duckdb"
 

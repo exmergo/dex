@@ -73,7 +73,8 @@ depth, then `reconcile` to get the proposed fix.
 ## Per-axis cost: what is free and what scans
 
 Detection is read-only, but read-only is not the same as free on a metered
-connector (BigQuery, Snowflake, Databricks, Postgres, Redshift). The axes split:
+connector (BigQuery, Snowflake, Databricks, Postgres, Redshift, ClickHouse).
+The axes split:
 
 - **Schema, volume, and the reference/definition half of semantic are free**
   everywhere: they read metadata and the snapshot, and run immediately.
@@ -83,7 +84,8 @@ connector (BigQuery, Snowflake, Databricks, Postgres, Redshift). The axes split:
   breakdown). Surface it to the user in human units, get an explicit budget, and
   re-issue the same command with `--confirm --budget <magnitude>` in the
   paradigm's unit (bytes on BigQuery, warehouse-seconds on Snowflake and
-  Databricks, compute-seconds on Redshift, database-seconds on Postgres).
+  Databricks, compute-seconds on Redshift, database-seconds on Postgres and
+  ClickHouse).
   Never invent a budget the user did not agree to, and never retry with a
   raised budget on an over-ceiling refusal without asking.
 - **`check` is two-phase on a metered connector**: the free axes complete
