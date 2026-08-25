@@ -9,6 +9,68 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`transform` authors dbt snapshots** ([#210]). A `snapshot_sql` edit kind, and
+  `snapshot-paths` read from `dbt_project.yml` with dbt's own default. Before
+  this, `transform plan` refused a snapshot file as "outside the project's model
+  paths", which was self-contradicting from the caller's side: a snapshot **is**
+  the dbt project surface, and slowly-changing-dimension capture is one of the
+  more common things an analytics engineer is asked to add. The only way to add
+  one was to leave the plan-then-apply path and write the file by hand, which
+  dropped the reviewable diff, the hash pinning and the conflict detection for
+  exactly the kind of change that most deserves them.
+
+  Validation is layered the way the macro kind's is. Structurally: exactly one
+  `{% snapshot %}` / `{% endsnapshot %}` block with nothing loose outside it, a
+  `config()` inside it naming a `unique_key` and a `strategy` of `timestamp` or
+  `check` along with the field that strategy cannot work without (`updated_at`
+  or `check_cols`), and a body that is a single read-only SELECT once its jinja
+  is stripped, the same guard a model gets. Each refusal names the fix rather
+  than the rule. Behind that, dbt's own parser runs at plan time and is the
+  authoritative gate, degrading to a warning where dbt is not installed.
+
+  `dbt build` runs snapshots natively, so nothing new has to be run after an
+  apply, and a snapshot writes a table, so it is priced in the cost handshake
+  like a model.
+
+- **`transform` authors dbt seeds** ([#211]). A `seed_csv` edit kind confined to
+  `seed-paths`, so moving a small reference mapping out of hard-coded SQL is a
+  reviewable diff like every other change instead of a hand-written file outside
+  the guardrail.
+
+  A seed is validated as CSV: it parses, the header is present and every column
+  is named, no two columns collide case-insensitively (warehouses fold
+  identifier case), and every row carries one field per column, with the refusal
+  naming the row and the column at fault. Two caps bound it, 5,000 data rows and
+  1 MiB, because a multi-megabyte CSV in a plan diff is unreadable in review,
+  which is the one thing a reviewable diff is for; over either, the refusal names
+  the cap and points at loading the data into the warehouse and `source()`-ing it.
+
+  **A seed is the first edit kind that puts values, not logic, into a diff**, and
+  a diff goes into git and stays there. So a seed's header is read two ways:
+  through the same name-and-type PII detector `explore` profiles warehouse
+  columns with, and against the flags already in the `.dex/` cache, where a
+  column a human has reviewed and cleared has already stopped being flagged. A
+  hit at or above the block threshold refuses, and the refusal names the exact
+  `pii_overrides` entry that would clear the column, carrying its name and
+  category and never a value. The refusal fires inside validation, which runs
+  before any diff is built, so a refused seed's values never enter a diff, agent
+  context, or git; a safety-spine assertion pins the ordering rather than only
+  the outcome.
+
+  Two limits are stated rather than papered over. Detection reads names and
+  types and never values, everywhere in dex, so a seed column named `code` full
+  of email addresses passes this gate. And the detector's generic `*_name` match
+  is one it explicitly calls provisional (on a warehouse column `explore` refines
+  it against value shape, up or down); dex never reads a seed's values, so that
+  refinement cannot run and the match warns instead of blocking. Every explicit
+  pattern (email, phone, address, government id, and the rest) still blocks, as
+  does a `*_name` column the cache has already flagged for real.
+
+  `dbt build` runs seeds natively, so applying and building is all it takes. A
+  seed loads a local CSV and scans nothing, so it stays deliberately unpriced.
+
 ### Changed
 
 - **`explore map` returns the map, not a receipt for it** ([#202]). The command
@@ -52,7 +114,53 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   it. Found by dogfooding the demo warehouse, and now asserted: every count in
   the payload reconciles with the objects it sits next to.
 
+- **The project view now loads all four of dbt's authored path families**
+  ([#210], [#211]). Loading snapshots and seeds is what makes them authorable: a
+  file dex can write but does not load hashes as absent, so a later edit to it
+  registers as a create and the apply after it conflicts on a file nobody
+  touched. The scan is per-family now rather than one global suffix filter
+  (`.sql`/`.yml`/`.yaml` under model, macro and snapshot paths, `.csv` plus YAML
+  under seed paths), so a stray CSV elsewhere in the repo is still nobody's
+  fixture to hash.
+
+  That widening moved what `maintain` fingerprints, which is the part that would
+  otherwise have broken quietly. Two derivations read "the things this project
+  builds" out of the file list by taking every `.sql` and using its filename;
+  loading snapshots would have made snapshots models there, and seeds would have
+  been missed entirely. Both are now scoped to the families that actually produce
+  a dbt node: `.sql` under model and snapshot paths, `.csv` under seed paths.
+  Macros counted as models before and no longer do, which is a fix rather than a
+  regression (a macro builds no relation and is `ref()`-able by nobody) but is a
+  behavior change worth naming. A baseline pinned before this lands reports no
+  phantom drift, because no detector diffs the file set or the model list; a test
+  pins that with a pre-change baseline.
+
+  Deleting a snapshot or a seed is now guarded like deleting a model, since both
+  are `ref()`-able. The seed half was a real hole: `.csv` never matched the
+  `.endswith(".sql")` test the guard made, so deleting a seed a model still
+  `ref()`s would have been accepted and broken the build.
+
+- **An edit's kind and its location must agree, across every family.** The rule
+  that kept a macro out of `models/` is now a table over the four families and
+  the file suffix, and it refuses in both directions naming both fixes (move the
+  file, or relabel the kind). `schema_yml` is admitted beside a snapshot and a
+  seed as well as beside a model, because that is where dbt expects a snapshot's
+  tests and a seed's column types declared. Macro-path behavior is unchanged.
+
 ### Fixed
+
+- **`transform plan` refuses on its own terms before it hands anything to dbt's
+  parser** ([#210], [#211]). The parse gate runs before the plan is stored, and
+  `shadow_parse` copies the project into a temp directory *with the edits written
+  into it*. Once snapshots and seeds joined that gate, a seed refused for
+  carrying personal data had already reached disk and a dbt subprocess by the
+  time the refusal fired, and dbt's message stood in for dex's own
+  ("Encountered unknown tag 'snapshot'" in place of "a snapshot_sql edit must
+  live under the project's snapshot paths"). The refusing half of plan-time
+  validation is now shared between `plans.plan` and the command, which runs it
+  first, on the same principle the profiles secret-guard already followed. Found
+  by dogfooding, and now pinned by a spine test that fails if the parser is ever
+  reached with a PII-flagged seed.
 
 - **Databricks: `explore profile` and `explore map` crashed on any real value
   domain.** The value-domain probe reads back a `collect_list`, which is an
