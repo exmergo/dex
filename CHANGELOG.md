@@ -305,6 +305,53 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   silently reported as clean, and only fractions and observation counts ever
   leave the engine, never a measure's value.
 
+- **`explore semantic list` carries the dbt project's own label and description
+  on dimensions and entities, not just on metrics** ([#333]). The catalog
+  answered with a rich metrics list beside two lists of bare snake_case
+  identifiers, because `DimensionInfo` and `EntityInfo` held a name and a type
+  and nothing else. A consumer rendering the catalog as a browsable manifest had
+  an empty Description column on its dimensions and entities tabs, and search
+  over them degraded to substring matching on the identifier, because there was
+  genuinely no field to show. An agent deciding what to group by got
+  `user__pricing_tier` when the dbt project may well have said what that
+  dimension means.
+
+  Both backends carried the fields all along and dex dropped them at the
+  request. The hosted catalog query asked for `dimensions { name type }`, so
+  widening the selection set costs no extra round trip, and the compiled semantic
+  manifest declares `label` and `description` on both elements where the local
+  read-view kept only the name and the type. Where the same element is met more
+  than once (the hosted API nests a dimension under every metric that can group
+  by it, and locally an entity is declared in every semantic model that joins on
+  it) each field now takes the first non-null value rather than the first copy
+  outright, so whichever copy happens to sort first can no longer blank out text
+  another one carries.
+
+  One asymmetry is structural and disclosed rather than papered over: the dbt
+  Cloud API's `Entity` type has no `label`, and asking for one fails the entire
+  catalog query, so an entity label arrives only from `--local` and a hosted
+  catalog that has entities says so in a note. What deliberately stays out is
+  everything that is not "what is this and what does it mean": `expr`, `role`,
+  `isPartition`, `queryableGranularities`, and `semanticModel` are all there for
+  the asking, and none of them belong on a discovery surface.
+
+### Changed
+
+- **An unset optional field is omitted from the `explore semantic list` payload
+  rather than emitted as a null** ([#333]). `SemanticCatalog.to_data()` was an
+  unconditional `asdict` per element, so widening dimensions and entities would
+  have billed every caller for placeholders: measured against our own deployment
+  (27 metrics, 65 dimensions, 11 entities, populating `label` on 0 of 65
+  dimensions and `description` on 1 of 65), those two blocks grew 61% and almost
+  all of the growth was the word `null`. A catalog is agent context, and a
+  project that documents nothing should pay nothing for the fields it left blank.
+
+  The rule is the same on all three lists, metrics included, so the metrics block
+  no longer emits `"label": null` or `"description": null` as it did before.
+  Absent means unset, and a caller reading the JSON envelope should reach for
+  those fields with `.get()`. An empty list is untouched, because
+  `"dimensions": []` on a metric is an answer where a null is not.
+
 ## [1.6.6] - 2026-08-15
 
 ### Fixed
