@@ -64,6 +64,28 @@ _DEFAULT_COMPUTE_TIME_CAP_NOTE = (
     "the warehouse-level statement timeout and auto-suspend are the server-side caps"
 )
 
+# The same shape for db-load, and for the same reason. This one is not
+# decoration: the note asserts that a specific server-side cap was applied, and
+# the mechanism differs per connector, so a shared sentence would claim a cap
+# that was never injected on every connector but the one it was written for.
+# `_cap_note` refuses to claim anything for a connector with no entry.
+_DB_LOAD_CAP_NOTES = {
+    "postgres": (
+        "each statement was capped server-side by a statement_timeout set to "
+        "the ceiling (injected via PGOPTIONS)"
+    ),
+    "clickhouse": (
+        "each statement was capped server-side by max_execution_time and "
+        "max_bytes_to_read set from the ceiling (injected through the "
+        "profile's custom_settings env_var references)"
+    ),
+}
+_UNCAPPED_BUILD_NOTE = (
+    "this build ran without a dex-injected server-side cap: the confirmed "
+    "budget bounded the estimate, but nothing bounded a statement that "
+    "outran it"
+)
+
 
 class BuildFailedError(DexError):
     """A dbt run that started and did not succeed.
@@ -589,6 +611,7 @@ def build(
             ceiling=ceiling,
             confirmed=engine.confirmed,
             paradigm=paradigm,
+            connector=connector,
             dev_target_check=dev_check,
         )
         return _shape_build_result(
@@ -621,6 +644,7 @@ def build(
             ceiling=ceiling,
             confirmed=engine.confirmed,
             paradigm=paradigm,
+            connector=connector,
             estimate=estimate,
             # The dev-target check already ran above; passing None keeps the
             # engine from opening its own connection a second time.
@@ -961,13 +985,9 @@ def _shape_build_result(
             summary["seconds_billed"] = seconds
             spend = _record_build_spend(store, connector, seconds, paradigm)
     elif paradigm is Paradigm.DB_LOAD:
-        notes = [
-            "each statement was capped server-side by a statement_timeout set to "
-            "the ceiling (injected via PGOPTIONS)",
-            *notes,
-        ]
-        # dbt-postgres reports no billing figure; per-node execution time is the
-        # honest database-seconds actual.
+        notes = [_DB_LOAD_CAP_NOTES.get(connector, _UNCAPPED_BUILD_NOTE), *notes]
+        # The db-load dbt adapters report no billing figure; per-node execution
+        # time is the honest database-seconds actual.
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )

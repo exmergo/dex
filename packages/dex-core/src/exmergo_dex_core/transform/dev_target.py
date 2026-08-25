@@ -79,6 +79,9 @@ _DRIFT_FIELDS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "postgres": (("dev_schema", "postgres.dev_schema", "schema"),),
     "redshift": (("dev_schema", "redshift.dev_schema", "schema"),),
+    # dbt-clickhouse has no `database` key: its `schema` is the ClickHouse
+    # database, which is the same two-part-namespace fact the adapter encodes.
+    "clickhouse": (("dev_database", "clickhouse.dev_database", "schema"),),
     "duckdb": (("path", "duckdb.path", "path"),),
 }
 
@@ -124,12 +127,78 @@ def check(
     project = Path(project_dir)
     profile = target_identifiers(project, target)
     _assert_no_drift(project, target, config, profile, repo_root)
-    return _assert_namespace_exists(
-        project,
-        target,
-        config,
-        preflight_opener(repo_root, store, config, connection),
-    )
+    return [
+        *_assert_build_cap_reachable(project, target, config),
+        *_assert_namespace_exists(
+            project,
+            target,
+            config,
+            preflight_opener(repo_root, store, config, connection),
+        ),
+    ]
+
+
+def _assert_build_cap_reachable(
+    project: Path, target: str, config: DexConfig
+) -> list[str]:
+    """Warn when dex cannot tighten the build's server-side cap.
+
+    On ClickHouse the cap rides the profile's ``custom_settings`` through two
+    ``env_var`` references that ``transform build`` fills from the confirmed
+    budget. A hand-written profile without them is perfectly valid and builds
+    fine; what it cannot do is be capped, so the confirmed budget bounds the
+    estimate and nothing bounds a statement that outruns it.
+
+    A warning, never a refusal, matching this module's posture: dex does not
+    own the profile. But it has to be said out loud, because the alternative is
+    a build that reports it was capped when it was not.
+    """
+
+    if config.connector != "clickhouse":
+        return []
+    from .init import CH_MAX_BYTES_TO_READ_ENV, CH_MAX_EXECUTION_TIME_ENV
+
+    settings = _raw_target_key(project, target, "custom_settings")
+    rendered = " ".join(str(v) for v in settings.values()) if settings else ""
+    missing = [
+        name
+        for name in (CH_MAX_EXECUTION_TIME_ENV, CH_MAX_BYTES_TO_READ_ENV)
+        if name not in rendered
+    ]
+    if not missing:
+        return []
+    return [
+        "this profile's custom_settings do not reference "
+        f"{' or '.join(missing)}, so `transform build` cannot wind the "
+        "confirmed budget down into a server-side cap for this connector. The "
+        "budget still bounds the estimate; nothing bounds a statement that "
+        "outruns it. Re-run `transform init` or add the references by hand"
+    ]
+
+
+def _raw_target_key(project: Path, target: str, key: str) -> dict:
+    """One raw key from the profile's target block.
+
+    Needed because ``target_identifiers`` deliberately filters its output
+    through ``_TARGET_IDENTIFIER_KEYS``, so a nested block like
+    ``custom_settings`` never reaches the drift comparison and is invisible to
+    every other reader here.
+    """
+
+    path = project / PROFILES_FILE
+    if not path.is_file():
+        return {}
+    try:
+        profiles = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        output = (profile.get("outputs") or {}).get(target)
+        if isinstance(output, dict) and isinstance(output.get(key), dict):
+            return output[key]
+    return {}
 
 
 def _assert_no_drift(
@@ -227,6 +296,8 @@ def _assert_namespace_exists(
         return _postgres_namespace(project, target, config, open_probe)
     if config.connector == "redshift":
         return _redshift_namespace(project, target, config, open_probe)
+    if config.connector == "clickhouse":
+        return _clickhouse_namespace(project, target, config, open_probe)
     return []
 
 
@@ -471,6 +542,68 @@ def _bigquery_namespace(
     ]
 
 
+def _clickhouse_namespace(
+    project: Path,
+    target: str,
+    config: DexConfig,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
+) -> list[str]:
+    """Free: system-table lookups, no scan.
+
+    ClickHouse asks Postgres's question, not Snowflake's: dbt-clickhouse issues
+    ``CREATE DATABASE IF NOT EXISTS`` in its own ``create_schema`` macro, so a
+    missing dev database is not the failure; the privilege to create it is. And
+    the user that needs the privilege is the one in the rendered profile, not
+    the one dex connects as.
+
+    Where this differs from Postgres is what happens when the answer is
+    unknown. Postgres will answer a privilege question about any role; ClickHouse
+    shows another user's grants only to a caller holding SHOW ACCESS. So this
+    can legitimately come back with no verdict, and it returns a warning rather
+    than inventing one: a preflight that guesses would either refuse a build
+    that works or pass one that cannot.
+    """
+
+    ch = config.clickhouse
+    if ch is None or not ch.dev_database:
+        return []
+    role = target_role(project, target)
+    if not role:
+        # No rendered profile to read a user from (or it names none): there is
+        # no user to ask a privilege question about, so nothing to check.
+        return []
+
+    adapter, note = open_probe("clickhouse")
+    if adapter is None:
+        return [note]
+    try:
+        missing = adapter.missing_dev_namespaces(ch.dev_database, role=role)
+        # The adapter records its own abstention as a note rather than a
+        # verdict, so an unreadable grant table surfaces here as a warning.
+        unreadable = adapter.table_notes(f"{ch.dev_database}.*")
+    except Exception as exc:
+        raise DevTargetError(str(exc)) from exc
+    finally:
+        adapter.close()
+
+    if unreadable:
+        return list(unreadable)
+    if not missing:
+        return []
+    if _confirmed_out_of_scope(project, "clickhouse", "schema", ch.dev_database):
+        return []
+    problem = missing[0]
+    raise DevTargetError(
+        f"clickhouse user {role} is missing {problem}; grant it with:\n"
+        f"  GRANT CREATE DATABASE, CREATE TABLE, INSERT, SELECT ON "
+        f"{ch.dev_database}.* TO {role};\n"
+        "(dbt creates its dev database and builds every model in it, but only "
+        "if the user may, so the first build otherwise dies on a bare "
+        "permission error), or point clickhouse.dev_database at a database the "
+        "user can write"
+    )
+
+
 def _postgres_namespace(
     project: Path,
     target: str,
@@ -672,6 +805,11 @@ def content_check(
             (f"{block.dev_catalog}.{schema}", (block.dev_catalog, schema))
             for schema in schemas
         )
+    elif connector == "clickhouse" and block.dev_database:
+        databases = [block.dev_database]
+        if layered:
+            databases.extend(layer_names)
+        probes.extend((database, (database,)) for database in databases)
     elif connector in ("postgres", "redshift") and block.dev_schema:
         schemas = [block.dev_schema]
         if layered:
