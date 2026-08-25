@@ -37,6 +37,12 @@ name: Integration
 #   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
 #   fork-runnable by construction, kept here for pattern parity with the other
 #   connectors rather than as a cost decision.
+#   ClickHouse: no setup at all either, and one step fewer than Postgres. The
+#   connector runs against a container this job starts itself with the very
+#   script a maintainer runs locally (scripts/setup_clickhouse_dev.sh), so the
+#   dogfood target and the CI target are the same target by construction rather
+#   than by two spellings of one seed that have to be kept in step. Free,
+#   keyless, and fork-runnable.
 on:
   push:
     branches: [main]
@@ -320,3 +326,33 @@ jobs:
         run: uv sync --extra postgres --extra duckdb --extra dev
       - name: Live Postgres integration suite
         run: uv run pytest tests/integration -q -m postgres
+
+  clickhouse:
+    # No repository gate and no environment: the target is a container this job
+    # starts, so there is nothing to authenticate against and nothing a fork
+    # could spend.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_CH_DSN: clickhouse://dex_ro:dex_ro@localhost:8124/app
+      DEX_TEST_CH_DEV_PASSWORD: dbt_dev
+    steps:
+      - uses: actions/checkout@v4
+      # Not a `services:` container. The seed is multi-statement and the HTTP
+      # interface refuses multi-statement bodies, so it has to go through
+      # clickhouse-client inside the container, which means the job needs a
+      # container it can `docker exec` by name. Calling the dogfood script gives
+      # exactly that and keeps the seeding path single-sourced.
+      - name: Start and seed ClickHouse
+        working-directory: .
+        run: scripts/setup_clickhouse_dev.sh
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (clickhouse + duckdb + dev extras)
+        run: uv sync --extra clickhouse --extra duckdb --extra dev
+      - name: Live ClickHouse integration suite
+        run: uv run pytest tests/integration -q -m clickhouse
