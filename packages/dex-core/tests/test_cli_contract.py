@@ -35,6 +35,8 @@ def _all_commands() -> list[list[str]]:
                     argv += ["SELECT 1", "--repo-root", "missing-dex-fixture-dir"]
                 if group == "explore" and sub == "cluster":
                     argv += ["some_table", "--repo-root", "missing-dex-fixture-dir"]
+                if group == "transform" and sub == "references":
+                    argv.append("some_name")
                 argvs.append(argv)
         elif group == "demo":
             # The one verb that creates a file. Pointed at a directory that does
@@ -165,6 +167,8 @@ def test_scope_is_accepted_on_every_subcommand():
                 argv.append("t")
             elif group == "explore" and sub == "query":
                 argv.append("select 1")
+            elif group == "transform" and sub == "references":
+                argv.append("some_name")
             args = parser.parse_args(argv)
             assert args.scope == ["raw"], f"{group} {sub} dropped --scope"
 
