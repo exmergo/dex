@@ -15,6 +15,7 @@ from typing import ClassVar
 
 import pytest
 from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
+from pydantic import ValidationError
 
 from exmergo_dex_core import envelope as env
 from exmergo_dex_core.cache import (
@@ -259,6 +260,54 @@ def test_resolve_backend_selection(monkeypatch):
         sem.resolve_backend(engine, api=True, local=True)
 
 
+def test_resolve_backend_reads_the_deployment_axis(monkeypatch):
+    # `backend` collapsed vendor and deployment into one enum. Both spellings
+    # select, because the released one keeps working and the new one is what a
+    # second vendor would extend.
+    import exmergo_dex_core.explore.semantic.hosted as hosted_mod
+    import exmergo_dex_core.explore.semantic.local as local_mod
+
+    monkeypatch.setattr(
+        hosted_mod.HostedDbtCloudBackend,
+        "from_config",
+        classmethod(lambda cls, config, source=None: "HOSTED"),
+    )
+    monkeypatch.setattr(
+        local_mod.LocalMetricFlowBackend,
+        "from_engine",
+        classmethod(lambda cls, engine: "LOCAL"),
+    )
+    by_deployment = _engine(DexConfig(semantic={"deployment": "dbt_cloud"}))
+    assert sem.resolve_backend(by_deployment) == "HOSTED"
+    assert sem.resolve_backend(by_deployment, local=True) == "LOCAL"
+    spelled_out = _engine(DexConfig(semantic={"vendor": "dbt", "deployment": "local"}))
+    assert sem.resolve_backend(spelled_out) == "LOCAL"
+    assert sem.resolve_backend(spelled_out, api=True) == "HOSTED"
+
+
+def test_a_semantic_vendor_dex_does_not_ship_is_refused():
+    # Refused at the config seam, by name, rather than resolving to whatever
+    # happens to be the default backend.
+    with pytest.raises(ValidationError, match=r"semantic\.vendor"):
+        DexConfig(semantic={"vendor": "cube"})
+
+
+def test_the_backend_declares_who_executes():
+    # The axis the guards read. `execution` is derived from the backend, never
+    # configured, because it decides whether the cost guard can apply at all.
+    from exmergo_dex_core.explore.semantic.hosted import HostedDbtCloudBackend
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    assert HostedDbtCloudBackend.execution == sem.EXECUTION_VENDOR
+    assert LocalMetricFlowBackend.execution == sem.EXECUTION_DEX
+    cost, warnings = sem.cost_posture(HostedDbtCloudBackend)
+    assert cost.paradigm == env.Paradigm.HOSTED
+    assert cost.estimate is None and cost.ceiling is None
+    assert any("cost guard unavailable" in w for w in warnings)
+    # A dex-executed backend gets its cost from the adapter, not from here.
+    assert sem.cost_posture(LocalMetricFlowBackend) == (None, [])
+
+
 # ---- hosted backend (fake transport) ----------------------------------------
 
 
@@ -488,6 +537,107 @@ def test_hosted_discloses_a_metadata_call_that_never_answered():
     # and the gate still bound on the way there, on the heuristic alone
     with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
         backend.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
+
+
+def test_both_payloads_name_the_axes_the_backend_enum_collapsed():
+    # A caller reading a result should not have to know that "dbt_cloud" implies
+    # "the vendor executed this, so no cost guard applied". `backend` stays for
+    # compatibility; the three axes say it outright.
+    backend = FakeHostedBackend(
+        metrics=[
+            {"name": "sessions", "type": "SIMPLE", "dimensions": [], "entities": []}
+        ],
+        result=table_json_result(["sessions"], ["number"], [[5.0]]),
+    )
+    catalog = backend.list_definitions().to_data()
+    assert catalog["backend"] == "dbt_cloud"
+    assert catalog["vendor"] == "dbt"
+    assert catalog["deployment"] == "dbt_cloud"
+    assert catalog["execution"] == sem.EXECUTION_VENDOR
+
+    payload = backend.query(SemanticQuery(metrics=["sessions"])).data()
+    assert payload["backend"] == "dbt_cloud"
+    assert payload["execution"] == sem.EXECUTION_VENDOR
+
+
+def test_hosted_metadata_is_the_union_across_a_query_s_metrics():
+    # `dimensions(metrics: [a, b])` returns the dimensions common to both, so
+    # asking once for a multi-metric query returns the intersection and the
+    # authoritative map shrinks as the query grows. One aliased field per metric
+    # is the union, which is what the gate has to screen against.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "sessions": [{"name": "session__mode", "config": {"meta": {}}}],
+            "agent_runs": [{"name": "agent__mode", "config": {"meta": {}}}],
+        }
+    )
+    meta = backend._dimension_meta(["sessions", "agent_runs"])
+    assert set(meta) == {"session__mode", "agent__mode"}
+
+
+def test_hosted_asks_the_layer_once_however_many_metrics_it_asks_about():
+    # Aliases, not N calls: the union costs one round trip on a path that already
+    # pays for createQuery and a poll loop, so nothing here needs concurrency.
+    backend = FakeHostedBackend(
+        dimensions_meta={"sessions": [], "agent_runs": [], "chat_turns": []}
+    )
+    backend._dimension_meta(["sessions", "agent_runs", "chat_turns"])
+    assert len(backend.posted) == 1
+    assert backend.posted[0].count("dimensions(environmentId") == 3
+
+
+def test_hosted_metadata_asks_once_per_distinct_metric():
+    backend = FakeHostedBackend(dimensions_meta={"sessions": []})
+    backend._dimension_meta(["sessions", "sessions"])
+    assert backend.posted[0].count("dimensions(environmentId") == 1
+
+
+def test_hosted_metadata_lets_pii_win_where_two_metrics_disagree():
+    # Same dimension, two metrics, contradictory metadata. The merge has one job
+    # in that case and it is not to be even-handed.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "sessions": [{"name": "user__handle", "config": {"meta": {"pii": False}}}],
+            "agent_runs": [{"name": "user__handle", "config": {"meta": {"pii": True}}}],
+        }
+    )
+    meta = backend._dimension_meta(["sessions", "agent_runs"])
+    assert meta["user__handle"] == {"pii": True}
+    with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
+        backend.query(
+            SemanticQuery(metrics=["sessions", "agent_runs"], group_by=["user__handle"])
+        )
+
+
+def test_hosted_metadata_says_nothing_never_displaces_a_flag():
+    # The reverse order, and the null config a synthesized dimension returns.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "sessions": [{"name": "user__handle", "config": {"meta": {"pii": True}}}],
+            "agent_runs": [{"name": "user__handle", "config": None}],
+        }
+    )
+    assert backend._dimension_meta(["sessions", "agent_runs"])["user__handle"] == {
+        "pii": True
+    }
+
+
+def test_hosted_screens_a_grain_suffixed_dimension_against_the_layer():
+    # A group-by token may carry a time grain that no dimension name has, so a
+    # flagged time dimension would otherwise need only `__month` on the end to
+    # drop to the name heuristic.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "sessions": [
+                {"name": "user__signed_up_at", "config": {"meta": {"pii": True}}}
+            ]
+        }
+    )
+    with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
+        backend.query(
+            SemanticQuery(metrics=["sessions"], group_by=["user__signed_up_at__month"])
+        )
+    assert not any("createQuery" in posted for posted in backend.posted)
 
 
 def test_hosted_pii_gate_blocks_before_execution():
@@ -1156,7 +1306,7 @@ def test_a_project_less_deployment_is_told_to_use_the_hosted_backend():
         sem.resolve_backend(engine, local=True)
     message = str(exc.value)
     assert "needs a dbt project on disk" in message
-    assert "semantic.backend: dbt_cloud" in message
+    assert "semantic.deployment: dbt_cloud" in message
 
 
 def test_the_hosted_surface_needs_nothing_on_the_filesystem(
