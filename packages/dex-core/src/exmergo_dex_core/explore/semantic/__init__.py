@@ -76,11 +76,17 @@ class SemanticQuery:
     """A backend-neutral metric query: the grammar shared by MetricFlow, the dbt
     Cloud GraphQL API, and the JDBC macro.
 
-    ``group_by`` tokens are entity-qualified dimension names (``user__pricing_tier``,
-    ``metric_time``). ``grain`` applies to ``metric_time`` when the caller wants a
-    time bucket without spelling it into the token; ``where`` clauses use the Jinja
-    filter dialect (``{{ Dimension('session__is_deleted') }} = false``) verbatim on
-    both backends.
+    ``group_by`` tokens are entity-qualified dimension names
+    (``user__pricing_tier``) plus whatever token the layer uses for a metric's own
+    time axis. ``grain`` applies to that time token when the caller wants a bucket
+    without spelling it into the token, and it is validated against the grains the
+    layer reports rather than against a list dex keeps.
+
+    ``where`` clauses are passed through in **the answering layer's own filter
+    dialect**, verbatim. That dialect is the backend's business, not this seam's:
+    dbt's is a Jinja call (``{{ Dimension('session__is_deleted') }} = false``) and
+    another format's is not, so the backend is what reads a clause when the PII
+    gate needs to know which dimensions one touches.
 
     Name lists normalize here rather than at the CLI, so the two backends and a
     library caller building the query object directly all see the same tokens: a
@@ -125,9 +131,11 @@ __all__ = [
     "derive_entity_type",
     "merge_element_fields",
     "qualified_dimension",
+    "queryable_grains",
     "requested_dimension_refs",
     "resolve_backend",
     "screen_dimension_refs",
+    "validate_grain",
 ]
 
 
@@ -297,6 +305,13 @@ class SemanticBackend(Protocol):
     backend that answers ``vendor`` inherits the whole no-guard posture from
     :func:`cost_posture` instead of assembling it again.
 
+    ``filter_refs`` is where the query dialect stays the backend's own. A filter
+    clause is written in the answering layer's language, and the PII gate has to
+    know which dimensions one names before it can screen them, so a backend reads
+    its own clauses and the neutral layer keeps the screening policy. A backend
+    that cannot read its dialect answers None and its filtered queries are refused
+    rather than passed with half their references unexamined.
+
     ``catalog_gaps`` and ``dimension_scope`` are the same idea applied to the
     catalog. A backend states, once, which fields of which element kind it cannot
     supply and what one dimension row of its catalog is, and both travel into the
@@ -316,6 +331,11 @@ class SemanticBackend(Protocol):
     def list_definitions(self) -> SemanticCatalog: ...
 
     def query(self, q: SemanticQuery): ...
+
+    def filter_refs(self, clauses: list[str]) -> list[str] | None:
+        """The dimension and entity tokens these filter clauses name, or None when
+        this backend cannot read its own filter dialect."""
+        ...
 
 
 # Who runs the statement. `dex` renders it and executes it through its own
@@ -385,19 +405,48 @@ def cost_posture(backend: Any) -> tuple[Any, list[str]]:
 # screened, because grouping by an email is as much a disclosure as filtering by
 # one and then projecting it.
 
-_DIMENSION_REF = re.compile(r"(?:Time)?Dimension\(\s*['\"]([^'\"]+)['\"]")
-_ENTITY_REF = re.compile(r"Entity\(\s*['\"]([^'\"]+)['\"]")
 # Meta keys, on a dimension's dbt `config.meta`, that authoritatively mark it PII.
 _PII_META_KEYS = ("pii", "contains_pii", "is_pii", "pii_category")
+# A time grain is an identifier in any dialect. Checked here because a grain
+# reaches a query as an enum or a token rather than as a quoted value, so a grain
+# that is not an identifier is the one shape that could carry query structure.
+_GRAIN_TOKEN = re.compile(r"[A-Za-z0-9_]+")
 
 
-def requested_dimension_refs(q: SemanticQuery) -> list[str]:
-    """Every dimension/entity token a query would touch, de-duplicated in order."""
+def requested_dimension_refs(
+    q: SemanticQuery, *, filter_refs: Callable[[list[str]], list[str]] | None
+) -> list[str]:
+    """Every dimension/entity token a query would touch, de-duplicated in order.
+
+    ``filter_refs`` is the answering backend's reader for its own filter dialect,
+    and it is a required argument with no default: a filter dex cannot read is a
+    filter dex cannot screen, and a signature that let a caller omit it would make
+    that the quiet outcome. **None means the backend cannot read its dialect**, and
+    a query that carries filter clauses is then refused rather than screened on its
+    group-by half alone.
+
+    That refusal is the point. The gate's disclosures can only report on refs the
+    extraction found, so an extractor that matches nothing produces a successful
+    query, no blocks, and no notes: every dimension named in a filter grouped and
+    projected with nothing saying it was never looked at.
+    """
 
     refs: list[str] = [*q.group_by]
-    for clause in q.where:
-        refs.extend(_DIMENSION_REF.findall(clause))
-        refs.extend(_ENTITY_REF.findall(clause))
+    if q.where:
+        # The reader may decline in either direction, and both mean the same thing:
+        # a caller with no extractor to pass, or a backend whose extractor cannot
+        # read this dialect. Checking only the first would let the second through
+        # with its filters unexamined, which is the failure this argument exists to
+        # make impossible.
+        found = filter_refs(list(q.where)) if filter_refs is not None else None
+        if found is None:
+            raise SemanticQueryRefusedError(
+                "refused: this semantic backend cannot read the dimensions its own "
+                "filter dialect names, so a filtered query cannot be screened for "
+                "PII. PII is flagged, never surfaced; move the condition into "
+                "--group-by, or query a backend that reads its filters."
+            )
+        refs.extend(found)
     seen: set[str] = set()
     ordered: list[str] = []
     for ref in refs:
@@ -405,6 +454,62 @@ def requested_dimension_refs(q: SemanticQuery) -> list[str]:
             seen.add(ref)
             ordered.append(ref)
     return ordered
+
+
+def queryable_grains(
+    metrics: list[str], reported: dict[str, list[str]]
+) -> list[str] | None:
+    """The grains valid for every metric in one query, or None when unknown.
+
+    A query groups all of its metrics by one time axis, so a grain has to be
+    queryable on all of them: the intersection is the honest answer, and it keeps a
+    two-metric query from being told a grain is available when only one side can
+    serve it. None where the layer said nothing about some metric, so that the
+    layer refuses it rather than dex guessing on the layer's behalf.
+    """
+
+    if not metrics or any(metric not in reported for metric in metrics):
+        return None
+    return [
+        grain
+        for grain in reported[metrics[0]]
+        if all(grain in reported[metric] for metric in metrics[1:])
+    ]
+
+
+def validate_grain(grain: str | None, *, available: list[str] | None) -> str | None:
+    """The requested grain, lowercased, or a refusal naming what the layer offers.
+
+    The vocabulary is the layer's, per metric, rather than a constant dex keeps.
+    A fixed tuple is wrong in both directions: it refuses grains the vendor
+    supports (its own enum runs from a nanosecond to a year) and it can never
+    contain a granularity a project defined for itself.
+
+    ``available`` is what the layer reported: a list to check against, ``[]`` for a
+    metric that can be grouped by no grain at all, and None for a layer that was
+    not reachable or does not answer the question. None leaves the identifier check
+    as the only gate, which is the honest fallback: refusing on dex's authority
+    what the layer never said is worse than letting the layer refuse it.
+    """
+
+    if not grain:
+        return None
+    if not _GRAIN_TOKEN.fullmatch(grain):
+        raise SemanticBackendError(f"invalid time grain: {grain!r}")
+    lowered = grain.lower()
+    if available is None:
+        return lowered
+    if not available:
+        raise SemanticBackendError(
+            f"this metric reports no queryable time grain, so '{lowered}' cannot "
+            "be applied; group by a time dimension of the metric instead"
+        )
+    if lowered not in [value.lower() for value in available]:
+        raise SemanticBackendError(
+            f"unknown time grain '{lowered}' for this metric; the layer reports "
+            f"{', '.join(available)}"
+        )
+    return lowered
 
 
 def _meta_says_pii(meta: Any) -> bool:

@@ -19,9 +19,11 @@ import json
 import os
 import re
 import time
+from dataclasses import replace
 from typing import Any
 
 from ... import envelope as env
+from ... import metricflow_dialect
 from ...config import QueryLimits
 from ..results import SemanticQueryResult
 from . import (
@@ -43,9 +45,11 @@ from . import (
     derive_entity_type,
     merge_element_fields,
     merge_pii_meta,
+    queryable_grains,
     requested_dimension_refs,
     screen_dimension_refs,
     unadjudicated_refs,
+    validate_grain,
 )
 
 # The very explicit line the founder asked for: wherever a reader or agent might
@@ -173,6 +177,21 @@ def _metric_info(payload: dict[str, Any], owners: list[str]) -> MetricInfo:
     if offsets:
         vendor["offset_windows"] = offsets
 
+    if payload.get("requiresMetricTime"):
+        # Written only when true, so an absent key means false and a layer of
+        # dozens of metrics does not pay for a false on each of them.
+        vendor["requires_metric_time"] = True
+
+    # One name over several columns: each measure aggregates over its own time
+    # dimension, so a metric drawing on measures from two models has two.
+    time_axis = sorted(
+        {
+            measure["aggTimeDimension"]
+            for measure in payload.get("measures") or []
+            if isinstance(measure, dict) and measure.get("aggTimeDimension")
+        }
+    )
+
     metric_filter = payload.get("filter")
     return MetricInfo(
         name=payload.get("name"),
@@ -182,6 +201,8 @@ def _metric_info(payload: dict[str, Any], owners: list[str]) -> MetricInfo:
         dimensions=[d.get("name") for d in (payload.get("dimensions") or [])],
         semantic_models=owners or None,
         input_measures=inputs or None,
+        time_axis=time_axis or None,
+        queryable_granularities=_grains(payload),
         composition=MetricComposition(
             measure=named(params.get("measure")),
             numerator=named(params.get("numerator")),
@@ -226,8 +247,29 @@ def _screening_notes(unknown: list[str], meta: dict[str, Any] | None) -> list[st
     ]
 
 
-# MetricFlow standard time grains, the only values the API's grain enum accepts.
-_GRAINS = ("day", "week", "month", "quarter", "year")
+_GRAIN_FIELDS = ("queryableTimeGranularities", "queryableGranularities")
+
+
+def _grains(payload: dict[str, Any]) -> list[str] | None:
+    """The grains the API reports for one metric or dimension, or None if it did
+    not answer.
+
+    Both fields are read and merged because they answer the same question in two
+    shapes: ``queryableGranularities`` is the standard enum, and
+    ``queryableTimeGranularities`` is the one that can also name a granularity the
+    project defined for itself. An **empty list is the answer** for a categorical
+    dimension, and it is the fact that stops a caller asking it for a month. A
+    payload carrying neither field is a deployment that was not asked, which is
+    not the same statement and must not read as one.
+    """
+
+    if not any(field in payload for field in _GRAIN_FIELDS):
+        return None
+    return metricflow_dialect.order_grains(
+        [value for field in _GRAIN_FIELDS for value in payload.get(field) or []]
+    )
+
+
 # Metric/dimension/entity names are identifiers; validating them keeps
 # caller-supplied values out of the GraphQL query as anything but a quoted name or
 # a known enum, so a name can never smuggle in extra query structure.
@@ -240,22 +282,20 @@ def _ident(name: str) -> str:
     return name
 
 
-def _split_grain(token: str, default_grain: str | None) -> tuple[str, str | None]:
-    """A group-by/order-by token to ``(name, grain)``. A trailing ``__<grain>`` is
-    a grain (``metric_time__month``); an ordinary ``entity__dimension`` is not.
-    ``metric_time`` picks up the query's ``--grain`` when the token carries none."""
+def _split_grain(
+    token: str, default_grain: str | None, grains: tuple[str, ...]
+) -> tuple[str, str | None]:
+    """A group-by/order-by token to ``(name, grain)``, both safe to interpolate.
 
-    name, grain = token, None
-    if "__" in token:
-        head, tail = token.rsplit("__", 1)
-        if tail.lower() in _GRAINS:
-            name, grain = head, tail.lower()
-    if name == "metric_time" and grain is None and default_grain:
-        grain = default_grain.lower()
-    if grain is not None and grain not in _GRAINS:
-        raise SemanticBackendError(
-            f"unknown time grain '{grain}'; use one of {', '.join(_GRAINS)}"
-        )
+    The split itself is the dialect's, which is also where the vocabulary comes
+    from: ``grains`` is what the layer reported for the metrics being queried, so a
+    granularity a project defined for itself is recognized as a grain suffix
+    instead of being read as part of a dimension name. A grain that arrives this
+    way is already one of those values, and the name still passes ``_ident``,
+    because both land in the query as structure rather than as a quoted value.
+    """
+
+    name, grain = metricflow_dialect.split_grain(token, default_grain, grains=grains)
     return _ident(name), grain
 
 
@@ -367,6 +407,7 @@ class HostedDbtCloudBackend:
     # 'Entity'"), and `Measure` has no words either.
     _CATALOG_FIELDS = (
         "name type label description "
+        "queryableGranularities queryableTimeGranularities requiresMetricTime "
         "filter { whereSqlTemplate } "
         "typeParams { measure { name } inputMeasures { name } "
         "numerator { name } denominator { name } expr "
@@ -374,7 +415,8 @@ class HostedDbtCloudBackend:
         "metrics { name offsetWindow { count granularity } } } "
         "measures { name agg expr aggTimeDimension } "
         "semanticModels { name } "
-        "dimensions { name type label description semanticModel { name } } "
+        "dimensions { name type label description semanticModel { name } "
+        "queryableGranularities queryableTimeGranularities } "
         "entities { name type description expr role semanticModel { name } }"
     )
 
@@ -416,6 +458,7 @@ class HostedDbtCloudBackend:
                         "description": d.get("description"),
                         "definition": _bare_dimension(d.get("name"), owner),
                         "semantic_model": owner,
+                        "queryable_granularities": _grains(d),
                     },
                 )
 
@@ -464,6 +507,14 @@ class HostedDbtCloudBackend:
         notes = [_HOSTED_REACH_NOTE]
         if roles:
             notes.append(_HOSTED_ENTITY_LABEL_NOTE)
+        disagreeing = sorted(m.name for m in metrics if len(m.time_axis or ()) > 1)
+        if disagreeing:
+            notes.append(
+                f"{', '.join(disagreeing)} aggregate over more than one time "
+                "column (see time_axis): grouping by metric_time uses each "
+                "measure's own, so the parts of one number can be bucketed by "
+                "different timestamps"
+            )
         return SemanticCatalog.from_backend(
             self,
             semantic_models=[SemanticModelInfo(name=n) for n in sorted(models)],
@@ -476,6 +527,7 @@ class HostedDbtCloudBackend:
                     description=fields.get("description"),
                     definition=fields.get("definition"),
                     semantic_model=fields.get("semantic_model"),
+                    queryable_granularities=fields.get("queryable_granularities"),
                 )
                 for name, fields in sorted(dims.items())
             ],
@@ -494,10 +546,26 @@ class HostedDbtCloudBackend:
 
     # ---- query -------------------------------------------------------------
 
+    def filter_refs(self, clauses: list[str]) -> list[str] | None:
+        """The dimensions and entities these filter clauses name.
+
+        dbt Cloud takes the clause as MetricFlow's Jinja dialect and renders it
+        server-side, so what a clause references is read with that dialect's own
+        grammar rather than with anything shared.
+        """
+
+        return metricflow_dialect.filter_refs(clauses)
+
     def query(self, q: SemanticQuery) -> SemanticQueryResult:
-        refs = requested_dimension_refs(q)
-        meta = self._dimension_meta(q.metrics)
-        lookup = self._meta_lookup(meta)
+        refs = requested_dimension_refs(q, filter_refs=self.filter_refs)
+        meta, reported = self._query_metadata(q.metrics)
+        # Every grain the layer named, in one vocabulary, so a token carrying a
+        # granularity this project defined for itself is read as a grain suffix
+        # rather than as part of a dimension name.
+        vocabulary = tuple(
+            dict.fromkeys(grain for values in reported.values() for grain in values)
+        )
+        lookup = self._meta_lookup(meta, vocabulary)
         blocked = screen_dimension_refs(refs, meta_lookup=lookup)
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
@@ -508,7 +576,10 @@ class HostedDbtCloudBackend:
             )
         notes = _screening_notes(unadjudicated_refs(refs, meta_lookup=lookup), meta)
 
-        query_id = self._create_query(q)
+        # Refused after the gate on purpose: a query that would disclose PII is
+        # refused for that reason whatever else is wrong with it.
+        grain = validate_grain(q.grain, available=queryable_grains(q.metrics, reported))
+        query_id = self._create_query(replace(q, grain=grain), vocabulary)
         json_result = self._await_result(query_id)
         # A hosted cost is a paradigm and nothing else: dbt Cloud ran the query
         # under its own warehouse connection, so there is no estimate dex could
@@ -523,9 +594,12 @@ class HostedDbtCloudBackend:
             warnings=warnings,
         )
 
-    def _dimension_meta(self, metrics: list[str]) -> dict[str, Any] | None:
-        """``dimension name -> its dbt config.meta`` for the PII gate, or None when
-        the layer could not be asked at all.
+    def _query_metadata(
+        self, metrics: list[str]
+    ) -> tuple[dict[str, Any] | None, dict[str, list[str]]]:
+        """Everything dex asks the layer before sending a query, in one document:
+        ``(dimension name -> its dbt config.meta, metric name -> queryable
+        grains)``. The first is None when the layer could not be asked at all.
 
         **One aliased field per metric, in one document.** ``dimensions(metrics:)``
         returns the dimensions common to *all* the listed metrics, not their union,
@@ -544,12 +618,18 @@ class HostedDbtCloudBackend:
         carries no PII metadata, so neither one passes unremarked. One unknown
         metric fails the whole document rather than its own alias, which costs the
         map for the other metrics; that query is about to be refused by
-        ``createQuery`` for the same reason, so it never reaches the warehouse."""
+        ``createQuery`` for the same reason, so it never reaches the warehouse.
+
+        The grains ride along in the same document, unaliased and for every metric
+        in the layer, because that field takes no metric argument and two fields of
+        two words each are cheaper than a second round trip. They are what a
+        requested ``--grain`` is validated against, so that a grain the layer
+        accepts is not refused by dex and a grain it does not is refused by name."""
 
         if not metrics:
             # Nothing to ask about, and an empty selection set is not a document.
             # `_create_query` refuses this query by name a moment later.
-            return None
+            return None, {}
         try:
             fields = " ".join(
                 f"a{index}: dimensions(environmentId: {self._env}, "
@@ -557,18 +637,32 @@ class HostedDbtCloudBackend:
                 f"{{ name config {{ meta }} }}"
                 for index, metric in enumerate(dict.fromkeys(metrics))
             )
+            fields += (
+                f" grains: metrics(environmentId: {self._env}) "
+                "{ name queryableGranularities queryableTimeGranularities }"
+            )
             data = self._post("{ " + fields + " }")
         except SemanticBackendError:
-            return None
+            return None, {}
         meta: dict[str, Any] = {}
-        for dimensions in data.values():
-            for d in dimensions or []:
+        reported: dict[str, list[str]] = {}
+        for alias, payload in data.items():
+            if alias == "grains":
+                for metric in payload or []:
+                    grains = _grains(metric) if isinstance(metric, dict) else None
+                    # A metric the layer answered about, only. An unanswered one
+                    # stays out of the map, which is what makes the requested grain
+                    # pass through to the layer instead of being refused by dex.
+                    if grains is not None and metric.get("name"):
+                        reported[metric["name"]] = grains
+                continue
+            for d in payload or []:
                 cfg = d.get("config")
                 value = cfg.get("meta") if isinstance(cfg, dict) else None
                 merge_pii_meta(meta, d.get("name"), value)
-        return meta
+        return meta, reported
 
-    def _meta_lookup(self, meta: dict[str, Any] | None):
+    def _meta_lookup(self, meta: dict[str, Any] | None, grains: tuple[str, ...] = ()):
         """The gate's authoritative lookup, over the tokens a caller actually
         writes rather than the names the API returns.
 
@@ -581,28 +675,30 @@ class HostedDbtCloudBackend:
         if meta is None:
             return lambda _ref: None
 
+        vocabulary = grains or metricflow_dialect.STANDARD_GRAINS
+
         def lookup(ref: str) -> Any:
             if ref in meta:
                 return meta[ref]
             head, sep, tail = ref.rpartition("__")
-            if sep and tail.lower() in _GRAINS:
+            if sep and tail.lower() in vocabulary:
                 return meta.get(head)
             return None
 
         return lookup
 
-    def _create_query(self, q: SemanticQuery) -> str:
+    def _create_query(self, q: SemanticQuery, grains: tuple[str, ...] = ()) -> str:
         if not q.metrics:
             raise SemanticBackendError("a metric query needs at least one --metric")
         metrics = ", ".join(f'{{name: "{_ident(m)}"}}' for m in q.metrics)
         parts = [f"environmentId: {self._env}", f"metrics: [{metrics}]"]
         if q.group_by:
-            parts.append(f"groupBy: {self._group_by(q)}")
+            parts.append(f"groupBy: {self._group_by(q, grains)}")
         if q.where:
             clauses = ", ".join("{sql: " + json.dumps(c) + "}" for c in q.where)
             parts.append(f"where: [{clauses}]")
         if q.order_by:
-            parts.append(f"orderBy: {self._order_by(q)}")
+            parts.append(f"orderBy: {self._order_by(q, grains)}")
         if q.limit:
             parts.append(f"limit: {int(q.limit)}")
         mutation = "mutation { createQuery(" + ", ".join(parts) + ") { queryId } }"
@@ -612,21 +708,23 @@ class HostedDbtCloudBackend:
             raise SemanticBackendError("the semantic layer returned no queryId")
         return query_id
 
-    def _group_by(self, q: SemanticQuery) -> str:
+    def _group_by(self, q: SemanticQuery, grains: tuple[str, ...] = ()) -> str:
         entries = []
         for token in q.group_by:
-            name, grain = _split_grain(token, q.grain)
+            name, grain = _split_grain(token, q.grain, grains)
             if grain:
                 entries.append(f'{{name: "{name}", grain: {grain.upper()}}}')
             else:
                 entries.append(f'{{name: "{name}"}}')
         return "[" + ", ".join(entries) + "]"
 
-    def _order_by(self, q: SemanticQuery) -> str:
+    def _order_by(self, q: SemanticQuery, grains: tuple[str, ...] = ()) -> str:
         entries = []
         for token in q.order_by:
             descending = token.startswith("-")
-            name, grain = _split_grain(token[1:] if descending else token, q.grain)
+            name, grain = _split_grain(
+                token[1:] if descending else token, q.grain, grains
+            )
             if name in q.metrics:
                 inner = f'metric: {{name: "{name}"}}'
             elif grain:
