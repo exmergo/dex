@@ -23,6 +23,46 @@ the project, reasons over it together with warehouse introspection and the
 - `profiles.yml` (searched the way dbt searches: `$DBT_PROFILES_DIR`, the project
   directory, `~/.dbt`), but only to resolve a target's **name and adapter type**.
   Connection fields, credentials included, never leave the engine.
+- `dbt_packages/` when packages are installed, each package loaded as the dbt
+  project it is, so a package that configures its own path families is read the
+  way dbt reads it.
+
+### The reference index
+
+One projection over all of the above answers "where is this name used", and
+`transform references` returns it. Three things about it are worth knowing before
+relying on it.
+
+**It reads calls, not text.** Jinja is scanned for the calls it contains, so a
+`var()` read inside a macro body is a use of that var, a `{% if %}` block is not a
+blind spot, and the two-argument `ref('package', 'model')` form resolves to the
+model rather than to the package.
+
+**An argument dex did not read is `indeterminate`, never absent.** A
+`{{ ref(var('x')) }}` names a model only dbt can know, and a dimension whose
+`expr` is a computed expression names a column dex will not guess at. Both are
+reported by file and line with no name attached, because the fact is about the
+call site and not about any one target. Collapsing "dex could not resolve this"
+into "there is nothing here" is how a use goes missing, so the two stay apart.
+
+**It states whether it believes itself complete.** `completeness` is `complete`
+only when every reason to doubt the answer has been ruled out, and `limits` names
+each remaining one: an unresolved reference, packages declared but not installed,
+`sqlglot` absent on a column query, a file that would not parse. A completeness
+claim that is not complete is worse than no claim, because it is the one a caller
+acts on without checking.
+
+Names are matched at the grain the question allows. A model, macro, var, source,
+metric, entity, dimension or measure name is exact. A bare column name is matched
+across the project and labelled `name_matched`; a qualified `model.column` is
+resolved through the `ref()` graph, with occurrences outside that lineage still
+listed and labelled `same_name_elsewhere` rather than dropped. A dotted name reads
+as a source before it reads as a qualified column, since `raw.orders` is the more
+common thing to ask about.
+
+A seed contributes its header row and never a data row: the header names columns,
+which is what an index is for, and the rows are project data, which never enters
+agent context.
 
 The project is discovered automatically (the repo root, or a unique child
 directory holding a `dbt_project.yml`); `dbt_project_dir` in `.dex/config.yml`
@@ -56,7 +96,10 @@ touched after planning is never silently removed. Deletes are guarded as a unit:
 a plan is refused if any file that survives it still `ref()`s a deleted model, so
 the post-change project is proven to have no dangling reference before the plan
 is stored (and, when dbt is available, the same post-deletion tree is confirmed
-by dbt's own parser). A rename is expressed as one plan: delete the old model,
+by dbt's own parser). The guard reads the reference index described under
+[What dex reads](#what-dex-reads), not a text search, so it resolves a
+two-argument `ref()`, does not mistake a seed's data row for source, and warns
+rather than refusing on a reference it could not resolve. A rename is expressed as one plan: delete the old model,
 create the new one, and update every referrer, validated together.
 
 Human edits to dbt are authoritative by construction; dex holds no competing copy

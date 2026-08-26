@@ -45,7 +45,17 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "cluster",
         "semantic",
     ],
-    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro", "test"],
+    "transform": [
+        "init",
+        "plan",
+        "apply",
+        "build",
+        "deps",
+        "plans",
+        "macro",
+        "references",
+        "test",
+    ],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
@@ -334,6 +344,22 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                if group == "transform" and name == "references":
+                    # Variadic like `explore query`: one call answers "where is
+                    # each of these used", which is the shape of a rename. `--kind`
+                    # narrows; omitting it reports every kind the name is used as,
+                    # because a caller usually knows the name and not what the
+                    # project calls it.
+                    #
+                    # `--kind` is validated in the command rather than by argparse
+                    # `choices`: a rejected choice exits before an envelope is
+                    # built, so a typo would return no JSON line at all, and every
+                    # command owes the caller exactly one.
+                    sp.add_argument("names", nargs="+")
+                    sp.add_argument("--kind", default=None)
+                    sp.add_argument(
+                        "--full", action="store_true", default=argparse.SUPPRESS
+                    )
                 if group == "transform" and name == "test":
                     # `test` is scaffold-only for now: the model to derive a
                     # unit_tests: skeleton from. No bare `transform test`
@@ -477,6 +503,17 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
     }
+    # `transform references` is routed before the authoring table and from its
+    # own module on purpose, the same trade `explore semantic` makes above. It
+    # reads the project's files and nothing else: no warehouse, no dialect
+    # engine. Importing the command module below would pull the plan store and
+    # sqlglot with it, and a bare install (no connector extra) could not run a
+    # command that only ever reads text off disk.
+    if args.group == "transform" and args.subcommand == "references":
+        from .references import cmd_references
+
+        return cmd_references(args, engine)
+
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
         ensure_dialect_available()

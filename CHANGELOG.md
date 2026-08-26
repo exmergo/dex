@@ -11,6 +11,96 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform references` reports every use of a name** ([#213]). A read-only,
+  repo-only report: given a name, every file that references it, with the line
+  and the form of the reference, across model SQL, `schema.yml`,
+  `dbt_project.yml`, macros, semantic YAML, seed headers and installed packages.
+  Free on every connector, and it needs no connector extra at all: it is routed
+  ahead of the dialect gate the rest of the authoring surface passes through,
+  because a command that only reads files off disk should not require the SQL
+  engine to be installed.
+
+  There was no way to ask "where is this used", and a text search is not a
+  substitute, because dbt's indirection is jinja. A var read inside a macro body,
+  a column named only in a `schema.yml` test, a `ref()` composed from a variable:
+  a grep finds none of them, and missing one is the normal outcome. The failure
+  is quiet, because most of the project gets updated, one file does not, and the
+  result still compiles.
+
+  `--kind` narrows to `model`, `source`, `seed`, `snapshot`, `macro`, `var`,
+  `column`, `metric`, `entity`, `dimension` or `measure`. Omitting it reports
+  every kind the name is used as, which is the common case: a caller asking where
+  `department_name` is used knows the name and not whether the project calls it a
+  column, a var, or both. The positional is variadic, so one call covers a whole
+  rename.
+
+  **The report says whether it believes itself.** `completeness` is `complete`
+  only once every reason to doubt it has been ruled out, and `limits` names each
+  remaining one: a reference dex could not resolve statically, packages declared
+  but not installed, `sqlglot` absent on a column query, a file that would not
+  parse. A completeness claim that is not complete is worse than no claim, since
+  it is the one a caller acts on without checking.
+
+  An argument dex did not read is reported as `indeterminate` with its file and
+  line and no name attached, never dropped and never guessed at. `{{ ref(var('x'))
+  }}` names a model only dbt can know; a dimension whose `expr` is a computed
+  expression names a column dex will not invent. That second case is not new
+  policy, it is the rule `physical_column` has always followed, now given a name
+  and surfaced rather than left implicit.
+
+  Column names are matched at the grain the question allows. A bare name is
+  matched project-wide and labelled `name_matched`; a qualified `model.column` is
+  resolved through the `ref()` graph, and occurrences outside that lineage are
+  still listed, labelled `same_name_elsewhere`. Neither is silently narrowed. A
+  dotted name reads as a source before a qualified column, since `raw.orders` is
+  the more common question.
+
+  A model a package also ships is reported on both sides, the project's marked as
+  shadowing and the package's as shadowed, because reporting only the winner
+  hides that the package still ships the loser. A seed contributes its header row
+  and never a data row, asserted in the safety spine rather than left to the
+  scanner's good manners, and no occurrence ever carries source text: the command
+  answers "where", so a line number is the whole payload it owes.
+
+  The verdict is emitted before the occurrences. A long answer is the ordinary
+  case here, so it will be read from the top and sometimes truncated from the
+  bottom, and putting `completeness` last would make the honesty the first thing
+  lost. Capped at 200 occurrences across 50 files with every elision counted in
+  `notes`; `--full` lifts both.
+
+### Changed
+
+- **The delete guard reads the reference index rather than the file text**
+  ([#213]). Three behaviour changes, each a case the text scan answered wrongly.
+
+  A seed's data rows and a YAML string no longer count as source, so a CSV row
+  containing the characters `ref('x')` stops blocking a delete it never affected.
+
+  The two-argument `ref('package', 'model')` form is now read as the model it
+  names. The regex captured the first argument, so a dangling reference written
+  that way registered as a reference to a model named after the package and the
+  plan passed. **This is a new refusal**: a plan that deletes a model still
+  referenced in that form was accepted before and is refused now, which is the
+  correct answer arriving late rather than a change of policy.
+
+  A reference dex cannot resolve statically now warns rather than being invisible.
+  It may or may not name the deleted node and dex cannot tell, so refusing on it
+  would be unsatisfiable: no edit the caller could make would settle it. The
+  warning names the file and line so a human can decide.
+
+  A `schema.yml` entry that merely documents a deleted model stays the soft
+  warning it has always been. Only the forms that actually stop the project
+  compiling refuse: `ref()`, a semantic model's `model:`, and a relationship
+  test's `to:`.
+
+- **One jinja reader behind the row-attribution renderer and the reference
+  index** ([#213]). Call extraction moved into `dbt_project.jinja_regions`, and
+  `render_model_sql` consumes it while keeping its own policy of refusing what it
+  cannot resolve. One behaviour, two policies on top. A latent bug went with it:
+  `{{ ref(var('x')) }}` used to resolve to whatever string the inner `var()` call
+  happened to name, silently attributing a row delta to the wrong relation. It is
+  now unattributable, which is what it always was.
+
 - **`transform` authors singular tests and analyses** ([#212]). A `test_sql` edit
   kind confined to `test-paths` and an `analysis_sql` kind confined to
   `analysis-paths`, both read from `dbt_project.yml` with dbt's own defaults.

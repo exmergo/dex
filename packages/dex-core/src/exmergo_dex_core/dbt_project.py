@@ -705,6 +705,219 @@ def node_name(path: str) -> str:
     return path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
 
+# --- Jinja: what a template calls ---------------------------------------------
+#
+# One scanner, two policies on top of it. `render_model_sql` refuses anything it
+# cannot resolve, because attributing a row delta to SQL dbt never runs would be
+# a wrong answer; the reference index reports the same thing as indeterminate,
+# because a use it cannot resolve is still a use worth naming. Both need the same
+# question answered first, "what does this template call, and with what", which
+# is all this does.
+#
+# It lives here rather than beside either caller because this module is inside
+# the zero-extra install and both callers are not: `row_attribution` and the
+# reference index reach it, and neither drags the other's dependencies along.
+
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
+_JINJA_REGION = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
+_CALL_START = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+_QUOTED_ARG = re.compile(r"^(['\"])([^'\"]*)\1$")
+
+
+class JinjaCall(BaseModel):
+    """One call written inside a jinja region, with its arguments as read.
+
+    An ``args`` entry is the literal string dex read, or ``None`` where the
+    argument was anything else: a variable, a concatenation, a nested call, a
+    keyword form. ``None`` means *dex did not resolve this*, never *there is
+    nothing here*, and every consumer has to keep that distinction: collapsing
+    the two is how a reference silently goes missing.
+
+    Nested calls are reported in their own right, so ``{{ ref(var('x')) }}``
+    yields both the resolved ``var('x')`` and the unresolved ``ref``. Reporting
+    only the outer call would hide the var; reporting only the inner would
+    invent a ref that was never written.
+    """
+
+    callee: str
+    args: tuple[str | None, ...] = ()
+    line: int
+    #: True when the call is the entire region body, so `{{ ref('x') }}` is
+    #: distinguishable from `{{ upper(ref('x')) }}`. A caller substituting the
+    #: region for the call's value needs to know the difference.
+    spans_region: bool = False
+    #: "expression" for `{{ }}`, "statement" for `{% %}`.
+    region_kind: str = "expression"
+
+
+class JinjaRegion(BaseModel):
+    """One ``{{ }}`` or ``{% %}`` span, its text, and the calls inside it.
+
+    ``start`` and ``end`` index the *comment-masked* source that
+    :func:`jinja_regions` returns alongside these, not the original, so a caller
+    splicing regions out works against text where a comment can no longer look
+    like code. Masking preserves length and newlines, so offsets and line
+    numbers still line up with the file a human opens.
+    """
+
+    kind: str
+    body: str
+    start: int
+    end: int
+    line: int
+    calls: list[JinjaCall] = Field(default_factory=list)
+
+
+def jinja_regions(content: str) -> tuple[list[JinjaRegion], str]:
+    """Every jinja region in ``content``, with the comment-masked source.
+
+    The primitive both jinja readers share. Comments are masked rather than
+    deleted so every reported line still matches the file, and string contents
+    are masked while structure is scanned so a paren or a comma inside a quoted
+    argument cannot be read as syntax; the arguments themselves come from the
+    original text.
+
+    A scanner, not a renderer. It never evaluates jinja, so it says what a
+    template names, never what it produces. A region carrying no call at all
+    (``{{ some_var }}``) is still returned, because "there is jinja here that dex
+    did not read" is the fact a caller most needs.
+    """
+
+    masked_source = _JINJA_COMMENT.sub(lambda m: _blank_like(m.group(0)), content)
+    regions: list[JinjaRegion] = []
+    for match in _JINJA_REGION.finditer(masked_source):
+        expression = match.group(1)
+        body = expression if expression is not None else match.group(2)
+        kind = "expression" if expression is not None else "statement"
+        regions.append(
+            JinjaRegion(
+                kind=kind,
+                body=body,
+                start=match.start(),
+                end=match.end(),
+                line=masked_source.count("\n", 0, match.start()) + 1,
+                calls=[
+                    JinjaCall(
+                        callee=callee,
+                        args=args,
+                        line=masked_source.count("\n", 0, offset) + 1,
+                        spans_region=call_text.strip() == body.strip(),
+                        region_kind=kind,
+                    )
+                    for offset, callee, args, call_text in sorted(
+                        _calls_in(body, match.start() + 2),
+                        key=lambda call: call[0],
+                    )
+                ],
+            )
+        )
+    return regions, masked_source
+
+
+def jinja_calls(content: str) -> list[JinjaCall]:
+    """Every call inside every jinja region of ``content``, in document order."""
+
+    regions, _masked = jinja_regions(content)
+    return [call for region in regions for call in region.calls]
+
+
+def _calls_in(
+    body: str, base: int
+) -> list[tuple[int, str, tuple[str | None, ...], str]]:
+    """``(offset, callee, args, call text)`` for ``body``, nested calls included."""
+
+    masked = _mask_strings(body)
+    found: list[tuple[int, str, tuple[str | None, ...], str]] = []
+    position = 0
+    while True:
+        start = _CALL_START.search(masked, position)
+        if start is None:
+            return found
+        open_paren = start.end() - 1
+        close = _closing_paren(masked, open_paren)
+        if close is None:
+            # An unbalanced call is a broken template. Skip past the callee and
+            # keep scanning: the rest of the file is still worth reading, and
+            # refusing here would make one typo hide every other reference.
+            position = start.end()
+            continue
+        inner = body[open_paren + 1 : close]
+        found.append(
+            (
+                base + start.start(1),
+                start.group(1),
+                _split_args(inner, masked[open_paren + 1 : close]),
+                body[start.start(1) : close + 1],
+            )
+        )
+        found.extend(_calls_in(inner, base + open_paren + 1))
+        position = close + 1
+
+
+def _split_args(inner: str, masked_inner: str) -> tuple[str | None, ...]:
+    """Top-level arguments of one call, each as its literal value or ``None``."""
+
+    if not inner.strip():
+        return ()
+    args: list[str | None] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(masked_inner):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(_literal(inner[start:index]))
+            start = index + 1
+    args.append(_literal(inner[start:]))
+    return tuple(args)
+
+
+def _literal(text: str) -> str | None:
+    quoted = _QUOTED_ARG.match(text.strip())
+    return quoted.group(2) if quoted else None
+
+
+def _closing_paren(masked: str, open_paren: int) -> int | None:
+    depth = 0
+    for index in range(open_paren, len(masked)):
+        if masked[index] == "(":
+            depth += 1
+        elif masked[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _mask_strings(text: str) -> str:
+    """``text`` with the *contents* of every quoted run blanked, offsets preserved.
+
+    Structure scanning runs over this so a paren, a comma or a quote written
+    inside a string cannot be read as syntax. The quotes themselves survive, so
+    an argument is still recognisable as a literal.
+    """
+
+    out = list(text)
+    quote: str | None = None
+    for index, char in enumerate(text):
+        if quote is None:
+            if char in "'\"":
+                quote = char
+        elif char == quote:
+            quote = None
+        else:
+            out[index] = "\n" if char == "\n" else "x"
+    return "".join(out)
+
+
+def _blank_like(text: str) -> str:
+    """``text`` reduced to whitespace, newlines kept so line numbers survive."""
+
+    return "".join("\n" if char == "\n" else " " for char in text)
+
+
 # --- Read view: what the project declares -------------------------------------
 #
 # Everything below is read-only projection over the loaded project: declared

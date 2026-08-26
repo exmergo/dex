@@ -17,6 +17,8 @@ from exmergo_dex_core.dbt_project import (
     content_hash,
     definitions,
     find_project,
+    jinja_calls,
+    jinja_regions,
     load,
     resolve_target,
     write_edits,
@@ -673,3 +675,69 @@ def test_definitions_yaml_derived_metric_lineage(dbt_project_dir: Path):
     )
     defs = definitions(dbt_project_dir)
     assert defs.metric_models == ["stg_orders"]
+
+
+# --- the jinja scanner -----------------------------------------------------------
+#
+# The shared reader behind both the row-attribution renderer and the reference
+# index. Its whole job is telling a resolved argument from one dex only guessed
+# at, so most of these are about the difference.
+
+
+def test_jinja_reads_a_call_and_its_literal_arguments():
+    (call,) = jinja_calls("select * from {{ ref('stg_orders') }}")
+    assert (call.callee, call.args, call.line) == ("ref", ("stg_orders",), 1)
+    assert call.spans_region is True
+
+
+def test_jinja_reports_a_non_literal_argument_as_unread_rather_than_guessing():
+    calls = jinja_calls("{{ ref(var('which')) }}")
+    # Both calls, not one. Reporting only the outer would hide the var; reporting
+    # only the inner would invent a ref nobody wrote.
+    assert [(c.callee, c.args) for c in calls] == [
+        ("ref", (None,)),
+        ("var", ("which",)),
+    ]
+    assert calls[0].spans_region is True
+    assert calls[1].spans_region is False
+
+
+def test_jinja_reads_the_two_argument_ref_and_source_forms():
+    assert jinja_calls("{{ ref('pkg', 'stg_orders') }}")[0].args == (
+        "pkg",
+        "stg_orders",
+    )
+    assert jinja_calls("{{ source('raw', 'orders') }}")[0].args == ("raw", "orders")
+
+
+def test_jinja_ignores_commas_and_parens_inside_a_string_argument():
+    (call,) = jinja_calls("{{ label('a, b (c)') }}")
+    assert call.args == ("a, b (c)",)
+
+
+def test_jinja_masks_comments_but_keeps_the_line_numbers():
+    calls = jinja_calls("{# ref('ghost') #}\nselect {{ ref('real') }}")
+    assert [(c.callee, c.args, c.line) for c in calls] == [("ref", ("real",), 2)]
+
+
+def test_jinja_reads_calls_inside_statement_blocks():
+    calls = jinja_calls("{% if var('flag') %}\nselect 1\n{% endif %}")
+    assert [(c.callee, c.args, c.region_kind) for c in calls] == [
+        ("var", ("flag",), "statement")
+    ]
+
+
+def test_jinja_skips_an_unbalanced_call_without_losing_the_rest():
+    # One broken template must not hide every other reference in the file.
+    calls = jinja_calls("{{ ref('unclosed' }}\n{{ ref('fine') }}")
+    assert [c.args for c in calls] == [("fine",)]
+
+
+def test_jinja_reads_a_keyword_argument_as_unread():
+    (call,) = jinja_calls("{{ config(materialized='view') }}")
+    assert call.args == (None,)
+
+
+def test_jinja_regions_returns_a_region_that_calls_nothing():
+    regions, _masked = jinja_regions("select {{ some_var }}")
+    assert [(r.kind, r.calls) for r in regions] == [("expression", [])]

@@ -945,3 +945,120 @@ def test_plan_unknown_op_is_rejected(dbt_project_dir: Path, tmp_path: Path, caps
     )
     assert rc == 1
     assert "unknown op" in envelope["errors"][0]
+
+
+# --- what the delete guard sees now ----------------------------------------------
+#
+# The guard reads the reference index rather than a regex over raw file text.
+# Three things change, and each is a case that used to be answered wrongly.
+
+
+def test_a_seed_row_that_merely_reads_like_a_ref_no_longer_blocks_a_delete(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    (dbt_project_dir / "seeds").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "seeds" / "notes.csv").write_text(
+        "id,note\n1,\"see ref('stg_customers') for the old shape\"\n",
+        encoding="utf-8",
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    # A seed's rows are data. The text-scanning guard read them as source and
+    # refused a delete that breaks nothing.
+    assert rc == 0, envelope
+
+
+def test_a_two_argument_ref_to_a_deleted_model_is_now_caught(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    (dbt_project_dir / "models" / "marts").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "models" / "marts" / "mart_customers.sql").write_text(
+        "select * from {{ ref('some_package', 'stg_customers') }}\n",
+        encoding="utf-8",
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    # The regex captured the first argument, so this dangling reference used to
+    # register as a reference to a model called `some_package`, and passed.
+    assert rc == 1
+    assert "still references" in envelope["errors"][0]
+    assert "mart_customers.sql" in envelope["errors"][0]
+
+
+def test_a_reference_dex_cannot_resolve_warns_instead_of_refusing(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _stub_parse_ok(monkeypatch)
+    (dbt_project_dir / "models" / "marts").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "models" / "marts" / "dynamic.sql").write_text(
+        "select * from {{ ref(var('which_model')) }}\n", encoding="utf-8"
+    )
+    payload = _write_payload(
+        tmp_path,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "op": "delete",
+            }
+        ],
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "drop stg_customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    # It might name the deleted model and dex cannot tell. Refusing would be
+    # unsatisfiable: no edit the caller could make would make it resolvable.
+    assert rc == 0, envelope
+    assert any("could not resolve" in warning for warning in envelope["warnings"])
+    assert any("dynamic.sql:1" in warning for warning in envelope["warnings"])

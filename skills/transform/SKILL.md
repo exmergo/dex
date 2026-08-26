@@ -196,6 +196,27 @@ check" note just means no connection was reachable at init time.
   (or, only when the user says so, re-run with `--confirm`).
 - `transform plans` lists stored plans (pending and applied, newest first), so
   you never need to browse `.dex/plans/` by hand.
+- `transform references <name> [more...]` answers "where is this used" before you
+  change it. **Reach for this whenever a change has to land in more than one
+  place**: removing a project variable, renaming a column, deleting a model,
+  changing what a macro returns. Editing the files you happen to have open and
+  hoping that was all of them is the failure this prevents, and it is a quiet
+  one, because the project still compiles with one use left behind.
+
+  It is repo-only and free on every connector, so there is never a cost reason
+  not to run it. The positional is variadic, so one call covers a whole rename.
+  `--kind` narrows to `model`, `source`, `seed`, `snapshot`, `macro`, `var`,
+  `column`, `metric`, `entity`, `dimension` or `measure`; leave it off when you
+  are not sure what the project calls the thing, and the answer will tell you.
+
+  Read `data.completeness` before you act on the list. When it says `incomplete`,
+  `data.limits` says why and `data.indeterminate` lists the call sites dex could
+  not resolve, each with a file and a line. Those are references that *may* name
+  what you asked about, so open them and decide yourself; do not treat the list
+  of resolved hits as exhaustive when the verdict says it is not. A bare column
+  name is matched across the project (`scope: name_matched`), so qualify it as
+  `model.column` when you want the lineage separated from same-named columns
+  elsewhere.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
   `--budget` on billed connectors). On BigQuery there is no upfront estimate
