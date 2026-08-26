@@ -27,6 +27,10 @@ MACRO = "{% macro cents_to_dollars(column) %}({{ column }} / 100){% endmacro %}\
 
 SEED = "status_code,label\nP,placed\nS,shipped\n"
 
+SINGULAR_TEST = "select order_id from {{ ref('stg_orders') }} where order_id is null\n"
+
+ANALYSIS = "select count(*) as n from {{ ref('stg_orders') }}\n"
+
 
 def _populate(root: Path) -> None:
     (root / "snapshots").mkdir(exist_ok=True)
@@ -35,9 +39,15 @@ def _populate(root: Path) -> None:
     (root / "macros" / "cents_to_dollars.sql").write_text(MACRO, encoding="utf-8")
     (root / "seeds").mkdir(exist_ok=True)
     (root / "seeds" / "status_labels.csv").write_text(SEED, encoding="utf-8")
+    (root / "tests").mkdir(exist_ok=True)
+    (root / "tests" / "assert_order_id_present.sql").write_text(
+        SINGULAR_TEST, encoding="utf-8"
+    )
+    (root / "analyses").mkdir(exist_ok=True)
+    (root / "analyses" / "order_volume.sql").write_text(ANALYSIS, encoding="utf-8")
 
 
-def test_a_node_is_a_model_a_snapshot_or_a_seed_and_never_a_macro(maintain_repo):
+def test_a_node_is_a_model_a_snapshot_or_a_seed_and_nothing_else(maintain_repo):
     _populate(maintain_repo.root)
     layer = transform_layer(load_project(maintain_repo.root))
 
@@ -47,10 +57,23 @@ def test_a_node_is_a_model_a_snapshot_or_a_seed_and_never_a_macro(maintain_repo)
     assert set(layer.models) == {"stg_orders", "snap_orders", "status_labels"}
     assert "cents_to_dollars" not in layer.models
 
+    # A singular test and an analysis are the case the scoping exists for. dbt
+    # calls a singular test a node, and it is still not one here: it builds no
+    # relation and nothing can ref() it, so counting it as a model would put a
+    # name into the drift baseline that no warehouse table will ever back.
+    assert "assert_order_id_present" not in layer.models
+    assert "order_volume" not in layer.models
+
     # The file fingerprint stays the whole editable surface: it is a change
     # fingerprint over what a human can edit, not a node list.
     assert "macros/cents_to_dollars.sql" in layer.files
     assert "seeds/status_labels.csv" in layer.files
+    assert "tests/assert_order_id_present.sql" in layer.files
+    assert "analyses/order_volume.sql" in layer.files
+
+    # And a test's ref() is not recorded as a model's dependency either, since
+    # there is no model there to depend on anything.
+    assert "assert_order_id_present" not in layer.model_refs
 
     # And a snapshot's ref() is recorded like a model's, which is what carries a
     # warehouse finding through to the snapshot standing on it.
@@ -62,11 +85,14 @@ def test_a_baseline_pinned_before_the_widening_reports_no_phantom_drift(
 ):
     """The risk this change carries, checked rather than assumed.
 
-    A baseline pinned before snapshots and seeds were loaded holds a smaller
-    file set and a models list that counted macros. Adding those files must read
-    as "nothing drifted", because no detector diffs the file set or the model
-    list: they feed `orphan_relation` and the semantic dangling-reference check,
-    both of which ask whether a *warehouse* table is still backed by the project.
+    A baseline pinned before the new families were loaded holds a smaller file
+    set and a models list that counted macros. Adding those files must read as
+    "nothing drifted", because no detector diffs the file set or the model list:
+    they feed `orphan_relation` and the semantic dangling-reference check, both
+    of which ask whether a *warehouse* table is still backed by the project.
+
+    Re-run against every family as they are added, since the widening is what
+    carries the risk and each new one widens it again.
     """
 
     maintain_repo.snapshot()

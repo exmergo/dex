@@ -315,5 +315,11 @@ def test_the_no_format_fallback_answers_exactly_what_dbt_answers():
     # `None` is a complete answer, not a gap: reconcile proposes staging models
     # and their schema.yml, and a kind it does not propose gets no path this
     # class would be inventing.
-    for unplaced in (EditKind.MACRO_SQL, EditKind.SNAPSHOT_SQL, EditKind.SEED_CSV):
+    for unplaced in (
+        EditKind.MACRO_SQL,
+        EditKind.SNAPSHOT_SQL,
+        EditKind.SEED_CSV,
+        EditKind.TEST_SQL,
+        EditKind.ANALYSIS_SQL,
+    ):
         assert _placed(None, unplaced, "orders") is None

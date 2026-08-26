@@ -104,11 +104,21 @@ declaring a dbt package is a reviewable diff too), `macro_sql`, `snapshot_sql`
 naming a `unique_key` and a strategy), `seed_csv` (a small reference CSV under
 the seed paths, capped at 5,000 rows and 1 MiB and refused when a column name
 looks like personal data, since a seed puts values into a diff and a diff goes
-into git), `project_yml` (the project-root `dbt_project.yml`), or `profiles_yml`
+into git), `test_sql` (a file under the test paths: a singular test, which is a
+SELECT that must return no rows, or a generic test definition, which is a
+`{% test %}` block checked like a macro), `analysis_sql` (SQL under the analysis
+paths that dbt compiles and never runs, held to the same read-only SELECT
+anyway), `project_yml` (the project-root `dbt_project.yml`), or `profiles_yml`
 (the project-root `profiles.yml`, secret-guarded so a credential never enters the
 diff: reference secrets via `{{ env_var('NAME') }}`). Each kind is confined to
-its own path family, and `schema_yml` is accepted beside a snapshot or a seed as
-well as beside a model. `op` is `upsert` (create or update, the
+its own path family, and `schema_yml` is accepted beside a snapshot, a seed, a
+test or an analysis as well as beside a model. A singular test and an analysis
+build no relation and nothing can `ref()` either, so neither is a node: neither
+enters the drift baseline and neither raises a dangling-reference guard on
+delete. Note that three separate things are called a test: generic tests
+declared inside a `schema.yml`, unit tests scaffolded by
+`transform test --scaffold` into a `unit_tests:` block, and the files under
+`test-paths` that `test_sql` authors. `op` is `upsert` (create or update, the
 default, carrying `content`) or `delete` (remove the file, no `content`); a
 delete is a reviewable diff too, guarded so the plan is refused if any surviving
 file still `ref()`s a deleted model, and a rename is one plan (delete old, create

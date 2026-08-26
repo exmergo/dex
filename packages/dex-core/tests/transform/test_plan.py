@@ -400,6 +400,49 @@ def test_project_yml_dropping_a_model_path_warns(dbt_project_dir: Path):
     assert any("model-paths drops" in w and "models" in w for w in warnings)
 
 
+def test_project_yml_dropping_any_authored_path_family_warns(dbt_project_dir: Path):
+    """Every path key dex authors into, not the two that happened to be first.
+
+    Dropping a family orphans every file under it, and which family a caller
+    restructures is not something the warning gets to have an opinion about.
+    Only `model-paths` and `macro-paths` were covered before, so a
+    dbt_project.yml that dropped `seed-paths` silently orphaned every seed.
+    """
+
+    original = (
+        "name: dex_test\nprofile: dex_test\n"
+        'model-paths: ["models"]\n'
+        'macro-paths: ["macros"]\n'
+        'snapshot-paths: ["snapshots"]\n'
+        'seed-paths: ["seeds"]\n'
+        'test-paths: ["tests"]\n'
+        'analysis-paths: ["analyses"]\n'
+    )
+    (dbt_project_dir / "dbt_project.yml").write_text(original, encoding="utf-8")
+
+    edit = _cfg_edit(
+        "dbt_project.yml",
+        "name: dex_test\nprofile: dex_test\n",
+        transform.EditKind.PROJECT_YML,
+    )
+    _plan, _diffs, warnings = transform.plan(
+        "flatten the project",
+        [edit],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    for key, directory in (
+        ("model-paths", "models"),
+        ("macro-paths", "macros"),
+        ("snapshot-paths", "snapshots"),
+        ("seed-paths", "seeds"),
+        ("test-paths", "tests"),
+        ("analysis-paths", "analyses"),
+    ):
+        assert any(f"{key} drops" in w and directory in w for w in warnings), key
+
+
 # --- column contract: authored SELECT list vs. declared schema.yml (#214) -----
 
 

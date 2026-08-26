@@ -1287,7 +1287,7 @@ def _write_manifest(project: Path, nodes: dict) -> None:
     )
 
 
-def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
+def test_compile_estimate_sums_priced_nodes_and_skips_the_unbilled_ones(
     dbt_project_dir: Path, monkeypatch
 ):
     build_mod = importlib.import_module("exmergo_dex_core.transform.build")
@@ -1323,6 +1323,15 @@ def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
             "compiled_code": "",
             "config": {},
         },
+        # Compiled by `dbt compile` and never built, so it has compiled SQL and
+        # still issues no billed statement. Priced at zero on purpose, not by
+        # accident of having no code to price.
+        "analysis.p.scratch": {
+            "resource_type": "analysis",
+            "name": "scratch",
+            "compiled_code": "select 5",
+            "config": {},
+        },
     }
     _write_manifest(dbt_project_dir, nodes)
     _compile_runner(
@@ -1333,7 +1342,8 @@ def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
     total, per_node, notes = build_mod.compile_estimate(
         dbt_project_dir, _EstimatingAdapter(), target="dev"
     )
-    # model(view) + snapshot + test priced at 10 each; ephemeral and seed skipped.
+    # model(view) + snapshot + test priced at 10 each; ephemeral, seed and
+    # analysis skipped.
     assert total == 30.0
     assert set(per_node) == {"stg_a", "snap", "not_null_stg_a"}
     assert notes == []

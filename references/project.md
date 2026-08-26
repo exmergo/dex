@@ -188,9 +188,10 @@ generates alongside the path, so placement alone cannot open that channel: a for
 that places a staging model elsewhere gets the proposal as advice rather than having
 dbt written into its tree. One `None` and one path is the shape this exists for.
 
-The kind list grows over time (`MACRO_SQL`, `SNAPSHOT_SQL` and `SEED_CSV` are all
-dbt-shaped artifacts a non-dbt format may have no equivalent of), and `None` stays
-the right answer for every one your format does not place. The shipped dbt format
+The kind list grows over time (`MACRO_SQL`, `SNAPSHOT_SQL`, `SEED_CSV`, `TEST_SQL`
+and `ANALYSIS_SQL` are all dbt-shaped artifacts a non-dbt format may have no
+equivalent of), and `None` stays the right answer for every one your format does
+not place. The shipped dbt format
 answers `None` for them too: reconcile proposes staging models and their
 `schema.yml` and nothing else, so a path for the rest would be invented rather
 than known.
@@ -218,8 +219,9 @@ the format itself declared. Your own writer still has to check, because `write_e
 is a public method of your format and dex is not its only caller, and the conformance
 suite asserts the case a prefix comparison gets wrong.
 
-**Declare what your writer accepts, not less.** The shipped dbt format lists its
-model and macro paths *and* the four root manifests it authors by name, because a
+**Declare what your writer accepts, not less.** The shipped dbt format lists every
+one of its authored path families *and* the four root manifests it authors by
+name, because a
 declaration narrower than the writer is not a modest one: it refuses the project
 config, the profiles and the package manifests at apply, every one of which is a path
 dex authors through a plan.

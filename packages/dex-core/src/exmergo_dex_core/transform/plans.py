@@ -75,6 +75,18 @@ class EditKind(str, Enum):
     # fails the build, and a seed filed anywhere else is never loaded at all.
     SNAPSHOT_SQL = "snapshot_sql"
     SEED_CSV = "seed_csv"
+    # A file under the project's test paths (a singular test, which is a SELECT
+    # that must return no rows, or a generic test definition) and one under its
+    # analysis paths (SQL dbt compiles and never runs). Neither builds a
+    # relation and nothing can ref() either, but each is still dbt's to parse
+    # from its own directory: a singular test filed under models/ is built as a
+    # model, and an analysis filed anywhere else is never compiled at all.
+    #
+    # `test_sql` is dbt's `test-paths`, not `transform test --scaffold` (which
+    # writes a unit_tests: block through schema_yml) and not the generic tests
+    # declared inside a schema.yml.
+    TEST_SQL = "test_sql"
+    ANALYSIS_SQL = "analysis_sql"
     # dbt project-root config: the project settings and the connection profiles.
     # Each governs the whole project (a wider blast radius than a single model),
     # so each is pinned by name to the one root file it may target, and
@@ -137,11 +149,12 @@ def contained_key(rel_path: str, surface: list[str]) -> str:
 # `.csv` under the seed paths, and the properties YAML that declares a seed's
 # column types or a snapshot's tests belongs beside the thing it describes.
 #
-# `schema_yml` is admitted under the snapshot and seed families for exactly that
-# reason, and deliberately *not* under macros: macro properties YAML is a
+# `schema_yml` is admitted under the snapshot, seed, test and analysis families
+# for exactly that reason (a singular test's config and severity, an analysis's
+# description), and deliberately *not* under macros: macro properties YAML is a
 # different document shape, dex has never authored one, and a test pins both
 # directions of today's macro rule. Widening that is a live behavior change and
-# belongs in its own change, not smuggled in beside two new kinds.
+# belongs in its own change, not smuggled in beside new kinds.
 _PLACEMENT: dict[str, dict[str, frozenset[EditKind]]] = {
     "macro": {".sql": frozenset({EditKind.MACRO_SQL})},
     "snapshot": {
@@ -151,6 +164,16 @@ _PLACEMENT: dict[str, dict[str, frozenset[EditKind]]] = {
     },
     "seed": {
         ".csv": frozenset({EditKind.SEED_CSV}),
+        ".yml": frozenset({EditKind.SCHEMA_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML}),
+    },
+    "test": {
+        ".sql": frozenset({EditKind.TEST_SQL}),
+        ".yml": frozenset({EditKind.SCHEMA_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML}),
+    },
+    "analysis": {
+        ".sql": frozenset({EditKind.ANALYSIS_SQL}),
         ".yml": frozenset({EditKind.SCHEMA_YML}),
         ".yaml": frozenset({EditKind.SCHEMA_YML}),
     },
@@ -190,6 +213,16 @@ _ROOT_KINDS = frozenset(
 )
 
 
+def _an(word: str) -> str:
+    """``word`` with the article that reads right in front of it.
+
+    Refusal text is assembled from kind and family names, and "a analysis_sql
+    edit" reads as a typo in the one message whose whole job is to be trusted.
+    """
+
+    return f"an {word}" if word[:1].lower() in "aeiou" else f"a {word}"
+
+
 def assert_kind_placement(
     edit: PlanEdit, family: str | None, view: DbtProjectView
 ) -> None:
@@ -221,9 +254,9 @@ def assert_kind_placement(
             else ""
         )
         raise PlanError(
-            f"a {edit.kind.value} edit must live under the project's {home} "
+            f"{_an(edit.kind.value)} edit must live under the project's {home} "
             f"paths ({', '.join(configured) or 'none configured'}), got "
-            f"'{edit.path}', which is a {family} path{instead}"
+            f"'{edit.path}', which is {_an(family)} path{instead}"
         )
     if edit.kind in admitted:
         return
@@ -234,11 +267,11 @@ def assert_kind_placement(
         )
         named = suffix or "suffixless"
         raise PlanError(
-            f"'{edit.path}' is under a {family} path, which holds {holds}; "
+            f"'{edit.path}' is under {_an(family)} path, which holds {holds}; "
             f"dex authors no '{named}' file there"
         )
     raise PlanError(
-        f"'{edit.path}' is under a {family} path but the edit kind is "
+        f"'{edit.path}' is under {_an(family)} path but the edit kind is "
         f"{edit.kind.value}; use "
         f"{' or '.join(sorted(k.value for k in admitted))} for a {suffix} file "
         "there"
@@ -442,9 +475,11 @@ def plan(
                     "{{ env_var('NAME') }} before editing so no credential "
                     "enters the plan diff"
                 )
-        # A dbt_project.yml that drops model or macro paths silently orphans the
-        # files under them; warn rather than refuse, since a deliberate
-        # restructure is a legitimate reason to change them.
+        # A dbt_project.yml that drops a path key silently orphans the files
+        # under it; warn rather than refuse, since a deliberate restructure is a
+        # legitimate reason to change them. Every key dex authors into is
+        # checked: covering only some of them makes the warning a coin flip on
+        # which family the caller happened to restructure.
         if (
             edit.kind is EditKind.PROJECT_YML
             and edit.op is EditOp.UPSERT
@@ -452,7 +487,14 @@ def plan(
         ):
             old = yaml.safe_load(current.content) or {}
             new = yaml.safe_load(edit.new_content) or {}
-            for key in ("model-paths", "macro-paths"):
+            for key in (
+                "model-paths",
+                "macro-paths",
+                "snapshot-paths",
+                "seed-paths",
+                "test-paths",
+                "analysis-paths",
+            ):
                 dropped = set(old.get(key) or []) - set(new.get(key) or [])
                 if dropped:
                     warnings.append(

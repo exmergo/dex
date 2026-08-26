@@ -11,6 +11,52 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform` authors singular tests and analyses** ([#212]). A `test_sql` edit
+  kind confined to `test-paths` and an `analysis_sql` kind confined to
+  `analysis-paths`, both read from `dbt_project.yml` with dbt's own defaults.
+  A singular test, an arbitrary SELECT that must return no rows, is where most
+  project-specific assertions actually live, and it was the one class of test
+  that could not be authored: generic tests were already reachable because they
+  are declared in `schema.yml`, but a singular test is a file, and the file was
+  refused as "outside the project's model paths". Analyses were in the same
+  position.
+
+  `test_sql` covers both shapes that share dbt's test paths, because only the
+  file's content says which one was written. A file holding
+  `{% test %}` / `{% endtest %}` blocks is a generic test definition and gets the
+  structural check a macro gets: balanced definitions, nothing loose between
+  them but jinja comments. Anything else is a singular test and gets a model's
+  check: a single read-only SELECT once its jinja is stripped. Reading the close
+  delimiter as well as the open one means an unclosed block is refused as the
+  broken definition it is, rather than as a query that fails to parse.
+
+  A singular test that names no `ref()` or `source()` warns rather than refuses:
+  it runs against nothing and passes unconditionally, which is worse than having
+  no test, but an assertion over literals is unusual rather than wrong. The
+  warning is suppressed when the file is entirely jinja, since a query assembled
+  inside a macro is content dex has just said it could not read, and guessing at
+  it would be a claim beyond the evidence.
+
+  An analysis is held to the same read-only SELECT as a model even though dbt
+  compiles it and never runs it. That is deliberate: read-only against data is a
+  guarantee dex makes about what it writes, not a restatement of what dbt
+  happens to execute, and compiled SQL sitting in `target/` is one copy-paste
+  from a warehouse. A spine assertion now pins that every SQL-carrying kind
+  passes through the guard, so a future kind cannot arrive without it.
+
+  Neither kind builds a relation and nothing can `ref()` either, so neither is a
+  node: they do not enter the drift baseline, and deleting one is not guarded
+  against dangling references because there are none to dangle. dbt does call a
+  singular test a node, which is exactly why this is said out loud rather than
+  left to the reader. `dbt build` runs a singular test natively and prices it
+  like any other test; an analysis is compiled by `dbt compile`, never built, and
+  contributes nothing to the cost handshake.
+
+  Three different things in this project are called a test, and they are not
+  interchangeable: generic tests declared inside a `schema.yml`, unit tests
+  scaffolded by `transform test --scaffold` into a `unit_tests:` block, and the
+  files under `test-paths` this kind authors. The docs now name all three.
+
 - **`transform` authors dbt snapshots** ([#210]). A `snapshot_sql` edit kind, and
   `snapshot-paths` read from `dbt_project.yml` with dbt's own default. Before
   this, `transform plan` refused a snapshot file as "outside the project's model
@@ -114,14 +160,18 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   it. Found by dogfooding the demo warehouse, and now asserted: every count in
   the payload reconciles with the objects it sits next to.
 
-- **The project view now loads all four of dbt's authored path families**
-  ([#210], [#211]). Loading snapshots and seeds is what makes them authorable: a
+- **The project view now loads all six of dbt's authored path families**
+  ([#210], [#211], [#212]). Loading a family is what makes it authorable: a
   file dex can write but does not load hashes as absent, so a later edit to it
   registers as a create and the apply after it conflicts on a file nobody
   touched. The scan is per-family now rather than one global suffix filter
-  (`.sql`/`.yml`/`.yaml` under model, macro and snapshot paths, `.csv` plus YAML
-  under seed paths), so a stray CSV elsewhere in the repo is still nobody's
-  fixture to hash.
+  (`.sql` plus YAML under model, macro, snapshot, test and analysis paths,
+  `.csv` plus YAML under seed paths), so a stray CSV elsewhere in the repo is
+  still nobody's fixture to hash.
+
+  One consequence is visible from outside: an `analyses/` directory used to be
+  refused as outside the project surface and is now part of it, so its files
+  are loaded and hashed.
 
   That widening moved what `maintain` fingerprints, which is the part that would
   otherwise have broken quietly. Two derivations read "the things this project
@@ -129,6 +179,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   loading snapshots would have made snapshots models there, and seeds would have
   been missed entirely. Both are now scoped to the families that actually produce
   a dbt node: `.sql` under model and snapshot paths, `.csv` under seed paths.
+  Singular tests and analyses stay out for the same reason macros do, which is
+  worth stating because dbt calls a singular test a node: it builds no relation
+  and nothing can `ref()` it, so counting it would put a name into the drift
+  baseline that no warehouse table will ever back.
   Macros counted as models before and no longer do, which is a fix rather than a
   regression (a macro builds no relation and is `ref()`-able by nobody) but is a
   behavior change worth naming. A baseline pinned before this lands reports no
@@ -141,13 +195,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `ref()`s would have been accepted and broken the build.
 
 - **An edit's kind and its location must agree, across every family.** The rule
-  that kept a macro out of `models/` is now a table over the four families and
-  the file suffix, and it refuses in both directions naming both fixes (move the
-  file, or relabel the kind). `schema_yml` is admitted beside a snapshot and a
-  seed as well as beside a model, because that is where dbt expects a snapshot's
-  tests and a seed's column types declared. Macro-path behavior is unchanged.
+  that kept a macro out of `models/` is now a table over the families and the
+  file suffix, and it refuses in both directions naming both fixes (move the
+  file, or relabel the kind). `schema_yml` is admitted beside a snapshot, a
+  seed, a test and an analysis as well as beside a model, because that is where
+  dbt expects a snapshot's tests, a seed's column types, a singular test's
+  severity and an analysis's description declared. Macro-path behavior is
+  unchanged.
 
 ### Fixed
+
+- **A `project_yml` edit that drops any authored path key now warns** ([#212]).
+  The warning covered `model-paths` and `macro-paths` only, so a `dbt_project.yml`
+  that dropped `snapshot-paths` or `seed-paths` silently orphaned every file
+  under them, which was a gap left behind when those two families were added. It
+  now checks every key dex authors into, six of them, since which family a caller
+  restructures is not something the warning gets to have an opinion about.
 
 - **`transform plan` refuses on its own terms before it hands anything to dbt's
   parser** ([#210], [#211]). The parse gate runs before the plan is stored, and

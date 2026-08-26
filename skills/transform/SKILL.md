@@ -34,6 +34,8 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
   {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
   {"path": "snapshots/snap_orders.sql", "kind": "snapshot_sql", "content": "..."},
   {"path": "seeds/country_vat.csv", "kind": "seed_csv", "content": "..."},
+  {"path": "tests/assert_totals_reconcile.sql", "kind": "test_sql", "content": "..."},
+  {"path": "analyses/email_skew.sql", "kind": "analysis_sql", "content": "..."},
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
@@ -41,7 +43,9 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 `kind` is `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update|plan`, which imply it), `macro_sql` (a macro file under
 the project's macro paths), `snapshot_sql` (a snapshot under the snapshot
-paths), `seed_csv` (a seed's CSV under the seed paths), `packages_yml`,
+paths), `seed_csv` (a seed's CSV under the seed paths), `test_sql` (a singular
+test or a generic test definition under the test paths), `analysis_sql` (SQL dbt
+compiles but never runs, under the analysis paths), `packages_yml`,
 `project_yml` (the project-root `dbt_project.yml`), or `profiles_yml` (the
 project-root `profiles.yml`). Model SQL must be a single read-only SELECT once
 its jinja is stripped; semantic YAML is validated against MetricFlow's schemas,
@@ -53,15 +57,29 @@ comments. A snapshot must hold exactly one `{% snapshot %}` block whose
 read-only SELECT. A seed must parse as CSV with a named, duplicate-free header
 and one field per column on every row, and stays under 5,000 data rows and 1 MiB
 (past that it is data rather than a lookup: load it into the warehouse and
-`source()` it). `project_yml` must keep a `name`; `profiles_yml` must reference
+`source()` it). A `test_sql` file is read to decide which of the two shapes
+sharing the test paths it is: one holding `{% test %}` blocks is a generic test
+definition and must hold only those and jinja comments, balanced; anything else
+is a singular test and must be a single read-only SELECT. A singular test that
+names no `ref()` or `source()` is warned about, not refused, because it runs
+against nothing and passes unconditionally. An analysis must be a single
+read-only SELECT too, even though dbt only compiles it. `project_yml` must keep
+a `name`; `profiles_yml` must reference
 every secret via `{{ env_var('NAME') }}` (a literal credential is refused so
 none reaches the diff). Config kinds, snapshots and seeds are all parsed by dbt
 at plan time.
 
 Each kind is confined to its own family of paths, and filing one in the wrong
 family is refused naming both fixes. `schema_yml` is the exception, accepted
-beside a model, a snapshot or a seed, because that is where dbt expects a
-snapshot's tests and a seed's column types declared.
+beside a model, a snapshot, a seed, a test or an analysis, because that is where
+dbt expects a snapshot's tests, a seed's column types, a singular test's severity
+and an analysis's description declared.
+
+**Three things here are called a test, and they are not interchangeable.**
+Generic tests are declared inside a `schema.yml` (`data_tests:` on a model or a
+column). Unit tests come from `transform test --scaffold <model>`, which writes a
+`unit_tests:` block, also `schema_yml`. Singular tests and generic test
+*definitions* are files under `test-paths`, and `test_sql` is the kind for those.
 
 **A seed puts values, not logic, into a diff, and a diff goes into git and stays
 there.** So a seed whose header names a column that looks like personal data is
@@ -71,9 +89,13 @@ values (everywhere in dex), so it cannot see personal data hiding under a
 neutral column name: do not build a seed out of warehouse rows you have not
 looked at.
 
-`dbt build` runs seeds and snapshots natively, so `transform build` after an
-apply is all it takes; there is no separate seed step. A snapshot writes a table
-and is priced in the cost handshake, a seed scans nothing and is not.
+`dbt build` runs seeds, snapshots and singular tests natively, so `transform
+build` after an apply is all it takes; there is no separate seed or test step. A
+snapshot writes a table and a test runs a scanning SELECT, so both are priced in
+the cost handshake; a seed scans nothing and an analysis is never built at all,
+so neither is. A singular test and an analysis build no relation and nothing can
+`ref()` either, so neither is a node: neither enters `maintain`'s drift baseline,
+and deleting one raises no dangling-reference guard.
 
 `op` is `upsert` (the default: create or update, carrying `content`) or
 `delete` (remove the file, no `content`). A delete is a first-class reviewable
@@ -285,8 +307,10 @@ database, which is fine for model-only builds.
 
 ## Guardrails (enforced in the engine, not here)
 
-- Writes confined to the repo, and within it to the dbt project's model paths.
-  dex never writes to source warehouse data.
+- Writes confined to the repo, and within it to the dbt project's authored path
+  families (models, macros, snapshots, seeds, tests, analyses) plus the
+  project-root manifests dbt keeps there. dex never writes to source warehouse
+  data.
 - Dev-target only. Prod-target execution is never initiated by dex.
 - Cost surfaced before any spend. A build that would spend requires explicit
   confirmation and a session budget.

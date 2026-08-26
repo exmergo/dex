@@ -34,6 +34,27 @@ def test_load_parses_project_and_files(dbt_project_dir: Path):
     assert sql.sha256 == content_hash(sql.content)
 
 
+def test_load_defaults_every_path_family_the_way_dbt_does(dbt_project_dir: Path):
+    # The fixture's dbt_project.yml declares only `model-paths`, which is the
+    # common case: a project that never wrote the other keys still gets dbt's
+    # own defaults, so a first authored test or analysis lands where dbt looks.
+    view = load(dbt_project_dir)
+    assert view.macro_paths == ["macros"]
+    assert view.snapshot_paths == ["snapshots"]
+    assert view.seed_paths == ["seeds"]
+    assert view.test_paths == ["tests"]
+    assert view.analysis_paths == ["analyses"]
+    # And the order they are matched in, with models last as the catch-all.
+    assert [name for name, _paths in view.path_families()] == [
+        "macro",
+        "snapshot",
+        "seed",
+        "test",
+        "analysis",
+        "model",
+    ]
+
+
 def test_load_without_manifest_is_graceful(dbt_project_dir: Path):
     assert load(dbt_project_dir).manifest is None
 
@@ -260,8 +281,10 @@ def test_write_edits_all_or_nothing_across_a_delete_and_an_upsert(
         "../outside.sql",
         "models/../../escape.sql",
         # Inside the project, outside every authored family: the surface is the
-        # four path families plus the root manifests, not the whole repo.
-        "analyses/scratch.sql",
+        # path families plus the root manifests, not the whole repo. `analyses/`
+        # used to sit here and no longer does, which is the one behavior change
+        # a project with a stray analyses directory sees.
+        "docs/scratch.sql",
         "target/compiled.sql",
     ],
 )

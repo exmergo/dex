@@ -368,6 +368,52 @@ def test_select_only_guard_rejects_writes():
             assert_select_only(bad)
 
 
+def test_every_authored_sql_kind_runs_through_the_select_only_guard():
+    """No edit kind carrying SQL may reach the repo without the guard.
+
+    dex writes SQL a human reviews and dbt later runs, so the read-only
+    guarantee has to hold at the point of authorship, not only at the point of
+    execution. The failure mode this pins is a new kind added with its own
+    validation branch that forgets the guard: the file lands, the diff reads
+    fine, and a DELETE is sitting in the project waiting for someone to run it.
+
+    An analysis is the sharpest case. dbt never runs one, so nothing downstream
+    would object, and it is still refused: compiled SQL in ``target/`` is one
+    copy-paste from a warehouse, and the guarantee is about what dex writes, not
+    about who presses the button.
+    """
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import EditValidationError, validate_edit
+
+    carriers = {
+        transform.EditKind.MODEL_SQL: "models/staging/stg_x.sql",
+        transform.EditKind.TEST_SQL: "tests/assert_x.sql",
+        transform.EditKind.ANALYSIS_SQL: "analyses/scratch.sql",
+    }
+    for kind, path in carriers.items():
+        for bad in ("delete from customers", "drop table customers"):
+            with pytest.raises(EditValidationError, match="read-only SELECT"):
+                validate_edit(transform.PlanEdit(path=path, kind=kind, new_content=bad))
+
+    # A snapshot carries its query inside the block, and the body gets the same
+    # guard as a standalone one.
+    with pytest.raises(EditValidationError, match="read-only SELECT"):
+        validate_edit(
+            transform.PlanEdit(
+                path="snapshots/snap_x.sql",
+                kind=transform.EditKind.SNAPSHOT_SQL,
+                new_content=(
+                    "{% snapshot snap_x %}\n"
+                    "{{ config(unique_key='id', strategy='timestamp', "
+                    "updated_at='updated_at') }}\n"
+                    "delete from customers\n"
+                    "{% endsnapshot %}\n"
+                ),
+            )
+        )
+
+
 def _firewall_cache():
     from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
 
@@ -1830,11 +1876,11 @@ def test_an_authored_kind_cannot_land_outside_its_own_path_family(
     """Writes are confined to the repo, and within the repo to the part of the
     dbt surface the kind belongs to.
 
-    Containment alone is not enough once there are four families: a snapshot
-    written into ``models/`` is inside the surface and still wrong, because dbt
-    parses it as a model and the build fails. So the kind and its location have
-    to agree, in both directions, and neither confirmation nor a re-plan can
-    talk past it.
+    Containment alone is not enough once the surface has several families: a
+    snapshot written into ``models/`` is inside the surface and still wrong,
+    because dbt parses it as a model and the build fails. So the kind and its
+    location have to agree, in both directions, and neither confirmation nor a
+    re-plan can talk past it.
     """
 
     from exmergo_dex_core import transform
@@ -1849,6 +1895,22 @@ def test_an_authored_kind_cannot_land_outside_its_own_path_family(
         (transform.EditKind.SEED_CSV, "models/staging/lookup.csv", "seed paths"),
         (transform.EditKind.SEED_CSV, "macros/lookup.csv", "seed paths"),
         (transform.EditKind.SNAPSHOT_SQL, "seeds/snap.sql", "snapshot paths"),
+        # The two families that hold nothing but `.sql` and sit beside each
+        # other, which is where a misfiling is easiest to make and hardest to
+        # notice: dbt would build a misfiled test as a model, and would never
+        # look at a misfiled analysis at all.
+        (
+            transform.EditKind.TEST_SQL,
+            "models/staging/assert_ids.sql",
+            "test paths",
+        ),
+        (transform.EditKind.TEST_SQL, "analyses/assert_ids.sql", "test paths"),
+        (
+            transform.EditKind.ANALYSIS_SQL,
+            "models/staging/scratch.sql",
+            "analysis paths",
+        ),
+        (transform.EditKind.ANALYSIS_SQL, "tests/scratch.sql", "analysis paths"),
     ]
     for kind, path, named in misplaced:
         with pytest.raises(transform.PlanError, match=named):
