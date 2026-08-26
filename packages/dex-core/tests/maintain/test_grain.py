@@ -228,7 +228,11 @@ def test_estimated_row_counts_cannot_fabricate_duplicates():
 
     dataset = Dataset(identifier="db.s.t", candidate_keys=[["id"]], grain=["id"])
     plan = GrainPlan(
-        key_checks=[(dataset, ["id"], 1200)], fanout_pairs=[], composite_checks=[]
+        key_checks=[(dataset, ["id"], 1200)],
+        fanout_pairs=[],
+        composite_checks=[],
+        declared_composite_checks=[],
+        notes=[],
     )
     findings = grain_drift(EstimatingAdapter(), plan)
     assert findings == []
@@ -319,6 +323,8 @@ def test_composite_key_lost_uniqueness_is_detected():
         key_checks=[],
         fanout_pairs=[],
         composite_checks=[(dataset, [["order_key", "line_number"]], 1000)],
+        declared_composite_checks=[],
+        notes=[],
     )
     adapter = _ComboAdapter(rows=1000, combo_count=950)
     findings = grain_drift(adapter, plan)
@@ -343,6 +349,8 @@ def test_composite_check_is_quiet_when_the_key_still_holds():
         key_checks=[],
         fanout_pairs=[],
         composite_checks=[(dataset, [["order_key", "line_number"]], 1000)],
+        declared_composite_checks=[],
+        notes=[],
     )
     findings = grain_drift(_ComboAdapter(rows=1000, combo_count=1000), plan)
     assert findings == []
@@ -356,6 +364,8 @@ def test_adapter_without_combination_counts_skips_composite_checks():
         key_checks=[],
         fanout_pairs=[],
         composite_checks=[(dataset, [["order_key", "line_number"]], 1000)],
+        declared_composite_checks=[],
+        notes=[],
     )
     adapter = _ComboAdapter(rows=1000, combo_count=950)
     adapter.distinct_combination_counts = None  # shadow: adapter can't probe
@@ -545,6 +555,8 @@ def test_grain_estimate_prices_composite_checks():
         key_checks=[],
         fanout_pairs=[],
         composite_checks=[(dataset, [["order_key", "line_number"]], 1000)],
+        declared_composite_checks=[],
+        notes=[],
     )
     priced: list[str] = []
 
@@ -555,3 +567,223 @@ def test_grain_estimate_prices_composite_checks():
     assert per_table == {"db.s.line_items": 7.0}
     assert len(priced) == 1
     assert "SELECT DISTINCT" in priced[0]
+
+
+# --- declared grains: the combination the project claims ------------------------
+#
+# Measurement and declaration disagree by design. Explore lets a proven single
+# column win the grain verdict over a declared composite, and `candidate_keys`
+# stays measurement-only because an unmeasured declared key is a claim, not a
+# baseline. Both are right for a cache, and together they left the grain a project
+# actually declares unverified on exactly the fact tables where it matters. These
+# cover reading it at plan time instead, which is what keeps the cache clean.
+
+
+def _declaring(*composites: tuple[str, list[str]]):
+    from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
+
+    return ProjectDefinitions(
+        present=True,
+        declared_composite_keys=[
+            DeclaredCompositeKey(model=model, columns=columns, source="yaml")
+            for model, columns in composites
+        ],
+    )
+
+
+def _single_key_snapshot():
+    """A dataset whose *measured* grain is one column, as explore records it when
+    a proven single key beats a declared composite."""
+
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    dataset = Dataset(
+        identifier="db.s.line_items",
+        candidate_keys=[["order_key"]],
+        grain=["order_key"],
+    )
+    return dataset, Snapshot.model_construct(
+        warehouse=WarehouseBaseline.model_construct(
+            datasets=[dataset], relationships=[]
+        )
+    )
+
+
+class _SingleAndComboAdapter(_ComboAdapter):
+    """`_ComboAdapter` with the single-column check allowed: the declared cases
+    need a dataset that has both a measured single key and a declared
+    combination."""
+
+    def __init__(self, rows: int, combo_count: int | None, key_count: int):
+        super().__init__(rows, combo_count)
+        self.key_count = key_count
+
+    def exact_distinct_counts(self, identifier, columns):
+        return dict.fromkeys(columns, self.key_count)
+
+
+def test_a_declared_grain_measurement_never_proved_is_planned_and_verified():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, snap = _single_key_snapshot()
+    adapter = _SingleAndComboAdapter(rows=1000, combo_count=900, key_count=1000)
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("line_items", ["order_key", "line_number"]))
+    )
+
+    # The measured single key still goes through key_checks; the declaration is a
+    # separate list because a failure on it is a separate fact.
+    assert plan.key_checks == [(dataset, ["order_key"], 1000)]
+    assert plan.composite_checks == []
+    assert plan.declared_composite_checks == [
+        (dataset, [["order_key", "line_number"]], 1000)
+    ]
+    assert plan.notes == []
+
+    findings = grain_drift(adapter, plan)
+    assert [f.code for f in findings] == ["declared_grain_not_unique"]
+    finding = findings[0]
+    assert finding.column == "order_key, line_number"
+    assert finding.data["columns"] == ["order_key", "line_number"]
+    assert finding.data["declared"] is True
+    # Nothing lapsed here: there was never a measurement saying this held, so
+    # "no longer" would be a false account of the same two numbers.
+    assert "no longer" not in finding.detail
+    assert "declares" in finding.detail
+
+
+def test_a_declared_grain_that_holds_reports_nothing():
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    _dataset, snap = _single_key_snapshot()
+    adapter = _SingleAndComboAdapter(rows=1000, combo_count=1000, key_count=1000)
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("line_items", ["order_key", "line_number"]))
+    )
+    assert grain_drift(adapter, plan) == []
+
+
+def test_a_declared_grain_measurement_also_proved_is_checked_once():
+    """A declaration duplicating a measured composite is checked as the measured
+    one: it has a baseline, so `key_lost_uniqueness` is the true statement about
+    it and the declared code would be a downgrade. Order and case are the
+    project's spelling, not part of the claim."""
+
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+
+    dataset, snap = _composite_snapshot()
+    adapter = _ComboAdapter(rows=1000, combo_count=950)
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("line_items", ["LINE_NUMBER", "order_key"]))
+    )
+    assert plan.composite_checks == [(dataset, [["order_key", "line_number"]], 1000)]
+    assert plan.declared_composite_checks == []
+
+    findings = grain_drift(adapter, plan)
+    assert [f.code for f in findings] == ["key_lost_uniqueness"]
+    assert adapter.combo_calls == [[["order_key", "line_number"]]]
+
+
+def test_an_unresolvable_declared_grain_is_noted_rather_than_dropped():
+    """A declaration naming no warehouse object, or several, is not verified, and
+    an unverified grain must not read like a holding one: "no finding" is what
+    both look like from the envelope."""
+
+    from exmergo_dex_core.maintain.drift import grain_plan
+
+    _dataset, snap = _single_key_snapshot()
+    adapter = _SingleAndComboAdapter(rows=1000, combo_count=900, key_count=1000)
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("nowhere", ["order_key", "line_number"]))
+    )
+
+    assert plan.declared_composite_checks == []
+    assert len(plan.notes) == 1
+    assert "nowhere" in plan.notes[0] and "not verified" in plan.notes[0]
+
+
+def test_a_connector_that_cannot_probe_combinations_says_so():
+    from exmergo_dex_core.maintain.drift import grain_plan
+
+    _dataset, snap = _single_key_snapshot()
+    adapter = _SingleAndComboAdapter(rows=1000, combo_count=900, key_count=1000)
+    adapter.distinct_combination_counts = None  # shadow: adapter can't probe
+
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("line_items", ["order_key", "line_number"]))
+    )
+    assert plan.declared_composite_checks == []
+    assert len(plan.notes) == 1
+    assert "cannot probe column combinations" in plan.notes[0]
+
+
+def test_grain_estimate_prices_the_declared_checks_too():
+    """The plan is the one survey both the estimate and the run read, so a scan
+    that reaches execution without appearing here is spend nobody saw."""
+
+    from exmergo_dex_core.maintain.drift import grain_estimate, grain_plan
+
+    _dataset, snap = _single_key_snapshot()
+    adapter = _SingleAndComboAdapter(rows=1000, combo_count=900, key_count=1000)
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("line_items", ["order_key", "line_number"]))
+    )
+    priced: list[str] = []
+    adapter.query_estimate = lambda sql: priced.append(sql) or 3.0
+
+    total, per_table = grain_estimate(adapter, plan)
+    assert total == 6.0  # the single key, plus the declared combination
+    assert per_table == {"db.s.line_items": 6.0}
+    assert len(priced) == 2
+
+
+def test_a_declared_grain_is_verified_on_a_table_the_baseline_never_captured():
+    """The one way declared checks differ structurally from measured ones.
+
+    A measured check needs a before to compare against, so it can only speak
+    about an object the baseline captured. A declaration needs no before: the
+    project's claim is the standard and the question is whether the data meets it
+    today. Driving these off the baseline as well went quiet on a model built
+    since the last snapshot, which is exactly when a newly declared grain is most
+    likely to be wrong, and it went quiet *because* the declaration resolved: the
+    unresolvable note disappeared as the situation got worse.
+    """
+
+    from exmergo_dex_core.maintain.drift import grain_drift, grain_plan
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    empty = Snapshot.model_construct(
+        warehouse=WarehouseBaseline.model_construct(datasets=[], relationships=[])
+    )
+    adapter = _ComboAdapter(rows=1000, combo_count=900)
+    plan = grain_plan(
+        adapter, empty, None, _declaring(("line_items", ["order_key", "line_number"]))
+    )
+
+    assert plan.key_checks == [] and plan.composite_checks == []
+    assert len(plan.declared_composite_checks) == 1
+    dataset, combos, rows = plan.declared_composite_checks[0]
+    assert dataset.identifier == "db.s.line_items"
+    # Nothing measured was invented for it: the identifier is all the declared
+    # pass reads, and a profile it never had would be a claim in a baseline's
+    # place.
+    assert dataset.candidate_keys == [] and dataset.grain is None
+    assert combos == [["order_key", "line_number"]] and rows == 1000
+
+    findings = grain_drift(adapter, plan)
+    assert [f.code for f in findings] == ["declared_grain_not_unique"]
+
+
+def test_a_declared_grain_naming_absent_columns_is_noted():
+    from exmergo_dex_core.maintain.drift import grain_plan
+
+    _dataset, snap = _single_key_snapshot()
+    adapter = _SingleAndComboAdapter(rows=1000, combo_count=900, key_count=1000)
+    plan = grain_plan(
+        adapter, snap, None, _declaring(("line_items", ["order_key", "invoice_no"]))
+    )
+
+    assert plan.declared_composite_checks == []
+    assert len(plan.notes) == 1
+    assert "invoice_no" in plan.notes[0] and "not verified" in plan.notes[0]
