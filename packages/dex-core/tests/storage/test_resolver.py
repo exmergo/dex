@@ -16,6 +16,7 @@ from exmergo_dex_core import ConfigurationError
 from exmergo_dex_core.storage import (
     ExploreStore,
     FilesystemStore,
+    SqliteStore,
     StoreContext,
     build_store,
     resolve_store_factory,
@@ -40,6 +41,12 @@ def _clean_registry():
 def test_the_default_name_builds_the_filesystem_backend(tmp_path: Path):
     store = build_store("filesystem", StoreContext(repo_root=str(tmp_path)))
     assert isinstance(store, FilesystemStore)
+    assert store.root == tmp_path
+
+
+def test_sqlite_is_a_shipped_name_too(tmp_path: Path):
+    store = build_store("sqlite", StoreContext(repo_root=str(tmp_path)))
+    assert isinstance(store, SqliteStore)
     assert store.root == tmp_path
 
 

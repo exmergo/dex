@@ -11,6 +11,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **An opt-in SQLite cache backend** ([#139]). `FilesystemStore` writes loose
+  JSON under `.dex/`, which is right for the CLI (persistence is git, a reviewer
+  reads the state in a pull request) and wrong for a host that wants durable
+  local state without a directory of files to gitignore and clean up. Select
+  `cache.backend: sqlite` (or `--cache-backend sqlite` for one run) and
+  everything lands in a single `.dex/dex.db` file instead; `filesystem` stays
+  the default.
+
+  It implements the full storage `Protocol` from [#137]: the cache, the
+  snapshot, the drift report, the transform plans, and both ledgers, backed by
+  real tables rather than a directory of loose files, and it passes the same
+  conformance suite the two shipped backends already run against. The spend
+  ledger's `spend_since`, the query the cumulative session budget reads on every
+  billed command, answers from an indexed lookup on `at` and `connector` rather
+  than reading and parsing every line ever appended, which is the gap the
+  filesystem backend's JSONL scan does not close as a ledger grows. The
+  cross-process spend lock is a `BEGIN IMMEDIATE` transaction on the database
+  file itself, so the cumulative ceiling still binds across two CLI processes
+  sharing a repo, the same guarantee the filesystem backend's advisory file lock
+  provides.
+
+  `.dex/dex.db` is a binary file, not a JSON document a reviewer can diff, so it
+  belongs in `.gitignore` the way any local database file does.
+
 - **`transform rename` and `transform remove` generate the whole propagation
   plan** ([#221]). `transform references` could tell you where a name was used
   and then left you to retype the change file by file. These two make the change:
