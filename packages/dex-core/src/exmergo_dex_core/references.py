@@ -140,6 +140,10 @@ class ReferenceIndex:
         self._model_refs: dict[str, set[str]] = defaultdict(set)
         self._sqlglot_missing = False
         self._macro_args: list[tuple[str, int, str, str]] = []
+        #: What each node in *this* project is, by node name. Packages are left
+        #: out: the graph accessors answer questions about the project a caller
+        #: can edit, and a packaged model is not one.
+        self._node_kinds: dict[str, str] = {}
 
         self._scan(view, package=None)
         if scan_packages:
@@ -203,7 +207,7 @@ class ReferenceIndex:
                 "matched by column name alone",
             ]
 
-        lineage = self._lineage(model)
+        lineage = self.descendants_of(model)
         return [
             hit.model_copy(
                 update={
@@ -225,11 +229,22 @@ class ReferenceIndex:
 
         return [ref for ref in self._indeterminate if ref.kind == kind]
 
-    def _lineage(self, model: str) -> set[str]:
-        """``model`` and everything that reaches it through ``ref()``, transitively."""
+    def parents_of(self, node: str) -> set[str]:
+        """What ``node`` reads directly, as resolved ``ref()`` targets."""
 
-        reached = {model}
-        pending = deque([model])
+        return set(self._model_refs.get(node, ()))
+
+    def descendants_of(self, node: str) -> set[str]:
+        """``node`` and everything that reaches it through ``ref()``, transitively.
+
+        Includes ``node`` itself, because the questions asked of this are about a
+        *lineage*: a column renamed in its defining model is renamed there as well
+        as downstream, and a caller filtering the defining model back out would
+        have to know to.
+        """
+
+        reached = {node}
+        pending = deque([node])
         while pending:
             current = pending.popleft()
             for candidate, refs in self._model_refs.items():
@@ -237,6 +252,51 @@ class ReferenceIndex:
                     reached.add(candidate)
                     pending.append(candidate)
         return reached
+
+    def ancestors_of(self, node: str) -> set[str]:
+        """``node`` and everything it reaches through ``ref()``, transitively.
+
+        The other direction from :meth:`descendants_of`, and the one a placement
+        question needs: "which models do all of these targets descend from" is an
+        intersection of these sets.
+
+        ``node`` is a member of its own ancestor set, so a target that is already
+        upstream of the others can host a shared definition. Excluding it would
+        rule out the answer that needs no new model at all.
+        """
+
+        reached = {node}
+        pending = deque([node])
+        while pending:
+            current = pending.popleft()
+            for parent in self._model_refs.get(current, ()):
+                if parent not in reached:
+                    reached.add(parent)
+                    pending.append(parent)
+        return reached
+
+    def node_kind(self, node: str) -> str | None:
+        """What this project builds ``node`` as, or ``None`` if it does not.
+
+        ``None`` covers both a name the project never defines and one only an
+        installed package defines, which are the same answer to the only question
+        asked of this: whether dex may propose an edit to it.
+        """
+
+        return self._node_kinds.get(node)
+
+    def definitions_of(self, name: str, kind: str) -> list[Reference]:
+        """Every place ``name`` is *defined* as ``kind``, project and packages.
+
+        Two definitions with a package among them is a shadow, which is why this
+        does not collapse to a single answer.
+        """
+
+        return [
+            reference
+            for reference in self._by_name.get((kind, name), [])
+            if reference.form in ("definition", "project_yml_var")
+        ]
 
     @staticmethod
     def _is_qualified(name: str) -> bool:
@@ -255,6 +315,8 @@ class ReferenceIndex:
     ) -> None:
         nodes = node_files(view)
         node_kinds = {node_name(path): self._node_kind(view, path) for path in nodes}
+        if package is None:
+            self._node_kinds = dict(node_kinds)
         for raw_path, source in sorted(view.files.items()):
             path = f"{prefix}{raw_path}"
             family = path_family(Path(view.root), raw_path, view)
@@ -464,7 +526,7 @@ class ReferenceIndex:
             self._sqlglot_missing = True
             return
 
-        blanked = _blank_jinja(content)
+        blanked = blank_jinja(content)
         try:
             parsed = sqlglot.parse_one(blanked)
         except Exception:
@@ -950,7 +1012,7 @@ class _ScalarLines:
         return self._keys.get(value, self.peek(value))
 
 
-def _blank_jinja(content: str) -> str:
+def blank_jinja(content: str) -> str:
     """``content`` with every jinja region blanked, offsets and newlines intact.
 
     An expression leaves a short identifier behind so the surrounding SQL still
