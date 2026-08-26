@@ -29,6 +29,11 @@ SECRET_TOKEN = "dbts_FAKE_secret_token_must_not_leak"  # noqa: S105 (test fixtur
 # share a document. Both forms are matched, because the point of some of these
 # tests is what happens when one call carries several metrics.
 _DIMENSIONS_FIELD = re.compile(r"(?:(\w+):\s*)?dimensions\((?P<args>[^)]*)\)")
+# The `metrics(...)` root field, aliased or not. One document carries both fields
+# (the per-metric PII map and the layer's queryable grains), so the fake answers
+# per field rather than per document: a transport that recognized only the first
+# field it saw would make a one-round-trip claim untestable.
+_METRICS_FIELD = re.compile(r"(?:(\w+):\s*)?metrics\(environmentId[^)]*\)")
 _METRIC_NAME = re.compile(r'name:\s*"([^"]+)"')
 
 
@@ -108,13 +113,13 @@ class FakeHostedBackend(HostedDbtCloudBackend):
                     "jsonResult": self._result,
                 }
             }
-        if "dimensions(environmentId" in query:
-            data = {}
-            for match in _DIMENSIONS_FIELD.finditer(query):
-                alias = match.group(1) or "dimensions"
-                metrics = _METRIC_NAME.findall(match.group("args"))
-                data[alias] = self._dimensions_for(metrics)
-            return data
-        if "metrics(environmentId" in query:
-            return {"metrics": self._metrics}
-        raise AssertionError(f"unexpected GraphQL query: {query}")
+        data: dict = {}
+        for match in _DIMENSIONS_FIELD.finditer(query):
+            alias = match.group(1) or "dimensions"
+            metrics = _METRIC_NAME.findall(match.group("args"))
+            data[alias] = self._dimensions_for(metrics)
+        for match in _METRICS_FIELD.finditer(query):
+            data[match.group(1) or "metrics"] = self._metrics
+        if not data:
+            raise AssertionError(f"unexpected GraphQL query: {query}")
+        return data
