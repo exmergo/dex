@@ -25,11 +25,11 @@ from pydantic import BaseModel
 from sqlglot import expressions as exp
 
 from ..dbt_project import (
-    REF_PATTERN,
     ApplyResult,
     DbtProjectView,
     Edit,
     EditOp,
+    SourceFile,
     contained_path,
     content_hash,
     find_project,
@@ -601,19 +601,45 @@ def apply(
     return result
 
 
+#: Reference forms that stop the project compiling once their target is gone.
+#: A `ref()` is the obvious one; a semantic model's `model:` and a relationship
+#: test's `to:` are the same thing written in YAML, and dbt fails to parse on
+#: either. A `schema.yml` entry that merely *documents* the model is not here on
+#: purpose: an orphaned doc block is a legitimate follow-up edit, so it stays the
+#: soft warning it has always been rather than becoming a refusal a caller cannot
+#: see the reason for.
+_BREAKS_ON_DELETE = frozenset(
+    {"ref_call", "semantic_model_ref", "yaml_relationship_to"}
+)
+
+
 def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]:
     """Refuse a plan whose deletions would orphan a ``ref()``, atomically.
 
     The project state *after* this plan is computed in memory (current files
-    minus the deletions, with this plan's upserts overlaid), then every surviving
-    file is scanned for a ``ref()`` to a deleted model. A dangling ref is a hard
-    refusal naming the offenders; a deleted model whose only remaining trace is a
+    minus the deletions, with this plan's upserts overlaid), then indexed for
+    references to the deleted nodes. A dangling ref is a hard refusal naming the
+    offenders and the line; a deleted model whose only remaining trace is a
     schema.yml doc entry is a soft warning, since an orphaned doc block is a
     legitimate follow-up edit rather than a broken project.
 
     Overlaying the upserts is what makes the guard atomic across the whole plan:
     a plan that deletes a model *and* updates its referrer to drop the ref is
     accepted, while deleting the model alone is refused.
+
+    The scan is :class:`~..references.ReferenceIndex` rather than a regex over
+    file text, which changes three things and each is deliberate. A seed's data
+    rows and a YAML string no longer count, so a CSV row that happens to contain
+    the characters ``ref('x')`` stops blocking a delete. The two-argument
+    ``ref('package', 'model')`` form is finally read as the model it names,
+    rather than as the package, so a dangling reference written that way is
+    caught instead of missed. And a reference dex cannot resolve statically
+    (``{{ ref(var('x')) }}``) *warns* rather than refusing: it may or may not name
+    the deleted node, dex cannot tell, and refusing on it would be unsatisfiable,
+    because no edit the caller could make would make it resolvable.
+
+    Packages are not scanned. The question is whether *this project* still points
+    at what it is deleting, and a package cannot be edited to fix it anyway.
     """
 
     delete_paths = {e.path for e in edits if e.op is EditOp.DELETE}
@@ -639,14 +665,32 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
         if edit.op is EditOp.UPSERT and edit.new_content is not None:
             surviving[edit.path] = edit.new_content
 
+    from ..references import ReferenceIndex
+
+    after = view.model_copy(
+        update={
+            "files": {
+                path: SourceFile(
+                    path=path, content=content, sha256=content_hash(content)
+                )
+                for path, content in surviving.items()
+            }
+        }
+    )
+    index = ReferenceIndex(after, scan_packages=False)
+
     danglers: dict[str, list[str]] = {}
-    for path, content in surviving.items():
-        hits = sorted(set(REF_PATTERN.findall(content)) & deleted_models)
-        if hits:
-            danglers[path] = hits
+    for model in sorted(deleted_models):
+        for kind in ("model", "seed", "snapshot"):
+            for reference in index.references_to(model, kind)[0]:
+                if reference.form not in _BREAKS_ON_DELETE:
+                    continue
+                danglers.setdefault(reference.path, []).append(
+                    f"{model} (line {reference.line}, {reference.form})"
+                )
     if danglers:
         detail = "; ".join(
-            f"{path} still ref()s {', '.join(names)}"
+            f"{path} still references {', '.join(names)}"
             for path, names in sorted(danglers.items())
         )
         raise PlanError(
@@ -657,6 +701,20 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
         )
 
     warnings: list[str] = []
+    unresolved = [
+        reference
+        for kind in ("model", "seed", "snapshot")
+        for reference in index.indeterminate_for(kind)
+    ]
+    if unresolved:
+        where = ", ".join(
+            f"{reference.path}:{reference.line}" for reference in unresolved
+        )
+        warnings.append(
+            f"the surviving project has {len(unresolved)} reference(s) dex could "
+            f"not resolve ({where}); one of them may name a node this plan "
+            "deletes, and dex cannot tell from the source alone"
+        )
     for path, content in surviving.items():
         if not path.endswith((".yml", ".yaml")):
             continue
