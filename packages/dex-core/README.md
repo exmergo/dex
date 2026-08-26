@@ -235,11 +235,14 @@ one. It starts bare by default; with `--use-project` it reads an existing
 dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
-writing back to `.dex/config.yml`. It also queries the dbt semantic layer
-(`explore semantic list` / `query`): metric queries run either locally through
-MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt Cloud
-deployment (`--api`), where dbt Cloud executes server-side and every result warns
-that dex's cost guard does not apply there.
+writing back to `.dex/config.yml`. It also reads and queries the dbt semantic layer
+(`explore semantic list` / `query`). `list` returns the layer's objects, semantic
+models and metrics and their composition and measures and dimensions and the
+declared entity graph, in one shape from either backend, scopeable to the metrics a
+caller came for and costing no warehouse query. Metric queries run either locally
+through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt
+Cloud deployment (`--api`), where dbt Cloud executes server-side and every result
+warns that dex's cost guard does not apply there.
 
 `transform`: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and
