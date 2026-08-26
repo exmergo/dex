@@ -271,6 +271,84 @@ def verify_handshake(
     return None
 
 
+def overlap_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    candidate_count: int,
+    object_count: int,
+    cap: int,
+    elided: int,
+) -> ConfirmationRequest | None:
+    """The mid-command checkpoint for ``--infer-by-overlap``'s sweep phase on
+    billed connectors, structurally the same two-phase pattern as
+    :func:`verify_handshake`.
+
+    The sweep's candidate pool can only be built once inference (and
+    ``--verify``, if also requested) has run, so this prices the sweep's own
+    batch of probes after that, on an already-confirmed command: a dry-run
+    estimate that fits what remains of the confirmed budget proceeds in one
+    pass, and one that doesn't returns the request rather than raising, since
+    everything found so far is already paid for.
+
+    ``cap``/``elided`` are carried on the checkpoint payload unconditionally
+    (not only when they bind), so a caller sees the sweep's bound even on a
+    confirmed run and never has to guess whether the reported candidate count
+    is the whole pool or a capped slice of it.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None or candidate_count == 0:
+        return None
+    try:
+        gate.preflight_phase(estimate)
+    except ConfirmationRequiredError as exc:
+        per_table = {"(overlap sweep probes)": estimate}
+        describe = getattr(adapter, "describe_estimate", None)
+        if describe is not None:
+            data = {"command": command, **describe(estimate, per_table)}
+        else:
+            data = {
+                "command": command,
+                "estimated_bytes": estimate,
+                "per_table_bytes": per_table,
+            }
+        data.update(
+            {
+                "phase": "overlap",
+                "candidate_count": candidate_count,
+                "object_count": object_count,
+                "cap": cap,
+                "elided": elided,
+                "hint": (
+                    f"found {candidate_count} unmatched key-shaped column "
+                    f"pair(s) across {object_count} object(s) to probe for "
+                    f"value overlap; probing them all is estimated at "
+                    f"{estimate:.0f} {gate.paradigm.value} beyond what "
+                    "remains of the confirmed budget. Relationships found so "
+                    "far are already saved to the exploration cache; re-run "
+                    "the same command with --confirm --budget "
+                    f"{math.ceil(exc.cost.estimate)} to profile, infer, and "
+                    "sweep in one pass (a re-run re-profiles first)"
+                ),
+            }
+        )
+        if (
+            gate.session_ceiling is not None
+            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
+        ):
+            data.setdefault("notes", [])
+            data["notes"] = [
+                *data["notes"],
+                "the session budget is the binding ceiling; raising --budget "
+                "alone will not unlock this, raise the session budget in "
+                ".dex/config.yml instead",
+            ]
+        return ConfirmationRequest(cost=exc.cost, data=data)
+    return None
+
+
 def cumulative_handshake(
     command: str,
     adapter: Adapter,

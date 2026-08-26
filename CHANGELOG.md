@@ -758,6 +758,42 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   
 ### Added
 
+- **`explore relationships`/`explore map --infer-by-overlap` proposes joins
+  from measured value overlap when no column name matches** ([#220],
+  depends on [#208]). Every proposed relationship started from a name; when
+  naming carried no signal at all (`acct_id_fk` to `ws_id`, or a source that
+  names every key `id`), inference had nothing to work with and the map was
+  silently incomplete, with no way to tell an absent edge from an absent
+  relationship. Value overlap is strictly stronger evidence than a name,
+  since it is the thing a name is a proxy for.
+
+  Off by default, and named in `explore map`'s notes even when off, so the
+  option is discoverable without `--help`. When passed, key-shaped columns
+  (a proven single-column key, or a near-key whose distinct count already
+  clears the near-unique ratio, PII-excluded) that no declared or
+  name-inferred edge already covers are paired across datasets, restricted
+  to type-compatible pairs, and probed with the same aggregate-only
+  overlap-probe SQL `--verify` already uses, authored once and transpiled
+  per connector dialect. Only a candidate whose measured orphan fraction
+  clears a strict ceiling (much stricter than a name-based join's, since
+  there is no naming signal backing the guess here at all) is proposed; the
+  rest are dropped outright rather than kept at a low confidence. The
+  candidate pool is capped, and both the cap and how many candidates it
+  elided are reported before anything runs, priced as a batch through the
+  same handshake `--verify` uses, and running after it so the two opt-in
+  phases never have more than one checkpoint pending at once.
+
+  An edge this sweep proposes carries a new `RelationshipKind.OVERLAP_INFERRED`
+  kind, distinguishable from a declared or name-derived edge in both the
+  cache and the envelope, and is never presented as equivalent to either.
+  Because nothing else ever rediscovers it (a declared join is re-read from
+  the dbt project every run and a name-inferred one is re-derived from cheap
+  metadata every run; an overlap-derived one only comes from this priced
+  probe), it is carried forward unconditionally on every later run as long
+  as both endpoints are still known objects, rather than needing the flag
+  again on every call, and a sweep that runs again never re-pays to
+  re-confirm a pair it already confirmed.
+
 - **`explore profile` flags a boolean-shaped column with more than two
   values** ([#218]). A column named like a two-valued flag (`is_*`, `has_*`,
   `*_flag`, `*_yn`, `*_ind`) whose content holds more than two distinct
