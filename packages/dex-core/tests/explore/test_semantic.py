@@ -18,6 +18,7 @@ from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
 from pydantic import ValidationError
 
 from exmergo_dex_core import envelope as env
+from exmergo_dex_core.adapters.project import DbtProject
 from exmergo_dex_core.cache import (
     ColumnProfile,
     Dataset,
@@ -35,6 +36,7 @@ from exmergo_dex_core.explore.semantic import (
     requested_dimension_refs,
     screen_dimension_refs,
 )
+from exmergo_dex_core.explore.semantic import commands as semantic_commands
 from exmergo_dex_core.explore.semantic.local import (
     LocalMetricFlowBackend,
     _unprofiled_note,
@@ -48,6 +50,24 @@ def _engine(config: DexConfig | None = None, **kwargs) -> DexEngine:
     route their one billed path through it, so a stand-in would test the stand-in."""
 
     return DexEngine(config=config or DexConfig(), store=MemoryStore(), **kwargs)
+
+
+def _local(project: Path, engine: DexEngine | None = None, connector: str = "duckdb"):
+    """The local backend with a project format injected, as `from_engine` wires it.
+
+    Injected rather than discovered so the read is exercised without a repo root
+    or a chdir: the backend reads the catalog and its PII column map through the
+    project seam now, and a real `DbtProject` on the other side is what makes that
+    a test of the seam rather than of a stand-in.
+    """
+
+    return LocalMetricFlowBackend(
+        project,
+        engine or _engine(),
+        connector,
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
 
 
 # ---- the shared abstraction -------------------------------------------------
@@ -93,7 +113,6 @@ def test_cli_group_by_reaches_the_backend_split(monkeypatch):
     """
 
     from exmergo_dex_core.cli import _build_parser
-    from exmergo_dex_core.explore.semantic import commands as semantic_commands
 
     seen: list[SemanticQuery] = []
 
@@ -119,7 +138,6 @@ def test_cli_group_by_reaches_the_backend_split(monkeypatch):
 
 def test_cli_semantic_query_accepts_positional_metrics_and_keeps_the_flag(monkeypatch):
     from exmergo_dex_core.cli import _build_parser
-    from exmergo_dex_core.explore.semantic import commands as semantic_commands
 
     seen: list[SemanticQuery] = []
 
@@ -375,8 +393,16 @@ def test_hosted_catalog_query_never_asks_for_an_entity_label():
     backend = FakeHostedBackend(metrics=_viz_like_metrics())
     backend.list_definitions()
     posted = backend.posted[0]
-    assert "dimensions { name type label description }" in posted
-    assert "entities { name type description }" in posted
+    assert "label" not in posted.split("entities {")[1]
+    # Every other field on the widened set was verified against the live schema by
+    # introspection before it was written, which is the only way to add one.
+    assert "entities { name type description expr role semanticModel { name } }" in (
+        posted
+    )
+    assert "dimensions { name type label description semanticModel { name } }" in (
+        posted
+    )
+    assert "measures { name agg expr aggTimeDimension }" in posted
 
 
 def test_hosted_list_keeps_the_first_non_null_field_not_the_first_metric():
@@ -418,7 +444,11 @@ def test_hosted_list_without_entities_says_nothing_about_entity_labels():
     metrics = [{"name": "sessions", "type": "SIMPLE", "dimensions": [], "entities": []}]
     catalog = FakeHostedBackend(metrics=metrics).list_definitions()
     assert catalog.entities == []
-    assert catalog.notes == []
+    assert not any("label on entities" in note for note in catalog.notes)
+    # The gap itself is still declared, because it is a property of this backend
+    # rather than of this layer: a consumer branching on it must not have to see
+    # an entity first to learn that an entity here cannot carry a label.
+    assert catalog.unavailable["entities"] == ["label"]
 
 
 def test_semantic_list_payload_omits_what_the_project_never_set(monkeypatch):
@@ -429,8 +459,6 @@ def test_semantic_list_payload_omits_what_the_project_never_set(monkeypatch):
     placeholders per list. An empty list survives, because "no groupable
     dimensions" is an answer where a null is not.
     """
-
-    from exmergo_dex_core.explore.semantic import commands as semantic_commands
 
     metrics = [
         *_viz_like_metrics(),
@@ -683,9 +711,7 @@ def _write_manifest(tmp_path: Path) -> Path:
 
 
 def test_local_list_reads_manifest(tmp_path: Path):
-    backend = LocalMetricFlowBackend(
-        _write_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_write_manifest(tmp_path))
     catalog = backend.list_definitions()
     assert catalog.backend == "local"
     orders = next(m for m in catalog.metrics if m.name == "orders")
@@ -751,9 +777,7 @@ def _described_manifest(tmp_path: Path) -> Path:
 
 
 def test_local_list_carries_the_projects_own_words(tmp_path: Path):
-    backend = LocalMetricFlowBackend(
-        _described_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_described_manifest(tmp_path))
     catalog = backend.list_definitions()
 
     status = next(d for d in catalog.dimensions if d.name == "order__status")
@@ -778,9 +802,7 @@ def test_local_list_invents_no_words_for_metric_time(tmp_path: Path):
     """`metric_time` is dex's own synthesis, not a manifest entry. Everything
     described in the catalog is described by the dbt project."""
 
-    backend = LocalMetricFlowBackend(
-        _described_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_described_manifest(tmp_path))
     metric_time = next(
         d for d in backend.list_definitions().dimensions if d.name == "metric_time"
     )
@@ -789,7 +811,7 @@ def test_local_list_invents_no_words_for_metric_time(tmp_path: Path):
 
 
 def test_local_list_missing_manifest_errors(tmp_path: Path):
-    backend = LocalMetricFlowBackend(tmp_path, _engine(), "duckdb", QueryLimits())
+    backend = _local(tmp_path)
     with pytest.raises(sem.SemanticBackendError):
         backend.list_definitions()
 
@@ -799,6 +821,520 @@ def test_local_query_pii_gate_blocks_before_render(tmp_path: Path):
     backend = LocalMetricFlowBackend(tmp_path, _engine(), "duckdb", QueryLimits())
     with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
         backend.query(SemanticQuery(metrics=["orders"], group_by=["customer__email"]))
+
+
+# ---- the object model: semantic models, measures, composition, entity roles ---
+#
+# One layer, expressed twice, so both backends can be held to the same ground
+# truth. The shape that matters is an entity declared in more than one semantic
+# model with a different type and a different join key in each, because that is
+# the fact a single flat record cannot carry and the one both backends used to get
+# wrong (in opposite directions, on the same layer).
+
+
+def _graph_metrics():
+    """A hosted catalog over two semantic models: a shared entity, a ratio metric
+    spanning both, a filtered metric, and a cumulative one."""
+
+    order_entity = {
+        "name": "order",
+        "type": "PRIMARY",
+        "expr": "order_key",
+        "description": "The order this row is about.",
+        "semanticModel": {"name": "orders"},
+    }
+    order_as_foreign = {
+        "name": "order",
+        "type": "FOREIGN",
+        "expr": "parent_order_id",
+        "description": "Nullable on refunds booked without an order.",
+        "semanticModel": {"name": "refunds"},
+    }
+    order_status = {
+        "name": "order__status",
+        "type": "CATEGORICAL",
+        "label": "Order status",
+        "semanticModel": {"name": "orders"},
+    }
+    refund_reason = {
+        "name": "order__refund__reason",
+        "type": "CATEGORICAL",
+        "semanticModel": {"name": "refunds"},
+    }
+    return [
+        {
+            "name": "orders",
+            "type": "SIMPLE",
+            "dimensions": [{"name": "metric_time", "type": "TIME"}, order_status],
+            "entities": [order_entity],
+            "measures": [
+                {
+                    "name": "order_count",
+                    "agg": "SUM",
+                    "expr": "CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END",
+                    "aggTimeDimension": "ordered_at",
+                }
+            ],
+            "semanticModels": [{"name": "orders"}],
+            "typeParams": {
+                "measure": {"name": "order_count"},
+                "inputMeasures": [{"name": "order_count"}],
+            },
+        },
+        {
+            "name": "refund_rate",
+            "type": "RATIO",
+            "dimensions": [order_status, refund_reason],
+            "entities": [order_entity, order_as_foreign],
+            "measures": [
+                {"name": "order_count", "agg": "SUM"},
+                {"name": "refund_count", "agg": "SUM"},
+            ],
+            "semanticModels": [{"name": "orders"}, {"name": "refunds"}],
+            "typeParams": {
+                "numerator": {"name": "refunds"},
+                "denominator": {"name": "orders"},
+                "inputMeasures": [
+                    {"name": "refund_count"},
+                    {"name": "order_count"},
+                ],
+            },
+        },
+        {
+            "name": "paid_orders",
+            "type": "SIMPLE",
+            "dimensions": [order_status],
+            "entities": [order_entity],
+            "measures": [{"name": "order_count", "agg": "SUM"}],
+            "semanticModels": [{"name": "orders"}],
+            "filter": {"whereSqlTemplate": "{{ Dimension('order__status') }} = 'paid'"},
+            "typeParams": {"inputMeasures": [{"name": "order_count"}]},
+        },
+        {
+            "name": "orders_to_date",
+            "type": "CUMULATIVE",
+            "dimensions": [order_status],
+            "entities": [order_entity],
+            "measures": [{"name": "order_count", "agg": "SUM"}],
+            "semanticModels": [{"name": "orders"}],
+            "typeParams": {
+                "inputMeasures": [{"name": "order_count"}],
+                "window": {"count": 7, "granularity": "DAY"},
+                "grainToDate": "MONTH",
+            },
+        },
+    ]
+
+
+def _graph_manifest(tmp_path: Path) -> Path:
+    """The same layer as a compiled semantic manifest."""
+
+    project = tmp_path / "graph"
+    (project / "target").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "semantic_models": [
+            {
+                "name": "orders",
+                "label": "Orders",
+                "description": "One row per order.",
+                "defaults": {"agg_time_dimension": "ordered_at"},
+                "node_relation": {
+                    "alias": "fct_orders",
+                    "relation_name": '"wh"."main"."fct_orders"',
+                },
+                "entities": [
+                    {
+                        "name": "order",
+                        "type": "primary",
+                        "expr": "order_key",
+                        "label": "Order",
+                        "description": "The order this row is about.",
+                    }
+                ],
+                "dimensions": [
+                    {"name": "status", "type": "categorical", "label": "Order status"},
+                    {"name": "ordered_at", "type": "time"},
+                ],
+                "measures": [
+                    {
+                        "name": "order_count",
+                        "agg": "count",
+                        "expr": "order_key",
+                        "label": "Orders",
+                    }
+                ],
+            },
+            {
+                "name": "refunds",
+                "description": "One row per refund.",
+                "defaults": {"agg_time_dimension": "refunded_at"},
+                "node_relation": {
+                    "alias": "fct_refunds",
+                    "relation_name": '"wh"."main"."fct_refunds"',
+                },
+                "entities": [
+                    {
+                        "name": "refund",
+                        "type": "primary",
+                        "expr": "refund_key",
+                    },
+                    {
+                        "name": "order",
+                        "type": "foreign",
+                        "expr": "parent_order_id",
+                        "description": ("Nullable on refunds booked without an order."),
+                    },
+                ],
+                "dimensions": [{"name": "reason", "type": "categorical"}],
+                "measures": [{"name": "refund_count", "agg": "count"}],
+            },
+        ],
+        "metrics": [
+            {
+                "name": "orders",
+                "type": "simple",
+                "type_params": {
+                    "measure": {"name": "order_count"},
+                    "input_measures": [{"name": "order_count"}],
+                },
+            },
+            {
+                "name": "refund_rate",
+                "type": "ratio",
+                "type_params": {
+                    "numerator": {"name": "refunds"},
+                    "denominator": {"name": "orders"},
+                    "input_measures": [
+                        {"name": "refund_count"},
+                        {"name": "order_count"},
+                    ],
+                },
+            },
+            {
+                "name": "paid_orders",
+                "type": "simple",
+                "filter": {
+                    "where_filters": [
+                        {
+                            "where_sql_template": (
+                                "{{ Dimension('order__status') }} = 'paid'"
+                            )
+                        }
+                    ]
+                },
+                "type_params": {"input_measures": [{"name": "order_count"}]},
+            },
+            {
+                "name": "orders_to_date",
+                "type": "cumulative",
+                "type_params": {
+                    "input_measures": [{"name": "order_count"}],
+                    "window": {"count": 7, "granularity": "day"},
+                    "grain_to_date": "month",
+                },
+            },
+        ],
+    }
+    (project / "target" / "semantic_manifest.json").write_text(json.dumps(manifest))
+    return project
+
+
+def _catalogs(tmp_path: Path):
+    """The same layer from both backends, for the assertions that must hold on
+    either. Parametrizing gives two failures for one cause; a pair keeps the
+    ground truth stated once."""
+
+    return {
+        "local": _local(_graph_manifest(tmp_path)).list_definitions(),
+        "hosted": FakeHostedBackend(metrics=_graph_metrics()).list_definitions(),
+    }
+
+
+def test_an_entity_carries_every_declaration_and_a_derived_type(tmp_path: Path):
+    """The bug this replaces: `type` was folded to whichever copy came first.
+
+    `order` is primary in the model it keys and foreign in the one that joins to
+    it. Collapsing that reported iteration order, and the two backends reported
+    opposite answers for the same layer. Now every declaration survives and the
+    single `type` is derived, so both backends agree and both are right.
+    """
+
+    for name, catalog in _catalogs(tmp_path).items():
+        order = next(e for e in catalog.entities if e.name == "order")
+        assert order.type == "primary", name
+        roles = {r.semantic_model: r for r in order.roles}
+        assert set(roles) == {"orders", "refunds"}, name
+        assert roles["orders"].type == "primary", name
+        assert roles["refunds"].type == "foreign", name
+        # The join key differs per model for the same entity, which is the whole
+        # reason a single record cannot carry it.
+        assert roles["orders"].expr == "order_key", name
+        assert roles["refunds"].expr == "parent_order_id", name
+        # And each declaration keeps its own words: the refunds one documents a
+        # nullable key, which is exactly the caveat the old merge discarded.
+        assert "Nullable" in roles["refunds"].description, name
+
+
+def test_a_semantic_model_is_an_object_with_the_hosted_gap_declared(tmp_path: Path):
+    catalogs = _catalogs(tmp_path)
+    for name, catalog in catalogs.items():
+        assert [m.name for m in catalog.semantic_models] == ["orders", "refunds"], name
+
+    local = next(m for m in catalogs["local"].semantic_models if m.name == "orders")
+    assert local.label == "Orders"
+    assert local.model_ref == "fct_orders"
+    assert local.agg_time_dimension == "ordered_at"
+    assert local.primary_entity == "order"
+
+    # The hosted `SemanticModel` type carries only a name, so the absence is a
+    # property of the path and is declared rather than left to look like a project
+    # that documented nothing.
+    hosted = next(m for m in catalogs["hosted"].semantic_models if m.name == "orders")
+    assert hosted.label is None and hosted.model_ref is None
+    assert "label" in catalogs["hosted"].unavailable["semantic_models"]
+    assert "model_ref" in catalogs["hosted"].unavailable["semantic_models"]
+    assert catalogs["local"].unavailable == {}
+
+
+def test_measures_carry_the_aggregation_behind_the_number(tmp_path: Path):
+    catalogs = _catalogs(tmp_path)
+    for name, catalog in catalogs.items():
+        assert {m.name for m in catalog.measures} == {"order_count", "refund_count"}, (
+            name
+        )
+        order_count = next(m for m in catalog.measures if m.name == "order_count")
+        assert order_count.agg
+        assert order_count.semantic_model == "orders", name
+        # A measure with no time dimension of its own resolves to its model's
+        # default, which is the column a time grouping actually aggregates by.
+        assert order_count.agg_time_dimension == "ordered_at", name
+
+    # The expression is the point on a conditional measure: `agg` alone would read
+    # as a plain count of rows.
+    assert (
+        "CASE WHEN"
+        in next(m for m in catalogs["hosted"].measures if m.name == "order_count").expr
+    )
+    assert catalogs["local"].unavailable == {}
+    assert catalogs["hosted"].unavailable["measures"] == ["label", "description"]
+
+
+def test_a_ratio_metric_carries_both_of_its_sides(tmp_path: Path):
+    for name, catalog in _catalogs(tmp_path).items():
+        ratio = next(m for m in catalog.metrics if m.name == "refund_rate")
+        assert ratio.composition.numerator == "refunds", name
+        assert ratio.composition.denominator == "orders", name
+        assert set(ratio.input_measures) == {"order_count", "refund_count"}, name
+        # Both sides come from different semantic models, which is what decides
+        # whether a given group-by is valid on both of them.
+        assert ratio.semantic_models == ["orders", "refunds"], name
+
+
+def test_a_filtered_metric_discloses_that_it_measures_a_subset(tmp_path: Path):
+    for name, catalog in _catalogs(tmp_path).items():
+        paid = next(m for m in catalog.metrics if m.name == "paid_orders")
+        assert paid.filter == "{{ Dimension('order__status') }} = 'paid'", name
+
+
+def test_metricflow_only_detail_stays_under_the_vendor_key(tmp_path: Path):
+    """A cumulative window is real and is this vendor's semantics.
+
+    Promoting it into the neutral core would make the shared shape mean something
+    only one format can fill; leaving it out would drop a fact a caller needs. One
+    declared key is the third option.
+    """
+
+    catalogs = _catalogs(tmp_path)
+    for name, catalog in catalogs.items():
+        cumulative = next(m for m in catalog.metrics if m.name == "orders_to_date")
+        assert cumulative.vendor_params["window"]["count"] == 7, name
+        assert cumulative.vendor_params["grain_to_date"], name
+        payload = _element_payload(catalog, "orders_to_date")
+        assert "window" not in payload, name
+        assert "grain_to_date" not in payload, name
+
+    simple = next(m for m in catalogs["local"].metrics if m.name == "orders")
+    assert simple.vendor_params is None
+
+
+def _element_payload(catalog, metric: str) -> dict:
+    return next(m for m in catalog.to_data()["metrics"] if m["name"] == metric)
+
+
+def test_a_dimension_row_says_what_kind_of_row_it_is(tmp_path: Path):
+    """The 44%-divergent dimension counts, explained rather than reconciled away.
+
+    A project read returns one row per declaration, single-hop qualified. The API
+    returns one row per token a query may group by, so a dimension reached through
+    a join appears once per path. Both are honest; a caller comparing counts needs
+    to be told which it is holding, and `definition` is what lets it see that two
+    paths reach one declaration.
+    """
+
+    catalogs = _catalogs(tmp_path)
+    assert catalogs["local"].dimension_scope == "declarations"
+    assert catalogs["hosted"].dimension_scope == "queryable_paths"
+
+    status = next(d for d in catalogs["local"].dimensions if d.name == "order__status")
+    assert status.definition == "status"
+    assert status.semantic_model == "orders"
+
+    # A two-hop path on the hosted side resolves to the declaration behind it.
+    joined = next(
+        d for d in catalogs["hosted"].dimensions if d.name == "order__refund__reason"
+    )
+    assert joined.definition == "reason"
+    assert joined.semantic_model == "refunds"
+
+    # dex's own synthesis points at no declaration, because there is none.
+    for name, catalog in catalogs.items():
+        metric_time = next(d for d in catalog.dimensions if d.name == "metric_time")
+        assert metric_time.definition is None, name
+        assert metric_time.semantic_model is None, name
+
+
+def test_the_widened_payload_still_omits_what_was_never_set(tmp_path: Path):
+    """The rule the catalog has carried since labels arrived, held across five
+    element kinds rather than three: absent means unset, and nobody pays bytes for
+    a null. `metric_time` is the case that proves it, being dex's own synthesis
+    with nothing behind it."""
+
+    for name, catalog in _catalogs(tmp_path).items():
+        dims = {d["name"]: d for d in catalog.to_data()["dimensions"]}
+        assert set(dims["metric_time"]) == {"name", "type"}, name
+        simple = _element_payload(catalog, "orders")
+        assert "vendor_params" not in simple, name
+        # A simple metric's composition is one key, not a shell of five nulls.
+        assert set(simple["composition"]) <= {"measure"}, name
+
+
+def test_the_catalog_costs_one_round_trip_and_no_warehouse_query(tmp_path: Path):
+    """A discovery call that priced a scan would be a discovery call nobody makes.
+
+    Asserted rather than assumed because the temptation in every follow-on change
+    is to reach for one: a value domain, a granularity, a join resolution.
+    """
+
+    hosted = FakeHostedBackend(metrics=_graph_metrics())
+    hosted.list_definitions()
+    assert len(hosted.posted) == 1
+
+    engine = _engine()
+    backend = _local(_graph_manifest(tmp_path), engine)
+    backend.list_definitions()
+    # No adapter was ever built, so nothing could have been estimated or run.
+    assert engine._adapter_instance is None
+
+
+def test_the_local_catalog_is_read_through_the_project_seam(tmp_path: Path):
+    """The tier is defined and must be load-bearing.
+
+    The local backend used to call a private function on the dbt module and parse
+    the compiled artifact itself, which hardwired the read to dbt while a
+    format-neutral seam sat unused beside it. This is the control that keeps it
+    routed: a project that records its calls must see the catalog asked for.
+    """
+
+    from exmergo_dex_core.semantic_catalog import SemanticCatalogView
+
+    class _Recorded:
+        name = "recorded"
+        calls: ClassVar[list[str]] = []
+
+        def definitions(self):
+            self.calls.append("definitions")
+            raise AssertionError("the catalog read must not go through tier 1")
+
+        def semantic_catalog(self):
+            self.calls.append("semantic_catalog")
+            return SemanticCatalogView(notes=["from the format"])
+
+    project = _Recorded()
+    backend = LocalMetricFlowBackend(
+        tmp_path, _engine(), "duckdb", QueryLimits(), project
+    )
+    catalog = backend.list_definitions()
+    assert project.calls == ["semantic_catalog"]
+    # The format's own note travels with the value, ahead of the backend's.
+    assert catalog.notes[0] == "from the format"
+
+
+def test_a_format_that_reads_no_semantic_layer_is_refused_by_name(tmp_path: Path):
+    """Not an empty catalog, which would read as a layer with nothing in it."""
+
+    class _NoSemantics:
+        name = "graph"
+
+        def definitions(self):
+            return None
+
+    backend = LocalMetricFlowBackend(
+        tmp_path, _engine(), "duckdb", QueryLimits(), _NoSemantics()
+    )
+    with pytest.raises(sem.SemanticBackendError, match="semantic_catalog"):
+        backend.list_definitions()
+
+
+def test_an_uncompiled_project_is_told_what_to_run(tmp_path: Path):
+    (tmp_path / "target").mkdir()
+    with pytest.raises(sem.SemanticBackendError, match="dbt parse"):
+        _local(tmp_path).list_definitions()
+
+
+# ---- scoping the catalog to the metrics a caller came for --------------------
+
+
+def test_scoping_keeps_only_what_the_named_metrics_reach(tmp_path: Path):
+    """Discovery on a large layer is one payload, and most of it is about
+    something else. Widening every element made that worse, so the scope arrives
+    with it rather than after."""
+
+    backend = _local(_graph_manifest(tmp_path))
+    catalog, unknown = backend.list_definitions().narrowed_to(["orders"])
+    assert unknown == []
+    assert [m.name for m in catalog.metrics] == ["orders"]
+    assert [m.name for m in catalog.semantic_models] == ["orders"]
+    assert [m.name for m in catalog.measures] == ["order_count"]
+    assert all(d.semantic_model in {"orders", None} for d in catalog.dimensions)
+    # refund_rate spans both models, so scoping to it keeps both.
+    both, _ = backend.list_definitions().narrowed_to(["refund_rate"])
+    assert [m.name for m in both.semantic_models] == ["orders", "refunds"]
+
+
+def test_scoping_keeps_an_entitys_declarations_whole(tmp_path: Path):
+    """Pruning roles to the scope would turn a primary entity into a foreign one,
+    which is a false statement about the layer rather than a smaller one."""
+
+    catalog, _ = (
+        _local(_graph_manifest(tmp_path)).list_definitions().narrowed_to(["orders"])
+    )
+    order = next(e for e in catalog.entities if e.name == "order")
+    assert order.type == "primary"
+    assert {r.semantic_model for r in order.roles} == {"orders", "refunds"}
+
+
+def test_a_scoped_catalog_says_so_in_the_payload(tmp_path: Path, monkeypatch):
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    envelope = to_envelope(
+        semantic_commands.semantic_list(_engine(), metrics=["orders"])
+    )
+    assert envelope.data["scoped_to"] == ["orders"]
+    assert len(envelope.data["metrics"]) == 1
+    assert any("scoped to 1 of 4 metrics" in note for note in envelope.data["notes"])
+    # And an unscoped catalog does not carry the key at all, so a complete answer
+    # is never shaped like a subset.
+    whole = to_envelope(semantic_commands.semantic_list(_engine()))
+    assert "scoped_to" not in whole.data
+
+
+def test_a_misspelled_metric_is_refused_rather_than_returning_nothing(
+    tmp_path: Path, monkeypatch
+):
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    with pytest.raises(sem.SemanticBackendError, match="no such metric"):
+        semantic_commands.semantic_list(_engine(), metrics=["ordrs"])
 
 
 # ---- local guards: cache-backed PII + namespace pre-check -------------------
@@ -842,9 +1378,7 @@ def _relation_manifest(tmp_path: Path, relation: str = "`wh`.`main`.`orders`") -
 def test_local_cache_pii_flag_blocks_a_clean_named_dimension(tmp_path: Path):
     # `order__contact` reads innocuous by name; the cache says its physical column
     # is flagged email. Evidence must block what the heuristic would have allowed.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     cache = _cache_with(
         [
             ColumnProfile(
@@ -861,17 +1395,13 @@ def test_local_cache_pii_flag_blocks_a_clean_named_dimension(tmp_path: Path):
 
 
 def test_local_cache_clears_a_profiled_unflagged_column(tmp_path: Path):
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     cache = _cache_with([ColumnProfile(name="contact_col", data_type="VARCHAR")])
     assert backend._cache_pii_lookup(cache)("order__contact") == {"pii": False}
 
 
 def test_local_cache_lookup_is_silent_on_unknown_dimensions(tmp_path: Path):
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     lookup = backend._cache_pii_lookup(_cache_with([]))
     # Not in the manifest at all, and a column the cache never profiled: both must
     # return None so the name heuristic stays in charge.
@@ -897,9 +1427,7 @@ class _Inventory:
 def test_relation_precheck_refuses_a_foreign_database(tmp_path: Path):
     # The manifest was compiled against another database entirely. No allowlist
     # could bring it into scope, so this is the mismatch the check exists for.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
     live = _Inventory(["wh.main.orders", "wh.staging.customers"])
     message, _unprofiled = backend._relation_precheck(
@@ -914,9 +1442,7 @@ def test_relation_precheck_refuses_a_relation_gone_from_a_listed_schema(tmp_path
     # Same database, same schema, and the inventory looked: the model was renamed,
     # dropped, or never built into this target. A different problem, so a different
     # message; blaming the compiled namespace would send the reader the wrong way.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     live = _Inventory(["wh.main.customers"])
     message, _unprofiled = backend._relation_precheck(
         "SELECT status FROM wh.main.orders", None, "duckdb", live
@@ -929,9 +1455,7 @@ def test_relation_precheck_refuses_a_relation_gone_from_a_listed_schema(tmp_path
 def test_relation_precheck_accepts_a_suffix_match(tmp_path: Path):
     # The cache is connector-normalized, so a legitimate spelling that resolves by
     # suffix must pass rather than being rejected on an exact string compare.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     cache = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
     live = _Inventory(["wh.main.orders"])
     for sql in ("SELECT status FROM main.orders", "SELECT status FROM orders"):
@@ -944,9 +1468,7 @@ def test_relation_precheck_accepts_a_built_but_unprofiled_relation(tmp_path: Pat
     # Issue #134: `transform build` creates the relation, `explore profile` is what
     # puts it in the cache, and the query must not need the second step. The cache
     # holds a different table, so the miss is real and the live listing decides.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     cache = _cache_with(
         [ColumnProfile(name="status", data_type="VARCHAR")],
         identifier="wh.main.customers",
@@ -966,9 +1488,7 @@ def test_relation_precheck_accepts_a_built_but_unprofiled_relation(tmp_path: Pat
 def test_relation_precheck_runs_without_a_cache(tmp_path: Path):
     # No `explore map` yet is no longer a hole in the guard: the connection itself
     # is the authority, so a foreign relation is still refused before any spend.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     live = _Inventory(["wh.main.orders"])
     for cache in (None, DexCache(datasets=[])):
         message, _unprofiled = backend._relation_precheck(
@@ -984,9 +1504,7 @@ def test_relation_precheck_never_refuses_an_unlisted_schema(tmp_path: Path):
     # The dataset allowlist can be narrower than the dbt project. `elsewhere` is a
     # schema of a database this connection does carry, so it is out of the
     # listing's scope rather than out of reach, and dex must not answer for it.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     live = _Inventory(["wh.main.orders"])
     message, unprofiled = backend._relation_precheck(
         "SELECT status FROM wh.elsewhere.orders", None, "duckdb", live
@@ -998,9 +1516,7 @@ def test_relation_precheck_never_refuses_an_unlisted_schema(tmp_path: Path):
 def test_relation_precheck_does_not_refuse_on_an_unreadable_inventory(tmp_path: Path):
     # An introspection failure is not evidence of a missing relation, and a
     # genuinely missing one still fails at planning without billing.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     live = _Inventory([], fails=True)
     message, _unprofiled = backend._relation_precheck(
         "SELECT status FROM wh.main.orders", None, "duckdb", live
@@ -1012,9 +1528,7 @@ def test_relation_precheck_does_not_refuse_on_an_unreadable_inventory(tmp_path: 
 def test_relation_precheck_ignores_cte_names(tmp_path: Path):
     # MetricFlow renders a stack of named subqueries. A CTE is defined by the
     # statement, not looked up in the connection, so it is not a missing relation.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     live = _Inventory(["wh.main.orders"])
     sql = "WITH subq_0 AS (SELECT status FROM wh.main.orders) SELECT status FROM subq_0"
     assert backend._relation_precheck(sql, None, "duckdb", live) == (
@@ -1026,9 +1540,7 @@ def test_relation_precheck_ignores_cte_names(tmp_path: Path):
 def test_relation_precheck_says_nothing_about_a_profiled_relation(tmp_path: Path):
     # A profile in the cache is what the PII gate needs, so there is nothing to
     # disclose. An inventory-only entry (no columns) is not a profile.
-    backend = LocalMetricFlowBackend(
-        _relation_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_relation_manifest(tmp_path))
     live = _Inventory(["wh.main.orders"])
     sql = "SELECT status FROM wh.main.orders"
     profiled = _cache_with([ColumnProfile(name="status", data_type="VARCHAR")])
@@ -1073,9 +1585,7 @@ def test_local_render_reaches_the_metricflow_engine(tmp_path: Path):
             self.requests.append(request)
             return _Explained()
 
-    backend = LocalMetricFlowBackend(
-        _write_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
-    )
+    backend = _local(_write_manifest(tmp_path))
     fake = _FakeMetricFlow()
     backend._metricflow_engine = lambda: fake
 
