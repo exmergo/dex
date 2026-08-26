@@ -1328,6 +1328,47 @@ def test_a_scoped_catalog_says_so_in_the_payload(tmp_path: Path, monkeypatch):
     assert "scoped_to" not in whole.data
 
 
+def test_cli_semantic_list_scopes_through_every_spelling(tmp_path: Path, monkeypatch):
+    """Through the real parser, because the wiring is the whole question here.
+
+    `--metric` and the positional metrics were declared on this subparser for
+    `query`, so scoping `list` needed no new flag; what it needed was the command
+    shim reading them in list mode too, and nothing about the parser shows whether
+    it does. Bare `explore semantic` reaches list by default, so that spelling is
+    checked as well.
+    """
+
+    from exmergo_dex_core.cli import _build_parser
+
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    parser = _build_parser()
+
+    for argv in (
+        ["explore", "semantic", "list", "--local", "--metric", "orders"],
+        ["explore", "semantic", "--local", "--metric", "orders"],
+        ["explore", "semantic", "list", "orders", "--local"],
+    ):
+        envelope = semantic_commands.cmd_semantic(parser.parse_args(argv), _engine())
+        assert envelope.data["scoped_to"] == ["orders"], argv
+        assert len(envelope.data["metrics"]) == 1, argv
+
+    both = semantic_commands.cmd_semantic(
+        parser.parse_args(
+            ["explore", "semantic", "list", "--local", "--metric", "orders,paid_orders"]
+        ),
+        _engine(),
+    )
+    assert both.data["scoped_to"] == ["orders", "paid_orders"]
+
+    # And an unscoped list is still the whole layer, with no scope key at all.
+    whole = semantic_commands.cmd_semantic(
+        parser.parse_args(["explore", "semantic", "list", "--local"]), _engine()
+    )
+    assert "scoped_to" not in whole.data
+    assert len(whole.data["metrics"]) == 4
+
+
 def test_a_misspelled_metric_is_refused_rather_than_returning_nothing(
     tmp_path: Path, monkeypatch
 ):
