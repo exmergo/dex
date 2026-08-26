@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from ..adapters.base import Adapter, distinct_combination_sql
 from ..cache import Dataset, Relationship, match_identifier
+from ..dbt_project import ProjectDefinitions
 from ..explore import relationships as rel_mod
 from .snapshot import SemanticLayer, Snapshot, TransformLayer
 
@@ -410,11 +411,36 @@ class GrainPlan(NamedTuple):
     # Proven multi-column keys re-verified as combinations: their members are
     # not individually unique, so they never enter key_checks.
     composite_checks: list[tuple[Dataset, list[list[str]], int]]
+    # Grains the *project* declares (model-level unique_combination_of_columns)
+    # that measurement never proved. Kept apart from `composite_checks` because
+    # a failure here is a different fact with a different finding code: nothing
+    # lapsed, the declaration was never true. Priced identically.
+    declared_composite_checks: list[tuple[Dataset, list[list[str]], int]]
+    # What the plan could not survey, so an unchecked declaration never reads as
+    # a clean bill.
+    notes: list[str]
 
 
 def grain_plan(
-    adapter: Adapter, snap: Snapshot, scope: set[str] | None = None
+    adapter: Adapter,
+    snap: Snapshot,
+    scope: set[str] | None = None,
+    definitions: ProjectDefinitions | None = None,
 ) -> GrainPlan:
+    """Survey the grain scans from free metadata, measured and declared.
+
+    ``definitions`` is the project speaking for itself. Measurement and
+    declaration disagree more often than they look like they should: explore
+    lets a measurement-proven single column win the grain verdict over a
+    declared composite, and ``candidate_keys`` stays measurement-only because an
+    unmeasured declared key is a claim rather than a baseline. Both are the right
+    calls for a cache, and together they mean the grain a project actually
+    declares was never re-verified on exactly the tables where it matters most.
+    Reading the declaration here, at plan time, closes that without putting a
+    claim into the measurement store: the declared combinations are surveyed and
+    priced with the measured ones, and the cache is untouched.
+    """
+
     described: dict[str, tuple[set[str], int | None]] = {}
     current = {meta.identifier for meta in adapter.list_objects()}
 
@@ -424,8 +450,12 @@ def grain_plan(
             described[identifier] = ({c.name for c in columns}, meta.row_count)
         return described[identifier]
 
+    declared_by_identifier, notes = _declared_composites(
+        definitions, sorted(current), scope
+    )
     key_checks: list[tuple[Dataset, list[str], int]] = []
     composite_checks: list[tuple[Dataset, list[list[str]], int]] = []
+    declared_checks: list[tuple[Dataset, list[list[str]], int]] = []
     for dataset in snap.warehouse.datasets:
         if scope is not None and dataset.identifier not in scope:
             continue
@@ -460,6 +490,59 @@ def grain_plan(
         if live_composites and row_count:
             composite_checks.append((dataset, live_composites, row_count))
 
+    # Declared grains are surveyed against the *current* warehouse rather than
+    # against the baseline, which is the one way they differ structurally from
+    # everything above. A measured check needs a before to compare with, so it can
+    # only speak about an object the baseline captured. A declaration needs
+    # nothing of the kind: the project's claim is the standard, and the question
+    # is whether the data meets it today. Driving these off the baseline too would
+    # go quiet on a model built since the last snapshot, which is exactly when a
+    # freshly declared grain is most likely to be wrong.
+    measured_composites = {
+        dataset.identifier: combos for dataset, combos, _rows in composite_checks
+    }
+    baselined = {dataset.identifier: dataset for dataset in snap.warehouse.datasets}
+    for identifier, declared in sorted(declared_by_identifier.items()):
+        columns, row_count = describe(identifier)
+        # A declared combination measurement also proved is checked once, as a
+        # measured one: it has a baseline, so `key_lost_uniqueness` is the true
+        # statement about it and the weaker declared code would be a downgrade.
+        known = measured_composites.get(identifier, [])
+        live_declared = [
+            combo
+            for combo in declared
+            if set(combo) <= columns
+            and not any(_same_combo(combo, seen) for seen in known)
+        ]
+        missing = [combo for combo in declared if not set(combo) <= columns]
+        if missing:
+            notes.append(
+                f"the declared grain on {identifier} names columns it does not "
+                "have ("
+                + "; ".join(
+                    ", ".join(sorted(set(combo) - columns)) for combo in missing
+                )
+                + "), so it was not verified"
+            )
+        if not live_declared:
+            continue
+        if not row_count:
+            notes.append(
+                f"{identifier} has no row count to compare against, so its "
+                "declared grain was not verified"
+            )
+            continue
+        # A `Dataset` carrying only the identifier where the baseline has none:
+        # the declared pass reads nothing else off it, and inventing measurements
+        # for an object nobody profiled would put a claim where a baseline goes.
+        declared_checks.append(
+            (
+                baselined.get(identifier) or Dataset(identifier=identifier),
+                live_declared,
+                row_count,
+            )
+        )
+
     fanout_pairs: list[tuple[Relationship, Relationship]] = []
     for rel in snap.warehouse.relationships:
         if not rel.verified or rel.orphan_fraction is None:
@@ -472,11 +555,82 @@ def grain_plan(
         to_columns, _ = describe(rel.to_dataset)
         if rel.from_columns[0] in from_columns and rel.to_columns[0] in to_columns:
             fanout_pairs.append((rel, rel.model_copy(deep=True)))
-    return GrainPlan(key_checks, fanout_pairs, composite_checks)
+    unsurveyed = [
+        dataset.identifier
+        for dataset, _combos, _rows in declared_checks
+        if getattr(adapter, "distinct_combination_counts", None) is None
+    ]
+    if unsurveyed:
+        # Named rather than dropped: an adapter with no combination probe cannot
+        # verify a declared grain, and a plan that quietly omitted the scan would
+        # report the same empty result a holding grain does.
+        notes = [
+            *notes,
+            "this connector cannot probe column combinations, so the declared "
+            "grains on " + ", ".join(sorted(set(unsurveyed))) + " were not verified",
+        ]
+        declared_checks = []
+    return GrainPlan(key_checks, fanout_pairs, composite_checks, declared_checks, notes)
+
+
+def _same_combo(left: list[str], right: list[str]) -> bool:
+    """Two column combinations naming the same grain: order and case are the
+    project's spelling choices, not part of what the combination asserts."""
+
+    return {c.lower() for c in left} == {c.lower() for c in right}
+
+
+def _declared_composites(
+    definitions: ProjectDefinitions | None,
+    known: list[str],
+    scope: set[str] | None,
+) -> tuple[dict[str, list[list[str]]], list[str]]:
+    """Declared composite grains keyed by warehouse identifier, and what could
+    not be resolved.
+
+    A declaration names a *model*; the plan scans an *identifier*. Resolution
+    goes through the same ``resolve_declared`` explore uses, so a declaration
+    that maps cleanly for the diagram maps cleanly here. Both failure modes are
+    noted rather than skipped, because "no finding" is what a holding grain also
+    looks like.
+    """
+
+    if definitions is None or not definitions.declared_composite_keys:
+        return {}, []
+
+    by_identifier: dict[str, list[list[str]]] = {}
+    notes: list[str] = []
+    for composite in definitions.declared_composite_keys:
+        identifier, ambiguous = rel_mod.resolve_declared(
+            composite.relation, composite.model, known
+        )
+        if identifier is None:
+            notes.append(
+                f"the declared grain on '{composite.model}' "
+                f"({', '.join(composite.columns)}) "
+                + (
+                    "matches several warehouse objects"
+                    if ambiguous
+                    else "matches no warehouse object"
+                )
+                + ", so it was not verified"
+            )
+            continue
+        if scope is not None and identifier not in scope:
+            continue
+        bucket = by_identifier.setdefault(identifier, [])
+        if not any(_same_combo(composite.columns, seen) for seen in bucket):
+            bucket.append(list(composite.columns))
+    return by_identifier, notes
 
 
 def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, float]]:
-    """Free dry-run pricing of the plan's scans; zero on free adapters."""
+    """Free dry-run pricing of the plan's scans; zero on free adapters.
+
+    Every list on the plan is priced, declared combinations included: the plan is
+    the single survey both this and ``grain_drift`` read, so a scan that reaches
+    execution without appearing here would be spend the operator never saw.
+    """
 
     query_estimate = getattr(adapter, "query_estimate", None)
     if query_estimate is None:
@@ -486,7 +640,9 @@ def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, 
         per_table[dataset.identifier] = query_estimate(
             _distinct_count_sql(dataset.identifier, keys, adapter.dialect)
         )
-    for dataset, combos, _row_count in plan.composite_checks:
+    for dataset, combos, _row_count in (
+        plan.composite_checks + plan.declared_composite_checks
+    ):
         per_table[dataset.identifier] = per_table.get(
             dataset.identifier, 0.0
         ) + query_estimate(
@@ -504,9 +660,17 @@ def grain_drift(
     adapter: Adapter, plan: GrainPlan, *, timeout_seconds: float = 30.0
 ) -> list[DriftFinding]:
     """Cardinality and identity drift, from aggregates only: exact distinct
-    counts against the baseline's proven keys, and the overlap probes re-run
-    against their baseline orphan fractions. Billed on metered connectors; the
-    command layer holds the handshake."""
+    counts against the baseline's proven keys, the grains the project declares
+    re-verified, and the overlap probes re-run against their baseline orphan
+    fractions. Billed on metered connectors; the command layer holds the
+    handshake.
+
+    Two codes come out of the uniqueness checks and the difference is the
+    baseline, not the SQL. ``key_lost_uniqueness`` needs a measured before: a key
+    explore proved unique and no longer is. ``declared_grain_not_unique`` has no
+    before at all, because the combination comes from the project rather than
+    from a measurement, so the honest reading of a failure is that the
+    declaration is false rather than that anything changed."""
 
     findings: list[DriftFinding] = []
     for dataset, keys, row_count in plan.key_checks:
@@ -578,6 +742,47 @@ def grain_drift(
                         "was_grain": bool(
                             dataset.grain and list(combo) == list(dataset.grain)
                         ),
+                    },
+                )
+            )
+
+    # The declared grains, reported under their own code. Nothing lapsed here:
+    # measurement never proved these unique, so there is no before-and-after and
+    # "no longer unique" would be a false account of the same numbers. What the
+    # numbers say is that the project asserts a grain the data does not have.
+    for dataset, combos, row_count in plan.declared_composite_checks:
+        if combo_counts is None:
+            break
+        counts = combo_counts(dataset.identifier, combos)
+        live_meta, _ = adapter.table_metadata(dataset.identifier)
+        if live_meta.row_count is not None:
+            row_count = live_meta.row_count
+        for combo in combos:
+            count = counts.get(tuple(combo))
+            if count is None or count >= row_count:
+                continue
+            duplicates = row_count - count
+            members = ", ".join(combo)
+            findings.append(
+                DriftFinding(
+                    axis="grain",
+                    code="declared_grain_not_unique",
+                    identifier=dataset.identifier,
+                    column=members,
+                    severity="high",
+                    detail=(
+                        f"the project declares ({members}) as the grain of "
+                        f"{dataset.identifier}, and the combination is not "
+                        f"unique: {count} distinct combinations over "
+                        f"{row_count} rows (~{duplicates} duplicate rows). "
+                        "Builds asserting this grain will fail and joins on it "
+                        "will fan out"
+                    ),
+                    data={
+                        "columns": list(combo),
+                        "distinct_count": count,
+                        "row_count": row_count,
+                        "declared": True,
                     },
                 )
             )

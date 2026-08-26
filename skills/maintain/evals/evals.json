@@ -44,8 +44,10 @@
       "assertions": [
         "Grain drift is established from SQL aggregates (uniqueness, cardinality), never raw rows",
         "The finding names the key that lost uniqueness or the changed row-per-entity cardinality",
+        "A key that was proven unique and lapsed is reported differently from a declared grain that never held",
         "On a billed connector, surfaces the dry-run cost estimate and re-issues with --confirm and a user-agreed budget rather than inventing one; on DuckDB it runs directly",
-        "Any proposed fix is a reviewable diff; nothing is applied silently"
+        "Any proposed fix is a reviewable diff; nothing is applied silently",
+        "No column-level unique test is proposed against a column covered by a declared composite grain"
       ]
     },
     {

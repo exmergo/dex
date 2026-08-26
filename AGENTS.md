@@ -85,7 +85,7 @@ credentials and no network.
 | `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors (free axes now, one estimate for the scanning axes) |
 | `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources (free) |
 | `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata) |
-| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout (scans; gated on billed connectors) |
+| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout, plus the grains the project itself declares (model-level `unique_combination_of_columns`) re-verified against the data (scans; gated on billed connectors). Two codes come out of the uniqueness checks and the difference is the baseline: `key_lost_uniqueness` is a key measurement proved unique and no longer is, `declared_grain_not_unique` is a declared combination that never held, which is a declaration to fix rather than drift to absorb |
 | `maintain semantic [<objects>]` | definition drift and dangling refs (free) plus categorical dimension cardinality change (scans; gated on billed connectors) |
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |

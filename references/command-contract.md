@@ -141,7 +141,8 @@ dex maintain schema [<objects>]   -> structural drift: columns/tables added, dro
                                      nullability; dangling sources (metadata, free everywhere)
 dex maintain volume [<objects>]   -> freshness drift: row counts that collapsed, emptied, or spiked (free)
 dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join
-                                     fanout (aggregates; gated by --confirm --budget on billed connectors)
+                                     fanout, and the grains the project declares re-verified
+                                     (aggregates; gated by --confirm --budget on billed connectors)
 dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + categorical dimension
                                      cardinality change (a scan; gated on billed connectors)
 dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as a stored plan
