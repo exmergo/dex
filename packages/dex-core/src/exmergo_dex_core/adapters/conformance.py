@@ -275,6 +275,14 @@ class DeclaringProjectContract:
         differently shaped. Override it if you can express one, because
         ``declared_composite_keys`` is a separate field from ``declared_keys``
         and nothing else in this suite reaches it.
+
+        **What getting this wrong costs, now that the field is read.** It is no
+        longer decoration on a diagram. The grain axis re-verifies the
+        combinations that arrive here, and reconcile checks them before proposing
+        a column-level ``unique``, so a format that leaves this empty loses grain
+        verification on exactly the tables whose grain is composite, and gets
+        offered ``unique`` tests on their member columns: assertions its own
+        parser is entitled to discard and dbt is entitled to fail every build on.
         """
 
         return None
@@ -366,6 +374,26 @@ class DeclaringProjectContract:
         assert tuple(matching[0].columns) == tuple(columns), (
             f"expected columns {tuple(columns)} in order, got "
             f"{tuple(matching[0].columns)}"
+        )
+        assert len(matching) == 1, (
+            f"expected one composite key on {model}, got {len(matching)}: "
+            f"{matching}. One declaration is one grain, and splitting it across "
+            "entries makes the grain axis verify combinations the project never "
+            "declared"
+        )
+        leaked = sorted(
+            key.column
+            for key in project.definitions().declared_keys
+            if key.model == model
+            and key.unique
+            and key.column.lower() in {c.lower() for c in columns}
+        )
+        assert not leaked, (
+            f"{model} reports {leaked} as unique on their own while also declaring "
+            f"the composite grain {tuple(columns)}. The fixture's grain needs every "
+            "one of those columns, so no single one of them is unique, and the "
+            "stronger claim is the one that gets acted on: reconcile reads it as a "
+            "grain the project already asserts and proposes edits against it"
         )
 
     def test_a_join_keeps_its_two_sides_apart_when_they_are_named_differently(
