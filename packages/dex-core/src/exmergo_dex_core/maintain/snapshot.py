@@ -37,6 +37,8 @@ from ..dbt_project import (
     DbtProjectView,
     content_hash,
     metric_inputs,
+    node_files,
+    node_name,
     physical_column,
     semantic_yaml_entries,
     yaml_documents,
@@ -277,15 +279,24 @@ def warehouse_from_metadata(adapter: Adapter) -> WarehouseBaseline:
 
 
 def transform_layer(view: DbtProjectView) -> TransformLayer:
-    """Fingerprint the transformation layer from the project view."""
+    """Fingerprint the transformation layer from the project view.
+
+    ``models`` is every node the project builds and names after its file: a
+    model, a snapshot, or a seed. It reads that from ``node_files`` rather than
+    from every ``.sql`` in the view, which is what keeps a macro (jinja, builds
+    nothing, ``ref()``-able by no one) from counting as a model and a snapshot
+    or seed from being missed now that both are loaded.
+
+    ``files`` stays the whole editable surface: it is a change fingerprint of
+    what a human can edit, not a node list, and nothing compares it across
+    snapshots to raise a finding.
+    """
 
     models: list[str] = []
     model_sources: dict[str, list[str]] = {}
     model_refs: dict[str, list[str]] = {}
-    for path, source in view.files.items():
-        if not path.endswith(".sql"):
-            continue
-        model = path.rsplit("/", 1)[-1][: -len(".sql")]
+    for path, source in node_files(view).items():
+        model = node_name(path)
         models.append(model)
         source_calls = sorted(
             {

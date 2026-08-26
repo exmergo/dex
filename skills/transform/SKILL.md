@@ -32,21 +32,48 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 {"edits": [
   {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
   {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
+  {"path": "snapshots/snap_orders.sql", "kind": "snapshot_sql", "content": "..."},
+  {"path": "seeds/country_vat.csv", "kind": "seed_csv", "content": "..."},
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
 `kind` is `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update|plan`, which imply it), `macro_sql` (a macro file under
-the project's macro paths), `packages_yml`, `project_yml` (the project-root
-`dbt_project.yml`), or `profiles_yml` (the project-root `profiles.yml`). Model
-SQL must be a single read-only SELECT once its jinja is stripped; semantic YAML
-is validated against MetricFlow's schemas, cross-reference-checked, and (when
-dbt is available) parsed by dbt itself before the plan is accepted; a macro file
-must hold only macro definitions and jinja comments. `project_yml` must keep a
-`name`; `profiles_yml` must reference every secret via `{{ env_var('NAME') }}`
-(a literal credential is refused so none reaches the diff), and both config
-kinds are parsed by dbt at plan time.
+the project's macro paths), `snapshot_sql` (a snapshot under the snapshot
+paths), `seed_csv` (a seed's CSV under the seed paths), `packages_yml`,
+`project_yml` (the project-root `dbt_project.yml`), or `profiles_yml` (the
+project-root `profiles.yml`). Model SQL must be a single read-only SELECT once
+its jinja is stripped; semantic YAML is validated against MetricFlow's schemas,
+cross-reference-checked, and (when dbt is available) parsed by dbt itself before
+the plan is accepted; a macro file must hold only macro definitions and jinja
+comments. A snapshot must hold exactly one `{% snapshot %}` block whose
+`config()` names a `unique_key` and a `strategy` of `timestamp` (with
+`updated_at`) or `check` (with `check_cols`), and whose body is a single
+read-only SELECT. A seed must parse as CSV with a named, duplicate-free header
+and one field per column on every row, and stays under 5,000 data rows and 1 MiB
+(past that it is data rather than a lookup: load it into the warehouse and
+`source()` it). `project_yml` must keep a `name`; `profiles_yml` must reference
+every secret via `{{ env_var('NAME') }}` (a literal credential is refused so
+none reaches the diff). Config kinds, snapshots and seeds are all parsed by dbt
+at plan time.
+
+Each kind is confined to its own family of paths, and filing one in the wrong
+family is refused naming both fixes. `schema_yml` is the exception, accepted
+beside a model, a snapshot or a seed, because that is where dbt expects a
+snapshot's tests and a seed's column types declared.
+
+**A seed puts values, not logic, into a diff, and a diff goes into git and stays
+there.** So a seed whose header names a column that looks like personal data is
+refused, and the refusal names the `pii_overrides` entry in `.dex/config.yml`
+that a human can add to clear it. Detection reads names and types and never
+values (everywhere in dex), so it cannot see personal data hiding under a
+neutral column name: do not build a seed out of warehouse rows you have not
+looked at.
+
+`dbt build` runs seeds and snapshots natively, so `transform build` after an
+apply is all it takes; there is no separate seed step. A snapshot writes a table
+and is priced in the cost handshake, a seed scans nothing and is not.
 
 `op` is `upsert` (the default: create or update, carrying `content`) or
 `delete` (remove the file, no `content`). A delete is a first-class reviewable

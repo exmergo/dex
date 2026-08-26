@@ -694,7 +694,7 @@ class DbtProject:
         return None if suffix is None else f"models/staging/stg_{model}.{suffix}"
 
     def editing_surface(self) -> list[str]:
-        """Everything dbt's own writer accepts: the model and macro paths, and
+        """Everything dbt's own writer accepts: every authored path family, and
         the four root manifests it admits by name.
 
         Read rather than assumed: a project that configures ``model-paths`` away
@@ -711,8 +711,5 @@ class DbtProject:
         """
 
         view = self.load()
-        return (
-            list(view.model_paths)
-            + list(view.macro_paths)
-            + sorted(dbt_project._ALLOWED_ROOT_FILES)
-        )
+        families = [path for _name, paths in view.path_families() for path in paths]
+        return families + sorted(dbt_project._ALLOWED_ROOT_FILES)

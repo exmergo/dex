@@ -57,6 +57,19 @@ _ALLOWED_ROOT_FILES = frozenset(
     {"packages.yml", "dependencies.yml", PROJECT_FILE, PROFILES_FILE}
 )
 
+# What each of dbt's authored path families can hold. Models and snapshots are
+# SQL plus their properties YAML; macros are jinja plus their properties YAML;
+# seeds are CSV data plus the YAML that declares their column types. The scan is
+# per-family rather than one global suffix filter because ".csv" is only a seed
+# anywhere else it is somebody's fixture, and a fixture is not dex's to hash.
+_YAML_SUFFIXES = frozenset({".yml", ".yaml"})
+_FAMILY_SUFFIXES: dict[str, frozenset[str]] = {
+    "model": _YAML_SUFFIXES | {".sql"},
+    "macro": _YAML_SUFFIXES | {".sql"},
+    "snapshot": _YAML_SUFFIXES | {".sql"},
+    "seed": _YAML_SUFFIXES | {".csv"},
+}
+
 
 class DbtProjectError(ProjectError):
     """The dbt format's refusal, and the shipped implementation of ``ProjectError``.
@@ -79,9 +92,15 @@ class SourceFile(BaseModel):
 class DbtProjectView(BaseModel):
     """The in-memory view of a dbt project.
 
-    ``files`` holds every ``*.sql``/``*.yml``/``*.yaml`` under the model paths:
-    the surface transform edits. ``manifest`` is the compiled artifact when the
-    project has been compiled; a fresh project loads fine without one.
+    ``files`` holds the editable surface: the source files under each of dbt's
+    four authored path families, each scanned for the suffixes that family can
+    hold (see :data:`_FAMILY_SUFFIXES`). ``manifest`` is the compiled artifact
+    when the project has been compiled; a fresh project loads fine without one.
+
+    A file that is *not* in ``files`` hashes as absent, so a later edit to it
+    registers as a create and the apply that follows conflicts on a file nobody
+    touched. That is why the scan covers every family dex can author into, not
+    only the ones it reads for definitions.
     """
 
     root: str
@@ -89,8 +108,27 @@ class DbtProjectView(BaseModel):
     profile_name: str
     model_paths: list[str] = Field(default_factory=lambda: ["models"])
     macro_paths: list[str] = Field(default_factory=lambda: ["macros"])
+    snapshot_paths: list[str] = Field(default_factory=lambda: ["snapshots"])
+    seed_paths: list[str] = Field(default_factory=lambda: ["seeds"])
     files: dict[str, SourceFile] = Field(default_factory=dict)
     manifest: dict[str, Any] | None = None
+
+    def path_families(self) -> list[tuple[str, list[str]]]:
+        """Every authored path family, as ``(name, configured paths)``.
+
+        One place to add the next family, and the order is the order a path is
+        matched against when deciding which family it belongs to: the specific
+        families first, models last as the catch-all. Two families configured to
+        the same directory is a project mistake dex does not adjudicate; the
+        first listed wins and the containment message names all four.
+        """
+
+        return [
+            ("macro", list(self.macro_paths)),
+            ("snapshot", list(self.snapshot_paths)),
+            ("seed", list(self.seed_paths)),
+            ("model", list(self.model_paths)),
+        ]
 
 
 class TargetInfo(BaseModel):
@@ -221,23 +259,46 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
     if not project_name:
         raise DbtProjectError(f"{project_file} has no 'name'")
     model_paths = list(raw.get("model-paths", ["models"]))
-    # dbt's own default when the key is absent, so a skeleton project's first
-    # scaffolded macro lands where dbt will look for it.
+    # dbt's own defaults when a key is absent, so a skeleton project's first
+    # scaffolded macro, snapshot, or seed lands where dbt will look for it.
     macro_paths = list(raw.get("macro-paths", ["macros"]))
+    snapshot_paths = list(raw.get("snapshot-paths", ["snapshots"]))
+    seed_paths = list(raw.get("seed-paths", ["seeds"]))
+
+    # Suffixes unioned per directory rather than per family, so a project that
+    # points two families at one directory gets both sets scanned instead of
+    # whichever happened to be visited last.
+    scan: dict[str, set[str]] = {}
+    for family, paths in (
+        ("model", model_paths),
+        ("macro", macro_paths),
+        ("snapshot", snapshot_paths),
+        ("seed", seed_paths),
+    ):
+        for configured in paths:
+            scan.setdefault(configured, set()).update(_FAMILY_SUFFIXES[family])
 
     files: dict[str, SourceFile] = {}
-    for model_path in model_paths + macro_paths:
-        base = root / model_path
+    for configured, suffixes in scan.items():
+        base = root / configured
         if not base.is_dir():
             continue
         for path in sorted(base.rglob("*")):
-            if path.suffix not in {".sql", ".yml", ".yaml"} or not path.is_file():
+            if path.suffix not in suffixes or not path.is_file():
                 continue
             # Posix-separated regardless of OS: every consumer of `files` keys
             # (transform_layer's model-name parsing, scaffolded model paths,
             # this module's own backed_relation_names) assumes "/".
             rel = path.relative_to(root).as_posix()
-            content = path.read_text(encoding="utf-8")
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                # A seed saved in a legacy encoding is the realistic case, and
+                # loading the project is a prerequisite for every command,
+                # explore included. Skipping the file costs a spurious conflict
+                # if someone later edits it through dex; raising would cost them
+                # the whole engine.
+                continue
             files[rel] = SourceFile(
                 path=rel, content=content, sha256=content_hash(content)
             )
@@ -271,6 +332,8 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
         profile_name=raw.get("profile", project_name),
         model_paths=model_paths,
         macro_paths=macro_paths,
+        snapshot_paths=snapshot_paths,
+        seed_paths=seed_paths,
         files=files,
         manifest=manifest,
     )
@@ -491,9 +554,7 @@ def write_edits(
     conflicts: list[Conflict] = []
     diffs: list[dict[str, Any]] = []
     for edit in edits:
-        target_path = contained_path(
-            root, edit.path, view.model_paths, view.macro_paths
-        )
+        target_path = contained_path(root, edit.path, view)
         current = (
             target_path.read_text(encoding="utf-8") if target_path.is_file() else None
         )
@@ -535,19 +596,20 @@ def write_edits(
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
 
 
-def contained_path(
-    root: Path,
-    rel_path: str,
-    model_paths: list[str],
-    macro_paths: list[str] | None = None,
-) -> Path:
+def contained_path(root: Path, rel_path: str, view: DbtProjectView) -> Path:
     """Resolve an edit path and refuse anything outside the project's editing
     surface.
 
     Writes are confined to the repo, and within the repo to the dbt editing
-    surface: model SQL, schema.yml, and semantic YAML live under the model
-    paths, and macros under the macro paths. Escapes (absolute paths, ``..``)
-    are refused outright.
+    surface: model SQL, schema.yml and semantic YAML under the model paths,
+    macros under the macro paths, snapshots under the snapshot paths, seeds
+    under the seed paths, plus the root manifests dbt keeps at the project root.
+    Escapes (absolute paths, ``..``) are refused outright.
+
+    The families are read off the view rather than passed positionally. Four of
+    them is where a positional list stops being readable, and every caller
+    already holds a view: the writer loads one, and both plan-time callers were
+    handed one.
     """
 
     candidate = Path(rel_path)
@@ -559,15 +621,67 @@ def contained_path(
     # name (still inside the project, still not an arbitrary escape).
     if resolved.parent == root_resolved and resolved.name in _ALLOWED_ROOT_FILES:
         return root / candidate
-    allowed = list(model_paths) + list(macro_paths or [])
-    for allowed_path in allowed:
-        base = (root_resolved / allowed_path).resolve()
-        if resolved == base or base in resolved.parents:
-            return root / candidate
-    raise DbtProjectError(
-        f"edit path '{rel_path}' is outside the project's model and macro "
-        f"paths ({', '.join(allowed)}); dex edits only the dbt project surface"
+    if path_family(root, rel_path, view) is not None:
+        return root / candidate
+    listed = ", ".join(
+        f"{name} ({', '.join(paths) or 'none'})" for name, paths in view.path_families()
     )
+    raise DbtProjectError(
+        f"edit path '{rel_path}' is outside the project's authored paths "
+        f"[{listed}]; dex edits only the dbt project surface"
+    )
+
+
+def path_family(root: Path, rel_path: str, view: DbtProjectView) -> str | None:
+    """Which authored family ``rel_path`` falls in, or ``None`` for none of them.
+
+    The other half of containment: containment asks whether a path is inside the
+    surface at all, and this asks *which* part of it, which is what decides
+    whether the edit's declared kind belongs there. Both answer from the same
+    traversal so they can never disagree about where a directory ends.
+    """
+
+    resolved = (root / Path(rel_path)).resolve()
+    root_resolved = root.resolve()
+    for name, paths in view.path_families():
+        for configured in paths:
+            base = (root_resolved / configured).resolve()
+            if resolved == base or base in resolved.parents:
+                return name
+    return None
+
+
+def node_files(view: DbtProjectView) -> dict[str, SourceFile]:
+    """The files that become a dbt node named after the file, keyed by path.
+
+    A model, a snapshot and a seed each build a relation dbt names after the
+    file and each is ``ref()``-able; a macro, a schema.yml and a semantic YAML
+    build nothing. Every derivation that reads "the things this project builds"
+    out of the file list goes through here, so widening the load to a new family
+    cannot quietly turn its files into models by filename.
+    """
+
+    nodes: dict[str, SourceFile] = {}
+    for path, source in view.files.items():
+        family = path_family(Path(view.root), path, view)
+        if (family in ("model", "snapshot") and path.endswith(".sql")) or (
+            family == "seed" and path.endswith(".csv")
+        ):
+            nodes[path] = source
+    return nodes
+
+
+def node_name(path: str) -> str:
+    """The dbt node name a node file builds: its stem, case preserved.
+
+    dbt names a model, snapshot or seed after the file, ignoring the
+    directories above it, which is why two same-named files in different
+    subdirectories are a dbt error rather than two nodes. Case is preserved
+    because ``ref()`` matches it; callers comparing against warehouse
+    identifiers lower it themselves.
+    """
+
+    return path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
 
 # --- Read view: what the project declares -------------------------------------
@@ -610,11 +724,7 @@ def backed_relation_names(view: DbtProjectView) -> set[str]:
     risk a cycle.
     """
 
-    names = {
-        path.rsplit("/", 1)[-1][: -len(".sql")].lower()
-        for path in view.files
-        if path.endswith(".sql")
-    }
+    names = {node_name(path).lower() for path in node_files(view)}
     for parsed, _path in yaml_documents(view):
         for src in parsed.get("sources") or []:
             if not isinstance(src, dict):

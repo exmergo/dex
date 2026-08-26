@@ -362,6 +362,12 @@ def test_the_dbt_editing_surface_admits_everything_its_writer_accepts(tmp_path: 
     for path in (
         "models/stg_customers.sql",
         "macros/m.sql",
+        # Every authored family, not only the two that predate them: a plan the
+        # writer accepts and this declaration refuses would be refused at apply
+        # after passing at plan.
+        "snapshots/snap_customers.sql",
+        "seeds/country_vat.csv",
+        "seeds/schema.yml",
         *dbt_project._ALLOWED_ROOT_FILES,
     ):
         contained_key(path, surface)

@@ -99,10 +99,16 @@ Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "op", "content"}, ...]}`
 with `kind` one of `model_sql`, `schema_yml`, `semantic_yml`, `packages_yml` (the
 guarded way to author the project-root `packages.yml`/`dependencies.yml`, so
-declaring a dbt package is a reviewable diff too), `macro_sql`, `project_yml`
-(the project-root `dbt_project.yml`), or `profiles_yml` (the project-root
-`profiles.yml`, secret-guarded so a credential never enters the diff: reference
-secrets via `{{ env_var('NAME') }}`). `op` is `upsert` (create or update, the
+declaring a dbt package is a reviewable diff too), `macro_sql`, `snapshot_sql`
+(one `{% snapshot %}` block under the project's snapshot paths, its `config()`
+naming a `unique_key` and a strategy), `seed_csv` (a small reference CSV under
+the seed paths, capped at 5,000 rows and 1 MiB and refused when a column name
+looks like personal data, since a seed puts values into a diff and a diff goes
+into git), `project_yml` (the project-root `dbt_project.yml`), or `profiles_yml`
+(the project-root `profiles.yml`, secret-guarded so a credential never enters the
+diff: reference secrets via `{{ env_var('NAME') }}`). Each kind is confined to
+its own path family, and `schema_yml` is accepted beside a snapshot or a seed as
+well as beside a model. `op` is `upsert` (create or update, the
 default, carrying `content`) or `delete` (remove the file, no `content`); a
 delete is a reviewable diff too, guarded so the plan is refused if any surviving
 file still `ref()`s a deleted model, and a rename is one plan (delete old, create

@@ -188,6 +188,13 @@ generates alongside the path, so placement alone cannot open that channel: a for
 that places a staging model elsewhere gets the proposal as advice rather than having
 dbt written into its tree. One `None` and one path is the shape this exists for.
 
+The kind list grows over time (`MACRO_SQL`, `SNAPSHOT_SQL` and `SEED_CSV` are all
+dbt-shaped artifacts a non-dbt format may have no equivalent of), and `None` stays
+the right answer for every one your format does not place. The shipped dbt format
+answers `None` for them too: reconcile proposes staging models and their
+`schema.yml` and nothing else, so a path for the rest would be invented rather
+than known.
+
 `editing_surface()` declares the region those paths must stay inside, and it is a
 different question with a different caller. `transform plan` validates edits an agent
 authored, where there is no `(kind, model)` pair to ask `edit_path` about and no
