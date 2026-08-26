@@ -77,6 +77,16 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind
 dex transform plans               -> list stored plans, pending and applied, newest first
+dex transform references <name>   -> where each name is used: model SQL, schema.yml, dbt_project.yml,
+  [more...] [--kind K] [--full]      macros, semantic YAML, seed headers, installed packages. Repo-only
+                                     and free on every connector; it opens no connection and needs no
+                                     extra, so it is routed ahead of the dialect gate the rest of the
+                                     authoring surface passes. Jinja-aware, so a var() read inside a
+                                     macro counts; a reference it cannot resolve statically is reported
+                                     under data.indeterminate rather than dropped. data.completeness is
+                                     `complete` only once every reason to doubt it is ruled out, and
+                                     data.limits names the rest. Capped, with every elision in notes;
+                                     --full lifts the caps
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
                                      auto-runs dbt deps when packages are declared but not installed
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
@@ -129,9 +139,14 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
-still `ref()`s a deleted model (the offenders are named), so the post-deletion
-project is proven free of dangling references before the plan is stored, and,
-when dbt is available, the same post-deletion tree is confirmed by dbt's parser.
+still `ref()`s a deleted model (the offenders are named, with the line), so the
+post-deletion project is proven free of dangling references before the plan is
+stored, and, when dbt is available, the same post-deletion tree is confirmed by
+dbt's parser. The guard reads the reference index behind `transform references`,
+which is why it sees the two-argument `ref('package', 'model')` form, why a seed's
+data rows no longer count as source, and why a reference dex could not resolve
+statically *warns* rather than refusing: it may or may not name the deleted node,
+and no edit the caller could make would settle it.
 A rename is one plan: `delete` the old model, `create` the new, `update` the
 referrers, validated together. The engine validates each edit
 (model SQL must be a single read-only SELECT once jinja is stripped; YAML must
