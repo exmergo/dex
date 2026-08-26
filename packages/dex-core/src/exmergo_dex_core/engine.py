@@ -69,6 +69,7 @@ if TYPE_CHECKING:
         SemanticQueryResult,
     )
     from .maintain.results import DriftResult, ReconcileResult, SnapshotResult
+    from .references import ReferencesResult
     from .transform.plans import PlanEdit
     from .transform.results import (
         ApplyResult,
@@ -866,6 +867,20 @@ class DexEngine:
         from .transform import commands as transform
 
         return transform.macro(self, name)
+
+    def references(
+        self,
+        names: list[str],
+        *,
+        kind: str | None = None,
+        full: bool = False,
+    ) -> ReferencesResult:
+        # From `references` rather than `transform.commands`: this one reads the
+        # project's files and needs neither the plan store nor the dialect engine,
+        # and reaching it through the authoring module would require both.
+        from . import references as references_mod
+
+        return references_mod.run(self, names, kind=kind, full=full)
 
     def build(
         self, *, target: str | None = None, select: str | None = None
