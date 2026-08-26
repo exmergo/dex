@@ -231,7 +231,12 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
 - `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
-  `--confirm` overrides it. A clean apply is all-or-nothing. With no plan id it
+  `--confirm` overrides it. An apply is all-or-nothing across the whole plan: one
+  conflict refuses the set, so the clean edits beside it do not land either. The
+  stored paths are re-checked against the project format's editing surface at the
+  same time, and a path outside it is refused outright rather than surfaced for
+  confirmation, since nobody can accept a write into a region the format says it
+  does not own. With no plan id it
   applies the latest unapplied plan of any kind (semantic plans included; `emit
   dbt` remains the semantic-scoped spelling). `transform plans` lists what is
   stored, pending and applied.

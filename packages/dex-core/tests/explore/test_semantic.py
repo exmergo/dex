@@ -270,10 +270,21 @@ def _viz_like_metrics():
             "label": "Sessions",
             "description": "Total sessions.",
             "dimensions": [
+                # metric_time stays bare: a real deployment populates these
+                # fields unevenly, and the unpopulated case is half the contract.
                 {"name": "metric_time", "type": "TIME"},
-                {"name": "user__pricing_tier", "type": "CATEGORICAL"},
+                {
+                    "name": "user__pricing_tier",
+                    "type": "CATEGORICAL",
+                    "label": "Pricing tier",
+                    "description": "The plan the user is billed on.",
+                },
             ],
-            "entities": [{"name": "user", "type": "PRIMARY"}],
+            # No `label` key here, and none in the selection set: the API's
+            # Entity type has no such field.
+            "entities": [
+                {"name": "user", "type": "PRIMARY", "description": "A viz user."}
+            ],
         }
     ]
 
@@ -287,6 +298,114 @@ def test_hosted_list_definitions():
     assert "user__pricing_tier" in catalog.metrics[0].dimensions
     assert any(d.name == "user__pricing_tier" for d in catalog.dimensions)
     assert any(e.name == "user" for e in catalog.entities)
+
+
+def test_hosted_list_carries_the_projects_own_words():
+    catalog = FakeHostedBackend(metrics=_viz_like_metrics()).list_definitions()
+    tier = next(d for d in catalog.dimensions if d.name == "user__pricing_tier")
+    assert tier.label == "Pricing tier"
+    assert tier.description == "The plan the user is billed on."
+    # A dimension the project never described says nothing, rather than guessing.
+    assert next(d for d in catalog.dimensions if d.name == "metric_time").label is None
+    user = next(e for e in catalog.entities if e.name == "user")
+    assert user.description == "A viz user."
+    # Structurally unavailable over GraphQL, and the catalog says so rather than
+    # letting the absence read as an undeclared label.
+    assert user.label is None
+    assert any("no label on entities" in note for note in catalog.notes)
+
+
+def test_hosted_catalog_query_never_asks_for_an_entity_label():
+    """`label` on an Entity is not a missing field, it is a rejected query.
+
+    dbt Cloud answers `Cannot query field 'label' on type 'Entity'` and fails the
+    whole request, so the widened selection set takes the metrics list down with
+    it if anyone adds one.
+    """
+
+    backend = FakeHostedBackend(metrics=_viz_like_metrics())
+    backend.list_definitions()
+    posted = backend.posted[0]
+    assert "dimensions { name type label description }" in posted
+    assert "entities { name type description }" in posted
+
+
+def test_hosted_list_keeps_the_first_non_null_field_not_the_first_metric():
+    """A dimension is nested under every metric that can group by it, and the
+    copies need not agree. Under a whole-element `setdefault`, whichever metric
+    sorted first blanked out text another one carried."""
+
+    metrics = [
+        {
+            "name": "aaa_sessions",
+            "type": "SIMPLE",
+            "dimensions": [{"name": "user__pricing_tier", "type": "CATEGORICAL"}],
+            "entities": [{"name": "user", "type": "PRIMARY"}],
+        },
+        {
+            "name": "zzz_queries",
+            "type": "SIMPLE",
+            "dimensions": [
+                {
+                    "name": "user__pricing_tier",
+                    "type": "CATEGORICAL",
+                    "description": "The plan the user is billed on.",
+                }
+            ],
+            "entities": [
+                {"name": "user", "type": "PRIMARY", "description": "A viz user."}
+            ],
+        },
+    ]
+    catalog = FakeHostedBackend(metrics=metrics).list_definitions()
+    tier = next(d for d in catalog.dimensions if d.name == "user__pricing_tier")
+    assert tier.description == "The plan the user is billed on."
+    assert next(e for e in catalog.entities if e.name == "user").description == (
+        "A viz user."
+    )
+
+
+def test_hosted_list_without_entities_says_nothing_about_entity_labels():
+    metrics = [{"name": "sessions", "type": "SIMPLE", "dimensions": [], "entities": []}]
+    catalog = FakeHostedBackend(metrics=metrics).list_definitions()
+    assert catalog.entities == []
+    assert catalog.notes == []
+
+
+def test_semantic_list_payload_omits_what_the_project_never_set(monkeypatch):
+    """An unset optional field is absent from the payload, never a null.
+
+    One rule across metrics, dimensions and entities: a catalog is agent context,
+    and a project that documents nothing would otherwise pay kilobytes of
+    placeholders per list. An empty list survives, because "no groupable
+    dimensions" is an answer where a null is not.
+    """
+
+    from exmergo_dex_core.explore.semantic import commands as semantic_commands
+
+    metrics = [
+        *_viz_like_metrics(),
+        {"name": "queries", "type": "SIMPLE", "dimensions": [], "entities": []},
+    ]
+    backend = FakeHostedBackend(metrics=metrics)
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    envelope = to_envelope(semantic_commands.semantic_list(_engine()))
+
+    dims = {d["name"]: d for d in envelope.data["dimensions"]}
+    assert dims["user__pricing_tier"]["label"] == "Pricing tier"
+    assert set(dims["metric_time"]) == {"name", "type"}
+
+    entities = {e["name"]: e for e in envelope.data["entities"]}
+    assert entities["user"]["description"] == "A viz user."
+    assert "label" not in entities["user"]
+
+    listed = {m["name"]: m for m in envelope.data["metrics"]}
+    assert listed["sessions"]["label"] == "Sessions"
+    assert "label" not in listed["queries"] and "description" not in listed["queries"]
+    assert listed["queries"]["dimensions"] == []
+
+    # The catalog's own note reaches the caller once, at envelope level.
+    assert any("no label on entities" in note for note in envelope.data["notes"])
 
 
 def test_hosted_query_is_warn_only_and_shaped():
@@ -423,6 +542,100 @@ def test_local_list_reads_manifest(tmp_path: Path):
     assert "order__status" in orders.dimensions
     assert "metric_time" in orders.dimensions
     assert any(e.name == "order" for e in catalog.entities)
+
+
+def _described_manifest(tmp_path: Path) -> Path:
+    """Two semantic models, unevenly documented, which is how a real project
+    looks: one dimension labelled and described and one bare, and an entity whose
+    only description lives in the second model that declares it."""
+
+    project = tmp_path / "described"
+    (project / "target").mkdir(parents=True)
+    manifest = {
+        "semantic_models": [
+            {
+                "name": "orders",
+                "entities": [
+                    {
+                        "name": "order",
+                        "type": "primary",
+                        "label": "Order",
+                        "description": "One placed order.",
+                    },
+                    {"name": "customer", "type": "foreign"},
+                ],
+                "dimensions": [
+                    {
+                        "name": "status",
+                        "type": "categorical",
+                        "label": "Order status",
+                        "description": "Where the order is in fulfilment.",
+                    },
+                    {"name": "channel", "type": "categorical"},
+                ],
+                "measures": [{"name": "order_count", "agg": "count"}],
+            },
+            {
+                "name": "payments",
+                "entities": [
+                    {
+                        "name": "customer",
+                        "type": "foreign",
+                        "description": "A paying customer.",
+                    }
+                ],
+                "dimensions": [],
+                "measures": [],
+            },
+        ],
+        "metrics": [
+            {
+                "name": "orders",
+                "type": "simple",
+                "type_params": {"input_measures": [{"name": "order_count"}]},
+            }
+        ],
+    }
+    (project / "target" / "semantic_manifest.json").write_text(json.dumps(manifest))
+    return project
+
+
+def test_local_list_carries_the_projects_own_words(tmp_path: Path):
+    backend = LocalMetricFlowBackend(
+        _described_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    catalog = backend.list_definitions()
+
+    status = next(d for d in catalog.dimensions if d.name == "order__status")
+    # The catalog key is entity-qualified; the label and description are the
+    # project's own text about the dimension, unqualified.
+    assert status.label == "Order status"
+    assert status.description == "Where the order is in fulfilment."
+    channel = next(d for d in catalog.dimensions if d.name == "order__channel")
+    assert channel.label is None and channel.description is None
+
+    order = next(e for e in catalog.entities if e.name == "order")
+    # Unlike the hosted path, the manifest declares entity labels and dex reads them.
+    assert order.label == "Order"
+    assert order.description == "One placed order."
+    # Declared in both models and described in only the second: the first
+    # declaration must not blank it out.
+    customer = next(e for e in catalog.entities if e.name == "customer")
+    assert customer.description == "A paying customer."
+
+
+def test_local_list_invents_no_words_for_metric_time(tmp_path: Path):
+    """`metric_time` is dex's own synthesis, not a manifest entry. Everything
+    described in the catalog is described by the dbt project."""
+
+    backend = LocalMetricFlowBackend(
+        _described_manifest(tmp_path), _engine(), "duckdb", QueryLimits()
+    )
+    metric_time = next(
+        d for d in backend.list_definitions().dimensions if d.name == "metric_time"
+    )
+    assert metric_time.type == "time"
+    assert metric_time.label is None and metric_time.description is None
 
 
 def test_local_list_missing_manifest_errors(tmp_path: Path):

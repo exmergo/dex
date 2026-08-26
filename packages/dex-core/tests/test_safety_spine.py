@@ -342,7 +342,15 @@ def test_combination_probe_sql_is_select_only_in_every_dialect():
         quote,
     )
     assert sql.lstrip().upper().startswith("SELECT")
-    dialects = ("duckdb", "bigquery", "snowflake", "databricks", "postgres", "redshift")
+    dialects = (
+        "duckdb",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "postgres",
+        "redshift",
+        "clickhouse",
+    )
     for dialect in dialects:
         assert assert_select_only(sql, dialect=dialect) == sql
 
@@ -503,7 +511,8 @@ def test_cost_guard_blocks_over_ceiling():
 
 
 @pytest.mark.parametrize(
-    "connector", ["bigquery", "snowflake", "databricks", "redshift", "postgres"]
+    "connector",
+    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
 )
 def test_row_attribution_never_spends_unasked_on_a_metered_connector(
     connector, dbt_project_dir: Path, monkeypatch
@@ -709,6 +718,11 @@ def test_a_scope_flag_cannot_widen_the_committed_allowlist():
         ("bigquery", "datasets", config_mod.BigQueryTarget(datasets=["analytics"])),
         ("databricks", "catalogs", config_mod.DatabricksTarget(catalogs=["raw"])),
         ("postgres", "schemas", config_mod.PostgresTarget(schemas=["public"])),
+        (
+            "clickhouse",
+            "databases",
+            config_mod.ClickHouseTarget(databases=["app"]),
+        ),
     ):
         narrowed = narrow_target(target, connector, [getattr(target, field)[0]])
         assert getattr(narrowed, field) == getattr(target, field)
@@ -792,6 +806,10 @@ def test_query_firewall_unnest_reshapes_but_never_smuggles():
         "postgres": "FROM events, jsonb_object_keys({col}) AS k",
         "redshift": "FROM events e, UNPIVOT e.{col} AS v AT k",
         "duckdb": "FROM events, UNNEST(json_keys({col})) AS u(k)",
+        # ClickHouse has no lateral join: ARRAY JOIN is the expansion, and it
+        # is a Join node rather than a FROM source, so the taint rule reaches
+        # it by a different path than every other dialect here.
+        "clickhouse": "FROM events ARRAY JOIN JSONExtractKeysAndValuesRaw({col}) AS k",
     }
     for dialect, idiom in idioms.items():
         allowed = "SELECT k " + idiom.format(col="doc")
@@ -1495,6 +1513,108 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     assert result.written == []
     assert result.conflicts
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
+
+
+def test_one_conflict_refuses_the_whole_plan_not_the_conflicting_edit(
+    dbt_project_dir: Path,
+):
+    """An apply is all-or-nothing across the plan, and the edit set is the unit.
+
+    Landing the clean edits beside a refused one leaves the project matching
+    neither the proposal nor what the human had, while the apply reports itself
+    refused, so nothing records which half arrived. The single-file refusal above
+    cannot see that: with one edit in the plan there is no clean half to land.
+    """
+
+    from exmergo_dex_core import transform
+
+    touched = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    untouched = dbt_project_dir / "models" / "marts" / "fct_orders.sql"
+    edits = [
+        transform.PlanEdit(
+            path="models/marts/fct_orders.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as order_id\n",
+        ),
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as id\n",
+        ),
+    ]
+    planned, _diffs, _warnings = transform.plan(
+        "two edits, one of which a human will touch",
+        edits,
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    model_existed = untouched.exists()
+    touched.write_text("select 99 as id -- hand-tuned\n", encoding="utf-8")
+
+    result = transform.apply(
+        planned.plan_id,
+        dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+
+    assert result.written == []
+    assert result.conflicts
+    assert touched.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
+    assert untouched.exists() == model_existed, (
+        "the clean edit landed while the conflicting one beside it was refused"
+    )
+
+
+def test_a_stored_plan_cannot_escape_the_surface_its_format_declares(
+    dbt_project_dir: Path,
+):
+    """Containment is re-checked at apply, and confirmation does not override it.
+
+    A plan is a stored artifact that sits through a human review, so what it was
+    validated against at plan time is not what it is being written into. The
+    hashes are re-checked for that reason and the surface now is too: a path
+    outside what the format declares is refused before anything reaches the
+    writer, and unlike a conflict there is nobody who can accept it.
+    """
+
+    import json as _json
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.adapters.project import DbtProject
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    planned, _diffs, _warnings = transform.plan(
+        "a plan to tamper with",
+        [
+            transform.PlanEdit(
+                path="models/staging/stg_customers.sql",
+                kind=transform.EditKind.MODEL_SQL,
+                new_content="select 1 as id\n",
+            )
+        ],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=store,
+    )
+    # The plan is rewritten where it sits, which is the only way to reach apply
+    # with a path plan-time containment would have refused.
+    stored_path = dbt_project_dir.parent / ".dex" / "plans" / f"{planned.plan_id}.json"
+    stored = _json.loads(stored_path.read_text(encoding="utf-8"))
+    stored["edits"][0]["path"] = "models_backup/stg_customers.sql"
+    stored_path.write_text(_json.dumps(stored), encoding="utf-8")
+    escaped = dbt_project_dir / "models_backup" / "stg_customers.sql"
+
+    for confirmed in (False, True):
+        with pytest.raises(transform.PlanError, match="editing surface"):
+            transform.apply(
+                planned.plan_id,
+                dbt_project_dir.parent,
+                store=store,
+                confirmed=confirmed,
+                project_format=DbtProject(dbt_project_dir.parent, dbt_project_dir),
+            )
+    assert not escaped.exists()
 
 
 def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):
@@ -3562,6 +3682,329 @@ def test_redshift_spend_ledger_holds_no_sql_or_values(
     lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
     entry = json.loads(lines[-1])
     assert "SELECT" not in json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
+
+
+# --- ClickHouse: the second db-load connector exercises every family ------------
+#
+# These run against the fake client (tests/fakes/clickhouse.py): deterministic,
+# offline, free. They importorskip on the [clickhouse] extra, which CI and the
+# release gate install, so trimming that extra from a workflow would silently
+# skip release-blocking families; keep `--extra clickhouse` in ci.yml and
+# release.yml.
+#
+# Two of these guard hazards that are specific to this engine and fail *silently*
+# rather than loudly, which is the failure mode a green suite is worst at
+# catching: ClickHouse fills an unmatched LEFT JOIN row with the column type's
+# default instead of NULL unless told otherwise, and it has no LAG at all.
+
+
+def _clickhouse_adapter(fake_clickhouse_connection, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.clickhouse import ClickHouseAdapter
+    from exmergo_dex_core.config import ClickHouseTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.DB_LOAD,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="clickhouse",
+    )
+    return ClickHouseAdapter(
+        connection=fake_clickhouse_connection,
+        cost_gate=gate,
+        target=ClickHouseTarget(),
+        auth_method="environment:password",
+    )
+
+
+def test_clickhouse_generated_sql_is_select_only(fake_clickhouse_connection):
+    # Family 1: every data statement the adapter generates passes the
+    # SELECT-only guard in its own dialect.
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    sql, _plan = adapter._build_aggregate_sql(
+        "shop.customers",
+        columns,
+        {"created_at"},
+        {"email"},
+        {"email"},
+        {"email"},
+        {"created_at"},
+    )
+    assert_select_only(sql, dialect="clickhouse")
+    for prefix in ("nn_", "d_", "su_", "sp_", "st_", "tp_d_", "tg_d_"):
+        assert prefix in sql
+
+
+def test_clickhouse_session_is_read_only_on_every_statement(
+    fake_clickhouse_connection,
+):
+    # Family 1: read-only is not a property of how the client was built. The
+    # settings ride each statement, so a host-supplied client cannot lose them.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    adapter.capabilities()
+    _meta, columns = adapter.table_metadata("shop.customers")
+    adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.queries
+    for query in fake_clickhouse_connection.queries:
+        assert query.settings["readonly"] == 2
+        assert query.settings["allow_ddl"] == 0
+
+
+def test_clickhouse_orphan_probes_can_actually_find_orphans(
+    fake_clickhouse_connection,
+):
+    # Family 1, and the sharpest ClickHouse-specific hazard in the connector.
+    #
+    # ClickHouse defaults join_use_nulls to 0, which fills an unmatched LEFT
+    # JOIN row with the column type's default (0, '') rather than NULL. The
+    # shared relationship overlap probe counts orphans with `IS NULL`, so with
+    # the default every inferred join reports perfectly clean and maintain
+    # grain's join-fanout half never fires. Measured live: 0 orphans under the
+    # default, 40 with the setting, against a table seeded with exactly 40.
+    #
+    # This is a control that looks active while doing nothing, so it gets a
+    # spine assertion rather than a unit test.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    adapter.capabilities()
+    _meta, columns = adapter.table_metadata("shop.customers")
+    adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.queries
+    for query in fake_clickhouse_connection.queries:
+        assert query.settings["join_use_nulls"] == 1, (
+            "without join_use_nulls=1 an unmatched LEFT JOIN row yields the "
+            "type default instead of NULL, and every orphan probe reports zero"
+        )
+
+
+def test_clickhouse_temporal_gaps_are_measurable_at_all(fake_clickhouse_connection):
+    # Family 1's honesty half: a detector that structurally cannot fire is
+    # worse than an absent one, because a clean result reads as a pass.
+    #
+    # ClickHouse has no LAG. lagInFrame returns the *type default* rather than
+    # NULL past the frame edge, so the naive rewrite makes the first row compare
+    # against the epoch and report a ~20,000 day gap on every column, and it
+    # respects the window frame, so it needs the explicit full frame. Measured
+    # live against a column with a known 3-day hole: 20590 without both
+    # corrections, 3 with them, which is what DuckDB reports for the same data.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    _meta, columns = adapter.table_metadata("shop.events")
+    occurred = next(c for c in columns if c.name == "occurred_at")
+    sql, _plan = adapter._build_aggregate_sql(
+        "shop.events", [occurred], set(), set(), set(), set(), {"occurred_at"}
+    )
+    assert "lagInFrame(toNullable(period), 1, NULL)" in sql
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" in sql
+
+
+def test_select_only_guard_rejects_clickhouse_writes_ddl_and_movement(
+    fake_clickhouse_connection,
+):
+    # Family 1: the guard refuses in this dialect, not merely in duckdb.
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    for sql in (
+        "INSERT INTO shop.customers VALUES (1)",
+        "ALTER TABLE shop.customers DROP COLUMN email",
+        "DROP TABLE shop.customers",
+        "TRUNCATE TABLE shop.customers",
+        "OPTIMIZE TABLE shop.customers FINAL",
+        "CREATE TABLE t (a UInt8) ENGINE = Memory",
+        "SELECT 1; DROP TABLE shop.customers",
+    ):
+        with pytest.raises(Exception):
+            assert_select_only(sql, dialect="clickhouse")
+
+
+def test_clickhouse_unconfirmed_scan_never_executes(fake_clickhouse_connection):
+    # Family 2: the gate binds before anything reaches the server.
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _clickhouse_adapter(fake_clickhouse_connection, confirmed=False)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_clickhouse_confirmed_run_without_a_ceiling_is_refused(
+    fake_clickhouse_connection,
+):
+    # Family 2: nothing executes unbudgeted.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _clickhouse_adapter(fake_clickhouse_connection, ceiling=None)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    with pytest.raises(CostGuardError):
+        adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_clickhouse_over_ceiling_cannot_be_confirmed_through(
+    fake_clickhouse_connection,
+):
+    # Family 2: an over-ceiling estimate refuses first, and confirmation
+    # cannot override it.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _clickhouse_adapter(
+        fake_clickhouse_connection, ceiling=0.001, confirmed=True
+    )
+    _meta, columns = adapter.table_metadata("shop.events")
+    with pytest.raises(OverCeilingError):
+        adapter.column_aggregates("shop.events", columns)
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_clickhouse_every_executed_statement_is_server_capped(
+    fake_clickhouse_connection,
+):
+    # Family 2: the layer that binds when the estimate is wrong. Both caps are
+    # asserted because max_execution_time is checked at block boundaries and a
+    # single fast block can overshoot it; the byte cap is what binds on a scan.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection, ceiling=600.0)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    adapter.column_aggregates("shop.customers", columns)
+    billed = fake_clickhouse_connection.data_queries
+    assert billed
+    for query in billed:
+        assert query.settings["max_execution_time"] > 0
+        assert query.settings["timeout_overflow_mode"] == "throw"
+        assert query.settings["max_bytes_to_read"] > 0
+        assert query.settings["read_overflow_mode"] == "throw"
+
+
+def test_query_firewall_blocks_clickhouse_value_carrying_shapes(
+    fake_clickhouse_connection,
+):
+    # Family 3: PII is flagged and never surfaced, in this dialect's idioms.
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError, inspect_query
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="shop.customers",
+                object_type="table",
+                row_count=100,
+                columns=[
+                    ColumnProfile(name="id", data_type="UInt64"),
+                    ColumnProfile(
+                        name="email",
+                        data_type="String",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+                    ),
+                    ColumnProfile(name="tags", data_type="Array(String)"),
+                ],
+            )
+        ]
+    )
+    limits = QueryLimits()
+
+    # Carrying shapes stay refused, including the ones ClickHouse spells its own
+    # way: an -If combinator over a value-returning aggregate is still value
+    # returning, and ARRAY JOIN reshapes but cannot launder.
+    for sql in (
+        "SELECT email FROM shop.customers",
+        "SELECT max(email) FROM shop.customers",
+        "SELECT anyIf(email, id > 1) FROM shop.customers",
+        "SELECT groupArray(email) FROM shop.customers",
+        "SELECT e FROM shop.customers ARRAY JOIN splitByChar(',', email) AS e",
+        "SELECT email LIKE 'a%' FROM shop.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(sql, cache, limits, dialect="clickhouse")
+
+    # Measuring shapes still pass, so the gate is a taint rule rather than a
+    # column blocklist. Without this half the refusals above would also hold on
+    # a firewall that refused everything.
+    for sql in (
+        "SELECT count() FROM shop.customers",
+        "SELECT uniqExact(email) FROM shop.customers",
+        "SELECT countIf(id > 1) FROM shop.customers",
+        "SELECT id, count() FROM shop.customers FINAL GROUP BY id",
+        "SELECT tag, count() FROM shop.customers ARRAY JOIN tags AS tag GROUP BY tag",
+    ):
+        inspect_query(sql, cache, limits, dialect="clickhouse")
+
+
+def test_init_clickhouse_profile_is_dev_only_with_no_secrets(tmp_path, monkeypatch):
+    # Family 4 and 5: the rendered profile writes only to the dev database and
+    # carries no credential value.
+    import yaml as _yaml
+
+    from exmergo_dex_core.config import ClickHouseTarget, DexConfig
+    from exmergo_dex_core.transform.init import _clickhouse_profile
+
+    monkeypatch.setenv("CLICKHOUSE_HOST", "ch.internal")
+    monkeypatch.setenv("CLICKHOUSE_USER", "dbt_dev")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "super-secret")
+    config = DexConfig(
+        connector="clickhouse",
+        clickhouse=ClickHouseTarget(databases=["app"], dev_database="dbt_dev"),
+    )
+    rendered = _clickhouse_profile("proj", None, config, tmp_path)
+
+    assert "super-secret" not in rendered
+    assert "env_var" in rendered
+    output = _yaml.safe_load(rendered)["proj"]["outputs"]["dev"]
+    assert output["type"] == "clickhouse"
+    # dbt-clickhouse has no `database` key: its `schema` is the ClickHouse
+    # database, and it must be the dev one, never a source.
+    assert output["schema"] == "dbt_dev"
+    assert "app" not in str(output["schema"])
+    assert output["password"].startswith("{{ env_var(")
+
+    # The cap references have to survive the yaml round trip intact. An f-string
+    # would silently collapse the closing `}}` to one brace, rendering a profile
+    # that parses, applies, and caps nothing.
+    settings = output["custom_settings"]
+    assert settings["max_execution_time"].endswith(") }}")
+    assert settings["max_bytes_to_read"].endswith(") }}")
+    assert settings["timeout_overflow_mode"] == "throw"
+
+
+def test_clickhouse_capabilities_pass_the_sanitizer(fake_clickhouse_connection):
+    # Family 5: nothing in the free probe trips the secret-key scan.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    env.sanitize(env.ok(adapter.capabilities()))
+
+
+def test_clickhouse_spend_ledger_holds_no_sql_or_values(
+    tmp_path, fake_clickhouse_connection
+):
+    # Family 5: the ledger records a hash and a number, never statement text.
+    import json as _json
+
+    from fakes.clickhouse import FakeResult
+
+    from exmergo_dex_core.storage.filesystem import FilesystemStore
+
+    store = FilesystemStore(tmp_path)
+    fake_clickhouse_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=0.4
+    )
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "shop"."customers"', max_rows=10, timeout_seconds=200
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = _json.loads(lines[-1])
+    assert "SELECT" not in _json.dumps(entry)
     assert entry["billed_seconds"] > 0
     assert entry["statement_sha256"]
 

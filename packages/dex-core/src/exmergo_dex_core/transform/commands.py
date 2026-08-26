@@ -27,6 +27,7 @@ import yaml
 
 from .. import command_args
 from .. import envelope as env
+from ..adapters.project import PlacingProject, placement_gap
 from ..dbt_project import ApplyResult as PlanApplyResult
 from ..dbt_project import EditOp
 from ..errors import DexError
@@ -34,7 +35,7 @@ from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
 from . import semantic as semantic_mod
-from .plans import EditKind, PlanEdit
+from .plans import EditKind, PlanEdit, PlanError
 from .results import (
     ApplyResult,
     BuildResult,
@@ -62,6 +63,28 @@ _COMPUTE_TIME_CAP_NOTES = {
 }
 _DEFAULT_COMPUTE_TIME_CAP_NOTE = (
     "the warehouse-level statement timeout and auto-suspend are the server-side caps"
+)
+
+# The same shape for db-load, and for the same reason. This one is not
+# decoration: the note asserts that a specific server-side cap was applied, and
+# the mechanism differs per connector, so a shared sentence would claim a cap
+# that was never injected on every connector but the one it was written for.
+# `_cap_note` refuses to claim anything for a connector with no entry.
+_DB_LOAD_CAP_NOTES = {
+    "postgres": (
+        "each statement was capped server-side by a statement_timeout set to "
+        "the ceiling (injected via PGOPTIONS)"
+    ),
+    "clickhouse": (
+        "each statement was capped server-side by max_execution_time and "
+        "max_bytes_to_read set from the ceiling (injected through the "
+        "profile's custom_settings env_var references)"
+    ),
+}
+_UNCAPPED_BUILD_NOTE = (
+    "this build ran without a dex-injected server-side cap: the confirmed "
+    "budget bounded the estimate, but nothing bounded a statement that "
+    "outran it"
 )
 
 
@@ -497,7 +520,10 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
 def cmd_apply(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
         return to_envelope(apply(engine, getattr(args, "argument", None)))
-    except ValueError as exc:
+    except (ValueError, PlanError) as exc:
+        # `PlanError` is the apply-time containment refusal, which is a refusal
+        # the caller can act on rather than a failure, so it gets the same named
+        # envelope every other refusal on this path gets.
         return env.error_for(exc)
 
 
@@ -589,6 +615,7 @@ def build(
             ceiling=ceiling,
             confirmed=engine.confirmed,
             paradigm=paradigm,
+            connector=connector,
             dev_target_check=dev_check,
         )
         return _shape_build_result(
@@ -621,6 +648,7 @@ def build(
             ceiling=ceiling,
             confirmed=engine.confirmed,
             paradigm=paradigm,
+            connector=connector,
             estimate=estimate,
             # The dev-target check already ran above; passing None keeps the
             # engine from opening its own connection a second time.
@@ -961,13 +989,9 @@ def _shape_build_result(
             summary["seconds_billed"] = seconds
             spend = _record_build_spend(store, connector, seconds, paradigm)
     elif paradigm is Paradigm.DB_LOAD:
-        notes = [
-            "each statement was capped server-side by a statement_timeout set to "
-            "the ceiling (injected via PGOPTIONS)",
-            *notes,
-        ]
-        # dbt-postgres reports no billing figure; per-node execution time is the
-        # honest database-seconds actual.
+        notes = [_DB_LOAD_CAP_NOTES.get(connector, _UNCAPPED_BUILD_NOTE), *notes]
+        # The db-load dbt adapters report no billing figure; per-node execution
+        # time is the honest database-seconds actual.
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )
@@ -1027,19 +1051,37 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
     # that function's own fallback (discovery from the repo root) would not
     # honor. For dbt the two agree by construction: its view loads the same
     # resolved directory `project_dir()` returns.
-    declares_surface = getattr(editable, "editing_surface", None) is not None
-    stored, diffs, warnings = plans_mod.plan(
-        intent,
-        edits,
-        None if declares_surface else engine.project_dir(),
-        repo_root,
-        store=engine.require_full_store("storing a semantic plan"),
-        # Agent-authored edits, which is the caller `editing_surface` exists for:
-        # there is no placement to compare a path against here, only the surface
-        # the format admits to owning. A format declining the write tier is
-        # `None` and validates against dbt's surface as before.
-        project_format=editable,
-    )
+    #
+    # Asked structurally: the branch turns on the format having a whole keyspace
+    # (a view to pin against, and a surface to check in), and a format holding
+    # one without the other has neither. `placement_gap` names the member it is
+    # missing, on the plan path as well as on reconcile's, because this is the
+    # other command that would otherwise fall silently back to dbt's discovery
+    # and refuse with "no dbt project found" in a repository that has none.
+    places = isinstance(editable, PlacingProject)
+    gap = placement_gap(editable)
+    try:
+        stored, diffs, warnings = plans_mod.plan(
+            intent,
+            edits,
+            None if places else engine.project_dir(),
+            repo_root,
+            store=engine.require_full_store("storing a semantic plan"),
+            # Agent-authored edits, which is the caller `editing_surface` exists
+            # for: there is no placement to compare a path against here, only the
+            # surface the format admits to owning. A format declining the write
+            # tier is `None` and validates against dbt's surface as before.
+            project_format=editable,
+        )
+    except DexError as exc:
+        # A format with a placement gap fell back to dbt's project and dbt's
+        # surface, so a refusal here names dbt's paths for an edit the format
+        # placed in its own keyspace, which reads as dex refusing the format's
+        # own file. The gap is what explains it, and it is the reason there was a
+        # fallback at all.
+        if gap is None:
+            raise
+        raise type(exc)(f"{exc}. {gap}") from exc
     return PlanResult(
         plan_id=stored.plan_id,
         intent=stored.intent,
@@ -1048,7 +1090,7 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
             stored.plan_id
         ),
         diffs=diffs,
-        warnings=warnings,
+        warnings=[*warnings, gap] if gap else warnings,
     )
 
 

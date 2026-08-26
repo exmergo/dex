@@ -9,7 +9,261 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-08-25
+
+### Added
+
+- **ClickHouse connector, self-hosted** ([#188]). The seventh connector, and the
+  second to bill nothing in dollars. Installed as `exmergo-dex-core[clickhouse]`
+  (the `clickhouse-connect` driver plus `dbt-clickhouse`), it runs the whole ETM
+  loop: inventory, profiling with PII flags, relationship inference and
+  verification, firewalled ad-hoc SQL, k-means clustering, `transform init`,
+  plan/apply, dev-target builds, and all four drift axes.
+
+  Identifiers are **two-part** `database.table`. ClickHouse has no catalog level
+  and dbt-clickhouse's `schema:` *is* the ClickHouse database, so a synthesized
+  third component would be a name that appears in the cache, the inventory and
+  every drift finding while being untypeable in `clickhouse-client`. Every
+  shared consumer of an identifier was already arity-agnostic, so nothing
+  downstream needed the fiction.
+
+  The paradigm is **database load**, expressed as database-seconds, exactly like
+  Postgres. Self-hosted ClickHouse bills no currency, but a scan is real load on
+  a server that is usually shared, and `free_local` would have removed the
+  handshake from a connector where an unbudgeted scan of a ten-billion-row table
+  is the exact failure the gate exists to stop. The lifecycle is unusually good:
+  the estimate comes from `EXPLAIN ESTIMATE`, which is free, executes nothing,
+  and prices a statement *after* primary-key and partition pruning, with a
+  `system.tables` fallback for the relations it does not cover and an
+  `estimate_basis` field saying which of the two priced a given command;
+  settlement is free and exact, because every response carries the server's own
+  elapsed nanoseconds in the `X-ClickHouse-Summary` header, so the ledger records
+  what the server spent rather than what the client waited.
+
+  Every billed statement carries **two** server-side caps, not one.
+  `max_execution_time` is checked at block boundaries and a single fast block can
+  overshoot it, so `max_bytes_to_read` rides alongside, derived by inverting the
+  same throughput constant the estimate used. Both overflow modes are set to
+  `throw` explicitly, so a server default of `break` could never turn a cap into
+  a silently truncated result: a refusal is recoverable, a wrong answer is not.
+  `max_result_rows` is deliberately not set, because with `throw` it refuses the
+  one-extra-row fetch that detects truncation and with `break` it was measured
+  not to bind at all.
+
+  Read-only is enforced in depth: `readonly = 2` and `allow_ddl = 0` sent as
+  settings on every statement rather than set once on the client (so a
+  host-supplied client cannot lose them), the SELECT-only guard in the ClickHouse
+  dialect through one execution door, an adapter that issues no mutating
+  statement, and a documented least-privilege user. `connect test` reports
+  `session_read_only` from the server's own setting rather than assuming it, and
+  the reference page states the honest limit: `readonly = 2` permits a session to
+  raise its own settings, so the cap is self-imposed exactly as Postgres's
+  `SET statement_timeout` is, and the unraisable form is a server-side settings
+  constraint.
+
+  Nullability comes from the type rather than a column flag, since
+  `system.columns` has no `is_nullable`: `Nullable(...)` and
+  `LowCardinality(...)` are unwrapped in either nesting order before any type
+  reasoning happens. `ORDER BY` is treated as a sort key and never as a
+  uniqueness constraint, and tables on `ReplacingMergeTree` and its relatives
+  carry a note saying rows sharing the sorting key survive until a merge
+  collapses them, so a duplicate count there reads as engine behavior rather than
+  as a grain defect. `max_full_profile_bytes` is honored only where the table
+  declared a sampling expression in its MergeTree key, and refused out loud with
+  a note where it cannot be, rather than silently producing a full scan the user
+  believed was sampled.
+
+  ClickHouse Cloud bills compute-unit-hours, which dex does not model, so
+  `clickhouse.deployment: cloud` is **refused at connect** naming the gap rather
+  than guarded with a database-seconds number that could not bound the spend. The
+  field and `compute_unit_price_usd` are accepted now so the committed config
+  surface will not change shape when Cloud lands, and
+  `compute_unit_price_usd` is refused under `self_hosted`, where it would be
+  accepted and ignored. Deployment is a declaration, never a sniff: the server's
+  `cloud_mode` setting is checked only to catch a declaration that does not match
+  reality.
+
+  The five safety families are extended to the new connector against a stateful
+  fake (`tests/fakes/clickhouse.py`), and `references/clickhouse.md` documents the
+  cost story, the two-part namespace, and the grant shape. The live suite runs
+  against a container `scripts/setup_clickhouse_dev.sh` stands up, and CI runs
+  that same script rather than a second copy of the seed, so the dogfood target
+  and the CI target cannot drift apart. The whole loop was verified live against
+  ClickHouse 25.3, including a real `dbt build` into the dev database and the
+  shipped `unpivot_json_object` macro, whose ClickHouse implementation uses
+  `ARRAY JOIN` because there is no lateral join.
+
+- **A project format's write tier is asserted at the strength it is used, and
+  `load()` is declared** ([#328]). A second format reached tier 3 and
+  `PlacingProject` in full, passed the whole conformance suite, and still could
+  not have completed a single `maintain reconcile`. Two gaps, one seam: what the
+  write tier requires was not what its contract asserted.
+
+  **`load()` is now a declared member of `PlacingProject`**, with the shape its
+  callers need stated on it: `ProjectView` (`root`, and `files` keyed the way
+  `edit_path` keys) and `SourceFileView` (`content`, `sha256`). Nothing declared
+  it before, and two callers used it anyway, so a format implementing the four
+  declared methods and omitting this one passed conformance and raised
+  `AttributeError: load` on the first real reconcile, after the tier said 3 and
+  after the gate let it through. It sits beside the two methods that share its
+  keyspace rather than on tier 3, for the reason `PlacingProject` is beside the
+  tiers at all: these protocols are `runtime_checkable`, so a method added to
+  tier 3 demotes every format that has not implemented it, and this requirement
+  is not tier 3's to state. Nothing outside the placement path calls `load()`,
+  so a format that receives edits and does not place them never needed a view.
+
+  The two view protocols are deliberately not `runtime_checkable` and nothing
+  calls `isinstance` against them: on a data protocol that only asks whether the
+  attribute names exist, which reads as a type check and is not one. The
+  conformance suite makes that check instead, with a message naming the missing
+  member and what it costs. `isinstance(view, DbtProjectView)` stays where it is,
+  because it asks whether a view is dbt's surface rather than whether it is a
+  view.
+
+  **Three assertions join the write contract**, each catching a defect that
+  passed it before, and all three are silent failures where the apply reports
+  success. A conflict now has to refuse the whole edit set rather than the
+  conflicting edit within it, which is the worst of them: landing the clean half
+  leaves the project matching neither the proposal nor what the human had, while
+  the apply reports itself refused, so nothing records which half arrived. A
+  create pinned to no prior content has to be refused when a file has appeared at
+  that path since, rather than overwriting whole the file somebody wrote during
+  review. And `write_edits` has to honor the surface its format declared,
+  asserted on the case a string-prefix comparison gets wrong, where
+  `declarations` admits `declarations_backup/`.
+
+  The first of those is worth an optional hook, `a_clean_edit(project)`, which
+  returns an unconflicted edit and a callable reading its target. Without it the
+  assertion can only ask what `write_edits` reported, so a writer that lands half
+  a set and reports nothing written still passes; with it, the project itself is
+  read. No new mandatory hook, so a downstream suite that was green stays
+  runnable, and the new assertions compose from what implementers already supply.
+
+  **A format holding part of `PlacingProject` is now told which member it is
+  missing.** The gate asks for the protocol structurally rather than probing for
+  one method, so the answer for a partial format is the advisory degradation a
+  narrower format has always got, on the `transform plan` path as well as
+  reconcile's, and the message names `load()` rather than sending the implementer
+  back to the two methods they already wrote.
+
+### Changed
+
+- **`transform apply` re-checks containment against the surface the format
+  declares, before the plan reaches the writer** ([#328]). The hashes are
+  re-checked at apply because a plan is a stored artifact that sits through a
+  human review, and the surface is exactly as much a plan-time fact as they are.
+  The shipped format re-checks inside its own writer; a second format was
+  trusted to. A stored edit whose path falls outside the declared surface is now
+  a `PlanError` naming the path and the surface, and `--confirm` is not a way
+  past it: confirmation is the handshake for a human edit somebody can look at
+  and accept, and nobody accepts a write outside the region the format itself
+  declared.
+
+- **The dbt format declares the four root manifests it authors, not just its
+  model and macro paths** ([#328]). `editing_surface()` omitted `packages.yml`,
+  `dependencies.yml`, `dbt_project.yml` and `profiles.yml` on the grounds that
+  dbt's own writer allowed them by name. With a second consumer re-checking that
+  declaration at apply, a surface narrower than the writer is not a modest claim:
+  it refuses the project config, the profiles and the package manifests, every
+  one of which is a path dex authors through a plan. What a format declares has
+  to be what its writer will take.
+
 ### Fixed
+
+- **A project format that places an edit and cannot be read no longer raises
+  from inside a command** ([#328]). `plans.plan` and `transform`'s authored-plan
+  path both decided whether to route through the format by probing for
+  `editing_surface`, then called `load()`, which no protocol declared. A format
+  holding one without the other reached that line and raised `AttributeError`
+  mid-command. Both now ask for `PlacingProject` structurally, so the format
+  falls back to the pre-seam behavior and carries a warning naming the member it
+  is missing. On the plan path that fallback is dbt's project and dbt's surface,
+  which refuses an edit the format placed in its own keyspace while naming dbt's
+  paths, so the gap rides along on the refusal to explain why dbt's surface was
+  the one consulted.
+
+- **A `DATETIME` column no longer reports its hour continuity as clean when it
+  was never measured** ([#188]). `is_date_only_type` claimed any type containing
+  `DATE` and not `TIMESTAMP`, which is true of ClickHouse `DateTime` and
+  `DateTime64` **and of BigQuery `DATETIME`**. Those columns were read as bare
+  calendar dates, so the hour-grain half of temporal continuity was silently
+  skipped: the column reported day and month gaps and simply never reported an
+  hour gap, which reads as a clean result rather than a missing one. `DATETIME`
+  is now excluded alongside `TIMESTAMP`. Verified live: a ClickHouse `DateTime`
+  column now reports 2,088 distinct hours and a 3-hour largest gap where it
+  previously reported nothing at that grain.
+
+- **A cheap command is no longer refused for having a sub-unit budget
+  remainder** ([#188]). `remaining_for_statement` returns an integer, because
+  every connector's cap setting takes one, and on the time-paradigm connectors a
+  cap of 0 does not mean "spend nothing" but *no limit* (Postgres
+  `statement_timeout`, ClickHouse `max_execution_time`), so the adapters refuse
+  rather than hand the server a 0. That makes which term produced a sub-unit
+  value load-bearing, and the two were conflated: a ceiling with under a unit
+  left is genuinely nearly spent and refusing is right, but the per-command
+  *booking* is headroom reserved for work that has not happened, and a cheap
+  statement legitimately books a fraction of a unit. Truncating that to 0
+  refused affordable work, and it fired on every small query the moment
+  `budget.session_ceiling` was set, since that setting is what creates a
+  reservation at all: `explore query` against a 60-second budget was refused
+  with "the remaining budget is under one database-second" having spent
+  nothing. The exhaustion test now reads the ceiling, and the booking is only
+  ever allowed to tighten the cap rather than turn it into a refusal.
+  **This affected Postgres identically** and was found by dogfooding the new
+  connector.
+
+- **`transform build` no longer claims a server-side cap it did not inject**
+  ([#188]). `_build_env` keyed the db-load cap on the paradigm alone and set
+  `PGOPTIONS`, and the build result asserted that each statement had been capped
+  by a `statement_timeout` injected through it. That was true while Postgres was
+  the only db-load connector and false the moment a second one existed:
+  ClickHouse ignores `PGOPTIONS` entirely, so the build would have run uncapped
+  while the envelope reported otherwise, which is a false cost-safety claim
+  rather than a missing feature. Both the environment injection and the note now
+  dispatch on the connector, a connector with no registered mechanism gets no
+  cap **and says the build was uncapped**, and a test asserts the two tables
+  cover exactly the same connectors so they cannot drift into claiming a cap
+  that was never applied.
+
+- **`explore query` no longer fails inside its own confirmed budget on
+  BigQuery** ([#320]). The server-side `maximum_bytes_billed` cap was set to
+  this command's own reservation against the cumulative session ceiling
+  (sized to the dry-run estimate), not the wider per-command budget the
+  operator actually confirmed. BigQuery's own execution-time rounding of
+  bytes billed can exceed any dry-run estimate regardless of how accurate
+  that estimate was, so a multi-table statement confirmed at a budget six
+  times its estimate still failed with `bytesBilledLimitExceeded`, a
+  self-imposed cap the error message never named as the cause.
+
+  BigQuery's own refusal already states the exact byte count it needed
+  (`"163595928. 164626432 or higher required."`), so a statement that hits
+  the cap now widens its charge to precisely that number and retries once,
+  rather than guessing at a margin or handing the warehouse a cap wider than
+  what this command actually reserved. A retry that still can't fit the
+  confirmed ceiling refuses on the real number, exactly as it would have
+  without the retry; the concurrency guarantee a cumulative session ceiling
+  depends on (two commands sharing one ceiling can never jointly overspend
+  it, [#159]) is unaffected, since the widening goes through the same locked
+  admission path an estimate drifting past its booking already used.
+  
+- **A mid-batch `explore query` refusal states exactly how much more budget
+  finishes the batch** ([#321]). BigQuery bills at least its per-query floor
+  no matter how little a statement reads, so an N-statement call needs at
+  least `N x 10,485,760` bytes of headroom; the multi-statement estimate
+  already reserves that (summed per-statement, since each floors on its own
+  distinct tables), and confirming at that estimate already completes every
+  statement for a batch that genuinely reads almost nothing. What can still
+  strand the tail is the same execution-time variance [#320] fixes within
+  one statement, here compounding across several: each statement's real
+  bill sits just far enough above its own floor that the shortfall only
+  surfaces once several statements have already run and billed.
+
+  A refusal partway through a batch already keeps and reports every
+  statement that completed, since it has been paid for; it now also states,
+  in the same refusal, exactly how many bytes finishing the remaining
+  statements needs, computed the same way the original estimate was, so a
+  caller re-running with a wider `--budget` picks the right number the
+  first time rather than guessing again after a second partial run.
 
 - **`get_dialect` now raises on an unrecognized connector instead of
   silently parsing every subsequent statement as DuckDB** ([#319]). A
@@ -153,6 +407,71 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   a human must still copy, edit, and commit, exactly as much friction for
   `credential` as for `name`. Inventing a severity tier to special-case here
   would be new, untested policy with no existing basis, not a fix.
+  
+- **`explore profile --check-cumulative` detects a running total or
+  point-in-time snapshot measure** ([#219]). A numeric column holding a
+  running total, an account balance, or a subscription's current MRR
+  profiles identically to one holding a per-row increment: same type, same
+  null fraction, same uniqueness. Summing it across rows is a common and
+  severely damaging misreading, and it silently inflates every aggregate
+  built on top of it.
+
+  The signal is structural: within an entity (a repeating, id-shaped column
+  that is not itself the table's own key) ordered by a temporal column, a
+  cumulative or snapshot measure almost never decreases from one observation
+  to the next, while a genuine per-row increment has natural ups and downs.
+  Measuring that needs a window-function scan over the table, so it sits on
+  the gated side of the free-versus-gated split: opt-in via
+  `--check-cumulative`, priced and confirmed the same way `--verify` prices
+  relationship overlap probes. The base profile always completes and is
+  returned first; the check runs as a second, individually skippable phase
+  against what the base scan already proved, and never blocks it. A table
+  missing an entity key or a temporal column is skipped with a note, not
+  silently reported as clean, and only fractions and observation counts ever
+  leave the engine, never a measure's value.
+
+- **`explore semantic list` carries the dbt project's own label and description
+  on dimensions and entities, not just on metrics** ([#333]). The catalog
+  answered with a rich metrics list beside two lists of bare snake_case
+  identifiers, because `DimensionInfo` and `EntityInfo` held a name and a type
+  and nothing else. A consumer rendering the catalog as a browsable manifest had
+  an empty Description column on its dimensions and entities tabs, and search
+  over them degraded to substring matching on the identifier, because there was
+  genuinely no field to show. An agent deciding what to group by got
+  `user__pricing_tier` when the dbt project may well have said what that
+  dimension means.
+
+  Both backends carried the fields all along and dex dropped them at the
+  request. The hosted catalog query asked for `dimensions { name type }`, so
+  widening the selection set costs no extra round trip, and the compiled semantic
+  manifest declares `label` and `description` on both elements where the local
+  read-view kept only the name and the type. Where the same element is met more
+  than once (the hosted API nests a dimension under every metric that can group
+  by it, and locally an entity is declared in every semantic model that joins on
+  it) each field now takes the first non-null value rather than the first copy
+  outright, so whichever copy happens to sort first can no longer blank out text
+  another one carries.
+
+  One asymmetry is structural and disclosed rather than papered over: the dbt
+  Cloud API's `Entity` type has no `label`, and asking for one fails the entire
+  catalog query, so an entity label arrives only from `--local` and a hosted
+  catalog that has entities says so in a note. What deliberately stays out is
+  everything that is not "what is this and what does it mean": `expr`, `role`,
+  `isPartition`, `queryableGranularities`, and `semanticModel` are all there for
+  the asking, and none of them belong on a discovery surface.
+
+### Changed
+
+- **An unset optional field is omitted from the `explore semantic list` payload
+  rather than emitted as a null** ([#333]). `SemanticCatalog.to_data()` was an
+  unconditional `asdict` per element, so widening dimensions and entities would
+  have billed every caller for placeholders.
+
+  The rule is the same on all three lists, metrics included, so the metrics block
+  no longer emits `"label": null` or `"description": null` as it did before.
+  Absent means unset, and a caller reading the JSON envelope should reach for
+  those fields with `.get()`. An empty list is untouched, because
+  `"dimensions": []` on a metric is an answer where a null is not.
 
 ## [1.6.6] - 2026-08-15
 

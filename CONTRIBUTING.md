@@ -213,6 +213,40 @@ fork-runnable, kept in the integration workflow for pattern parity with the
 cloud connectors rather than as a cost decision. There is no
 `setup_postgres_ci.sh`; there is nothing to provision.
 
+## Live ClickHouse integration tests
+
+The same `tests/integration/` directory carries the ClickHouse suite:
+connection discovery, the database-seconds handshake, the over-ceiling
+refusal, PII flag-not-surface, relationship inference on the seeded orphans,
+temporal continuity over a deliberate gap, a firewalled query using ClickHouse
+idioms (`countIf`, `FINAL`, `ARRAY JOIN`), the dev-target grant preflight, and
+a dbt build into the dedicated dev database. Like the Postgres suite it bills
+nothing and needs no account: the target is a local Docker container.
+
+Unlike Postgres it has only one seeding path, and CI uses it too. The seed is
+multi-statement and the ClickHouse HTTP interface refuses multi-statement
+bodies, so it has to go through `clickhouse-client` inside the container, which
+means the same script serves both places:
+
+```
+scripts/setup_clickhouse_dev.sh
+DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+    DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
+    uv run pytest tests/integration -q -m clickhouse
+scripts/setup_clickhouse_dev.sh --down
+```
+
+There is no `setup_clickhouse_ci.sh`; there is nothing to provision.
+
+Two assertions in that suite are load-bearing and worth understanding before
+changing the seed. The seed puts exactly 40 of 5,000 `order_items` rows on
+products that do not exist, so an orphan probe reporting zero has lost the
+`join_use_nulls` session setting rather than found clean data. And
+`events.occurred_at` is missing exactly three consecutive days out of ninety,
+so a continuity check reporting no gap has the window function wrong. Both
+failures are silent by nature: they produce a clean result rather than an
+error.
+
 ## Agent evals (`evals/`)
 
 The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from
@@ -339,6 +373,18 @@ the code that produced the graph is, so an edit written into the reduction is
 overwritten on the next run. `maintain reconcile` reads that declaration, and your
 format gets advisory proposals and no stored plan, by contract rather than by luck.
 
+If you do serve it, `PlacingProject` is what carries a proposal to your write path,
+and it is three methods rather than two: `load()` reads the keyspace an edit is
+pinned against, `edit_path()` names a key in it, and `editing_surface()` declares the
+region those keys may fall in. They go together because none of them answers
+anything alone, and a format holding two of the three places nothing at all. Mix
+`PlacingProjectContract` in beside your tier-3 contract: it checks that the three
+agree, that the view carries the `root`, `content` and `sha256` a pinned edit needs,
+and that your own writer refuses a path outside the surface you declared, including
+the sibling case a string-prefix comparison lets through. Supplying its optional
+`a_clean_edit(project)` hook is what upgrades the all-or-nothing assertion from
+asking what your writer reported to reading what your project holds.
+
 Decide it by asking which artifact an edit would land in, not where your project came
 from. Those questions come apart more often than the graph example suggests: an asset
 graph carries neither column names nor join keys, so a format over one reads its
@@ -350,7 +396,10 @@ serve this tier for that channel while still refusing to author a model.
 that are not obvious from the signatures.
 
 Formats contributed here run the same suite: see
-`packages/dex-core/tests/adapters/test_project_parity.py`.
+`packages/dex-core/tests/adapters/test_project_parity.py` for the shipped format, and
+`packages/dex-core/tests/adapters/test_project_conformance.py` for a format that is
+neither dbt nor a directory, driven through the contract and then broken on purpose,
+one defect per assertion.
 
 ## Linting and formatting (Ruff)
 

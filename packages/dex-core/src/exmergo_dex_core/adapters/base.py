@@ -417,10 +417,19 @@ def is_date_only_type(data_type: str) -> bool:
     is meaningless on one (there is nothing to truncate to an hour), and on
     BigQuery ``DATE_TRUNC`` does not even accept an ``HOUR`` unit -- so
     every adapter skips the hour-grain computation for this shape rather
-    than relying on another dialect's implicit date-to-timestamp cast."""
+    than relying on another dialect's implicit date-to-timestamp cast.
+
+    ``DATETIME`` is excluded alongside ``TIMESTAMP`` because it *is* a
+    timestamp under a different spelling (BigQuery ``DATETIME``, ClickHouse
+    ``DateTime``/``DateTime64``) and the bare ``"DATE" in upper`` test would
+    otherwise claim it. Getting that wrong is silent: the column keeps its
+    day and month continuity and simply never reports an hour gap, which
+    reads as a clean result rather than a skipped one."""
 
     upper = data_type.upper()
-    return "DATE" in upper and "TIMESTAMP" not in upper
+    if "TIMESTAMP" in upper or "DATETIME" in upper:
+        return False
+    return "DATE" in upper
 
 
 TEMPORAL_UNITS_WITH_TIME = ("day", "month", "hour")
@@ -717,6 +726,17 @@ def temporal_alignment_expressions(
     ]
 
 
+def default_lag_expr(value: str, order_by: str) -> str:
+    """The standard-SQL previous-row window expression, used by every dialect
+    whose ``LAG`` returns NULL past the frame edge.
+
+    ClickHouse has no ``LAG`` at all, and its ``lagInFrame`` substitute returns
+    the *type default* rather than NULL for the first row, so a connector whose
+    lag idiom differs supplies its own (see `temporal_continuity_sql`)."""
+
+    return f"LAG({value}) OVER (ORDER BY {order_by})"
+
+
 def temporal_continuity_sql(
     qcol: str,
     i: int,
@@ -724,20 +744,32 @@ def temporal_continuity_sql(
     table_sql: str,
     date_trunc: Callable[[str, str], str],
     date_diff: Callable[[str, str, str], str],
+    lag_expr: Callable[[str, str], str] = default_lag_expr,
 ) -> list[str]:
     """Distinct-period count and largest gap for one column at one
     granularity, as two scalar subqueries spliced into the caller's flat
     SELECT (the same "subquery inside the SELECT list" shape
     ``distinct_combination_sql`` already uses for composite-key probes).
 
-    The gap is measured between consecutive *present* periods via
-    ``LAG() OVER (ORDER BY period)``, diffed by the caller's own date-diff
-    idiom (there is no universal ``DATEDIFF`` across dialects -- Postgres
-    has none), minus one: a diff of 1 between neighbors means no missing
-    period between them, so the reported gap is the count of missing
-    periods in the widest run, not the raw diff. ``COALESCE(..., 0)``
-    covers both the single-period and the empty-column case, where the
-    inner aggregate has nothing (or only a NULL first-row lag) to compare.
+    The gap is measured between consecutive *present* periods via the
+    caller's ``lag_expr`` (standard ``LAG`` for every dialect that has one),
+    diffed by the caller's own date-diff idiom (there is no universal
+    ``DATEDIFF`` across dialects -- Postgres has none), minus one: a diff of
+    1 between neighbors means no missing period between them, so the
+    reported gap is the count of missing periods in the widest run, not the
+    raw diff. ``COALESCE(..., 0)`` covers both the single-period and the
+    empty-column case, where the inner aggregate has nothing (or only a NULL
+    first-row lag) to compare.
+
+    **The first row's lag must be NULL, not a zero value.** ``MAX`` skips
+    NULL, so a NULL lag drops the meaningless first-row comparison; a lag
+    that yields the type default instead (ClickHouse ``lagInFrame`` without
+    an explicit NULL default returns the epoch) makes every column report a
+    gap of ~20,000 days, and one that silently returns the *current* row
+    makes every column report no gap at all. Both look like a working
+    detector. Any adapter overriding ``lag_expr`` owes a live test against a
+    column with a known hole.
+
     Only two integers ever leave the engine through this path.
     """
 
@@ -751,7 +783,7 @@ def temporal_continuity_sql(
         f"FROM {table_sql} WHERE {qcol} IS NOT NULL)"
     )
     lagged = (
-        f"(SELECT period, LAG(period) OVER (ORDER BY period) AS prev_period "  # noqa: S608
+        f"(SELECT period, {lag_expr('period', 'period')} AS prev_period "  # noqa: S608
         f"FROM {periods} AS periods_{alias}_{i})"
     )
     gap_expr = date_diff(unit, "period", "prev_period")

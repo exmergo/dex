@@ -192,6 +192,7 @@ it is better than the one a point below it.
 ## Connectors
 
 - Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first).
+- Self-hosted analytical: **ClickHouse**.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
@@ -204,16 +205,22 @@ through the SDK's unified chain (`databricks auth login`, `DATABRICKS_*` env,
 or a dbt profile), Redshift through the AWS credential chain (a pinned
 Serverless workgroup mints IAM temporary database credentials) or `REDSHIFT_*`
 env, Postgres through `pg_service.conf`, `DATABASE_URL`, the `PG*`
-environment, or a dbt profile. Every scan is estimated and confirmed
-before it spends, capped server-side (`maximum_bytes_billed` on BigQuery; a
-per-statement statement timeout on Snowflake, Databricks, Redshift, and
-Postgres, whose budgets are warehouse-seconds with credits or DBUs alongside,
-compute-seconds with RPU-hours alongside, and database-seconds respectively),
-and recorded in a local spend ledger.
+environment, or a dbt profile, ClickHouse through `CLICKHOUSE_URL`, the
+`CLICKHOUSE_*` environment, or a dbt profile. Every scan is estimated and
+confirmed before it spends, capped server-side (`maximum_bytes_billed` on
+BigQuery; a per-statement statement timeout on Snowflake, Databricks, Redshift,
+and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse,
+whose budgets are warehouse-seconds with credits or DBUs alongside,
+compute-seconds with RPU-hours alongside, and database-seconds for the last
+two), and recorded in a local spend ledger.
+
+The two self-hosted connectors bill no dollars, and dex still gates them: an
+unbounded scan on a production Postgres primary or a shared ClickHouse cluster
+is a real cost even when nothing appears on an invoice.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Trino**, **ClickHouse**, **Azure Synapse**, **Microsoft Fabric**
+- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**, **ClickHouse Cloud**
 
 ## The `exmergo-dex-core` package
 

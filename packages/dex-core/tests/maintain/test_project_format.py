@@ -35,7 +35,7 @@ from exmergo_dex_core.maintain.snapshot import (
     SourceTable,
     TransformLayer,
 )
-from exmergo_dex_core.transform.plans import EditKind
+from exmergo_dex_core.transform.plans import EditKind, contained_key
 
 _NOTE = "models are assets in an orchestrated graph, so no file backs a definition"
 
@@ -188,8 +188,13 @@ class SidecarView:
         self.files = files
 
 
-class SidecarGraphProject(GraphProject):
-    """Tier 3 for one channel only, which is the shape #258 is about.
+class ViewlessSidecarProject(GraphProject):
+    """Tier 3 for one channel only, and no way to read the keyspace it places in.
+
+    Split out from :class:`SidecarGraphProject` rather than written twice: the
+    only difference is `load()`, which is the member a second format implemented
+    without being asked to and dex called anyway. Everything below is what a
+    format got right and still could not complete a reconcile with.
 
     The models are a reduction of a running graph and cannot receive an authored
     staging model. The declared keys live in a hand-written YAML sidecar that
@@ -211,18 +216,6 @@ class SidecarGraphProject(GraphProject):
     def _root(self) -> Path:
         return Path(self.context.repo_root or ".")
 
-    def load(self) -> SidecarView:
-        root = self._root()
-        files = {}
-        for path in sorted(root.glob("declarations/*.yml")):
-            content = path.read_text(encoding="utf-8")
-            files[f"declarations/{path.name}"] = SourceFile(
-                path=f"declarations/{path.name}",
-                content=content,
-                sha256=content_hash(content),
-            )
-        return SidecarView(str(root), files)
-
     def edit_path(self, kind: EditKind, model: str) -> str | None:
         if kind is EditKind.SCHEMA_YML:
             return f"declarations/{model}.yml"
@@ -236,6 +229,10 @@ class SidecarGraphProject(GraphProject):
         root = Path(project_dir) if project_dir else self._root()
         conflicts, staged = [], []
         for edit in edits:
+            # The writer honors the surface the format declared, rather than
+            # trusting whoever built the edit to have honored it. `write_edits`
+            # is a public method, so the plan-time check is not the only door.
+            contained_key(edit.path, self.editing_surface())
             target = root / edit.path
             current = target.read_text(encoding="utf-8") if target.is_file() else None
             found = content_hash(current) if current is not None else None
@@ -256,6 +253,27 @@ class SidecarGraphProject(GraphProject):
         return ApplyResult(
             written=[e.path for _, e in staged], diffs=[], conflicts=conflicts
         )
+
+
+class SidecarGraphProject(ViewlessSidecarProject):
+    """The whole seam: the sidecar can be read as well as placed into and written.
+
+    `load()` is what carries the declarations dex pins an edit against and reads
+    before it proposes one. It lives here rather than on the base above only so
+    the base can stand in for the format that omits it.
+    """
+
+    def load(self) -> SidecarView:
+        root = self._root()
+        files = {}
+        for path in sorted(root.glob("declarations/*.yml")):
+            content = path.read_text(encoding="utf-8")
+            files[f"declarations/{path.name}"] = SourceFile(
+                path=f"declarations/{path.name}",
+                content=content,
+                sha256=content_hash(content),
+            )
+        return SidecarView(str(root), files)
 
 
 @pytest.fixture
@@ -495,6 +513,75 @@ def test_an_authored_edit_is_pinned_and_applied_where_the_format_put_it(
     assert applied["data"]["written"] == [_SIDECAR]
     assert "unique" in (authored_repo / _SIDECAR).read_text(encoding="utf-8")
     assert not (authored_repo / "analytics" / _SIDECAR).exists()
+
+
+@pytest.fixture
+def viewless_repo(maintain_repo, monkeypatch):
+    """The same repository, wired to the format that cannot be read."""
+
+    module = types.ModuleType("dex_viewless_format")
+    module.viewless_project = ViewlessSidecarProject
+    monkeypatch.setitem(sys.modules, "dex_viewless_format", module)
+
+    config = maintain_repo.root / ".dex" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "project:\n  format: dex_viewless_format:viewless_project\n",
+        encoding="utf-8",
+    )
+    sidecar = maintain_repo.root / _SIDECAR
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(_SIDECAR_CONTENT, encoding="utf-8")
+    return maintain_repo
+
+
+def test_a_format_that_cannot_be_read_degrades_and_names_the_member(viewless_repo):
+    """The gap arrives as a warning, not as `AttributeError` mid-command.
+
+    This is the format the write tier let all the way through: it implements
+    every declared method, omits the one no protocol declared, answers tier 3,
+    passes the gate, and then raised from inside a reconcile someone ran. What it
+    gets now is what a narrower format has always got, advisory proposals and a
+    warning, and the warning names the member rather than sending the
+    implementer to the two they already wrote.
+    """
+
+    _grain_drift(viewless_repo)
+
+    rc, payload = viewless_repo.dex("maintain", "reconcile", "grain")
+
+    assert rc == 0 and payload["status"] == "ok", payload.get("errors")
+    assert payload["data"].get("plan_id") is None
+    assert not payload.get("diffs")
+    warning = next(w for w in payload["warnings"] if "PlacingProject" in w)
+    assert "`load()`" in warning
+    # And not sent to the members it already implements.
+    named = warning.split("missing")[1].split(".")[0]
+    assert "edit_path" not in named and "editing_surface" not in named
+
+
+def test_an_authored_plan_against_an_unreadable_format_says_so(viewless_repo, tmp_path):
+    """`transform plan` is the other caller, and it used to fall back silently.
+
+    The format is not asked for a view it cannot produce, so dex goes back to
+    discovering a dbt project, which is what every caller predating the seam
+    gets. That fallback is the right behavior and a baffling refusal on its own:
+    the edit is turned down for being outside *dbt's* model paths, when the
+    format placed it inside the surface it declared, so the message describes a
+    project the author was not editing. The gap rides along to say why dbt's
+    surface was the one consulted.
+    """
+
+    payload_file = _authored_edit(tmp_path, _AUTHORED)
+
+    rc, payload = viewless_repo.dex(
+        "transform", "plan", "add a unique test", "--edits-file", str(payload_file)
+    )
+
+    assert rc != 0
+    reported = json.dumps(payload["errors"])
+    assert "outside" in reported
+    assert "`load()`" in reported and "PlacingProject" in reported
 
 
 def test_a_placing_format_still_declines_the_staging_model_channel(sidecar_repo):

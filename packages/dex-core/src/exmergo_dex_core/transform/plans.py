@@ -153,14 +153,23 @@ def plan(
     if not edits:
         raise PlanError("a plan needs at least one edit")
 
-    # A format that declares no surface is not routed through this seam at all:
-    # it goes down the path it went down before the seam existed, loading the dbt
-    # project and validating against dbt's paths. That is a deliberate fallback
-    # rather than an oversight. Such a format cannot place an edit either (the
-    # placement seam and the surface are declared together), so the edits reaching
-    # here are dbt-shaped and dbt's view is the right thing to pin them against.
-    declares_surface = getattr(project_format, "editing_surface", None)
-    if project_format is not None and declares_surface is not None:
+    # A format that does not place is not routed through this seam at all: it goes
+    # down the path it went down before the seam existed, loading the dbt project
+    # and validating against dbt's paths. That is a deliberate fallback rather than
+    # an oversight, and the edits reaching here are dbt-shaped, so dbt's view is the
+    # right thing to pin them against.
+    #
+    # Asked structurally rather than by probing for `editing_surface`, because the
+    # branch needs `load()` as well and a format holding one without the other used
+    # to reach this line and raise `AttributeError` from inside it. `PlacingProject`
+    # is the object that says all three are there; `placement_gap` is what tells an
+    # implementer which one is not.
+    #
+    # Late import: `adapters.project` reads this module's `EditKind`.
+    from ..adapters.project import PlacingProject
+
+    places = isinstance(project_format, PlacingProject)
+    if places:
         view = project_format.load()
         project = Path(project_dir) if project_dir else Path(getattr(view, "root", "."))
     else:
@@ -173,7 +182,7 @@ def plan(
     # this from becoming the `isinstance(project, DbtProject)` gate the seam
     # exists to remove.
     dbt_shaped = isinstance(view, DbtProjectView)
-    surface = [] if dbt_shaped else list(declares_surface())
+    surface = [] if dbt_shaped or not places else list(project_format.editing_surface())
 
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
@@ -344,13 +353,34 @@ def apply(
     accepted it, and the tier-3 ``write_edits`` the format implemented would
     never be reached. A plan a format could store and not apply is not a write
     path.
+
+    Raises ``PlanError`` when a stored edit falls outside the surface the format
+    declares, before anything is handed to the writer. Confirmation does not
+    override it.
     """
+
+    from ..adapters.project import PlacingProject
 
     stored = store.load_plan(plan_id)
     project = Path(repo_root) / stored.project_dir
     if project_format is None:
         result = write_edits(list(stored.edits), project, confirmed=confirmed)
     else:
+        # Containment is re-checked here, against the surface the format declares
+        # now, for the same reason the hashes are re-checked: a plan is a stored
+        # artifact that sat through a human review, and what it was validated
+        # against at plan time is not what it is being written into. The shipped
+        # format re-checks inside its own writer; a second format is otherwise
+        # trusted to, and this is the one guarantee that is not a format's to
+        # decide.
+        #
+        # A hard refusal rather than a conflict: `confirmed` is the handshake for
+        # a human edit someone can look at and accept, and no one accepts a write
+        # outside the surface the format itself declared.
+        if isinstance(project_format, PlacingProject):
+            surface = list(project_format.editing_surface())
+            for edit in stored.edits:
+                contained_key(edit.path, surface)
         result = project_format.write_edits(
             list(stored.edits), project, confirmed=confirmed
         )

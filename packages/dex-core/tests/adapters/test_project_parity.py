@@ -30,6 +30,8 @@ from exmergo_dex_core.adapters.project import (
     DbtProject,
     EditableProject,
     ProjectContext,
+    ProjectView,
+    SourceFileView,
     tier_of,
 )
 from exmergo_dex_core.config import DexConfig
@@ -44,6 +46,7 @@ from exmergo_dex_core.maintain.snapshot import (
     TransformLayer,
 )
 from exmergo_dex_core.storage import MemoryStore
+from exmergo_dex_core.transform.plans import PlanError, contained_key
 
 _PROJECT_YML = (
     'name: dex_test\nversion: "1.0.0"\nprofile: dex_test\nmodel-paths: ["models"]\n'
@@ -90,6 +93,27 @@ def _staged_conflict(root: Path):
     )
 
 
+def _clean_edit(root: Path):
+    """An edit beside the staged conflict that is not itself in conflict.
+
+    Supplied so the all-or-nothing assertion asks what the project holds rather
+    than what the writer reported holding: a writer that lands this one while
+    refusing the conflict answers the result honestly and still leaves the tree
+    matching nothing anybody proposed.
+    """
+
+    target = root / "analytics" / "models" / "stg_orders.sql"
+    edit = dbt_project.Edit(
+        path="models/stg_orders.sql",
+        new_content="select 1 as order_id\n",
+        old_content_hash=None,
+    )
+    return (
+        edit,
+        lambda: target.read_text(encoding="utf-8") if target.is_file() else None,
+    )
+
+
 class TestDbtProject(
     DeclaringProjectContract,
     SemanticProjectContract,
@@ -108,6 +132,9 @@ class TestDbtProject(
 
     def an_edit_against_a_changed_target(self):
         return _staged_conflict(self.root)
+
+    def a_clean_edit(self, project):
+        return _clean_edit(self.root)
 
     def placeable_model(self) -> str:
         # The warehouse table, not `stg_orders`: dbt's scaffold prefix is applied
@@ -259,6 +286,9 @@ class TestDbtProjectFactory(ProjectFactoryContract, EditableProjectContract):
     def an_edit_against_a_changed_target(self):
         return _staged_conflict(self.root)
 
+    def a_clean_edit(self, project):
+        return _clean_edit(self.root)
+
 
 class _PathlessProject:
     """A tier-2 format reduced from objects rather than files.
@@ -296,6 +326,47 @@ class TestPathlessProject(MaintainProjectContract):
 
     def make_project(self) -> _PathlessProject:
         return _PathlessProject()
+
+
+def test_the_dbt_view_is_the_shipped_project_view(tmp_path: Path):
+    """`DbtProjectView` implements `ProjectView`, member for member.
+
+    The two protocols are not `runtime_checkable`, deliberately: an isinstance
+    check on a data protocol only asks whether the names exist, which reads as a
+    type check and is not one. Asserting against the declared members rather than
+    a hand-written list is what keeps this honest if a member is ever added, since
+    the shipped format has to grow it too or this fails.
+    """
+
+    view = DbtProject(tmp_path, _project(tmp_path)).load()
+
+    for member in ProjectView.__annotations__:
+        assert hasattr(view, member), f"DbtProjectView has no `{member}`"
+    entry = view.files["models/stg_customers.sql"]
+    for member in SourceFileView.__annotations__:
+        assert hasattr(entry, member), f"SourceFile has no `{member}`"
+
+
+def test_the_dbt_editing_surface_admits_everything_its_writer_accepts(tmp_path: Path):
+    """The declaration and the writer agree, which `transform apply` now needs.
+
+    Containment is re-checked against this list before a stored plan reaches the
+    writer, so a surface narrower than what the writer takes refuses the project
+    config, the profiles and the package manifests at apply. Every one of those is
+    a path dex authors through a plan.
+    """
+
+    project = _project(tmp_path)
+    surface = DbtProject(tmp_path, project).editing_surface()
+
+    for path in (
+        "models/stg_customers.sql",
+        "macros/m.sql",
+        *dbt_project._ALLOWED_ROOT_FILES,
+    ):
+        contained_key(path, surface)
+    with pytest.raises(PlanError):
+        contained_key("models_backup/stg_customers.sql", surface)
 
 
 def test_a_pathless_format_declines_the_write_tier():

@@ -33,6 +33,7 @@ _DISCOVERY = (
     "resolve_databricks_connection",
     "resolve_postgres_connection",
     "resolve_redshift_connection",
+    "resolve_clickhouse_connection",
 )
 
 

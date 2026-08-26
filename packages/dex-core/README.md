@@ -27,6 +27,7 @@ exmergo-dex-core[bigquery]
 exmergo-dex-core[databricks]
 exmergo-dex-core[redshift]
 exmergo-dex-core[postgres]
+exmergo-dex-core[clickhouse]
 exmergo-dex-core[all]          # every optional capability at once
 ```
 
@@ -206,8 +207,11 @@ full surface and the envelope spec.
 
 Early and under active development; open issues on [GitHub](https://github.com/exmergo/dex)! Today the engine
 runs Explore, Transform, and Maintain end to end on every connector: DuckDB,
-BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres, through either
-the command contract or the Python API.
+BigQuery, Snowflake, Databricks, Amazon Redshift, Postgres, and ClickHouse
+(self-hosted), through either the command contract or the Python API. One
+exception, stated so it is never overclaimed: `explore semantic query --local`
+renders through MetricFlow, which ships no ClickHouse renderer, so that one
+capability refuses on ClickHouse by name rather than running.
 
 ### Commands
 
@@ -330,6 +334,27 @@ planner's own statistics instead of scanning distincts, and dbt builds go to
 a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
 carries, with the ceiling injected as a statement timeout through
 `PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
+
+ClickHouse: the self-hosted analytical connector. Connects through discovered
+credentials (`CLICKHOUSE_URL`, the `CLICKHOUSE_*` environment, a committed
+non-secret target, or a dbt profile). Identifiers are two-part
+`database.table`, because ClickHouse has no catalog level and dbt-clickhouse's
+`schema:` is the ClickHouse database. Nothing is billed in dollars; the
+guarded quantity is load on a server that is usually shared, so budgets are
+**database-seconds** through the same confirm handshake. Estimates come from
+the free, non-executing `EXPLAIN ESTIMATE`, which prices a statement after
+primary-key pruning, with a `system.tables` fallback for the relations it does
+not cover; the budget is hard-enforced anyway by a per-statement
+`max_execution_time` **and** `max_bytes_to_read`, since time alone is checked
+only at block boundaries. Settlement is free and exact: every response carries
+the server's own elapsed time, so the ledger records what the server spent
+rather than what the client waited. The session sends `readonly = 2` and
+`allow_ddl = 0` on every statement, and dbt builds go to a dedicated dev
+database via dbt-clickhouse, which the `[clickhouse]` extra carries, with the
+ceiling injected through the profile's `custom_settings`. ClickHouse Cloud
+bills compute-unit-hours, which dex does not yet model, and is refused at
+connect rather than guarded in the wrong unit. See
+[`references/clickhouse.md`](../../references/clickhouse.md).
 
 ## License
 

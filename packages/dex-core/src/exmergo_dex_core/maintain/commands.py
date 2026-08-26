@@ -729,7 +729,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import PlacingProject
+    from ..adapters.project import PlacingProject, placement_gap
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
@@ -773,14 +773,23 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             "actually defined"
         )
     elif not isinstance(editable, PlacingProject):
+        # A format holding some of `PlacingProject` and not the rest gets told
+        # which member is missing, because the general message below would send
+        # it to the ones it already wrote. That is the difference between the
+        # gap being reported here and it surfacing as `AttributeError` from
+        # inside the reconcile the tier check already let through.
         warnings.append(
-            f"the '{editable.name}' project format implements the write tier, but "
-            "does not say where a proposed edit lands, so reconcile has no path to "
-            "plan an edit against and every proposal below is advisory. A format "
-            "reaches this path by implementing `PlacingProject`: `edit_path` "
-            "answers where an edit of a given kind goes and may decline a kind by "
-            "answering None, and `editing_surface` declares the region those "
-            "paths must stay inside"
+            placement_gap(editable)
+            or (
+                f"the '{editable.name}' project format implements the write tier, "
+                "but does not say where a proposed edit lands, so reconcile has no "
+                "path to plan an edit against and every proposal below is "
+                "advisory. A format reaches this path by implementing "
+                "`PlacingProject`: `load` returns the view an edit is pinned "
+                "against, `edit_path` answers where an edit of a given kind goes "
+                "and may decline a kind by answering None, and `editing_surface` "
+                "declares the region those paths must stay inside"
+            )
         )
     else:
         try:

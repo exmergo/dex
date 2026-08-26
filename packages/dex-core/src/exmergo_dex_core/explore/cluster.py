@@ -109,6 +109,14 @@ def _sample_parts(
         # No TABLESAMPLE on Redshift: a random-ordered top-N is the portable
         # sample. It is a full scan bounded by the budget, so the note says so.
         return "", f" ORDER BY RANDOM() LIMIT {n}", f"ORDER BY RANDOM() LIMIT {n}"
+    if dialect == "clickhouse":
+        # ClickHouse has SAMPLE, but only on a table that declared a sampling
+        # expression in its MergeTree key, which most do not. Emitting it
+        # unconditionally would fail on the common case, and falling through to
+        # the unknown-dialect branch would silently scan everything, so this
+        # takes Redshift's shape: a random-ordered top-N, a full scan bounded by
+        # the budget, described honestly in the note.
+        return "", f" ORDER BY rand() LIMIT {n}", f"ORDER BY rand() LIMIT {n}"
     # Unknown dialect: no sampling clause. The row-cap on the fetch and the cost
     # gate still bound the work; column pruning still limits the scan.
     return "", "", "no sample clause (unrecognized dialect)"
