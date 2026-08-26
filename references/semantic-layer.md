@@ -27,9 +27,13 @@ released one-value spelling), plus `vendor`, `deployment`, and `execution`.
   `--where "<jinja>"`, `--order-by <c>`, `--grain <g>`, and `--limit N`.
 
 The query grammar is identical across backends: entity-qualified group-by tokens
-(`user__pricing_tier`, `metric_time`), the Jinja filter dialect in `--where`
-(`{{ Dimension('session__is_deleted') }} = false`), and a `--grain` that applies
-to `metric_time`. Positional metrics and the `--metric`, `--group-by`, and
+(`user__pricing_tier`, `metric_time`), the answering layer's own filter dialect in
+`--where` (dbt's is a Jinja call,
+`{{ Dimension('session__is_deleted') }} = false`), and a `--grain` that applies to
+`metric_time`. A grain is checked against the grains the layer reports for the
+metrics being queried, not against a list dex keeps, so a refusal names what that
+metric actually offers and a granularity the project defined for itself is a grain
+like any other. Positional metrics and the `--metric`, `--group-by`, and
 `--order-by` flags each accept comma-separated lists. The flags may also repeat,
 and the two forms mix freely: `--group-by a,b` and
 `--group-by a --group-by b` are the same query. `--where` never splits, because a
@@ -61,8 +65,8 @@ unset one is absent rather than null:
 | list | fields |
 |---|---|
 | `semantic_models` | `name`, `label`, `description`, `model_ref` (the transformation-layer model it sits on), `agg_time_dimension` (the model's default time dimension), `primary_entity` |
-| `metrics` | `name`, `type`, `label`, `description`, `dimensions` (the tokens it can be grouped by), `semantic_models`, `input_measures` (resolved through any ratio or derived chain), `composition`, `filter`, `vendor_params` |
-| `dimensions` | `name` (the token a query groups by), `type`, `label`, `description`, `definition` (the bare dimension name), `semantic_model` |
+| `metrics` | `name`, `type`, `label`, `description`, `dimensions` (the tokens it can be grouped by), `semantic_models`, `input_measures` (resolved through any ratio or derived chain), `composition`, `filter`, `time_axis` (what a time grouping resolves to), `queryable_granularities`, `vendor_params` |
+| `dimensions` | `name` (the token a query groups by), `type`, `label`, `description`, `definition` (the bare dimension name), `semantic_model`, `queryable_granularities` |
 | `entities` | `name`, `type` (**derived**, see below), `label`, `description`, `roles` |
 | `measures` | `name`, `agg`, `expr`, `agg_time_dimension`, `label`, `description`, `semantic_model` |
 
@@ -72,11 +76,30 @@ means this metric type has no such part rather than that the value is unknown. A
 ratio metric therefore arrives with both of its sides, which is what decides
 whether a group-by is valid on both and whether the ratio is additive.
 
+`time_axis` is what `metric_time` resolves to for this metric, and it is the field
+to read before trusting a time series. `metric_time` is not a dimension of the
+layer: it resolves per metric to that metric's measures' own aggregation time
+dimension, so on a layer of a dozen semantic models one token stands for a dozen
+different physical columns. **More than one entry means the metric's measures
+disagree**, which happens whenever a ratio's two sides sit in different models: part
+of the number is then bucketed by one timestamp and the rest by another, invisibly,
+in a result that looks like any other. The disagreement is reported rather than
+resolved, because picking one column would be right about half the number, and the
+catalog carries a note naming the metrics it affects.
+
+`queryable_granularities` is the grains a time grouping may ask for, per metric and
+per dimension, in the layer's own vocabulary. An **empty list is an answer**: a
+categorical dimension has no grain, which is what stops an agent asking one for a
+month. An absent field means the backend could not say, which is a different
+statement.
+
 `vendor_params` is the boundary of that portability, declared rather than blurred.
-MetricFlow's cumulative `window`, its `grain_to_date`, and a derived metric's
-per-input `offset_windows` are real and only mean something under this vendor's
-semantics, so they travel under one key instead of being promoted into the shared
-shape.
+MetricFlow's cumulative `window`, its `grain_to_date`, a derived metric's per-input
+`offset_windows`, and `requires_metric_time` (a metric that accumulates along a
+time axis cannot be queried without one) are real and only mean something under
+this vendor's semantics, so they travel under one key instead of being promoted
+into the shared shape. `requires_metric_time` is written only when true, so an
+absent key is a false.
 
 `roles` is one entry per `(entity, semantic model)` declaration, each carrying
 `semantic_model`, `type`, `expr`, `role`, `description`. That is the unit the layer
@@ -93,13 +116,17 @@ Both are stated in the payload rather than left to be inferred, because a caller
 that cannot tell a structural absence from an undeclared field will read the first
 as the second.
 
-**`dimension_scope`.** `--local` returns one row per declaration, entity-qualified
-and single-hop, so the count is the number of dimensions the project declares.
-`--api` returns one row per token a query may group by, join-resolved, so a
-dimension reached through a join appears once per path that reaches it and a layer
-with joins reports substantially more rows. Neither is wrong. `definition` plus
-`semantic_model` is what lets a caller see that several paths reach one
-declaration.
+**`dimension_scope`.** `queryable_paths` means one row per token a query may group
+by, join-resolved, so a dimension reached through a join appears once per path that
+reaches it. `declarations` means one row per dimension the project declares,
+entity-qualified single-hop, which names fewer tokens than a query can actually
+use. `--api` is always the first. `--local` is the first too where the join graph
+could be resolved, and the second where it could not, which is an install without
+the `[semantic]` extra or a compiled manifest that extra's resolver will not read;
+that read also carries a note naming the fix. Neither scope is wrong, and the
+difference is in the payload because a caller comparing counts across backends
+needs to know which it is holding. `definition` plus `semantic_model` is what lets
+it see that several paths reach one declaration.
 
 **`unavailable`.** The hosted `SemanticModel` GraphQL type carries only a name, its
 `Entity` type has no `label` at all, and its `Measure` type carries no words, so a
@@ -207,6 +234,10 @@ spine, in order:
    that cannot be read settles nothing either, and the query proceeds.
 4. The **cost-before-spend handshake**, then the active connector.
 
+`--grain` is checked before any of that, against the grains the project declares
+for the metrics in the query, so an impossible grain is named as such rather than
+surfacing as a MetricFlow resolution error further in.
+
 **dex owns execution here, so the full cost guard applies** exactly as it does for
 `explore query`. `list` reads the catalog through the project seam
 (`SemanticCatalogProject.semantic_catalog()`, described in
@@ -217,10 +248,30 @@ needing its own parser. For the dbt format that read is
 as far as `dbt parse`, and says so by name when it is not. `query` needs the
 `[semantic]` extra (MetricFlow) and the same compiled manifest.
 
+**The join graph is resolved where it can be.** A metric can be grouped by the
+dimensions of every model its own models join to, and computing that from the
+shared-entity rule is MetricFlow's job rather than something dex should restate, so
+the read asks MetricFlow when the `[semantic]` extra is present. What comes back is
+the same set the hosted API returns for the same layer, including paths through two
+joins that a single-hop qualification scheme cannot express at all.
+
+Without that extra, `list --local` stays what it has always been, a
+dependency-free read of a compiled artifact, and reports the dimensions the project
+declares. That is the narrower answer, so it is declared rather than left to look
+complete: `dimension_scope` says `declarations`, and a note names the extra. The
+same degradation covers a compiled manifest the resolver refuses, because it
+validates the whole artifact against its own schema and can reject one dex read
+without trouble; losing the catalog over the joins would be the worse outcome.
+
+A dimension the project declares but no metric can reach stays in the list either
+way, which is the half of a layer a hosted read cannot see at all.
+
 The PII gate's column resolution comes through the same seam: the format maps every
-dimension and entity token to the `(relation, column)` behind it, and a token whose
-reference is a computed expression is absent rather than guessed, since guessing a
-column out of an expression would make the gate over-claim.
+dimension and entity token to the `(relation, column)` behind it, resolved paths
+included, so a token the join resolution added is adjudicated from its column's
+evidence rather than dropping to the name heuristic. A token whose reference is a
+computed expression is absent rather than guessed, since guessing a column out of
+an expression would make the gate over-claim.
 
 ## Hosted backend (`--api`, dbt Cloud Semantic Layer)
 
@@ -259,6 +310,15 @@ Cloud, not dex, governs the spend, with the cost paradigm reported as `hosted` a
 no estimate or ceiling. Spend is bounded only by the dbt Cloud environment's own
 limits.
 
+Both backends screen the group-by tokens and the dimensions a filter clause names.
+Reading a clause is the **backend's** job, not the shared gate's, because the
+dialect is the layer's: dbt's clauses are Jinja calls and another format's are not,
+and a shared parser that matched nothing against a second dialect would screen half
+its input while disclosing nothing (a query succeeds, no dimension is blocked, and
+no note is emitted, because nothing was found to adjudicate). A backend that cannot
+read its own filter dialect therefore refuses filtered queries instead of passing
+them.
+
 PII is still screened before the query is sent: a dimension the layer's own
 metadata marks as PII is refused, and a name heuristic (the same detector the
 profiler uses) is the fail-closed floor for a layer that carries no such metadata.
@@ -274,6 +334,11 @@ heuristic. Asking per metric is what keeps the layer authoritative for every
 dimension a query touches, and the aliases keep it to one round trip. A group-by
 token that carries a time grain (`user__created_at__month`) is looked up under the
 dimension name too, since no dimension name carries a grain.
+
+The same request carries the layer's queryable grains per metric, which is what
+`--grain` is validated against. It is one more field on a document that was already
+being posted, so the pre-query metadata still costs one round trip and nothing
+billable.
 
 Where the floor was all that ran, the result says so, the same way the local
 backend discloses an unprofiled relation. The two silences are reported separately
@@ -300,7 +365,9 @@ heuristic at once) wants retrying.
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
 | Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` |
 | Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else |
-| `dimension_scope` | `declarations`: one row per declaration, single-hop qualified | `queryable_paths`: one row per groupable token, join-resolved |
+| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved |
+| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always |
+| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric |
 | Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent |
 | Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |
