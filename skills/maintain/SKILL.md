@@ -63,9 +63,18 @@ comparison live in the engine, so any other path is guesswork.
 - `maintain volume [<objects>]` detects **freshness drift**: row counts that
   collapsed, spiked, or went to zero. This is the "is the data still flowing
   correctly?" axis, distinct from "did the shape change?".
-- `maintain grain [<objects>]` detects **grain drift**: a declared primary or
-  unique key that now has duplicates, a changed row-per-entity cardinality, or an
-  increased join fanout. Uses aggregates, never raw rows.
+- `maintain grain [<objects>]` detects **grain drift**: a key that now has
+  duplicates, a changed row-per-entity cardinality, or an increased join fanout.
+  It also re-verifies the grains your project *declares* (a model-level
+  `unique_combination_of_columns`), which measurement on its own can miss. Uses
+  aggregates, never raw rows.
+
+  Two findings come out of the uniqueness checks and the difference is the
+  baseline. `key_lost_uniqueness` is a key that was proven unique and is not any
+  more: something changed in the data. `declared_grain_not_unique` is a declared
+  combination that does not hold, and nothing changed at all: the project asserts
+  a grain the data never had, so the fix is to the declaration (widen it, dedup
+  upstream, or drop the claim) rather than to the data.
 - `maintain semantic [<objects>]` detects **definition drift**: metric, measure,
   dimension, or entity definitions that changed against the baseline; semantic
   references that no longer resolve to a model or column; and categorical
@@ -111,7 +120,11 @@ Reconcile tags every proposal by `kind`, because the fix differs sharply by axis
 - **`advisory`**: grain, volume, and semantic drift are decisions, not auto-fixes
   (dex cannot dedup your warehouse or decide whether a new `'refunded'` status
   belongs in a metric). The proposal is the decision surfaced, at most backed by a
-  test edit that makes the break visible in builds.
+  test edit that makes the break visible in builds. It declines that test where
+  the test would be wrong: if your model declares a composite grain covering the
+  column, no column-level `unique` is proposed on it, and the warning names the
+  combination so you can tell "re-baseline, this is still the grain" from
+  "something relied on that column alone".
 
 When reconcile produces edits it stores them as a plan and prints a `plan_id`.
 Apply them with `transform apply <plan-id>` (the one apply door): a human edit made

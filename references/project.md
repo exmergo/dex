@@ -232,6 +232,25 @@ model named `orders`). If you pack several models into one file, no entry matche
 you get a warning instead of an edit, which is a refusal to guess rather than a wrong
 write.
 
+**That edit is checked against your declarations before it is proposed.** If
+`definitions()` reports a composite grain covering the column, no column-level
+`unique` is proposed on it and the warning names the combination, because the edit
+would assert something your project explicitly does not claim: dbt runs a
+column-level `unique` and a `unique_combination_of_columns` independently, so the
+new test fails every build from then on and can only go green by changing the
+declared grain, while a format that resolves the two as dbt's semantics imply
+discards it and the plan applies having changed nothing.
+
+This is the practical reason `declared_composite_keys` is worth populating properly,
+and why it is a separate field from `declared_keys` rather than several entries in
+it. It is not decoration on a diagram. `maintain grain` re-verifies the combinations
+that arrive there, so a format that leaves the field empty loses grain verification
+on exactly the tables whose grain is composite, and gets offered `unique` tests on
+their member columns. Splitting one grain across several entries is worse than
+leaving it out, because each entry then claims a column is unique on its own, which
+is a stronger claim than the one you made and the one that gets acted on. The
+conformance suite checks both shapes.
+
 ## The one rule that is not visible in the signatures
 
 **`definitions()` must not raise.** Not on a project that is absent, not on an
