@@ -5004,6 +5004,82 @@ def test_hosted_semantic_pii_dimension_refused_not_surfaced():
     assert not any("createQuery" in posted for posted in backend.posted)
 
 
+def test_the_hosted_pii_map_covers_every_metric_in_a_multi_metric_query():
+    # Family 3, and the reason the gate asks one metric at a time. The API's
+    # `dimensions(metrics: [a, b])` returns the dimensions common to ALL the
+    # listed metrics, not their union, so asking once for a multi-metric query
+    # shrinks the authoritative map instead of growing it: everything outside the
+    # intersection falls through to the name heuristic. A dimension the dbt
+    # project marked `meta: {pii: true}` whose name carries no PII signal then
+    # passes the gate and is grouped and projected. "PII is flagged, never
+    # surfaced" does not survive that, and a note after the fact is not the same
+    # as a refusal.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+        screen_dimension_refs,
+    )
+
+    clean = {"name": "user__pricing_tier", "config": {"meta": {}}}
+    flagged = {"name": "agent__operator_handle", "config": {"meta": {"pii": True}}}
+    # Two metrics from two semantic models: the flagged dimension is reachable
+    # from one of them, so it is exactly what an intersection drops.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "active_users": [clean],
+            "agent_runs": [clean, flagged],
+        }
+    )
+    # Nothing about the name gives it away, which is what makes the layer's own
+    # metadata the only thing standing between this dimension and stdout.
+    assert not screen_dimension_refs(["agent__operator_handle"])
+
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(
+            SemanticQuery(
+                metrics=["active_users", "agent_runs"],
+                group_by=["agent__operator_handle"],
+            )
+        )
+    assert not any("createQuery" in posted for posted in backend.posted)
+
+
+def test_the_hosted_pii_map_adjudicates_rather_than_disclosing_a_gap():
+    # The other half of the same invariant. Blocking is not enough: a dimension
+    # the layer documented must be *adjudicated*, not cleared by the heuristic and
+    # then disclosed as unscreened, because a note is the part of a payload a
+    # caller is least likely to act on. So a ref the layer speaks to leaves
+    # nothing unadjudicated, and a grain suffix (which no dimension name carries)
+    # is not enough on its own to drop a ref back to the floor.
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery, unadjudicated_refs
+
+    dims = {
+        "active_users": [{"name": "user__pricing_tier", "config": {"meta": {}}}],
+        "agent_runs": [
+            {"name": "agent__mode", "config": {"meta": {"pii": False}}},
+            {"name": "user__created_at", "config": {"meta": {"pii": False}}},
+        ],
+    }
+    backend = FakeHostedBackend(
+        dimensions_meta=dims,
+        result=table_json_result(["active_users"], ["number"], [[5.0]]),
+    )
+    query = SemanticQuery(
+        metrics=["active_users", "agent_runs"],
+        group_by=["agent__mode", "user__created_at__month"],
+    )
+    meta = backend._dimension_meta(query.metrics)
+    lookup = backend._meta_lookup(meta)
+    assert unadjudicated_refs(query.group_by, meta_lookup=lookup) == []
+
+    result = backend.query(query)
+    assert not any("name heuristic alone" in note for note in result.notes)
+
+
 def test_hosted_semantic_pii_gate_still_binds_on_an_injected_token(monkeypatch):
     # Family 3, at the semantic credential seam. Supplying the token makes identity
     # the host's; it does not make the PII policy the host's. The gate has to refuse
