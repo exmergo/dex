@@ -4947,7 +4947,18 @@ def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
             )
         ]
     )
-    backend = LocalMetricFlowBackend(project, _memory_engine(), "duckdb", QueryLimits())
+    # The project format is injected, because the gate resolves a dimension to its
+    # physical column through the project seam now rather than by parsing the
+    # compiled artifact itself. The seam is what must keep the evidence flowing.
+    from exmergo_dex_core.adapters.project import DbtProject
+
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
     lookup = backend._cache_pii_lookup(cache)
     assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
 
