@@ -240,17 +240,24 @@ def _build_parser() -> argparse.ArgumentParser:
                         type=int,
                         default=argparse.SUPPRESS,
                     )
-                # `explore semantic list|query` queries the dbt semantic layer
-                # (distinct from the top-level `semantic` group, which authors it).
-                # The backend (local MetricFlow vs a hosted dbt Cloud deployment) is
-                # ambient: the .dex config `semantic.backend`, overridable here with
-                # --local / --api.
+                # `explore semantic list|query` reads and queries the dbt
+                # semantic layer (distinct from the top-level `semantic` group,
+                # which authors it). Which layer answers is ambient: the .dex
+                # config `semantic.vendor` and `semantic.deployment` (or the
+                # released `semantic.backend` spelling of the two), overridable
+                # here with --local / --api.
                 if group == "explore" and name == "semantic":
                     # Bare `explore semantic` lists (discovery is first-class);
                     # `explore semantic query` runs a metric query.
                     sp.add_argument(
                         "mode", nargs="?", choices=["list", "query"], default="list"
                     )
+                    # Named metrics mean something in both modes, which is why one
+                    # pair of spellings serves both: in `query` they are what to
+                    # measure, in `list` they scope the catalog to those metrics
+                    # and what they reach. A whole layer's catalog is one payload
+                    # and mostly about something else, so a caller that already
+                    # knows the metric should not have to read past it.
                     sp.add_argument("metrics", nargs="*")
                     sp.add_argument("--metric", action="append", default=None)
                     sp.add_argument("--group-by", action="append", default=None)
@@ -489,8 +496,9 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # executes the SQL, so the command needs no dialect engine, and a
         # pure-remote install ([semantic-api], no connector) must be able to reach
         # it. Importing the module below would pull the query firewall and defeat
-        # that. `--local` lands here too: `list` is a manifest read-view, and a
-        # local `query` reaches the dialect engine through MetricFlow's own path.
+        # that. `--local` lands here too: `list` reads the catalog through the
+        # project seam and parses no SQL, and a local `query` reaches the dialect
+        # engine through MetricFlow's own path.
         if args.subcommand == "semantic":
             from .explore.semantic.commands import cmd_semantic
 
