@@ -84,6 +84,61 @@ def test_methods_return_domain_objects_never_envelopes(duckdb_file: Path):
     assert isinstance(mapped.cache, DexCache)
 
 
+#: Subcommands that are not engine methods, each for a reason the reader can
+#: check. `test` is `transform test --scaffold`, reached as `test_scaffold`;
+#: `semantic *` is spelled `semantic_*`; `demo` writes a warehouse and is not a
+#: command a library caller drives. Everything else must have a method.
+_NOT_ENGINE_METHODS = {
+    ("transform", "test"),
+    ("semantic", "define"),
+    ("semantic", "update"),
+    ("semantic", "plan"),
+    ("viz", "preview"),
+}
+
+#: Where a subcommand's method is spelled differently from the subcommand.
+_METHOD_NAMES = {
+    ("connect", "test"): "connect_test",
+    ("explore", "semantic"): "semantic_list",
+    ("maintain", "schema"): "schema_drift",
+    ("maintain", "volume"): "volume_drift",
+    ("maintain", "grain"): "grain_drift",
+    ("maintain", "semantic"): "semantic_drift",
+    ("transform", "init"): "init_project",
+}
+
+
+def test_every_cli_subcommand_is_reachable_from_the_python_api():
+    """The CLI is a consumer of this API, not a parallel implementation of it.
+
+    That is the promise this module's own docstring makes, and it is the one a new
+    command quietly breaks: a `cmd_*` shim that calls its module function directly
+    works perfectly through the CLI and leaves the capability unreachable for every
+    library caller. Nothing else in the suite notices, because both surfaces are
+    tested against their own entry point.
+
+    Asserted as a set difference rather than per command so adding a subcommand
+    fails here until it is either given a method or listed above with a reason.
+    """
+
+    from exmergo_dex_core.cli import COMMAND_SURFACE
+
+    missing = []
+    for group, subcommands in COMMAND_SURFACE.items():
+        for sub in subcommands:
+            if (group, sub) in _NOT_ENGINE_METHODS:
+                continue
+            method = _METHOD_NAMES.get((group, sub), sub)
+            if not callable(getattr(DexEngine, method, None)):
+                missing.append(f"{group} {sub} (expected DexEngine.{method})")
+
+    assert missing == [], (
+        "these subcommands are reachable from the CLI and not from the Python "
+        f"API: {missing}. Add the method, or list it in _NOT_ENGINE_METHODS with "
+        "the reason it is CLI-only."
+    )
+
+
 def test_the_engine_module_never_references_the_envelope():
     """Structural, over the parsed module rather than its text.
 
