@@ -472,12 +472,15 @@ def orphan_findings(
     (nothing was measured) never qualifies; confidence arithmetic is unchanged,
     this only reports what `verify_relationships` already measured.
 
-    The two kinds get different text because they are different findings. For
-    an inferred join the claim under suspicion is dex's own: a shared column
-    name turned out not to be a shared key. For a declared one the name is not
-    the evidence at all, so there is nothing to disclaim; the project states
-    this foreign key and the warehouse disagrees, which is a defect in the data
-    or in the declaration rather than a weak guess (issue #163).
+    Each kind gets its own text because each is a different finding. For an
+    inferred join the claim under suspicion is dex's own: a shared column name
+    turned out not to be a shared key. For a declared one the name is not the
+    evidence at all, so there is nothing to disclaim; the project states this
+    foreign key and the warehouse disagrees, which is a defect in the data or
+    in the declaration rather than a weak guess (issue #163). For an
+    overlap-inferred edge the name never mattered in the first place, so a
+    later catastrophic orphan rate reads as the data drifting away from the
+    containment a probe once measured, not as a naming coincidence failing.
     """
 
     findings = []
@@ -497,6 +500,12 @@ def orphan_findings(
                 f"{edge} is declared as a foreign key but "
                 f"{rel.orphan_fraction:.0%} of values have no match in the "
                 "parent; the project and the warehouse disagree"
+            )
+        elif rel.kind is RelationshipKind.OVERLAP_INFERRED:
+            text = (
+                f"{edge} was proposed from measured value overlap but "
+                f"{rel.orphan_fraction:.0%} of values now have no match; the "
+                "containment that proposed this edge no longer holds"
             )
         else:
             text = (
@@ -655,6 +664,248 @@ def _quote_identifier(identifier: str) -> str:
 def _quote_part(name: str) -> str:
     escaped = name.replace('"', '""')
     return f'"{escaped}"'
+
+
+# --- issue #220: propose joins from measured value overlap -------------------
+#
+# Name-based inference above exhausts every naming convention it knows before
+# anything below here ever runs. What's left is exactly the case naming
+# cannot help with (`acct_id_fk` to `ws_id`, or a source that names every key
+# `id`). Value overlap is strictly stronger evidence than a name, since it is
+# the thing a name is a proxy for, so an opt-in, bounded sweep proposes an
+# edge here purely from measured containment, never from a name.
+#
+# The bound is the whole design: the candidate pool is a cross product over
+# every unmatched key-shaped column, so it is opt-in, capped, and priced as a
+# batch through the normal handshake before anything runs, the same as
+# `--verify`. An edge this sweep proposes is always
+# `RelationshipKind.OVERLAP_INFERRED`, distinguishable from a name-derived or
+# declared edge in both the cache and the envelope.
+#
+# A composite key never enters the candidate pool, for the same reason
+# `probe_candidates` excludes a composite join from `--verify`: probing one
+# column of a composite key measures a different relationship than the whole
+# key would, so a column that is only a composite-key member (never unique or
+# near-unique on its own) is not "key-shaped" for this sweep's purposes.
+
+# A hard ceiling on how many probes one sweep run issues. The candidate pool
+# grows quadratically in the number of unmatched key-shaped columns, so an
+# unbounded sweep on a wide warehouse would price, and eventually run, an
+# enormous batch. Elided candidates are reported, never silently dropped.
+_OVERLAP_SWEEP_CAP = 50
+
+# A candidate's measured orphan fraction must clear this ceiling to be
+# proposed as an edge. Much stricter than `_ORPHAN_FINDING_THRESHOLD` (which
+# flags an *existing* edge gone bad): here there is no name-based prior at
+# all backing the guess, only the measurement itself, so the bar for "this is
+# real" is correspondingly higher. Matches this codebase's other "almost
+# entirely" ceilings (e.g. `cumulative._DECREASE_FRACTION_CEILING`).
+_OVERLAP_ORPHAN_CEILING = 0.05
+
+# Below this many non-null values, a candidate's containment is not enough
+# evidence either way; it is dropped rather than proposed on a handful of
+# rows that happened to line up. Mirrors this codebase's other "not enough
+# evidence, fail closed" floors (e.g. `cumulative._MIN_OBSERVATIONS`).
+_OVERLAP_MIN_OBSERVATIONS = 20
+
+
+def _is_key_or_near_key(col: ColumnProfile, row_count: int | None) -> bool:
+    """A single column already established, at profile time, as a proven key
+    or a near-key: the pool the issue restricts overlap-sweep candidates to.
+
+    A proven key is exactly :func:`candidate_keys`'s single-column half:
+    unique and non-null. A near-key widens that to a column whose distinct
+    count alone (an escalation cap, or an adapter without
+    ``exact_distinct_counts``, left it short of proof) already clears
+    ``NEAR_UNIQUE_RATIO``, the same ratio ``profile.py``'s composite-key probe
+    uses to decide a column is worth testing at all.
+
+    PII-excluded: every other candidacy check in this codebase excludes a
+    PII-flagged column from a probe pool, and this sweep is no exception even
+    though its probe never projects a value.
+    """
+
+    if col.pii is not None:
+        return False
+    if col.null_fraction not in (0.0, None):
+        return False
+    if col.is_unique:
+        return True
+    if row_count and col.distinct_count is not None:
+        return col.distinct_count >= NEAR_UNIQUE_RATIO * row_count
+    return False
+
+
+def _key_strength(col: ColumnProfile) -> int:
+    """0 for a proven single-column key, 1 for a near-key. Lower is
+    stronger, and decides which side of a sweep candidate plays parent."""
+
+    return 0 if (col.is_unique and col.null_fraction in (0.0, None)) else 1
+
+
+def _order_by_strength(
+    a: tuple[Dataset, ColumnProfile], b: tuple[Dataset, ColumnProfile]
+) -> tuple[tuple[Dataset, ColumnProfile], tuple[Dataset, ColumnProfile]]:
+    """Which of two key-shaped columns plays parent in a sweep candidate.
+
+    Neither side of an unmatched pair comes with a declared direction, since
+    that is exactly what "no name matched" means, so this picks one
+    deterministically: the proven key over the near-key, and between two
+    equally strong, the smaller table, since a many-to-one join's "one" side
+    is usually the smaller one. Ties break on identifier so the same
+    warehouse always proposes the same direction.
+
+    Returns ``(child, parent)``.
+    """
+
+    def rank(pair: tuple[Dataset, ColumnProfile]) -> tuple:
+        dataset, col = pair
+        return (_key_strength(col), dataset.row_count or 0, dataset.identifier.lower())
+
+    if rank(a) <= rank(b):
+        parent, child = a, b
+    else:
+        parent, child = b, a
+    return child, parent
+
+
+def _sweep_sort_key(rel: Relationship) -> tuple:
+    return (
+        rel.from_dataset.lower(),
+        rel.from_columns[0].lower(),
+        rel.to_dataset.lower(),
+        rel.to_columns[0].lower(),
+    )
+
+
+def overlap_sweep_candidates(
+    datasets: list[Dataset],
+    matched: set[tuple[str, str]],
+    *,
+    cap: int = _OVERLAP_SWEEP_CAP,
+) -> tuple[list[Relationship], int, int]:
+    """Every key-or-near-key column pair, across different datasets, that no
+    existing edge already covers on either endpoint, restricted to
+    type-compatible pairs, sorted deterministically and capped at ``cap``.
+
+    ``matched`` is the set of ``(dataset identifier, column name)``, both
+    lowercased, that a cheaper rule (declared or name-inferred) already has
+    an edge on; a key-shaped column already covered never re-enters here,
+    which is the entire reason this sweep runs after inference rather than
+    instead of it.
+
+    Returns ``(kept, elided, cap)``: ``cap`` is echoed back (rather than left
+    for the caller to import as a private constant) so a checkpoint payload
+    can always report the bound that applied, even when the caller passes no
+    explicit ``cap`` and gets the default. ``elided`` is how many candidates
+    the cap dropped, per the issue's bounding requirement. Every returned
+    candidate is a real ``Relationship`` (``kind=OVERLAP_INFERRED``,
+    unmeasured: ``verified`` and ``orphan_fraction`` stay unset until a probe
+    actually runs), so pricing (:func:`overlap_sweep_statements`) and running
+    (:func:`probe_overlap_candidates`) both select from exactly this list, the
+    same one-source-of-truth pattern :func:`probe_candidates` uses for
+    ``--verify``.
+    """
+
+    pool: list[tuple[Dataset, ColumnProfile]] = []
+    for dataset in datasets:
+        for col in dataset.columns:
+            if (dataset.identifier.lower(), col.name.lower()) in matched:
+                continue
+            if _is_key_or_near_key(col, dataset.row_count):
+                pool.append((dataset, col))
+
+    # Each unordered pair of pool entries is visited exactly once (`pool` has
+    # no duplicate (dataset, column), and enumerate/pool[i+1:] never revisits
+    # a pair), so no dedup is needed here the way `matched` needed one above.
+    candidates: list[Relationship] = []
+    for i, a in enumerate(pool):
+        for b in pool[i + 1 :]:
+            if a[0].identifier == b[0].identifier:
+                continue
+            if not _type_compatible(a[1].data_type, b[1].data_type):
+                continue
+            child, parent = _order_by_strength(a, b)
+            candidates.append(
+                Relationship(
+                    from_dataset=child[0].identifier,
+                    from_columns=[child[1].name],
+                    to_dataset=parent[0].identifier,
+                    to_columns=[parent[1].name],
+                    kind=RelationshipKind.OVERLAP_INFERRED,
+                )
+            )
+
+    candidates.sort(key=_sweep_sort_key)
+    elided = max(0, len(candidates) - cap)
+    return candidates[:cap], elided, cap
+
+
+def overlap_sweep_statements(candidates: list[Relationship], dialect: str) -> list[str]:
+    """The exact SQL :func:`probe_overlap_candidates` will run, one statement
+    per candidate, in the adapter's dialect. Exists so a billed caller can
+    dry-run the sweep for a cost estimate before confirming the spend.
+
+    Every candidate :func:`overlap_sweep_candidates` returns is already
+    single-column by construction, so this skips the `probe_candidates`
+    composite-key filter ``--verify`` needs; there is nothing to filter."""
+
+    return [_transpile_probe(_overlap_probe_sql(rel), dialect) for rel in candidates]
+
+
+def probe_overlap_candidates(
+    adapter: Adapter,
+    candidates: list[Relationship],
+    *,
+    timeout_seconds: float = 30.0,
+    progress: ProgressReporter | None = None,
+) -> int:
+    """Probe each sweep candidate for real containment, in place.
+
+    A candidate whose containment clears both ``_OVERLAP_MIN_OBSERVATIONS``
+    and ``_OVERLAP_ORPHAN_CEILING`` is proposed: mutated to ``verified=True``,
+    its measured ``orphan_fraction``, and a ``confidence`` derived from it.
+    Anything short of that is left exactly as :func:`overlap_sweep_candidates`
+    built it (``verified=False``), which doubles as how a caller tells
+    proposed from rejected afterward: filter ``candidates`` on ``verified``
+    rather than trust this function's return value for that split.
+
+    In-place mutation rather than a returned list of survivors is
+    deliberate: it is what keeps a mid-loop ``OverCeilingError`` (this raises,
+    it does not catch) non-destructive. Whatever this already decided about a
+    candidate before the ceiling hit stays decided on the very object the
+    caller is still holding, the same way :func:`verify_relationships`
+    survives its own mid-loop ceiling by mutating in place rather than
+    building a return value that a raise would discard.
+
+    Only the two aggregate counts the probe itself computes are ever read;
+    reuses :func:`_overlap_probe_sql` verbatim, so this is exactly as
+    value-blind as :func:`verify_relationships`.
+
+    Returns the count rejected by measurement (a candidate the ceiling cut
+    off before it was probed at all is neither proposed nor counted here).
+    """
+
+    rejected = 0
+    for rel in candidates:
+        sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
+        result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
+        values = dict(zip(result.columns, result.cells[0], strict=True))
+        nonnull = int(values["nonnull_fk"] or 0)
+        orphans = int(values["orphans"] or 0)
+        if progress is not None:
+            progress.advance()
+        if nonnull < _OVERLAP_MIN_OBSERVATIONS:
+            rejected += 1
+            continue
+        fraction = orphans / nonnull
+        if fraction > _OVERLAP_ORPHAN_CEILING:
+            rejected += 1
+            continue
+        rel.verified = True
+        rel.orphan_fraction = round(fraction, 4)
+        rel.confidence = round(min(0.95, max(0.05, 1.0 - fraction)), 4)
+    return rejected
 
 
 def declared_relationships(

@@ -35,6 +35,7 @@ from .base import (
 from .filesystem import DEX_DIR, FilesystemStore
 from .memory import MemoryStore
 from .resolver import build_store, resolve_store_factory
+from .sqlite import SqliteStore
 
 __all__ = [
     "DEX_DIR",
@@ -45,6 +46,7 @@ __all__ = [
     "MaintainStore",
     "MemoryStore",
     "SpendLock",
+    "SqliteStore",
     "Store",
     "StoreContext",
     "StoreFactory",

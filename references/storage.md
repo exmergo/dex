@@ -12,10 +12,16 @@ cache, the reconcile baseline, the last drift report, the append-only query and
 spend ledgers, and the stored transform plans. Delete all of it and nothing
 canonical is lost. That is what a `Store` holds.
 
-Two backends ship. `FilesystemStore` writes plain files under `.dex/` and is what
-the CLI uses, so persistence is git and a reviewer can read the state in a pull
-request. `MemoryStore` writes nothing and is the library default, which is why
-`import exmergo_dex_core` cannot leave a `.dex/` directory in a consumer's repo.
+Three backends ship. `FilesystemStore` writes plain files under `.dex/` and is
+what the CLI uses by default, so persistence is git and a reviewer can read the
+state in a pull request. `MemoryStore` writes nothing and is the library
+default, which is why `import exmergo_dex_core` cannot leave a `.dex/` directory
+in a consumer's repo. `SqliteStore` is opt-in: one `.dex/dex.db` file with real
+tables in place of loose JSON, for a host that wants durable local state without
+a directory of files to review, gitignore, or clean up. Select it with
+`cache.backend: sqlite` or `--cache-backend sqlite`; `filesystem` stays the
+default, and `.dex/dex.db` is not reviewable the way `.dex/cache.json` is, so add
+it to `.gitignore` the way you would any local database file.
 
 Secrets never live in any backend.
 
@@ -468,7 +474,7 @@ order:
 
 | Name | Example | For |
 |---|---|---|
-| shipped | `filesystem` | dex's own backends, and never shadowable by anything installed |
+| shipped | `filesystem`, `sqlite` | dex's own backends, and never shadowable by anything installed |
 | dotted path | `mypkg.stores:my_store` | a factory reachable by import, with no packaging work |
 | entry point | `acme` | a name an installed distribution registered under `exmergo_dex_core.stores` |
 
@@ -502,10 +508,10 @@ exists.
 
 Recorded so they are not re-argued.
 
-**Always pass `repo_root`.** It builds both shipped backends and would build an
-opt-in SQLite file, and it cannot build a tenant-keyed backend at all. That is the
-class of backend this seam was made public for, and widening a released config
-schema afterwards costs a deprecation.
+**Always pass `repo_root`.** It builds all three shipped backends, but it cannot
+build a tenant-keyed backend at all. That is the class of backend this seam was
+made public for, and widening a released config schema afterwards costs a
+deprecation.
 
 **Require a `from_config` classmethod on the store.** It puts an obligation on the
 structural protocol, which is what makes "no base class to inherit and no

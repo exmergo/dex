@@ -660,13 +660,18 @@ class DexEngine:
         self,
         *,
         verify: bool = False,
+        infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
     ) -> RelationshipsResult:
         from .explore import commands as explore
 
         return explore.relationships(
-            self, verify=verify, refresh=refresh, use_project=use_project
+            self,
+            verify=verify,
+            infer_by_overlap=infer_by_overlap,
+            refresh=refresh,
+            use_project=use_project,
         )
 
     def map(
@@ -675,6 +680,7 @@ class DexEngine:
         full: bool = False,
         detail: bool = False,
         verify: bool = False,
+        infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
     ) -> MapResult:
@@ -683,6 +689,7 @@ class DexEngine:
         return explore.map(
             self,
             full=full,
+            infer_by_overlap=infer_by_overlap,
             detail=detail,
             verify=verify,
             refresh=refresh,

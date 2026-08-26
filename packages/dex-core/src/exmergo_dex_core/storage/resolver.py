@@ -31,6 +31,7 @@ from __future__ import annotations
 from ..errors import ConfigurationError
 from .base import ExploreStore, StoreContext, StoreFactory
 from .filesystem import FilesystemStore
+from .sqlite import SqliteStore
 
 ENTRY_POINT_GROUP = "exmergo_dex_core.stores"
 
@@ -38,6 +39,7 @@ ENTRY_POINT_GROUP = "exmergo_dex_core.stores"
 #: installed, so no third-party registration can take over a shipped name.
 SHIPPED: dict[str, StoreFactory] = {
     "filesystem": FilesystemStore.from_context,
+    "sqlite": SqliteStore.from_context,
 }
 
 #: Shipped backends that are deliberately *not* selectable, and why. Refusing by

@@ -11,6 +11,30 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **An opt-in SQLite cache backend** ([#139]). `FilesystemStore` writes loose
+  JSON under `.dex/`, which is right for the CLI (persistence is git, a reviewer
+  reads the state in a pull request) and wrong for a host that wants durable
+  local state without a directory of files to gitignore and clean up. Select
+  `cache.backend: sqlite` (or `--cache-backend sqlite` for one run) and
+  everything lands in a single `.dex/dex.db` file instead; `filesystem` stays
+  the default.
+
+  It implements the full storage `Protocol` from [#137]: the cache, the
+  snapshot, the drift report, the transform plans, and both ledgers, backed by
+  real tables rather than a directory of loose files, and it passes the same
+  conformance suite the two shipped backends already run against. The spend
+  ledger's `spend_since`, the query the cumulative session budget reads on every
+  billed command, answers from an indexed lookup on `at` and `connector` rather
+  than reading and parsing every line ever appended, which is the gap the
+  filesystem backend's JSONL scan does not close as a ledger grows. The
+  cross-process spend lock is a `BEGIN IMMEDIATE` transaction on the database
+  file itself, so the cumulative ceiling still binds across two CLI processes
+  sharing a repo, the same guarantee the filesystem backend's advisory file lock
+  provides.
+
+  `.dex/dex.db` is a binary file, not a JSON document a reviewer can diff, so it
+  belongs in `.gitignore` the way any local database file does.
+
 - **`transform rename` and `transform remove` generate the whole propagation
   plan** ([#221]). `transform references` could tell you where a name was used
   and then left you to retype the change file by file. These two make the change:
@@ -825,6 +849,42 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   convention it doesn't already cover.
   
 ### Added
+
+- **`explore relationships`/`explore map --infer-by-overlap` proposes joins
+  from measured value overlap when no column name matches** ([#220],
+  depends on [#208]). Every proposed relationship started from a name; when
+  naming carried no signal at all (`acct_id_fk` to `ws_id`, or a source that
+  names every key `id`), inference had nothing to work with and the map was
+  silently incomplete, with no way to tell an absent edge from an absent
+  relationship. Value overlap is strictly stronger evidence than a name,
+  since it is the thing a name is a proxy for.
+
+  Off by default, and named in `explore map`'s notes even when off, so the
+  option is discoverable without `--help`. When passed, key-shaped columns
+  (a proven single-column key, or a near-key whose distinct count already
+  clears the near-unique ratio, PII-excluded) that no declared or
+  name-inferred edge already covers are paired across datasets, restricted
+  to type-compatible pairs, and probed with the same aggregate-only
+  overlap-probe SQL `--verify` already uses, authored once and transpiled
+  per connector dialect. Only a candidate whose measured orphan fraction
+  clears a strict ceiling (much stricter than a name-based join's, since
+  there is no naming signal backing the guess here at all) is proposed; the
+  rest are dropped outright rather than kept at a low confidence. The
+  candidate pool is capped, and both the cap and how many candidates it
+  elided are reported before anything runs, priced as a batch through the
+  same handshake `--verify` uses, and running after it so the two opt-in
+  phases never have more than one checkpoint pending at once.
+
+  An edge this sweep proposes carries a new `RelationshipKind.OVERLAP_INFERRED`
+  kind, distinguishable from a declared or name-derived edge in both the
+  cache and the envelope, and is never presented as equivalent to either.
+  Because nothing else ever rediscovers it (a declared join is re-read from
+  the dbt project every run and a name-inferred one is re-derived from cheap
+  metadata every run; an overlap-derived one only comes from this priced
+  probe), it is carried forward unconditionally on every later run as long
+  as both endpoints are still known objects, rather than needing the flag
+  again on every call, and a sweep that runs again never re-pays to
+  re-confirm a pair it already confirmed.
 
 - **`explore profile` flags a boolean-shaped column with more than two
   values** ([#218]). A column named like a two-valued flag (`is_*`, `has_*`,

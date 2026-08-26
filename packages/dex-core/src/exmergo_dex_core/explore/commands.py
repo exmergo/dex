@@ -38,6 +38,7 @@ from ..cache import (
     Dataset,
     DexCache,
     Relationship,
+    RelationshipKind,
     match_identifier,
     relation_verdict,
 )
@@ -204,6 +205,29 @@ def _verify_estimate(
     total = sum(
         query_estimate(sql)
         for sql in rel_mod.probe_statements(candidates, adapter.dialect)
+    )
+    return total, len(candidates), len(objects)
+
+
+def _overlap_estimate(
+    adapter: Adapter, candidates: list[Relationship]
+) -> tuple[float, int, int]:
+    """Free dry-run pricing of the probes ``--infer-by-overlap`` would run
+    against ``candidates`` (already capped by :func:`rel_mod.overlap_sweep_candidates`),
+    plus the candidate/object counts for the checkpoint payload; zero-cost on
+    free adapters or when nothing qualifies to probe.
+
+    Mirrors :func:`_verify_estimate`'s shape; unlike that one, ``candidates``
+    is already the exact priced-and-run set (the cap already applied), so
+    there is no analogue of `probe_candidates` to select through here."""
+
+    objects = {r.from_dataset for r in candidates} | {r.to_dataset for r in candidates}
+    query_estimate = getattr(adapter, "query_estimate", None)
+    if query_estimate is None or not candidates:
+        return 0.0, len(candidates), len(objects)
+    total = sum(
+        query_estimate(sql)
+        for sql in rel_mod.overlap_sweep_statements(candidates, adapter.dialect)
     )
     return total, len(candidates), len(objects)
 
@@ -694,6 +718,7 @@ def relationships(
     engine: DexEngine,
     *,
     verify: bool = False,
+    infer_by_overlap: bool = False,
     refresh: bool = False,
     use_project: bool = False,
 ) -> RelationshipsResult:
@@ -704,6 +729,11 @@ def relationships(
     the cheaper way in. With ``verify``, candidate joins are probed for real
     overlap, priced only after inference knows what the candidates are, which is
     why that phase can come back as ``pending_confirmation`` rather than raising.
+    With ``infer_by_overlap``, key-shaped columns no name-based rule matched are
+    swept for measured value containment (issue #220), a second and
+    independent opt-in phase with the same priced-after-the-fact shape,
+    which runs after ``verify`` so at most one checkpoint is ever pending at
+    once.
     """
 
     store = engine.store
@@ -719,6 +749,8 @@ def relationships(
     over_ceiling = False
     verify_pending: ConfirmationRequest | None = None
     verify_warning: str | None = None
+    overlap_pending: ConfirmationRequest | None = None
+    overlap_warning: str | None = None
     warnings: list[str] = []
 
     # Relationship inference needs uniqueness signals, so profile every object
@@ -828,6 +860,16 @@ def relationships(
     )
     rels, confirmed = _merge_relationships(declared, inferred)
 
+    # A prior overlap-derived edge (issue #220) is never rediscovered by
+    # plain inference, so unlike everything else here it must be carried
+    # forward unconditionally rather than only when out of scope; see
+    # `_carry_forward_overlap_edges`. Before --verify, so a re-confirmed edge
+    # is eligible for re-verification too, and before the sweep below, so it
+    # never re-probes (and re-pays for) a pair already confirmed.
+    rels, overlap_carried = _carry_forward_overlap_edges(
+        prior, connector, {d.identifier for d in datasets}, rels
+    )
+
     # Verify the *merged* set, not the inferred one. Declared joins are probe
     # candidates now (issue #163) and are only born at the merge above, so
     # verifying earlier would price and measure a set that excludes exactly the
@@ -864,6 +906,71 @@ def relationships(
                     "results are saved; raise --budget and re-run to "
                     "finish verification"
                 )
+
+    # The overlap sweep (issue #220): key-shaped columns no name-based rule
+    # matched, probed for real value containment. Runs after --verify, on the
+    # same merged set (`rels` now also carries anything --verify measured),
+    # so at most one of the two phases is ever pending confirmation at once
+    # -- a verify checkpoint the caller hasn't resolved yet defers the sweep
+    # rather than pricing a second, simultaneous ask.
+    overlap_proposed = 0
+    overlap_rejected = 0
+    overlap_elided = 0
+    overlap_deferred = infer_by_overlap and verify_pending is not None
+    if infer_by_overlap and verify_pending is None:
+        matched = {
+            (rel.from_dataset.lower(), col.lower())
+            for rel in rels
+            for col in rel.from_columns
+        } | {
+            (rel.to_dataset.lower(), col.lower())
+            for rel in rels
+            for col in rel.to_columns
+        }
+        overlap_candidates, overlap_elided, overlap_cap = (
+            rel_mod.overlap_sweep_candidates(datasets, matched)
+        )
+        if overlap_candidates:
+            overlap_cost, candidate_count, object_count = _overlap_estimate(
+                adapter, overlap_candidates
+            )
+            overlap_pending = command_args.overlap_handshake(
+                "explore relationships",
+                adapter,
+                overlap_cost,
+                candidate_count=candidate_count,
+                object_count=object_count,
+                cap=overlap_cap,
+                elided=overlap_elided,
+            )
+            if overlap_pending is None:
+                overlap_reporter = _reporter(
+                    len(overlap_candidates), "swept", "candidates"
+                )
+                try:
+                    overlap_rejected = rel_mod.probe_overlap_candidates(
+                        adapter,
+                        overlap_candidates,
+                        timeout_seconds=config.query.timeout_seconds,
+                        progress=overlap_reporter,
+                    )
+                    overlap_reporter.done()
+                except OverCeilingError:
+                    # Mutation is in place (see probe_overlap_candidates), so
+                    # whatever it decided before the ceiling hit survives on
+                    # overlap_candidates regardless of this raise; only
+                    # candidates the ceiling cut off before they were probed
+                    # at all are simply absent from both counts below.
+                    overlap_warning = (
+                        "budget exhausted mid-sweep; a candidate not yet "
+                        "probed when the ceiling hit is neither proposed nor "
+                        "reported as rejected, since it was never measured. "
+                        "Relationships proposed before the ceiling are "
+                        "saved; raise --budget and re-run to finish the sweep"
+                    )
+                proposed = [rel for rel in overlap_candidates if rel.verified]
+                rels = rels + proposed
+                overlap_proposed = len(proposed)
 
     # Prior relationships are only reusable when they came from the same
     # connector, same as the profiles below.
@@ -922,6 +1029,19 @@ def relationships(
             "with an endpoint this run did not profile or reuse fresh (a "
             "--scope/--dataset narrower than a prior run)"
         )
+    notes.extend(
+        _overlap_sweep_notes(
+            infer_by_overlap=infer_by_overlap,
+            deferred=overlap_deferred,
+            pending=overlap_pending,
+            proposed=overlap_proposed,
+            rejected=overlap_rejected,
+            elided=overlap_elided,
+            carried=overlap_carried,
+        )
+    )
+    if overlap_warning:
+        warnings.append(overlap_warning)
 
     # Persist the profiles this run already paid for. Relationships inventories
     # and profiles the full set and infers across all of it, so its relationship
@@ -942,7 +1062,12 @@ def relationships(
         updated_at=now.isoformat(),
         notes=notes,
         warnings=warnings,
-        pending_confirmation=verify_pending,
+        # `verify`'s checkpoint always resolves first (the sweep defers
+        # behind it, see `overlap_deferred`), so at most one of the two is
+        # ever non-None at once; the ternary is defensive, not load-bearing.
+        pending_confirmation=verify_pending
+        if verify_pending is not None
+        else overlap_pending,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -952,6 +1077,7 @@ def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
         relationships(
             engine,
             verify=getattr(args, "verify", False),
+            infer_by_overlap=getattr(args, "infer_by_overlap", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
         )
@@ -1689,6 +1815,7 @@ def map(
     full: bool = False,
     detail: bool = False,
     verify: bool = False,
+    infer_by_overlap: bool = False,
     refresh: bool = False,
     use_project: bool = False,
 ) -> MapResult:
@@ -1702,6 +1829,11 @@ def map(
     only the top-ranked objects are deep-profiled and the rest stay
     inventory-only, because profiling everything on a metered connector is how a
     first look becomes an expensive one. ``full`` overrides that.
+
+    With ``infer_by_overlap``, key-shaped columns no name-based rule matched
+    are swept for measured value containment (issue #220), the same opt-in,
+    priced-after-the-fact phase :func:`relationships` runs, in the same slot
+    after ``verify``.
     """
 
     store = engine.store
@@ -1718,6 +1850,8 @@ def map(
     over_ceiling = False
     verify_pending: ConfirmationRequest | None = None
     verify_warning: str | None = None
+    overlap_pending: ConfirmationRequest | None = None
+    overlap_warning: str | None = None
     warnings: list[str] = []
 
     metas = inventory_mod.inventory(adapter)
@@ -1824,6 +1958,16 @@ def map(
     )
     relationship_set, confirmed = _merge_relationships(declared, inferred)
 
+    # A prior overlap-derived edge (issue #220) is never rediscovered by
+    # plain inference, so it is carried forward unconditionally rather than
+    # only when out of scope; see `_carry_forward_overlap_edges` and the
+    # identical call in `relationships`. Checked against the full live
+    # inventory (`metas`), not just `all_selected`, so an object merely
+    # skipped by this run's rank cutoff still counts as known.
+    relationship_set, overlap_carried = _carry_forward_overlap_edges(
+        prior, adapter.name, {m.identifier for m in metas}, relationship_set
+    )
+
     # Verify the merged set: declared joins are probe candidates (issue #163)
     # and only exist from the merge above. Same ordering as `relationships`.
     if verify:
@@ -1858,6 +2002,64 @@ def map(
                     "results are saved; raise --budget and re-run to "
                     "finish verification"
                 )
+
+    # The overlap sweep (issue #220), same slot and same deferral rule as in
+    # `relationships`: it runs after --verify, on the merged set, and defers
+    # entirely behind a still-pending verify checkpoint so at most one of the
+    # two phases is ever pending confirmation at once.
+    overlap_proposed = 0
+    overlap_rejected = 0
+    overlap_elided = 0
+    overlap_deferred = infer_by_overlap and verify_pending is not None
+    if infer_by_overlap and verify_pending is None:
+        matched = {
+            (rel.from_dataset.lower(), col.lower())
+            for rel in relationship_set
+            for col in rel.from_columns
+        } | {
+            (rel.to_dataset.lower(), col.lower())
+            for rel in relationship_set
+            for col in rel.to_columns
+        }
+        overlap_candidates, overlap_elided, overlap_cap = (
+            rel_mod.overlap_sweep_candidates(all_selected, matched)
+        )
+        if overlap_candidates:
+            overlap_cost, candidate_count, object_count = _overlap_estimate(
+                adapter, overlap_candidates
+            )
+            overlap_pending = command_args.overlap_handshake(
+                "explore map",
+                adapter,
+                overlap_cost,
+                candidate_count=candidate_count,
+                object_count=object_count,
+                cap=overlap_cap,
+                elided=overlap_elided,
+            )
+            if overlap_pending is None:
+                overlap_reporter = _reporter(
+                    len(overlap_candidates), "swept", "candidates"
+                )
+                try:
+                    overlap_rejected = rel_mod.probe_overlap_candidates(
+                        adapter,
+                        overlap_candidates,
+                        timeout_seconds=config.query.timeout_seconds,
+                        progress=overlap_reporter,
+                    )
+                    overlap_reporter.done()
+                except OverCeilingError:
+                    overlap_warning = (
+                        "budget exhausted mid-sweep; a candidate not yet "
+                        "probed when the ceiling hit is neither proposed nor "
+                        "reported as rejected, since it was never measured. "
+                        "Relationships proposed before the ceiling are "
+                        "saved; raise --budget and re-run to finish the sweep"
+                    )
+                proposed = [rel for rel in overlap_candidates if rel.verified]
+                relationship_set = relationship_set + proposed
+                overlap_proposed = len(proposed)
 
     # Prior profiles are only reusable when they came from the same connector.
     reusable = prior if prior and prior.provenance.connector == adapter.name else None
@@ -1962,6 +2164,19 @@ def map(
         )
     if verify_warning:
         warnings.append(verify_warning)
+    notes.extend(
+        _overlap_sweep_notes(
+            infer_by_overlap=infer_by_overlap,
+            deferred=overlap_deferred,
+            pending=overlap_pending,
+            proposed=overlap_proposed,
+            rejected=overlap_rejected,
+            elided=overlap_elided,
+            carried=overlap_carried,
+        )
+    )
+    if overlap_warning:
+        warnings.append(overlap_warning)
 
     # Same ordering the payload's own selection uses: rank first, identifier
     # second. Two orderings derived from one cache inside one envelope would be a
@@ -1996,7 +2211,9 @@ def map(
         updated_at=now.isoformat(),
         notes=notes,
         warnings=warnings,
-        pending_confirmation=verify_pending,
+        pending_confirmation=verify_pending
+        if verify_pending is not None
+        else overlap_pending,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -2008,6 +2225,7 @@ def cmd_map(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             full=getattr(args, "full", False),
             detail=getattr(args, "detail", False),
             verify=getattr(args, "verify", False),
+            infer_by_overlap=getattr(args, "infer_by_overlap", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
         )
@@ -2698,6 +2916,50 @@ def _carry_forward_relationships(
     return relationships + carried, len(carried)
 
 
+def _carry_forward_overlap_edges(
+    prior: DexCache | None,
+    connector: str,
+    known_identifiers: set[str],
+    relationships: list[Relationship],
+) -> tuple[list[Relationship], int]:
+    """Union back in every prior ``OVERLAP_INFERRED`` edge whose endpoints
+    are both still known objects on this connector (issue #220).
+
+    The general :func:`_carry_forward_relationships` above only reaches back
+    for an edge outside this run's examined scope, on the premise that
+    anything in scope would be re-found this run if it still holds -- true
+    for a declared join (re-read from the dbt project every run) and a
+    name-inferred one (re-derived from cheap metadata every run), but false
+    for an overlap-derived one: nothing rediscovers it except the opt-in,
+    priced ``--infer-by-overlap`` sweep. Without this, an edge only that
+    sweep can find would vanish the moment a caller runs a plain
+    ``explore relationships``/``explore map``, which is a worse loss than
+    the general function guards against, since here there is no cheaper path
+    back to the same fact.
+
+    Called before the sweep builds its own "already matched" exclusion set,
+    so a pair this already covers is never re-probed (and re-paid for) on a
+    later ``--infer-by-overlap`` run that finds the same edge again.
+    Deduped the same way the general carry-forward is, so a --infer-by-overlap
+    run that reconfirms an edge this run doesn't double it.
+    """
+
+    if prior is None or prior.provenance.connector != connector:
+        return relationships, 0
+    existing = {_relationship_edge_key(rel) for rel in relationships}
+    carried = [
+        rel
+        for rel in prior.relationships
+        if rel.kind is RelationshipKind.OVERLAP_INFERRED
+        and rel.from_dataset in known_identifiers
+        and rel.to_dataset in known_identifiers
+        and _relationship_edge_key(rel) not in existing
+    ]
+    if not carried:
+        return relationships, 0
+    return relationships + carried, len(carried)
+
+
 def _orphan_candidates(
     metas: list[ObjectMeta], defs: dbt_project.ProjectDefinitions
 ) -> set[str]:
@@ -2961,6 +3223,70 @@ def _affix_match_notes(affix_matches: list[rel_mod.AffixMatch]) -> list[str]:
         f"stripping a configured prefix/suffix ({examples}{more}); scored below "
         "an exact entity-name match to the same key"
     ]
+
+
+def _overlap_sweep_notes(
+    *,
+    infer_by_overlap: bool,
+    deferred: bool,
+    pending: ConfirmationRequest | None,
+    proposed: int,
+    rejected: int,
+    elided: int,
+    carried: int,
+) -> list[str]:
+    """Notes for the ``--infer-by-overlap`` sweep phase (issue #220).
+
+    Named even when the sweep did not run, off by default, deferred behind a
+    still-pending ``--verify`` checkpoint, or pending its own, per the
+    issue's acceptance criterion that the flag is discoverable from notes
+    alone rather than only from ``--help``. ``carried`` is reported
+    unconditionally, since a prior overlap-derived edge survives into this
+    run's set regardless of whether the sweep itself ran again (see
+    :func:`_carry_forward_overlap_edges`).
+    """
+
+    notes: list[str] = []
+    if carried:
+        notes.append(
+            f"carried forward {carried} previously discovered value-overlap "
+            "join(s); an overlap-derived edge is never rediscovered by "
+            "plain inference, so it persists once found rather than "
+            "needing --infer-by-overlap again on every call"
+        )
+    if not infer_by_overlap:
+        notes.append(
+            "value-overlap join inference not run; pass --infer-by-overlap "
+            "to probe key-shaped columns whose names matched nothing for "
+            "measured value containment"
+        )
+        return notes
+    if deferred:
+        notes.append(
+            "value-overlap sweep deferred: --verify's own checkpoint is "
+            "still pending confirmation; confirm and re-run to also run "
+            "the sweep in the same pass"
+        )
+        return notes
+    if pending is not None:
+        notes.append(
+            "value-overlap sweep saved unswept; confirmation awaits (see hint)"
+        )
+        return notes
+    if proposed or rejected:
+        notes.append(
+            f"overlap sweep proposed {proposed} join(s) from measured value "
+            f"containment alone (no column name matched); {rejected} probed "
+            "candidate(s) did not show enough containment to propose"
+        )
+    else:
+        notes.append("overlap sweep found no unmatched key-shaped column pair to probe")
+    if elided:
+        notes.append(
+            f"{elided} additional unmatched key-shaped column pair(s) "
+            "exceeded the overlap-sweep cap and were not probed"
+        )
+    return notes
 
 
 def _select_for_profiling(

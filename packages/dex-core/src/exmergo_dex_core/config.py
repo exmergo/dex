@@ -479,7 +479,9 @@ class CacheConfig(BaseModel):
 
     ``backend`` is an open registry rather than a closed set. It accepts a name
     dex ships (``filesystem``, the default, which writes the loose JSON under
-    `.dex/` that a reviewer reads in a pull request), a dotted
+    `.dex/` that a reviewer reads in a pull request; or ``sqlite``, which writes
+    one `.dex/dex.db` file instead and is not git-reviewable, for a host that
+    wants durable state without scattering JSON files), a dotted
     ``mypkg.stores:my_store`` path, or a name an installed distribution registered
     under the ``exmergo_dex_core.stores`` entry-point group. A backend published
     as its own package is therefore selectable without a change to dex.
