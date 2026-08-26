@@ -34,6 +34,20 @@ from pydantic import BaseModel, Field, model_validator
 
 from .diffs import file_diff
 from .errors import ProjectError
+from .semantic_catalog import (
+    DIMENSIONS_PER_DECLARATION,
+    DimensionInfo,
+    EntityInfo,
+    EntityRole,
+    MeasureInfo,
+    MetricComposition,
+    MetricInfo,
+    SemanticCatalogView,
+    SemanticModelInfo,
+    derive_entity_type,
+    merge_element_fields,
+    qualified_dimension,
+)
 
 PROJECT_FILE = "dbt_project.yml"
 PROFILES_FILE = "profiles.yml"
@@ -1510,6 +1524,311 @@ def _read_semantic_manifest(project: Path) -> dict[str, Any] | None:
     if isinstance(payload, dict) and payload.get("semantic_models"):
         return payload
     return None
+
+
+def semantic_catalog(project: Path) -> SemanticCatalogView:
+    """The project's semantic layer as a read catalog.
+
+    The compiled ``target/semantic_manifest.json`` is the source rather than the
+    authored YAML, and the two are not interchangeable here. The manifest has
+    already resolved what a reader would otherwise have to reconstruct: a
+    ratio or derived metric's ``input_measures`` all the way down to the
+    aggregations it really reads, each semantic model's physical relation, and
+    the inherited defaults. The YAML fingerprint ``maintain`` takes is the
+    opposite trade on purpose, hashing exactly what the author wrote so a
+    baseline survives a dbt upgrade; a catalog wants the resolution.
+
+    Takes the project directory rather than a loaded view because the compiled
+    artifact is the only file it reads: loading the view would scan and hash every
+    authored file in the project to answer a question none of them can.
+
+    Raises :class:`DbtProjectError` when the project has no compiled semantic
+    manifest, because an empty catalog and an uncompiled project are different
+    answers and only one of them is fixed by running ``dbt parse``. The caller
+    adds whatever alternative it can offer.
+    """
+
+    manifest = _read_semantic_manifest(project)
+    if manifest is None:
+        raise DbtProjectError(
+            "no compiled semantic manifest at target/semantic_manifest.json; run "
+            "`dbt parse` in the project so the semantic layer can be read"
+        )
+
+    models: list[SemanticModelInfo] = []
+    measures: list[MeasureInfo] = []
+    dimensions: dict[str, dict[str, Any]] = {}
+    entity_roles: dict[str, list[EntityRole]] = {}
+    entity_words: dict[str, dict[str, Any]] = {}
+    physical: dict[str, tuple[str, str]] = {}
+    model_dimensions: dict[str, list[str]] = {}
+    measure_owner: dict[str, str] = {}
+
+    for entry in manifest.get("semantic_models") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+        model_name = entry["name"]
+        node_relation = entry.get("node_relation")
+        node_relation = node_relation if isinstance(node_relation, dict) else {}
+        defaults = entry.get("defaults")
+        defaults = defaults if isinstance(defaults, dict) else {}
+        agg_time = defaults.get("agg_time_dimension")
+        relation = node_relation.get("relation_name")
+        relation = _strip_relation_quoting(str(relation)) if relation else None
+
+        declared_entities = [
+            e for e in entry.get("entities") or [] if isinstance(e, dict)
+        ]
+        primary = next(
+            (
+                e.get("name")
+                for e in declared_entities
+                if str(e.get("type", "")).lower() == "primary"
+            ),
+            None,
+        )
+        for element in declared_entities:
+            name = element.get("name")
+            if not isinstance(name, str):
+                continue
+            entity_roles.setdefault(name, []).append(
+                EntityRole(
+                    semantic_model=model_name,
+                    type=str(element.get("type") or "").lower(),
+                    expr=element.get("expr"),
+                    role=element.get("role"),
+                    description=element.get("description"),
+                )
+            )
+            # An entity's words are the same wherever it is declared, so the first
+            # model that wrote any wins; its per-model caveats live on the role.
+            words = entity_words.setdefault(name, {})
+            for field_name in ("label", "description"):
+                if words.get(field_name) is None:
+                    words[field_name] = element.get(field_name)
+
+        qualified: list[str] = []
+        for element in entry.get("dimensions") or []:
+            if not isinstance(element, dict) or not isinstance(
+                element.get("name"), str
+            ):
+                continue
+            bare = element["name"]
+            token = qualified_dimension(primary, bare)
+            qualified.append(token)
+            merge_element_fields(
+                dimensions,
+                token,
+                {
+                    "type": element.get("type"),
+                    "label": element.get("label"),
+                    "description": element.get("description"),
+                    "definition": bare,
+                    "semantic_model": model_name,
+                },
+            )
+        model_dimensions[model_name] = qualified
+
+        for element in entry.get("measures") or []:
+            if not isinstance(element, dict) or not isinstance(
+                element.get("name"), str
+            ):
+                continue
+            measure_owner[element["name"]] = model_name
+            measures.append(
+                MeasureInfo(
+                    name=element["name"],
+                    agg=str(element.get("agg") or "").lower() or None,
+                    expr=element.get("expr"),
+                    # Resolved, not verbatim: a measure with no time dimension of
+                    # its own uses the model's default, which is the value
+                    # MetricFlow aggregates by and therefore the one a caller
+                    # needs. Reporting the null instead would make the field mean
+                    # "unknown" on the majority of a well-configured layer.
+                    agg_time_dimension=element.get("agg_time_dimension") or agg_time,
+                    label=element.get("label"),
+                    description=element.get("description"),
+                    semantic_model=model_name,
+                )
+            )
+
+        if relation:
+            for element in [*(entry.get("dimensions") or []), *declared_entities]:
+                column = physical_column(element)
+                name = element.get("name") if isinstance(element, dict) else None
+                if not column or not isinstance(name, str):
+                    continue
+                for token in {name, qualified_dimension(primary, name)}:
+                    physical.setdefault(token, (relation, column))
+
+        models.append(
+            SemanticModelInfo(
+                name=model_name,
+                label=entry.get("label"),
+                description=entry.get("description"),
+                model_ref=node_relation.get("alias")
+                or _parse_relation_ref(str(entry.get("model", ""))),
+                agg_time_dimension=agg_time,
+                primary_entity=primary or entry.get("primary_entity"),
+            )
+        )
+
+    # dex's own synthesis rather than a manifest entry, so it carries no label,
+    # description or owning model: every word in the catalog is the project's.
+    dimensions.setdefault("metric_time", {"type": "time"})
+
+    metrics = [
+        _metric_info(entry, measure_owner, model_dimensions)
+        for entry in manifest.get("metrics") or []
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    ]
+
+    return SemanticCatalogView(
+        semantic_models=sorted(models, key=lambda m: m.name),
+        metrics=metrics,
+        dimensions=[
+            DimensionInfo(
+                name=name,
+                type=fields.get("type") or "",
+                label=fields.get("label"),
+                description=fields.get("description"),
+                definition=fields.get("definition"),
+                semantic_model=fields.get("semantic_model"),
+            )
+            for name, fields in sorted(dimensions.items())
+        ],
+        entities=[
+            EntityInfo(
+                name=name,
+                type=derive_entity_type(roles),
+                label=entity_words.get(name, {}).get("label"),
+                description=entity_words.get(name, {}).get("description"),
+                roles=roles,
+            )
+            for name, roles in sorted(entity_roles.items())
+        ],
+        measures=sorted(measures, key=lambda m: m.name),
+        dimension_scope=DIMENSIONS_PER_DECLARATION,
+        physical_columns=physical,
+    )
+
+
+def _metric_info(
+    entry: dict[str, Any],
+    measure_owner: dict[str, str],
+    model_dimensions: dict[str, list[str]],
+) -> MetricInfo:
+    """One metric, with what it is built from and what it can be grouped by.
+
+    Groupable dimensions are the dimensions of the semantic models owning its
+    input measures, entity-qualified and single-hop. That under-reports a layer
+    with joins, which the catalog says in a note rather than here; resolving the
+    join graph locally is a separate piece of work.
+    """
+
+    params = entry.get("type_params")
+    params = params if isinstance(params, dict) else {}
+
+    def named(value: Any) -> str | None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("name"), str):
+            return value["name"]
+        return None
+
+    input_measures = [
+        name
+        for name in (named(m) for m in params.get("input_measures") or [])
+        if name is not None
+    ]
+    owners = sorted({measure_owner[m] for m in input_measures if m in measure_owner})
+    groupable = {"metric_time"}
+    for owner in owners:
+        groupable.update(model_dimensions.get(owner, []))
+
+    input_metrics = [
+        name
+        for name in (named(m) for m in params.get("metrics") or [])
+        if name is not None
+    ]
+    composition = MetricComposition(
+        measure=named(params.get("measure")),
+        numerator=named(params.get("numerator")),
+        denominator=named(params.get("denominator")),
+        expr=params.get("expr"),
+        input_metrics=input_metrics or None,
+    )
+
+    return MetricInfo(
+        name=entry["name"],
+        type=str(entry.get("type") or "").lower(),
+        label=entry.get("label"),
+        description=entry.get("description"),
+        dimensions=sorted(groupable),
+        semantic_models=owners or None,
+        input_measures=input_measures or None,
+        composition=composition,
+        filter=_where_template(entry.get("filter")),
+        vendor_params=_metricflow_params(params),
+    )
+
+
+def _where_template(value: Any) -> str | None:
+    """A filter's SQL template, from either spelling the artifacts use.
+
+    dbt has carried a metric filter as a single ``where_sql_template`` and as a
+    ``where_filters`` list across versions, and the hosted API returns the single
+    form. Several templates join with ``AND``, which is how MetricFlow itself
+    combines them.
+    """
+
+    if isinstance(value, str):
+        return value or None
+    if not isinstance(value, dict):
+        return None
+    single = value.get("where_sql_template")
+    if isinstance(single, str) and single:
+        return single
+    templates = [
+        f.get("where_sql_template")
+        for f in value.get("where_filters") or []
+        if isinstance(f, dict) and isinstance(f.get("where_sql_template"), str)
+    ]
+    return " AND ".join(t for t in templates if t) or None
+
+
+def _metricflow_params(params: dict[str, Any]) -> dict[str, Any] | None:
+    """The parts of a metric's definition that only mean something under
+    MetricFlow, under one key rather than promoted into the neutral core.
+
+    A cumulative window, a grain-to-date, and a derived metric's per-input offset
+    window are real and worth carrying; they are also this vendor's semantics, and
+    a consumer needs to be able to tell that without a lookup table.
+    """
+
+    def window(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        count, granularity = value.get("count"), value.get("granularity")
+        if count is None and granularity is None:
+            return None
+        return {"count": count, "granularity": granularity}
+
+    vendor: dict[str, Any] = {}
+    if (cumulative := window(params.get("window"))) is not None:
+        vendor["window"] = cumulative
+    if params.get("grain_to_date"):
+        vendor["grain_to_date"] = params["grain_to_date"]
+    offsets = {}
+    for input_metric in params.get("metrics") or []:
+        if not isinstance(input_metric, dict):
+            continue
+        offset = window(input_metric.get("offset_window"))
+        if offset is not None and isinstance(input_metric.get("name"), str):
+            offsets[input_metric["name"]] = offset
+    if offsets:
+        vendor["offset_windows"] = offsets
+    return vendor or None
 
 
 def _primary_entity_column(entities: Any) -> str | None:
