@@ -1072,6 +1072,167 @@ def test_the_reference_index_reports_names_and_never_a_column_value(
     )
 
 
+def test_propagation_writes_nothing_to_the_project_before_apply(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Propose-don't-impose, on the one path where dex authors the content itself.
+
+    `transform rename` is the first verb where the engine writes the SQL rather
+    than validating what an agent wrote, so the guarantee that nothing reaches the
+    project until `apply` is asserted here rather than inherited from the plan
+    store's good behaviour.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    schema = dbt_project_dir / "models" / "staging" / "schema.yml"
+    before = (model.read_text(), schema.read_text())
+
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(tmp_path),
+                "transform",
+                "rename",
+                "column",
+                "stg_customers.id",
+                "customer_id",
+            ]
+        )
+        == 0
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["plan_id"]
+    assert envelope["diffs"]
+    assert (model.read_text(), schema.read_text()) == before
+
+
+def test_propagation_never_proposes_an_edit_inside_an_installed_package(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """dex reads packages and does not write them.
+
+    The reference index scans `dbt_packages/` on purpose, because a package that
+    ships a model the project shadows is a reference on both sides. That makes an
+    installed package reachable from the same walk that builds edits, so the write
+    boundary is asserted rather than assumed.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    package = dbt_project_dir / "dbt_packages" / "utils"
+    (package / "models").mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        'name: utils\nversion: "1.0.0"\nprofile: utils\n', encoding="utf-8"
+    )
+    (package / "models" / "packaged.sql").write_text(
+        "select 1 as id\n", encoding="utf-8"
+    )
+    packaged_before = (package / "models" / "packaged.sql").read_text()
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "rename",
+            "column",
+            "stg_customers.id",
+            "customer_id",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert not any(
+        path.startswith("dbt_packages/") for path in envelope["data"]["paths"]
+    )
+    assert (package / "models" / "packaged.sql").read_text() == packaged_before
+
+
+def test_propagation_refuses_rather_than_partially_applying(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The rule the whole propagation surface rests on.
+
+    `transform references` may answer "here is what I found, and here is why I
+    might be missing something", because a person reads that and compensates. A
+    generated plan cannot, because it will be applied. So a reference dex could
+    not resolve refuses the plan outright, and nothing is stored.
+
+    Deliberately stricter than the delete guard, which warns on the same input:
+    a dangling dynamic ref left by a delete is unsatisfiable, and one in a
+    rename's path is fixable by hand.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    (dbt_project_dir / "models" / "staging" / "stg_dynamic.sql").write_text(
+        "select * from {{ ref(var('which')) }}\n", encoding="utf-8"
+    )
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "rename",
+            "model",
+            "stg_customers",
+            "stg_people",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert rc != 0
+    assert envelope["status"] == "error"
+    assert "stg_dynamic.sql:1" in json.dumps(envelope["errors"])
+    assert FilesystemStore(tmp_path).list_plans() == []
+    assert (dbt_project_dir / "models" / "staging" / "stg_customers.sql").exists()
+
+
+def test_propagation_and_placement_open_no_connection(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Both verbs are repo-only, whatever the repo is configured to bill against.
+
+    They rewrite files and read a `ref()` graph, and neither needs a warehouse.
+    A connector opened here would price nothing and still authenticate, which is
+    the quiet version of the failure the cost handshake exists to make loud.
+    """
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import DexConfig, save_config
+    from exmergo_dex_core.engine import DexEngine
+
+    monkeypatch.setattr(
+        DexEngine,
+        "_adapter",
+        lambda *a, **k: pytest.fail("a propagation command opened a connection"),
+    )
+    for connector in ("bigquery", "snowflake", "databricks", "duckdb"):
+        save_config(DexConfig(connector=connector), tmp_path)
+        assert (
+            main(
+                [
+                    "--repo-root",
+                    str(tmp_path),
+                    "transform",
+                    "rename",
+                    "column",
+                    "stg_customers.id",
+                    f"id_{connector}",
+                ]
+            )
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+
 def test_the_reference_index_opens_no_connection_on_any_connector(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
