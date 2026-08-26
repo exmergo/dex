@@ -25,6 +25,7 @@ from ... import envelope as env
 from ...config import QueryLimits
 from ..results import SemanticQueryResult
 from . import (
+    EXECUTION_VENDOR,
     DimensionInfo,
     EntityInfo,
     MetricInfo,
@@ -33,7 +34,9 @@ from . import (
     SemanticQuery,
     SemanticQueryRefusedError,
     cap_columnar,
+    cost_posture,
     merge_element_fields,
+    merge_pii_meta,
     requested_dimension_refs,
     screen_dimension_refs,
     unadjudicated_refs,
@@ -127,6 +130,13 @@ def _split_grain(token: str, default_grain: str | None) -> tuple[str, str | None
 
 class HostedDbtCloudBackend:
     name = "dbt_cloud"
+    vendor = "dbt"
+    deployment = "dbt_cloud"
+    # dbt Cloud owns the warehouse connection, so dex never holds a statement it
+    # could price or cap. Everything the no-cost-guard posture needs follows from
+    # this one declaration; see `cost_posture`.
+    execution = EXECUTION_VENDOR
+    cost_guard_warning = _HOSTED_COST_WARNING
 
     _POLL_ATTEMPTS = 90
     _POLL_INTERVAL = 1.0
@@ -244,8 +254,8 @@ class HostedDbtCloudBackend:
                     dimensions=metric_dims,
                 )
             )
-        return SemanticCatalog(
-            backend=self.name,
+        return SemanticCatalog.from_backend(
+            self,
             metrics=metrics,
             dimensions=[
                 DimensionInfo(
@@ -272,7 +282,7 @@ class HostedDbtCloudBackend:
     def query(self, q: SemanticQuery) -> SemanticQueryResult:
         refs = requested_dimension_refs(q)
         meta = self._dimension_meta(q.metrics)
-        lookup = (lambda _ref: None) if meta is None else meta.get
+        lookup = self._meta_lookup(meta)
         blocked = screen_dimension_refs(refs, meta_lookup=lookup)
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
@@ -287,38 +297,84 @@ class HostedDbtCloudBackend:
         json_result = self._await_result(query_id)
         # A hosted cost is a paradigm and nothing else: dbt Cloud ran the query
         # under its own warehouse connection, so there is no estimate dex could
-        # honestly report and no ceiling it could have enforced.
+        # honestly report and no ceiling it could have enforced. That follows from
+        # `execution`, so it is read rather than restated here.
+        cost, warnings = cost_posture(self)
         return SemanticQueryResult.from_capped(
             self._shape(json_result, extra_notes=notes),
-            backend=self.name,
+            backend=self,
             query_id=query_id,
-            cost=env.Cost(paradigm=env.Paradigm.HOSTED),
-            warnings=[_HOSTED_COST_WARNING],
+            cost=cost,
+            warnings=warnings,
         )
 
     def _dimension_meta(self, metrics: list[str]) -> dict[str, Any] | None:
         """``dimension name -> its dbt config.meta`` for the PII gate, or None when
         the layer could not be asked at all.
 
+        **One aliased field per metric, in one document.** ``dimensions(metrics:)``
+        returns the dimensions common to *all* the listed metrics, not their union,
+        so asking about a whole multi-metric query at once shrinks the
+        authoritative map instead of growing it, and the further apart the metrics
+        are in the layer the less of it survives. Everything outside that
+        intersection falls through to the name heuristic, which is the
+        authoritative half of the PII gate quietly not running: the one thing this
+        gate may not do. Asking per metric is what keeps it authoritative, and the
+        aliases keep that to a single round trip, so nothing here needs to be
+        issued concurrently.
+
         Best-effort by design: a metadata call that fails leaves the name heuristic
         screening every ref, which is the fail-closed floor. The None is what lets
         the caller tell that degradation apart from a layer that answered and simply
-        carries no PII metadata, so neither one passes unremarked."""
+        carries no PII metadata, so neither one passes unremarked. One unknown
+        metric fails the whole document rather than its own alias, which costs the
+        map for the other metrics; that query is about to be refused by
+        ``createQuery`` for the same reason, so it never reaches the warehouse."""
 
+        if not metrics:
+            # Nothing to ask about, and an empty selection set is not a document.
+            # `_create_query` refuses this query by name a moment later.
+            return None
         try:
-            metric_inputs = ", ".join(f'{{name: "{_ident(m)}"}}' for m in metrics)
-            query = (
-                f"{{ dimensions(environmentId: {self._env}, metrics: "
-                f"[{metric_inputs}]) {{ name config {{ meta }} }} }}"
+            fields = " ".join(
+                f"a{index}: dimensions(environmentId: {self._env}, "
+                f'metrics: [{{name: "{_ident(metric)}"}}]) '
+                f"{{ name config {{ meta }} }}"
+                for index, metric in enumerate(dict.fromkeys(metrics))
             )
-            data = self._post(query)
+            data = self._post("{ " + fields + " }")
         except SemanticBackendError:
             return None
         meta: dict[str, Any] = {}
-        for d in data.get("dimensions") or []:
-            cfg = d.get("config")
-            meta[d.get("name")] = cfg.get("meta") if isinstance(cfg, dict) else None
+        for dimensions in data.values():
+            for d in dimensions or []:
+                cfg = d.get("config")
+                value = cfg.get("meta") if isinstance(cfg, dict) else None
+                merge_pii_meta(meta, d.get("name"), value)
         return meta
+
+    def _meta_lookup(self, meta: dict[str, Any] | None):
+        """The gate's authoritative lookup, over the tokens a caller actually
+        writes rather than the names the API returns.
+
+        A group-by token may carry a time grain (``user__created_at__month``) that
+        no dimension name has, so a token that misses is retried without it.
+        Without that, a grain suffix is enough on its own to drop a flagged
+        dimension to the name heuristic, which is the same fail-open the aliased
+        query above closes."""
+
+        if meta is None:
+            return lambda _ref: None
+
+        def lookup(ref: str) -> Any:
+            if ref in meta:
+                return meta[ref]
+            head, sep, tail = ref.rpartition("__")
+            if sep and tail.lower() in _GRAINS:
+                return meta.get(head)
+            return None
+
+        return lookup
 
     def _create_query(self, q: SemanticQuery) -> str:
         if not q.metrics:
