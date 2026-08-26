@@ -255,6 +255,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
+                # Deliberately not spelled `--full`, which on `map` decides how
+                # much gets *scanned* and therefore what the run costs. This one
+                # decides only how much of what was found comes back, spends
+                # nothing, and lifts none of the payload caps.
+                if group == "explore" and name == "map":
+                    sp.add_argument(
+                        "--detail", action="store_true", default=argparse.SUPPRESS
+                    )
                 if group == "explore" and name in {"relationships", "map"}:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS

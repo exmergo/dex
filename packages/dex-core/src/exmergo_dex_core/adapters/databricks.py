@@ -1186,7 +1186,15 @@ class DatabricksAdapter:
         values = dict(zip(labels, rows[0], strict=True))
         result = {}
         for i, name in enumerate(columns):
-            domain = values[f"d_{i}"] or []
+            # `is None` rather than a truthiness test: `collect_list` returns an
+            # ARRAY, which this driver materializes through pyarrow as a numpy
+            # ndarray, and `ndarray.__bool__` raises on anything longer than one
+            # element. `x or []` therefore crashed the whole command on exactly
+            # the tables the probe exists to describe, while passing on a column
+            # whose domain happened to hold a single value.
+            domain = values[f"d_{i}"]
+            if domain is None:
+                domain = []
             result[name] = ValueDomainSample(
                 values=[(_field(entry, "v"), _field(entry, "c")) for entry in domain],
                 total_distinct=int(values[f"n_{i}"]),

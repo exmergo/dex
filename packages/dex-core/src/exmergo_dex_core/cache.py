@@ -127,6 +127,55 @@ class Dataset(BaseModel):
     data_quality: list[str] = Field(default_factory=list)
     profiled_at: str | None = None
 
+    def notable_columns(
+        self,
+        join_columns: set[str] | None = None,
+        *,
+        everything: bool = False,
+    ) -> tuple[list[tuple[ColumnProfile, str | None]], int]:
+        """The columns worth reporting about this dataset, with the role each plays.
+
+        A dataset knows which of its own columns carry meaning: the ones that
+        establish its grain, the ones that key it, the ones a join lands on, and
+        the ones flagged as personal data. Everything else is schema, and
+        reporting it is the enumeration dex exists not to do.
+
+        Returns each kept column paired with its role (``"grain"``, ``"key"``,
+        ``"join"``, or ``None`` for a column kept only because it is flagged) and
+        the number dropped, so a caller can always say how much it did not show.
+        ``everything`` keeps every column and still assigns the roles.
+
+        ``join_columns`` is supplied rather than derived, because which joins are
+        in view is the caller's question: a diagram marks FK against the edges it
+        actually drew, and a map marks it against every edge in the cache.
+
+        Warehouse column order is preserved rather than sorted: it is how the
+        table reads in every other tool, and it is already stable in the cache.
+        """
+
+        keyed = {c.lower() for group in self.candidate_keys for c in group}
+        keyed |= {c.lower() for group in self.composite_keys for c in group}
+        grain = {c.lower() for c in (self.grain or [])}
+        joins = {c.lower() for c in (join_columns or ())}
+
+        kept: list[tuple[ColumnProfile, str | None]] = []
+        dropped = 0
+        for column in self.columns:
+            lowered = column.name.lower()
+            if lowered in grain:
+                role: str | None = "grain"
+            elif lowered in joins:
+                role = "join"
+            elif lowered in keyed or column.is_unique is True:
+                role = "key"
+            else:
+                role = None
+            if role is None and column.pii is None and not everything:
+                dropped += 1
+                continue
+            kept.append((column, role))
+        return kept, dropped
+
 
 class RelationshipKind(str, Enum):
     DECLARED = "declared"
@@ -251,3 +300,55 @@ class DexCache(BaseModel):
     datasets: list[Dataset] = Field(default_factory=list)
     relationships: list[Relationship] = Field(default_factory=list)
     provenance: CacheProvenance = Field(default_factory=CacheProvenance)
+
+    def ranked_datasets(
+        self, *, profiled_only: bool = True, connected_only: bool = False
+    ) -> list[Dataset]:
+        """The datasets worth reporting, best first.
+
+        An empty ``columns`` list is the codebase's own test for "inventoried but
+        never profiled" (see ``_compose_datasets``), so ``profiled_only`` is the
+        difference between an object that can say something about itself and one
+        that cannot.
+
+        ``connected_only`` is a separate question, and callers genuinely differ on
+        it. A diagram wants it: an isolated box with no edge is a box that says
+        nothing about the model. A findings payload does not: an isolated object
+        that carries four PII flags and an empty-table warning is exactly a
+        finding, and dropping it would leave the envelope's own
+        ``pii_column_count`` contradicting the objects beside it.
+
+        Order is rank first and identifier second, never cache order, so the same
+        cache reports byte-identically however its datasets happen to be stored.
+        """
+
+        connected = {r.from_dataset.lower() for r in self.relationships}
+        connected |= {r.to_dataset.lower() for r in self.relationships}
+        candidates = [
+            d
+            for d in self.datasets
+            if (d.columns or not profiled_only)
+            and (not connected_only or d.identifier.lower() in connected)
+        ]
+        return sorted(candidates, key=lambda d: (-(d.rank_score or 0.0), d.identifier))
+
+
+def join_columns_by_dataset(
+    relationships: list[Relationship],
+) -> dict[str, set[str]]:
+    """Columns that carry a join, per lowered dataset identifier, for the FK role.
+
+    Takes the relationships in view rather than reading a whole cache, so a
+    caller that narrowed its edges marks FK against what it kept rather than
+    against edges it dropped.
+    """
+
+    columns: dict[str, set[str]] = {}
+    for rel in relationships:
+        columns.setdefault(rel.from_dataset.lower(), set()).update(
+            c.lower() for c in rel.from_columns
+        )
+        columns.setdefault(rel.to_dataset.lower(), set()).update(
+            c.lower() for c in rel.to_columns
+        )
+    return columns

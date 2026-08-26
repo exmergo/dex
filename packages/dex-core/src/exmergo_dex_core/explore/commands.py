@@ -84,6 +84,7 @@ from .results import (
     RankedObject,
     RelationshipsResult,
 )
+from .summary import summarize_map
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -1686,6 +1687,7 @@ def map(
     engine: DexEngine,
     *,
     full: bool = False,
+    detail: bool = False,
     verify: bool = False,
     refresh: bool = False,
     use_project: bool = False,
@@ -1961,7 +1963,12 @@ def map(
     if verify_warning:
         warnings.append(verify_warning)
 
-    top = sorted(datasets, key=lambda d: d.rank_score or 0.0, reverse=True)[:5]
+    # Same ordering the payload's own selection uses: rank first, identifier
+    # second. Two orderings derived from one cache inside one envelope would be a
+    # bug, and rank alone does not break ties.
+    top = sorted(datasets, key=lambda d: (-(d.rank_score or 0.0), d.identifier))[:5]
+    view = summarize_map(cache, detail=detail)
+    notes.extend(view.notes)
     result = MapResult(
         cache=cache,
         cache_path=locator,
@@ -1981,6 +1988,11 @@ def map(
         top_objects=[
             RankedObject(identifier=d.identifier, rank_score=d.rank_score) for d in top
         ],
+        objects=view.objects,
+        edges=view.edges,
+        elided_object_count=view.elided_object_count,
+        elided_column_count=view.elided_column_count,
+        elided_edge_count=view.elided_edge_count,
         updated_at=now.isoformat(),
         notes=notes,
         warnings=warnings,
@@ -1994,6 +2006,7 @@ def cmd_map(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         map(
             engine,
             full=getattr(args, "full", False),
+            detail=getattr(args, "detail", False),
             verify=getattr(args, "verify", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),

@@ -670,6 +670,7 @@ class DexEngine:
         self,
         *,
         full: bool = False,
+        detail: bool = False,
         verify: bool = False,
         refresh: bool = False,
         use_project: bool = False,
@@ -677,7 +678,12 @@ class DexEngine:
         from .explore import commands as explore
 
         return explore.map(
-            self, full=full, verify=verify, refresh=refresh, use_project=use_project
+            self,
+            full=full,
+            detail=detail,
+            verify=verify,
+            refresh=refresh,
+            use_project=use_project,
         )
 
     def query(self, sql: str, *, auto_profile: bool | None = None) -> QueryResult:
