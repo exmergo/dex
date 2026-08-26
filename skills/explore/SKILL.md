@@ -142,9 +142,24 @@ Subcommands, in the usual order:
    first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
    automatically for this subcommand.
 9. `explore semantic list` and `explore semantic query` reach the dbt semantic
-   layer (metrics, dimensions, entities). `list` is discovery: which metrics
-   exist, which dimensions each can be grouped by, and the label and description
-   the dbt project gave each metric, dimension, and entity. `query` takes a positional
+   layer. `list` is discovery, and it returns the layer's objects rather than
+   three lists of names: semantic models (the unit the layer is organized
+   around, each with the transformation model it sits on and its default time
+   dimension), metrics (which dimensions each can be grouped by, the measures it
+   reads, a ratio's two sides, any filter that makes it a subset), dimensions
+   (the token to group by, plus the definition and owning model behind it),
+   entities (one declaration per semantic model, each with its own join key, so
+   the declared join graph is readable), and measures (the aggregation and
+   expression the number is made of, which is often a conditional rather than a
+   column). Read a metric's `input_measures` through to those measures before
+   trusting what a number counts. On a large layer, `list --metric <m>` narrows
+   the catalog to those metrics and what they reach, at no extra cost; the
+   payload names the scope in `scoped_to`, so a scoped catalog is never mistaken
+   for the whole layer. Two payload fields carry differences between the
+   backends rather than leaving them to be inferred: `dimension_scope` says
+   whether a dimension row is one declaration or one groupable path (which is
+   why the two backends report different dimension counts for one layer), and
+   `unavailable` names fields a backend structurally cannot supply. `query` takes a positional
    metric after the explicit mode (with `--metric` kept for compatibility) and a
    `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
    `--limit`) and returns a metric's values as a capped, columnar result. Name
@@ -155,9 +170,9 @@ Subcommands, in the usual order:
    with `--local` / `--api`. Those two flags name who executes, not which vendor:
    every result reports it as `execution` (`dex` or `vendor`). `--local` renders
    the SQL with MetricFlow and executes it through dex's own connector and cost
-   handshake, so cost is surfaced before spend (needs a dbt project and, for
-   `query`, the `[semantic]` extra; `list` is a manifest read-view that needs
-   neither). `--api` sends the query to a hosted
+   handshake, so cost is surfaced before spend (needs a dbt project parsed at
+   least once, and for `query` the `[semantic]` extra; `list` reads the project
+   and needs no extra). `--api` sends the query to a hosted
    dbt Cloud deployment (needs only a host, an environment id, and a
    `DBT_SL_TOKEN`, plus the `[semantic-api]` extra, no local project). The hosted
    backend is the one place the cost guard cannot apply: dbt Cloud executes
