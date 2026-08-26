@@ -24,6 +24,8 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -34,8 +36,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from .diffs import file_diff
 from .errors import ProjectError
+from .metricflow_dialect import METRIC_TIME, STANDARD_GRAINS, order_grains
 from .semantic_catalog import (
     DIMENSIONS_PER_DECLARATION,
+    DIMENSIONS_PER_QUERYABLE_PATH,
     DimensionInfo,
     EntityInfo,
     EntityRole,
@@ -1241,7 +1245,7 @@ def definitions(
 
     semantic_manifest = _read_semantic_manifest(Path(view.root))
     if semantic_manifest is not None:
-        _semantic_from_manifest(semantic_manifest, defs)
+        _semantic_from_manifest(semantic_manifest[0], defs)
     else:
         _semantic_from_yaml(semantic_yaml_entries(view), defs)
 
@@ -1510,23 +1514,191 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
         )
 
 
-def _read_semantic_manifest(project: Path) -> dict[str, Any] | None:
-    """``target/semantic_manifest.json`` when present and carrying semantic
-    models; an empty or unreadable artifact falls back to raw YAML."""
+def _read_semantic_manifest(project: Path) -> tuple[dict[str, Any], str] | None:
+    """``target/semantic_manifest.json`` as ``(payload, raw text)`` when present
+    and carrying semantic models; an empty or unreadable artifact falls back to
+    raw YAML.
+
+    The raw text comes back beside the parsed payload because MetricFlow's own
+    manifest parser takes the document rather than a dict, and reading a large
+    artifact twice for one command is work for nothing.
+    """
 
     path = project / SEMANTIC_MANIFEST_PATH
     if not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        payload = json.loads(text)
     except (OSError, json.JSONDecodeError):
         return None
     if isinstance(payload, dict) and payload.get("semantic_models"):
-        return payload
+        return payload, text
     return None
 
 
-def semantic_catalog(project: Path) -> SemanticCatalogView:
+@dataclass(frozen=True)
+class ResolvedPath:
+    """One token a metric query may group by, and what it reaches.
+
+    The unit a join-resolved read produces: ``user__pricing_tier`` is a
+    ``pricing_tier`` declared in the ``users`` model, reached through the ``user``
+    entity. ``definition`` and ``semantic_model`` are what let a caller see that
+    several paths reach one declaration, and they are left unset rather than
+    guessed where a path is reachable from more than one declaring model.
+    """
+
+    token: str
+    definition: str | None = None
+    semantic_model: str | None = None
+    type: str = ""
+    grains: tuple[str, ...] = ()
+
+
+def resolve_group_by_paths(manifest_text: str) -> dict[str, list[ResolvedPath]] | None:
+    """Per metric, every dimension path a query may group by, or None.
+
+    Asks MetricFlow, which owns the join-resolution rules this catalog would
+    otherwise have to restate: which models a metric's measures live in, which
+    entities those models share, and how far a dimension can be reached through
+    them. A hand-rolled single-hop union under-reports a layer with joins, and the
+    dimension it drops is often the one every metric description tells a caller to
+    group by.
+
+    **None means the join graph could not be resolved**, which is the whole reason
+    this is separated from the manifest read. ``explore semantic list --local`` is
+    a dependency-free read of a compiled artifact, and it stays one: an install
+    that picked no extras gets the declared single-hop view and a payload that says
+    so. Returning None rather than raising is what makes that a declared
+    degradation instead of a failure.
+
+    A manifest the resolver refuses degrades the same way, on purpose. The
+    resolver validates the whole artifact against its own schema, so a manifest
+    written by a different version of dbt can fail a read that dex itself performed
+    without trouble, and losing the catalog over the joins is the worse of the two
+    outcomes. The absence is declared either way, in ``dimension_scope`` before any
+    note, so a caller can tell a resolved list from an unresolved one.
+
+    One lookup builds the whole answer, because constructing it parses the
+    manifest. Date-part specs (``extract(year from ...)``) are skipped: they are
+    real, and their queryable spelling is not a ``__``-joined token, so emitting
+    one would name something no query accepts.
+    """
+
+    try:
+        from metricflow_semantics.model.dbt_manifest_parser import (
+            parse_manifest_from_dbt_generated_manifest,
+        )
+        from metricflow_semantics.model.semantic_manifest_lookup import (
+            SemanticManifestLookup,
+        )
+    except ImportError:
+        return None
+
+    try:
+        return _resolve_through(
+            SemanticManifestLookup(
+                parse_manifest_from_dbt_generated_manifest(manifest_text)
+            ).metric_lookup
+        )
+    except Exception:
+        # Broad, and around the resolution rather than only the parse: this is a
+        # third-party validator and resolver over an artifact dex did not write,
+        # and every way either of them can refuse one means the same thing here.
+        return None
+
+
+def _resolve_through(lookup: Any) -> dict[str, list[ResolvedPath]]:
+    """The resolution itself, given MetricFlow's metric lookup.
+
+    Apart from :func:`resolve_group_by_paths` only so that its whole body, and not
+    just the parse, sits inside one refusal-means-degrade boundary.
+    """
+
+    resolved: dict[str, list[ResolvedPath]] = {}
+    for reference in lookup.metric_references:
+        found: dict[str, dict[str, Any]] = {}
+        for spec in lookup.get_common_group_by_items(
+            metric_references=(reference,)
+        ).annotated_specs:
+            kind = spec.element_type.name
+            if (
+                kind not in ("DIMENSION", "TIME_DIMENSION")
+                or spec.date_part is not None
+            ):
+                continue
+            token = "__".join([*spec.entity_link_names, spec.element_name])
+            entry = found.setdefault(
+                token, {"grains": [], "time": False, "models": set(), "name": None}
+            )
+            entry["time"] = entry["time"] or kind == "TIME_DIMENSION"
+            entry["name"] = spec.element_name
+            entry["models"].update(spec.origin_semantic_model_names)
+            grain = getattr(spec.time_grain, "name", None)
+            if grain and grain not in entry["grains"]:
+                # The resolver names a custom granularity here the same way it
+                # names a standard one, so this is also how a deployment's own
+                # granularities reach the catalog.
+                entry["grains"].append(grain)
+
+        paths: list[ResolvedPath] = []
+        for token, entry in sorted(found.items()):
+            models = sorted(entry["models"])
+            synthesized = token == METRIC_TIME
+            paths.append(
+                ResolvedPath(
+                    token=token,
+                    # dex's own token, not a declaration: it resolves per metric,
+                    # so attributing it to one model's dimension would be a claim
+                    # the layer does not make.
+                    definition=None if synthesized else entry["name"],
+                    semantic_model=(
+                        None if synthesized or len(models) != 1 else models[0]
+                    ),
+                    type="time" if entry["time"] else "categorical",
+                    grains=tuple(order_grains(entry["grains"])),
+                )
+            )
+        resolved[reference.element_name] = paths
+    return resolved
+
+
+def _grains_from(base: str | None, custom: tuple[str, ...] = ()) -> list[str] | None:
+    """The grains a time column declared at ``base`` can be queried at.
+
+    A daily column can be rolled up to a week or a year and cannot be split into
+    an hour, so the answer is the standard grains at or coarser than the declared
+    one. None where nothing was declared, because "any grain" and "we do not know"
+    are different answers and only one of them should read as complete.
+    """
+
+    if not base or base.lower() not in STANDARD_GRAINS:
+        return None
+    floor = STANDARD_GRAINS.index(base.lower())
+    return [*STANDARD_GRAINS[floor:], *custom]
+
+
+@dataclass
+class _LayerIndex:
+    """What a metric needs to know about the layer around it.
+
+    Passed as one object rather than as five maps threaded through a signature:
+    every one of them is derived in the same pass over the semantic models, and a
+    metric reads whichever of them its own type happens to need.
+    """
+
+    measure_owner: dict[str, str]
+    measure_agg_time: dict[str, str | None]
+    model_dimensions: dict[str, list[str]]
+    dimension_grains: dict[tuple[str, str], list[str] | None]
+    resolved: dict[str, list[ResolvedPath]] | None = None
+
+
+def semantic_catalog(
+    project: Path,
+    *,
+    resolve_paths: Callable[[str], dict[str, list[ResolvedPath]] | None] | None = None,
+) -> SemanticCatalogView:
     """The project's semantic layer as a read catalog.
 
     The compiled ``target/semantic_manifest.json`` is the source rather than the
@@ -1546,14 +1718,23 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
     manifest, because an empty catalog and an uncompiled project are different
     answers and only one of them is fixed by running ``dbt parse``. The caller
     adds whatever alternative it can offer.
+
+    ``resolve_paths`` is how the join graph gets resolved, defaulting to
+    :func:`resolve_group_by_paths`. It is injected rather than called directly so
+    that both halves of the contract are reachable in a test: the resolved read,
+    and the declared single-hop read an install without the ``[semantic]`` extra
+    gets. A resolver that answers None is the second of those, and the catalog
+    declares it rather than letting a short list read as the whole layer.
     """
 
-    manifest = _read_semantic_manifest(project)
-    if manifest is None:
+    read = _read_semantic_manifest(project)
+    if read is None:
         raise DbtProjectError(
             "no compiled semantic manifest at target/semantic_manifest.json; run "
             "`dbt parse` in the project so the semantic layer can be read"
         )
+    manifest, manifest_text = read
+    resolved = (resolve_paths or resolve_group_by_paths)(manifest_text)
 
     models: list[SemanticModelInfo] = []
     measures: list[MeasureInfo] = []
@@ -1563,6 +1744,19 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
     physical: dict[str, tuple[str, str]] = {}
     model_dimensions: dict[str, list[str]] = {}
     measure_owner: dict[str, str] = {}
+    measure_agg_time: dict[str, str | None] = {}
+    dimension_grains: dict[tuple[str, str], list[str] | None] = {}
+    # (semantic model, bare dimension name) -> the physical column behind it, so a
+    # join-resolved path can be given the same column resolution a declared token
+    # gets. Without it the PII gate would fall back to the name heuristic on every
+    # token the join resolution added, which is the weaker screening.
+    columns_by_definition: dict[tuple[str, str], tuple[str, str]] = {}
+    # (semantic model, bare dimension name) -> what the project says about it, so a
+    # path that reaches a declaration carries the same words the declaration does.
+    # The hosted API returns them on every path it names, and a caller comparing
+    # the two backends should not find one of them silent.
+    words_by_definition: dict[tuple[str, str], dict[str, Any]] = {}
+    custom_grains = _custom_granularities(manifest)
 
     for entry in manifest.get("semantic_models") or []:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -1616,6 +1810,23 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
             bare = element["name"]
             token = qualified_dimension(primary, bare)
             qualified.append(token)
+            kind = str(element.get("type") or "").lower()
+            element_params = element.get("type_params")
+            element_params = element_params if isinstance(element_params, dict) else {}
+            # A categorical dimension gets an empty list rather than nothing: "no
+            # grain applies here" is an answer, and it is the one that stops a
+            # caller asking for a grain the dimension could never have.
+            grains = (
+                _grains_from(element_params.get("time_granularity"), custom_grains)
+                if kind == "time"
+                else []
+            )
+            dimension_grains[(model_name, bare)] = grains
+            words_by_definition[(model_name, bare)] = {
+                "type": kind,
+                "label": element.get("label"),
+                "description": element.get("description"),
+            }
             merge_element_fields(
                 dimensions,
                 token,
@@ -1625,6 +1836,7 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
                     "description": element.get("description"),
                     "definition": bare,
                     "semantic_model": model_name,
+                    "queryable_granularities": grains,
                 },
             )
         model_dimensions[model_name] = qualified
@@ -1635,6 +1847,9 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
             ):
                 continue
             measure_owner[element["name"]] = model_name
+            measure_agg_time[element["name"]] = (
+                element.get("agg_time_dimension") or agg_time
+            )
             measures.append(
                 MeasureInfo(
                     name=element["name"],
@@ -1658,6 +1873,7 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
                 name = element.get("name") if isinstance(element, dict) else None
                 if not column or not isinstance(name, str):
                     continue
+                columns_by_definition[(model_name, name)] = (relation, column)
                 for token in {name, qualified_dimension(primary, name)}:
                     physical.setdefault(token, (relation, column))
 
@@ -1675,10 +1891,42 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
 
     # dex's own synthesis rather than a manifest entry, so it carries no label,
     # description or owning model: every word in the catalog is the project's.
-    dimensions.setdefault("metric_time", {"type": "time"})
+    dimensions.setdefault(METRIC_TIME, {"type": "time"})
 
+    # A join-resolved path is a row of its own, folded in beside the declarations
+    # so a dimension the project declares stays visible even when no metric can
+    # reach it (which is exactly what a hosted read cannot see). The declarations
+    # were folded first, so the project's own words win and the resolution only
+    # fills in what it alone knows.
+    for paths in (resolved or {}).values():
+        for path in paths:
+            declaration = (path.semantic_model, path.definition)
+            words = words_by_definition.get(declaration, {})
+            merge_element_fields(
+                dimensions,
+                path.token,
+                {
+                    "type": words.get("type") or path.type,
+                    "label": words.get("label"),
+                    "description": words.get("description"),
+                    "definition": path.definition,
+                    "semantic_model": path.semantic_model,
+                    "queryable_granularities": list(path.grains),
+                },
+            )
+            column = columns_by_definition.get(declaration)
+            if column is not None:
+                physical.setdefault(path.token, column)
+
+    index = _LayerIndex(
+        measure_owner=measure_owner,
+        measure_agg_time=measure_agg_time,
+        model_dimensions=model_dimensions,
+        dimension_grains=dimension_grains,
+        resolved=resolved,
+    )
     metrics = [
-        _metric_info(entry, measure_owner, model_dimensions)
+        _metric_info(entry, index)
         for entry in manifest.get("metrics") or []
         if isinstance(entry, dict) and isinstance(entry.get("name"), str)
     ]
@@ -1694,6 +1942,7 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
                 description=fields.get("description"),
                 definition=fields.get("definition"),
                 semantic_model=fields.get("semantic_model"),
+                queryable_granularities=fields.get("queryable_granularities"),
             )
             for name, fields in sorted(dimensions.items())
         ],
@@ -1708,22 +1957,79 @@ def semantic_catalog(project: Path) -> SemanticCatalogView:
             for name, roles in sorted(entity_roles.items())
         ],
         measures=sorted(measures, key=lambda m: m.name),
-        dimension_scope=DIMENSIONS_PER_DECLARATION,
+        dimension_scope=(
+            DIMENSIONS_PER_QUERYABLE_PATH if resolved else DIMENSIONS_PER_DECLARATION
+        ),
+        notes=_catalog_notes(metrics),
         physical_columns=physical,
     )
 
 
-def _metric_info(
-    entry: dict[str, Any],
-    measure_owner: dict[str, str],
-    model_dimensions: dict[str, list[str]],
-) -> MetricInfo:
-    """One metric, with what it is built from and what it can be grouped by.
+def _custom_granularities(manifest: dict[str, Any]) -> tuple[str, ...]:
+    """The granularities this project declares on its own time spines.
 
-    Groupable dimensions are the dimensions of the semantic models owning its
-    input measures, entity-qualified and single-hop. That under-reports a layer
-    with joins, which the catalog says in a note rather than here; resolving the
-    join graph locally is a separate piece of work.
+    dbt lets a project define granularities of its own (a fiscal quarter, a
+    retail week) on the time spine, and they are queryable exactly like a standard
+    grain. A fixed list cannot contain them, which is half of why validating a
+    grain against one was wrong.
+    """
+
+    configuration = manifest.get("project_configuration")
+    configuration = configuration if isinstance(configuration, dict) else {}
+    found: list[str] = []
+    for spine in configuration.get("time_spines") or []:
+        if not isinstance(spine, dict):
+            continue
+        for granularity in spine.get("custom_granularities") or []:
+            name = (
+                granularity.get("name")
+                if isinstance(granularity, dict)
+                else granularity
+            )
+            if isinstance(name, str) and name not in found:
+                found.append(name)
+    return tuple(found)
+
+
+def _catalog_notes(metrics: list[MetricInfo]) -> list[str]:
+    """What this read of the layer has to say about the layer.
+
+    One thing, and it is the thing a caller reading the lists alone gets wrong: a
+    metric whose measures aggregate over different time columns has no single time
+    axis, so grouping it by the layer's time token buckets part of the number by
+    one timestamp and the rest by another, invisibly, in a result that looks like
+    any other.
+
+    What the *read* could not do (a join graph left unresolved because the resolver
+    is absent) is said by the surface rather than here, because the alternatives it
+    has to offer are that surface's own.
+    """
+
+    disagreeing = sorted(m.name for m in metrics if len(m.time_axis or ()) > 1)
+    if not disagreeing:
+        return []
+    return [
+        f"{', '.join(disagreeing)} aggregate over more than one time column "
+        "(see time_axis): grouping by metric_time uses each measure's own, so "
+        "the parts of one number can be bucketed by different timestamps"
+    ]
+
+
+def _metric_info(entry: dict[str, Any], index: _LayerIndex) -> MetricInfo:
+    """One metric: what it is built from, what it can be grouped by, and what a
+    time grouping on it resolves to.
+
+    Groupable dimensions come from the join resolver where it ran, which is the
+    same answer a hosted read gives for the same layer. Without it they are the
+    dimensions of the semantic models owning the metric's input measures,
+    entity-qualified and single-hop, which under-reports a layer with joins; the
+    catalog says so in a note rather than letting the shorter list read as
+    complete.
+
+    ``time_axis`` is read per input measure rather than per metric, because that
+    is where the disagreement lives: a ratio whose two sides sit in different
+    models aggregates over each model's own time column, so a single value would
+    be right about half the number.
     """
 
     params = entry.get("type_params")
@@ -1741,10 +2047,44 @@ def _metric_info(
         for name in (named(m) for m in params.get("input_measures") or [])
         if name is not None
     ]
-    owners = sorted({measure_owner[m] for m in input_measures if m in measure_owner})
-    groupable = {"metric_time"}
-    for owner in owners:
-        groupable.update(model_dimensions.get(owner, []))
+    owners = sorted(
+        {index.measure_owner[m] for m in input_measures if m in index.measure_owner}
+    )
+    resolved = (index.resolved or {}).get(entry["name"])
+    if resolved is not None:
+        groupable = {path.token for path in resolved}
+    else:
+        groupable = {METRIC_TIME}
+        for owner in owners:
+            groupable.update(index.model_dimensions.get(owner, []))
+
+    time_axis: list[str] = []
+    axis_grains: list[list[str] | None] = []
+    for measure in input_measures:
+        axis = index.measure_agg_time.get(measure)
+        if not axis:
+            continue
+        if axis not in time_axis:
+            time_axis.append(axis)
+        axis_grains.append(
+            index.dimension_grains.get((index.measure_owner.get(measure, ""), axis))
+        )
+    # The metric's floor is its coarsest axis, so the grains it can be queried at
+    # are the ones every axis can serve. One unknown axis makes the whole answer
+    # unknown rather than optimistic.
+    granularities: list[str] | None = None
+    if axis_grains and all(axis_grains):
+        granularities = [
+            grain
+            for grain in axis_grains[0] or []
+            if all(grain in (other or []) for other in axis_grains[1:])
+        ]
+    if resolved is not None:
+        # The resolver states this outright, so prefer it over the derivation.
+        from_resolver = next(
+            (path.grains for path in resolved if path.token == METRIC_TIME), ()
+        )
+        granularities = list(from_resolver) or granularities
 
     input_metrics = [
         name
@@ -1769,7 +2109,9 @@ def _metric_info(
         input_measures=input_measures or None,
         composition=composition,
         filter=_where_template(entry.get("filter")),
-        vendor_params=_metricflow_params(params),
+        time_axis=sorted(time_axis) or None,
+        queryable_granularities=granularities,
+        vendor_params=_metricflow_params(params, str(entry.get("type") or "").lower()),
     )
 
 
@@ -1797,13 +2139,22 @@ def _where_template(value: Any) -> str | None:
     return " AND ".join(t for t in templates if t) or None
 
 
-def _metricflow_params(params: dict[str, Any]) -> dict[str, Any] | None:
+def _metricflow_params(
+    params: dict[str, Any], metric_type: str
+) -> dict[str, Any] | None:
     """The parts of a metric's definition that only mean something under
     MetricFlow, under one key rather than promoted into the neutral core.
 
-    A cumulative window, a grain-to-date, and a derived metric's per-input offset
-    window are real and worth carrying; they are also this vendor's semantics, and
-    a consumer needs to be able to tell that without a lookup table.
+    A cumulative window, a grain-to-date, a derived metric's per-input offset
+    window and whether the metric can be queried at all without a time dimension
+    are real and worth carrying; they are also this vendor's semantics, and a
+    consumer needs to be able to tell that without a lookup table.
+
+    ``requires_metric_time`` is derived rather than read, because the compiled
+    artifact does not carry it: a metric that accumulates or offsets its window
+    has no meaning without a time axis to accumulate or offset along. It is
+    written only when true, so an absent key means false and 27 metrics do not
+    each pay for a false.
     """
 
     def window(value: Any) -> dict[str, Any] | None:
@@ -1814,11 +2165,21 @@ def _metricflow_params(params: dict[str, Any]) -> dict[str, Any] | None:
             return None
         return {"count": count, "granularity": granularity}
 
+    # dbt has moved a cumulative metric's window and grain-to-date under their own
+    # key and kept mirroring them at the top level; read both so the fields do not
+    # silently vanish on a newer project.
+    cumulative_params = params.get("cumulative_type_params")
+    cumulative_params = cumulative_params if isinstance(cumulative_params, dict) else {}
+
     vendor: dict[str, Any] = {}
-    if (cumulative := window(params.get("window"))) is not None:
+    cumulative = window(params.get("window")) or window(cumulative_params.get("window"))
+    if cumulative is not None:
         vendor["window"] = cumulative
-    if params.get("grain_to_date"):
-        vendor["grain_to_date"] = params["grain_to_date"]
+    grain_to_date = params.get("grain_to_date") or cumulative_params.get(
+        "grain_to_date"
+    )
+    if grain_to_date:
+        vendor["grain_to_date"] = grain_to_date
     offsets = {}
     for input_metric in params.get("metrics") or []:
         if not isinstance(input_metric, dict):
@@ -1828,6 +2189,12 @@ def _metricflow_params(params: dict[str, Any]) -> dict[str, Any] | None:
             offsets[input_metric["name"]] = offset
     if offsets:
         vendor["offset_windows"] = offsets
+    offset_to_grain = any(
+        isinstance(x, dict) and x.get("offset_to_grain")
+        for x in params.get("metrics") or []
+    )
+    if metric_type == "cumulative" or offsets or offset_to_grain:
+        vendor["requires_metric_time"] = True
     return vendor or None
 
 
