@@ -54,6 +54,9 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "plans",
         "macro",
         "references",
+        "rename",
+        "remove",
+        "place",
         "test",
     ],
     "semantic": ["define", "update", "plan"],
@@ -360,6 +363,36 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
+                if group == "transform" and name in {"rename", "remove", "place"}:
+                    # The write half of `references`, so it sits behind the
+                    # dialect gate the read half is routed around: these author
+                    # SQL and need the engine that parses it.
+                    #
+                    # `--edits-file` on both propagation verbs, for the same
+                    # payload `transform plan` takes. A removal needs it (dex
+                    # removes a declaration and refuses while a read survives,
+                    # and only the caller knows what a read should become); a
+                    # rename accepts it so a related hand-authored change can
+                    # ride in the same atomic plan.
+                    sp.add_argument("--edits-file", default=None)
+                if group == "transform" and name == "rename":
+                    sp.add_argument("kind")
+                    sp.add_argument("old")
+                    sp.add_argument("new")
+                if group == "transform" and name == "remove":
+                    sp.add_argument("kind")
+                    sp.add_argument("name")
+                if group == "transform" and name == "place":
+                    # The column to define, then where it has to appear and what
+                    # computes it. `--targets` repeats and splits on commas, the
+                    # spelling `explore semantic query` already uses for its own
+                    # lists.
+                    sp.add_argument("argument", nargs="?", default=None)
+                    sp.add_argument("--targets", action="append", default=None)
+                    sp.add_argument("--expr", default=None)
+                    # Answer without storing a plan. The proposal is only worth
+                    # calling one if a caller can ask for it cheaply and disagree.
+                    sp.add_argument("--explain", action="store_true", default=False)
                 if group == "transform" and name == "test":
                     # `test` is scaffold-only for now: the model to derive a
                     # unit_tests: skeleton from. No bare `transform test`
@@ -498,6 +531,9 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "deps"): "cmd_deps",
         ("transform", "plans"): "cmd_plans",
         ("transform", "macro"): "cmd_macro",
+        ("transform", "rename"): "cmd_rename",
+        ("transform", "remove"): "cmd_remove",
+        ("transform", "place"): "cmd_place",
         ("transform", "test"): "cmd_test",
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",

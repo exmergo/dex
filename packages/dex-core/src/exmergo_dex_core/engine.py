@@ -78,8 +78,10 @@ if TYPE_CHECKING:
         InitResult,
         MacroListResult,
         MacroResult,
+        PlacementResult,
         PlanListResult,
         PlanResult,
+        PropagationResult,
     )
 
 
@@ -881,6 +883,37 @@ class DexEngine:
         from . import references as references_mod
 
         return references_mod.run(self, names, kind=kind, full=full)
+
+    def rename(
+        self,
+        kind: str,
+        old: str,
+        new: str,
+        *,
+        edits_file: str | None = None,
+    ) -> PropagationResult:
+        from .transform import commands as transform
+
+        return transform.rename(self, kind, old, new, edits_file=edits_file)
+
+    def remove(
+        self, kind: str, name: str, *, edits_file: str | None = None
+    ) -> PropagationResult:
+        from .transform import commands as transform
+
+        return transform.remove(self, kind, name, edits_file=edits_file)
+
+    def place(
+        self,
+        column: str,
+        targets: list[str],
+        expression: str,
+        *,
+        explain: bool = False,
+    ) -> PlacementResult:
+        from .transform import commands as transform
+
+        return transform.place(self, column, targets, expression, explain=explain)
 
     def build(
         self, *, target: str | None = None, select: str | None = None
