@@ -87,6 +87,41 @@ dex transform references <name>   -> where each name is used: model SQL, schema.
                                      `complete` only once every reason to doubt it is ruled out, and
                                      data.limits names the rest. Capped, with every elision in notes;
                                      --full lifts the caps
+dex transform rename <kind>       -> every edit the rename needs, as one plan: the definition, every
+  <old> <new> [--edits-file <f>]     model that selects it, every schema.yml that documents or tests it,
+                                     every semantic reference, and a seed header. <kind> is one of
+                                     column, var, model, seed, snapshot, macro, source. A column must
+                                     be named `model.column`: a bare name is refused, because a report
+                                     may answer imprecisely and a rewrite may not. Scoped to the
+                                     defining node and its ref() descendants. Repo-only and free.
+                                     REFUSES rather than partially applying: on a reference dex could
+                                     not resolve statically, on a name an installed package also
+                                     defines (renaming this project's copy un-shadows the package's),
+                                     on a column handed to a macro as a literal string, and on a model
+                                     whose SELECT list it cannot read. A bare `select *` is not a
+                                     refusal: it provably carries the column through, needs no edit,
+                                     and the plan says so. --edits-file carries related hand-authored
+                                     edits into the same atomic plan
+dex transform remove <kind> <name>   -> the definition removed, and every read verified gone. Same kinds
+  [--edits-file <f>]                 as rename, same refusals. dex authors the removal of the
+                                     definition and REFUSES while any read survives, naming each with
+                                     a file and a line; it never rewrites a read, because
+                                     `{% if var('flag') %}` can be dropped or unguarded and only the
+                                     caller knows which. Pass those read edits with --edits-file and
+                                     they are validated and stored in this same plan
+dex transform place <column>      -> where a derived column shared by several models belongs: the
+  --targets <m,m> --expr "<sql>"     lowest model in the ref() graph that every target descends from
+  [--explain]                        and that already projects the inputs the expression reads. The
+                                     inputs are parsed out of --expr, so they cannot disagree with it.
+                                     Defines the column there and threads it down every chain, with a
+                                     schema.yml entry at the ancestor and at each target and none in
+                                     between. data.reasoning names the ancestor, why it is the lowest,
+                                     which targets descend from it, and the chain, because a proposal
+                                     has to be arguable. Where there is no common ancestor, where the
+                                     lowest one lacks an input, or where two tie, data.strategy is
+                                     `per_target` and the reason is stated rather than the worse thing
+                                     being done quietly. --explain returns the reasoning and stores no
+                                     plan. Repo-only and free
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
                                      auto-runs dbt deps when packages are declared but not installed
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
@@ -148,7 +183,14 @@ data rows no longer count as source, and why a reference dex could not resolve
 statically *warns* rather than refusing: it may or may not name the deleted node,
 and no edit the caller could make would settle it.
 A rename is one plan: `delete` the old model, `create` the new, `update` the
-referrers, validated together. The engine validates each edit
+referrers, validated together. `transform rename` generates exactly that plan, and
+the rest of the rename's edits with it, so hand-assembling one is now the fallback
+rather than the route. Note the two guards read the same index and answer
+differently on purpose: a reference dex cannot resolve *warns* on a delete and
+*refuses* on a rename. A dangling dynamic ref left by a delete is unsatisfiable,
+so refusing would block a legitimate delete forever; the same reference in a
+rename's path is satisfiable, because the caller can resolve it by hand and
+re-run. The engine validates each edit
 (model SQL must be a single read-only SELECT once jinja is stripped; YAML must
 parse; semantic YAML must satisfy MetricFlow's schemas; a `packages_yml` edit
 must carry a `packages:` or `dependencies:` list and targets the project-root

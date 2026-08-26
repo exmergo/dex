@@ -108,6 +108,11 @@ point at it, all together) so the post-change project is validated as one unit.
 An unconfirmed delete against a file a human edited after planning surfaces as
 `needs_confirmation`, never a silent removal.
 
+For a rename or a removal, reach for `transform rename` / `transform remove`
+instead of assembling the edits yourself. They generate the whole change from the
+reference graph and refuse when they cannot promise it is complete, which is the
+guarantee hand-assembly cannot give you.
+
 ### Bootstrapping a project
 
 If no dbt project exists in the repo, offer `transform init` before anything
@@ -217,6 +222,66 @@ check" note just means no connection was reachable at init time.
   name is matched across the project (`scope: name_matched`), so qualify it as
   `model.column` when you want the lineage separated from same-named columns
   elsewhere.
+
+  Once you know where a name is used, `transform rename` and `transform remove`
+  below make the change; you do not have to carry the list into hand edits.
+- `transform rename <kind> <old> <new>` generates **every** edit the rename needs
+  and stores them as one plan: the definition, every model that selects the name,
+  every `schema.yml` that documents or tests it, every semantic reference, and a
+  seed header. Kinds are `column`, `var`, `model`, `seed`, `snapshot`, `macro`,
+  `source`. Repo-only and free, like `references`.
+
+  **Use this instead of editing the files yourself.** Retyping a rename across
+  nine files and missing the tenth is the failure mode this exists for, and it is
+  a quiet one: the project still compiles.
+
+  Name a column as `model.column`. A bare name is refused, and the refusal lists
+  the models that define a column of that name so you can pick. That asymmetry
+  with `references` is deliberate: a report you read can afford to be imprecise
+  and a rewrite cannot, because renaming a bare `id` project-wide would rewrite
+  every unrelated `id` there is.
+
+  **It refuses rather than half-applying**, and each refusal names what to fix:
+  a reference dex could not resolve statically, a name an installed package also
+  defines, a column handed to a macro as a literal string (dex cannot tell a
+  column argument from a display label), a SELECT list it cannot read. Fix what
+  it names and re-run. There is no override flag, because a completeness
+  guarantee you can switch off is a suggestion. A bare `select *` is *not* a
+  refusal: it carries the column through under the new name with no edit, and the
+  plan's `notes` says so.
+
+  Read `data.sites` against the `transform references` output you ran first. It
+  counts occurrences per reference form in the same vocabulary, so the two
+  agreeing is your evidence that nothing was dropped between reading and writing.
+- `transform remove <kind> <name>` removes the **definition** and verifies every
+  read is gone, refusing while any survives and naming each with a file and line.
+
+  It never rewrites a read, and that boundary is the point rather than a gap.
+  `{% if var('using_department') %}` can be deleted or unguarded, and
+  `{{ var('x') }}` sitting in an expression has no value dex may invent. You are
+  the one who knows. Author those edits yourself and pass them with
+  `--edits-file` in the same call: they are validated and stored in the same
+  plan, so the removal is still atomic.
+- `transform place <column> --targets <a,b> --expr "<sql>"` answers where a
+  derived column that several models need should be *defined*. It walks `ref()`
+  upward from every target, takes the lowest model they all descend from that
+  already projects the inputs your expression reads, defines the column there,
+  and threads it down every chain. The inputs come from parsing `--expr`, so
+  there is no separate list to get out of sync with it.
+
+  **Read `data.reasoning` before you apply.** It names the ancestor, why it is
+  the lowest, which targets descend from it, and the chain. You are supposed to
+  be able to disagree with it; `--explain` gives you the same answer with no plan
+  stored, which is the cheap way to ask.
+
+  When `data.strategy` is `per_target` the shared definition was not available
+  and the reasoning says why: no common ancestor, or the lowest one is missing an
+  input, or two candidates tie. dex will not go further upstream to pull an input
+  down, because that turns one placement into an unbounded rewrite of everything
+  above it. The fallback duplicates the derivation in each target and those
+  copies will drift, so relay the reason to the user rather than applying it on
+  their behalf. Often the named fix (add the missing column to the ancestor
+  first) is what they actually want.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
   `--budget` on billed connectors). On BigQuery there is no upfront estimate

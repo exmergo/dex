@@ -248,6 +248,15 @@ deterministic staging scaffolds into reviewable, conflict-checked diffs
 gated dev-target-only builds with cost surfaced before any spend
 (`transform build`), and authors the semantic layer as MetricFlow-validated dbt
 semantic models (`semantic define|update|plan`, applied with `transform apply`).
+It also answers, and then acts on, "where is this used": `transform references`
+reports every use of a name across model SQL, `schema.yml`, `dbt_project.yml`,
+macros, semantic YAML, seed headers and installed packages, jinja-aware and honest
+about what it could not resolve; `transform rename` and `transform remove` turn
+that report into every edit the change needs as one plan, refusing rather than
+propagating a change to most of a project; and `transform place` decides where a
+derived column that several models need should be defined, proposing the lowest
+common ancestor in the `ref()` graph along with the reasoning behind the choice.
+All four are repo-only and free on every connector.
 
 `maintain`: detects drift against the `.dex/` snapshot on four axes and proposes
 the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
