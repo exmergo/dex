@@ -748,6 +748,18 @@ class JinjaCall(BaseModel):
     spans_region: bool = False
     #: "expression" for `{{ }}`, "statement" for `{% %}`.
     region_kind: str = "expression"
+    #: Half-open ``[start, end)`` of the callee name, and of each resolved
+    #: argument's *contents* inside its quotes, indexed into the same
+    #: comment-masked source :class:`JinjaRegion` offsets are in. A span is
+    #: ``None`` wherever the corresponding ``args`` entry is ``None``, since
+    #: there is no literal to point at.
+    #:
+    #: Here so a caller renaming what a call names can splice exactly those
+    #: bytes and leave the rest of the template alone. A rewriter working from
+    #: ``line`` alone has to re-find the name by searching the line, which picks
+    #: the wrong occurrence as soon as a line carries the name twice.
+    callee_span: tuple[int, int] | None = None
+    arg_spans: tuple[tuple[int, int] | None, ...] = ()
 
 
 class JinjaRegion(BaseModel):
@@ -799,12 +811,14 @@ def jinja_regions(content: str) -> tuple[list[JinjaRegion], str]:
                 calls=[
                     JinjaCall(
                         callee=callee,
-                        args=args,
+                        args=tuple(value for value, _span in arguments),
                         line=masked_source.count("\n", 0, offset) + 1,
                         spans_region=call_text.strip() == body.strip(),
                         region_kind=kind,
+                        callee_span=(offset, offset + len(callee)),
+                        arg_spans=tuple(span for _value, span in arguments),
                     )
-                    for offset, callee, args, call_text in sorted(
+                    for offset, callee, arguments, call_text in sorted(
                         _calls_in(body, match.start() + 2),
                         key=lambda call: call[0],
                     )
@@ -821,13 +835,23 @@ def jinja_calls(content: str) -> list[JinjaCall]:
     return [call for region in regions for call in region.calls]
 
 
+#: One argument as read: its literal value (``None`` when dex did not resolve it)
+#: and the absolute half-open span of that literal's contents (``None`` likewise).
+_Argument = tuple[str | None, tuple[int, int] | None]
+
+
 def _calls_in(
     body: str, base: int
-) -> list[tuple[int, str, tuple[str | None, ...], str]]:
-    """``(offset, callee, args, call text)`` for ``body``, nested calls included."""
+) -> list[tuple[int, str, tuple[_Argument, ...], str]]:
+    """``(callee offset, callee, arguments, call text)``, nested calls included.
+
+    Offsets are absolute: ``base`` is where ``body`` starts in the source the
+    caller is indexing into, which is what lets a rewriter splice a name out of
+    a nested call without re-finding it by text.
+    """
 
     masked = _mask_strings(body)
-    found: list[tuple[int, str, tuple[str | None, ...], str]] = []
+    found: list[tuple[int, str, tuple[_Argument, ...], str]] = []
     position = 0
     while True:
         start = _CALL_START.search(masked, position)
@@ -846,7 +870,9 @@ def _calls_in(
             (
                 base + start.start(1),
                 start.group(1),
-                _split_args(inner, masked[open_paren + 1 : close]),
+                _split_args(
+                    inner, masked[open_paren + 1 : close], base + open_paren + 1
+                ),
                 body[start.start(1) : close + 1],
             )
         )
@@ -854,12 +880,16 @@ def _calls_in(
         position = close + 1
 
 
-def _split_args(inner: str, masked_inner: str) -> tuple[str | None, ...]:
-    """Top-level arguments of one call, each as its literal value or ``None``."""
+def _split_args(inner: str, masked_inner: str, base: int) -> tuple[_Argument, ...]:
+    """Top-level arguments of one call, each as its literal value and span.
+
+    ``base`` is where ``inner`` starts in the source being indexed, so a span
+    lands on the file a human opens rather than on this slice.
+    """
 
     if not inner.strip():
         return ()
-    args: list[str | None] = []
+    args: list[_Argument] = []
     depth = 0
     start = 0
     for index, char in enumerate(masked_inner):
@@ -868,15 +898,24 @@ def _split_args(inner: str, masked_inner: str) -> tuple[str | None, ...]:
         elif char in ")]}":
             depth -= 1
         elif char == "," and depth == 0:
-            args.append(_literal(inner[start:index]))
+            args.append(_literal(inner[start:index], base + start))
             start = index + 1
-    args.append(_literal(inner[start:]))
+    args.append(_literal(inner[start:], base + start))
     return tuple(args)
 
 
-def _literal(text: str) -> str | None:
+def _literal(text: str, base: int) -> _Argument:
+    """One argument's literal value and the span of its contents, or two ``None``.
+
+    The span covers what is *between* the quotes, so a rewriter replaces the
+    name and leaves the quoting style the author chose alone.
+    """
+
     quoted = _QUOTED_ARG.match(text.strip())
-    return quoted.group(2) if quoted else None
+    if quoted is None:
+        return None, None
+    offset = base + len(text) - len(text.lstrip())
+    return quoted.group(2), (offset + quoted.start(2), offset + quoted.end(2))
 
 
 def _closing_paren(masked: str, open_paren: int) -> int | None:

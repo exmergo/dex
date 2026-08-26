@@ -11,6 +11,132 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform rename` and `transform remove` generate the whole propagation
+  plan** ([#221]). `transform references` could tell you where a name was used
+  and then left you to retype the change file by file. These two make the change:
+  given a rename or a removal, every edit it needs arrives as one plan, reviewed
+  and applied as a unit.
+
+  Kinds are `column`, `var`, `model`, `seed`, `snapshot`, `macro` and `source`,
+  and every reference *form* is covered rather than only the ones that break a
+  build. The delete guard only ever needed `ref_call` and its two YAML
+  equivalents, because those are what stop a project compiling. A rename needs
+  the rest as well: a column named only in a `schema.yml` test, a seed header, a
+  semantic `expr`, a var declared under a scoped `+vars:`. Each of those is a file
+  that has to change and none of them would have failed a build.
+
+  **SQL is rewritten by splicing, never by regenerating.** `sqlglot`'s parse tree
+  carries a byte range on every identifier and says what each one is, so dex
+  replaces exactly the identifiers that named the column and leaves every other
+  byte where it was. Comments survive, so does the author's formatting, and so
+  does each dialect's own spelling. The alternative reads better in a design
+  document and is wrong in practice: parsing five models and printing them back
+  out produces five whole-file diffs in which the actual change is invisible,
+  which defeats the point of proposing rather than imposing. `schema.yml` is
+  spliced the same way, through `yaml.compose` marks, so a column's `description`
+  keeps its comments and its quoting.
+
+  Every rewrite is checked afterwards by re-reading the result and comparing its
+  output columns against what was intended, because a splice at a wrong offset
+  produces SQL that still parses. Nothing else would catch that.
+
+  **It refuses rather than partially applying.** That is the whole point, and it
+  is the one rule the command surface rests on: `references` may say "here is what
+  I found and here is why I might be missing something", because a person reads
+  that and compensates; a generated plan cannot, because it will be applied. So
+  every reason the index gives for doubting itself is a refusal here, and each one
+  names what to fix. A reference dex could not resolve statically. A name an
+  installed package also defines, since renaming this project's copy stops it
+  shadowing the package's, which would then resolve under the old name, and dex
+  does not edit installed packages. A column handed to a macro as a literal
+  string, because dex cannot tell a column argument from a display label and
+  rewriting a label changes what the project reports without changing what it
+  computes. A SELECT list dex cannot read. There is no override flag: a
+  completeness guarantee you can switch off is a suggestion.
+
+  A bare `select *` is deliberately not one of those. It provably carries a
+  renamed column through under its new name, so it needs no edit at all, and the
+  plan says so rather than staying silent about a model it skipped.
+
+  **A column must be named `model.column`.** `transform references` answers a bare
+  name across the whole project on purpose, and that asymmetry is the point: a
+  report can afford to be imprecise because a human reads it, and a rewrite
+  cannot, because renaming a bare `id` project-wide would rewrite every unrelated
+  `id` there is and the result would compile. The refusal lists the models that
+  define a column of that name, so qualifying it is one step rather than a search.
+
+  **A removal removes the definition and verifies the reads are gone.** dex will
+  not rewrite a read, and that is a boundary rather than a gap:
+  `{% if var('using_department') %}` can be dropped or unguarded, and
+  `{{ var('x') }}` standing in an expression has no value dex may invent. Only the
+  caller knows. So the removal refuses while any read survives, naming each with a
+  file and a line, and `--edits-file` carries the caller's own read edits into the
+  same plan, where they are validated and stored together. The change stays atomic
+  without dex guessing at semantics.
+
+  This is deliberately stricter than the delete guard, which *warns* on the same
+  unresolved reference, and the two policies now differ visibly rather than by
+  accident. A dangling dynamic ref left by a delete cannot be fixed by any edit
+  the caller could make, so refusing would block a legitimate delete forever. The
+  same reference in a rename's path is fixable by hand, so refusing is a solvable
+  problem.
+
+  Generated edits go through the same `transform plan` path a hand-authored one
+  does, so they get containment, structural validation, the profiles secret guard,
+  the dangling-reference guard and dbt's own parser. A generated edit is not more
+  trustworthy than an authored one; it is only faster to produce. Row attribution
+  is off by default, since a rename changes what a column is called and not which
+  rows a model returns, and measuring it would put a warehouse scan and a cost
+  handshake in front of a change that is free and repo-only.
+
+- **`transform place` proposes where a shared derived column belongs** ([#222]).
+  When a derived column has to appear in several models, where it is *defined* is
+  a graph question with a right answer: the lowest point in the lineage that all
+  of the targets descend from and that has the inputs the derivation needs.
+  Defining it in each target instead duplicates the logic, and the copies drift
+  the first time one of them is corrected.
+
+  `transform place <column> --targets a,b --expr "<sql>"` walks `ref()` upward
+  from every target, intersects, takes the lowest common ancestor that already
+  projects every input, defines the column there, and threads it down every chain
+  as one plan. `schema.yml` gets an entry at the ancestor, where the column is
+  defined, and at each target, where it is consumed, and none at the hops in
+  between, which only carry it.
+
+  The inputs are parsed out of `--expr` rather than passed separately. Two sources
+  for the same fact is one too many: an input list that disagreed with the
+  expression using it would produce a confidently wrong ancestor, and there would
+  be no way for dex to notice.
+
+  **The reasoning is the product.** `data.reasoning` names which ancestor, why it
+  is the lowest, which targets descend from it, and what the pass-through chain
+  is, because "propose, do not impose" only means something if the proposal is
+  legible enough to argue with. `--explain` returns exactly that and stores no
+  plan, so asking the question is cheap.
+
+  **Eligibility is deliberately narrow.** An ancestor qualifies only if it already
+  projects every input. dex will not hunt further upstream to pull an input down,
+  because one placement request would then become an unbounded rewrite of the
+  graph above it. Where the lowest common ancestor is ineligible it is reported by
+  name with what it is missing, which is the fact a caller needs in order to
+  disagree, and often the named fix is what they actually wanted.
+
+  Where there is no common ancestor, where the lowest is ineligible, or where two
+  incomparable candidates tie, `data.strategy` is `per_target`: the column is
+  defined separately in each target and the reason is stated. That is the worse
+  outcome, and saying so beats doing it quietly.
+
+  Threading into a model that groups its rows is refused, naming both ways to
+  resolve it. A bare column added to a `GROUP BY` model is neither grouped nor
+  aggregated, and whether it should join the grain or be wrapped in an aggregate
+  is a question about what the model means. Caught at plan time rather than at
+  `dbt run`.
+
+  Placement is asked of the project format through `PlacingProject.edit_path`, the
+  way `maintain reconcile` asks it. The `ref()` graph and the SQL stay explicitly
+  dbt's, which is what they are: a per-format graph protocol with exactly one
+  implementation would be a seam with nothing on the other side of it.
+
 - **`transform references` reports every use of a name** ([#213]). A read-only,
   repo-only report: given a name, every file that references it, with the line
   and the form of the reference, across model SQL, `schema.yml`,
