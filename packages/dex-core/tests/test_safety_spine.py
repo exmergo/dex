@@ -9,6 +9,7 @@ logic arrives.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1002,6 +1003,102 @@ def test_a_seed_s_pii_refusal_fires_before_any_diff_is_built(dbt_project_dir: Pa
     # Nothing was stored (the plan never got made) and nothing was written.
     assert store.list_plans() == []
     assert not (dbt_project_dir / "seeds" / "contacts.csv").exists()
+
+
+def test_the_reference_index_reads_a_seed_s_header_and_never_its_rows(
+    dbt_project_dir: Path,
+):
+    """A seed is project data, and the index walks every file in the project.
+
+    The header names columns, which is what a reference index is for. The rows
+    below it are values, and values never enter agent context. This is the one
+    place in the read path where "scan every file" meets "a seed holds data", so
+    the boundary is asserted here rather than left to the scanner's good manners.
+    """
+
+    from exmergo_dex_core.dbt_project import load
+    from exmergo_dex_core.references import ReferenceIndex
+
+    (dbt_project_dir / "seeds").mkdir(parents=True, exist_ok=True)
+    a_person = "someone@example.com"
+    (dbt_project_dir / "seeds" / "contacts.csv").write_text(
+        f"id,email\n1,{a_person}\n2,other@example.com\n", encoding="utf-8"
+    )
+    index = ReferenceIndex(load(dbt_project_dir))
+
+    header, _limits = index.references_to("email", "column")
+    assert ("seeds/contacts.csv", "seed_header") in {
+        (hit.path, hit.form) for hit in header
+    }
+    indexed = {
+        reference.name
+        for references in index._by_name.values()
+        for reference in references
+    }
+    assert a_person not in indexed
+    assert not any(name and "@example.com" in name for name in indexed)
+
+
+def test_the_reference_index_reports_names_and_never_a_column_value(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Every occurrence carries a path, a line and a form, and no content.
+
+    The command answers "where", so a line number is the whole payload it owes.
+    Echoing the matching source line back would be a small convenience and a
+    standing leak, because the line that names a column is routinely the line
+    that also carries a literal.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    (dbt_project_dir / "models" / "staging" / "stg_secrets.sql").write_text(
+        "select 'hunter2' as token, id from {{ ref('stg_customers') }}\n",
+        encoding="utf-8",
+    )
+    assert main(["--repo-root", str(tmp_path), "transform", "references", "id"]) == 0
+    payload = capsys.readouterr().out
+    assert "hunter2" not in payload
+    occurrences = [
+        occurrence
+        for target in json.loads(payload)["data"]["targets"]
+        for file_entry in target["files"]
+        for occurrence in file_entry["occurrences"]
+    ]
+    assert occurrences
+    assert all(
+        set(occurrence) <= {"line", "form", "resolution", "note"}
+        for occurrence in occurrences
+    )
+
+
+def test_the_reference_index_opens_no_connection_on_any_connector(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Repo-only means repo-only, whatever the repo is configured to bill against.
+
+    The command is advertised as free on every connector. A connector that got
+    opened here would price nothing and still authenticate, which is the quiet
+    version of the failure the cost handshake exists to make loud.
+    """
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import DexConfig, save_config
+    from exmergo_dex_core.engine import DexEngine
+
+    monkeypatch.setattr(
+        DexEngine,
+        "_adapter",
+        lambda *a, **k: pytest.fail("`transform references` opened a connection"),
+    )
+    for connector in ("bigquery", "snowflake", "databricks", "redshift", "duckdb"):
+        save_config(DexConfig(connector=connector), tmp_path)
+        assert (
+            main(["--repo-root", str(tmp_path), "transform", "references", "id"]) == 0
+        )
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == "ok"
+        assert envelope["cost"]["estimate"] is None
 
 
 def test_a_refused_seed_never_reaches_a_dbt_subprocess(
