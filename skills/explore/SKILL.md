@@ -61,10 +61,22 @@ Subcommands, in the usual order:
    plus notes explaining what the inference examined (so an empty list is
    meaningful). Add `--verify` to measure each inferred join with an aggregate
    overlap probe (orphan fraction, confidence adjusted).
-5. `explore map` writes or updates the `.dex/` cache and prints a summary
-   (`--verify` works here too). Past 50 objects it profiles only the top 25 by
-   rank and says so in `notes` (with `skipped_count`); pass `--full` to profile
-   everything. On a re-map, objects skipped this run keep their prior profiles
+5. `explore map` writes or updates the `.dex/` cache and returns the map
+   (`--verify` works here too). Alongside the counts, `data.objects` gives each
+   top-ranked object its row count, detected grain, candidate key, notable
+   columns (each carrying the role that earned it a place: `grain`, `key`,
+   `join`, or a PII flag) and data-quality findings, and `data.edges` gives the
+   join edges in the same shape `explore relationships` returns. **Read that
+   payload instead of chaining `profile` and `relationships` to re-derive it**;
+   go to those two when you need one object in full, or a value domain, which
+   `map` never carries. It is budgeted: 25 objects by rank, 12 columns per
+   object, 40 edges, 5 findings per object. Every cap binds in every mode and
+   every elision is counted in `notes` and in an `elided_*` field, so an empty
+   `notes` means nothing was cut. `--detail` widens the selection to every column
+   and to objects that were inventoried but never profiled, and lifts no cap; it
+   spends nothing, unlike `--full`. Past 50 objects it profiles only the top 25
+   by rank and says so in `notes` (with `skipped_count`); pass `--full` to
+   profile everything. On a re-map, objects skipped this run keep their prior profiles
    (`carried_forward_count`), each stamped with its own `profiled_at` so
    staleness is visible instead of column detail silently vanishing. A selected
    object whose cached profile is still fresh (same connector, schema unchanged,

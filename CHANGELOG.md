@@ -9,6 +9,449 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`transform rename` and `transform remove` generate the whole propagation
+  plan** ([#221]). `transform references` could tell you where a name was used
+  and then left you to retype the change file by file. These two make the change:
+  given a rename or a removal, every edit it needs arrives as one plan, reviewed
+  and applied as a unit.
+
+  Kinds are `column`, `var`, `model`, `seed`, `snapshot`, `macro` and `source`,
+  and every reference *form* is covered rather than only the ones that break a
+  build. The delete guard only ever needed `ref_call` and its two YAML
+  equivalents, because those are what stop a project compiling. A rename needs
+  the rest as well: a column named only in a `schema.yml` test, a seed header, a
+  semantic `expr`, a var declared under a scoped `+vars:`. Each of those is a file
+  that has to change and none of them would have failed a build.
+
+  **SQL is rewritten by splicing, never by regenerating.** `sqlglot`'s parse tree
+  carries a byte range on every identifier and says what each one is, so dex
+  replaces exactly the identifiers that named the column and leaves every other
+  byte where it was. Comments survive, so does the author's formatting, and so
+  does each dialect's own spelling. The alternative reads better in a design
+  document and is wrong in practice: parsing five models and printing them back
+  out produces five whole-file diffs in which the actual change is invisible,
+  which defeats the point of proposing rather than imposing. `schema.yml` is
+  spliced the same way, through `yaml.compose` marks, so a column's `description`
+  keeps its comments and its quoting.
+
+  Every rewrite is checked afterwards by re-reading the result and comparing its
+  output columns against what was intended, because a splice at a wrong offset
+  produces SQL that still parses. Nothing else would catch that.
+
+  **It refuses rather than partially applying.** That is the whole point, and it
+  is the one rule the command surface rests on: `references` may say "here is what
+  I found and here is why I might be missing something", because a person reads
+  that and compensates; a generated plan cannot, because it will be applied. So
+  every reason the index gives for doubting itself is a refusal here, and each one
+  names what to fix. A reference dex could not resolve statically. A name an
+  installed package also defines, since renaming this project's copy stops it
+  shadowing the package's, which would then resolve under the old name, and dex
+  does not edit installed packages. A column handed to a macro as a literal
+  string, because dex cannot tell a column argument from a display label and
+  rewriting a label changes what the project reports without changing what it
+  computes. A SELECT list dex cannot read. There is no override flag: a
+  completeness guarantee you can switch off is a suggestion.
+
+  A bare `select *` is deliberately not one of those. It provably carries a
+  renamed column through under its new name, so it needs no edit at all, and the
+  plan says so rather than staying silent about a model it skipped.
+
+  **A column must be named `model.column`.** `transform references` answers a bare
+  name across the whole project on purpose, and that asymmetry is the point: a
+  report can afford to be imprecise because a human reads it, and a rewrite
+  cannot, because renaming a bare `id` project-wide would rewrite every unrelated
+  `id` there is and the result would compile. The refusal lists the models that
+  define a column of that name, so qualifying it is one step rather than a search.
+
+  **A removal removes the definition and verifies the reads are gone.** dex will
+  not rewrite a read, and that is a boundary rather than a gap:
+  `{% if var('using_department') %}` can be dropped or unguarded, and
+  `{{ var('x') }}` standing in an expression has no value dex may invent. Only the
+  caller knows. So the removal refuses while any read survives, naming each with a
+  file and a line, and `--edits-file` carries the caller's own read edits into the
+  same plan, where they are validated and stored together. The change stays atomic
+  without dex guessing at semantics.
+
+  This is deliberately stricter than the delete guard, which *warns* on the same
+  unresolved reference, and the two policies now differ visibly rather than by
+  accident. A dangling dynamic ref left by a delete cannot be fixed by any edit
+  the caller could make, so refusing would block a legitimate delete forever. The
+  same reference in a rename's path is fixable by hand, so refusing is a solvable
+  problem.
+
+  Generated edits go through the same `transform plan` path a hand-authored one
+  does, so they get containment, structural validation, the profiles secret guard,
+  the dangling-reference guard and dbt's own parser. A generated edit is not more
+  trustworthy than an authored one; it is only faster to produce. Row attribution
+  is off by default, since a rename changes what a column is called and not which
+  rows a model returns, and measuring it would put a warehouse scan and a cost
+  handshake in front of a change that is free and repo-only.
+
+- **`transform place` proposes where a shared derived column belongs** ([#222]).
+  When a derived column has to appear in several models, where it is *defined* is
+  a graph question with a right answer: the lowest point in the lineage that all
+  of the targets descend from and that has the inputs the derivation needs.
+  Defining it in each target instead duplicates the logic, and the copies drift
+  the first time one of them is corrected.
+
+  `transform place <column> --targets a,b --expr "<sql>"` walks `ref()` upward
+  from every target, intersects, takes the lowest common ancestor that already
+  projects every input, defines the column there, and threads it down every chain
+  as one plan. `schema.yml` gets an entry at the ancestor, where the column is
+  defined, and at each target, where it is consumed, and none at the hops in
+  between, which only carry it.
+
+  The inputs are parsed out of `--expr` rather than passed separately. Two sources
+  for the same fact is one too many: an input list that disagreed with the
+  expression using it would produce a confidently wrong ancestor, and there would
+  be no way for dex to notice.
+
+  **The reasoning is the product.** `data.reasoning` names which ancestor, why it
+  is the lowest, which targets descend from it, and what the pass-through chain
+  is, because "propose, do not impose" only means something if the proposal is
+  legible enough to argue with. `--explain` returns exactly that and stores no
+  plan, so asking the question is cheap.
+
+  **Eligibility is deliberately narrow.** An ancestor qualifies only if it already
+  projects every input. dex will not hunt further upstream to pull an input down,
+  because one placement request would then become an unbounded rewrite of the
+  graph above it. Where the lowest common ancestor is ineligible it is reported by
+  name with what it is missing, which is the fact a caller needs in order to
+  disagree, and often the named fix is what they actually wanted.
+
+  Where there is no common ancestor, where the lowest is ineligible, or where two
+  incomparable candidates tie, `data.strategy` is `per_target`: the column is
+  defined separately in each target and the reason is stated. That is the worse
+  outcome, and saying so beats doing it quietly.
+
+  Threading into a model that groups its rows is refused, naming both ways to
+  resolve it. A bare column added to a `GROUP BY` model is neither grouped nor
+  aggregated, and whether it should join the grain or be wrapped in an aggregate
+  is a question about what the model means. Caught at plan time rather than at
+  `dbt run`.
+
+  Placement is asked of the project format through `PlacingProject.edit_path`, the
+  way `maintain reconcile` asks it. The `ref()` graph and the SQL stay explicitly
+  dbt's, which is what they are: a per-format graph protocol with exactly one
+  implementation would be a seam with nothing on the other side of it.
+
+- **`transform references` reports every use of a name** ([#213]). A read-only,
+  repo-only report: given a name, every file that references it, with the line
+  and the form of the reference, across model SQL, `schema.yml`,
+  `dbt_project.yml`, macros, semantic YAML, seed headers and installed packages.
+  Free on every connector, and it needs no connector extra at all: it is routed
+  ahead of the dialect gate the rest of the authoring surface passes through,
+  because a command that only reads files off disk should not require the SQL
+  engine to be installed.
+
+  There was no way to ask "where is this used", and a text search is not a
+  substitute, because dbt's indirection is jinja. A var read inside a macro body,
+  a column named only in a `schema.yml` test, a `ref()` composed from a variable:
+  a grep finds none of them, and missing one is the normal outcome. The failure
+  is quiet, because most of the project gets updated, one file does not, and the
+  result still compiles.
+
+  `--kind` narrows to `model`, `source`, `seed`, `snapshot`, `macro`, `var`,
+  `column`, `metric`, `entity`, `dimension` or `measure`. Omitting it reports
+  every kind the name is used as, which is the common case: a caller asking where
+  `department_name` is used knows the name and not whether the project calls it a
+  column, a var, or both. The positional is variadic, so one call covers a whole
+  rename.
+
+  **The report says whether it believes itself.** `completeness` is `complete`
+  only once every reason to doubt it has been ruled out, and `limits` names each
+  remaining one: a reference dex could not resolve statically, packages declared
+  but not installed, `sqlglot` absent on a column query, a file that would not
+  parse. A completeness claim that is not complete is worse than no claim, since
+  it is the one a caller acts on without checking.
+
+  An argument dex did not read is reported as `indeterminate` with its file and
+  line and no name attached, never dropped and never guessed at. `{{ ref(var('x'))
+  }}` names a model only dbt can know; a dimension whose `expr` is a computed
+  expression names a column dex will not invent. That second case is not new
+  policy, it is the rule `physical_column` has always followed, now given a name
+  and surfaced rather than left implicit.
+
+  Column names are matched at the grain the question allows. A bare name is
+  matched project-wide and labelled `name_matched`; a qualified `model.column` is
+  resolved through the `ref()` graph, and occurrences outside that lineage are
+  still listed, labelled `same_name_elsewhere`. Neither is silently narrowed. A
+  dotted name reads as a source before a qualified column, since `raw.orders` is
+  the more common question.
+
+  A model a package also ships is reported on both sides, the project's marked as
+  shadowing and the package's as shadowed, because reporting only the winner
+  hides that the package still ships the loser. A seed contributes its header row
+  and never a data row, asserted in the safety spine rather than left to the
+  scanner's good manners, and no occurrence ever carries source text: the command
+  answers "where", so a line number is the whole payload it owes.
+
+  The verdict is emitted before the occurrences. A long answer is the ordinary
+  case here, so it will be read from the top and sometimes truncated from the
+  bottom, and putting `completeness` last would make the honesty the first thing
+  lost. Capped at 200 occurrences across 50 files with every elision counted in
+  `notes`; `--full` lifts both.
+
+### Changed
+
+- **The delete guard reads the reference index rather than the file text**
+  ([#213]). Three behaviour changes, each a case the text scan answered wrongly.
+
+  A seed's data rows and a YAML string no longer count as source, so a CSV row
+  containing the characters `ref('x')` stops blocking a delete it never affected.
+
+  The two-argument `ref('package', 'model')` form is now read as the model it
+  names. The regex captured the first argument, so a dangling reference written
+  that way registered as a reference to a model named after the package and the
+  plan passed. **This is a new refusal**: a plan that deletes a model still
+  referenced in that form was accepted before and is refused now, which is the
+  correct answer arriving late rather than a change of policy.
+
+  A reference dex cannot resolve statically now warns rather than being invisible.
+  It may or may not name the deleted node and dex cannot tell, so refusing on it
+  would be unsatisfiable: no edit the caller could make would settle it. The
+  warning names the file and line so a human can decide.
+
+  A `schema.yml` entry that merely documents a deleted model stays the soft
+  warning it has always been. Only the forms that actually stop the project
+  compiling refuse: `ref()`, a semantic model's `model:`, and a relationship
+  test's `to:`.
+
+- **One jinja reader behind the row-attribution renderer and the reference
+  index** ([#213]). Call extraction moved into `dbt_project.jinja_regions`, and
+  `render_model_sql` consumes it while keeping its own policy of refusing what it
+  cannot resolve. One behaviour, two policies on top. A latent bug went with it:
+  `{{ ref(var('x')) }}` used to resolve to whatever string the inner `var()` call
+  happened to name, silently attributing a row delta to the wrong relation. It is
+  now unattributable, which is what it always was.
+
+- **`transform` authors singular tests and analyses** ([#212]). A `test_sql` edit
+  kind confined to `test-paths` and an `analysis_sql` kind confined to
+  `analysis-paths`, both read from `dbt_project.yml` with dbt's own defaults.
+  A singular test, an arbitrary SELECT that must return no rows, is where most
+  project-specific assertions actually live, and it was the one class of test
+  that could not be authored: generic tests were already reachable because they
+  are declared in `schema.yml`, but a singular test is a file, and the file was
+  refused as "outside the project's model paths". Analyses were in the same
+  position.
+
+  `test_sql` covers both shapes that share dbt's test paths, because only the
+  file's content says which one was written. A file holding
+  `{% test %}` / `{% endtest %}` blocks is a generic test definition and gets the
+  structural check a macro gets: balanced definitions, nothing loose between
+  them but jinja comments. Anything else is a singular test and gets a model's
+  check: a single read-only SELECT once its jinja is stripped. Reading the close
+  delimiter as well as the open one means an unclosed block is refused as the
+  broken definition it is, rather than as a query that fails to parse.
+
+  A singular test that names no `ref()` or `source()` warns rather than refuses:
+  it runs against nothing and passes unconditionally, which is worse than having
+  no test, but an assertion over literals is unusual rather than wrong. The
+  warning is suppressed when the file is entirely jinja, since a query assembled
+  inside a macro is content dex has just said it could not read, and guessing at
+  it would be a claim beyond the evidence.
+
+  An analysis is held to the same read-only SELECT as a model even though dbt
+  compiles it and never runs it. That is deliberate: read-only against data is a
+  guarantee dex makes about what it writes, not a restatement of what dbt
+  happens to execute, and compiled SQL sitting in `target/` is one copy-paste
+  from a warehouse. A spine assertion now pins that every SQL-carrying kind
+  passes through the guard, so a future kind cannot arrive without it.
+
+  Neither kind builds a relation and nothing can `ref()` either, so neither is a
+  node: they do not enter the drift baseline, and deleting one is not guarded
+  against dangling references because there are none to dangle. dbt does call a
+  singular test a node, which is exactly why this is said out loud rather than
+  left to the reader. `dbt build` runs a singular test natively and prices it
+  like any other test; an analysis is compiled by `dbt compile`, never built, and
+  contributes nothing to the cost handshake.
+
+  Three different things in this project are called a test, and they are not
+  interchangeable: generic tests declared inside a `schema.yml`, unit tests
+  scaffolded by `transform test --scaffold` into a `unit_tests:` block, and the
+  files under `test-paths` this kind authors. The docs now name all three.
+
+- **`transform` authors dbt snapshots** ([#210]). A `snapshot_sql` edit kind, and
+  `snapshot-paths` read from `dbt_project.yml` with dbt's own default. Before
+  this, `transform plan` refused a snapshot file as "outside the project's model
+  paths", which was self-contradicting from the caller's side: a snapshot **is**
+  the dbt project surface, and slowly-changing-dimension capture is one of the
+  more common things an analytics engineer is asked to add. The only way to add
+  one was to leave the plan-then-apply path and write the file by hand, which
+  dropped the reviewable diff, the hash pinning and the conflict detection for
+  exactly the kind of change that most deserves them.
+
+  Validation is layered the way the macro kind's is. Structurally: exactly one
+  `{% snapshot %}` / `{% endsnapshot %}` block with nothing loose outside it, a
+  `config()` inside it naming a `unique_key` and a `strategy` of `timestamp` or
+  `check` along with the field that strategy cannot work without (`updated_at`
+  or `check_cols`), and a body that is a single read-only SELECT once its jinja
+  is stripped, the same guard a model gets. Each refusal names the fix rather
+  than the rule. Behind that, dbt's own parser runs at plan time and is the
+  authoritative gate, degrading to a warning where dbt is not installed.
+
+  `dbt build` runs snapshots natively, so nothing new has to be run after an
+  apply, and a snapshot writes a table, so it is priced in the cost handshake
+  like a model.
+
+- **`transform` authors dbt seeds** ([#211]). A `seed_csv` edit kind confined to
+  `seed-paths`, so moving a small reference mapping out of hard-coded SQL is a
+  reviewable diff like every other change instead of a hand-written file outside
+  the guardrail.
+
+  A seed is validated as CSV: it parses, the header is present and every column
+  is named, no two columns collide case-insensitively (warehouses fold
+  identifier case), and every row carries one field per column, with the refusal
+  naming the row and the column at fault. Two caps bound it, 5,000 data rows and
+  1 MiB, because a multi-megabyte CSV in a plan diff is unreadable in review,
+  which is the one thing a reviewable diff is for; over either, the refusal names
+  the cap and points at loading the data into the warehouse and `source()`-ing it.
+
+  **A seed is the first edit kind that puts values, not logic, into a diff**, and
+  a diff goes into git and stays there. So a seed's header is read two ways:
+  through the same name-and-type PII detector `explore` profiles warehouse
+  columns with, and against the flags already in the `.dex/` cache, where a
+  column a human has reviewed and cleared has already stopped being flagged. A
+  hit at or above the block threshold refuses, and the refusal names the exact
+  `pii_overrides` entry that would clear the column, carrying its name and
+  category and never a value. The refusal fires inside validation, which runs
+  before any diff is built, so a refused seed's values never enter a diff, agent
+  context, or git; a safety-spine assertion pins the ordering rather than only
+  the outcome.
+
+  Two limits are stated rather than papered over. Detection reads names and
+  types and never values, everywhere in dex, so a seed column named `code` full
+  of email addresses passes this gate. And the detector's generic `*_name` match
+  is one it explicitly calls provisional (on a warehouse column `explore` refines
+  it against value shape, up or down); dex never reads a seed's values, so that
+  refinement cannot run and the match warns instead of blocking. Every explicit
+  pattern (email, phone, address, government id, and the rest) still blocks, as
+  does a `*_name` column the cache has already flagged for real.
+
+  `dbt build` runs seeds natively, so applying and building is all it takes. A
+  seed loads a local CSV and scans nothing, so it stays deliberately unpriced.
+
+### Changed
+
+- **`explore map` returns the map, not a receipt for it** ([#202]). The command
+  wrote the `.dex/` cache and printed fourteen integers and five identifiers. To
+  learn what the joins were, what the PII flags were, or what the data-quality
+  findings said, a caller ran `explore profile` and `explore relationships`
+  afterwards: three round trips, and more total context than one budgeted answer
+  costs. "Sense-making, not enumeration" is a rule against dumping a schema, not
+  a rule against answering the question, and read literally it had inverted.
+
+  `data.objects` now carries each top-ranked object's row count, detected grain,
+  candidate key, notable columns and data-quality findings, and `data.edges`
+  carries the join edges in exactly the shape `explore relationships` already
+  returns them, so a caller learns one shape rather than two. Every column
+  carries the `role` that earned it a place (`grain`, `key`, `join`, or a PII
+  flag), which is the same predicate `explore diagram` draws from: both commands
+  now read one selection, so the picture and the payload can never disagree about
+  what matters. Every existing count field keeps its name and its meaning.
+
+  It is budgeted the way the diagram is: 25 objects by rank, 12 columns per
+  object, 40 edges, 5 findings per object. Every cap binds in every mode, each
+  elision is reported both as a count and as a note naming the cap and the way to
+  read the rest, and `notes` is now always present, so an empty list is the
+  positive statement "nothing was elided". The new `--detail` widens what is
+  eligible (every column, and objects inventoried but never profiled) and lifts
+  no cap. It is deliberately not `--full`, which on this command decides how much
+  gets *scanned* and therefore what the run costs; `--detail` decides only how
+  much of what was found comes back, and spends nothing.
+
+  **No column value crosses this envelope.** The cache holds `min_value`,
+  `max_value` and a value domain for the columns that earned them, and this
+  command does not read them: `explore profile` is where a caller asks for a
+  value domain, deliberately and one object at a time. A safety-spine assertion
+  pins that, alongside PII staying category and confidence.
+
+  Objects are selected differently from the diagram's, on purpose. A diagram
+  drops an object that participates in no join, because a box with no edge draws
+  nothing. A findings payload must not: an isolated lookup table carrying four
+  PII flags and an empty-table warning is exactly a finding, and dropping it left
+  the envelope's own `pii_column_count` contradicting the objects printed beside
+  it. Found by dogfooding the demo warehouse, and now asserted: every count in
+  the payload reconciles with the objects it sits next to.
+
+- **The project view now loads all six of dbt's authored path families**
+  ([#210], [#211], [#212]). Loading a family is what makes it authorable: a
+  file dex can write but does not load hashes as absent, so a later edit to it
+  registers as a create and the apply after it conflicts on a file nobody
+  touched. The scan is per-family now rather than one global suffix filter
+  (`.sql` plus YAML under model, macro, snapshot, test and analysis paths,
+  `.csv` plus YAML under seed paths), so a stray CSV elsewhere in the repo is
+  still nobody's fixture to hash.
+
+  One consequence is visible from outside: an `analyses/` directory used to be
+  refused as outside the project surface and is now part of it, so its files
+  are loaded and hashed.
+
+  That widening moved what `maintain` fingerprints, which is the part that would
+  otherwise have broken quietly. Two derivations read "the things this project
+  builds" out of the file list by taking every `.sql` and using its filename;
+  loading snapshots would have made snapshots models there, and seeds would have
+  been missed entirely. Both are now scoped to the families that actually produce
+  a dbt node: `.sql` under model and snapshot paths, `.csv` under seed paths.
+  Singular tests and analyses stay out for the same reason macros do, which is
+  worth stating because dbt calls a singular test a node: it builds no relation
+  and nothing can `ref()` it, so counting it would put a name into the drift
+  baseline that no warehouse table will ever back.
+  Macros counted as models before and no longer do, which is a fix rather than a
+  regression (a macro builds no relation and is `ref()`-able by nobody) but is a
+  behavior change worth naming. A baseline pinned before this lands reports no
+  phantom drift, because no detector diffs the file set or the model list; a test
+  pins that with a pre-change baseline.
+
+  Deleting a snapshot or a seed is now guarded like deleting a model, since both
+  are `ref()`-able. The seed half was a real hole: `.csv` never matched the
+  `.endswith(".sql")` test the guard made, so deleting a seed a model still
+  `ref()`s would have been accepted and broken the build.
+
+- **An edit's kind and its location must agree, across every family.** The rule
+  that kept a macro out of `models/` is now a table over the families and the
+  file suffix, and it refuses in both directions naming both fixes (move the
+  file, or relabel the kind). `schema_yml` is admitted beside a snapshot, a
+  seed, a test and an analysis as well as beside a model, because that is where
+  dbt expects a snapshot's tests, a seed's column types, a singular test's
+  severity and an analysis's description declared. Macro-path behavior is
+  unchanged.
+
+### Fixed
+
+- **A `project_yml` edit that drops any authored path key now warns** ([#212]).
+  The warning covered `model-paths` and `macro-paths` only, so a `dbt_project.yml`
+  that dropped `snapshot-paths` or `seed-paths` silently orphaned every file
+  under them, which was a gap left behind when those two families were added. It
+  now checks every key dex authors into, six of them, since which family a caller
+  restructures is not something the warning gets to have an opinion about.
+
+- **`transform plan` refuses on its own terms before it hands anything to dbt's
+  parser** ([#210], [#211]). The parse gate runs before the plan is stored, and
+  `shadow_parse` copies the project into a temp directory *with the edits written
+  into it*. Once snapshots and seeds joined that gate, a seed refused for
+  carrying personal data had already reached disk and a dbt subprocess by the
+  time the refusal fired, and dbt's message stood in for dex's own
+  ("Encountered unknown tag 'snapshot'" in place of "a snapshot_sql edit must
+  live under the project's snapshot paths"). The refusing half of plan-time
+  validation is now shared between `plans.plan` and the command, which runs it
+  first, on the same principle the profiles secret-guard already followed. Found
+  by dogfooding, and now pinned by a spine test that fails if the parser is ever
+  reached with a PII-flagged seed.
+
+- **Databricks: `explore profile` and `explore map` crashed on any real value
+  domain.** The value-domain probe reads back a `collect_list`, which is an
+  ARRAY, and the Databricks driver materializes one through pyarrow as a numpy
+  `ndarray`, whose `__bool__` raises above a single element. An `x or []`
+  guarding the empty case therefore took the whole command down with
+  "The truth value of an array with more than one element is ambiguous" against
+  any table holding more than one value in a screened column, which on a real
+  warehouse is most of them. The suite never saw it because every fake fed a
+  plain Python list. Now an explicit `is None` check, with a test that feeds the
+  ndarray the driver actually returns.
+
 ## [1.7.0] - 2026-08-25
 
 ### Added

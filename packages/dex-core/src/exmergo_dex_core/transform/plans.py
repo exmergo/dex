@@ -25,14 +25,17 @@ from pydantic import BaseModel
 from sqlglot import expressions as exp
 
 from ..dbt_project import (
-    REF_PATTERN,
     ApplyResult,
     DbtProjectView,
     Edit,
     EditOp,
+    SourceFile,
     contained_path,
     content_hash,
     find_project,
+    node_files,
+    node_name,
+    path_family,
     write_edits,
 )
 from ..dbt_project import (
@@ -65,6 +68,25 @@ class EditKind(str, Enum):
     # A macro definition under the project's macro paths, the surface widened
     # for scaffolded and hand-repaired macros alike.
     MACRO_SQL = "macro_sql"
+    # A snapshot block under the project's snapshot paths, and a seed's CSV data
+    # under its seed paths. Both build a relation dbt names after the file and
+    # both are ref()-able, which is why each is confined to its own family the
+    # way a macro is: a snapshot filed under models/ is parsed as a model and
+    # fails the build, and a seed filed anywhere else is never loaded at all.
+    SNAPSHOT_SQL = "snapshot_sql"
+    SEED_CSV = "seed_csv"
+    # A file under the project's test paths (a singular test, which is a SELECT
+    # that must return no rows, or a generic test definition) and one under its
+    # analysis paths (SQL dbt compiles and never runs). Neither builds a
+    # relation and nothing can ref() either, but each is still dbt's to parse
+    # from its own directory: a singular test filed under models/ is built as a
+    # model, and an analysis filed anywhere else is never compiled at all.
+    #
+    # `test_sql` is dbt's `test-paths`, not `transform test --scaffold` (which
+    # writes a unit_tests: block through schema_yml) and not the generic tests
+    # declared inside a schema.yml.
+    TEST_SQL = "test_sql"
+    ANALYSIS_SQL = "analysis_sql"
     # dbt project-root config: the project settings and the connection profiles.
     # Each governs the whole project (a wider blast radius than a single model),
     # so each is pinned by name to the one root file it may target, and
@@ -121,6 +143,198 @@ def contained_key(rel_path: str, surface: list[str]) -> str:
     )
 
 
+# Which kind may be authored where, keyed by dbt's authored path family and then
+# by file suffix. dbt decides all of it: a `.sql` under the snapshot paths is
+# parsed as a snapshot block and nothing else, a seed is loaded only from a
+# `.csv` under the seed paths, and the properties YAML that declares a seed's
+# column types or a snapshot's tests belongs beside the thing it describes.
+#
+# `schema_yml` is admitted under the snapshot, seed, test and analysis families
+# for exactly that reason (a singular test's config and severity, an analysis's
+# description), and deliberately *not* under macros: macro properties YAML is a
+# different document shape, dex has never authored one, and a test pins both
+# directions of today's macro rule. Widening that is a live behavior change and
+# belongs in its own change, not smuggled in beside new kinds.
+_PLACEMENT: dict[str, dict[str, frozenset[EditKind]]] = {
+    "macro": {".sql": frozenset({EditKind.MACRO_SQL})},
+    "snapshot": {
+        ".sql": frozenset({EditKind.SNAPSHOT_SQL}),
+        ".yml": frozenset({EditKind.SCHEMA_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML}),
+    },
+    "seed": {
+        ".csv": frozenset({EditKind.SEED_CSV}),
+        ".yml": frozenset({EditKind.SCHEMA_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML}),
+    },
+    "test": {
+        ".sql": frozenset({EditKind.TEST_SQL}),
+        ".yml": frozenset({EditKind.SCHEMA_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML}),
+    },
+    "analysis": {
+        ".sql": frozenset({EditKind.ANALYSIS_SQL}),
+        ".yml": frozenset({EditKind.SCHEMA_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML}),
+    },
+    "model": {
+        ".sql": frozenset({EditKind.MODEL_SQL}),
+        ".yml": frozenset({EditKind.SCHEMA_YML, EditKind.SEMANTIC_YML}),
+        ".yaml": frozenset({EditKind.SCHEMA_YML, EditKind.SEMANTIC_YML}),
+    },
+}
+
+
+def _home_families() -> dict[EditKind, str]:
+    """The one family each kind belongs to, where it has one.
+
+    Derived from :data:`_PLACEMENT` so the two can never drift: a kind exactly
+    one family admits lives there, and a kind several admit (``schema_yml``) has
+    no single home and is judged by where it actually landed instead.
+    """
+
+    families: dict[EditKind, set[str]] = {}
+    for family, by_suffix in _PLACEMENT.items():
+        for kinds in by_suffix.values():
+            for kind in kinds:
+                families.setdefault(kind, set()).add(family)
+    return {
+        kind: next(iter(found)) for kind, found in families.items() if len(found) == 1
+    }
+
+
+_HOME_FAMILY: dict[EditKind, str] = _home_families()
+
+# The project-root manifests. Each governs the whole project rather than sitting
+# in a path family, and each is pinned to its own filename separately, so the
+# family table has nothing to say about them.
+_ROOT_KINDS = frozenset(
+    {EditKind.PACKAGES_YML, EditKind.PROJECT_YML, EditKind.PROFILES_YML}
+)
+
+
+def _an(word: str) -> str:
+    """``word`` with the article that reads right in front of it.
+
+    Refusal text is assembled from kind and family names, and "a analysis_sql
+    edit" reads as a typo in the one message whose whole job is to be trusted.
+    """
+
+    return f"an {word}" if word[:1].lower() in "aeiou" else f"a {word}"
+
+
+def assert_kind_placement(
+    edit: PlanEdit, family: str | None, view: DbtProjectView
+) -> None:
+    """Refuse an edit whose kind and location disagree, in either direction.
+
+    ``family`` is what :func:`~..dbt_project.path_family` made of the edit's
+    path, and ``None`` means containment admitted it as a project-root manifest,
+    which the family table does not govern.
+
+    Both directions matter and they fail differently. A kind in the wrong family
+    is told where its family is; a file in a family that does not admit its kind
+    is told which kinds that family admits for that suffix. Either way the
+    message names the fix rather than the rule.
+    """
+
+    if family is None or edit.kind in _ROOT_KINDS:
+        return
+    suffix = PurePosixPath(edit.path).suffix.lower()
+    admitted = _PLACEMENT[family].get(suffix, frozenset())
+    home = _HOME_FAMILY.get(edit.kind)
+    if home is not None and home != family:
+        configured = dict(view.path_families()).get(home) or []
+        # Both halves, because either one is a complete fix and only the caller
+        # knows which they meant: move the file, or relabel the kind.
+        instead = (
+            f"; a {suffix} file there is "
+            + " or ".join(sorted(k.value for k in admitted))
+            if admitted
+            else ""
+        )
+        raise PlanError(
+            f"{_an(edit.kind.value)} edit must live under the project's {home} "
+            f"paths ({', '.join(configured) or 'none configured'}), got "
+            f"'{edit.path}', which is {_an(family)} path{instead}"
+        )
+    if edit.kind in admitted:
+        return
+    if not admitted:
+        holds = "; ".join(
+            f"{ext} -> {', '.join(sorted(k.value for k in kinds))}"
+            for ext, kinds in sorted(_PLACEMENT[family].items())
+        )
+        named = suffix or "suffixless"
+        raise PlanError(
+            f"'{edit.path}' is under {_an(family)} path, which holds {holds}; "
+            f"dex authors no '{named}' file there"
+        )
+    raise PlanError(
+        f"'{edit.path}' is under {_an(family)} path but the edit kind is "
+        f"{edit.kind.value}; use "
+        f"{' or '.join(sorted(k.value for k in admitted))} for a {suffix} file "
+        "there"
+    )
+
+
+def admit_edit(
+    edit: PlanEdit,
+    view: DbtProjectView,
+    project: Path,
+    *,
+    cache: Any = None,
+    pii_overrides: Any = None,
+) -> list[str]:
+    """Every check that can refuse one dbt-shaped edit, and the warnings it
+    raises. Stores nothing, writes nothing, reads no subprocess.
+
+    Containment, kind-and-location agreement, the root-manifest pinning, and the
+    per-kind content validation, in that order, which is the order the refusals
+    read best in: where a file may live, then whether this kind may live there,
+    then whether the content is what that kind promises.
+
+    Split out of :func:`plan` because it has a second caller, and the order that
+    caller needs it in is the point. ``transform plan`` hands snapshots, seeds
+    and the config kinds to dbt's own parser before it stores anything, and dbt
+    parses a *copy of the project with the edit written into it*. Running that
+    first would mean a seed refused for carrying personal data had already been
+    written to disk and read by a subprocess, and it would mean dbt's message
+    ("Encountered unknown tag 'snapshot'") reaching the caller in place of dex's
+    ("a snapshot_sql edit must live under the project's snapshot paths"). dex
+    refuses on its own terms first; dbt's parser is the backstop behind it.
+    """
+
+    resolved = contained_path(project, edit.path, view).resolve()
+    assert_kind_placement(edit, path_family(project, edit.path, view), view)
+
+    # The one root file each config kind may target. Both the kind and the path
+    # must agree: a config kind aimed elsewhere, or one of these files reached
+    # by any other kind, is refused.
+    project_resolved = project.resolve()
+    root_config = {
+        EditKind.PROJECT_YML: (project_resolved / "dbt_project.yml").resolve(),
+        EditKind.PROFILES_YML: (project_resolved / "profiles.yml").resolve(),
+    }
+    if edit.kind in root_config and resolved != root_config[edit.kind]:
+        raise PlanError(
+            f"a {edit.kind.value} edit must target the project's "
+            f"{root_config[edit.kind].name}, got '{edit.path}'"
+        )
+    target_kind = {target: kind for kind, target in root_config.items()}.get(resolved)
+    if target_kind is not None and edit.kind is not target_kind:
+        raise PlanError(
+            f"'{edit.path}' is a project config file but the edit kind is "
+            f"{edit.kind.value}; use {target_kind.value} for it"
+        )
+
+    # A delete has no content to structurally validate; the whole-plan guard
+    # verifies the post-deletion project instead.
+    if edit.op is not EditOp.UPSERT:
+        return []
+    return validate_edit(edit, cache=cache, pii_overrides=pii_overrides)
+
+
 def plan(
     intent: str,
     edits: list[PlanEdit],
@@ -129,6 +343,7 @@ def plan(
     *,
     store: Store,
     project_format: EditableProject | None = None,
+    pii_overrides: Any = None,
 ) -> tuple[TransformPlan, list[dict[str, Any]], list[str]]:
     """Validate agent-authored edits and store them as a plan. Writes no project file.
 
@@ -148,6 +363,12 @@ def plan(
     while placing into a format's own keyspace hashes an existing file as absent,
     which renders a one-line change as a whole-file create and turns the next
     apply into a conflict on a file nobody touched.
+
+    ``pii_overrides`` is the reviewed-columns matcher from the engine config,
+    read only by the seed gate. Absent (a host calling this directly, a test),
+    the gate still runs on the seed's own header and on whatever the exploration
+    cache already flagged; an override is what a human uses to clear a column,
+    not what makes the check happen.
     """
 
     if not edits:
@@ -187,78 +408,59 @@ def plan(
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
     diffs: list[dict[str, Any]] = []
-    project_resolved = project.resolve()
-    macro_bases = (
-        [(project_resolved / mp).resolve() for mp in view.macro_paths]
-        if dbt_shaped
-        else []
-    )
-    # The one root file each config kind may target, resolved once. Both the
-    # kind and the path must agree: a config kind aimed elsewhere, or one of
-    # these files reached by any other kind, is refused.
-    root_config = (
-        {
-            EditKind.PROJECT_YML: (project_resolved / "dbt_project.yml").resolve(),
-            EditKind.PROFILES_YML: (project_resolved / "profiles.yml").resolve(),
-        }
-        if dbt_shaped
-        else {}
-    )
-    config_targets = {target: kind for kind, target in root_config.items()}
+    # Read at most once, and only when a seed is actually in the plan: the cache
+    # is a stored document, and every other kind has no use for it.
+    cached: list[Any] = []
+
+    def seed_cache() -> Any:
+        if not cached:
+            from ..storage import CacheUnreadableError, readable_cache
+
+            try:
+                cached.append(readable_cache(store))
+            except CacheUnreadableError as exc:
+                # An unreadable cache narrows the seed's PII gate to the header
+                # detector rather than stopping the plan. Said out loud, because
+                # a check that quietly got weaker is worse than one that failed.
+                cached.append(None)
+                warnings.append(
+                    f"the exploration cache could not be read ({exc}), so a "
+                    "seed's columns were checked against their own names only, "
+                    "not against columns a profile already flagged"
+                )
+        return cached[0]
+
     for edit in edits:
         # Containment is checked at plan time as well as at write time, so a bad
         # path is refused before it ever becomes a stored proposal. Which surface
         # it is checked against is the format's to say; that it is checked at all
         # is not.
         if dbt_shaped:
-            resolved = contained_path(
-                project, edit.path, view.model_paths, view.macro_paths
-            ).resolve()
-            # Kind and surface must agree: a macro written into models/ would be
-            # parsed as a model and fail the build, and a model written into
-            # macros/ would silently never become a model.
-            in_macros = any(
-                resolved == base or base in resolved.parents for base in macro_bases
+            warnings.extend(
+                admit_edit(
+                    edit,
+                    view,
+                    project,
+                    cache=seed_cache() if edit.kind is EditKind.SEED_CSV else None,
+                    pii_overrides=pii_overrides,
+                )
             )
-            if edit.kind is EditKind.MACRO_SQL and not in_macros:
-                raise PlanError(
-                    f"a macro_sql edit must live under the project's macro paths "
-                    f"({', '.join(view.macro_paths)}), got '{edit.path}'"
-                )
-            if edit.kind is not EditKind.MACRO_SQL and in_macros:
-                raise PlanError(
-                    f"'{edit.path}' is under a macro path but the edit kind is "
-                    f"{edit.kind.value}; use macro_sql for macro files"
-                )
-            if edit.kind in root_config and resolved != root_config[edit.kind]:
-                raise PlanError(
-                    f"a {edit.kind.value} edit must target the project's "
-                    f"{root_config[edit.kind].name}, got '{edit.path}'"
-                )
-            target_kind = config_targets.get(resolved)
-            if target_kind is not None and edit.kind is not target_kind:
-                raise PlanError(
-                    f"'{edit.path}' is a project config file but the edit kind is "
-                    f"{edit.kind.value}; use {target_kind.value} for it"
-                )
         else:
-            # The three checks above read dbt's project layout (its macro paths,
+            # `admit_edit`'s checks read dbt's project layout (its path families,
             # its root manifests) to decide whether a kind and its location
             # agree. Another format's layout makes no such claim, and asserting
             # dbt's over it would refuse exactly the edits this seam exists to
             # allow. Agreement there is the format's own, expressed through what
             # `edit_path` places and what `write_edits` accepts.
             contained_key(edit.path, surface)
+            if edit.op is EditOp.UPSERT:
+                warnings.extend(validate_edit(edit))
         current = view.files.get(edit.path)
         if edit.op is EditOp.DELETE and current is None:
             raise PlanError(
                 f"nothing to delete at '{edit.path}': the file is not part of "
                 "the project (it may already be gone, or the path is wrong)"
             )
-        # A delete has no content to structurally validate; the guard that runs
-        # after this loop verifies the post-deletion project instead.
-        if edit.op is EditOp.UPSERT:
-            warnings.extend(validate_edit(edit))
         # The profiles secret-guard, current side: validate_edit covers the
         # proposed content, but the diff also surfaces the removed (on-disk)
         # content, so a pre-existing inlined credential is refused before any
@@ -273,9 +475,11 @@ def plan(
                     "{{ env_var('NAME') }} before editing so no credential "
                     "enters the plan diff"
                 )
-        # A dbt_project.yml that drops model or macro paths silently orphans the
-        # files under them; warn rather than refuse, since a deliberate
-        # restructure is a legitimate reason to change them.
+        # A dbt_project.yml that drops a path key silently orphans the files
+        # under it; warn rather than refuse, since a deliberate restructure is a
+        # legitimate reason to change them. Every key dex authors into is
+        # checked: covering only some of them makes the warning a coin flip on
+        # which family the caller happened to restructure.
         if (
             edit.kind is EditKind.PROJECT_YML
             and edit.op is EditOp.UPSERT
@@ -283,7 +487,14 @@ def plan(
         ):
             old = yaml.safe_load(current.content) or {}
             new = yaml.safe_load(edit.new_content) or {}
-            for key in ("model-paths", "macro-paths"):
+            for key in (
+                "model-paths",
+                "macro-paths",
+                "snapshot-paths",
+                "seed-paths",
+                "test-paths",
+                "analysis-paths",
+            ):
                 dropped = set(old.get(key) or []) - set(new.get(key) or [])
                 if dropped:
                     warnings.append(
@@ -390,31 +601,58 @@ def apply(
     return result
 
 
+#: Reference forms that stop the project compiling once their target is gone.
+#: A `ref()` is the obvious one; a semantic model's `model:` and a relationship
+#: test's `to:` are the same thing written in YAML, and dbt fails to parse on
+#: either. A `schema.yml` entry that merely *documents* the model is not here on
+#: purpose: an orphaned doc block is a legitimate follow-up edit, so it stays the
+#: soft warning it has always been rather than becoming a refusal a caller cannot
+#: see the reason for.
+_BREAKS_ON_DELETE = frozenset(
+    {"ref_call", "semantic_model_ref", "yaml_relationship_to"}
+)
+
+
 def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]:
     """Refuse a plan whose deletions would orphan a ``ref()``, atomically.
 
     The project state *after* this plan is computed in memory (current files
-    minus the deletions, with this plan's upserts overlaid), then every surviving
-    file is scanned for a ``ref()`` to a deleted model. A dangling ref is a hard
-    refusal naming the offenders; a deleted model whose only remaining trace is a
+    minus the deletions, with this plan's upserts overlaid), then indexed for
+    references to the deleted nodes. A dangling ref is a hard refusal naming the
+    offenders and the line; a deleted model whose only remaining trace is a
     schema.yml doc entry is a soft warning, since an orphaned doc block is a
     legitimate follow-up edit rather than a broken project.
 
     Overlaying the upserts is what makes the guard atomic across the whole plan:
     a plan that deletes a model *and* updates its referrer to drop the ref is
     accepted, while deleting the model alone is refused.
+
+    The scan is :class:`~..references.ReferenceIndex` rather than a regex over
+    file text, which changes three things and each is deliberate. A seed's data
+    rows and a YAML string no longer count, so a CSV row that happens to contain
+    the characters ``ref('x')`` stops blocking a delete. The two-argument
+    ``ref('package', 'model')`` form is finally read as the model it names,
+    rather than as the package, so a dangling reference written that way is
+    caught instead of missed. And a reference dex cannot resolve statically
+    (``{{ ref(var('x')) }}``) *warns* rather than refusing: it may or may not name
+    the deleted node, dex cannot tell, and refusing on it would be unsatisfiable,
+    because no edit the caller could make would make it resolvable.
+
+    Packages are not scanned. The question is whether *this project* still points
+    at what it is deleting, and a package cannot be edited to fix it anyway.
     """
 
     delete_paths = {e.path for e in edits if e.op is EditOp.DELETE}
     if not delete_paths:
         return []
 
-    macro_prefixes = tuple(f"{mp}/" for mp in view.macro_paths)
-    deleted_models = {
-        Path(path).stem
-        for path in delete_paths
-        if path.endswith(".sql") and not path.startswith(macro_prefixes)
-    }
+    # A snapshot and a seed are ref()-able exactly as a model is, so deleting
+    # one while a surviving model still ref()s it breaks the build the same way.
+    # `node_files` is what says which of the deleted paths build a node at all,
+    # which is why a macro is excluded and a seed's `.csv` is included: the
+    # `.endswith(".sql")` test this used to make would have missed every seed.
+    nodes = node_files(view)
+    deleted_models = {node_name(path) for path in delete_paths if path in nodes}
     if not deleted_models:
         return []
 
@@ -427,14 +665,32 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
         if edit.op is EditOp.UPSERT and edit.new_content is not None:
             surviving[edit.path] = edit.new_content
 
+    from ..references import ReferenceIndex
+
+    after = view.model_copy(
+        update={
+            "files": {
+                path: SourceFile(
+                    path=path, content=content, sha256=content_hash(content)
+                )
+                for path, content in surviving.items()
+            }
+        }
+    )
+    index = ReferenceIndex(after, scan_packages=False)
+
     danglers: dict[str, list[str]] = {}
-    for path, content in surviving.items():
-        hits = sorted(set(REF_PATTERN.findall(content)) & deleted_models)
-        if hits:
-            danglers[path] = hits
+    for model in sorted(deleted_models):
+        for kind in ("model", "seed", "snapshot"):
+            for reference in index.references_to(model, kind)[0]:
+                if reference.form not in _BREAKS_ON_DELETE:
+                    continue
+                danglers.setdefault(reference.path, []).append(
+                    f"{model} (line {reference.line}, {reference.form})"
+                )
     if danglers:
         detail = "; ".join(
-            f"{path} still ref()s {', '.join(names)}"
+            f"{path} still references {', '.join(names)}"
             for path, names in sorted(danglers.items())
         )
         raise PlanError(
@@ -445,6 +701,20 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
         )
 
     warnings: list[str] = []
+    unresolved = [
+        reference
+        for kind in ("model", "seed", "snapshot")
+        for reference in index.indeterminate_for(kind)
+    ]
+    if unresolved:
+        where = ", ".join(
+            f"{reference.path}:{reference.line}" for reference in unresolved
+        )
+        warnings.append(
+            f"the surviving project has {len(unresolved)} reference(s) dex could "
+            f"not resolve ({where}); one of them may name a node this plan "
+            "deletes, and dex cannot tell from the source alone"
+        )
     for path, content in surviving.items():
         if not path.endswith((".yml", ".yaml")):
             continue

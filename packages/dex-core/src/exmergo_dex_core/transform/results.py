@@ -8,7 +8,7 @@ what it touched.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import Field
 
@@ -69,6 +69,70 @@ class PlanResult(Result):
         if self.row_attribution is not None:
             payload["row_attribution"] = self.row_attribution
         return payload
+
+
+class PropagationResult(PlanResult):
+    """A rename or a removal, propagated across the project as one plan.
+
+    A :class:`PlanResult` because propagating *is* planning edits, the way
+    scaffolding a macro is. What it adds is the evidence that nothing was
+    dropped: ``sites`` counts occurrences per reference form, in the same
+    vocabulary ``transform references`` reports in, so the two can be compared
+    directly. A caller who ran the report first can check the rename touched what
+    the report said it would.
+    """
+
+    change: str = ""
+    kind: str = ""
+    sites: dict[str, int] = Field(default_factory=dict)
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "change": self.change,
+            "kind": self.kind,
+            "sites": self.sites,
+            "site_count": sum(self.sites.values()),
+            **super().data(),
+        }
+
+
+class PlacementResult(PlanResult):
+    """Where a derived column should be defined, and why that answer.
+
+    ``reasoning`` comes before the plan in :meth:`data` on purpose. The proposal
+    is the point of this command and it has to be arguable, so the case for it is
+    what a reader meets first rather than something below a diff they have
+    already started applying.
+
+    ``always_reports_notes`` because an empty ``notes`` is a positive statement
+    here: every model in the chain took the edit, and none was skipped for
+    projecting a star or for already carrying the column.
+    """
+
+    column: str = ""
+    strategy: str = ""
+    ancestor: str | None = None
+    inputs: list[str] = Field(default_factory=list)
+    targets: list[str] = Field(default_factory=list)
+    reasoning: list[str] = Field(default_factory=list)
+    chain: dict[str, list[str]] = Field(default_factory=dict)
+    explained: bool = False
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "column": self.column,
+            "strategy": self.strategy,
+            "ancestor": self.ancestor,
+            "inputs": self.inputs,
+            "targets": self.targets,
+            "reasoning": self.reasoning,
+            "chain": self.chain,
+        }
+        # `--explain` stores nothing, so there are no plan fields to report and
+        # an empty `plan_id` would read as a plan that failed to store.
+        return payload if self.explained else {**payload, **super().data()}
 
 
 class MacroListResult(Result):

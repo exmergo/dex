@@ -9,6 +9,7 @@ logic arrives.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -366,6 +367,52 @@ def test_select_only_guard_rejects_writes():
     ):
         with pytest.raises(NotSelectOnlyError):
             assert_select_only(bad)
+
+
+def test_every_authored_sql_kind_runs_through_the_select_only_guard():
+    """No edit kind carrying SQL may reach the repo without the guard.
+
+    dex writes SQL a human reviews and dbt later runs, so the read-only
+    guarantee has to hold at the point of authorship, not only at the point of
+    execution. The failure mode this pins is a new kind added with its own
+    validation branch that forgets the guard: the file lands, the diff reads
+    fine, and a DELETE is sitting in the project waiting for someone to run it.
+
+    An analysis is the sharpest case. dbt never runs one, so nothing downstream
+    would object, and it is still refused: compiled SQL in ``target/`` is one
+    copy-paste from a warehouse, and the guarantee is about what dex writes, not
+    about who presses the button.
+    """
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import EditValidationError, validate_edit
+
+    carriers = {
+        transform.EditKind.MODEL_SQL: "models/staging/stg_x.sql",
+        transform.EditKind.TEST_SQL: "tests/assert_x.sql",
+        transform.EditKind.ANALYSIS_SQL: "analyses/scratch.sql",
+    }
+    for kind, path in carriers.items():
+        for bad in ("delete from customers", "drop table customers"):
+            with pytest.raises(EditValidationError, match="read-only SELECT"):
+                validate_edit(transform.PlanEdit(path=path, kind=kind, new_content=bad))
+
+    # A snapshot carries its query inside the block, and the body gets the same
+    # guard as a standalone one.
+    with pytest.raises(EditValidationError, match="read-only SELECT"):
+        validate_edit(
+            transform.PlanEdit(
+                path="snapshots/snap_x.sql",
+                kind=transform.EditKind.SNAPSHOT_SQL,
+                new_content=(
+                    "{% snapshot snap_x %}\n"
+                    "{{ config(unique_key='id', strategy='timestamp', "
+                    "updated_at='updated_at') }}\n"
+                    "delete from customers\n"
+                    "{% endsnapshot %}\n"
+                ),
+            )
+        )
 
 
 def _firewall_cache():
@@ -918,6 +965,387 @@ def test_pii_refusal_s_suggested_override_carries_no_value():
     assert "AFRICA" not in message and "@" not in message
 
 
+def test_a_seed_s_pii_refusal_fires_before_any_diff_is_built(dbt_project_dir: Path):
+    """A seed is the first edit kind that puts **values** into a reviewable diff,
+    and a diff goes into git and stays there.
+
+    Two things have to hold, and only one of them is the refusal. The other is
+    its position: ``plan`` validates every edit before it builds a single diff,
+    because the envelope sanitizer walks ``data`` and never ``diffs``. If the
+    order were the other way round, a refused seed's values would already be in
+    the diff list, and from there in the transcript. So this asserts the
+    ordering, not just the outcome: nothing was stored, nothing was written, and
+    the message that comes back carries the column name and never a value.
+    """
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import EditValidationError
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    a_person = "someone@example.com"
+    with pytest.raises(EditValidationError) as excinfo:
+        transform.plan(
+            "a lookup built from customer data",
+            [
+                transform.PlanEdit(
+                    path="seeds/contacts.csv",
+                    kind=transform.EditKind.SEED_CSV,
+                    new_content=f"id,email\n1,{a_person}\n",
+                )
+            ],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=store,
+        )
+    message = str(excinfo.value)
+    assert "'email' looks like email" in message
+    assert a_person not in message
+    # Nothing was stored (the plan never got made) and nothing was written.
+    assert store.list_plans() == []
+    assert not (dbt_project_dir / "seeds" / "contacts.csv").exists()
+
+
+def test_the_reference_index_reads_a_seed_s_header_and_never_its_rows(
+    dbt_project_dir: Path,
+):
+    """A seed is project data, and the index walks every file in the project.
+
+    The header names columns, which is what a reference index is for. The rows
+    below it are values, and values never enter agent context. This is the one
+    place in the read path where "scan every file" meets "a seed holds data", so
+    the boundary is asserted here rather than left to the scanner's good manners.
+    """
+
+    from exmergo_dex_core.dbt_project import load
+    from exmergo_dex_core.references import ReferenceIndex
+
+    (dbt_project_dir / "seeds").mkdir(parents=True, exist_ok=True)
+    a_person = "someone@example.com"
+    (dbt_project_dir / "seeds" / "contacts.csv").write_text(
+        f"id,email\n1,{a_person}\n2,other@example.com\n", encoding="utf-8"
+    )
+    index = ReferenceIndex(load(dbt_project_dir))
+
+    header, _limits = index.references_to("email", "column")
+    assert ("seeds/contacts.csv", "seed_header") in {
+        (hit.path, hit.form) for hit in header
+    }
+    indexed = {
+        reference.name
+        for references in index._by_name.values()
+        for reference in references
+    }
+    assert a_person not in indexed
+    assert not any(name and "@example.com" in name for name in indexed)
+
+
+def test_the_reference_index_reports_names_and_never_a_column_value(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Every occurrence carries a path, a line and a form, and no content.
+
+    The command answers "where", so a line number is the whole payload it owes.
+    Echoing the matching source line back would be a small convenience and a
+    standing leak, because the line that names a column is routinely the line
+    that also carries a literal.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    (dbt_project_dir / "models" / "staging" / "stg_secrets.sql").write_text(
+        "select 'hunter2' as token, id from {{ ref('stg_customers') }}\n",
+        encoding="utf-8",
+    )
+    assert main(["--repo-root", str(tmp_path), "transform", "references", "id"]) == 0
+    payload = capsys.readouterr().out
+    assert "hunter2" not in payload
+    occurrences = [
+        occurrence
+        for target in json.loads(payload)["data"]["targets"]
+        for file_entry in target["files"]
+        for occurrence in file_entry["occurrences"]
+    ]
+    assert occurrences
+    assert all(
+        set(occurrence) <= {"line", "form", "resolution", "note"}
+        for occurrence in occurrences
+    )
+
+
+def test_propagation_writes_nothing_to_the_project_before_apply(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Propose-don't-impose, on the one path where dex authors the content itself.
+
+    `transform rename` is the first verb where the engine writes the SQL rather
+    than validating what an agent wrote, so the guarantee that nothing reaches the
+    project until `apply` is asserted here rather than inherited from the plan
+    store's good behaviour.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    schema = dbt_project_dir / "models" / "staging" / "schema.yml"
+    before = (model.read_text(), schema.read_text())
+
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(tmp_path),
+                "transform",
+                "rename",
+                "column",
+                "stg_customers.id",
+                "customer_id",
+            ]
+        )
+        == 0
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["plan_id"]
+    assert envelope["diffs"]
+    assert (model.read_text(), schema.read_text()) == before
+
+
+def test_propagation_never_proposes_an_edit_inside_an_installed_package(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """dex reads packages and does not write them.
+
+    The reference index scans `dbt_packages/` on purpose, because a package that
+    ships a model the project shadows is a reference on both sides. That makes an
+    installed package reachable from the same walk that builds edits, so the write
+    boundary is asserted rather than assumed.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    package = dbt_project_dir / "dbt_packages" / "utils"
+    (package / "models").mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        'name: utils\nversion: "1.0.0"\nprofile: utils\n', encoding="utf-8"
+    )
+    (package / "models" / "packaged.sql").write_text(
+        "select 1 as id\n", encoding="utf-8"
+    )
+    packaged_before = (package / "models" / "packaged.sql").read_text()
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "rename",
+            "column",
+            "stg_customers.id",
+            "customer_id",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert not any(
+        path.startswith("dbt_packages/") for path in envelope["data"]["paths"]
+    )
+    assert (package / "models" / "packaged.sql").read_text() == packaged_before
+
+
+def test_propagation_refuses_rather_than_partially_applying(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The rule the whole propagation surface rests on.
+
+    `transform references` may answer "here is what I found, and here is why I
+    might be missing something", because a person reads that and compensates. A
+    generated plan cannot, because it will be applied. So a reference dex could
+    not resolve refuses the plan outright, and nothing is stored.
+
+    Deliberately stricter than the delete guard, which warns on the same input:
+    a dangling dynamic ref left by a delete is unsatisfiable, and one in a
+    rename's path is fixable by hand.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    (dbt_project_dir / "models" / "staging" / "stg_dynamic.sql").write_text(
+        "select * from {{ ref(var('which')) }}\n", encoding="utf-8"
+    )
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "rename",
+            "model",
+            "stg_customers",
+            "stg_people",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert rc != 0
+    assert envelope["status"] == "error"
+    assert "stg_dynamic.sql:1" in json.dumps(envelope["errors"])
+    assert FilesystemStore(tmp_path).list_plans() == []
+    assert (dbt_project_dir / "models" / "staging" / "stg_customers.sql").exists()
+
+
+def test_propagation_and_placement_open_no_connection(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Both verbs are repo-only, whatever the repo is configured to bill against.
+
+    They rewrite files and read a `ref()` graph, and neither needs a warehouse.
+    A connector opened here would price nothing and still authenticate, which is
+    the quiet version of the failure the cost handshake exists to make loud.
+    """
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import DexConfig, save_config
+    from exmergo_dex_core.engine import DexEngine
+
+    monkeypatch.setattr(
+        DexEngine,
+        "_adapter",
+        lambda *a, **k: pytest.fail("a propagation command opened a connection"),
+    )
+    for connector in ("bigquery", "snowflake", "databricks", "duckdb"):
+        save_config(DexConfig(connector=connector), tmp_path)
+        assert (
+            main(
+                [
+                    "--repo-root",
+                    str(tmp_path),
+                    "transform",
+                    "rename",
+                    "column",
+                    "stg_customers.id",
+                    f"id_{connector}",
+                ]
+            )
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+
+def test_the_reference_index_opens_no_connection_on_any_connector(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Repo-only means repo-only, whatever the repo is configured to bill against.
+
+    The command is advertised as free on every connector. A connector that got
+    opened here would price nothing and still authenticate, which is the quiet
+    version of the failure the cost handshake exists to make loud.
+    """
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import DexConfig, save_config
+    from exmergo_dex_core.engine import DexEngine
+
+    monkeypatch.setattr(
+        DexEngine,
+        "_adapter",
+        lambda *a, **k: pytest.fail("`transform references` opened a connection"),
+    )
+    for connector in ("bigquery", "snowflake", "databricks", "redshift", "duckdb"):
+        save_config(DexConfig(connector=connector), tmp_path)
+        assert (
+            main(["--repo-root", str(tmp_path), "transform", "references", "id"]) == 0
+        )
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == "ok"
+        assert envelope["cost"]["estimate"] is None
+
+
+def test_a_refused_seed_never_reaches_a_dbt_subprocess(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    """The PII gate runs before the parse, not after it.
+
+    `transform plan` hands snapshots, seeds and the config kinds to dbt's own
+    parser before it stores anything, and that parser reads a *copy of the
+    project with the edit written into it*. Parsing first would put a refused
+    seed's values on disk and through a subprocess before the gate ever fired,
+    which is the same failure the profiles secret-guard is ordered against.
+
+    Found by dogfooding, not by the suite: every unit test called the validator
+    directly and so could not see what the command layer did first.
+    """
+
+    import importlib
+    import json as _json
+
+    from exmergo_dex_core.cli import main
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def refuse_to_run(*args, **kwargs):
+        raise AssertionError("dbt was handed the seed before it was refused")
+
+    monkeypatch.setattr(build_mod, "shadow_parse", refuse_to_run)
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        _json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "seeds/contacts.csv",
+                        "kind": "seed_csv",
+                        "content": "id,email\n1,someone@example.com\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "a lookup built from customer data",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    envelope = _json.loads(capsys.readouterr().out)
+    assert rc != 0
+    assert "'email' looks like email" in envelope["errors"][0]
+    assert "someone@example.com" not in _json.dumps(envelope)
+
+
+def test_a_seed_over_the_size_cap_refuses_rather_than_writes(dbt_project_dir: Path):
+    # The other half of "a seed is data entering git": a multi-megabyte CSV is
+    # unreadable in review, which is the one thing a reviewable diff is for.
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import MAX_SEED_ROWS, EditValidationError
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    with pytest.raises(EditValidationError, match="row cap"):
+        transform.plan(
+            "far too much data",
+            [
+                transform.PlanEdit(
+                    path="seeds/big.csv",
+                    kind=transform.EditKind.SEED_CSV,
+                    new_content="code\n" + "x\n" * (MAX_SEED_ROWS + 1),
+                )
+            ],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=store,
+        )
+    assert store.list_plans() == []
+    assert not (dbt_project_dir / "seeds" / "big.csv").exists()
+
+
 def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     # A hand-edit to the cache is overwritten by the next profile; only the
     # committed config entry durably clears a reviewed column, and the clear is
@@ -1129,6 +1557,89 @@ def test_the_er_diagram_marks_pii_and_carries_no_column_value():
             assert value not in mermaid, "a column value reached the diagram"
         assert "pii:email 0.95" in mermaid
         assert "pii:government_id 0.90" in mermaid
+
+
+def test_the_map_payload_marks_pii_and_carries_no_column_value():
+    """`explore map` returns findings rather than a receipt (issue #202), which
+    puts profile content into the envelope for the first time. The rule the
+    diagram obeys has to hold here for the same reason and in the same strict
+    form: the cache retains min/max and a value domain for every column that
+    earned one, and this payload must never reach for them. The PII flag IS
+    reported, because flagged-not-hidden is the posture, and it is (category,
+    confidence) as it is everywhere.
+    """
+
+    import json as _json
+
+    from exmergo_dex_core.cache import (
+        Dataset,
+        DexCache,
+        PIICategory,
+        Relationship,
+        ValueCount,
+        ValueDomain,
+    )
+    from exmergo_dex_core.explore.summary import summarize_map
+
+    customers = Dataset(
+        identifier="shop.main.customers",
+        columns=[
+            ColumnProfile(
+                name="customer_id",
+                data_type="INTEGER",
+                is_unique=True,
+                min_value=1,
+                max_value=987654,
+            ),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                min_value="aaron@example.com",
+                max_value="zoe@example.com",
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+            ),
+            ColumnProfile(
+                name="tier",
+                data_type="VARCHAR",
+                value_domain=ValueDomain(
+                    values=[ValueCount(value="platinum", count=3)]
+                ),
+            ),
+        ],
+        candidate_keys=[["customer_id"]],
+        grain=["customer_id"],
+    )
+    orders = Dataset(
+        identifier="shop.main.orders",
+        columns=[
+            ColumnProfile(name="order_id", data_type="INTEGER", is_unique=True),
+            ColumnProfile(name="customer_id", data_type="INTEGER"),
+        ],
+    )
+    cache = DexCache(
+        datasets=[customers, orders],
+        relationships=[
+            Relationship(
+                from_dataset="shop.main.orders",
+                from_columns=["customer_id"],
+                to_dataset="shop.main.customers",
+                to_columns=["customer_id"],
+            )
+        ],
+    )
+
+    for detail in (False, True):
+        view = summarize_map(cache, detail=detail)
+        blob = _json.dumps(
+            [o.model_dump(mode="json") for o in view.objects], sort_keys=True
+        )
+        for value in ("987654", "aaron@example.com", "zoe@example.com", "platinum"):
+            assert value not in blob, "a column value reached the map payload"
+        for key in ("min_value", "max_value", "value_domain"):
+            assert key not in blob
+        flagged = next(c for o in view.objects for c in o.columns if c.name == "email")
+        assert flagged.pii is not None
+        assert set(flagged.pii.model_dump()) == {"category", "confidence"}
 
 
 # --- Family 4: propose-don't-impose ------------------------------------------
@@ -1615,6 +2126,61 @@ def test_a_stored_plan_cannot_escape_the_surface_its_format_declares(
                 project_format=DbtProject(dbt_project_dir.parent, dbt_project_dir),
             )
     assert not escaped.exists()
+
+
+def test_an_authored_kind_cannot_land_outside_its_own_path_family(
+    dbt_project_dir: Path,
+):
+    """Writes are confined to the repo, and within the repo to the part of the
+    dbt surface the kind belongs to.
+
+    Containment alone is not enough once the surface has several families: a
+    snapshot written into ``models/`` is inside the surface and still wrong,
+    because dbt parses it as a model and the build fails. So the kind and its
+    location have to agree, in both directions, and neither confirmation nor a
+    re-plan can talk past it.
+    """
+
+    from exmergo_dex_core import transform
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    misplaced = [
+        (
+            transform.EditKind.SNAPSHOT_SQL,
+            "models/staging/snap_customers.sql",
+            "snapshot paths",
+        ),
+        (transform.EditKind.SEED_CSV, "models/staging/lookup.csv", "seed paths"),
+        (transform.EditKind.SEED_CSV, "macros/lookup.csv", "seed paths"),
+        (transform.EditKind.SNAPSHOT_SQL, "seeds/snap.sql", "snapshot paths"),
+        # The two families that hold nothing but `.sql` and sit beside each
+        # other, which is where a misfiling is easiest to make and hardest to
+        # notice: dbt would build a misfiled test as a model, and would never
+        # look at a misfiled analysis at all.
+        (
+            transform.EditKind.TEST_SQL,
+            "models/staging/assert_ids.sql",
+            "test paths",
+        ),
+        (transform.EditKind.TEST_SQL, "analyses/assert_ids.sql", "test paths"),
+        (
+            transform.EditKind.ANALYSIS_SQL,
+            "models/staging/scratch.sql",
+            "analysis paths",
+        ),
+        (transform.EditKind.ANALYSIS_SQL, "tests/scratch.sql", "analysis paths"),
+    ]
+    for kind, path, named in misplaced:
+        with pytest.raises(transform.PlanError, match=named):
+            transform.plan(
+                "misfiled",
+                [transform.PlanEdit(path=path, kind=kind, new_content="id\n1\n")],
+                dbt_project_dir,
+                repo_root=dbt_project_dir.parent,
+                store=store,
+            )
+        assert not (dbt_project_dir / path).exists()
+    assert store.list_plans() == []
 
 
 def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):

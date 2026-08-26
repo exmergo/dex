@@ -45,7 +45,20 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "cluster",
         "semantic",
     ],
-    "transform": ["init", "plan", "apply", "build", "deps", "plans", "macro", "test"],
+    "transform": [
+        "init",
+        "plan",
+        "apply",
+        "build",
+        "deps",
+        "plans",
+        "macro",
+        "references",
+        "rename",
+        "remove",
+        "place",
+        "test",
+    ],
     "semantic": ["define", "update", "plan"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
@@ -255,6 +268,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
+                # Deliberately not spelled `--full`, which on `map` decides how
+                # much gets *scanned* and therefore what the run costs. This one
+                # decides only how much of what was found comes back, spends
+                # nothing, and lifts none of the payload caps.
+                if group == "explore" and name == "map":
+                    sp.add_argument(
+                        "--detail", action="store_true", default=argparse.SUPPRESS
+                    )
                 if group == "explore" and name in {"relationships", "map"}:
                     sp.add_argument(
                         "--verify", action="store_true", default=argparse.SUPPRESS
@@ -334,6 +355,52 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                if group == "transform" and name == "references":
+                    # Variadic like `explore query`: one call answers "where is
+                    # each of these used", which is the shape of a rename. `--kind`
+                    # narrows; omitting it reports every kind the name is used as,
+                    # because a caller usually knows the name and not what the
+                    # project calls it.
+                    #
+                    # `--kind` is validated in the command rather than by argparse
+                    # `choices`: a rejected choice exits before an envelope is
+                    # built, so a typo would return no JSON line at all, and every
+                    # command owes the caller exactly one.
+                    sp.add_argument("names", nargs="+")
+                    sp.add_argument("--kind", default=None)
+                    sp.add_argument(
+                        "--full", action="store_true", default=argparse.SUPPRESS
+                    )
+                if group == "transform" and name in {"rename", "remove", "place"}:
+                    # The write half of `references`, so it sits behind the
+                    # dialect gate the read half is routed around: these author
+                    # SQL and need the engine that parses it.
+                    #
+                    # `--edits-file` on both propagation verbs, for the same
+                    # payload `transform plan` takes. A removal needs it (dex
+                    # removes a declaration and refuses while a read survives,
+                    # and only the caller knows what a read should become); a
+                    # rename accepts it so a related hand-authored change can
+                    # ride in the same atomic plan.
+                    sp.add_argument("--edits-file", default=None)
+                if group == "transform" and name == "rename":
+                    sp.add_argument("kind")
+                    sp.add_argument("old")
+                    sp.add_argument("new")
+                if group == "transform" and name == "remove":
+                    sp.add_argument("kind")
+                    sp.add_argument("name")
+                if group == "transform" and name == "place":
+                    # The column to define, then where it has to appear and what
+                    # computes it. `--targets` repeats and splits on commas, the
+                    # spelling `explore semantic query` already uses for its own
+                    # lists.
+                    sp.add_argument("argument", nargs="?", default=None)
+                    sp.add_argument("--targets", action="append", default=None)
+                    sp.add_argument("--expr", default=None)
+                    # Answer without storing a plan. The proposal is only worth
+                    # calling one if a caller can ask for it cheaply and disagree.
+                    sp.add_argument("--explain", action="store_true", default=False)
                 if group == "transform" and name == "test":
                     # `test` is scaffold-only for now: the model to derive a
                     # unit_tests: skeleton from. No bare `transform test`
@@ -472,11 +539,25 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "deps"): "cmd_deps",
         ("transform", "plans"): "cmd_plans",
         ("transform", "macro"): "cmd_macro",
+        ("transform", "rename"): "cmd_rename",
+        ("transform", "remove"): "cmd_remove",
+        ("transform", "place"): "cmd_place",
         ("transform", "test"): "cmd_test",
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
     }
+    # `transform references` is routed before the authoring table and from its
+    # own module on purpose, the same trade `explore semantic` makes above. It
+    # reads the project's files and nothing else: no warehouse, no dialect
+    # engine. Importing the command module below would pull the plan store and
+    # sqlglot with it, and a bare install (no connector extra) could not run a
+    # command that only ever reads text off disk.
+    if args.group == "transform" and args.subcommand == "references":
+        from .references import cmd_references
+
+        return cmd_references(args, engine)
+
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
         ensure_dialect_available()

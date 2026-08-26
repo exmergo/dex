@@ -69,6 +69,7 @@ if TYPE_CHECKING:
         SemanticQueryResult,
     )
     from .maintain.results import DriftResult, ReconcileResult, SnapshotResult
+    from .references import ReferencesResult
     from .transform.plans import PlanEdit
     from .transform.results import (
         ApplyResult,
@@ -77,8 +78,10 @@ if TYPE_CHECKING:
         InitResult,
         MacroListResult,
         MacroResult,
+        PlacementResult,
         PlanListResult,
         PlanResult,
+        PropagationResult,
     )
 
 
@@ -675,6 +678,7 @@ class DexEngine:
         self,
         *,
         full: bool = False,
+        detail: bool = False,
         verify: bool = False,
         infer_by_overlap: bool = False,
         refresh: bool = False,
@@ -685,8 +689,9 @@ class DexEngine:
         return explore.map(
             self,
             full=full,
-            verify=verify,
             infer_by_overlap=infer_by_overlap,
+            detail=detail,
+            verify=verify,
             refresh=refresh,
             use_project=use_project,
         )
@@ -871,6 +876,51 @@ class DexEngine:
         from .transform import commands as transform
 
         return transform.macro(self, name)
+
+    def references(
+        self,
+        names: list[str],
+        *,
+        kind: str | None = None,
+        full: bool = False,
+    ) -> ReferencesResult:
+        # From `references` rather than `transform.commands`: this one reads the
+        # project's files and needs neither the plan store nor the dialect engine,
+        # and reaching it through the authoring module would require both.
+        from . import references as references_mod
+
+        return references_mod.run(self, names, kind=kind, full=full)
+
+    def rename(
+        self,
+        kind: str,
+        old: str,
+        new: str,
+        *,
+        edits_file: str | None = None,
+    ) -> PropagationResult:
+        from .transform import commands as transform
+
+        return transform.rename(self, kind, old, new, edits_file=edits_file)
+
+    def remove(
+        self, kind: str, name: str, *, edits_file: str | None = None
+    ) -> PropagationResult:
+        from .transform import commands as transform
+
+        return transform.remove(self, kind, name, edits_file=edits_file)
+
+    def place(
+        self,
+        column: str,
+        targets: list[str],
+        expression: str,
+        *,
+        explain: bool = False,
+    ) -> PlacementResult:
+        from .transform import commands as transform
+
+        return transform.place(self, column, targets, expression, explain=explain)
 
     def build(
         self, *, target: str | None = None, select: str | None = None

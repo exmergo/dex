@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.dbt_project import DbtProjectError, contained_path
+from exmergo_dex_core.dbt_project import (
+    DbtProjectError,
+    DbtProjectView,
+    contained_path,
+)
 from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit, PlanError
 from exmergo_dex_core.transform.plans import plan as make_plan
@@ -214,13 +218,16 @@ def test_plan_warns_when_a_model_calls_the_missing_macro(
 def test_contained_path_admits_macros_and_still_refuses_escapes(tmp_path: Path):
     root = tmp_path / "proj"
     root.mkdir()
-    assert contained_path(root, "macros/x.sql", ["models"], ["macros"])
+    view = DbtProjectView(
+        root=str(root), project_name="p", profile_name="p", model_paths=["models"]
+    )
+    assert contained_path(root, "macros/x.sql", view)
     with pytest.raises(DbtProjectError):
-        contained_path(root, "../macros/x.sql", ["models"], ["macros"])
+        contained_path(root, "../macros/x.sql", view)
     with pytest.raises(DbtProjectError):
-        contained_path(root, str(tmp_path / "macros" / "x.sql"), ["models"], ["macros"])
+        contained_path(root, str(tmp_path / "macros" / "x.sql"), view)
     with pytest.raises(DbtProjectError):
-        contained_path(root, "scripts/x.sql", ["models"], ["macros"])
+        contained_path(root, "scripts/x.sql", view)
 
 
 def test_custom_macro_paths_are_honored(dbt_project_dir: Path, tmp_path: Path, capsys):

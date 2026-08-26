@@ -57,6 +57,22 @@ _ALLOWED_ROOT_FILES = frozenset(
     {"packages.yml", "dependencies.yml", PROJECT_FILE, PROFILES_FILE}
 )
 
+# What each of dbt's authored path families can hold. Models, snapshots, tests
+# and analyses are SQL plus their properties YAML; macros are jinja plus their
+# properties YAML; seeds are CSV data plus the YAML that declares their column
+# types. The scan is per-family rather than one global suffix filter because
+# ".csv" is only a seed under the seed paths: anywhere else it is somebody's
+# fixture, and a fixture is not dex's to hash.
+_YAML_SUFFIXES = frozenset({".yml", ".yaml"})
+_FAMILY_SUFFIXES: dict[str, frozenset[str]] = {
+    "model": _YAML_SUFFIXES | {".sql"},
+    "macro": _YAML_SUFFIXES | {".sql"},
+    "snapshot": _YAML_SUFFIXES | {".sql"},
+    "seed": _YAML_SUFFIXES | {".csv"},
+    "test": _YAML_SUFFIXES | {".sql"},
+    "analysis": _YAML_SUFFIXES | {".sql"},
+}
+
 
 class DbtProjectError(ProjectError):
     """The dbt format's refusal, and the shipped implementation of ``ProjectError``.
@@ -79,9 +95,15 @@ class SourceFile(BaseModel):
 class DbtProjectView(BaseModel):
     """The in-memory view of a dbt project.
 
-    ``files`` holds every ``*.sql``/``*.yml``/``*.yaml`` under the model paths:
-    the surface transform edits. ``manifest`` is the compiled artifact when the
-    project has been compiled; a fresh project loads fine without one.
+    ``files`` holds the editable surface: the source files under each of dbt's
+    authored path families, each scanned for the suffixes that family can hold
+    (see :data:`_FAMILY_SUFFIXES`). ``manifest`` is the compiled artifact when
+    the project has been compiled; a fresh project loads fine without one.
+
+    A file that is *not* in ``files`` hashes as absent, so a later edit to it
+    registers as a create and the apply that follows conflicts on a file nobody
+    touched. That is why the scan covers every family dex can author into, not
+    only the ones it reads for definitions.
     """
 
     root: str
@@ -89,8 +111,32 @@ class DbtProjectView(BaseModel):
     profile_name: str
     model_paths: list[str] = Field(default_factory=lambda: ["models"])
     macro_paths: list[str] = Field(default_factory=lambda: ["macros"])
+    snapshot_paths: list[str] = Field(default_factory=lambda: ["snapshots"])
+    seed_paths: list[str] = Field(default_factory=lambda: ["seeds"])
+    test_paths: list[str] = Field(default_factory=lambda: ["tests"])
+    analysis_paths: list[str] = Field(default_factory=lambda: ["analyses"])
     files: dict[str, SourceFile] = Field(default_factory=dict)
     manifest: dict[str, Any] | None = None
+
+    def path_families(self) -> list[tuple[str, list[str]]]:
+        """Every authored path family, as ``(name, configured paths)``.
+
+        One place to add the next family, and the order is the order a path is
+        matched against when deciding which family it belongs to: the specific
+        families first, models last as the catch-all. Two families configured to
+        the same directory is a project mistake dex does not adjudicate; the
+        first listed wins and the containment message names every family it
+        checked.
+        """
+
+        return [
+            ("macro", list(self.macro_paths)),
+            ("snapshot", list(self.snapshot_paths)),
+            ("seed", list(self.seed_paths)),
+            ("test", list(self.test_paths)),
+            ("analysis", list(self.analysis_paths)),
+            ("model", list(self.model_paths)),
+        ]
 
 
 class TargetInfo(BaseModel):
@@ -221,23 +267,50 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
     if not project_name:
         raise DbtProjectError(f"{project_file} has no 'name'")
     model_paths = list(raw.get("model-paths", ["models"]))
-    # dbt's own default when the key is absent, so a skeleton project's first
-    # scaffolded macro lands where dbt will look for it.
+    # dbt's own defaults when a key is absent, so a skeleton project's first
+    # scaffolded macro, snapshot, or seed lands where dbt will look for it.
     macro_paths = list(raw.get("macro-paths", ["macros"]))
+    snapshot_paths = list(raw.get("snapshot-paths", ["snapshots"]))
+    seed_paths = list(raw.get("seed-paths", ["seeds"]))
+    test_paths = list(raw.get("test-paths", ["tests"]))
+    analysis_paths = list(raw.get("analysis-paths", ["analyses"]))
+
+    # Suffixes unioned per directory rather than per family, so a project that
+    # points two families at one directory gets both sets scanned instead of
+    # whichever happened to be visited last.
+    scan: dict[str, set[str]] = {}
+    for family, paths in (
+        ("model", model_paths),
+        ("macro", macro_paths),
+        ("snapshot", snapshot_paths),
+        ("seed", seed_paths),
+        ("test", test_paths),
+        ("analysis", analysis_paths),
+    ):
+        for configured in paths:
+            scan.setdefault(configured, set()).update(_FAMILY_SUFFIXES[family])
 
     files: dict[str, SourceFile] = {}
-    for model_path in model_paths + macro_paths:
-        base = root / model_path
+    for configured, suffixes in scan.items():
+        base = root / configured
         if not base.is_dir():
             continue
         for path in sorted(base.rglob("*")):
-            if path.suffix not in {".sql", ".yml", ".yaml"} or not path.is_file():
+            if path.suffix not in suffixes or not path.is_file():
                 continue
             # Posix-separated regardless of OS: every consumer of `files` keys
             # (transform_layer's model-name parsing, scaffolded model paths,
             # this module's own backed_relation_names) assumes "/".
             rel = path.relative_to(root).as_posix()
-            content = path.read_text(encoding="utf-8")
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                # A seed saved in a legacy encoding is the realistic case, and
+                # loading the project is a prerequisite for every command,
+                # explore included. Skipping the file costs a spurious conflict
+                # if someone later edits it through dex; raising would cost them
+                # the whole engine.
+                continue
             files[rel] = SourceFile(
                 path=rel, content=content, sha256=content_hash(content)
             )
@@ -271,6 +344,10 @@ def load(project_dir: Path | str = ".") -> DbtProjectView:
         profile_name=raw.get("profile", project_name),
         model_paths=model_paths,
         macro_paths=macro_paths,
+        snapshot_paths=snapshot_paths,
+        seed_paths=seed_paths,
+        test_paths=test_paths,
+        analysis_paths=analysis_paths,
         files=files,
         manifest=manifest,
     )
@@ -491,9 +568,7 @@ def write_edits(
     conflicts: list[Conflict] = []
     diffs: list[dict[str, Any]] = []
     for edit in edits:
-        target_path = contained_path(
-            root, edit.path, view.model_paths, view.macro_paths
-        )
+        target_path = contained_path(root, edit.path, view)
         current = (
             target_path.read_text(encoding="utf-8") if target_path.is_file() else None
         )
@@ -535,19 +610,21 @@ def write_edits(
     return ApplyResult(written=written, diffs=diffs, conflicts=conflicts)
 
 
-def contained_path(
-    root: Path,
-    rel_path: str,
-    model_paths: list[str],
-    macro_paths: list[str] | None = None,
-) -> Path:
+def contained_path(root: Path, rel_path: str, view: DbtProjectView) -> Path:
     """Resolve an edit path and refuse anything outside the project's editing
     surface.
 
     Writes are confined to the repo, and within the repo to the dbt editing
-    surface: model SQL, schema.yml, and semantic YAML live under the model
-    paths, and macros under the macro paths. Escapes (absolute paths, ``..``)
-    are refused outright.
+    surface: model SQL, schema.yml and semantic YAML under the model paths,
+    macros under the macro paths, snapshots under the snapshot paths, seeds
+    under the seed paths, singular and generic tests under the test paths,
+    analyses under the analysis paths, plus the root manifests dbt keeps at the
+    project root. Escapes (absolute paths, ``..``) are refused outright.
+
+    The families are read off the view rather than passed positionally. Four of
+    them was where a positional list stopped being readable, and there are six
+    now; every caller already holds a view: the writer loads one, and both
+    plan-time callers were handed one.
     """
 
     candidate = Path(rel_path)
@@ -559,15 +636,325 @@ def contained_path(
     # name (still inside the project, still not an arbitrary escape).
     if resolved.parent == root_resolved and resolved.name in _ALLOWED_ROOT_FILES:
         return root / candidate
-    allowed = list(model_paths) + list(macro_paths or [])
-    for allowed_path in allowed:
-        base = (root_resolved / allowed_path).resolve()
-        if resolved == base or base in resolved.parents:
-            return root / candidate
-    raise DbtProjectError(
-        f"edit path '{rel_path}' is outside the project's model and macro "
-        f"paths ({', '.join(allowed)}); dex edits only the dbt project surface"
+    if path_family(root, rel_path, view) is not None:
+        return root / candidate
+    listed = ", ".join(
+        f"{name} ({', '.join(paths) or 'none'})" for name, paths in view.path_families()
     )
+    raise DbtProjectError(
+        f"edit path '{rel_path}' is outside the project's authored paths "
+        f"[{listed}]; dex edits only the dbt project surface"
+    )
+
+
+def path_family(root: Path, rel_path: str, view: DbtProjectView) -> str | None:
+    """Which authored family ``rel_path`` falls in, or ``None`` for none of them.
+
+    The other half of containment: containment asks whether a path is inside the
+    surface at all, and this asks *which* part of it, which is what decides
+    whether the edit's declared kind belongs there. Both answer from the same
+    traversal so they can never disagree about where a directory ends.
+    """
+
+    resolved = (root / Path(rel_path)).resolve()
+    root_resolved = root.resolve()
+    for name, paths in view.path_families():
+        for configured in paths:
+            base = (root_resolved / configured).resolve()
+            if resolved == base or base in resolved.parents:
+                return name
+    return None
+
+
+def node_files(view: DbtProjectView) -> dict[str, SourceFile]:
+    """The files that build a relation dbt names after the file, keyed by path.
+
+    A model, a snapshot and a seed each build such a relation and each is
+    ``ref()``-able; a macro, a schema.yml and a semantic YAML build nothing.
+    Every derivation that reads "the things this project builds" out of the file
+    list goes through here, so widening the load to a new family cannot quietly
+    turn its files into models by filename.
+
+    "Node" is the looser word and it is why this function is not called that: a
+    singular test *is* a dbt node, and it belongs here no more than a macro
+    does, because it builds no relation and nothing can ``ref()`` it. An
+    analysis is compiled and never built at all. Both are loaded so they can be
+    authored and hashed; neither is a thing this project builds.
+    """
+
+    nodes: dict[str, SourceFile] = {}
+    for path, source in view.files.items():
+        family = path_family(Path(view.root), path, view)
+        if (family in ("model", "snapshot") and path.endswith(".sql")) or (
+            family == "seed" and path.endswith(".csv")
+        ):
+            nodes[path] = source
+    return nodes
+
+
+def node_name(path: str) -> str:
+    """The dbt node name a node file builds: its stem, case preserved.
+
+    dbt names a model, snapshot or seed after the file, ignoring the
+    directories above it, which is why two same-named files in different
+    subdirectories are a dbt error rather than two nodes. Case is preserved
+    because ``ref()`` matches it; callers comparing against warehouse
+    identifiers lower it themselves.
+    """
+
+    return path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+
+# --- Jinja: what a template calls ---------------------------------------------
+#
+# One scanner, two policies on top of it. `render_model_sql` refuses anything it
+# cannot resolve, because attributing a row delta to SQL dbt never runs would be
+# a wrong answer; the reference index reports the same thing as indeterminate,
+# because a use it cannot resolve is still a use worth naming. Both need the same
+# question answered first, "what does this template call, and with what", which
+# is all this does.
+#
+# It lives here rather than beside either caller because this module is inside
+# the zero-extra install and both callers are not: `row_attribution` and the
+# reference index reach it, and neither drags the other's dependencies along.
+
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
+_JINJA_REGION = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
+_CALL_START = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+_QUOTED_ARG = re.compile(r"^(['\"])([^'\"]*)\1$")
+
+
+class JinjaCall(BaseModel):
+    """One call written inside a jinja region, with its arguments as read.
+
+    An ``args`` entry is the literal string dex read, or ``None`` where the
+    argument was anything else: a variable, a concatenation, a nested call, a
+    keyword form. ``None`` means *dex did not resolve this*, never *there is
+    nothing here*, and every consumer has to keep that distinction: collapsing
+    the two is how a reference silently goes missing.
+
+    Nested calls are reported in their own right, so ``{{ ref(var('x')) }}``
+    yields both the resolved ``var('x')`` and the unresolved ``ref``. Reporting
+    only the outer call would hide the var; reporting only the inner would
+    invent a ref that was never written.
+    """
+
+    callee: str
+    args: tuple[str | None, ...] = ()
+    line: int
+    #: True when the call is the entire region body, so `{{ ref('x') }}` is
+    #: distinguishable from `{{ upper(ref('x')) }}`. A caller substituting the
+    #: region for the call's value needs to know the difference.
+    spans_region: bool = False
+    #: "expression" for `{{ }}`, "statement" for `{% %}`.
+    region_kind: str = "expression"
+    #: Half-open ``[start, end)`` of the callee name, and of each resolved
+    #: argument's *contents* inside its quotes, indexed into the same
+    #: comment-masked source :class:`JinjaRegion` offsets are in. A span is
+    #: ``None`` wherever the corresponding ``args`` entry is ``None``, since
+    #: there is no literal to point at.
+    #:
+    #: Here so a caller renaming what a call names can splice exactly those
+    #: bytes and leave the rest of the template alone. A rewriter working from
+    #: ``line`` alone has to re-find the name by searching the line, which picks
+    #: the wrong occurrence as soon as a line carries the name twice.
+    callee_span: tuple[int, int] | None = None
+    arg_spans: tuple[tuple[int, int] | None, ...] = ()
+
+
+class JinjaRegion(BaseModel):
+    """One ``{{ }}`` or ``{% %}`` span, its text, and the calls inside it.
+
+    ``start`` and ``end`` index the *comment-masked* source that
+    :func:`jinja_regions` returns alongside these, not the original, so a caller
+    splicing regions out works against text where a comment can no longer look
+    like code. Masking preserves length and newlines, so offsets and line
+    numbers still line up with the file a human opens.
+    """
+
+    kind: str
+    body: str
+    start: int
+    end: int
+    line: int
+    calls: list[JinjaCall] = Field(default_factory=list)
+
+
+def jinja_regions(content: str) -> tuple[list[JinjaRegion], str]:
+    """Every jinja region in ``content``, with the comment-masked source.
+
+    The primitive both jinja readers share. Comments are masked rather than
+    deleted so every reported line still matches the file, and string contents
+    are masked while structure is scanned so a paren or a comma inside a quoted
+    argument cannot be read as syntax; the arguments themselves come from the
+    original text.
+
+    A scanner, not a renderer. It never evaluates jinja, so it says what a
+    template names, never what it produces. A region carrying no call at all
+    (``{{ some_var }}``) is still returned, because "there is jinja here that dex
+    did not read" is the fact a caller most needs.
+    """
+
+    masked_source = _JINJA_COMMENT.sub(lambda m: _blank_like(m.group(0)), content)
+    regions: list[JinjaRegion] = []
+    for match in _JINJA_REGION.finditer(masked_source):
+        expression = match.group(1)
+        body = expression if expression is not None else match.group(2)
+        kind = "expression" if expression is not None else "statement"
+        regions.append(
+            JinjaRegion(
+                kind=kind,
+                body=body,
+                start=match.start(),
+                end=match.end(),
+                line=masked_source.count("\n", 0, match.start()) + 1,
+                calls=[
+                    JinjaCall(
+                        callee=callee,
+                        args=tuple(value for value, _span in arguments),
+                        line=masked_source.count("\n", 0, offset) + 1,
+                        spans_region=call_text.strip() == body.strip(),
+                        region_kind=kind,
+                        callee_span=(offset, offset + len(callee)),
+                        arg_spans=tuple(span for _value, span in arguments),
+                    )
+                    for offset, callee, arguments, call_text in sorted(
+                        _calls_in(body, match.start() + 2),
+                        key=lambda call: call[0],
+                    )
+                ],
+            )
+        )
+    return regions, masked_source
+
+
+def jinja_calls(content: str) -> list[JinjaCall]:
+    """Every call inside every jinja region of ``content``, in document order."""
+
+    regions, _masked = jinja_regions(content)
+    return [call for region in regions for call in region.calls]
+
+
+#: One argument as read: its literal value (``None`` when dex did not resolve it)
+#: and the absolute half-open span of that literal's contents (``None`` likewise).
+_Argument = tuple[str | None, tuple[int, int] | None]
+
+
+def _calls_in(
+    body: str, base: int
+) -> list[tuple[int, str, tuple[_Argument, ...], str]]:
+    """``(callee offset, callee, arguments, call text)``, nested calls included.
+
+    Offsets are absolute: ``base`` is where ``body`` starts in the source the
+    caller is indexing into, which is what lets a rewriter splice a name out of
+    a nested call without re-finding it by text.
+    """
+
+    masked = _mask_strings(body)
+    found: list[tuple[int, str, tuple[_Argument, ...], str]] = []
+    position = 0
+    while True:
+        start = _CALL_START.search(masked, position)
+        if start is None:
+            return found
+        open_paren = start.end() - 1
+        close = _closing_paren(masked, open_paren)
+        if close is None:
+            # An unbalanced call is a broken template. Skip past the callee and
+            # keep scanning: the rest of the file is still worth reading, and
+            # refusing here would make one typo hide every other reference.
+            position = start.end()
+            continue
+        inner = body[open_paren + 1 : close]
+        found.append(
+            (
+                base + start.start(1),
+                start.group(1),
+                _split_args(
+                    inner, masked[open_paren + 1 : close], base + open_paren + 1
+                ),
+                body[start.start(1) : close + 1],
+            )
+        )
+        found.extend(_calls_in(inner, base + open_paren + 1))
+        position = close + 1
+
+
+def _split_args(inner: str, masked_inner: str, base: int) -> tuple[_Argument, ...]:
+    """Top-level arguments of one call, each as its literal value and span.
+
+    ``base`` is where ``inner`` starts in the source being indexed, so a span
+    lands on the file a human opens rather than on this slice.
+    """
+
+    if not inner.strip():
+        return ()
+    args: list[_Argument] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(masked_inner):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(_literal(inner[start:index], base + start))
+            start = index + 1
+    args.append(_literal(inner[start:], base + start))
+    return tuple(args)
+
+
+def _literal(text: str, base: int) -> _Argument:
+    """One argument's literal value and the span of its contents, or two ``None``.
+
+    The span covers what is *between* the quotes, so a rewriter replaces the
+    name and leaves the quoting style the author chose alone.
+    """
+
+    quoted = _QUOTED_ARG.match(text.strip())
+    if quoted is None:
+        return None, None
+    offset = base + len(text) - len(text.lstrip())
+    return quoted.group(2), (offset + quoted.start(2), offset + quoted.end(2))
+
+
+def _closing_paren(masked: str, open_paren: int) -> int | None:
+    depth = 0
+    for index in range(open_paren, len(masked)):
+        if masked[index] == "(":
+            depth += 1
+        elif masked[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _mask_strings(text: str) -> str:
+    """``text`` with the *contents* of every quoted run blanked, offsets preserved.
+
+    Structure scanning runs over this so a paren, a comma or a quote written
+    inside a string cannot be read as syntax. The quotes themselves survive, so
+    an argument is still recognisable as a literal.
+    """
+
+    out = list(text)
+    quote: str | None = None
+    for index, char in enumerate(text):
+        if quote is None:
+            if char in "'\"":
+                quote = char
+        elif char == quote:
+            quote = None
+        else:
+            out[index] = "\n" if char == "\n" else "x"
+    return "".join(out)
+
+
+def _blank_like(text: str) -> str:
+    """``text`` reduced to whitespace, newlines kept so line numbers survive."""
+
+    return "".join("\n" if char == "\n" else " " for char in text)
 
 
 # --- Read view: what the project declares -------------------------------------
@@ -610,11 +997,7 @@ def backed_relation_names(view: DbtProjectView) -> set[str]:
     risk a cycle.
     """
 
-    names = {
-        path.rsplit("/", 1)[-1][: -len(".sql")].lower()
-        for path in view.files
-        if path.endswith(".sql")
-    }
+    names = {node_name(path).lower() for path in node_files(view)}
     for parsed, _path in yaml_documents(view):
         for src in parsed.get("sources") or []:
             if not isinstance(src, dict):

@@ -292,15 +292,20 @@ def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     patterns remain string-only.
     """
 
-    flag, _generic = _classify_pii(column_name, data_type)
+    flag, _generic = classify_pii(column_name, data_type)
     return flag
 
 
-def _classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool]:
+def classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool]:
     """The detector plus a marker for the generic `*_name` match.
 
-    The marker tells :func:`profile` which flags are eligible for value-shape
-    refinement. It is deliberately a return value and never persisted: keying
+    The marker says the flag is **provisional**: it is the one match
+    :func:`profile` refines against value shape, up to person-name confidence or
+    down to reference-vocabulary confidence. A caller that cannot run that
+    refinement (nothing that reads names without values can) needs to know it is
+    holding an unrefined guess rather than a verdict, which is why this is
+    public and :func:`detect_pii` is the front door for callers that do not
+    care. It is deliberately a return value and never persisted: keying
     eligibility on the flag itself (e.g. its confidence value) would couple the
     shape rules to the base-confidence table.
     """
@@ -721,7 +726,7 @@ def profile(
 
         # Decide min/max safety BEFORE querying, from name + type, so the adapter
         # never even computes a suppressed extreme.
-        classified = {c.name: _classify_pii(c.name, c.data_type) for c in columns}
+        classified = {c.name: classify_pii(c.name, c.data_type) for c in columns}
         prelim_pii = {name: flag for name, (flag, _g) in classified.items()}
         overridden: dict[str, PIICategory] = {}
         for c in columns:

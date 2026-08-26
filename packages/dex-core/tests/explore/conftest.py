@@ -203,6 +203,33 @@ def many_tables_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def wide_tables_duckdb(tmp_path: Path) -> Path:
+    """Enough objects to bind the map's object cap, and one table wide enough to
+    bind its per-object column cap twice over.
+
+    ``wide`` carries a key, a join, and twenty columns that are none of those and
+    trip no PII pattern, so the default selection keeps one and ``--detail`` runs
+    into the column cap rather than returning all twenty-one.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "wide_tables.duckdb"
+    conn = duckdb.connect(str(path))
+    plain = ", ".join(f"attr_{i:02d} VARCHAR" for i in range(20))
+    conn.execute(f"CREATE TABLE wide (wide_id INTEGER, {plain})")
+    values = ", ".join(f"'v{i}'" for i in range(20))
+    for row in range(5):
+        conn.execute(f"INSERT INTO wide VALUES ({row}, {values})")  # noqa: S608
+    conn.execute("CREATE TABLE child (child_id INTEGER, wide_id INTEGER)")
+    conn.execute("INSERT INTO child VALUES (1, 0), (2, 1), (3, 2)")
+    for i in range(30):
+        conn.execute(f"CREATE TABLE filler_{i:02d} (id INTEGER, v INTEGER)")
+        conn.execute(f"INSERT INTO filler_{i:02d} VALUES (1, {i})")  # noqa: S608
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def composite_grain_duckdb(tmp_path: Path) -> Path:
     """A TPCH-shaped pair: a fact table whose only key is the composite
     (order_key, line_number), where line_number alone has tiny cardinality

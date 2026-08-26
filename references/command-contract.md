@@ -47,7 +47,13 @@ dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
-dex explore map                   -> write/update the .dex cache; print a summary
+dex explore map [--detail]        -> write/update the .dex cache, and return the map:
+                                     per top-ranked object its grain, key, notable
+                                     columns, PII flags and data-quality findings,
+                                     plus the join edges, alongside the counts. Every
+                                     cap binds in every mode and every elision is
+                                     counted in notes; --detail widens the selection,
+                                     never the caps. No column value ever appears
 dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
                                      free and connectionless (a store read, no warehouse);
                                      declared joins solid, inferred dotted, and a cardinality
@@ -71,6 +77,51 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
 dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewable git diff);
                                      no id means the latest unapplied plan of any kind
 dex transform plans               -> list stored plans, pending and applied, newest first
+dex transform references <name>   -> where each name is used: model SQL, schema.yml, dbt_project.yml,
+  [more...] [--kind K] [--full]      macros, semantic YAML, seed headers, installed packages. Repo-only
+                                     and free on every connector; it opens no connection and needs no
+                                     extra, so it is routed ahead of the dialect gate the rest of the
+                                     authoring surface passes. Jinja-aware, so a var() read inside a
+                                     macro counts; a reference it cannot resolve statically is reported
+                                     under data.indeterminate rather than dropped. data.completeness is
+                                     `complete` only once every reason to doubt it is ruled out, and
+                                     data.limits names the rest. Capped, with every elision in notes;
+                                     --full lifts the caps
+dex transform rename <kind>       -> every edit the rename needs, as one plan: the definition, every
+  <old> <new> [--edits-file <f>]     model that selects it, every schema.yml that documents or tests it,
+                                     every semantic reference, and a seed header. <kind> is one of
+                                     column, var, model, seed, snapshot, macro, source. A column must
+                                     be named `model.column`: a bare name is refused, because a report
+                                     may answer imprecisely and a rewrite may not. Scoped to the
+                                     defining node and its ref() descendants. Repo-only and free.
+                                     REFUSES rather than partially applying: on a reference dex could
+                                     not resolve statically, on a name an installed package also
+                                     defines (renaming this project's copy un-shadows the package's),
+                                     on a column handed to a macro as a literal string, and on a model
+                                     whose SELECT list it cannot read. A bare `select *` is not a
+                                     refusal: it provably carries the column through, needs no edit,
+                                     and the plan says so. --edits-file carries related hand-authored
+                                     edits into the same atomic plan
+dex transform remove <kind> <name>   -> the definition removed, and every read verified gone. Same kinds
+  [--edits-file <f>]                 as rename, same refusals. dex authors the removal of the
+                                     definition and REFUSES while any read survives, naming each with
+                                     a file and a line; it never rewrites a read, because
+                                     `{% if var('flag') %}` can be dropped or unguarded and only the
+                                     caller knows which. Pass those read edits with --edits-file and
+                                     they are validated and stored in this same plan
+dex transform place <column>      -> where a derived column shared by several models belongs: the
+  --targets <m,m> --expr "<sql>"     lowest model in the ref() graph that every target descends from
+  [--explain]                        and that already projects the inputs the expression reads. The
+                                     inputs are parsed out of --expr, so they cannot disagree with it.
+                                     Defines the column there and threads it down every chain, with a
+                                     schema.yml entry at the ancestor and at each target and none in
+                                     between. data.reasoning names the ancestor, why it is the lowest,
+                                     which targets descend from it, and the chain, because a proposal
+                                     has to be arguable. Where there is no common ancestor, where the
+                                     lowest one lacks an input, or where two tie, data.strategy is
+                                     `per_target` and the reason is stated rather than the worse thing
+                                     being done quietly. --explain returns the reasoning and stores no
+                                     plan. Repo-only and free
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
                                      auto-runs dbt deps when packages are declared but not installed
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
@@ -108,27 +159,56 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 {"edits": [
   {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
   {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
+  {"path": "snapshots/snap_orders.sql", "kind": "snapshot_sql", "content": "..."},
+  {"path": "seeds/country_vat.csv", "kind": "seed_csv", "content": "..."},
+  {"path": "tests/assert_totals_reconcile.sql", "kind": "test_sql", "content": "..."},
+  {"path": "analyses/email_skew.sql", "kind": "analysis_sql", "content": "..."},
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
-`macro_sql`, `project_yml`, or `profiles_yml`. Each edit also has an `op`:
+`macro_sql`, `snapshot_sql`, `seed_csv`, `test_sql`, `analysis_sql`,
+`project_yml`, or `profiles_yml`. Each edit also has an `op`:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
-still `ref()`s a deleted model (the offenders are named), so the post-deletion
-project is proven free of dangling references before the plan is stored, and,
-when dbt is available, the same post-deletion tree is confirmed by dbt's parser.
+still `ref()`s a deleted model (the offenders are named, with the line), so the
+post-deletion project is proven free of dangling references before the plan is
+stored, and, when dbt is available, the same post-deletion tree is confirmed by
+dbt's parser. The guard reads the reference index behind `transform references`,
+which is why it sees the two-argument `ref('package', 'model')` form, why a seed's
+data rows no longer count as source, and why a reference dex could not resolve
+statically *warns* rather than refusing: it may or may not name the deleted node,
+and no edit the caller could make would settle it.
 A rename is one plan: `delete` the old model, `create` the new, `update` the
-referrers, validated together. The engine validates each edit
+referrers, validated together. `transform rename` generates exactly that plan, and
+the rest of the rename's edits with it, so hand-assembling one is now the fallback
+rather than the route. Note the two guards read the same index and answer
+differently on purpose: a reference dex cannot resolve *warns* on a delete and
+*refuses* on a rename. A dangling dynamic ref left by a delete is unsatisfiable,
+so refusing would block a legitimate delete forever; the same reference in a
+rename's path is satisfiable, because the caller can resolve it by hand and
+re-run. The engine validates each edit
 (model SQL must be a single read-only SELECT once jinja is stripped; YAML must
 parse; semantic YAML must satisfy MetricFlow's schemas; a `packages_yml` edit
 must carry a `packages:` or `dependencies:` list and targets the project-root
 `packages.yml` or `dependencies.yml`; a `macro_sql` edit must hold only macro
 definitions and jinja comments and must target the project's macro paths, where
-no other kind may go; a `project_yml` edit targets the project-root
+no other kind may go; a `snapshot_sql` edit must hold exactly one
+`{% snapshot %}` block whose `config()` names a `unique_key` and a `strategy` of
+`timestamp` (with `updated_at`) or `check` (with `check_cols`), whose body is a
+single read-only SELECT, and must target the project's snapshot paths; a
+`seed_csv` edit must parse as CSV with a named, duplicate-free header and one
+field per column on every row, must stay under 5,000 data rows and 1 MiB, must
+not name columns that look like personal data, and must target the project's
+seed paths; a `test_sql` edit must target the project's test paths and must be
+either a generic test definition (only `{% test %}` blocks and jinja comments,
+balanced) or a singular test that is a single read-only SELECT once its jinja is
+stripped; an `analysis_sql` edit must target the project's analysis paths and be
+a single read-only SELECT on the same terms; a `project_yml` edit targets the
+project-root
 `dbt_project.yml` and must keep a `name`; a `profiles_yml` edit targets the
 project-root `profiles.yml` and must reference every secret via
 `{{ env_var('NAME') }}`, never a literal), pins it to the sha256 of the file it
@@ -138,7 +218,48 @@ would change, computes the diffs, and stores the plan under
 reviewable diff like any other edit, then `transform deps` (or the automatic
 deps step in `transform build`) installs them. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path
-for the macros dex ships. `project_yml` and `profiles_yml` bring the two
+for the macros dex ships. `snapshot_sql` and `seed_csv` bring slowly-changing
+dimension capture and small reference tables into the same flow, each confined to
+its own path family (`snapshot-paths` and `seed-paths` in `dbt_project.yml`, read
+with dbt's own defaults) and each gated by dbt's parser at plan time. A
+`schema_yml` edit is accepted beside either one, which is where dbt expects a
+seed's column types and a snapshot's tests and docs to be declared. `dbt build`
+runs seeds and snapshots natively, so nothing new has to be run after an apply;
+a snapshot writes a table and is priced in the cost handshake, while a seed
+loads a local CSV, scans nothing, and is deliberately unpriced.
+
+`test_sql` and `analysis_sql` do the same for the two remaining families
+(`test-paths` and `analysis-paths`, again with dbt's defaults). A singular test
+is an arbitrary SELECT that must return no rows, which is where most
+project-specific assertions live, and generic test definitions share the same
+directory, so `test_sql` reads the file to tell them apart: a `{% test %}` block
+is checked structurally like a macro, anything else is checked like a model. A
+singular test naming no `ref()` or `source()` warns rather than refuses, since it
+runs against nothing and passes unconditionally. An analysis is held to the same
+read-only SELECT even though dbt only ever compiles it, because read-only against
+data describes what dex writes rather than what dbt runs. `schema_yml` is
+accepted beside each. Neither kind builds a relation and nothing can `ref()`
+either, so neither is a node: neither enters the drift baseline, and deleting one
+raises no dangling-reference guard. `dbt build` runs a singular test natively and
+prices it like any other test; an analysis is compiled by `dbt compile`, never
+built, and costs nothing.
+
+**Three different things here are called a test.** Generic tests are declared
+inside a `schema.yml` (`data_tests:` on a model or a column). Unit tests are
+scaffolded by `transform test --scaffold <model>` into a `unit_tests:` block,
+also `schema_yml`. Singular tests and generic test *definitions* are files under
+`test-paths`, and those are what `test_sql` authors.
+
+`seed_csv` is the first kind that puts **values**, not logic, into a reviewable
+diff, and a diff goes into git and stays there. So a seed's header is checked
+both against the PII detector `explore` profiles warehouse columns with and
+against the flags already in the `.dex/` cache. A column at or above the block
+threshold is refused, and the refusal names the `pii_overrides` entry that would
+clear it (never a value). The standing limit is worth knowing: dex detects PII
+from names and types and never from values, everywhere, so a seed column named
+`code` full of email addresses passes this gate.
+
+`project_yml` and `profiles_yml` bring the two
 project-root config files into the same plan/diff/apply flow; because they carry
 project-wide settings and connection targets, they are gated by dbt's own parser
 at plan time, and a `profiles_yml` edit is refused if it (or the file it would
@@ -316,6 +437,39 @@ models reachable from metric definitions rank higher alongside the configured
 `ranking_hints`. The compiled manifest resolves names exactly when present;
 an uncompiled project falls back to name-based resolution and says so. A
 stale manifest (older than the model sources) is noted, not trusted silently.
+
+**`explore map` returns the map, not a receipt for it.** Alongside the counts,
+`data.objects` carries each top-ranked object's row count, detected grain,
+candidate key, notable columns (each with the role that earned it a place:
+`grain`, `key`, `join`, or a PII flag) and data-quality findings, and `data.edges`
+carries the join edges in exactly the shape `explore relationships` returns them.
+It is budgeted the way `explore diagram` is budgeted: at most 25 objects kept by
+rank, 12 columns per object, 40 edges, and 5 data-quality findings per object.
+Every cap binds in every mode, `elided_object_count` / `elided_column_count` /
+`elided_edge_count` report what each one cut, and `notes` names the count, the cap
+and the way to read the rest, so a truncated answer never reads as a complete one.
+`notes` is always present, so an empty list is the positive statement "nothing was
+elided".
+
+Which objects are eligible differs from `explore diagram` on purpose, and the two
+commands share only the *column* selection. Every profiled object is eligible here,
+including one that joins to nothing, because an isolated lookup table carrying PII
+flags and an empty-table warning is exactly a finding; the diagram drops those,
+since a box with no edge draws nothing. So a map can report more objects than the
+diagram of the same cache draws, and the counts in the envelope always reconcile
+with the objects printed beside them.
+
+`--detail` widens what is *eligible*: every column rather than the notable ones,
+and objects that were inventoried but never profiled. It lifts none of the caps.
+It is deliberately not spelled `--full`, which on this command decides how much
+gets scanned and therefore what the run costs; `--detail` decides only how much of
+what was found comes back, and spends nothing.
+
+**No column value crosses this envelope.** The cache holds `min_value`,
+`max_value` and a value domain for the columns that earned them, and this command
+does not read them: `explore profile` is where a caller asks for a value domain,
+deliberately and one object at a time. PII is category and confidence, as
+everywhere.
 
 `explore map` never caps silently: past 50 objects it profiles the top
 `profile_top_n` (default 25) by rank and announces the cutoff in `notes`

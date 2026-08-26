@@ -34,7 +34,7 @@ from sqlglot import expressions as exp
 
 from ..adapters import get_dialect, is_free_connector
 from ..cache import DexCache, match_identifier
-from ..dbt_project import EditOp
+from ..dbt_project import EditOp, jinja_regions
 from ..dbt_project import load as load_project
 from ..errors import DexError
 from ..guards.query_firewall import QueryRefusedError, inspect_query
@@ -120,14 +120,6 @@ class AttributionOutcome:
 
 # --- jinja resolution ----------------------------------------------------------
 
-_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
-_JINJA_STMT = re.compile(r"\{%.*?%\}", re.DOTALL)
-_JINJA_EXPR = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
-_REF_CALL = re.compile(r"^\s*ref\s*\(\s*(.+?)\s*\)\s*$", re.DOTALL)
-_SOURCE_CALL = re.compile(r"^\s*source\s*\(\s*(.+?)\s*\)\s*$", re.DOTALL)
-_CONFIG_CALL = re.compile(r"^\s*config\s*\(", re.DOTALL)
-_STRING_ARG = re.compile(r"['\"]([^'\"]+)['\"]")
-
 
 class UnattributableError(DexError):
     """This model's SQL cannot be reduced to something dex may reason about.
@@ -193,43 +185,53 @@ def render_model_sql(sql: str, resolve: Resolver) -> str:
     :class:`UnattributableError`: a macro call or an ``{% if %}`` means the rendered
     shape is not the shape dex can see, and guessing at it would attribute a
     delta to a statement the warehouse never runs.
+
+    The scan is :func:`~..dbt_project.jinja_regions`; the refusals are this
+    function's own. The reference index reads the same regions and reports what
+    this refuses, which is the point of the split: one reader, two policies.
     """
 
-    text = _JINJA_COMMENT.sub("", sql)
-    statement = _JINJA_STMT.search(text)
+    regions, text = jinja_regions(sql)
+    statement = next((r for r in regions if r.kind == "statement"), None)
     if statement is not None:
         raise UnattributableError(
             f"the model carries a jinja statement block "
-            f"({_clip(statement.group(0))}); its rendered shape depends on dbt, "
-            "so dex cannot isolate a change in it"
+            f"({_clip(text[statement.start : statement.end])}); its rendered "
+            "shape depends on dbt, so dex cannot isolate a change in it"
         )
 
-    def replace(match: re.Match[str]) -> str:
-        body = match.group(1).strip()
-        if _CONFIG_CALL.match(body):
-            return ""
-        ref = _REF_CALL.match(body)
-        source = _SOURCE_CALL.match(body)
-        if ref is None and source is None:
+    rendered: list[str] = []
+    cursor = 0
+    for region in regions:
+        rendered.append(text[cursor : region.start])
+        cursor = region.end
+        call = next((c for c in region.calls if c.spans_region), None)
+        if call is not None and call.callee == "config":
+            continue
+        if call is None or call.callee not in {"ref", "source"}:
             raise UnattributableError(
-                f"the model calls {{{{ {_clip(body)} }}}}, which only dbt can "
-                "render; dex cannot isolate a change against it"
-            )
-        args = _STRING_ARG.findall((ref or source).group(1))
-        if not args:
-            raise UnattributableError(
-                f"could not read a relation name out of {{{{ {_clip(body)} }}}}"
+                f"the model calls {{{{ {_clip(region.body.strip())} }}}}, which "
+                "only dbt can render; dex cannot isolate a change against it"
             )
         # ref('pkg', 'model') and source('name', 'table') both name the relation
-        # last, so the trailing argument is the one to resolve either way.
-        return resolve(args[-1])
+        # last, so the trailing argument is the one to resolve either way. A
+        # non-literal there (`ref(var('x'))`) is a name only dbt knows, and
+        # resolving the var's own argument instead would silently attribute the
+        # delta to whichever relation that string happens to name.
+        if not call.args or call.args[-1] is None:
+            raise UnattributableError(
+                f"could not read a relation name out of "
+                f"{{{{ {_clip(region.body.strip())} }}}}"
+            )
+        rendered.append(resolve(call.args[-1]))
+    rendered.append(text[cursor:])
 
-    rendered = _JINJA_EXPR.sub(replace, text).strip()
-    if not rendered:
+    joined = "".join(rendered).strip()
+    if not joined:
         raise UnattributableError(
             "the model is entirely jinja; there is no SQL to compare"
         )
-    return rendered
+    return joined
 
 
 def _clip(text: str, limit: int = 60) -> str:

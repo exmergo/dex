@@ -17,6 +17,7 @@ from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, Relationshi
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
+from exmergo_dex_core.explore import summary
 from exmergo_dex_core.explore.commands import _annotate_grain, _merged_hints
 from exmergo_dex_core.storage import FilesystemStore
 
@@ -252,17 +253,199 @@ def test_map_writes_cache_and_preserves_created_at(
     assert second["data"]["relationship_count"] >= 1
 
 
-def test_map_summary_is_counts_not_a_schema_dump(
+def test_map_summary_is_a_budgeted_map_not_a_schema_dump(
     duckdb_file: Path, tmp_path: Path, capsys
 ):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+    # The summary answers the question it was asked (issue #202): findings, not a
+    # receipt. What it still never does is paste the cache, so the whole-dataset
+    # dump `explore profile` returns stays out of it.
+    assert "datasets" not in data
+    assert data["profiled_count"] <= data["object_count"]
+
+    assert data["objects"], "a map returns the objects it mapped"
+    first = data["objects"][0]
+    assert first["identifier"]
+    assert set(first["columns"][0]) == {"name", "data_type", "role", "pii"}
+    assert data["edges"], "a map returns the joins it inferred"
+    assert set(data["edges"][0]) == {
+        "from_dataset",
+        "from_columns",
+        "to_dataset",
+        "to_columns",
+        "kind",
+        "confidence",
+        "verified",
+        "orphan_fraction",
+    }, "edges are shaped exactly like `explore relationships` returns them"
+
+
+def test_map_counts_reconcile_with_the_objects_beside_them(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """A count the payload contradicts is worse than a count with no payload.
+
+    Found by dogfooding: an eligibility rule borrowed from `explore diagram` drops
+    objects that carry no join, so a warehouse whose only PII sat on an unjoined
+    lookup table reported `pii_column_count: 6` beside objects accounting for 2.
+    """
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+
+    assert data["pii_column_count"] == sum(
+        o["pii_column_count"] for o in data["objects"]
+    )
+    assert data["data_quality_note_count"] == sum(
+        len(o["data_quality"]) + o["elided_data_quality_count"] for o in data["objects"]
+    )
+    assert data["relationship_count"] == len(data["edges"]) + data["elided_edge_count"]
+
+
+def test_map_reports_a_profiled_object_that_joins_to_nothing(tmp_path: Path, capsys):
+    """An isolated object is a finding, not noise. `explore diagram` drops it
+    because a box with no edge draws nothing; a findings payload must not."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "isolated.duckdb"
+    con = duckdb.connect(str(warehouse))
+    con.execute("create table lonely (site_name varchar, city varchar)")
+    con.execute("insert into lonely values ('a', 'Berlin'), ('b', 'Lisbon')")
+    con.execute("create table parent (id integer)")
+    con.execute("create table child (id integer, parent_id integer)")
+    con.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(warehouse), "--repo-root", str(repo)], capsys
+    )["data"]
+    reported = {o["identifier"].rsplit(".", 1)[-1] for o in data["objects"]}
+    assert "lonely" in reported
+    assert data["pii_column_count"] == sum(
+        o["pii_column_count"] for o in data["objects"]
+    )
+
+
+def test_map_payload_carries_no_column_value(duckdb_file: Path, tmp_path: Path, capsys):
+    """The cache holds min/max and value domains for the columns that earned them.
+    This command deliberately does not read them; `explore profile` is where a
+    caller asks for a value domain, one object at a time."""
+
     repo = tmp_path / "repo"
     repo.mkdir()
     payload = _run(
         ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
     )
-    # The printed summary carries counts and a small top list, never the columns.
-    assert "datasets" not in payload["data"]
-    assert payload["data"]["profiled_count"] <= payload["data"]["object_count"]
+    blob = json.dumps(payload["data"])
+    for banned in ("min_value", "max_value", "value_domain"):
+        assert banned not in blob
+    for obj in payload["data"]["objects"]:
+        for column in obj["columns"]:
+            assert column["pii"] is None or set(column["pii"]) == {
+                "category",
+                "confidence",
+            }
+
+
+def test_map_always_reports_notes_so_silence_is_a_positive_statement(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+    assert "notes" in data
+
+
+def test_map_caps_bind_and_every_elision_is_counted(
+    wide_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(wide_tables_duckdb), "--repo-root", str(repo)],
+        capsys,
+    )["data"]
+
+    assert data["object_count"] == 32
+    assert len(data["objects"]) == summary.MAX_OBJECTS
+    assert data["elided_object_count"] == 32 - summary.MAX_OBJECTS
+    note = next(n for n in data["notes"] if "capped at" in n and "object" in n)
+    assert str(summary.MAX_OBJECTS) in note
+    assert "explore profile" in note, "a note names the way to read what it cut"
+
+    assert data["elided_column_count"] > 0
+    assert any("column(s) are not described" in n for n in data["notes"])
+    assert all(
+        len(o["columns"]) <= summary.MAX_COLUMNS_PER_OBJECT for o in data["objects"]
+    )
+    assert len(data["edges"]) <= summary.MAX_EDGES
+
+
+def test_map_detail_widens_the_selection_but_never_the_caps(
+    wide_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(wide_tables_duckdb),
+        "--repo-root",
+        str(repo),
+    ]
+    default = _run(argv, capsys)["data"]
+    detailed = _run([*argv, "--refresh", "--detail"], capsys)["data"]
+
+    def wide(data: dict) -> dict:
+        return next(o for o in data["objects"] if o["identifier"].endswith(".wide"))
+
+    assert len(wide(default)["columns"]) < len(wide(detailed)["columns"])
+    assert wide(detailed)["elided_column_count"] < wide(default)["elided_column_count"]
+    # `--detail` widens what is eligible. It lifts neither cap, so a table with
+    # twenty-two eligible columns still reports twelve, and still says so.
+    assert len(wide(detailed)["columns"]) == summary.MAX_COLUMNS_PER_OBJECT
+    assert wide(detailed)["elided_column_count"] > 0
+    assert len(detailed["objects"]) == summary.MAX_OBJECTS
+    assert detailed["elided_object_count"] == default["elided_object_count"]
+
+
+def test_map_and_diagram_agree_on_which_columns_are_notable(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """Both commands read one predicate (`Dataset.notable_columns`). A caller who
+    reads the map and then draws the diagram must not see two different answers."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    mapped = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+    drawn = _run(["explore", "diagram", "--repo-root", str(repo)], capsys)["data"]
+
+    joined = {
+        o["identifier"]
+        for o in mapped["objects"]
+        if any(c["role"] == "join" for c in o["columns"])
+    }
+    for entity in drawn["entities"]:
+        if entity["identifier"] not in joined:
+            continue
+        obj = next(
+            o for o in mapped["objects"] if o["identifier"] == entity["identifier"]
+        )
+        for column in obj["columns"]:
+            assert column["name"] in drawn["mermaid"]
 
 
 def test_map_announces_profile_cutoff(many_tables_duckdb: Path, tmp_path: Path, capsys):
