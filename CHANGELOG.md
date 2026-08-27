@@ -28,6 +28,35 @@ case, zeros included.
 
 ### Changed
 
+- **Three behavior changes that come with the row-count and ledger fixes, none of
+  which breaks the contract.**
+
+  **A BigQuery profile estimate rises for any object the warehouse keeps no row
+  count for**, which is every view and every external table. The escalation reserve
+  is held at estimate time, before any aggregate has run, and it was dropped for
+  these objects on the grounds that their probes provably could not run. Now that
+  the aggregate's count reaches them, they can, so the reserve has to cover them,
+  and with no count yet to narrow it the maximum is the only honest hold. Measured
+  on three external tables over GCS parquet: the estimate went from 31,457,280
+  bytes to 125,829,120, of which 94,371,840 is reserve for nine probes that may
+  never be issued. `profile_reserve` attributes that on the handshake and on an
+  over-ceiling refusal, so the number is explained where it is quoted, and a
+  provably empty table (a real metadata zero, on a kind that maintains one) still
+  reserves nothing. Narrow the work or raise the budget; the reserve is released,
+  not spent, when a probe does not run.
+
+  **`cost.ceiling` on a free command no longer tightens to the session
+  remainder.** Computing that bound needs a reading of the day's spend, and a
+  command that cannot spend no longer takes one. Every billed path still reads
+  before it decides, so no ceiling that binds anything has changed.
+
+  **A BigQuery or Snowflake view reports a real row count after it is profiled**,
+  where it previously reported none, and so gains the uniqueness proofs, composite
+  keys and data-quality notes that a row count unlocks. This one is worth calling
+  out because issue #375 predicted the opposite: it asked for a view's behavior to
+  stay unchanged on the grounds that the view branch was the working pattern being
+  copied. It was not working.
+
 - Refactored the unreleased semantic-layer implementation into a neutral catalog
   domain, composed response model, shared request policy, typed backend descriptor,
   hosted GraphQL transport and local MetricFlow runtime. The CLI and envelope stay
@@ -37,6 +66,63 @@ case, zeros included.
   longer carries time-axis caveats for metrics outside that scope.
 
 ### Fixed
+
+- **A ledger outage took down commands that never spend** ([#374]).
+  `connect.new_cost_gate` documents the design: the day's spend is passed as a
+  reader rather than a number, so the gate re-reads it when it admits work. But
+  `CostGate.__init__` ended by calling that reader, and a gate is built at every
+  connection assembly on a billed connector, free commands included. On a
+  deployment whose store keeps the ledger on a network, a store outage therefore
+  failed `connect test` and `explore inventory` alongside the billed commands
+  that had a stake in the answer, and it failed them as `reason: internal`,
+  because the backend's own exception was neither a `DexError` nor a `ValueError`.
+
+  Nothing reads the ledger now until something needs the number. Billed admission
+  reads it and fails closed on a failure, as a named `LedgerUnreadableError`
+  carrying the cost and saying nothing ran. Settlement tolerates a failure instead,
+  because it re-reads only so the summary can report the day's total and the
+  release it performs needs no reading, so a backend that went away mid-command no
+  longer turns a command that already ran into a refusal at the end of it. Free
+  commands never reach the ledger at all, with one deliberate exception:
+  `connect test` exists to report what the budget looks like, so its capability
+  payload takes one guarded read and reports `budget.session_spent_today: null`
+  when the ledger cannot be reached, rather than failing the report it is part of.
+
+  One thing that came out of writing the test rather than the fix. `charge` takes a
+  cheap local path for a statement inside what the command already booked, and with
+  no booking that path computed a ceiling with the session bound simply missing. A
+  caller charging a statement without going through the handshake first would have
+  had a configured cumulative cap silently not apply. It now goes through admission
+  whenever a cumulative ceiling is set and no reading stands behind it.
+
+- **BigQuery external tables cached `row_count: 0`, so profiling called them
+  empty and their grain went undetected** ([#375]). BigQuery maintains no row
+  count for an external table and reports `num_rows` as a real `0`, verified live:
+  an external table over GCS parquet holding rows reports `0` rows and `0` bytes,
+  indistinguishable from a table that genuinely is empty, while its profiling
+  aggregate returns correct column statistics. That zero was stored as a count, so
+  the table profiled with a false `empty table (no rows)` note, scored its size
+  signal as `log1p(0)`, and lost the two probes that take a row count as an
+  argument: the exact-distinct escalation, so every uniqueness verdict stayed an
+  approximation nothing is allowed to conclude from, and the composite-key probe,
+  so a table whose grain is a pair reported no grain and scaffolded no key test.
+
+  The classification is now an allowlist of the kinds BigQuery keeps counts for
+  rather than a list of the kinds it does not, so external tables, snapshots and
+  anything the API names next are read as unknown instead of empty. An absent
+  `table_type` still means a base table, which is what "the server has not said
+  yet" means. And the count the report expected to arrive from the aggregate now
+  actually does: `_read_aggregates` read `COUNT(*)` off every batch and discarded
+  it, so the pattern the fix was supposed to copy did not exist for views either.
+  It is captured and supersedes the metadata for the rest of the command, the way
+  it already did on Postgres, Redshift, ClickHouse and Databricks. A genuinely
+  empty external table gets its note from the aggregate's zero instead of the
+  metadata's. Snowflake had the identical gap on views and is fixed with it.
+
+  `maintain volume` runs on free metadata, so it still has nothing to compare for
+  an object the warehouse does not count. It now names those objects instead of
+  returning no finding for them, because an absent finding reads as "checked, and
+  nothing moved".
 
 - **The skill wrapper installed neither semantic extra, so most of
   `explore semantic` refused through the skill** ([#358]).
