@@ -282,7 +282,7 @@ class RedshiftAdapter:
         }
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if cost.ceiling is not None:
             rpu_hours = self._to_rpu_hours(cost.ceiling)

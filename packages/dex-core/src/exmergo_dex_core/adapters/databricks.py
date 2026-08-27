@@ -270,7 +270,7 @@ class DatabricksAdapter:
         cost = self.cost_gate.cost()
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if self.target.warehouse:
             info = self._warehouse()
