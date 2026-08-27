@@ -76,6 +76,21 @@ class SpendLockTimeoutError(CostGuardError):
     """
 
 
+class LedgerUnreadableError(CostGuardError):
+    """The spend ledger could not be read, so billed work was not admitted.
+
+    Fails closed for the same reason :class:`SpendLockTimeoutError` does: the
+    day's spend is what the cumulative ceiling is measured against, and admitting
+    work against a reading nobody took would put a number in the envelope that no
+    ceiling stands behind. Recoverable, because the backend is the thing that is
+    unwell rather than the command.
+
+    Only billed admission raises this. A command that cannot spend has no stake
+    in the ledger and must not inherit its availability, which is why the day's
+    spend is read where work is admitted rather than where the gate is built.
+    """
+
+
 class ConfirmationRequiredError(CostGuardError):
     """The command would spend but was not confirmed, so nothing ran.
 
@@ -334,7 +349,17 @@ class CostGate:
             if callable(session_spent)
             else (lambda fixed=float(session_spent): fixed)
         )
-        self.session_spent = self._read_session_spent()
+        # `None` means nobody has read the day's spend yet, which is different
+        # from having read a zero. A reader is a ledger call that can fail, and a
+        # gate is built for every command on a billed connector including the
+        # ones that cannot spend, so reading here would make free work depend on
+        # the ledger's availability: `_admission` reads it where the reading is
+        # actually load-bearing. A caller who handed over a plain float handed
+        # over the answer rather than a way to get it, so there is nothing to
+        # defer and that form seeds immediately.
+        self.session_spent: float | None = (
+            None if callable(session_spent) else self._read_session_spent()
+        )
 
     @property
     def serialized(self) -> bool:
@@ -350,17 +375,26 @@ class CostGate:
         return self._lock is not None or self._record is None
 
     @contextmanager
-    def _admission(self) -> Iterator[None]:
+    def _admission(self, *, strict: bool = True) -> Iterator[None]:
         """The critical section around read, decide, and book.
 
         Held for the decision only, never across a warehouse query: a lock that
         spans execution would serialize commands that have no reason to wait for
         each other, and would ask a hosted backend to hold one for minutes.
+
+        ``strict`` is about what an unreadable ledger means at this point.
+        Admitting work needs the reading, so a failure there refuses
+        (:class:`LedgerUnreadableError`) rather than deciding a ceiling from
+        nothing. Settling does not: it re-reads only so the spend summary can
+        report the day's total, and the release it performs needs no reading at
+        all, so a backend that went away mid-command must not turn a command that
+        already ran into a refusal at the end of it. Non-strict leaves the day's
+        spend unknown and carries on.
         """
 
         try:
             with self._lock() if self._lock is not None else nullcontext():
-                self._refresh()
+                self._refresh(strict=strict)
                 yield
         except TimeoutError as exc:
             raise SpendLockTimeoutError(
@@ -374,8 +408,45 @@ class CostGate:
                 ),
             ) from exc
 
-    def _refresh(self) -> None:
-        self.session_spent = self._read_session_spent() - self._ledger_written
+    def _refresh(self, *, strict: bool = True) -> None:
+        try:
+            spent = self._read_session_spent()
+        except Exception as exc:
+            # Deliberately broad: the reader is a backend's own code reached
+            # through a one-method protocol, so the failure modes are the
+            # backend's (a permission error on a file, a driver error, a socket)
+            # and enumerating them here would be enumerating every backend that
+            # could ever exist. What the gate needs to know is only whether it
+            # got a number.
+            if strict:
+                raise LedgerUnreadableError(
+                    f"could not read the spend ledger ({exc}); the day's spend "
+                    "is what the cumulative ceiling is measured against, so "
+                    "nothing was admitted. Nothing ran, so re-issuing the same "
+                    "command is safe",
+                    cost=Cost(
+                        paradigm=self.paradigm,
+                        estimate=self._command_estimate,
+                        ceiling=self.ceiling,
+                    ),
+                ) from exc
+            self.session_spent = None
+            return
+        self.session_spent = spent - self._ledger_written
+
+    def session_spent_now(self) -> float | None:
+        """The day's spend for a caller that wants to report it, not spend against it.
+
+        The one read outside admission, and guarded rather than fail-closed:
+        ``connect test`` exists to say what the connection and the budget look
+        like, so a ledger it cannot reach is an answer of "unavailable" on an
+        otherwise healthy report rather than a failed command. Nothing decides a
+        ceiling from this, which is what makes swallowing the error the right
+        call here and the wrong one in :meth:`_admission`.
+        """
+
+        self._refresh(strict=False)
+        return self.session_spent
 
     def _append(self, kind: str, amount: float, **extra) -> None:
         if self._record is None:
@@ -412,11 +483,19 @@ class CostGate:
     def effective_ceiling(self) -> float | None:
         """The binding ceiling: the per-command budget or what remains of the
         session budget, whichever is tighter. ``None`` only when neither is
-        set, which :func:`preflight` then refuses for billed paradigms."""
+        set, which :func:`preflight` then refuses for billed paradigms.
+
+        The session bound needs a reading of the day's spend to exist, and it
+        drops out when there is none. That is not a loosened ceiling: admission
+        always reads before it decides, so every path that could spend has the
+        bound. What reaches here unread is a command that reports a cost without
+        ever pricing one, and telling it the session remainder would mean reading
+        a ledger on behalf of work that cannot touch it.
+        """
 
         remaining_session = (
             max(self.session_ceiling - self.session_spent, 0.0)
-            if self.session_ceiling is not None
+            if self.session_ceiling is not None and self.session_spent is not None
             else None
         )
         bounds = [b for b in (self.ceiling, remaining_session) if b is not None]
@@ -518,10 +597,21 @@ class CostGate:
         headroom it never reserved, and the frozen reading it was admitted on
         cannot see what a concurrent command has taken since. Only the drift pays
         for the lock, and drift is the exception rather than the rule.
+
+        A cumulative ceiling with no reading behind it also goes through
+        admission, which is the case a caller reaches by charging a statement
+        without having gone through :meth:`preflight_command` first. The local
+        path would compute a ceiling with the session bound simply missing, so a
+        configured cumulative cap would silently not apply, and on an unreadable
+        ledger the statement would spend where the whole command should refuse.
+        The reading has to exist before a ceiling derived from it can be trusted.
         """
 
         needed = self._estimated + estimate
-        if self._reserved and needed > self._reserved:
+        unmeasured_session = (
+            self.session_ceiling is not None and self.session_spent is None
+        )
+        if unmeasured_session or (self._reserved and needed > self._reserved):
             with self._admission():
                 preflight(
                     needed,
@@ -660,7 +750,7 @@ class CostGate:
         # the live total and this gate's own written total by the same amount,
         # so the difference between them, which is what `session_spent` holds,
         # does not move.
-        with self._admission():
+        with self._admission(strict=False):
             if self._reserved:
                 self._append("release", -self._reserved)
                 self._reserved = 0.0
@@ -692,9 +782,19 @@ class CostGate:
         this one just did. Two commands running at once used to report their own
         spend under a name that promised the day's, so a caller reading either
         one saw a fraction of the truth.
+
+        It reports ``None`` when the ledger could not be read at settlement.
+        What this command billed is still exact, because that number comes from
+        the warehouse rather than from the ledger; it is only the day's total that
+        is unavailable, and saying so beats reporting this command's spend as if
+        it were the day's.
         """
 
         return {
             spend_field(self.paradigm): self._billed,
-            "session_spent_today": self.session_spent + self._billed,
+            "session_spent_today": (
+                self.session_spent + self._billed
+                if self.session_spent is not None
+                else None
+            ),
         }
