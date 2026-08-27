@@ -339,12 +339,51 @@ def schema_drift(
     return findings
 
 
+def uncomparable_volume(
+    current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
+) -> list[str]:
+    """Objects this axis had to skip because no live row count exists for them.
+
+    The axis runs on free metadata, and for a view or an external table the
+    warehouse maintains no count to read, so there is nothing to compare the
+    baseline against. :func:`volume_drift` skipping those is correct; skipping
+    them in silence is not, because an absent finding reads as "checked, and
+    nothing moved". A baseline with a real count on one side and nothing on the
+    other is the case worth naming: the object was profiled once, so a reader has
+    every reason to expect the axis covers it.
+    """
+
+    baseline = {d.identifier: d for d in snap.warehouse.datasets}
+    now = {d.identifier: d for d in current}
+    skipped = sorted(
+        identifier
+        for identifier in baseline.keys() & now.keys()
+        if (scope is None or identifier in scope)
+        and baseline[identifier].row_count is not None
+        and now[identifier].row_count is None
+    )
+    if not skipped:
+        return []
+    return [
+        "no live row count for "
+        + ", ".join(skipped)
+        + ", so volume was not compared for "
+        + ("it" if len(skipped) == 1 else "them")
+        + " (the warehouse maintains no count for this kind of object; "
+        "`explore profile` counts it, at a scan's cost)"
+    ]
+
+
 def volume_drift(
     current: list[Dataset], snap: Snapshot, scope: set[str] | None = None
 ) -> list[DriftFinding]:
     """Freshness drift from free metadata: row counts (and byte sizes) that
     moved beyond load chatter. Structure unchanged, keys intact, but the data
-    stopped flowing correctly: the axis the other three cannot see."""
+    stopped flowing correctly: the axis the other three cannot see.
+
+    An object with no count on either side is not drift and not a finding;
+    :func:`uncomparable_volume` is what says so out loud.
+    """
 
     baseline = {d.identifier: d for d in snap.warehouse.datasets}
     now = {d.identifier: d for d in current}

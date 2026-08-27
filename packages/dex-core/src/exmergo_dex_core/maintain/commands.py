@@ -430,7 +430,13 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
 def volume_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """A row count that collapsed, a table that emptied, a load that half-failed."""
 
-    return _detect_free_axis(engine, "volume", drift_mod.volume_drift, objects)
+    return _detect_free_axis(
+        engine,
+        "volume",
+        drift_mod.volume_drift,
+        objects,
+        noter=drift_mod.uncomparable_volume,
+    )
 
 
 def cmd_schema(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -636,6 +642,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         current_datasets, snap, scope, current_transform
     )
     volume_findings = drift_mod.volume_drift(current_datasets, snap, scope)
+    warnings.extend(drift_mod.uncomparable_volume(current_datasets, snap, scope))
     semantic_findings = (
         _semantic_scope(
             drift_mod.semantic_free_drift(
@@ -896,10 +903,15 @@ def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def _detect_free_axis(
-    engine: DexEngine, axis: str, detector, objects: list[str] | None
+    engine: DexEngine, axis: str, detector, objects: list[str] | None, noter=None
 ) -> DriftResult:
     """One metadata-only detector: free on every connector, so no handshake.
-    The cost stamp still reflects the connector's paradigm for the caller."""
+    The cost stamp still reflects the connector's paradigm for the caller.
+
+    ``noter`` reports what the detector could not examine, over the same inputs.
+    An axis that silently declines to check an object is indistinguishable from
+    one that checked and found nothing, and the two mean opposite things.
+    """
 
     store = engine.store
     snap = _require_baseline(store)
@@ -920,7 +932,8 @@ def _detect_free_axis(
         by_axis,
         snap,
         store,
-        warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours),
+        warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours)
+        + (noter(current, snap, scope) if noter is not None else []),
     )
     result.cost = cost
     return result
