@@ -21,6 +21,33 @@ payload is still open work.
 
 ### Fixed
 
+- **The skill wrapper installed neither semantic extra, so most of
+  `explore semantic` refused through the skill** ([#358]).
+  `skills/<skill>/scripts/run.py` picks the packaging extras `uv` resolves before
+  the engine exists. It resolved the connector's extra and added `[cluster]` for
+  `explore cluster`, and had no equivalent for `explore semantic`, which has
+  shipped since 1.8.0. Through the skill, `--api` refused with
+  `the hosted semantic-layer backend needs the [semantic-api] extra` and
+  `query --local` refused for `[semantic]`; only `list --local` worked, because it
+  is a dependency-free read of the compiled manifest.
+
+  The wrapper now resolves those extras from the command being run, on the same
+  terms as `[cluster]`: `[semantic-api]` on any `explore semantic` (an httpx and
+  nothing heavier), and `[semantic]` as well only where a statement might be
+  rendered locally, which is any mode but `list` without `--api`. Where the backend
+  is ambient rather than flagged, both go in, because the wrapper runs before the
+  engine and does not read the nested config block that decides it: a heavier
+  install is the right way to be wrong there. A repo that runs neither
+  `explore cluster` nor `explore semantic` still resolves neither scikit-learn nor
+  MetricFlow.
+
+  Nothing inside the engine could see this. Every other test imports the package
+  from the source tree, where all the extras are present, so the wrapper's choice
+  is invisible: `tests/test_skill_wrapper.py` now covers it, pins the three skills'
+  wrappers as byte-identical, and holds the wrapper's list of value-taking flags to
+  the real parser, since a flag added there and forgotten in the wrapper shifts the
+  bare tokens and picks its extras from the wrong word.
+
 - **`explore semantic list --local` under-reported a metric's groupable
   dimensions, contradicting the metric description it printed beside them**
   ([#356]). A metric's dimensions were computed as the dimensions of its owning
@@ -132,6 +159,78 @@ payload is still open work.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
+
+- **`explore semantic values <dimension>` returns a dimension's value domain**
+  ([#358]). Naming a value is the precondition for writing a filter, and dex could
+  not name one. `list` returns names, types and prose; `explore profile` cannot see
+  a semantic dimension at all; and on a hosted layer there was no SQL path of any
+  kind, because dbt Cloud is not a connector. On the layer this was measured
+  against, several metric descriptions instruct the reader to filter one dimension
+  to one of a handful of values, and no dex command could say which.
+
+  It takes exactly one dimension, accepts a grain suffix
+  (`user__created_at__month`) split against the grains the layer reports, and
+  returns the distinct values capped and columnar like `explore query`. The token
+  is resolved against the layer's own catalog first, so a misspelling is refused by
+  name and the refusal says the token is entity-qualified, which is the likelier
+  mistake.
+
+  **`scoped_to` says how the values were reached, and that changes what they
+  mean.** A dimension of one semantic model is answerable on its own and
+  `scoped_to` is empty: these are the values of the column behind it. A dimension
+  reached through a join is not answerable that way at all, because there is no
+  measure to join from, and both layers refuse the request. The only shape that
+  exists is one scoped to a metric that reaches the dimension, and it answers a
+  narrower question: the values present for that metric. So dex tries the cheap
+  shape first, falls back once to the first metric that reaches it, and names that
+  metric in `scoped_to` and in a note along with the `--metric` flag that overrides
+  the choice. On the hosted backend the fallback is settled with a free
+  `compileDimensionValuesSql` before any query is created, because dbt Cloud
+  accepts the values mutation and reports a resolution failure asynchronously, at
+  poll time; deciding afterwards would mean running a second query once the first
+  had already been submitted.
+
+  **PII is screened harder here than on a metric query.** A metric query returns
+  aggregates that a dimension merely slices, so a flagged dimension can be dropped
+  from the grouping and the query still answers something. Here the result *is* the
+  values, so a flagged dimension refuses the command, and the refusal names the
+  durable ways to clear a dimension reviewed as not PII. The evidence is unchanged
+  on each backend: the `.dex/` cache's flag on the resolved physical column
+  locally, the layer's own `config.meta` hosted, asked one metric at a time and
+  unioned across every metric that reaches the dimension, with the name heuristic
+  as the fail-closed floor and disclosed on the result when it was all that ran.
+
+  dex reports the values that came back and never claims an exact cardinality,
+  which would cost a second scan of the same table on every connector: a large
+  domain arrives cut at `query.max_rows`, `truncated`, and saying so. Local renders
+  through MetricFlow and takes the full cost handshake, so it needs the `[semantic]`
+  extra unlike `list`; hosted is executed by dbt Cloud and carries the same
+  cost-guard-unavailable warning every hosted result carries.
+
+- **`explore semantic list --for-dimension <d>` answers the reverse question**
+  ([#359]). The catalog says what a metric can be grouped by. A caller more often
+  arrives with "I want to slice by pricing tier, what can I slice", and answering
+  that meant reading every metric's dimension list and inverting it by hand, which
+  is the whole catalog read to ask about one dimension. It is also the cheapest way
+  to find the metrics that can go on one chart against one axis, since metrics that
+  share a group-by are exactly those.
+
+  The flag is repeatable and comma-separated, returns the metrics groupable by
+  **all** the named tokens, and then narrows the catalog exactly as `--metric` does,
+  so what comes back is a catalog rather than a list of names. The two compose, and
+  a named metric that cannot be grouped that way is dropped with a note naming it
+  rather than silently. `for_dimensions` names the scope in the payload.
+
+  It is an **inversion of the `dimensions` list each metric already carries**, not a
+  call to the layer, so it costs no extra round trip and no warehouse query on
+  either backend. The dbt Cloud API has a field for this and dex does not use it:
+  `metricsForDimensions` answers the empty list both for a name the layer does not
+  have and for a real dimension no metric shares, so a typo would come back
+  indistinguishable from a fact about the layer, and it does not accept a metric's
+  own time token at all. Inverting the catalog closes both. Measured against that
+  field on the live layer, the inversion reproduced it exactly on every case tried
+  (24 metrics for one dimension, 14 for another, 14 for the pair, 11 for a joined
+  one), and additionally answered 27 for `metric_time`, where the API answers none.
 
 - **A metric now says what `metric_time` resolves to for it** ([#354]).
   `metric_time` is not a dimension of the layer: it resolves per metric to that
