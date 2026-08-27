@@ -33,22 +33,32 @@ def semantic_list(
     *,
     metrics: list[str] | None = None,
     for_dimensions: list[str] | None = None,
+    search: list[str] | None = None,
+    full: bool = False,
     api: bool = False,
     local: bool = False,
 ):
     """The semantic layer's objects: semantic models, metrics, dimensions,
     entities, measures.
 
-    Two ways to narrow it, and they compose. ``metrics`` keeps those metrics and
-    what is reachable from them, which is what a caller that already knows the
-    metric wants: a whole layer's catalog is one payload and most of it is about
-    something else. ``for_dimensions`` asks the reverse question, "I want to slice
-    by pricing tier, what can I slice", and resolves to the metrics groupable by
-    every named token before narrowing to the same shape.
+    Three ways to narrow it, and they compose in the order a caller reads them.
+    ``for_dimensions`` asks the reverse question, "I want to slice by pricing
+    tier, what can I slice", and resolves to the metrics groupable by every named
+    token. ``metrics`` keeps those metrics and what is reachable from them, which
+    is what a caller that already knows the metric wants. ``search`` is for the
+    caller who knows a word rather than a name, and matches it against every
+    element's name and the project's own words about it.
 
-    Both cost no extra round trip and no warehouse query: the reverse lookup is an
-    inversion of the ``dimensions`` list each metric already carries. The scope is
-    named in the payload either way, so a subset is never mistaken for the layer.
+    None of them costs an extra round trip or a warehouse query: the reverse
+    lookup is an inversion of the ``dimensions`` list each metric already carries,
+    and the search is over the catalog already in hand rather than a second call
+    to the layer. The scope is named in the payload every way, so a subset is
+    never mistaken for the layer.
+
+    Whatever survives is then capped, and every cut is counted in ``elided`` and
+    named in a note. ``full`` lifts the caps. The narrowing flags are the better
+    answer on a large layer, because they decide *which* part comes back rather
+    than letting a cap decide.
     """
 
     from . import SemanticBackendError, SemanticQuery, resolve_backend
@@ -121,7 +131,41 @@ def semantic_list(
                 f"scoped to {len(wanted)} of {total} metrics and what they reach; "
                 "list without --metric for the whole layer"
             )
-        catalog.notes = [*catalog.notes, *notes]
+
+    terms = SemanticQuery(metrics=list(search or [])).metrics
+    if terms:
+        # Applied after the two name-based scopes, so `--metric x --search y` reads
+        # as "within x, the parts about y" rather than the other way round.
+        matched, unmatched = catalog.matching(terms)
+        catalog = matched
+        catalog.searched_for = terms
+        if unmatched:
+            # A note rather than a refusal, and the difference from an unknown
+            # metric name is real: a substring that matches nothing is an honest
+            # answer about the layer's words, where a misspelled identifier is a
+            # question the layer was never asked. Named individually so a search
+            # of three words with one typo is not read as three empty answers.
+            answered = [term for term in terms if term not in unmatched]
+            notes.append(
+                f"nothing in this layer is named or described with "
+                f"{', '.join(unmatched)}"
+                + (f"; {', '.join(answered)} still answered" if answered else "")
+            )
+        if not catalog.metrics:
+            notes.append(
+                f"no metric matched {', '.join(terms)}, so this catalog is empty. "
+                "A search resolves to the metrics it touches, so a term matching "
+                "only an element no metric reads answers nothing queryable; list "
+                "without --search for the whole layer"
+            )
+        elif len(catalog.metrics) < total:
+            notes.append(
+                f"matched {len(catalog.metrics)} of {total} metrics and what they "
+                "reach; list without --search for the whole layer"
+            )
+
+    catalog = catalog.capped(full=full)
+    catalog.notes = [*catalog.notes, *notes]
     return SemanticListResult(catalog=catalog, notes=list(catalog.notes))
 
 
@@ -216,10 +260,22 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         positional = list(getattr(args, "metrics", None) or [])
         flagged = list(getattr(args, "metric", None) or [])
         for_dimensions = list(getattr(args, "for_dimension", None) or [])
-        if for_dimensions and mode != "list":
+        search = list(getattr(args, "search", None) or [])
+        full = bool(getattr(args, "full", False))
+        catalog_only = {
+            "--for-dimension": bool(for_dimensions),
+            "--search": bool(search),
+            "--full": full,
+        }
+        misplaced = [flag for flag, given in catalog_only.items() if given]
+        if misplaced and mode != "list":
+            one = len(misplaced) == 1
             raise SemanticBackendError(
-                f"--for-dimension narrows the catalog and has no meaning on "
-                f"`explore semantic {mode}`; use it with `list`"
+                f"{', '.join(misplaced)} "
+                f"{'shapes' if one else 'shape'} the catalog and "
+                f"{'has' if one else 'have'} no meaning on "
+                f"`explore semantic {mode}`; use "
+                f"{'it' if one else 'them'} with `list`"
             )
         if mode == "list":
             return to_envelope(
@@ -227,6 +283,8 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     engine,
                     metrics=[*positional, *flagged],
                     for_dimensions=for_dimensions,
+                    search=search,
+                    full=full,
                     api=api,
                     local=local,
                 )
