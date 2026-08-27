@@ -4963,6 +4963,121 @@ def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
     assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
 
 
+def test_local_semantic_pii_evidence_follows_a_join_resolved_dimension(
+    tmp_path: Path,
+):
+    # Family 3, on the tokens the join resolution added. A metric can be grouped by
+    # a dimension declared in a model it joins to, and resolving those paths puts
+    # tokens in the catalog that a caller can now name. A token the gate cannot
+    # resolve to a physical column is screened on its name alone, which is the
+    # fail-closed floor rather than an equivalent, so every path the resolution
+    # adds has to reach the same evidence a declared token reaches.
+    import json as _json
+
+    from exmergo_dex_core import dbt_project
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import screen_dimension_refs
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "joined"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "users",
+                        "node_relation": {
+                            "alias": "dim_users",
+                            "relation_name": "wh.main.dim_users",
+                        },
+                        "entities": [{"name": "user", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [],
+                    },
+                    {
+                        "name": "sessions",
+                        "node_relation": {
+                            "alias": "fct_sessions",
+                            "relation_name": "wh.main.fct_sessions",
+                        },
+                        "entities": [
+                            {"name": "session", "type": "primary"},
+                            {"name": "user", "type": "foreign"},
+                        ],
+                        "dimensions": [],
+                        "measures": [{"name": "session_count", "agg": "count"}],
+                    },
+                ],
+                "metrics": [
+                    {
+                        "name": "sessions",
+                        "type": "simple",
+                        "type_params": {"input_measures": [{"name": "session_count"}]},
+                    }
+                ],
+            }
+        )
+    )
+
+    def resolve(_manifest_text):
+        # The resolver's answer, stated here rather than asked of MetricFlow: this
+        # suite installs no [semantic] extra, and the claim under test is what the
+        # gate does with a resolved path, not how the path was resolved.
+        return {
+            "sessions": [
+                dbt_project.ResolvedPath(
+                    "session__user__contact", "contact", "users", "categorical"
+                )
+            ]
+        }
+
+    class _Layer(DbtProject):
+        def semantic_catalog(self):
+            return dbt_project.semantic_catalog(self.project_dir, resolve_paths=resolve)
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.dim_users",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        _Layer(project.parent, project),
+    )
+    # The name says nothing: `session__user__contact` matches no PII pattern, so the
+    # column's own evidence is the only thing that refuses this query.
+    assert not screen_dimension_refs(["session__user__contact"])
+    lookup = backend._cache_pii_lookup(cache)
+    assert dict(screen_dimension_refs(["session__user__contact"], meta_lookup=lookup))
+
+
 def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Path):
     # Family 2 + 1: rendered metric SQL bakes in the relations the project was
     # compiled against. Reading a namespace this connection does not have is
@@ -5083,12 +5198,52 @@ def test_the_hosted_pii_map_adjudicates_rather_than_disclosing_a_gap():
         metrics=["active_users", "agent_runs"],
         group_by=["agent__mode", "user__created_at__month"],
     )
-    meta = backend._dimension_meta(query.metrics)
+    meta, _ = backend._query_metadata(query.metrics)
     lookup = backend._meta_lookup(meta)
     assert unadjudicated_refs(query.group_by, meta_lookup=lookup) == []
 
     result = backend.query(query)
     assert not any("name heuristic alone" in note for note in result.notes)
+
+
+def test_a_filter_a_backend_cannot_read_is_refused_rather_than_half_screened():
+    # Family 3, and the gate's other structural fail-open. A metric query touches
+    # dimensions two ways: the group_by tokens and the dimensions its filter
+    # clauses name. The filter dialect belongs to the answering layer, so the
+    # backend reads it; a backend that cannot has to refuse the query, because the
+    # gate's disclosures can only report on refs the extraction found. An extractor
+    # that matches nothing produces a successful query, no blocks and no notes,
+    # with every filtered dimension grouped and projected and nothing saying it was
+    # never examined. Both shipped backends read MetricFlow's dialect, so this is
+    # the contract a third one inherits rather than a live path.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+    )
+
+    class _NoFilterDialect(FakeHostedBackend):
+        def filter_refs(self, clauses):
+            return None
+
+    backend = _NoFilterDialect(
+        dimensions_meta={"sessions": [{"name": "user__email", "config": None}]}
+    )
+    filtered = SemanticQuery(
+        metrics=["sessions"],
+        group_by=["session__mode"],
+        where=['{"member": "users.email", "operator": "set"}'],
+    )
+    with pytest.raises(SemanticQueryRefusedError, match="filter dialect"):
+        backend.query(filtered)
+    assert not any("createQuery" in posted for posted in backend.posted)
+
+    # The same backend still answers an unfiltered query: the refusal is scoped to
+    # the input it cannot screen, not to the backend.
+    unfiltered = SemanticQuery(metrics=["sessions"], group_by=["user__email"])
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(unfiltered)
 
 
 def test_hosted_semantic_pii_gate_still_binds_on_an_injected_token(monkeypatch):

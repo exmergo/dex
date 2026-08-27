@@ -146,25 +146,36 @@ Subcommands, in the usual order:
    three lists of names: semantic models (the unit the layer is organized
    around, each with the transformation model it sits on and its default time
    dimension), metrics (which dimensions each can be grouped by, the measures it
-   reads, a ratio's two sides, any filter that makes it a subset), dimensions
-   (the token to group by, plus the definition and owning model behind it),
+   reads, a ratio's two sides, any filter that makes it a subset, the grains it
+   can be queried at, and the time column a time grouping resolves to),
+   dimensions (the token to group by, plus the definition, owning model, and
+   queryable grains behind it),
    entities (one declaration per semantic model, each with its own join key, so
    the declared join graph is readable), and measures (the aggregation and
    expression the number is made of, which is often a conditional rather than a
    column). Read a metric's `input_measures` through to those measures before
-   trusting what a number counts. On a large layer, `list --metric <m>` narrows
+   trusting what a number counts, and read its `time_axis` before trusting a time
+   series: `metric_time` is not one column but each metric's own aggregation time
+   dimension, so two entries there mean the metric's measures bucket by different
+   timestamps and grouping by `metric_time` splits the number between them. On a large layer, `list --metric <m>` narrows
    the catalog to those metrics and what they reach, at no extra cost; the
    payload names the scope in `scoped_to`, so a scoped catalog is never mistaken
    for the whole layer. Two payload fields carry differences between the
    backends rather than leaving them to be inferred: `dimension_scope` says
    whether a dimension row is one declaration or one groupable path (which is
    why the two backends report different dimension counts for one layer), and
-   `unavailable` names fields a backend structurally cannot supply. `query` takes a positional
+   `unavailable` names fields a backend structurally cannot supply. `--local`
+   resolves the join graph through MetricFlow where the `[semantic]` extra is
+   installed, which is what makes its dimension lists the tokens a query can
+   actually use; without it the payload says `declarations` and a note names the
+   extra. `query` takes a positional
    metric after the explicit mode (with `--metric` kept for compatibility) and a
    `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
    `--limit`) and returns a metric's values as a capped, columnar result. Name
    flags take a comma-separated list or a repeated flag (`--group-by a,b` is
-   `--group-by a --group-by b`); `--where` is never split. Two backends answer
+   `--group-by a --group-by b`); `--where` is never split. `--grain` is checked
+   against the grains the layer reports for the metrics queried, so a refusal
+   names the ones that metric has. Two backends answer
    these, chosen by `.dex/config.yml` `semantic.vendor` and `semantic.deployment`
    (the older `semantic.backend` spelling of the two still works), and overridable
    with `--local` / `--api`. Those two flags name who executes, not which vendor:

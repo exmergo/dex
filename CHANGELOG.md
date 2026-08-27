@@ -12,11 +12,68 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 **Payload growth, called out because nothing caps it yet.** Widening every element
 grows the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
 measures, `--local` grew 1.8x and `--api` 1.4x, almost all of it new objects and
-the project's own prose rather than placeholders. `--metric` scoping ships with the
-change rather than after it for that reason, and brings a single metric's catalog
-to a tenth of the layer's. A budget for the unscoped payload is still open work.
+the project's own prose rather than placeholders. The time axis and the queryable
+grains below add a further 1.10x on the same layer (about 5.5 KB), and resolving
+the local join graph takes its dimension list from 45 rows to 65. `--metric`
+scoping ships with the change rather than after it for that reason, and brings a
+single metric's catalog to a tenth of the layer's. A budget for the unscoped
+payload is still open work.
 
 ### Fixed
+
+- **`explore semantic list --local` under-reported a metric's groupable
+  dimensions, contradicting the metric description it printed beside them**
+  ([#356]). A metric's dimensions were computed as the dimensions of its owning
+  semantic models, entity-qualified and single-hop, which is not the set a query
+  can group by: a metric can also be grouped by the dimensions of every model its
+  own models join to. On one layer measured against the hosted backend's
+  join-resolved answer, one metric reported 6 dimensions where 11 were queryable
+  and another reported 2 where 7 were, and the dimension both lists were missing
+  was the one nearly every metric description in that project tells a caller to
+  group by. So the catalog contradicted the prose it was carrying in the same
+  payload, and an agent budgeting one discovery call reads the list, not the
+  caveat.
+
+  The local read now asks MetricFlow to resolve the join graph, which is the same
+  answer the API gives for the same layer, including paths through two joins that
+  the single-hop qualification scheme cannot express at all. On the layer above,
+  `--local` and `--api` now return the same 65 dimensions and the same per-metric
+  dimension lists, where before they differed by 44%.
+
+  **`explore semantic list --local` remains a dependency-free read of a compiled
+  artifact.** Resolving the join graph needs the `[semantic]` extra, and an install
+  that picked no extras still lists the layer: it reports the dimensions the
+  project declares, says `declarations` in `dimension_scope`, and carries a note
+  naming the extra. A compiled manifest that extra's resolver refuses degrades the
+  same way rather than failing a read dex performed without trouble. What is gone
+  is the short list that read as complete.
+
+  Every path the resolution adds also resolves to the physical column behind it,
+  so the PII request-gate adjudicates a joined dimension from that column's
+  evidence instead of falling back to its name. On the layer above that is 20
+  tokens the gate previously knew nothing about.
+
+- **The PII gate parsed filter clauses with MetricFlow-specific regexes in shared
+  code, so a non-dbt backend would inherit a gate that screened nothing on half
+  its input** ([#357]). A metric query touches dimensions two ways: the group-by
+  tokens, and the dimensions its `--where` clauses name. The extraction for the
+  second lived in the neutral package beside the screening policy and matched two
+  Jinja call forms, which is correct for dbt and a fail-open for any layer whose
+  filters are shaped differently: the regexes match nothing, `refs` holds the
+  group-by tokens alone, and every dimension in the filter goes unscreened.
+
+  The failure would have been invisible. The query succeeds, nothing is blocked,
+  and the notes disclose nothing, because the gate's disclosures can only report on
+  refs the extraction found. Together with [#347] that was the second structural
+  fail-open in the same gate, both of the same shape: the authoritative screening
+  quietly does not run.
+
+  Reading a filter clause is now the backend's own job, since the dialect belongs
+  to the answering layer, and the neutral layer keeps the screening policy
+  unchanged. A backend that cannot read its own filter dialect refuses filtered
+  queries rather than passing them with half their references unexamined. Both
+  shipped backends read MetricFlow's dialect, so nothing changes for them today;
+  this is the contract a third one inherits. The safety spine pins it.
 
 - **An entity's `type` was whichever declaration the iteration reached first, and
   both backends reported it wrong** ([#350]). `type` is a property of the
@@ -75,6 +132,41 @@ to a tenth of the layer's. A budget for the unscoped payload is still open work.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
+
+- **A metric now says what `metric_time` resolves to for it** ([#354]).
+  `metric_time` is not a dimension of the layer: it resolves per metric to that
+  metric's measures' own aggregation time dimension, so on a layer of a dozen
+  semantic models one token stands for a dozen different physical columns. dex
+  presented it as one global time dimension carrying nothing but a type.
+
+  Every metric now carries `time_axis`, the time columns a time grouping on it
+  actually aggregates by. Measured on one layer, that is 7 distinct columns across
+  27 metrics. **More than one entry means the metric's measures disagree**, which
+  happens whenever a ratio's two sides sit in different models: part of the number
+  is then bucketed by one timestamp and the rest by another, invisibly, in a
+  result that looks like any other. The disagreement is reported rather than
+  resolved, because picking one column would be right about half the number, and
+  the catalog carries a note naming the metrics it affects. On the hosted backend
+  it costs one more field on a selection set dex already sends; locally it is read
+  from the compiled manifest and needs no extra.
+
+- **A grain is validated against the grains the layer reports, per metric, instead
+  of against a five-value tuple** ([#355]). `--grain` was checked against
+  `("day", "week", "month", "quarter", "year")`, which is narrower than the dbt
+  Cloud API's own enum (that runs from a nanosecond to a year) and can never
+  contain a granularity a project defined for itself. So dex refused grains the
+  layer accepts, on its own authority, before the layer was ever asked.
+
+  Metrics and dimensions now carry `queryable_granularities`, and a refusal names
+  what that metric actually offers. An **empty list is an answer**: a categorical
+  dimension has no grain, which is what stops an agent asking one for a month.
+  Where the layer said nothing, the grain passes through and the layer refuses it,
+  because refusing what the layer never spoke about is dex guessing on its behalf;
+  a grain still has to be an identifier before it can reach a query. Hosted reads
+  this from the same metadata request the PII gate already posts, so it costs no
+  round trip; locally it is derived from the grain each time dimension declares.
+  A metric that cannot be queried without a time axis at all now says so, under
+  the vendor key as `requires_metric_time`.
 
 - **`explore semantic list` returns the semantic layer's objects, not three lists
   of names** ([#349], [#351], [#352]). A semantic layer is a graph: semantic
@@ -210,6 +302,17 @@ to a tenth of the layer's. A budget for the unscoped payload is still open work.
   in it. `SemanticCatalogContract` is the conformance suite for the new channel,
   and there is now a control asserting `explore semantic list --local` actually
   routes through the seam, which is what the tier-2 layers already had.
+
+- **Three behavior changes that come with the semantic-layer work, none of which
+  breaks the contract.** A metric query whose backend cannot read its own filter
+  dialect is now refused rather than screened on its group-by half alone
+  ([#357]); both shipped backends read theirs, so no shipped path changes. On an
+  install with the `[semantic]` extra, `explore semantic list --local` returns
+  more dimension rows than before and reports `queryable_paths` rather than
+  `declarations`, because the join graph is now resolved ([#356]); the payload says
+  which of the two it is holding either way. And the grain vocabulary a group-by
+  token is read against widened from five values to the layer's own, so a token
+  ending in something like `__hour` is now read as a grain suffix ([#355]).
 
 - **`semantic.backend` is still accepted, and reads as one spelling of the two
   new axes** ([#348]). `backend: local` is dbt plus the local deployment,

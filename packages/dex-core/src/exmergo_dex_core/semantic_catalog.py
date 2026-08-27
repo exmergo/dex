@@ -107,6 +107,12 @@ class DimensionInfo:
     ``label`` and ``description`` stay the project's own words about the
     dimension, unqualified: they describe the dimension, not the path a query
     reaches it by.
+
+    ``queryable_granularities`` is what a time grouping on this dimension may
+    ask for. An **empty list is an answer**: a categorical dimension has no grain,
+    which is what stops a caller asking for one and getting a refusal it could
+    have predicted. Absent means the layer was not asked or could not say, which
+    is a different thing and reads differently.
     """
 
     name: str
@@ -115,6 +121,7 @@ class DimensionInfo:
     description: str | None = None
     definition: str | None = None
     semantic_model: str | None = None
+    queryable_granularities: list[str] | None = None
 
 
 @dataclass
@@ -189,6 +196,17 @@ class MetricInfo:
     derived chain, which is what connects it to :class:`MeasureInfo` and so to the
     aggregation behind the number. ``filter`` discloses that the metric measures a
     subset, which is otherwise invisible.
+
+    ``time_axis`` is what a time grouping on this metric actually aggregates by:
+    the agg time dimension of each measure it reads. A layer's time token is one
+    name over many columns, so this is the highest-value field here for reading a
+    number correctly, and **more than one entry means the measures disagree**. The
+    disagreement is reported rather than resolved: picking one would name a column
+    that is right for part of the metric and wrong for the rest, and one of those
+    columns is often absent on rows the other one has.
+
+    ``queryable_granularities`` is the grains a time grouping may ask for, which
+    the layer knows per metric and a fixed list cannot.
     """
 
     name: str
@@ -200,6 +218,8 @@ class MetricInfo:
     input_measures: list[str] | None = None
     composition: MetricComposition | None = None
     filter: str | None = None
+    time_axis: list[str] | None = None
+    queryable_granularities: list[str] | None = None
     vendor_params: dict[str, Any] | None = None
 
 
@@ -317,7 +337,13 @@ def merge_element_fields(
     fields = store.setdefault(key, {})
     if not fields.get("type"):
         fields["type"] = (element.get("type") or "").lower()
-    for name in ("label", "description", "definition", "semantic_model"):
+    for name in (
+        "label",
+        "description",
+        "definition",
+        "semantic_model",
+        "queryable_granularities",
+    ):
         if fields.get(name) is None:
             fields[name] = element.get(name)
 

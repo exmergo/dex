@@ -21,11 +21,12 @@ it is proven read-only first.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 from typing import ClassVar
 
-from ... import command_args
+from ... import command_args, metricflow_dialect
 from ... import envelope as env
 from ...adapters import get_dialect
 from ...cache import match_identifier
@@ -40,17 +41,23 @@ from . import (
     SemanticQuery,
     SemanticQueryRefusedError,
     cap_columnar,
+    queryable_grains,
     requested_dimension_refs,
     screen_dimension_refs,
+    validate_grain,
 )
 
-# The one caveat a local catalog carries: a metric's groupable dimensions are
-# computed per owning semantic model, single-hop, so a layer with joins has
-# dimensions reachable at query time that this list does not name.
-_LOCAL_LIST_NOTE = (
-    "local list: a metric's dimensions are those of its owning semantic "
-    "model(s), entity-qualified; dimensions reachable only through a join "
-    "resolve at query time (or list with --api)"
+# Said only when the join graph could not be resolved, which is an install that
+# picked no extras. A list that names a metric's single-hop dimensions and reads
+# as complete is worse than an acknowledged gap: the dimension it drops is often
+# the one the metric's own description tells a caller to group by.
+_UNRESOLVED_JOINS_NOTE = (
+    "local list: a metric's dimensions are those of its owning semantic model(s), "
+    "entity-qualified single-hop, because the join graph was not resolved (the "
+    "[semantic] extra is not installed, or this compiled manifest is not one its "
+    "resolver reads), so dimensions reachable only through a join are missing from "
+    "these lists. Install or upgrade that extra for the resolved lists, or list "
+    "with --api"
 )
 
 _MISSING_EXTRA = (
@@ -116,8 +123,10 @@ class LocalMetricFlowBackend:
     # Nothing structurally missing: a project read carries every field the
     # catalog defines, which is the half of the asymmetry worth stating plainly.
     catalog_gaps: ClassVar[dict[str, list[str]]] = {}
-    # One row per declaration, single-hop qualified, which is why this backend
-    # reports fewer dimensions than the hosted one on an identical layer.
+    # The floor, not the claim. What one dimension row actually is depends on
+    # whether the project read could resolve the join graph, so the catalog carries
+    # what that read reported and this stands in only for a caller that asks the
+    # backend without one.
     dimension_scope = DIMENSIONS_PER_DECLARATION
 
     def __init__(
@@ -181,10 +190,17 @@ class LocalMetricFlowBackend:
         the neutral catalog, so this backend adds only what it knows: its own
         provenance, and the caveat about how a metric's groupable dimensions were
         computed.
+
+        That caveat is conditional now, because the read is. A project read that
+        resolved the join graph carries one row per queryable path and needs no
+        caveat; one that could not says so, and says it in ``dimension_scope`` as
+        data before it says it in a note.
         """
 
+        view = self._semantic_view()
+        unresolved = view.dimension_scope == DIMENSIONS_PER_DECLARATION
         return SemanticCatalog.from_view(
-            self._semantic_view(), self, notes=[_LOCAL_LIST_NOTE]
+            view, self, notes=[_UNRESOLVED_JOINS_NOTE] if unresolved else []
         )
 
     def _semantic_view(self):
@@ -217,6 +233,16 @@ class LocalMetricFlowBackend:
 
     # ---- query -------------------------------------------------------------
 
+    def filter_refs(self, clauses: list[str]) -> list[str] | None:
+        """The dimensions and entities these filter clauses name.
+
+        MetricFlow renders the clause, so it is read with MetricFlow's own filter
+        grammar. The gate screens what this returns, so a clause dex could not read
+        would be a clause dex could not screen.
+        """
+
+        return metricflow_dialect.filter_refs(clauses)
+
     def query(self, q: SemanticQuery) -> SemanticQueryResult:
         if not q.metrics:
             raise SemanticBackendError("a metric query needs at least one --metric")
@@ -226,7 +252,8 @@ class LocalMetricFlowBackend:
         # PII request-gate, before rendering. Catching a flagged dimension at the
         # request is cheaper and more precise than parsing rendered SQL.
         blocked = screen_dimension_refs(
-            requested_dimension_refs(q), meta_lookup=self._cache_pii_lookup(cache)
+            requested_dimension_refs(q, filter_refs=self.filter_refs),
+            meta_lookup=self._cache_pii_lookup(cache),
         )
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
@@ -234,6 +261,12 @@ class LocalMetricFlowBackend:
                 f"refused: grouping or filtering by {named} would surface PII. "
                 "PII is flagged, never surfaced; query a non-PII dimension instead."
             )
+
+        # Checked against the grains the project declares for these metrics, and
+        # only after the gate: a query that would disclose PII is refused for that
+        # reason whatever else is wrong with it. Costs nothing, because the catalog
+        # this reads is the one the command already parsed.
+        q = replace(q, grain=validate_grain(q.grain, available=self._grains(q.metrics)))
 
         try:
             sql = self._render(q)
@@ -486,15 +519,31 @@ class LocalMetricFlowBackend:
         return self._metricflow_engine().explain(request).sql_statement.sql
 
     def _group_by_names(self, q: SemanticQuery) -> list[str]:
-        # MetricFlow spells a time grain into the token (metric_time__month); a
-        # bare metric_time with --grain becomes that form. Other tokens pass through.
-        names: list[str] = []
-        for tok in q.group_by:
-            if tok == "metric_time" and q.grain:
-                names.append(f"metric_time__{q.grain.lower()}")
-            else:
-                names.append(tok)
-        return names
+        # MetricFlow spells a time grain into the token, which is the dialect's
+        # business rather than this backend's.
+        return [metricflow_dialect.spell_grain(tok, q.grain) for tok in q.group_by]
+
+    def _grains(self, metrics: list[str]) -> list[str] | None:
+        """The grains every one of these metrics can be queried at, per the project.
+
+        None where the project could not be read at all, which leaves MetricFlow to
+        refuse an impossible grain on its own authority. That is the same posture
+        the hosted backend takes when the layer does not answer: dex declines to
+        refuse a grain the layer never spoke about.
+        """
+
+        try:
+            view = self._semantic_view()
+        except SemanticBackendError:
+            return None
+        return queryable_grains(
+            metrics,
+            {
+                metric.name: metric.queryable_granularities
+                for metric in view.metrics
+                if metric.queryable_granularities is not None
+            },
+        )
 
     def _metricflow_engine(self):
         if self._mf_engine is not None:

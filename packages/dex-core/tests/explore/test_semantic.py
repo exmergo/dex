@@ -17,7 +17,9 @@ import pytest
 from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
 from pydantic import ValidationError
 
+from exmergo_dex_core import dbt_project as dbt_project_module
 from exmergo_dex_core import envelope as env
+from exmergo_dex_core import metricflow_dialect
 from exmergo_dex_core.adapters.project import DbtProject
 from exmergo_dex_core.cache import (
     ColumnProfile,
@@ -27,14 +29,18 @@ from exmergo_dex_core.cache import (
     PIIFlag,
 )
 from exmergo_dex_core.config import DexConfig, QueryLimits
+from exmergo_dex_core.dbt_project import ResolvedPath
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.explore import semantic as sem
 from exmergo_dex_core.explore.results import SemanticQueryResult
 from exmergo_dex_core.explore.semantic import (
     SemanticQuery,
+    SemanticQueryRefusedError,
     cap_columnar,
+    queryable_grains,
     requested_dimension_refs,
     screen_dimension_refs,
+    validate_grain,
 )
 from exmergo_dex_core.explore.semantic import commands as semantic_commands
 from exmergo_dex_core.explore.semantic.local import (
@@ -52,7 +58,39 @@ def _engine(config: DexConfig | None = None, **kwargs) -> DexEngine:
     return DexEngine(config=config or DexConfig(), store=MemoryStore(), **kwargs)
 
 
-def _local(project: Path, engine: DexEngine | None = None, connector: str = "duckdb"):
+def _no_joins(_manifest_text: str) -> None:
+    """A join resolver that cannot answer, which is what an install with no
+    ``[semantic]`` extra has. The default here, so every test states which half of
+    the contract it is holding and none of them changes answer depending on which
+    extras the machine running them happens to have."""
+
+    return None
+
+
+class _Layer(DbtProject):
+    """A dbt project whose join resolution is the test's to state.
+
+    The resolver is injected into the format rather than reached from the backend,
+    because that is where the format's own read happens; this carries the choice
+    through the seam without a monkeypatch.
+    """
+
+    def __init__(self, root: Path, project: Path, resolve_paths) -> None:
+        super().__init__(root, project)
+        self._resolve_paths = resolve_paths
+
+    def semantic_catalog(self):
+        return dbt_project_module.semantic_catalog(
+            self.project_dir, resolve_paths=self._resolve_paths
+        )
+
+
+def _local(
+    project: Path,
+    engine: DexEngine | None = None,
+    connector: str = "duckdb",
+    resolve_paths=_no_joins,
+):
     """The local backend with a project format injected, as `from_engine` wires it.
 
     Injected rather than discovered so the read is exercised without a repo root
@@ -66,7 +104,7 @@ def _local(project: Path, engine: DexEngine | None = None, connector: str = "duc
         engine or _engine(),
         connector,
         QueryLimits(),
-        DbtProject(project.parent, project),
+        _Layer(project.parent, project, resolve_paths),
     )
 
 
@@ -83,11 +121,36 @@ def test_requested_dimension_refs_from_group_by_and_where():
             "{{ Entity('user') }} is not null",
         ],
     )
-    refs = requested_dimension_refs(q)
+    refs = requested_dimension_refs(q, filter_refs=metricflow_dialect.filter_refs)
     assert "user__pricing_tier" in refs
     assert "session__is_deleted" in refs
     assert "user" in refs
     assert len(refs) == len(set(refs))  # de-duplicated
+
+
+def test_requested_dimension_refs_refuses_a_filter_it_cannot_read():
+    """A backend that cannot read its own filter dialect gets its filtered queries
+    refused, not screened on their group-by half.
+
+    The gate can only report on refs the extraction found, so an extractor that
+    matches nothing produces a clean query with no blocks and no notes: every
+    dimension in the filter grouped and projected with nothing saying it was never
+    examined. Both shipped backends read their dialect, so this is the contract a
+    third one inherits rather than a live path.
+    """
+
+    unfiltered = SemanticQuery(metrics=["m"], group_by=["user__pricing_tier"])
+    assert requested_dimension_refs(unfiltered, filter_refs=None) == [
+        "user__pricing_tier"
+    ]
+
+    filtered = SemanticQuery(
+        metrics=["m"],
+        group_by=["user__pricing_tier"],
+        where=['{"member": "users.email", "operator": "set"}'],
+    )
+    with pytest.raises(SemanticQueryRefusedError, match="cannot read"):
+        requested_dimension_refs(filtered, filter_refs=None)
 
 
 def test_query_accepts_comma_joined_name_lists():
@@ -399,10 +462,14 @@ def test_hosted_catalog_query_never_asks_for_an_entity_label():
     assert "entities { name type description expr role semanticModel { name } }" in (
         posted
     )
-    assert "dimensions { name type label description semanticModel { name } }" in (
-        posted
+    assert (
+        "dimensions { name type label description semanticModel { name } "
+        "queryableGranularities queryableTimeGranularities }" in posted
     )
     assert "measures { name agg expr aggTimeDimension }" in posted
+    assert (
+        "queryableGranularities queryableTimeGranularities requiresMetricTime" in posted
+    )
 
 
 def test_hosted_list_keeps_the_first_non_null_field_not_the_first_metric():
@@ -599,7 +666,7 @@ def test_hosted_metadata_is_the_union_across_a_query_s_metrics():
             "agent_runs": [{"name": "agent__mode", "config": {"meta": {}}}],
         }
     )
-    meta = backend._dimension_meta(["sessions", "agent_runs"])
+    meta, _ = backend._query_metadata(["sessions", "agent_runs"])
     assert set(meta) == {"session__mode", "agent__mode"}
 
 
@@ -609,14 +676,18 @@ def test_hosted_asks_the_layer_once_however_many_metrics_it_asks_about():
     backend = FakeHostedBackend(
         dimensions_meta={"sessions": [], "agent_runs": [], "chat_turns": []}
     )
-    backend._dimension_meta(["sessions", "agent_runs", "chat_turns"])
+    backend._query_metadata(["sessions", "agent_runs", "chat_turns"])
     assert len(backend.posted) == 1
     assert backend.posted[0].count("dimensions(environmentId") == 3
+    # The grains the requested grain is validated against ride in the same
+    # document, because that field takes no metric argument and a second round
+    # trip for two words would be one more than this path needs.
+    assert "grains: metrics(environmentId" in backend.posted[0]
 
 
 def test_hosted_metadata_asks_once_per_distinct_metric():
     backend = FakeHostedBackend(dimensions_meta={"sessions": []})
-    backend._dimension_meta(["sessions", "sessions"])
+    backend._query_metadata(["sessions", "sessions"])
     assert backend.posted[0].count("dimensions(environmentId") == 1
 
 
@@ -629,7 +700,7 @@ def test_hosted_metadata_lets_pii_win_where_two_metrics_disagree():
             "agent_runs": [{"name": "user__handle", "config": {"meta": {"pii": True}}}],
         }
     )
-    meta = backend._dimension_meta(["sessions", "agent_runs"])
+    meta, _ = backend._query_metadata(["sessions", "agent_runs"])
     assert meta["user__handle"] == {"pii": True}
     with pytest.raises(sem.SemanticQueryRefusedError, match="PII"):
         backend.query(
@@ -645,9 +716,8 @@ def test_hosted_metadata_says_nothing_never_displaces_a_flag():
             "agent_runs": [{"name": "user__handle", "config": None}],
         }
     )
-    assert backend._dimension_meta(["sessions", "agent_runs"])["user__handle"] == {
-        "pii": True
-    }
+    meta, _ = backend._query_metadata(["sessions", "agent_runs"])
+    assert meta["user__handle"] == {"pii": True}
 
 
 def test_hosted_screens_a_grain_suffixed_dimension_against_the_layer():
@@ -832,9 +902,27 @@ def test_local_query_pii_gate_blocks_before_render(tmp_path: Path):
 # wrong (in opposite directions, on the same layer).
 
 
+# What the API reports for a day-grained time column, and for a categorical one.
+# An empty list is the answer that stops a caller asking a category for a month.
+_TIME_GRAINS = ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"]
+_TIME_GRAIN_NAMES = ["day", "week", "month", "quarter", "year"]
+
+
 def _graph_metrics():
     """A hosted catalog over two semantic models: a shared entity, a ratio metric
-    spanning both, a filtered metric, and a cumulative one."""
+    spanning both, a filtered metric, and a cumulative one.
+
+    The ratio is the load-bearing part twice over: its two sides sit in different
+    models, so it spans the join graph and it aggregates over two different time
+    columns, which is the fact a single time axis cannot carry.
+    """
+
+    def grains(payload: dict, values: list[str]) -> dict:
+        return {
+            **payload,
+            "queryableGranularities": values,
+            "queryableTimeGranularities": [v.lower() for v in values],
+        }
 
     order_entity = {
         "name": "order",
@@ -850,79 +938,130 @@ def _graph_metrics():
         "description": "Nullable on refunds booked without an order.",
         "semanticModel": {"name": "refunds"},
     }
-    order_status = {
-        "name": "order__status",
-        "type": "CATEGORICAL",
-        "label": "Order status",
-        "semanticModel": {"name": "orders"},
-    }
-    refund_reason = {
-        "name": "order__refund__reason",
-        "type": "CATEGORICAL",
-        "semanticModel": {"name": "refunds"},
-    }
+    order_status = grains(
+        {
+            "name": "order__status",
+            "type": "CATEGORICAL",
+            "label": "Order status",
+            "semanticModel": {"name": "orders"},
+        },
+        [],
+    )
+    refund_reason = grains(
+        {
+            "name": "order__refund__reason",
+            "type": "CATEGORICAL",
+            "semanticModel": {"name": "refunds"},
+        },
+        [],
+    )
+    metric_time = grains({"name": "metric_time", "type": "TIME"}, _TIME_GRAINS)
     return [
-        {
-            "name": "orders",
-            "type": "SIMPLE",
-            "dimensions": [{"name": "metric_time", "type": "TIME"}, order_status],
-            "entities": [order_entity],
-            "measures": [
-                {
-                    "name": "order_count",
-                    "agg": "SUM",
-                    "expr": "CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END",
-                    "aggTimeDimension": "ordered_at",
-                }
-            ],
-            "semanticModels": [{"name": "orders"}],
-            "typeParams": {
-                "measure": {"name": "order_count"},
-                "inputMeasures": [{"name": "order_count"}],
-            },
-        },
-        {
-            "name": "refund_rate",
-            "type": "RATIO",
-            "dimensions": [order_status, refund_reason],
-            "entities": [order_entity, order_as_foreign],
-            "measures": [
-                {"name": "order_count", "agg": "SUM"},
-                {"name": "refund_count", "agg": "SUM"},
-            ],
-            "semanticModels": [{"name": "orders"}, {"name": "refunds"}],
-            "typeParams": {
-                "numerator": {"name": "refunds"},
-                "denominator": {"name": "orders"},
-                "inputMeasures": [
-                    {"name": "refund_count"},
-                    {"name": "order_count"},
+        grains(
+            {
+                "name": "orders",
+                "type": "SIMPLE",
+                "requiresMetricTime": False,
+                "dimensions": [metric_time, order_status],
+                "entities": [order_entity],
+                "measures": [
+                    {
+                        "name": "order_count",
+                        "agg": "SUM",
+                        "expr": "CASE WHEN order_key IS NOT NULL THEN 1 ELSE 0 END",
+                        "aggTimeDimension": "ordered_at",
+                    }
                 ],
+                "semanticModels": [{"name": "orders"}],
+                "typeParams": {
+                    "measure": {"name": "order_count"},
+                    "inputMeasures": [{"name": "order_count"}],
+                },
             },
-        },
-        {
-            "name": "paid_orders",
-            "type": "SIMPLE",
-            "dimensions": [order_status],
-            "entities": [order_entity],
-            "measures": [{"name": "order_count", "agg": "SUM"}],
-            "semanticModels": [{"name": "orders"}],
-            "filter": {"whereSqlTemplate": "{{ Dimension('order__status') }} = 'paid'"},
-            "typeParams": {"inputMeasures": [{"name": "order_count"}]},
-        },
-        {
-            "name": "orders_to_date",
-            "type": "CUMULATIVE",
-            "dimensions": [order_status],
-            "entities": [order_entity],
-            "measures": [{"name": "order_count", "agg": "SUM"}],
-            "semanticModels": [{"name": "orders"}],
-            "typeParams": {
-                "inputMeasures": [{"name": "order_count"}],
-                "window": {"count": 7, "granularity": "DAY"},
-                "grainToDate": "MONTH",
+            _TIME_GRAINS,
+        ),
+        grains(
+            {
+                "name": "refund_rate",
+                "type": "RATIO",
+                "requiresMetricTime": False,
+                "dimensions": [order_status, refund_reason],
+                "entities": [order_entity, order_as_foreign],
+                "measures": [
+                    {
+                        "name": "order_count",
+                        "agg": "SUM",
+                        "aggTimeDimension": "ordered_at",
+                    },
+                    {
+                        "name": "refund_count",
+                        "agg": "SUM",
+                        "aggTimeDimension": "refunded_at",
+                    },
+                ],
+                "semanticModels": [{"name": "orders"}, {"name": "refunds"}],
+                "typeParams": {
+                    "numerator": {"name": "refunds"},
+                    "denominator": {"name": "orders"},
+                    "inputMeasures": [
+                        {"name": "refund_count"},
+                        {"name": "order_count"},
+                    ],
+                },
             },
-        },
+            _TIME_GRAINS,
+        ),
+        grains(
+            {
+                "name": "paid_orders",
+                "type": "SIMPLE",
+                "requiresMetricTime": False,
+                "dimensions": [order_status],
+                "entities": [order_entity],
+                "measures": [
+                    {
+                        "name": "order_count",
+                        "agg": "SUM",
+                        "aggTimeDimension": "ordered_at",
+                    }
+                ],
+                "semanticModels": [{"name": "orders"}],
+                "filter": {
+                    "whereSqlTemplate": "{{ Dimension('order__status') }} = 'paid'"
+                },
+                "typeParams": {"inputMeasures": [{"name": "order_count"}]},
+            },
+            _TIME_GRAINS,
+        ),
+        grains(
+            {
+                "name": "orders_to_date",
+                "type": "CUMULATIVE",
+                # A cumulative metric accumulates along a time axis, so it cannot
+                # be queried without one. The layer says so; dex derives the same
+                # answer from the manifest, which does not carry the field.
+                "requiresMetricTime": True,
+                "dimensions": [order_status],
+                "entities": [order_entity],
+                "measures": [
+                    {
+                        "name": "order_count",
+                        "agg": "SUM",
+                        "aggTimeDimension": "ordered_at",
+                    }
+                ],
+                "semanticModels": [{"name": "orders"}],
+                "typeParams": {
+                    "inputMeasures": [{"name": "order_count"}],
+                    "window": {"count": 7, "granularity": "DAY"},
+                    "grainToDate": "MONTH",
+                },
+            },
+            # Coarser than the others on purpose: a grain is validated per metric,
+            # so a layer that reports a narrower set for one metric is what shows
+            # the validation is not reading a constant.
+            ["MONTH", "QUARTER", "YEAR"],
+        ),
     ]
 
 
@@ -953,7 +1092,11 @@ def _graph_manifest(tmp_path: Path) -> Path:
                 ],
                 "dimensions": [
                     {"name": "status", "type": "categorical", "label": "Order status"},
-                    {"name": "ordered_at", "type": "time"},
+                    {
+                        "name": "ordered_at",
+                        "type": "time",
+                        "type_params": {"time_granularity": "day"},
+                    },
                 ],
                 "measures": [
                     {
@@ -985,7 +1128,14 @@ def _graph_manifest(tmp_path: Path) -> Path:
                         "description": ("Nullable on refunds booked without an order."),
                     },
                 ],
-                "dimensions": [{"name": "reason", "type": "categorical"}],
+                "dimensions": [
+                    {"name": "reason", "type": "categorical"},
+                    {
+                        "name": "refunded_at",
+                        "type": "time",
+                        "type_params": {"time_granularity": "day"},
+                    },
+                ],
                 "measures": [{"name": "refund_count", "agg": "count"}],
             },
         ],
@@ -1201,7 +1351,13 @@ def test_the_widened_payload_still_omits_what_was_never_set(tmp_path: Path):
 
     for name, catalog in _catalogs(tmp_path).items():
         dims = {d["name"]: d for d in catalog.to_data()["dimensions"]}
-        assert set(dims["metric_time"]) == {"name", "type"}, name
+        # Words and a declaration are what `metric_time` has none of. Its grains
+        # are a different matter: the layer answers that question about it, and an
+        # answer nobody wrote is not a placeholder.
+        assert set(dims["metric_time"]) <= {"name", "type", "queryable_granularities"}
+        assert "label" not in dims["metric_time"], name
+        assert "definition" not in dims["metric_time"], name
+        assert "semantic_model" not in dims["metric_time"], name
         simple = _element_payload(catalog, "orders")
         assert "vendor_params" not in simple, name
         # A simple metric's composition is one key, not a shell of five nulls.
@@ -1279,6 +1435,483 @@ def test_an_uncompiled_project_is_told_what_to_run(tmp_path: Path):
     (tmp_path / "target").mkdir()
     with pytest.raises(sem.SemanticBackendError, match="dbt parse"):
         _local(tmp_path).list_definitions()
+
+
+# ---- reading a number correctly: the time axis, grains, and the join graph ----
+#
+# What the catalog says a metric can be grouped by, and what a time grouping on it
+# actually means. Both are per metric, and both were previously either absent or
+# stated once for a whole layer.
+
+
+def _day_grains() -> tuple[str, ...]:
+    return ("day", "week", "month", "quarter", "year")
+
+
+def _joined_paths(_manifest_text: str) -> dict[str, list[ResolvedPath]]:
+    """A join resolver's answer for the paired fixture, stated by the test.
+
+    Injected rather than asked of MetricFlow, because CI installs no `[semantic]`
+    extra and an assertion that only runs on a developer's machine is not an
+    assertion. `test_the_real_resolver_answers_in_the_same_shape` is what keeps
+    this from drifting away from the library.
+
+    `order__refund__reason` is the point: a two-link path, which is the same token
+    the hosted half of this fixture carries and the one the single-hop
+    qualification scheme cannot express at all (it can only ever say
+    `refund__reason`).
+    """
+
+    return {
+        "orders": [
+            ResolvedPath("metric_time", type="time", grains=_day_grains()),
+            ResolvedPath("order__status", "status", "orders", "categorical"),
+            ResolvedPath(
+                "order__ordered_at", "ordered_at", "orders", "time", _day_grains()
+            ),
+        ],
+        "refund_rate": [
+            ResolvedPath("metric_time", type="time", grains=_day_grains()),
+            ResolvedPath("order__status", "status", "orders", "categorical"),
+            ResolvedPath("refund__reason", "reason", "refunds", "categorical"),
+            ResolvedPath("order__refund__reason", "reason", "refunds", "categorical"),
+        ],
+    }
+
+
+def test_a_metrics_time_axis_names_what_metric_time_resolves_to(tmp_path: Path):
+    """One token, many columns, and the catalog now says which.
+
+    `metric_time` is not a dimension of the layer: it resolves per metric to that
+    metric's measures' own aggregation time dimension. A ratio whose two sides sit
+    in different models therefore has two, and grouping it by `metric_time` buckets
+    part of the number by one timestamp and the rest by another.
+    """
+
+    for name, catalog in _catalogs(tmp_path).items():
+        simple = next(m for m in catalog.metrics if m.name == "orders")
+        assert simple.time_axis == ["ordered_at"], name
+
+        ratio = next(m for m in catalog.metrics if m.name == "refund_rate")
+        assert ratio.time_axis == ["ordered_at", "refunded_at"], name
+
+        # Reported, not resolved: picking one would be right about half the number.
+        assert any(
+            "refund_rate" in note and "more than one time column" in note
+            for note in catalog.notes
+        ), name
+
+
+def test_queryable_granularities_come_from_the_layer_not_a_constant(tmp_path: Path):
+    """A grain is a property of the column and of the metric over it.
+
+    A categorical dimension gets an empty list, which is the answer that stops an
+    agent asking a category for a month; a metric gets what its time axis can
+    serve. `orders_to_date` reports a narrower set than the rest of the layer, so a
+    validation reading a constant instead of this would accept a grain the layer
+    refuses.
+    """
+
+    catalogs = _catalogs(tmp_path)
+    for name, catalog in catalogs.items():
+        dims = {d.name: d for d in catalog.dimensions}
+        assert dims["order__status"].queryable_granularities == [], name
+        assert next(
+            m for m in catalog.metrics if m.name == "orders"
+        ).queryable_granularities == list(_day_grains()), name
+
+    assert catalogs["local"].dimensions and catalogs["hosted"].dimensions
+    ordered_at = next(
+        d for d in catalogs["local"].dimensions if d.name == "order__ordered_at"
+    )
+    assert ordered_at.queryable_granularities == list(_day_grains())
+    narrower = next(m for m in catalogs["hosted"].metrics if m.name == "orders_to_date")
+    assert narrower.queryable_granularities == ["month", "quarter", "year"]
+
+
+def test_requires_metric_time_is_derived_locally_and_read_hosted(tmp_path: Path):
+    """A cumulative metric cannot be queried without a time axis.
+
+    The API says so outright. The compiled manifest does not carry the field at
+    all, so the project read derives it from the same fact that makes it true (a
+    window to accumulate along), and both land under the vendor key because a
+    metric that requires a time axis is MetricFlow's own semantics.
+    """
+
+    for name, catalog in _catalogs(tmp_path).items():
+        cumulative = next(m for m in catalog.metrics if m.name == "orders_to_date")
+        assert cumulative.vendor_params["requires_metric_time"] is True, name
+        # Only when true: an absent key is false, so a layer of dozens of ordinary
+        # metrics does not pay for a false on each of them.
+        simple = next(m for m in catalog.metrics if m.name == "orders")
+        assert "requires_metric_time" not in (simple.vendor_params or {}), name
+
+
+def test_a_grain_is_validated_against_what_the_layer_reports(tmp_path: Path):
+    """The hardcoded five-grain tuple was wrong in both directions.
+
+    It refused `hour`, which the API's own enum has, and it could never contain a
+    granularity a project defined for itself. So the vocabulary is the layer's, per
+    metric, and a refusal names what that metric actually offers.
+    """
+
+    backend = FakeHostedBackend(
+        metrics=[
+            {
+                "name": "orders",
+                "queryableTimeGranularities": ["hour", "day", "fiscal_quarter"],
+                "queryableGranularities": ["HOUR", "DAY"],
+            }
+        ],
+        result=table_json_result(["orders"], ["number"], [[1]]),
+    )
+    # Outside the old tuple and inside the layer's answer: accepted.
+    backend.query(
+        SemanticQuery(metrics=["orders"], group_by=["metric_time"], grain="hour")
+    )
+    assert any("createQuery" in posted for posted in backend.posted)
+    assert "grain: HOUR" in next(p for p in backend.posted if "createQuery" in p)
+
+    # A granularity this project defined for itself is a grain like any other.
+    backend.query(
+        SemanticQuery(
+            metrics=["orders"], group_by=["metric_time"], grain="fiscal_quarter"
+        )
+    )
+
+    with pytest.raises(sem.SemanticBackendError, match="hour, day, fiscal_quarter"):
+        backend.query(
+            SemanticQuery(metrics=["orders"], group_by=["metric_time"], grain="week")
+        )
+
+
+def test_a_grain_the_layer_did_not_speak_about_is_left_to_the_layer(tmp_path: Path):
+    """Where the metadata call did not answer, dex does not refuse on its own
+    authority: the identifier check is the only gate, and the layer refuses what it
+    does not accept. What dex may never do is let a grain reach a query as
+    structure without being an identifier."""
+
+    backend = FakeHostedBackend(result=table_json_result(["orders"], ["number"], [[1]]))
+    backend.query(
+        SemanticQuery(metrics=["orders"], group_by=["metric_time"], grain="week")
+    )
+    assert any("createQuery" in posted for posted in backend.posted)
+
+    assert validate_grain(None, available=None) is None
+    assert validate_grain("Month", available=["month"]) == "month"
+    with pytest.raises(sem.SemanticBackendError, match="invalid time grain"):
+        validate_grain("month) { x } mutation {", available=None)
+    with pytest.raises(sem.SemanticBackendError, match="no queryable time grain"):
+        validate_grain("month", available=[])
+    # One grain has to serve every metric in the query, so the intersection is the
+    # honest answer and an unanswered metric makes the whole answer unknown.
+    reported = {"a": ["day", "month"], "b": ["month", "year"]}
+    assert queryable_grains(["a", "b"], reported) == ["month"]
+    assert queryable_grains(["a", "c"], reported) is None
+
+
+def test_local_refuses_a_grain_the_project_does_not_declare(tmp_path: Path):
+    """Before rendering, and before MetricFlow is even needed: the project already
+    said what grains its metrics have."""
+
+    backend = _local(_graph_manifest(tmp_path))
+    with pytest.raises(sem.SemanticBackendError, match="day, week, month"):
+        backend.query(
+            SemanticQuery(metrics=["orders"], group_by=["metric_time"], grain="hour")
+        )
+
+
+def test_local_resolves_the_join_graph_when_the_resolver_answers(tmp_path: Path):
+    """The bug: a list that read as complete and was not.
+
+    A metric's dimensions were its owning models' own, single-hop. On a layer with
+    joins that drops the dimensions every metric description tells a caller to
+    group by, so the catalog contradicted the prose it was carrying two lines
+    above. Resolved, the rows are the tokens a query may actually group by, and the
+    payload says which of the two it is holding.
+    """
+
+    catalog = _local(
+        _graph_manifest(tmp_path), resolve_paths=_joined_paths
+    ).list_definitions()
+
+    assert catalog.dimension_scope == "queryable_paths"
+    ratio = next(m for m in catalog.metrics if m.name == "refund_rate")
+    assert "order__refund__reason" in ratio.dimensions
+
+    # Every token a metric names is a row of its own, which is what the catalog
+    # contract requires and what the join resolution could otherwise break.
+    listed = {d.name for d in catalog.dimensions}
+    assert set(ratio.dimensions) <= listed
+
+    joined = next(d for d in catalog.dimensions if d.name == "order__refund__reason")
+    assert joined.definition == "reason"
+    assert joined.semantic_model == "refunds"
+    # Two paths reach one declaration, and both carry that declaration's own type.
+    # The hosted API answers the same way, so a caller comparing the backends does
+    # not find one of them silent about a path the other describes.
+    single_hop = next(d for d in catalog.dimensions if d.name == "refund__reason")
+    assert (joined.type, joined.definition) == (single_hop.type, single_hop.definition)
+
+    # A dimension the project declares but no metric can reach stays visible, which
+    # is the half of the layer a hosted read cannot see.
+    assert "refund__refunded_at" in listed
+
+    # The resolved path resolves to a physical column too, so the PII gate
+    # adjudicates it from evidence instead of falling back to its name.
+    assert catalog.notes == [note for note in catalog.notes if "single-hop" not in note]
+
+
+def test_a_resolved_path_reaches_the_physical_column_behind_it(tmp_path: Path):
+    """The safety half of the join resolution.
+
+    A token the gate cannot resolve to a column is screened on its name alone,
+    which is the fail-closed floor rather than an equivalent. Every path the
+    resolution adds is a token a query can now name, so each one needs the same
+    column resolution a declared token gets.
+    """
+
+    view = dbt_project_module.semantic_catalog(
+        _graph_manifest(tmp_path), resolve_paths=_joined_paths
+    )
+    assert view.physical_columns["order__refund__reason"] == (
+        "wh.main.fct_refunds",
+        "reason",
+    )
+
+
+def test_local_says_so_when_the_join_graph_was_not_resolved(tmp_path: Path):
+    """`explore semantic list --local` is a dependency-free read of a compiled
+    artifact on an install that picked no extras, and it stays one. What changes is
+    that the shorter list no longer reads as the whole answer: the scope says
+    `declarations` as data, and the note names the fix."""
+
+    catalog = _local(_graph_manifest(tmp_path)).list_definitions()
+
+    assert catalog.dimension_scope == "declarations"
+    ratio = next(m for m in catalog.metrics if m.name == "refund_rate")
+    assert "order__refund__reason" not in ratio.dimensions
+    assert any(
+        "single-hop" in note and "[semantic] extra" in note for note in catalog.notes
+    )
+
+
+def _metricflow_manifest(tmp_path: Path) -> Path:
+    """The paired layer again, spelled out in the shape MetricFlow's own parser
+    accepts.
+
+    Written out in full rather than trimmed, because that parser validates the
+    whole artifact against its own schema: every other manifest in this file is a
+    minimal fixture it refuses, which is the same degradation an install without
+    the extra gets and is asserted as such above.
+    """
+
+    def entity(name: str, kind: str, expr: str, description: str | None = None) -> dict:
+        return {
+            "name": name,
+            "type": kind,
+            "expr": expr,
+            "role": None,
+            "description": description,
+            "label": None,
+            "metadata": None,
+            "config": {"meta": {}},
+        }
+
+    def dimension(name: str, kind: str, grain: str | None = None) -> dict:
+        return {
+            "name": name,
+            "type": kind,
+            "is_partition": False,
+            "type_params": (
+                {"time_granularity": grain, "validity_params": None} if grain else None
+            ),
+            "expr": None,
+            "metadata": None,
+            "label": None,
+            "config": {"meta": {}},
+        }
+
+    def measure(name: str, expr: str) -> dict:
+        return {
+            "name": name,
+            "agg": "count",
+            "expr": expr,
+            "description": None,
+            "create_metric": False,
+            "agg_params": None,
+            "metadata": None,
+            "non_additive_dimension": None,
+            "agg_time_dimension": None,
+            "label": None,
+            "config": {"meta": {}},
+        }
+
+    def model(name: str, alias: str, agg_time: str, **parts) -> dict:
+        return {
+            "name": name,
+            "description": f"one row per {name}",
+            "defaults": {"agg_time_dimension": agg_time},
+            "node_relation": {
+                "alias": alias,
+                "schema_name": "main",
+                "database": "wh",
+                "relation_name": f'"wh"."main"."{alias}"',
+            },
+            "primary_entity": None,
+            "metadata": None,
+            "config": {"meta": {}},
+            "label": None,
+            **parts,
+        }
+
+    def simple_metric(name: str, measure_name: str) -> dict:
+        reference = {
+            "name": measure_name,
+            "filter": None,
+            "alias": None,
+            "join_to_timespine": False,
+            "fill_nulls_with": None,
+        }
+        return {
+            "name": name,
+            "description": None,
+            "type": "simple",
+            "label": None,
+            "config": {"meta": {}},
+            "metadata": None,
+            "filter": None,
+            "time_granularity": None,
+            "type_params": {
+                "measure": reference,
+                "numerator": None,
+                "denominator": None,
+                "expr": None,
+                "window": None,
+                "grain_to_date": None,
+                "metrics": None,
+                "conversion_type_params": None,
+                "cumulative_type_params": None,
+                "input_measures": [reference],
+            },
+        }
+
+    project = tmp_path / "parseable"
+    (project / "target").mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "semantic_models": [
+            model(
+                "orders",
+                "fct_orders",
+                "ordered_at",
+                entities=[entity("order", "primary", "order_key")],
+                dimensions=[
+                    dimension("status", "categorical"),
+                    dimension("ordered_at", "time", "day"),
+                ],
+                measures=[measure("order_count", "order_key")],
+            ),
+            model(
+                "refunds",
+                "fct_refunds",
+                "refunded_at",
+                entities=[
+                    entity("refund", "primary", "refund_key"),
+                    entity(
+                        "order",
+                        "foreign",
+                        "parent_order_id",
+                        "Nullable on refunds booked without an order.",
+                    ),
+                ],
+                dimensions=[
+                    dimension("reason", "categorical"),
+                    dimension("refunded_at", "time", "day"),
+                ],
+                measures=[measure("refund_count", "refund_key")],
+            ),
+        ],
+        "metrics": [
+            simple_metric("orders", "order_count"),
+            simple_metric("refunds", "refund_count"),
+        ],
+        "project_configuration": {
+            "time_spine_table_configurations": [],
+            "metadata": None,
+            "dsi_package_version": {
+                "major_version": "0",
+                "minor_version": "9",
+                "patch_version": "0",
+            },
+            "time_spines": [
+                {
+                    "node_relation": {
+                        "alias": "time_spine",
+                        "schema_name": "main",
+                        "database": "wh",
+                        "relation_name": '"wh"."main"."time_spine"',
+                    },
+                    "primary_column": {"name": "date_day", "time_granularity": "day"},
+                    "custom_granularities": [],
+                }
+            ],
+        },
+        "saved_queries": [],
+    }
+    (project / "target" / "semantic_manifest.json").write_text(json.dumps(manifest))
+    return project
+
+
+def test_the_real_resolver_answers_in_the_same_shape(tmp_path: Path):
+    """What keeps the injected resolver above from drifting from the library.
+
+    Skipped where the `[semantic]` extra is absent, which includes CI, so it is a
+    check on the coupling rather than the coverage: the shape the other tests
+    assert against is the shape MetricFlow actually returns, including the join it
+    resolves that a single-hop read cannot.
+    """
+
+    pytest.importorskip("metricflow_semantics")
+
+    resolved = dbt_project_module.resolve_group_by_paths(
+        (
+            _metricflow_manifest(tmp_path) / "target" / "semantic_manifest.json"
+        ).read_text()
+    )
+    assert resolved is not None
+    paths = {path.token: path for path in resolved["refunds"]}
+
+    # The join a single-hop read cannot see: the refunds model declares `order` as
+    # a foreign entity, so a refund metric can be grouped by the order's own
+    # dimensions, which are declared in a model this metric's measure is not in.
+    assert "order__status" in paths
+    joined = paths["order__status"]
+    assert joined.definition == "status"
+    assert joined.semantic_model == "orders"
+    assert joined.type == "categorical"
+    assert joined.grains == ()
+
+    time_axis = paths["metric_time"]
+    assert time_axis.type == "time"
+    assert time_axis.grains == _day_grains()
+    # dex's own token points at no declaration, whatever the resolver knows about
+    # where it came from.
+    assert time_axis.definition is None
+    assert time_axis.semantic_model is None
+
+
+def test_a_manifest_the_resolver_cannot_read_degrades_rather_than_failing(
+    tmp_path: Path,
+):
+    """The resolver validates the whole artifact against its own schema, so a
+    manifest written by another version of dbt can fail a read dex performed
+    without trouble. Losing the catalog over the joins is the worse of the two
+    outcomes, and the absence is declared either way."""
+
+    pytest.importorskip("metricflow_semantics")
+
+    unreadable = json.dumps({"semantic_models": [{"name": "orders"}], "metrics": []})
+    assert dbt_project_module.resolve_group_by_paths(unreadable) is None
 
 
 # ---- scoping the catalog to the metrics a caller came for --------------------
