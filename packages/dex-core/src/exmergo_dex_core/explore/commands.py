@@ -64,6 +64,7 @@ from ..guards.query_firewall import (
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
+from ..semantic_catalog import entity_joins
 from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
 from . import cluster as cluster_mod
 from . import cumulative as cumulative_mod
@@ -739,6 +740,7 @@ def relationships(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
+    catalog = _semantic_catalog(engine, use_project)
 
     adapter = engine._adapter("explore relationships")
     # Capture pre-run cache state before any checkpoint write, so the success-path
@@ -855,9 +857,10 @@ def relationships(
         datasets, inferred, _dev_schemas(config)
     )
 
-    declared, declared_notes = rel_mod.declared_relationships(
-        defs, [d.identifier for d in datasets]
-    )
+    identifiers = [d.identifier for d in datasets]
+    declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
+    declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
     rels, confirmed = _merge_relationships(declared, inferred)
 
     # A prior overlap-derived edge (issue #220) is never rediscovered by
@@ -981,6 +984,10 @@ def relationships(
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
+    notes.extend(semantic_edge_notes)
+    notes.extend(
+        _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
+    )
     notes.extend(defs.notes)
     if confirmed:
         notes.append(
@@ -1049,12 +1056,15 @@ def relationships(
     # endpoint outside that (a narrower --scope/--dataset than a prior run) is
     # carried forward above rather than dropped, same as the profiles are.
     cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
+    if catalog is not None:
+        _annotate_semantic_exposure(cache.datasets, catalog)
     locator = store.save_cache(cache, now=now)
     notes.append(_persist_note(stats, len(datasets), keeps_relationships=False))
 
     result = RelationshipsResult(
         relationships=rels,
         declared_count=len(declared),
+        semantic_join_count=len(semantic_edges),
         profiled_count=len(profiled),
         cache_hit_count=len(fresh_reused),
         carried_relationship_count=carried_relationships,
@@ -1839,6 +1849,7 @@ def map(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
+    catalog = _semantic_catalog(engine, use_project)
     hints = _merged_hints(config.ranking_hints, defs.metric_models)
 
     adapter = engine._adapter("explore map")
@@ -1953,9 +1964,13 @@ def map(
         all_selected, inferred, _dev_schemas(config)
     )
 
-    declared, declared_notes = rel_mod.declared_relationships(
-        defs, [m.identifier for m in metas]
-    )
+    # Resolved against the full live inventory rather than the profiled subset:
+    # a declared join between two objects the rank cutoff skipped is still a fact
+    # about this warehouse, and both channels are read on the same terms.
+    identifiers = [m.identifier for m in metas]
+    declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
+    declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
     relationship_set, confirmed = _merge_relationships(declared, inferred)
 
     # A prior overlap-derived edge (issue #220) is never rediscovered by
@@ -2086,6 +2101,14 @@ def map(
         if child is not None:
             child.data_quality.append(text)
 
+    # After `_compose_datasets` rather than beside `_annotate_grain`, and over the
+    # composed set rather than this run's profiles: the link is derived from the
+    # project, not from a scan, so an object this run declined to re-profile is
+    # marked as accurately as one it just read.
+    semantic_exposed = (
+        _annotate_semantic_exposure(datasets, catalog) if catalog is not None else 0
+    )
+
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
     cache.provenance.created_at = (
@@ -2097,6 +2120,16 @@ def map(
 
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
+    notes.extend(semantic_edge_notes)
+    notes.extend(
+        _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
+    )
+    if semantic_exposed:
+        notes.append(
+            f"{semantic_exposed} object(s) are exposed through the project's "
+            "semantic layer (see semantic_models on each); the rest back no "
+            "metric, which is what separates a load-bearing table from a large one"
+        )
     notes.extend(defs.notes)
     notes.extend(text for _rel, text in orphan_findings)
     if confirmed:
@@ -2836,6 +2869,150 @@ def _project_definitions(
     # explore path, and `definitions()` is the channel declared keys and joins
     # reach dex through at all. Whichever format configuration named answers here.
     return engine.project_format().definitions()
+
+
+def _semantic_catalog(engine: DexEngine, use_project: bool):
+    """The project's semantic layer as a read catalog, or None.
+
+    The optional channel beside tier 2, read the way :func:`_project_definitions`
+    reads tier 1, and gated the same way: exploration starts bare, so a project's
+    declared join graph and its physical exposure fold in only when
+    ``--use-project`` asks for them. Without the flag the default map's payload is
+    byte-identical to what it was.
+
+    **None on every declinable condition, and it never raises**, which is the
+    difference between this and calling ``semantic_catalog()`` directly. There is
+    no repo, or the configured format does not read a semantic layer, or the
+    project has no compiled semantic manifest yet: every one of those is an
+    ordinary state on the explore path, where the warehouse is the subject and a
+    project is a bonus. ``explore semantic list`` is the command whose whole
+    subject *is* the layer, and it is the one that refuses by name instead.
+    """
+
+    from ..adapters.project import SemanticCatalogProject
+
+    if engine.repo_root is None or not use_project:
+        return None
+    try:
+        project = engine.project_format()
+        if not isinstance(project, SemanticCatalogProject):
+            return None
+        return project.semantic_catalog()
+    except (DexError, ValueError, OSError):
+        return None
+
+
+def _annotate_semantic_exposure(datasets: list[Dataset], catalog) -> int:
+    """Mark each dataset with the semantic models that sit on it. Returns how many
+    were exposed.
+
+    Runs over the **composed** set rather than this run's profiles, unlike
+    :func:`_annotate_grain`: the link is derived from the project rather than from
+    a scan, so it costs nothing to apply to a carried-forward object, and leaving
+    those unmarked would make the annotation read as "not exposed" for exactly the
+    objects a narrower run declined to re-profile.
+
+    Every dataset in view is written, empty list included, so a model dropped from
+    the layer clears on the next run instead of persisting as a stale claim. That
+    is only correct because the caller reaches this at all only when a catalog was
+    actually read; with no catalog nothing here runs and the prior values stand.
+    """
+
+    known = [d.identifier for d in datasets]
+    by_identifier: dict[str, set[str]] = {}
+    for model in catalog.semantic_models:
+        if not model.relation:
+            continue
+        # The same resolution a declared join's endpoints go through, and for the
+        # same reason: a compiled manifest spells the database component the way
+        # dbt was configured while the adapter normalizes it per connector, so an
+        # exact compare would expose nothing on a project that works. A relation
+        # matching several objects here resolves to none of them rather than to a
+        # guess.
+        identifier, _ambiguous = rel_mod.resolve_declared(
+            model.relation, model.name, known
+        )
+        if identifier is not None:
+            by_identifier.setdefault(identifier, set()).add(model.name)
+    exposed = 0
+    for dataset in datasets:
+        models = sorted(by_identifier.get(dataset.identifier, ()))
+        dataset.semantic_models = models
+        exposed += bool(models)
+    return exposed
+
+
+def _semantic_edges(
+    catalog, identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """The layer's declared entity graph as join edges, or nothing without one."""
+
+    if catalog is None:
+        return [], []
+    return rel_mod.semantic_relationships(entity_joins(catalog), identifiers)
+
+
+def _fold_semantic_edges(
+    declared: list[Relationship], semantic: list[Relationship]
+) -> tuple[list[Relationship], int]:
+    """Semantic edges added to the declared set, deduped against it.
+
+    Returns the widened declared set and how many semantic edges the project's
+    ``relationships`` tests already stated. Both channels are declarations of the
+    same tier, so an edge in both is one edge; which of the two named it first is
+    not a fact about the warehouse, and doubling it would inflate the connectivity
+    ranking the same way a doubled declared/inferred pair would.
+    """
+
+    known = {_relationship_edge_key(rel) for rel in declared}
+    merged = list(declared)
+    already = 0
+    for rel in semantic:
+        if _relationship_edge_key(rel) in known:
+            already += 1
+            continue
+        known.add(_relationship_edge_key(rel))
+        merged.append(rel)
+    return merged, already
+
+
+def _semantic_join_notes(
+    semantic: list[Relationship], already_declared: int, inferred: list[Relationship]
+) -> list[str]:
+    """What the declared entity graph added, and specifically what it rescued.
+
+    The count alone is not the interesting number. An edge the semantic layer
+    declares and name-based inference did not find is a join that would otherwise
+    be missing from the map entirely, with a key no naming rule could have matched,
+    and that is the case worth naming out loud: it is the whole argument for
+    reading the graph rather than scanning for it.
+    """
+
+    if not semantic:
+        return []
+    inferred_keys = {_relationship_edge_key(rel) for rel in inferred}
+    missed = [
+        rel for rel in semantic if _relationship_edge_key(rel) not in inferred_keys
+    ]
+    notes = [
+        f"{len(semantic)} join(s) come from the semantic layer's declared entity "
+        "graph, at the declared tier: the layer states the join and names its key "
+        "per model, so these are read rather than inferred"
+    ]
+    if missed:
+        named = ", ".join(
+            sorted({rel.declared_by for rel in missed if rel.declared_by})[:5]
+        )
+        notes.append(
+            f"{len(missed)} of them were not found by name-based inference and "
+            f"would otherwise be missing from this map ({named})"
+        )
+    if already_declared:
+        notes.append(
+            f"{already_declared} of them are also declared by a relationships "
+            "test; counted once"
+        )
+    return notes
 
 
 def _relationship_edge_key(rel: Relationship) -> tuple:
