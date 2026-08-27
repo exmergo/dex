@@ -11,8 +11,8 @@ Three habits, in order of how much they save:
 
 - **Scope the catalog rather than reading the layer.** A whole layer's catalog is
   one payload and most of it is about something else. `list --metric <m>` if you
-  know the metric, `list --for-dimension <d>` if you know the slice, `list
-  --search <word>` if you know neither. All three are free, none costs a round
+  know the metric, `list --for-dimension <d>` if you know the slice, or
+  `list --search <word>` if you know neither. All three are free, none costs a round
   trip beyond the first, and each names its scope in the payload.
 - **Read the metric's caveats before its dimensions.** `time_axis`, `filter` and
   `input_measures` change what the number is. The dimension list only changes how

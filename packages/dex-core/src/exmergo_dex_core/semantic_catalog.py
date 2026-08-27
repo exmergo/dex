@@ -14,9 +14,9 @@ no dex imports of its own:
 
 - a **project format**, through ``SemanticCatalogProject.semantic_catalog()``,
   reducing whatever it holds on disk into this shape;
-- the **explore surface**, through ``SemanticCatalog``, which subclasses
-  :class:`SemanticCatalogView` to add the answering backend's provenance and to
-  serialize the payload.
+- the **explore surface**, through ``SemanticCatalog``, which composes a
+  :class:`SemanticCatalogView` with the answering backend's provenance and adds
+  payload serialization.
 
 One model set rather than two is what stops a second semantic-layer format from
 needing a parallel vocabulary, and it is why the fields here are named for what

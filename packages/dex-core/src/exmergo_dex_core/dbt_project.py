@@ -34,9 +34,19 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
+from .dbt_semantic import (
+    ResolvedPath,
+    resolve_group_by_paths,
+)
+from .dbt_semantic import (
+    grains_from as _grains_from,
+)
+from .dbt_semantic import (
+    read_semantic_manifest as _read_semantic_manifest_file,
+)
 from .diffs import file_diff
 from .errors import ProjectError
-from .metricflow_dialect import METRIC_TIME, STANDARD_GRAINS, order_grains
+from .metricflow_dialect import METRIC_TIME
 from .semantic_catalog import (
     DIMENSIONS_PER_DECLARATION,
     DIMENSIONS_PER_QUERYABLE_PATH,
@@ -1512,167 +1522,7 @@ def _declared_from_yaml(view: DbtProjectView, defs: ProjectDefinitions) -> None:
 
 
 def _read_semantic_manifest(project: Path) -> tuple[dict[str, Any], str] | None:
-    """``target/semantic_manifest.json`` as ``(payload, raw text)`` when present
-    and carrying semantic models; an empty or unreadable artifact falls back to
-    raw YAML.
-
-    The raw text comes back beside the parsed payload because MetricFlow's own
-    manifest parser takes the document rather than a dict, and reading a large
-    artifact twice for one command is work for nothing.
-    """
-
-    path = project / SEMANTIC_MANIFEST_PATH
-    if not path.is_file():
-        return None
-    try:
-        text = path.read_text(encoding="utf-8")
-        payload = json.loads(text)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if isinstance(payload, dict) and payload.get("semantic_models"):
-        return payload, text
-    return None
-
-
-@dataclass(frozen=True)
-class ResolvedPath:
-    """One token a metric query may group by, and what it reaches.
-
-    The unit a join-resolved read produces: ``user__pricing_tier`` is a
-    ``pricing_tier`` declared in the ``users`` model, reached through the ``user``
-    entity. ``definition`` and ``semantic_model`` are what let a caller see that
-    several paths reach one declaration, and they are left unset rather than
-    guessed where a path is reachable from more than one declaring model.
-    """
-
-    token: str
-    definition: str | None = None
-    semantic_model: str | None = None
-    type: str = ""
-    grains: tuple[str, ...] = ()
-
-
-def resolve_group_by_paths(manifest_text: str) -> dict[str, list[ResolvedPath]] | None:
-    """Per metric, every dimension path a query may group by, or None.
-
-    Asks MetricFlow, which owns the join-resolution rules this catalog would
-    otherwise have to restate: which models a metric's measures live in, which
-    entities those models share, and how far a dimension can be reached through
-    them. A hand-rolled single-hop union under-reports a layer with joins, and the
-    dimension it drops is often the one every metric description tells a caller to
-    group by.
-
-    **None means the join graph could not be resolved**, which is the whole reason
-    this is separated from the manifest read. ``explore semantic list --local`` is
-    a dependency-free read of a compiled artifact, and it stays one: an install
-    that picked no extras gets the declared single-hop view and a payload that says
-    so. Returning None rather than raising is what makes that a declared
-    degradation instead of a failure.
-
-    A manifest the resolver refuses degrades the same way, on purpose. The
-    resolver validates the whole artifact against its own schema, so a manifest
-    written by a different version of dbt can fail a read that dex itself performed
-    without trouble, and losing the catalog over the joins is the worse of the two
-    outcomes. The absence is declared either way, in ``dimension_scope`` before any
-    note, so a caller can tell a resolved list from an unresolved one.
-
-    One lookup builds the whole answer, because constructing it parses the
-    manifest. Date-part specs (``extract(year from ...)``) are skipped: they are
-    real, and their queryable spelling is not a ``__``-joined token, so emitting
-    one would name something no query accepts.
-    """
-
-    try:
-        from metricflow_semantics.model.dbt_manifest_parser import (
-            parse_manifest_from_dbt_generated_manifest,
-        )
-        from metricflow_semantics.model.semantic_manifest_lookup import (
-            SemanticManifestLookup,
-        )
-    except ImportError:
-        return None
-
-    try:
-        return _resolve_through(
-            SemanticManifestLookup(
-                parse_manifest_from_dbt_generated_manifest(manifest_text)
-            ).metric_lookup
-        )
-    except Exception:
-        # Broad, and around the resolution rather than only the parse: this is a
-        # third-party validator and resolver over an artifact dex did not write,
-        # and every way either of them can refuse one means the same thing here.
-        return None
-
-
-def _resolve_through(lookup: Any) -> dict[str, list[ResolvedPath]]:
-    """The resolution itself, given MetricFlow's metric lookup.
-
-    Apart from :func:`resolve_group_by_paths` only so that its whole body, and not
-    just the parse, sits inside one refusal-means-degrade boundary.
-    """
-
-    resolved: dict[str, list[ResolvedPath]] = {}
-    for reference in lookup.metric_references:
-        found: dict[str, dict[str, Any]] = {}
-        for spec in lookup.get_common_group_by_items(
-            metric_references=(reference,)
-        ).annotated_specs:
-            kind = spec.element_type.name
-            if (
-                kind not in ("DIMENSION", "TIME_DIMENSION")
-                or spec.date_part is not None
-            ):
-                continue
-            token = "__".join([*spec.entity_link_names, spec.element_name])
-            entry = found.setdefault(
-                token, {"grains": [], "time": False, "models": set(), "name": None}
-            )
-            entry["time"] = entry["time"] or kind == "TIME_DIMENSION"
-            entry["name"] = spec.element_name
-            entry["models"].update(spec.origin_semantic_model_names)
-            grain = getattr(spec.time_grain, "name", None)
-            if grain and grain not in entry["grains"]:
-                # The resolver names a custom granularity here the same way it
-                # names a standard one, so this is also how a deployment's own
-                # granularities reach the catalog.
-                entry["grains"].append(grain)
-
-        paths: list[ResolvedPath] = []
-        for token, entry in sorted(found.items()):
-            models = sorted(entry["models"])
-            synthesized = token == METRIC_TIME
-            paths.append(
-                ResolvedPath(
-                    token=token,
-                    # dex's own token, not a declaration: it resolves per metric,
-                    # so attributing it to one model's dimension would be a claim
-                    # the layer does not make.
-                    definition=None if synthesized else entry["name"],
-                    semantic_model=(
-                        None if synthesized or len(models) != 1 else models[0]
-                    ),
-                    type="time" if entry["time"] else "categorical",
-                    grains=tuple(order_grains(entry["grains"])),
-                )
-            )
-        resolved[reference.element_name] = paths
-    return resolved
-
-
-def _grains_from(base: str | None, custom: tuple[str, ...] = ()) -> list[str] | None:
-    """The grains a time column declared at ``base`` can be queried at.
-
-    A daily column can be rolled up to a week or a year and cannot be split into
-    an hour, so the answer is the standard grains at or coarser than the declared
-    one. None where nothing was declared, because "any grain" and "we do not know"
-    are different answers and only one of them should read as complete.
-    """
-
-    if not base or base.lower() not in STANDARD_GRAINS:
-        return None
-    floor = STANDARD_GRAINS.index(base.lower())
-    return [*STANDARD_GRAINS[floor:], *custom]
+    return _read_semantic_manifest_file(project, SEMANTIC_MANIFEST_PATH)
 
 
 @dataclass

@@ -26,6 +26,16 @@ was already too large to read in one payload is trimmed. `--metric` brings that 
 layer to 10% of its unscoped size, and the payload now states what was cut in every
 case, zeros included.
 
+### Changed
+
+- Refactored the unreleased semantic-layer implementation into a neutral catalog
+  domain, composed response model, shared request policy, typed backend descriptor,
+  hosted GraphQL transport and local MetricFlow runtime. The CLI and envelope stay
+  unchanged; the internal backend/catalog seam is intentionally allowed to change
+  before release. Malformed hosted tabular JSON now returns a clean semantic
+  backend error instead of leaking a decoder exception, and a scoped catalog no
+  longer carries time-axis caveats for metrics outside that scope.
+
 ### Fixed
 
 - **The skill wrapper installed neither semantic extra, so most of

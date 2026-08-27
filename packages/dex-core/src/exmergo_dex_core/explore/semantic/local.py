@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
-from importlib import import_module
 from pathlib import Path
 from typing import ClassVar
 
@@ -36,6 +35,7 @@ from . import (
     DIMENSIONS_PER_DECLARATION,
     EXECUTION_DEX,
     PII_BLOCK_CONFIDENCE,
+    BackendDescriptor,
     SemanticBackendError,
     SemanticCatalog,
     SemanticQuery,
@@ -50,6 +50,7 @@ from . import (
     validate_grain,
     values_reach_note,
 )
+from .local_runtime import metricflow_engine
 
 # Said only when the join graph could not be resolved, which is an install that
 # picked no extras. A list that names a metric's single-hop dimensions and reads
@@ -69,52 +70,6 @@ _MISSING_EXTRA = (
     "pip install 'exmergo-dex-core[semantic]'"
 )
 
-# dex connector -> (renderer submodule under _RENDER_ROOT, class, SqlEngine name).
-# MetricFlow ships a renderer per dialect; the shim hands the engine the one
-# matching the active connector so the SQL it renders is in that connector's dialect.
-_RENDER_ROOT = "metricflow.sql.render"
-_RENDERERS: dict[str, tuple[str, str, str]] = {
-    "duckdb": ("duckdb_renderer", "DuckDbSqlPlanRenderer", "DUCKDB"),
-    "bigquery": ("big_query", "BigQuerySqlPlanRenderer", "BIGQUERY"),
-    "snowflake": ("snowflake", "SnowflakeSqlPlanRenderer", "SNOWFLAKE"),
-    "databricks": ("databricks", "DatabricksSqlPlanRenderer", "DATABRICKS"),
-    "postgres": ("postgres", "PostgresSqlPlanRenderer", "POSTGRES"),
-    "redshift": ("redshift", "RedshiftSqlPlanRenderer", "REDSHIFT"),
-}
-
-
-class _RendererOnlySqlClient:
-    """A MetricFlow ``SqlClient`` that can render but never execute. If MetricFlow
-    calls anything execution-shaped, it raises: the mechanical form of "MetricFlow
-    never reaches the warehouse". Only ``explain()`` (pure rendering) uses it."""
-
-    def __init__(self, renderer, engine) -> None:
-        self._renderer = renderer
-        self._engine = engine
-
-    @property
-    def sql_plan_renderer(self):
-        return self._renderer
-
-    @property
-    def sql_engine_type(self):
-        return self._engine
-
-    def render_bind_parameter_key(self, bind_parameter_key: str) -> str:
-        return f":{bind_parameter_key}"
-
-    def query(self, *args, **kwargs):
-        raise RuntimeError("renderer-only SqlClient: execution is not permitted")
-
-    def execute(self, *args, **kwargs):
-        raise RuntimeError("renderer-only SqlClient: execution is not permitted")
-
-    def dry_run(self, *args, **kwargs):
-        raise RuntimeError("renderer-only SqlClient: execution is not permitted")
-
-    def close(self) -> None:
-        pass
-
 
 class LocalMetricFlowBackend:
     name = "local"
@@ -132,6 +87,14 @@ class LocalMetricFlowBackend:
     # what that read reported and this stands in only for a caller that asks the
     # backend without one.
     dimension_scope = DIMENSIONS_PER_DECLARATION
+    descriptor = BackendDescriptor(
+        name=name,
+        vendor=vendor,
+        deployment=deployment,
+        execution=execution,
+        catalog_gaps=catalog_gaps,
+        dimension_scope=dimension_scope,
+    )
 
     def __init__(
         self,
@@ -654,55 +617,12 @@ class LocalMetricFlowBackend:
     def _metricflow_engine(self):
         if self._mf_engine is not None:
             return self._mf_engine
-        try:
-            from metricflow.engine.metricflow_engine import MetricFlowEngine
-            from metricflow_semantics.model.dbt_manifest_parser import (
-                parse_manifest_from_dbt_generated_manifest,
-            )
-            from metricflow_semantics.model.semantic_manifest_lookup import (
-                SemanticManifestLookup,
-            )
-        except ImportError as exc:
-            raise SemanticBackendError(_MISSING_EXTRA) from exc
-
-        from ... import dbt_project
-
-        manifest_path = self._project / dbt_project.SEMANTIC_MANIFEST_PATH
-        if not manifest_path.is_file():
-            raise SemanticBackendError(
-                "no compiled semantic manifest at target/semantic_manifest.json; "
-                "run `dbt parse` in the project first"
-            )
-        manifest = parse_manifest_from_dbt_generated_manifest(
-            manifest_path.read_text(encoding="utf-8")
-        )
-        lookup = SemanticManifestLookup(manifest)
-        self._mf_engine = MetricFlowEngine(
-            semantic_manifest_lookup=lookup, sql_client=self._sql_client()
+        self._mf_engine = metricflow_engine(
+            self._project,
+            self._connector,
+            missing_extra_message=_MISSING_EXTRA,
         )
         return self._mf_engine
-
-    def _sql_client(self) -> _RendererOnlySqlClient:
-        spec = _RENDERERS.get(self._connector)
-        if spec is None:
-            # An inert capability declares itself rather than degrading:
-            # falling back to another dialect's renderer would emit SQL that
-            # parses and returns wrong numbers, which is the worst of the three
-            # available behaviors. MetricFlow ships no ClickHouse renderer, so
-            # the connector is named here rather than silently missing.
-            supported = ", ".join(sorted(_RENDERERS))
-            raise SemanticBackendError(
-                f"no MetricFlow renderer for connector '{self._connector}'; "
-                f"local metric queries support {supported}. dex will not "
-                "render a metric through another dialect's renderer, because "
-                "the SQL would run and the numbers would be wrong"
-            )
-        module_name, class_name, engine_name = spec
-        from metricflow.protocols.sql_client import SqlEngine
-
-        module = import_module(f"{_RENDER_ROOT}.{module_name}")
-        renderer = getattr(module, class_name)()
-        return _RendererOnlySqlClient(renderer, SqlEngine[engine_name])
 
 
 # ---- the relation pre-check's plumbing --------------------------------------
