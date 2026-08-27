@@ -25,7 +25,9 @@ from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
+    _fold_semantic_edges,
     _merge_relationships,
+    _semantic_join_notes,
 )
 from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.explore.relationships import (
@@ -36,9 +38,11 @@ from exmergo_dex_core.explore.relationships import (
     fk_candidate_count,
     fold_replica_relationships,
     infer_relationships,
+    semantic_relationships,
     verify_relationships,
 )
 from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
+from exmergo_dex_core.semantic_catalog import EntityJoin
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -1675,3 +1679,153 @@ def test_relationships_envelope_unresolved_declared_is_a_signal(tmp_path: Path, 
     notes = data["notes"]
     assert any("no declared relationships resolved" in n for n in notes)
     assert any("not in this connection's inventory" in n for n in notes)
+
+
+# ---- the semantic layer's declared entity graph (#361) -----------------------
+#
+# A shared entity is a join the layer states, with the key named per model. These
+# arrive at the declared tier beside the `relationships` tests, so the assertions
+# below are the ones that keep that tier honest: the same never-guess endpoint
+# resolution, one edge per join however many channels name it, and the entity
+# carried as the thing a reader can look up.
+
+
+def _join(
+    entity: str = "customer",
+    *,
+    parent_relation: str = "wh.main.customers",
+    parent_column: str = "id",
+    child_relation: str = "wh.main.orders",
+    child_column: str = "buyer_id",
+) -> EntityJoin:
+    return EntityJoin(
+        entity=entity,
+        parent_model="customers_sm",
+        parent_relation=parent_relation,
+        parent_column=parent_column,
+        child_model="orders_sm",
+        child_relation=child_relation,
+        child_column=child_column,
+    )
+
+
+def test_a_declared_entity_becomes_an_edge_naming_the_entity():
+    rels, notes = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    assert notes == []
+    (rel,) = rels
+    assert rel.from_dataset == "wh.main.orders" and rel.from_columns == ["buyer_id"]
+    assert rel.to_dataset == "wh.main.customers" and rel.to_columns == ["id"]
+    # Declared, not inferred: the layer states this join and names its key. A
+    # name-based rule would never have found `buyer_id` against `id`.
+    assert rel.kind is RelationshipKind.DECLARED
+    assert rel.confidence == 1.0
+    assert rel.declared_by == "semantic entity 'customer'"
+
+
+def test_a_semantic_endpoint_resolves_across_a_database_alias():
+    """Same rule the `relationships` tests go through, and the same reason: a
+    compiled manifest spells the database the way dbt was configured while the
+    adapter normalizes it per connector."""
+
+    rels, notes = semantic_relationships(
+        [
+            _join(
+                parent_relation="analytics.main.customers",
+                child_relation="analytics.main.orders",
+            )
+        ],
+        ["wh.main.orders", "wh.main.customers"],
+    )
+
+    assert notes == []
+    assert rels[0].from_dataset == "wh.main.orders"
+
+
+def test_a_semantic_endpoint_missing_here_is_a_note_not_an_edge():
+    rels, notes = semantic_relationships([_join()], ["wh.main.orders"])
+
+    assert rels == []
+    (note,) = notes
+    assert "semantic entity 'customer'" in note
+    assert "not in this connection's inventory" in note
+
+
+def test_an_ambiguous_semantic_endpoint_is_skipped_rather_than_guessed():
+    rels, notes = semantic_relationships(
+        [_join()], ["wh.a.orders", "wh.b.orders", "wh.main.customers"]
+    )
+
+    assert rels == []
+    assert any("more than one object" in note for note in notes)
+
+
+def test_duplicate_semantic_joins_are_deduped():
+    rels, _ = semantic_relationships(
+        [_join(), _join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    assert len(rels) == 1
+
+
+def test_a_semantic_edge_the_project_already_declares_is_counted_once():
+    """Both channels are declarations of the same tier, so an edge in both is one
+    edge. Which named it first is not a fact about the warehouse, and doubling it
+    would inflate the connectivity ranking."""
+
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["buyer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, already = _fold_semantic_edges([declared], semantic)
+
+    assert len(merged) == 1 and already == 1
+    # The relationships test's edge stands; the semantic channel adds nothing it
+    # did not already say.
+    assert merged[0].declared_by is None
+
+
+def test_the_notes_name_what_inference_would_have_missed():
+    """The count alone is not the interesting number. An edge the layer declares
+    and inference did not find is a join that would otherwise be absent from the
+    map, with a key no naming rule could have matched."""
+
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    notes = _semantic_join_notes(semantic, 0, [])
+
+    assert any("declared entity graph" in note for note in notes)
+    missed = next(note for note in notes if "not found by name-based" in note)
+    assert "semantic entity 'customer'" in missed
+
+
+def test_an_edge_inference_also_found_is_not_reported_as_rescued():
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+    inferred = [
+        Relationship(
+            from_dataset="wh.main.orders",
+            from_columns=["buyer_id"],
+            to_dataset="wh.main.customers",
+            to_columns=["id"],
+            kind=RelationshipKind.INFERRED,
+            confidence=0.7,
+        )
+    ]
+
+    notes = _semantic_join_notes(semantic, 0, inferred)
+
+    assert not any("not found by name-based" in note for note in notes)

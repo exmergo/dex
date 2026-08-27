@@ -281,6 +281,7 @@ def test_map_summary_is_a_budgeted_map_not_a_schema_dump(
         "confidence",
         "verified",
         "orphan_fraction",
+        "declared_by",
     }, "edges are shaped exactly like `explore relationships` returns them"
 
 
@@ -1324,3 +1325,191 @@ def test_merged_hints_appends_without_displacing():
         "customer",
         "orders",
     ]
+
+
+# --- the semantic layer, folded into the map (#360, #361) ---------------------
+
+
+def _semantic_layer_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A warehouse whose two tables join on differently named columns, plus a
+    project whose compiled semantic layer declares that join and sits one of its
+    models on a third table nothing exposes.
+
+    `buyer_id` against `id` is the join name-based inference cannot find, and
+    `audit_log` is the object the layer does not expose, so both halves of the
+    annotation have something to say.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE customers (id INTEGER, region VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'eu'), (2, 'us')")
+    conn.execute("CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2)")
+    conn.execute("CREATE TABLE audit_log (event_id INTEGER)")
+    conn.execute("INSERT INTO audit_log VALUES (1), (2)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "target").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    manifest = {
+        "semantic_models": [
+            {
+                "name": "customers_sm",
+                # Quoted and with a database component that disagrees with the
+                # DuckDB file stem, which is the ordinary case: the suffix pins it.
+                "node_relation": {
+                    "alias": "customers",
+                    "relation_name": '"analytics"."main"."customers"',
+                },
+                "entities": [{"name": "customer", "type": "primary", "expr": "id"}],
+                "dimensions": [{"name": "region", "type": "categorical"}],
+                "measures": [{"name": "customer_count", "agg": "count", "expr": "id"}],
+            },
+            {
+                "name": "orders_sm",
+                "node_relation": {
+                    "alias": "orders",
+                    "relation_name": '"analytics"."main"."orders"',
+                },
+                "entities": [
+                    {"name": "order", "type": "primary", "expr": "order_id"},
+                    {"name": "customer", "type": "foreign", "expr": "buyer_id"},
+                ],
+                "dimensions": [],
+                "measures": [{"name": "order_count", "agg": "count"}],
+            },
+        ],
+        "metrics": [
+            {
+                "name": "orders",
+                "type": "simple",
+                "type_params": {"input_measures": [{"name": "order_count"}]},
+            }
+        ],
+    }
+    (repo / "target" / "semantic_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return db, repo
+
+
+def _map_with_project(db: Path, repo: Path, capsys) -> dict:
+    return _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+
+
+def test_map_says_which_objects_the_semantic_layer_exposes(tmp_path: Path, capsys):
+    """The physical half of the link, and what makes "is this table load-bearing"
+    answerable from the map: a relation several metrics are built on is a
+    different object from one nothing reads, and row count and PII flags cannot
+    tell them apart."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+
+    data = _map_with_project(db, repo, capsys)
+
+    exposure = {
+        o["identifier"].rsplit(".", 1)[-1]: o["semantic_models"]
+        for o in data["objects"]
+    }
+    assert exposure["customers"] == ["customers_sm"]
+    assert exposure["orders"] == ["orders_sm"]
+    # Exposed through nothing is an answer, not a gap.
+    assert exposure["audit_log"] == []
+    assert any(
+        "exposed through the project's semantic layer" in n for n in data["notes"]
+    )
+
+
+def test_map_draws_the_join_the_semantic_layer_declares(tmp_path: Path, capsys):
+    """`buyer_id` against `id` shares no name, so nothing dex infers would find
+    it. The layer states it outright, with the key named per model."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+
+    data = _map_with_project(db, repo, capsys)
+
+    declared = [e for e in data["edges"] if e["declared_by"]]
+    assert len(declared) == 1
+    edge = declared[0]
+    assert edge["from_dataset"].endswith(".orders")
+    assert edge["from_columns"] == ["buyer_id"]
+    assert edge["to_dataset"].endswith(".customers")
+    assert edge["to_columns"] == ["id"]
+    assert edge["kind"] == "declared" and edge["confidence"] == 1.0
+    assert edge["declared_by"] == "semantic entity 'customer'"
+    assert any("not found by name-based inference" in n for n in data["notes"])
+
+
+def test_exploration_still_starts_bare_without_use_project(tmp_path: Path, capsys):
+    """The default path is unchanged, which is what keeps this a minor release and
+    what keeps a warehouse observation independent of whichever repo dex runs
+    from."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+
+    data = _run(
+        ["explore", "map", "--path", str(db), "--repo-root", str(repo)], capsys
+    )["data"]
+
+    assert all(o["semantic_models"] == [] for o in data["objects"])
+    assert all(e["declared_by"] is None for e in data["edges"])
+
+
+def test_a_model_dropped_from_the_layer_clears_its_annotation(tmp_path: Path, capsys):
+    """A stale exposure claim is worse than none: it says a table backs a metric
+    that no longer reads it. Every dataset in view is rewritten whenever a
+    catalog was read, so the annotation cannot outlive the declaration."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+    _map_with_project(db, repo, capsys)
+
+    manifest = json.loads((repo / "target" / "semantic_manifest.json").read_text())
+    manifest["semantic_models"] = [
+        m for m in manifest["semantic_models"] if m["name"] != "orders_sm"
+    ]
+    (repo / "target" / "semantic_manifest.json").write_text(json.dumps(manifest))
+
+    data = _map_with_project(db, repo, capsys)
+
+    exposure = {
+        o["identifier"].rsplit(".", 1)[-1]: o["semantic_models"]
+        for o in data["objects"]
+    }
+    assert exposure["orders"] == []
+    assert exposure["customers"] == ["customers_sm"]
+    # The join went with it: the layer no longer declares that entity on orders.
+    assert not [e for e in data["edges"] if e["declared_by"]]
+
+
+def test_the_semantic_read_survives_a_project_with_no_compiled_layer(
+    tmp_path: Path, capsys
+):
+    """An uncompiled project is an ordinary state on the explore path, where the
+    warehouse is the subject and a project is a bonus. `explore semantic list` is
+    the command whose subject is the layer, and it is the one that refuses."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+    (repo / "target" / "semantic_manifest.json").unlink()
+
+    data = _map_with_project(db, repo, capsys)
+
+    assert data["objects"], "the map still describes the warehouse"
+    assert all(o["semantic_models"] == [] for o in data["objects"])
