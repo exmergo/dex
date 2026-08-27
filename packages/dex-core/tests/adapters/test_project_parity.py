@@ -13,6 +13,7 @@ keeps the seam load-bearing rather than merely defined.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from exmergo_dex_core.adapters.conformance import (
     MaintainProjectContract,
     PlacingProjectContract,
     ProjectFactoryContract,
+    SemanticCatalogContract,
     SemanticProjectContract,
 )
 from exmergo_dex_core.adapters.project import (
@@ -116,6 +118,7 @@ def _clean_edit(root: Path):
 
 class TestDbtProject(
     DeclaringProjectContract,
+    SemanticCatalogContract,
     SemanticProjectContract,
     PlacingProjectContract,
     EditableProjectContract,
@@ -231,6 +234,10 @@ class TestDbtProject(
             "semantic_models:\n"
             "  - name: customers_sm\n"
             "    model: ref('stg_customers')\n"
+            "    entities:\n"
+            "      - name: customer\n"
+            "        type: primary\n"
+            "        expr: id\n"
             "    dimensions:\n"
             "      - name: signed_up_at\n"
             "        type: time\n"
@@ -246,15 +253,124 @@ class TestDbtProject(
             "        expr: revenue_net\n"
             "      - name: blended\n"
             "        agg: sum\n"
-            "        expr: revenue_net + adjustments\n",
+            "        expr: revenue_net + adjustments\n"
+            "  - name: orders_sm\n"
+            "    model: ref('stg_orders')\n"
+            "    entities:\n"
+            "      - name: order\n"
+            "        type: primary\n"
+            "      - name: customer\n"
+            "        type: foreign\n"
+            "        expr: buyer_id\n"
+            "    dimensions:\n"
+            "      - name: status\n"
+            "        type: categorical\n"
+            "    measures:\n"
+            "      - name: order_count\n"
+            "        agg: count\n"
+            "        expr: order_id\n",
             encoding="utf-8",
         )
+        _write_compiled_semantics(project)
         return (
             DbtProject(self.root, project),
             "customers_sm",
             {"signed_up_at": "signed_up_at", "region": "region_code", "markup": None},
             {"revenue": "revenue_net", "blended": None},
         )
+
+
+def _write_compiled_semantics(project: Path) -> None:
+    """The compiled counterpart of the YAML above.
+
+    A real project holds both, and the two seam channels read the one each was
+    designed for: the fingerprint hashes what the author wrote, so it stays stable
+    across tool upgrades, and the catalog reads the compiled artifact, where the
+    metric inputs and the physical relations are already resolved. Writing only one
+    of them would leave whichever contract reads the other with nothing to check.
+    """
+
+    target = project / "target"
+    target.mkdir(exist_ok=True)
+    (target / "semantic_manifest.json").write_text(
+        json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "customers_sm",
+                        "node_relation": {
+                            "alias": "stg_customers",
+                            "relation_name": "wh.main.stg_customers",
+                        },
+                        "defaults": {"agg_time_dimension": "signed_up_at"},
+                        "entities": [
+                            {"name": "customer", "type": "primary", "expr": "id"}
+                        ],
+                        "dimensions": [
+                            {"name": "signed_up_at", "type": "time"},
+                            {
+                                "name": "region",
+                                "type": "categorical",
+                                "expr": "region_code",
+                            },
+                            {
+                                "name": "markup",
+                                "type": "categorical",
+                                "expr": "base_rate * 1.2",
+                            },
+                        ],
+                        "measures": [
+                            {"name": "revenue", "agg": "sum", "expr": "revenue_net"},
+                            {
+                                "name": "blended",
+                                "agg": "sum",
+                                "expr": "revenue_net + adjustments",
+                            },
+                        ],
+                    },
+                    {
+                        "name": "orders_sm",
+                        "node_relation": {
+                            "alias": "stg_orders",
+                            "relation_name": "wh.main.stg_orders",
+                        },
+                        "defaults": {"agg_time_dimension": "signed_up_at"},
+                        "entities": [
+                            {"name": "order", "type": "primary"},
+                            {
+                                "name": "customer",
+                                "type": "foreign",
+                                "expr": "buyer_id",
+                            },
+                        ],
+                        "dimensions": [{"name": "status", "type": "categorical"}],
+                        "measures": [
+                            {"name": "order_count", "agg": "count", "expr": "order_id"}
+                        ],
+                    },
+                ],
+                "metrics": [
+                    {
+                        "name": "revenue",
+                        "type": "simple",
+                        "type_params": {
+                            "measure": {"name": "revenue"},
+                            "input_measures": [{"name": "revenue"}],
+                        },
+                    },
+                    {
+                        "name": "orders",
+                        "type": "simple",
+                        "type_params": {
+                            "measure": {"name": "order_count"},
+                            "input_measures": [{"name": "order_count"}],
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class TestDbtProjectFactory(ProjectFactoryContract, EditableProjectContract):

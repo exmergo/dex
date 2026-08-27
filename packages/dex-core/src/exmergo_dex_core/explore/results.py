@@ -75,8 +75,19 @@ class ProfileResult(Result):
 
 
 class RelationshipsResult(Result):
+    """Joins across the objects in scope, with what earned each one.
+
+    ``declared_count`` is every join the project states, from either channel: a
+    ``relationships`` test or a semantic layer's shared entity.
+    ``semantic_join_count`` is how many of those the second channel contributed,
+    which is worth its own number because it is the one that appears only under
+    ``--use-project`` on a project with a semantic layer, and a reader comparing
+    two runs otherwise sees `declared_count` move with no field explaining it.
+    """
+
     relationships: list[Relationship] = Field(default_factory=list)
     declared_count: int = 0
+    semantic_join_count: int = 0
     profiled_count: int = 0
     cache_hit_count: int = 0
     carried_relationship_count: int = 0
@@ -87,6 +98,7 @@ class RelationshipsResult(Result):
         return {
             "relationships": [r.model_dump(mode="json") for r in self.relationships],
             "declared_count": self.declared_count,
+            "semantic_join_count": self.semantic_join_count,
             "inferred_count": len(self.relationships) - self.declared_count,
             "profiled_count": self.profiled_count,
             "cache_hit_count": self.cache_hit_count,
@@ -365,9 +377,18 @@ class SemanticQueryResult(Result):
     while dbt Cloud executes server-side where that guard is structurally
     unavailable, which is why a hosted result carries a ``hosted`` paradigm and
     says so in a warning rather than reporting a number it cannot know.
+
+    ``execution`` is that distinction stated directly rather than left to be
+    inferred from the backend's name: ``dex`` means dex ran the statement and the
+    cost guard applied, ``vendor`` means the semantic layer ran it and no guard
+    could. ``vendor`` and ``deployment`` are the other two axes ``backend``
+    collapses; ``backend`` itself stays, unchanged, as the released spelling.
     """
 
     backend: str = ""
+    vendor: str = ""
+    deployment: str = ""
+    execution: str = ""
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -379,14 +400,20 @@ class SemanticQueryResult(Result):
 
     @classmethod
     def from_capped(
-        cls, payload: dict[str, Any], *, backend: str, **fields: Any
+        cls, payload: dict[str, Any], *, backend: Any, **fields: Any
     ) -> SemanticQueryResult:
         """Build from :func:`~.semantic.cap_columnar` output, whose ``notes``
-        record every cut it made and therefore belong on the result's notes."""
+        record every cut it made and therefore belong on the result's notes.
+
+        ``backend`` is the answering backend itself, not its name: it declares its
+        own provenance as class attributes, so a new one is described correctly
+        without every construction site being taught about it."""
+
+        from .semantic import backend_axes
 
         payload = dict(payload)
         notes = payload.pop("notes", [])
-        return cls(backend=backend, notes=notes, **payload, **fields)
+        return cls(**backend_axes(backend), notes=notes, **payload, **fields)
 
     def data(self) -> dict[str, Any]:
         payload = {
@@ -396,7 +423,48 @@ class SemanticQueryResult(Result):
             "row_count": self.row_count,
             "truncated": self.truncated,
             "backend": self.backend,
+            "vendor": self.vendor,
+            "deployment": self.deployment,
+            "execution": self.execution,
         }
         if self.query_id is not None:
             payload["query_id"] = self.query_id
         return payload
+
+
+class SemanticValuesResult(SemanticQueryResult):
+    """One semantic dimension's value domain, from whichever backend answered.
+
+    A subclass rather than a sibling. The envelope shape, the four provenance
+    axes, and the capped-columnar construction are the same object; what differs is
+    what the result is about, and inheriting is what keeps a new provenance field
+    from having to be added twice.
+
+    ``dimension`` is the token that was asked for, grain suffix included, so a
+    caller reading a stored result knows which question it answers.
+
+    ``scoped_to`` is the metrics the values were reached through, and it changes
+    what the answer *means* rather than only how it was obtained: unscoped, these
+    are the values of the column behind the dimension; scoped, they are the values
+    present for those metrics, which on a filtered or sparsely joined metric is a
+    subset. Empty means the first. That is why it is a payload field and not a
+    note, and why the notes name the metric when dex chose one itself.
+
+    ``notes`` is always reported, like ``query`` and ``diagram``: an empty list is
+    the positive statement that nothing was capped and nothing was narrowed.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    dimension: str = ""
+    scoped_to: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        # The two fields that say what was asked lead, for the reason the catalog
+        # leads with its provenance: key order means nothing to a parser and
+        # everything to an agent reading a truncated result.
+        return {
+            "dimension": self.dimension,
+            "scoped_to": self.scoped_to,
+            **super().data(),
+        }

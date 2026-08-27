@@ -445,18 +445,53 @@ class EntityAffixes(BaseModel):
     )
 
 
-class SemanticConfig(BaseModel):
-    """How ``explore semantic`` reaches the semantic layer.
+# Which deployments each semantic-layer vendor ships, and the spellings that name
+# them. One vendor today; the table exists because `backend:` collapsed vendor and
+# deployment into one enum, which only extends while there is exactly one vendor.
+# `api` and `cloud` are released spellings of `dbt_cloud` and stay accepted.
+SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {"dbt": ("local", "dbt_cloud")}
+_SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
+    "local": "local",
+    "dbt_cloud": "dbt_cloud",
+    "api": "dbt_cloud",
+    "cloud": "dbt_cloud",
+}
 
-    Two backends, selected by ``backend`` and overridable per command with
-    ``--local`` / ``--api``. ``local`` renders metric queries with MetricFlow and
-    executes them through dex's own connector and cost guard, so a dbt project
-    must be present (like DuckDB needs a local file). ``dbt_cloud`` sends the
-    query to a hosted dbt Cloud Semantic Layer over GraphQL and needs no local
-    project (like BigQuery needs no local DuckDB); dbt Cloud owns the warehouse
-    connection and executes server-side, so **dex's cost guard does not apply on
-    that path** (the dbt Cloud environment governs spend, and every hosted result
-    says so).
+
+def canonical_semantic_deployment(value: str) -> str:
+    """One deployment spelling, canonicalized. Unknown values pass through so the
+    validator (or the backend resolver, for a duck-typed config) can refuse them
+    by name rather than silently mapping them onto something that exists."""
+
+    key = (value or "").strip().lower()
+    return _SEMANTIC_DEPLOYMENT_SPELLINGS.get(key, key)
+
+
+class SemanticConfig(BaseModel):
+    """How ``explore semantic`` reaches the semantic layer, on two axes.
+
+    ``vendor`` is which semantic-layer format answers (``dbt``/MetricFlow today).
+    It is ambient per repo, chosen once, the same rule ``connector:`` follows: a
+    repo has one semantic layer, so there is no more reason to retype the vendor
+    per command than to retype the warehouse.
+
+    ``deployment`` is which endpoint or artifact of that vendor is read. For dbt:
+    ``local`` renders metric queries with MetricFlow and executes them through
+    dex's own connector and cost guard, so a dbt project must be present (like
+    DuckDB needs a local file); ``dbt_cloud`` sends the query to a hosted dbt Cloud
+    Semantic Layer over GraphQL and needs no local project (like BigQuery needs no
+    local DuckDB).
+
+    A third property, **who executes**, is derived from those two and never
+    configured, because it is what decides whether the cost guard can apply at
+    all. Each backend declares it (``execution``: ``dex`` or ``vendor``) and every
+    result carries it. ``--local`` / ``--api`` override that axis for one command.
+
+    ``backend`` is the released spelling of the two axes as one enum and is still
+    accepted: ``local`` reads as dbt plus the local deployment, ``dbt_cloud`` as
+    dbt plus the hosted one. Setting both is fine while they agree and refused
+    when they contradict, because a config dex accepts and then ignores is worse
+    than one it refuses.
 
     ``host`` and ``environment_id`` are the non-secret hosted coordinates, copied
     from the dbt Cloud Semantic Layer panel (or ``DBT_SL_HOST`` / ``DBT_SL_ENV_ID``
@@ -465,8 +500,58 @@ class SemanticConfig(BaseModel):
     """
 
     backend: str = "local"
+    vendor: str = "dbt"
+    deployment: str | None = None
     host: str | None = None
     environment_id: str | None = None
+
+    @model_validator(mode="after")
+    def _check_axes(self) -> SemanticConfig:
+        vendor = (self.vendor or "").strip().lower()
+        if vendor not in SEMANTIC_DEPLOYMENTS:
+            raise ValueError(
+                f"semantic.vendor must be one of "
+                f"{', '.join(sorted(SEMANTIC_DEPLOYMENTS))}, got '{self.vendor}'"
+            )
+        allowed = SEMANTIC_DEPLOYMENTS[vendor]
+
+        from_backend = canonical_semantic_deployment(self.backend)
+        explicit_backend = "backend" in self.model_fields_set
+        if explicit_backend and from_backend not in allowed:
+            raise ValueError(
+                f"semantic.backend '{self.backend}' names no deployment of vendor "
+                f"'{vendor}'; use one of {', '.join(allowed)}"
+            )
+
+        if self.deployment is None:
+            deployment = from_backend
+        else:
+            deployment = canonical_semantic_deployment(self.deployment)
+            if deployment not in allowed:
+                raise ValueError(
+                    f"semantic.deployment must be one of {', '.join(allowed)} for "
+                    f"vendor '{vendor}', got '{self.deployment}'"
+                )
+            # Refused rather than resolved by precedence: the two keys are two
+            # spellings of one choice, and picking a winner would leave the other
+            # accepted and ignored, which reads as a setting that took effect.
+            if explicit_backend and deployment != from_backend:
+                raise ValueError(
+                    f"semantic.backend '{self.backend}' and semantic.deployment "
+                    f"'{self.deployment}' name different deployments. They are two "
+                    "spellings of one choice; keep whichever you prefer and remove "
+                    "the other"
+                )
+
+        # Written through ``object.__setattr__`` so the derived values do not join
+        # ``model_fields_set``: ``save_config`` dumps with ``exclude_unset``, and a
+        # derived default written back into the committed file would read as a
+        # choice the author made. ``backend`` is kept consistent with the canonical
+        # deployment rather than left stale, so either spelling answers correctly.
+        object.__setattr__(self, "vendor", vendor)
+        object.__setattr__(self, "deployment", deployment)
+        object.__setattr__(self, "backend", deployment)
+        return self
 
 
 class CacheConfig(BaseModel):

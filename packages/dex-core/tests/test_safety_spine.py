@@ -10,6 +10,7 @@ logic arrives.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -4947,9 +4948,135 @@ def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
             )
         ]
     )
-    backend = LocalMetricFlowBackend(project, _memory_engine(), "duckdb", QueryLimits())
+    # The project format is injected, because the gate resolves a dimension to its
+    # physical column through the project seam now rather than by parsing the
+    # compiled artifact itself. The seam is what must keep the evidence flowing.
+    from exmergo_dex_core.adapters.project import DbtProject
+
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
     lookup = backend._cache_pii_lookup(cache)
     assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
+
+
+def test_local_semantic_pii_evidence_follows_a_join_resolved_dimension(
+    tmp_path: Path,
+):
+    # Family 3, on the tokens the join resolution added. A metric can be grouped by
+    # a dimension declared in a model it joins to, and resolving those paths puts
+    # tokens in the catalog that a caller can now name. A token the gate cannot
+    # resolve to a physical column is screened on its name alone, which is the
+    # fail-closed floor rather than an equivalent, so every path the resolution
+    # adds has to reach the same evidence a declared token reaches.
+    import json as _json
+
+    from exmergo_dex_core import dbt_project
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import screen_dimension_refs
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "joined"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "users",
+                        "node_relation": {
+                            "alias": "dim_users",
+                            "relation_name": "wh.main.dim_users",
+                        },
+                        "entities": [{"name": "user", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [],
+                    },
+                    {
+                        "name": "sessions",
+                        "node_relation": {
+                            "alias": "fct_sessions",
+                            "relation_name": "wh.main.fct_sessions",
+                        },
+                        "entities": [
+                            {"name": "session", "type": "primary"},
+                            {"name": "user", "type": "foreign"},
+                        ],
+                        "dimensions": [],
+                        "measures": [{"name": "session_count", "agg": "count"}],
+                    },
+                ],
+                "metrics": [
+                    {
+                        "name": "sessions",
+                        "type": "simple",
+                        "type_params": {"input_measures": [{"name": "session_count"}]},
+                    }
+                ],
+            }
+        )
+    )
+
+    def resolve(_manifest_text):
+        # The resolver's answer, stated here rather than asked of MetricFlow: this
+        # suite installs no [semantic] extra, and the claim under test is what the
+        # gate does with a resolved path, not how the path was resolved.
+        return {
+            "sessions": [
+                dbt_project.ResolvedPath(
+                    "session__user__contact", "contact", "users", "categorical"
+                )
+            ]
+        }
+
+    class _Layer(DbtProject):
+        def semantic_catalog(self):
+            return dbt_project.semantic_catalog(self.project_dir, resolve_paths=resolve)
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.dim_users",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        _Layer(project.parent, project),
+    )
+    # The name says nothing: `session__user__contact` matches no PII pattern, so the
+    # column's own evidence is the only thing that refuses this query.
+    assert not screen_dimension_refs(["session__user__contact"])
+    lookup = backend._cache_pii_lookup(cache)
+    assert dict(screen_dimension_refs(["session__user__contact"], meta_lookup=lookup))
 
 
 def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Path):
@@ -5002,6 +5129,279 @@ def test_hosted_semantic_pii_dimension_refused_not_surfaced():
         backend.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
     # refused before the query was ever submitted for execution
     assert not any("createQuery" in posted for posted in backend.posted)
+
+
+def test_a_dimensions_values_are_refused_when_the_layer_flags_it():
+    # Family 3, at its sharpest. `explore semantic values` returns nothing but the
+    # values of one dimension, so there is no aggregate for a flagged dimension to
+    # hide behind and no reduced answer to fall back to: the command is refused.
+    # The gate that decides is the authoritative one, asked per metric and unioned,
+    # so a dimension whose NAME gives nothing away is still caught.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQueryRefusedError,
+        screen_dimension_refs,
+    )
+
+    flagged = {"name": "agent__operator_handle", "config": {"meta": {"pii": True}}}
+    backend = FakeHostedBackend(
+        metrics=[
+            {
+                "name": "agent_runs",
+                "dimensions": [{"name": "agent__operator_handle"}],
+            }
+        ],
+        dimensions_meta=[flagged],
+    )
+    assert not screen_dimension_refs(["agent__operator_handle"])
+
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.values("agent__operator_handle", [])
+    # Refused before the values query was ever submitted for execution, so the
+    # warehouse never read the column.
+    assert not any("createDimensionValuesQuery" in q for q in backend.posted)
+
+
+def test_a_local_dimensions_values_are_refused_on_the_columns_own_evidence(
+    tmp_path: Path,
+):
+    # The same refusal on the other backend, decided by the other authority: the
+    # .dex cache's value-evidence flag on the physical column the dimension
+    # resolves to, reached through the project seam. Refused before anything is
+    # rendered, so no statement exists that could reach a connection.
+    import json as _json
+
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import SemanticQueryRefusedError
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "proj"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "orders",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": "wh.main.orders",
+                        },
+                        "entities": [{"name": "order", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [{"name": "order_count", "agg": "count"}],
+                    }
+                ],
+                "metrics": [
+                    {
+                        "name": "orders",
+                        "type": "simple",
+                        "type_params": {"input_measures": [{"name": "order_count"}]},
+                    }
+                ],
+            }
+        )
+    )
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
+    backend._load_cache = lambda: DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.orders",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+
+    def _never(*_args, **_kwargs):
+        raise AssertionError("rendering was reached past the gate")
+
+    backend._metricflow_engine = _never
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.values("order__contact", [])
+
+
+def test_a_values_result_is_columnar_and_passes_the_sanitizer(capsys):
+    # Family 5. A values result is the one payload on this surface whose whole
+    # point is column values, so it is exactly the shape the sanitizer exists to
+    # judge: columnar, never row dicts, and never keyed by anything a caller named.
+    from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core import envelope as env
+    from exmergo_dex_core.results import to_envelope
+
+    backend = FakeHostedBackend(
+        metrics=[{"name": "sessions", "dimensions": [{"name": "user__pricing_tier"}]}],
+        result=table_json_result(
+            ["user__pricing_tier"], ["string"], [["free"], ["pro"]]
+        ),
+    )
+    env.emit(to_envelope(backend.values("user__pricing_tier", [])))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["cells"] == [["free"], ["pro"]]
+    assert SECRET_TOKEN not in json.dumps(payload)
+
+
+def test_hosted_values_is_warn_only_never_silently_priced():
+    # Family 4, on the second hosted command. dbt Cloud owns the warehouse
+    # connection here too, so there is no estimate dex could honestly report and
+    # no ceiling it could have enforced, and every result has to say so rather
+    # than report a zero that reads as free.
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core import envelope as env
+
+    backend = FakeHostedBackend(
+        metrics=[{"name": "sessions", "dimensions": [{"name": "user__pricing_tier"}]}],
+        result=table_json_result(["user__pricing_tier"], ["string"], [["free"]]),
+    )
+    record = backend.values("user__pricing_tier", [])
+    assert record.cost.paradigm == env.Paradigm.HOSTED
+    assert record.cost.estimate is None and record.cost.ceiling is None
+    assert any("cost guard unavailable" in w for w in record.warnings)
+
+
+def test_the_hosted_pii_map_covers_every_metric_in_a_multi_metric_query():
+    # Family 3, and the reason the gate asks one metric at a time. The API's
+    # `dimensions(metrics: [a, b])` returns the dimensions common to ALL the
+    # listed metrics, not their union, so asking once for a multi-metric query
+    # shrinks the authoritative map instead of growing it: everything outside the
+    # intersection falls through to the name heuristic. A dimension the dbt
+    # project marked `meta: {pii: true}` whose name carries no PII signal then
+    # passes the gate and is grouped and projected. "PII is flagged, never
+    # surfaced" does not survive that, and a note after the fact is not the same
+    # as a refusal.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+        screen_dimension_refs,
+    )
+
+    clean = {"name": "user__pricing_tier", "config": {"meta": {}}}
+    flagged = {"name": "agent__operator_handle", "config": {"meta": {"pii": True}}}
+    # Two metrics from two semantic models: the flagged dimension is reachable
+    # from one of them, so it is exactly what an intersection drops.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "active_users": [clean],
+            "agent_runs": [clean, flagged],
+        }
+    )
+    # Nothing about the name gives it away, which is what makes the layer's own
+    # metadata the only thing standing between this dimension and stdout.
+    assert not screen_dimension_refs(["agent__operator_handle"])
+
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(
+            SemanticQuery(
+                metrics=["active_users", "agent_runs"],
+                group_by=["agent__operator_handle"],
+            )
+        )
+    assert not any("createQuery" in posted for posted in backend.posted)
+
+
+def test_the_hosted_pii_map_adjudicates_rather_than_disclosing_a_gap():
+    # The other half of the same invariant. Blocking is not enough: a dimension
+    # the layer documented must be *adjudicated*, not cleared by the heuristic and
+    # then disclosed as unscreened, because a note is the part of a payload a
+    # caller is least likely to act on. So a ref the layer speaks to leaves
+    # nothing unadjudicated, and a grain suffix (which no dimension name carries)
+    # is not enough on its own to drop a ref back to the floor.
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery, unadjudicated_refs
+
+    dims = {
+        "active_users": [{"name": "user__pricing_tier", "config": {"meta": {}}}],
+        "agent_runs": [
+            {"name": "agent__mode", "config": {"meta": {"pii": False}}},
+            {"name": "user__created_at", "config": {"meta": {"pii": False}}},
+        ],
+    }
+    backend = FakeHostedBackend(
+        dimensions_meta=dims,
+        result=table_json_result(["active_users"], ["number"], [[5.0]]),
+    )
+    query = SemanticQuery(
+        metrics=["active_users", "agent_runs"],
+        group_by=["agent__mode", "user__created_at__month"],
+    )
+    meta, _ = backend._query_metadata(query.metrics)
+    lookup = backend._meta_lookup(meta)
+    assert unadjudicated_refs(query.group_by, meta_lookup=lookup) == []
+
+    result = backend.query(query)
+    assert not any("name heuristic alone" in note for note in result.notes)
+
+
+def test_a_filter_a_backend_cannot_read_is_refused_rather_than_half_screened():
+    # Family 3, and the gate's other structural fail-open. A metric query touches
+    # dimensions two ways: the group_by tokens and the dimensions its filter
+    # clauses name. The filter dialect belongs to the answering layer, so the
+    # backend reads it; a backend that cannot has to refuse the query, because the
+    # gate's disclosures can only report on refs the extraction found. An extractor
+    # that matches nothing produces a successful query, no blocks and no notes,
+    # with every filtered dimension grouped and projected and nothing saying it was
+    # never examined. Both shipped backends read MetricFlow's dialect, so this is
+    # the contract a third one inherits rather than a live path.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+    )
+
+    class _NoFilterDialect(FakeHostedBackend):
+        def filter_refs(self, clauses):
+            return None
+
+    backend = _NoFilterDialect(
+        dimensions_meta={"sessions": [{"name": "user__email", "config": None}]}
+    )
+    filtered = SemanticQuery(
+        metrics=["sessions"],
+        group_by=["session__mode"],
+        where=['{"member": "users.email", "operator": "set"}'],
+    )
+    with pytest.raises(SemanticQueryRefusedError, match="filter dialect"):
+        backend.query(filtered)
+    assert not any("createQuery" in posted for posted in backend.posted)
+
+    # The same backend still answers an unfiltered query: the refusal is scoped to
+    # the input it cannot screen, not to the backend.
+    unfiltered = SemanticQuery(metrics=["sessions"], group_by=["user__email"])
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(unfiltered)
 
 
 def test_hosted_semantic_pii_gate_still_binds_on_an_injected_token(monkeypatch):
@@ -5390,3 +5790,124 @@ def test_duckdb_cannot_be_reached_through_an_injected_connection(duckdb_file: Pa
 
     with pytest.raises(ValueError, match="read-only"):
         DexEngine(config=config, connection=writable)._adapter("explore inventory")
+
+
+def test_the_semantic_layer_read_costs_the_warehouse_nothing(
+    tmp_path: Path, monkeypatch, capsys
+):
+    # Family 2: `--use-project` now folds a semantic layer into the map, and that
+    # read is a compiled-artifact parse and nothing else. A project read that
+    # quietly issued a statement would be spend the cost handshake never priced
+    # and the estimate never covered, which is the failure mode the guard exists
+    # for and the one a "free" read is most likely to introduce.
+    #
+    # Asserted as a delta rather than as an absolute: the map's own profiling
+    # statements are the subject of other tests, and what has to hold here is that
+    # adding the semantic read adds none of them.
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE customers (id INTEGER, region VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'eu')")
+    conn.execute("CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "target").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n', encoding="utf-8"
+    )
+    (repo / "target" / "semantic_manifest.json").write_text(
+        json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "customers_sm",
+                        "node_relation": {
+                            "alias": "customers",
+                            "relation_name": '"a"."main"."customers"',
+                        },
+                        "entities": [
+                            {"name": "customer", "type": "primary", "expr": "id"}
+                        ],
+                        "dimensions": [{"name": "region", "type": "categorical"}],
+                        "measures": [{"name": "n", "agg": "count", "expr": "id"}],
+                    },
+                    {
+                        "name": "orders_sm",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": '"a"."main"."orders"',
+                        },
+                        "entities": [
+                            {"name": "order", "type": "primary", "expr": "order_id"},
+                            {
+                                "name": "customer",
+                                "type": "foreign",
+                                "expr": "buyer_id",
+                            },
+                        ],
+                        "dimensions": [],
+                        "measures": [{"name": "m", "agg": "count"}],
+                    },
+                ],
+                "metrics": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    statements: list[str] = []
+    original = DuckDBAdapter._run_select
+
+    def counting(self, sql, params=None):
+        statements.append(sql)
+        return original(self, sql, params)
+
+    monkeypatch.setattr(DuckDBAdapter, "_run_select", counting)
+
+    def run(*extra: str) -> int:
+        statements.clear()
+        cache = repo / ".dex"
+        if cache.is_dir():
+            shutil.rmtree(cache)
+        _run(
+            [
+                "explore",
+                "map",
+                "--path",
+                str(db),
+                "--repo-root",
+                str(repo),
+                *extra,
+            ],
+            capsys,
+        )
+        return len(statements)
+
+    bare = run()
+    with_layer = run("--use-project")
+
+    assert with_layer == bare, (
+        "folding the semantic layer into the map changed how many statements "
+        f"reached the warehouse ({bare} -> {with_layer}). The link is a read of a "
+        "compiled artifact; a version of it that scans is spend nothing priced"
+    )
+
+    # And the read did happen, so the equality above is not the trivial one.
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    edges = [e for e in payload["data"]["edges"] if e["declared_by"]]
+    assert edges and edges[0]["declared_by"] == "semantic entity 'customer'"

@@ -67,6 +67,7 @@ if TYPE_CHECKING:
         RelationshipsResult,
         SemanticListResult,
         SemanticQueryResult,
+        SemanticValuesResult,
     )
     from .maintain.results import DriftResult, ReconcileResult, SnapshotResult
     from .references import ReferencesResult
@@ -750,11 +751,40 @@ class DexEngine:
     # serve metric queries with nothing on the filesystem and only [semantic-api]
     # installed. Reaching through the heavier module would quietly require both.
     def semantic_list(
-        self, *, api: bool = False, local: bool = False
+        self,
+        *,
+        metrics: list[str] | None = None,
+        for_dimensions: list[str] | None = None,
+        search: list[str] | None = None,
+        full: bool = False,
+        api: bool = False,
+        local: bool = False,
     ) -> SemanticListResult:
         from .explore.semantic import commands as semantic_cmds
 
-        return semantic_cmds.semantic_list(self, api=api, local=local)
+        return semantic_cmds.semantic_list(
+            self,
+            metrics=metrics,
+            for_dimensions=for_dimensions,
+            search=search,
+            full=full,
+            api=api,
+            local=local,
+        )
+
+    def semantic_values(
+        self,
+        dimension: str,
+        *,
+        metrics: list[str] | None = None,
+        api: bool = False,
+        local: bool = False,
+    ) -> SemanticValuesResult:
+        from .explore.semantic import commands as semantic_cmds
+
+        return semantic_cmds.semantic_values(
+            self, dimension, metrics=metrics, api=api, local=local
+        )
 
     def semantic_query(
         self,

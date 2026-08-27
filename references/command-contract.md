@@ -16,7 +16,12 @@ logic.
   holds the envelope contract even there: with no `uv` on `PATH` it refuses with a
   `reason: prerequisite` error envelope naming the install command, rather than
   failing the exec. It is the one refusal built by hand, because the engine that
-  would otherwise build it is what is missing.
+  would otherwise build it is what is missing. Two commands need more than a
+  warehouse client, and both are resolved the same way, from the command being run
+  rather than installed always: `explore cluster` adds `[cluster]`, and
+  `explore semantic` adds `[semantic-api]` plus, where a statement might be
+  rendered locally (any mode but `list`, without `--api`), `[semantic]`. A repo
+  that runs neither resolves neither scikit-learn nor MetricFlow.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.
@@ -47,6 +52,8 @@ dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
+                                     (declared covers both a relationships test and a join the
+                                     semantic layer declares; `semantic_join_count` splits them)
 dex explore map [--detail]        -> write/update the .dex cache, and return the map:
                                      per top-ranked object its grain, key, notable
                                      columns, PII flags and data-quality findings,
@@ -56,7 +63,9 @@ dex explore map [--detail]        -> write/update the .dex cache, and return the
                                      never the caps. No column value ever appears
 dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
                                      free and connectionless (a store read, no warehouse);
-                                     declared joins solid, inferred dotted, and a cardinality
+                                     declared joins solid (a relationships test or a shared
+                                     semantic-layer entity, the latter naming the entity in
+                                     its label), inferred dotted, and a cardinality
                                      drawn only where the cache proved it; draws profiled,
                                      joined objects with their grain/key/join/PII columns
                                      (--full for every eligible object and column); every
@@ -68,6 +77,41 @@ dex explore cluster <object>      -> k-means over a bounded sample of numeric no
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows
                                      (--features to choose columns, -k to fix the cluster count)
+dex explore semantic list         -> the semantic layer as the object graph it is, in one shape from either
+  [--metric <m>]                     backend: semantic models, metrics (composition, the measures behind the
+  [--for-dimension <d>]              number, the grains it can be queried at, and the time column a time
+  [--search <t>] [--full]            grouping resolves to), dimensions, entities with one declaration per
+  [--local|--api]                    semantic model, and measures. Each semantic model carries the physical
+                                     relation it sits on and each element the column behind it, which is what
+                                     connects a metric to the objects `explore map` describes; the hosted API
+                                     exposes no relation and declares that gap. Costs no warehouse query on
+                                     either backend.
+                                     Three ways to narrow it, all free and all composable, and all named in
+                                     the payload so a subset is never mistaken for the layer. --metric keeps
+                                     those metrics and what they reach; --for-dimension is the reverse lookup,
+                                     the metrics groupable by all the named tokens, which is also the cheapest
+                                     way to find the metrics that share an axis; --search matches a word
+                                     against every element's name and the project's own words about it, and
+                                     resolves to the metrics it touches. A search term that matches nothing is
+                                     named in a note rather than refusing, unlike an unknown metric name.
+                                     Budgeted like `explore map`: 50 semantic models, 60 metrics, 150
+                                     dimension rows, 50 entities, 60 measures, 40 groupable tokens per metric.
+                                     Every cut is counted in `elided` and named in `notes`, `elided` is present
+                                     with its zeros so a complete catalog says so, and --full lifts the caps.
+                                     The defaults leave an ordinary layer uncut, so a cap only bites one that
+                                     was already too large to read in one payload
+dex explore semantic values <d>   -> one dimension's value domain: what a filter on it may be filtered to,
+  [--metric <m>] [--local|--api]     capped and columnar like `explore query`. A PII-flagged dimension refuses
+                                     the command rather than being screened, because the whole output is
+                                     values. `scoped_to` says whether these are the column's own values or the
+                                     ones present for a metric, which is the only way a dimension behind a
+                                     join can be read at all
+dex explore semantic query <m,m>  -> one governed metric query, capped and row-major like `explore query`.
+  [--group-by <d>] [--where <f>]     --local renders the SQL with MetricFlow and executes it through dex's own
+  [--order-by <c>] [--grain <g>]     connector, PII gate, read-only assertion, relation pre-check and cost
+  [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
+                                     server-side where dex's cost guard is structurally unavailable and every
+                                     result says so
 dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their
@@ -421,6 +465,29 @@ warn when the baseline was pinned from a cache older than
 `profile_freshness_hours`, judged on the capture time recorded in the baseline
 rather than on which file was written last, so re-pinning cannot silence it.
 
+**`explore semantic` queries the semantic layer; `transform` and the `semantic`
+group author it, and `maintain semantic` detects drift in it.** Two backends answer
+the same three subcommands through one abstraction, chosen ambiently by
+`semantic.vendor` and `semantic.deployment` in `.dex/config.yml` (the released
+`semantic.backend` spelling of the two is still accepted) and overridable per
+command with `--local` / `--api`. Those two flags name **who executes**, not which
+vendor: every catalog and every result reports it as `execution` (`dex` or
+`vendor`), and that is the axis the guards read. A vendor-executed backend owns the
+warehouse connection, so dex never holds a statement it could price or cap, and
+every hosted result carries a warning saying exactly that.
+
+`list` costs no warehouse query on either backend, and neither does the reverse
+lookup, which inverts the dimension list each metric already carries rather than
+asking the layer a second question. `values` and `query` each execute one, and both
+screen every dimension a request would touch before it is sent: on `query` a
+flagged dimension is refused from the grouping or the filter, and on `values` it
+refuses the command outright, since there is no aggregate to fall back to when the
+whole output is values. Where only the name heuristic could screen a dimension, the
+result says so, so weaker screening is never mistaken for evidence. The
+field-by-field catalog contract, the two backends' declared asymmetries, and what
+`dimension_scope` and `scoped_to` mean are in
+[`semantic-layer.md`](semantic-layer.md).
+
 `explore relationships` and `explore map` accept `--verify`, which measures each
 inferred join with one aggregate overlap probe (non-null foreign keys, orphan
 count) and adjusts its confidence; the result carries `verified` and
@@ -439,6 +506,29 @@ models reachable from metric definitions rank higher alongside the configured
 `ranking_hints`. The compiled manifest resolves names exactly when present;
 an uncompiled project falls back to name-based resolution and says so. A
 stale manifest (older than the model sources) is noted, not trusted silently.
+
+**The project's semantic layer folds in on the same flag**, in both directions,
+and neither direction costs a warehouse query.
+
+Every entity two semantic models share is a join the layer states outright, with
+the physical key named per model, so those arrive as **declared** joins at
+confidence 1.0 beside the `relationships` tests, through the same endpoint
+resolution and the same never-guess rule. `declared_by` on the edge names the
+entity, which is the part a reader can look up with `explore semantic list` and
+the only part the edge does not already carry; a `relationships` test leaves it
+unset, because it declares exactly the two columns the edge already names. An edge
+both channels declare is counted once. `notes` says how many came from the layer
+and, separately, how many of those name-based inference did not find, which is the
+case that matters: the layer routinely joins columns that share no name.
+
+In the other direction, each object in `data.objects` carries `semantic_models`,
+the models that sit on that relation. Empty is an answer: a relation nothing in the
+layer reads is a different object from one several metrics are built on, and row
+counts and PII flags cannot tell them apart. Every object in view is rewritten
+whenever the layer was read, so a model dropped from the layer clears rather than
+leaving a stale claim. A project with no compiled semantic layer contributes
+neither direction and is not an error on this path; `explore semantic list` is the
+command whose subject is the layer, and it is the one that refuses by name.
 
 **`explore map` returns the map, not a receipt for it.** Alongside the counts,
 `data.objects` carries each top-ranked object's row count, detected grain,

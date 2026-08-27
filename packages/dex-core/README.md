@@ -235,11 +235,26 @@ one. It starts bare by default; with `--use-project` it reads an existing
 dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
-writing back to `.dex/config.yml`. It also queries the dbt semantic layer
-(`explore semantic list` / `query`): metric queries run either locally through
-MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt Cloud
-deployment (`--api`), where dbt Cloud executes server-side and every result warns
-that dex's cost guard does not apply there.
+writing back to `.dex/config.yml`. It also reads and queries the dbt semantic layer
+(`explore semantic list` / `values` / `query`). `list` returns the layer's objects,
+semantic models and metrics and their composition and measures and dimensions and
+the declared entity graph, in one shape from either backend, scopeable to the
+metrics a caller came for (or, with `--for-dimension`, to the metrics a given slice
+is available on, or, with `--search`, to the metrics a word matches in a name or in
+the project's own prose) and costing no warehouse query. The catalog is budgeted
+like the map, with every cut counted in the payload and `--full` to lift the caps,
+so a complete answer says that it is complete. Each semantic model carries the
+relation it sits on and each element the column behind it, which is what connects a
+metric to the objects `explore map` and `explore profile` describe; the hosted
+backend exposes columns but no relations, and declares that gap rather than leaving
+it to be inferred. That link runs both ways: with `--use-project`, `explore map`
+marks each object with the semantic models that expose it and draws the joins the
+layer declares, at the declared tier and with the entity named. `values` returns one dimension's
+value domain, which is what you need before writing a filter and the only way to
+reach it at all on a hosted layer. Metric queries run either locally
+through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt
+Cloud deployment (`--api`), where dbt Cloud executes server-side and every result
+warns that dex's cost guard does not apply there.
 
 `transform`: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and

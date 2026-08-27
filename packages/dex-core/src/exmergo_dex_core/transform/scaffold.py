@@ -40,6 +40,11 @@ MACRO_ASSETS: dict[str, str] = {
         "rows, top-level keys only; native semi-structured value type on "
         "every connector"
     ),
+    "drop_orphan_relations": (
+        "drop named warehouse relations that no longer have a backing model "
+        "or source; dry-run by default, refuses to run at all if any named "
+        "relation is still a live model, seed, or snapshot"
+    ),
 }
 
 

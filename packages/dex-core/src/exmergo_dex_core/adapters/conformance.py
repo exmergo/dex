@@ -83,6 +83,7 @@ __all__ = [
     "MaintainProjectContract",
     "PlacingProjectContract",
     "ProjectFactoryContract",
+    "SemanticCatalogContract",
     "SemanticProjectContract",
 ]
 
@@ -561,6 +562,197 @@ class SemanticProjectContract:
             "categorical_dimensions names a field that is not a dimension: "
             f"{sorted(set(model.categorical_dimensions) - set(model.dimensions))}"
         )
+
+
+class SemanticCatalogContract:
+    """Opt-in, beside tier 2: the read catalog keeps what the fingerprint drops.
+
+    Mix in when your format implements
+    :class:`~.project.SemanticCatalogProject`::
+
+        class TestMyProject(SemanticCatalogContract, MaintainProjectContract):
+            def make_project(self): ...
+            def a_project_declaring_a_semantic_model(self): ...
+
+    **Why a separate contract from** :class:`SemanticProjectContract`. That one
+    checks the drift fingerprint, whose whole job is to reduce a layer to what a
+    comparison needs: a hash, and the column behind each field. This one checks
+    the opposite reduction. ``explore semantic list`` reads the catalog to answer
+    "what can I query, how, and what will the number mean", and every field that
+    answers it is a field the fingerprint correctly throws away: the element
+    types, the project's own labels and descriptions, a measure's aggregation, a
+    metric's composition, and the token a query actually groups by.
+
+    A format can therefore pass the fingerprint contract in full and return a
+    catalog of bare names, which reads to a caller as a layer nobody documented
+    and reduces the discovery surface to the thing it exists to replace.
+
+    **The entity assertion is the load-bearing one.** An entity's type is a
+    property of the (entity, semantic model) declaration, not of the entity: it is
+    primary in the model that keys it and foreign in every model that joins to it.
+    A format that returns one record per entity has to pick, and whichever it
+    picks is iteration order rather than a fact. Both of dex's own backends got
+    this wrong, in opposite directions, on one identical layer, which is why it is
+    asserted here rather than left to a reviewer to notice.
+    """
+
+    def make_project(self):  # pragma: no cover - provided by the subclass
+        raise NotImplementedError
+
+    def a_project_declaring_a_semantic_model(self):
+        # pragma: no cover - provided by the subclass
+        raise NotImplementedError
+
+    def test_the_format_declares_the_catalog_channel(self) -> None:
+        from .project import SemanticCatalogProject
+
+        project = self.make_project()
+        assert isinstance(project, SemanticCatalogProject), (
+            "semantic_catalog() is what `explore semantic list --local` reads, and "
+            "it is checked structurally rather than declared, so a format missing "
+            "the member is refused by name at the command rather than here. Drop "
+            "this mixin if the format reads no semantic layer"
+        )
+
+    def test_the_catalog_keeps_what_the_fingerprint_reduces_away(self) -> None:
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        assert [m.name for m in catalog.semantic_models], (
+            "the catalog carries no semantic models. The layer's organizing unit "
+            "is the semantic model, and a caller with none of them holds one "
+            "undifferentiated list of dimension names"
+        )
+        assert any(m.name == name for m in catalog.semantic_models), (
+            f"expected a semantic model named {name!r}, got "
+            f"{[m.name for m in catalog.semantic_models]}"
+        )
+        assert all(d.type for d in catalog.dimensions), (
+            "a dimension arrived with no type. Whether a dimension is time or "
+            "categorical decides how it can be grouped by, so a caller that has "
+            "to guess cannot build a valid query from this catalog"
+        )
+        assert all(m.agg for m in catalog.measures), (
+            "a measure arrived with no aggregation. A measure without its "
+            "aggregation cannot say what the number counts, which is the question "
+            "the catalog exists to answer"
+        )
+
+    def test_an_entity_carries_a_declaration_per_semantic_model(self) -> None:
+        project, _, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        for entity in catalog.entities:
+            assert entity.roles, (
+                f"entity {entity.name!r} carries no declarations. Its `type` is "
+                "then a single value with nothing behind it, and a value chosen "
+                "per entity rather than per declaration is iteration order"
+            )
+            assert all(r.semantic_model for r in entity.roles), (
+                f"a declaration of entity {entity.name!r} names no semantic "
+                "model, so a caller cannot tell which model it is primary in"
+            )
+            declared = {r.type for r in entity.roles}
+            expected = "primary" if "primary" in declared else next(iter(declared))
+            assert entity.type == expected, (
+                f"entity {entity.name!r} reports type {entity.type!r} while its "
+                f"declarations say {sorted(declared)}. The single value is derived: "
+                "primary wherever any declaration is primary"
+            )
+
+    def test_the_catalog_resolves_a_semantic_model_to_its_relation(self) -> None:
+        """A semantic model that names no relation leaves the layer disconnected.
+
+        The catalog and the physical catalog are two views of one warehouse, and
+        the relation on a semantic model is the whole join between them: it is what
+        answers "which table is behind this metric", what lets ``explore map`` say
+        an object is exposed, and what an entity's declared join is drawn between.
+        A format that reads a layer but resolves none of it to a relation returns a
+        catalog that cannot be connected to anything the rest of ``explore``
+        describes.
+
+        Declining is still possible and is not this: a backend that structurally
+        cannot know the relation declares that gap, which is a different statement
+        from a format that could and did not.
+        """
+
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        model = next(m for m in catalog.semantic_models if m.name == name)
+        assert model.relation, (
+            f"semantic model {name!r} resolves to no physical relation, so nothing "
+            "connects this layer to the objects explore profiles and maps"
+        )
+
+    def test_an_element_carries_its_column_and_never_invents_one(self) -> None:
+        """The same rule the fingerprint follows, on the read catalog.
+
+        Two failures, opposite in direction and both live. A catalog whose columns
+        are all absent cannot reach a physical column at all, which is what the PII
+        gate needs to adjudicate a dimension from evidence rather than from the
+        shape of its name. A catalog that invents a column out of an expression is
+        worse: the gate then screens a column that is not the one behind the
+        element and reports the verdict as evidence-backed.
+
+        The fixture's own mapping is the oracle, including its ``None`` entries, so
+        a format is held to what it said its layer contains rather than to a shape.
+        """
+
+        project, name, dimensions, measures = (
+            self.a_project_declaring_a_semantic_model()
+        )
+        catalog = project.semantic_catalog()
+
+        for element, expected in (
+            (
+                {
+                    d.definition: d.column
+                    for d in catalog.dimensions
+                    if d.semantic_model == name
+                },
+                dimensions,
+            ),
+            (
+                {
+                    m.name: m.column
+                    for m in catalog.measures
+                    if m.semantic_model == name
+                },
+                measures,
+            ),
+        ):
+            for field, column in expected.items():
+                assert field in element, (
+                    f"the catalog carries no entry for {field!r} on {name!r}; the "
+                    "fixture declares it, so the read dropped it"
+                )
+                assert element[field] == column, (
+                    f"{field!r} on {name!r} carries column {element[field]!r} where "
+                    f"the fixture says {column!r}. None is the honest answer for an "
+                    "expression: a column guessed out of one makes the PII gate "
+                    "screen the wrong column and call it evidence"
+                )
+
+    def test_a_dimension_row_names_the_token_a_query_groups_by(self) -> None:
+        """The catalog's ``name`` is a query token, not a display name.
+
+        A caller builds a group-by out of it, so a format that returns the bare
+        declared name where the layer requires a qualified path hands back a
+        catalog whose every dimension fails at query time.
+        """
+
+        project, _, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        listed = {d.name for d in catalog.dimensions}
+        for metric in catalog.metrics:
+            missing = sorted(set(metric.dimensions) - listed - {"metric_time"})
+            assert not missing, (
+                f"metric {metric.name!r} says it can be grouped by {missing}, and "
+                "no dimension row carries those names. The two must be the same "
+                "vocabulary or neither can be acted on"
+            )
 
 
 class MaintainProjectContract(ExploreProjectContract):

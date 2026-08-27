@@ -126,6 +126,16 @@ class Dataset(BaseModel):
     rank_score: float | None = None
     data_quality: list[str] = Field(default_factory=list)
     profiled_at: str | None = None
+    #: The semantic models that sit on this relation, from the project's own
+    #: semantic layer. This is the physical catalog's half of a link the semantic
+    #: catalog carries in the other direction, and it is what makes "is this table
+    #: load-bearing" answerable from the map: a relation several metrics are built
+    #: on is a different object from one nothing reads, and the two are
+    #: indistinguishable by row count and PII flags alone. Empty means the layer
+    #: exposes it through no model **or** that no project was read, which is why
+    #: it is folded in only under `--use-project` and stated in the payload rather
+    #: than inferred from its absence.
+    semantic_models: list[str] = Field(default_factory=list)
 
     def notable_columns(
         self,
@@ -190,8 +200,18 @@ class RelationshipKind(str, Enum):
 
 
 class Relationship(BaseModel):
-    """A join between two datasets: declared (FK / dbt), inferred (a name-based
-    heuristic), or overlap-inferred (a name-blind value-containment probe).
+    """A join between two datasets: declared (a project's own statement), inferred
+    (a name-based heuristic), or overlap-inferred (a name-blind value-containment
+    probe).
+
+    A declared edge has two possible sources and they are equally authoritative: a
+    ``relationships`` test, which is the project's claim that a foreign key holds,
+    and a semantic layer's shared entity, which is a join the layer will actually
+    perform with a key it names per model. ``declared_by`` names the second, whose
+    name (the entity) is something a reader can look up and the edge does not
+    otherwise carry. It stays unset for a ``relationships`` test, which declares
+    exactly the two columns the edge already names, so repeating them there would
+    be noise rather than provenance.
 
     ``verified`` and ``orphan_fraction`` are set by the opt-in ``--verify``
     overlap probe on a DECLARED or INFERRED edge: a name-based join stays a
@@ -218,6 +238,7 @@ class Relationship(BaseModel):
     confidence: float | None = None
     verified: bool = False
     orphan_fraction: float | None = None
+    declared_by: str | None = None
 
 
 def match_identifier(name: str, known: list[str]) -> list[str]:

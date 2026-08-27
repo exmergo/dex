@@ -1,433 +1,107 @@
-"""The semantic-layer query surface: one intent, one envelope, two backends.
+"""Governed semantic-layer discovery and query primitives.
 
-``explore semantic`` lets an agent discover metrics and dimensions and run
-governed metric queries against the dbt semantic layer. Two backends share the
-intent grammar and the columnar envelope but differ in who executes and how spend
-and PII are governed:
-
-- ``local`` (:mod:`.local`): MetricFlow renders the metric SQL with ``explain()``
-  and dex executes it through its own connector, cost guard, and PII request-gate.
-  A dbt project must be present, the way DuckDB needs a local file.
-- ``dbt_cloud`` (:mod:`.hosted`): the query is sent to a hosted dbt Cloud Semantic
-  Layer over GraphQL and needs no local project, the way BigQuery needs no local
-  DuckDB. dbt Cloud owns the warehouse connection and executes server-side, so
-  dex's cost guard is structurally unavailable on that path (every hosted result
-  says so) and PII is gated from the layer's own metadata plus a name heuristic.
-
-Backend selection is ambient, mirroring how the warehouse connector resolves: the
-``.dex/config.yml`` ``semantic.backend`` default, overridable per command with
-``--local`` / ``--api``.
+The package root is intentionally an export surface only. Domain, response,
+policy, and backend concerns live in dependency-directed leaf modules so adding
+a hosted-only feature cannot accidentally import MetricFlow or a SQL dialect.
 """
 
-from __future__ import annotations
-
-import re
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
-from typing import Any, Protocol
-
-from ...errors import DexError
-
-# The confidence at or above which a name-detected PII category refuses a query,
-# shared with the query firewall so the two surfaces block at the same threshold.
-# Imported from the guards package, not from the firewall: this package must stay
-# importable without a dialect engine, because the hosted backend parses no SQL.
 from ...guards import PII_BLOCK_CONFIDENCE
-from ..profile import detect_pii
-
-
-def _split_tokens(raw: list[str]) -> list[str]:
-    """Flatten repeated and comma-joined name lists into one clean token list.
-
-    A metric, dimension, or entity name is an identifier, so a comma can never be
-    part of one and splitting on it is lossless. Never apply this to ``where``,
-    whose Jinja clauses carry commas of their own
-    (``{{ TimeDimension('metric_time', 'month') }}``).
-    """
-
-    return [part.strip() for entry in raw for part in entry.split(",") if part.strip()]
-
-
-@dataclass
-class SemanticQuery:
-    """A backend-neutral metric query: the grammar shared by MetricFlow, the dbt
-    Cloud GraphQL API, and the JDBC macro.
-
-    ``group_by`` tokens are entity-qualified dimension names (``user__pricing_tier``,
-    ``metric_time``). ``grain`` applies to ``metric_time`` when the caller wants a
-    time bucket without spelling it into the token; ``where`` clauses use the Jinja
-    filter dialect (``{{ Dimension('session__is_deleted') }} = false``) verbatim on
-    both backends.
-
-    Name lists normalize here rather than at the CLI, so the two backends and a
-    library caller building the query object directly all see the same tokens: a
-    comma-joined list (``--group-by a,b``) is as natural a first guess as the
-    repeated flag, and mixing the two is natural too.
-    """
-
-    metrics: list[str]
-    group_by: list[str] = field(default_factory=list)
-    where: list[str] = field(default_factory=list)
-    order_by: list[str] = field(default_factory=list)
-    grain: str | None = None
-    limit: int | None = None
-
-    def __post_init__(self) -> None:
-        self.metrics = _split_tokens(self.metrics)
-        self.group_by = _split_tokens(self.group_by)
-        self.order_by = _split_tokens(self.order_by)
-
-
-@dataclass
-class MetricInfo:
-    name: str
-    type: str
-    label: str | None = None
-    description: str | None = None
-    # The dimensions this metric can be grouped by, entity-qualified. Precise on
-    # the hosted backend (the API resolves the join graph); on the local read-view
-    # it is the per-semantic-model listing, noted as such.
-    dimensions: list[str] = field(default_factory=list)
-
-
-@dataclass
-class DimensionInfo:
-    name: str
-    type: str
-    # The dbt project's own words for this dimension, when it wrote any. Both
-    # backends carry both fields: the compiled semantic manifest declares them,
-    # and the hosted API returns them in the catalog query dex already issues.
-    label: str | None = None
-    description: str | None = None
-
-
-@dataclass
-class EntityInfo:
-    name: str
-    type: str
-    # Local-only. The hosted GraphQL schema has no `label` on its Entity type,
-    # and asking for one fails the whole catalog query ("Cannot query field
-    # 'label' on type 'Entity'"), taking the metrics list down with it, so it
-    # must never enter that selection set. A hosted catalog says so in a note
-    # rather than letting the absence read as "the project declared none".
-    label: str | None = None
-    description: str | None = None
-
-
-def merge_element_fields(
-    store: dict[str, dict[str, Any]], key: str, element: dict[str, Any]
-) -> None:
-    """Fold one dimension or entity into a catalog accumulator keyed by ``key``.
-
-    Both backends meet the same element more than once: the hosted API nests a
-    dimension under every metric that can group by it, and locally the same
-    entity appears in every semantic model that declares it. The copies need not
-    agree, so each field takes the first non-null value seen rather than the
-    first copy outright. Under a plain ``setdefault`` on the whole element,
-    whichever copy happened to come first could blank out a description another
-    one carried.
-
-    ``key`` is passed rather than read off the element because the local backend
-    files a dimension under its entity-qualified name (``session__created_at``)
-    while the element itself carries the bare one.
-    """
-
-    fields = store.setdefault(key, {})
-    if not fields.get("type"):
-        fields["type"] = (element.get("type") or "").lower()
-    for name in ("label", "description"):
-        if fields.get(name) is None:
-            fields[name] = element.get(name)
-
-
-def _element_data(element: Any) -> dict[str, Any]:
-    """One catalog element as a dict, with its unset optional fields omitted.
-
-    A catalog is agent context, so a project that declares no labels should not
-    pay for null placeholders: measured against our own deployment (which
-    populates ``label`` on 0 of 65 dimensions and ``description`` on 1 of 65),
-    they were most of the dimensions and entities blocks. Absent means unset,
-    the same rule on metrics, dimensions and entities alike. An empty list
-    survives, because "no groupable dimensions" is an answer where None is not.
-    """
-
-    return {k: v for k, v in asdict(element).items() if v is not None}
-
-
-@dataclass
-class SemanticCatalog:
-    """What ``explore semantic list`` returns: enough for an agent to discover what
-    it can query, in the same shape from either backend."""
-
-    backend: str
-    metrics: list[MetricInfo] = field(default_factory=list)
-    dimensions: list[DimensionInfo] = field(default_factory=list)
-    entities: list[EntityInfo] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
-
-    def to_data(self) -> dict[str, Any]:
-        return {
-            "backend": self.backend,
-            "metrics": [_element_data(m) for m in self.metrics],
-            "dimensions": [_element_data(d) for d in self.dimensions],
-            "entities": [_element_data(e) for e in self.entities],
-            "notes": self.notes,
-        }
-
-
-class SemanticBackendError(DexError):
-    """A backend cannot be constructed, reached, or asked what was asked of it: a
-    missing extra, missing hosted coordinates, missing credentials, a missing local
-    project, an unresolvable metric. The message names the fix; the caller turns it
-    into a clean error (never a stack trace)."""
-
-
-class SemanticQueryRefusedError(SemanticBackendError):
-    """The query was understood and deliberately not run.
-
-    A subclass so a single ``except SemanticBackendError`` still catches it, while
-    a caller that cares can tell "dex said no" apart from "the backend broke".
-    Today that means a PII request-gate refusal or rendered SQL that was not
-    read-only, both of which are policy, not failure.
-    """
-
-
-class SemanticBackend(Protocol):
-    """The seam both backends satisfy.
-
-    ``query`` returns a ``SemanticQueryResult``, not an envelope: the two paths
-    genuinely differ in cost surfacing and warnings, and each owns its own
-    posture, but a posture is data on the result (a cost paradigm, a warning),
-    not a transport object. Backends that built their own envelopes made the
-    engine impossible to call from anything but a CLI.
-
-    A backend that cannot answer raises :class:`SemanticBackendError`; the caller
-    turns that into a clean error rather than a stack trace.
-    """
-
-    name: str
-
-    def list_definitions(self) -> SemanticCatalog: ...
-
-    def query(self, q: SemanticQuery): ...
-
-
-# ---- shared PII screening --------------------------------------------------
-#
-# A metric query touches dimensions two ways: the group_by tokens, and the
-# Dimension()/TimeDimension()/Entity() refs inside a where filter. Both are
-# screened, because grouping by an email is as much a disclosure as filtering by
-# one and then projecting it.
-
-_DIMENSION_REF = re.compile(r"(?:Time)?Dimension\(\s*['\"]([^'\"]+)['\"]")
-_ENTITY_REF = re.compile(r"Entity\(\s*['\"]([^'\"]+)['\"]")
-# Meta keys, on a dimension's dbt `config.meta`, that authoritatively mark it PII.
-_PII_META_KEYS = ("pii", "contains_pii", "is_pii", "pii_category")
-
-
-def requested_dimension_refs(q: SemanticQuery) -> list[str]:
-    """Every dimension/entity token a query would touch, de-duplicated in order."""
-
-    refs: list[str] = [*q.group_by]
-    for clause in q.where:
-        refs.extend(_DIMENSION_REF.findall(clause))
-        refs.extend(_ENTITY_REF.findall(clause))
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for ref in refs:
-        if ref not in seen:
-            seen.add(ref)
-            ordered.append(ref)
-    return ordered
-
-
-def _meta_says_pii(meta: Any) -> bool:
-    return isinstance(meta, dict) and any(bool(meta.get(key)) for key in _PII_META_KEYS)
-
-
-def _meta_clears(meta: Any) -> bool:
-    """Whether a lookup positively adjudicated the ref as not PII.
-
-    Only an explicit ``{"pii": False}`` clears: a lookup that knows nothing returns
-    None and leaves the name heuristic in charge. This is what lets a profiled,
-    value-evidence-cleared column (or a human ``pii_overrides`` entry) stop being
-    re-blocked by its name, without that silence ever being mistaken for consent.
-    """
-
-    return isinstance(meta, dict) and meta.get("pii") is False
-
-
-def screen_dimension_refs(
-    refs: list[str],
-    *,
-    meta_lookup: Callable[[str], Any] | None = None,
-) -> list[tuple[str, str]]:
-    """Refuse verdicts for the refs that must not be queried, as ``(ref, reason)``.
-
-    Evidence beats names, and silence never clears. A lookup that positively knows
-    the ref (the ``.dex/`` cache's value-evidence flags on the resolved physical
-    column, or a dimension's dbt ``config.meta``) decides in both directions; a
-    lookup that returns nothing falls through to the name heuristic, which is the
-    fail-closed floor because a false positive is the wanted error direction on PII.
-    Runs on the entity-qualified token (``user__email``), whose bounded ``_email``
-    suffix still matches the email pattern, so no join-graph resolution is needed
-    when nothing authoritative is available.
-    """
-
-    blocked: list[tuple[str, str]] = []
-    for ref in refs:
-        meta = meta_lookup(ref) if meta_lookup is not None else None
-        if _meta_says_pii(meta):
-            category = meta.get("category") if isinstance(meta, dict) else None
-            reason = (
-                f"{category} (profiled and flagged)"
-                if category
-                else "declared PII in the semantic-layer metadata"
-            )
-            blocked.append((ref, reason))
-            continue
-        if _meta_clears(meta):
-            continue
-        flag = detect_pii(ref, "string")
-        if flag is not None and flag.confidence >= PII_BLOCK_CONFIDENCE:
-            blocked.append(
-                (ref, f"{flag.category.value} (name heuristic, {flag.confidence:.2f})")
-            )
-    return blocked
-
-
-def unadjudicated_refs(
-    refs: list[str],
-    *,
-    meta_lookup: Callable[[str], Any] | None = None,
-) -> list[str]:
-    """The refs no authoritative source spoke to, in the order they were requested.
-
-    The counterpart to :func:`screen_dimension_refs`, over the same lookup: those
-    refs passed the gate on the name heuristic alone, which is the fail-closed
-    floor and not equivalent to evidence. Run it after the gate has cleared a
-    query, so what it returns is exactly the set the result should disclose. A
-    caller with no lookup at all had no evidence for anything.
-    """
-
-    if meta_lookup is None:
-        return list(refs)
-    unknown: list[str] = []
-    for ref in refs:
-        meta = meta_lookup(ref)
-        if not _meta_says_pii(meta) and not _meta_clears(meta):
-            unknown.append(ref)
-    return unknown
-
-
-def cap_columnar(
-    columns: list[str],
-    types: list[str],
-    cells: list[list[Any]],
-    *,
-    max_rows: int,
-    max_cell_chars: int,
-    max_payload_bytes: int,
-    truncated_by_source: bool = False,
-    extra_notes: list[str] | None = None,
-) -> dict[str, Any]:
-    """Cap a columnar result for agent context, matching ``explore query`` shaping:
-    per-cell width truncation, a hard row cap, and a total payload byte cap, each
-    cut announced in ``notes`` so a trimmed result is never mistaken for complete.
-    Shared by both backends so their envelopes are identical in shape."""
-
-    import json
-
-    notes: list[str] = list(extra_notes or [])
-    truncated = truncated_by_source
-
-    if len(cells) > max_rows:
-        cells = cells[:max_rows]
-        truncated = True
-        notes.append(
-            f"result truncated to {max_rows} rows (engine cap); refine the query "
-            "or raise query.max_rows in .dex/config.yml"
-        )
-
-    clipped = 0
-    shaped_cells: list[list[Any]] = []
-    for row in cells:
-        shaped: list[Any] = []
-        for value in row:
-            if isinstance(value, str) and len(value) > max_cell_chars:
-                shaped.append(value[:max_cell_chars] + "...")
-                clipped += 1
-            else:
-                shaped.append(value)
-        shaped_cells.append(shaped)
-    if clipped:
-        notes.append(f"{clipped} cell(s) truncated to {max_cell_chars} chars")
-
-    dropped = 0
-    while shaped_cells and (
-        len(json.dumps(shaped_cells, default=str)) > max_payload_bytes
-    ):
-        shaped_cells.pop()
-        dropped += 1
-    if dropped:
-        truncated = True
-        notes.append(
-            f"dropped {dropped} row(s) to fit the {max_payload_bytes}-byte payload "
-            "cap; aggregate further or select fewer columns"
-        )
-
-    return {
-        "columns": columns,
-        "types": types,
-        "cells": shaped_cells,
-        "row_count": len(shaped_cells),
-        "truncated": truncated,
-        "notes": notes,
-    }
-
-
-def resolve_backend(
-    engine, *, api: bool = False, local: bool = False
-) -> SemanticBackend:
-    """The ambient backend resolution: ``api``/``local`` override the
-    ``.dex/config.yml`` ``semantic.backend`` default. Raises
-    :class:`SemanticBackendError` (never a bare import error, and never a bare
-    ``ValueError`` from a missing project) when the chosen backend's extra,
-    config, or credentials are missing."""
-
-    if api and local:
-        raise SemanticBackendError("choose one of --local or --api, not both")
-
-    if api:
-        backend = "dbt_cloud"
-    elif local:
-        backend = "local"
-    else:
-        configured = getattr(getattr(engine.config, "semantic", None), "backend", None)
-        backend = (configured or "local").strip().lower()
-
-    source = getattr(engine, "semantic_source", None)
-    if backend in {"dbt_cloud", "api", "cloud"}:
-        from .hosted import HostedDbtCloudBackend
-
-        return HostedDbtCloudBackend.from_config(engine.config, source)
-    if backend == "local":
-        if source is not None:
-            # Honored or named in an error, never accepted and dropped. A host that
-            # believes it supplied this request's principal, and in fact reached
-            # the warehouse under whatever the process could discover, has lost the
-            # access control it came here for with nothing in the output saying so.
-            raise SemanticBackendError(
-                "a semantic source supplies a hosted dbt Cloud token and has no "
-                "meaning for the local backend, which renders metric SQL and runs "
-                "it through this engine's own connector. Select the hosted backend "
-                "(semantic.backend: dbt_cloud, or --api), or drop the source and "
-                "let the connector's credential govern"
-            )
-        from .local import LocalMetricFlowBackend
-
-        return LocalMetricFlowBackend.from_engine(engine)
-    raise SemanticBackendError(
-        f"unknown semantic backend '{backend}'; use 'local' or 'dbt_cloud' "
-        "(or pass --local / --api)"
-    )
+from ...semantic_catalog import (
+    DIMENSIONS_PER_DECLARATION,
+    DIMENSIONS_PER_QUERYABLE_PATH,
+    DimensionInfo,
+    EntityInfo,
+    EntityRole,
+    MeasureInfo,
+    MetricComposition,
+    MetricInfo,
+    SemanticCatalogView,
+    SemanticModelInfo,
+    derive_entity_type,
+    merge_element_fields,
+    qualified_dimension,
+)
+from .backend import (
+    EXECUTION_DEX,
+    EXECUTION_VENDOR,
+    BackendDescriptor,
+    SemanticBackend,
+    SemanticBackendError,
+    SemanticQueryRefusedError,
+    backend_axes,
+    catalog_declarations,
+    cost_posture,
+    descriptor_from_backend,
+    resolve_backend,
+    values_gap,
+)
+from .catalog import (
+    MAX_DIMENSIONS,
+    MAX_DIMENSIONS_PER_METRIC,
+    MAX_ENTITIES,
+    MAX_MEASURES,
+    MAX_METRICS,
+    MAX_SEMANTIC_MODELS,
+    SemanticCatalog,
+)
+from .model import SemanticQuery, ValuesRequest
+from .policy import (
+    cap_columnar,
+    merge_pii_meta,
+    queryable_grains,
+    requested_dimension_refs,
+    resolve_values_request,
+    screen_dimension_refs,
+    screen_values_request,
+    unadjudicated_refs,
+    validate_grain,
+    values_reach_note,
+)
+
+__all__ = [
+    "DIMENSIONS_PER_DECLARATION",
+    "DIMENSIONS_PER_QUERYABLE_PATH",
+    "EXECUTION_DEX",
+    "EXECUTION_VENDOR",
+    "MAX_DIMENSIONS",
+    "MAX_DIMENSIONS_PER_METRIC",
+    "MAX_ENTITIES",
+    "MAX_MEASURES",
+    "MAX_METRICS",
+    "MAX_SEMANTIC_MODELS",
+    "PII_BLOCK_CONFIDENCE",
+    "BackendDescriptor",
+    "DimensionInfo",
+    "EntityInfo",
+    "EntityRole",
+    "MeasureInfo",
+    "MetricComposition",
+    "MetricInfo",
+    "SemanticBackend",
+    "SemanticBackendError",
+    "SemanticCatalog",
+    "SemanticCatalogView",
+    "SemanticModelInfo",
+    "SemanticQuery",
+    "SemanticQueryRefusedError",
+    "ValuesRequest",
+    "backend_axes",
+    "cap_columnar",
+    "catalog_declarations",
+    "cost_posture",
+    "derive_entity_type",
+    "descriptor_from_backend",
+    "merge_element_fields",
+    "merge_pii_meta",
+    "qualified_dimension",
+    "queryable_grains",
+    "requested_dimension_refs",
+    "resolve_backend",
+    "resolve_values_request",
+    "screen_dimension_refs",
+    "screen_values_request",
+    "unadjudicated_refs",
+    "validate_grain",
+    "values_gap",
+    "values_reach_note",
+]

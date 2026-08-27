@@ -9,6 +9,172 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+**Payload growth, and the budget that now bounds it.** Widening every element grew
+the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
+measures, `--local` grew 1.8x and `--api` 1.4x, almost all of it new objects and
+the project's own prose rather than placeholders. The time axis and the queryable
+grains added a further 1.10x on the same layer (about 5.5 KB), resolving the local
+join graph took its dimension list from 45 rows to 65, and the physical link added
+a further 1.05x (about 3.3 KB), because a relation is carried once per semantic
+model rather than once per element. That layer's unscoped catalog now measures
+71.4 KB on `--local` and 62.2 KB on `--api`, against roughly 40 KB before this
+round.
+
+The budget below closes that out. It comes back **uncut** at those sizes, because
+the caps are calibrated so an ordinary layer is emitted whole and only a layer that
+was already too large to read in one payload is trimmed. `--metric` brings that same
+layer to 10% of its unscoped size, and the payload now states what was cut in every
+case, zeros included.
+
+### Changed
+
+- Refactored the unreleased semantic-layer implementation into a neutral catalog
+  domain, composed response model, shared request policy, typed backend descriptor,
+  hosted GraphQL transport and local MetricFlow runtime. The CLI and envelope stay
+  unchanged; the internal backend/catalog seam is intentionally allowed to change
+  before release. Malformed hosted tabular JSON now returns a clean semantic
+  backend error instead of leaking a decoder exception, and a scoped catalog no
+  longer carries time-axis caveats for metrics outside that scope.
+
+### Fixed
+
+- **The skill wrapper installed neither semantic extra, so most of
+  `explore semantic` refused through the skill** ([#358]).
+  `skills/<skill>/scripts/run.py` picks the packaging extras `uv` resolves before
+  the engine exists. It resolved the connector's extra and added `[cluster]` for
+  `explore cluster`, and had no equivalent for `explore semantic`, which has
+  shipped since 1.8.0. Through the skill, `--api` refused with
+  `the hosted semantic-layer backend needs the [semantic-api] extra` and
+  `query --local` refused for `[semantic]`; only `list --local` worked, because it
+  is a dependency-free read of the compiled manifest.
+
+  The wrapper now resolves those extras from the command being run, on the same
+  terms as `[cluster]`: `[semantic-api]` on any `explore semantic` (an httpx and
+  nothing heavier), and `[semantic]` as well only where a statement might be
+  rendered locally, which is any mode but `list` without `--api`. Where the backend
+  is ambient rather than flagged, both go in, because the wrapper runs before the
+  engine and does not read the nested config block that decides it: a heavier
+  install is the right way to be wrong there. A repo that runs neither
+  `explore cluster` nor `explore semantic` still resolves neither scikit-learn nor
+  MetricFlow.
+
+  Nothing inside the engine could see this. Every other test imports the package
+  from the source tree, where all the extras are present, so the wrapper's choice
+  is invisible: `tests/test_skill_wrapper.py` now covers it, pins the three skills'
+  wrappers as byte-identical, and holds the wrapper's list of value-taking flags to
+  the real parser, since a flag added there and forgotten in the wrapper shifts the
+  bare tokens and picks its extras from the wrong word.
+
+- **`explore semantic list --local` under-reported a metric's groupable
+  dimensions, contradicting the metric description it printed beside them**
+  ([#356]). A metric's dimensions were computed as the dimensions of its owning
+  semantic models, entity-qualified and single-hop, which is not the set a query
+  can group by: a metric can also be grouped by the dimensions of every model its
+  own models join to. On one layer measured against the hosted backend's
+  join-resolved answer, one metric reported 6 dimensions where 11 were queryable
+  and another reported 2 where 7 were, and the dimension both lists were missing
+  was the one nearly every metric description in that project tells a caller to
+  group by. So the catalog contradicted the prose it was carrying in the same
+  payload, and an agent budgeting one discovery call reads the list, not the
+  caveat.
+
+  The local read now asks MetricFlow to resolve the join graph, which is the same
+  answer the API gives for the same layer, including paths through two joins that
+  the single-hop qualification scheme cannot express at all. On the layer above,
+  `--local` and `--api` now return the same 65 dimensions and the same per-metric
+  dimension lists, where before they differed by 44%.
+
+  **`explore semantic list --local` remains a dependency-free read of a compiled
+  artifact.** Resolving the join graph needs the `[semantic]` extra, and an install
+  that picked no extras still lists the layer: it reports the dimensions the
+  project declares, says `declarations` in `dimension_scope`, and carries a note
+  naming the extra. A compiled manifest that extra's resolver refuses degrades the
+  same way rather than failing a read dex performed without trouble. What is gone
+  is the short list that read as complete.
+
+  Every path the resolution adds also resolves to the physical column behind it,
+  so the PII request-gate adjudicates a joined dimension from that column's
+  evidence instead of falling back to its name. On the layer above that is 20
+  tokens the gate previously knew nothing about.
+
+- **The PII gate parsed filter clauses with MetricFlow-specific regexes in shared
+  code, so a non-dbt backend would inherit a gate that screened nothing on half
+  its input** ([#357]). A metric query touches dimensions two ways: the group-by
+  tokens, and the dimensions its `--where` clauses name. The extraction for the
+  second lived in the neutral package beside the screening policy and matched two
+  Jinja call forms, which is correct for dbt and a fail-open for any layer whose
+  filters are shaped differently: the regexes match nothing, `refs` holds the
+  group-by tokens alone, and every dimension in the filter goes unscreened.
+
+  The failure would have been invisible. The query succeeds, nothing is blocked,
+  and the notes disclose nothing, because the gate's disclosures can only report on
+  refs the extraction found. Together with [#347] that was the second structural
+  fail-open in the same gate, both of the same shape: the authoritative screening
+  quietly does not run.
+
+  Reading a filter clause is now the backend's own job, since the dialect belongs
+  to the answering layer, and the neutral layer keeps the screening policy
+  unchanged. A backend that cannot read its own filter dialect refuses filtered
+  queries rather than passing them with half their references unexamined. Both
+  shipped backends read MetricFlow's dialect, so nothing changes for them today;
+  this is the contract a third one inherits. The safety spine pins it.
+
+- **An entity's `type` was whichever declaration the iteration reached first, and
+  both backends reported it wrong** ([#350]). `type` is a property of the
+  (entity, semantic model) declaration, not of the entity: one entity is `primary`
+  in the model that keys it and `foreign` in every model that joins to it. The
+  catalog folded every copy into one record and kept the first non-null value, so
+  the reported type was iteration order.
+
+  Measured on one layer: the two backends disagreed with each other on two of three
+  entities checked, and both reported the layer's most-joined entity as `foreign`
+  when it is primary in the model that keys it. An agent reading that catalog to
+  work out the join graph was reading noise.
+
+  An entity now carries `roles`, one entry per declaration, each with that model's
+  own `type`, its `expr` (the physical join key, which differs per model for the
+  same entity) and its `role` and `description`. The same merge had been discarding
+  those descriptions, which is where a project documents each model's own join,
+  including how much of a model is lost to a nullable key: for an entity declared
+  in seven models it kept one description and dropped six, with nothing saying so.
+
+  The top-level `type` is kept, because consumers render it, and is now **derived**:
+  primary wherever any declaration is primary, and documented as derived. A
+  consumer reading it gets a correct summary instead of an order-dependent value,
+  and both backends now agree on the same layer.
+
+
+- **`explore semantic query --api` now holds the semantic layer's own PII
+  metadata for every dimension a query touches, not just for the ones all of its
+  metrics share** ([#347]). The authoritative half of the hosted PII
+  request-gate was built from a single call to the API's `dimensions(metrics:)`
+  field, listing every metric in the query. That field returns the dimensions
+  common to **all** the metrics listed, not their union, so the authoritative
+  map shrank as the query grew: a query over two metrics from two different
+  semantic models held metadata for a small handful of dimensions and screened
+  all the rest on their names alone. A dimension the dbt project had marked
+  `meta: {pii: true}` whose name carried no PII signal was not blocked. It was
+  grouped, or filtered on, and projected.
+
+  The result disclosed the degradation in a note afterwards, so this was a
+  fail-open on the authoritative source with disclosure rather than a silent
+  leak. It was still not "PII is flagged, never surfaced", which is a hard
+  constraint the safety spine asserts, and a note is the part of a payload a
+  caller is least likely to act on.
+
+  The gate now asks about one metric at a time and unions the answers, with PII
+  winning wherever two metrics carry contradictory metadata for the same
+  dimension. That costs no extra round trip: the requests are independent, so
+  they go out as one document carrying one aliased field per metric. A group-by
+  token that carries a time grain (`user__created_at__month`) is looked up under
+  its dimension name as well, since no dimension name carries a grain and a
+  suffix was otherwise enough on its own to drop a flagged dimension back to the
+  name heuristic.
+
+  **Some queries that succeeded before will now be refused.** That is the point
+  of the fix: those queries were reaching dimensions the project had marked as
+  PII, and the refusal names the dimension and suggests a non-PII one.
+
 ### Added
 
 - **`maintain schema` detects a model added, removed, or content-changed
@@ -42,10 +208,491 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   behavior); that test now pins the opposite, and the reasoning for both is
   recorded on it and on `transform_drift` itself.
 
+- **`explore semantic list` is capped, searchable, and accounts for what it left
+  out** ([#362]). It was the one explore command that budgeted nothing: every
+  metric, dimension, entity, semantic model and measure serialized with no cap, no
+  way to narrow it beyond naming metrics, and nothing in the payload saying
+  anything had been left out. `explore map` caps objects, columns, edges and
+  findings and counts every elision; `explore inventory --rank` is open as the same
+  bug class. Five rounds of object-model work then widened every element in it.
+
+  Three things ship together, because a cap without a way to ask a narrower
+  question is just a smaller wrong answer.
+
+  `--search <term>` (repeatable, comma-separated) takes a word rather than a name
+  and matches it case-insensitively against every element's name and against the
+  project's own label and description. A search resolves to metrics and narrows the
+  catalog exactly as `--metric` does, so what comes back is a catalog whichever way
+  it was asked; an element other than a metric is matched for the metrics that reach
+  it, and a measure deliberately does not widen to its own semantic model, because
+  "in the same model as" is not "made of". The union across terms, unlike
+  `--for-dimension`, where the intersection is the whole question. A term that
+  matches nothing is named in a note rather than refusing the command, which is
+  where it differs from an unknown metric name: a substring matching nothing is an
+  honest answer about the layer's words, so a search for three terms with one typo
+  still answers for the other two. It is applied after the two name-based scopes,
+  so `--metric x --search y` reads as "within x, the parts about y", and
+  `searched_for` names the terms in the payload. dex does not pass it to the dbt
+  Cloud API's own `search` argument, which sits on each root field separately: a
+  hosted search would filter the metrics list and leave the dimensions nested under
+  each metric unfiltered, which is a different answer from the local one for the
+  same command, and the whole catalog arrives in one round trip either way.
+
+  Caps, in the shape `explore map` uses: 50 semantic models, 60 metrics, 150
+  dimension rows, 50 entities, 60 measures, and 40 groupable tokens per metric.
+  That last one is the only cap on a repeating block and it is where the bytes are
+  on a wide layer: on the layer measured, the per-metric dimension lists are 441
+  tokens and 15 to 17% of the whole payload. **The defaults leave an ordinary layer
+  uncut**, verified on both backends against a live layer of a dozen models and 27
+  metrics, so a cap only bites one that was already unusable in a single payload; a
+  consumer that silently loses catalog entries is a worse outcome than a large
+  payload. `--full` lifts them.
+
+  `elided` counts every cut per element kind and is **always present, zeros
+  included**. That is the point of it: a zeroed `elided` with no cap notes is the
+  positive statement "this is the whole layer", which a caller cannot get from a
+  missing key. Each non-empty cut also gets a note naming the cap, the count, the
+  consequence (a capped catalog can name a measure or a groupable token the payload
+  no longer describes) and the flags that answer it. The one exception is
+  `elided_dimension_count` on a metric, absent where nothing was cut, because that
+  field repeats once per metric and the layer-wide total is what makes its absence
+  readable.
+
+  A library caller reading `list_definitions()` off a backend still gets the layer
+  uncapped. The budget is applied at the command layer, so only the surface that has
+  to fit in an agent's context pays it, and `SemanticCatalog.capped()` takes each cap
+  as an argument for a host that wants to budget its own.
+
+- **An executable conformance contract for semantic backends** ([#363]).
+  `SemanticBackend` was a Protocol, and a Protocol asserts nothing. The two shipped
+  backends disagreed about one identical layer: 45 dimension rows against 65, a
+  metric reporting 6 groupable dimensions where 11 were queryable, an entity
+  reported `primary` by one and `foreign` by the other. Some of that was genuine
+  asymmetry that should have been declared and some was a bug, and nothing told them
+  apart.
+
+  `exmergo_dex_core.explore.semantic.conformance` is the third of dex's shipped
+  contracts, after storage and project formats, in the same shape: a pytest module
+  a backend author outside this distribution subclasses.
+  `SemanticBackendContract` asserts what holds of any catalog;
+  `SemanticCatalogContract` asserts content against `REFERENCE_LAYER`, a small
+  neutral description of a layer that exercises every field the catalog can carry,
+  including two models joined by a shared entity whose key is spelled differently on
+  each side, three measure shapes, a filtered metric, a ratio, and a PII-shaped
+  dimension. `reference_dbt_manifest()` renders it in dbt's compiled form;
+  MetricFlow's own resolver accepts it and resolves exactly the groupable token sets
+  the description declares. Pinning the layer as committed data rather than a hosted
+  deployment is what keeps the suite from re-documenting itself whenever someone
+  edits the project behind it.
+
+  **The assertion worth the most is the one about silence.** For every field the
+  reference layer declares, a backend either answers it on some element or names it
+  in `catalog_gaps`. Undeclared silence fails, because an absent field and a
+  declared gap are indistinguishable to a consumer: "the hosted API has no entity
+  labels" reads as "this project labelled no entities" and the reader stops looking.
+  The rest covers the four provenance axes, a repeatable read, `dimension_scope` as
+  a promise rather than a label, referential integrity across the five lists, an
+  entity's derived `type`, a ratio's two sides, `time_axis` naming a measure the
+  metric reads, a payload that never carries the PII gate's own column lookup, caps
+  that count what they cut and leave the catalog they were given alone,
+  `filter_refs` answering or declining without raising, and a values request for a
+  PII-flagged dimension refused.
+
+  dex binds its own backends three times: `--local` with MetricFlow resolving the
+  join graph, `--local` with no resolver, and `--api` against a transport
+  reproducing the dbt Cloud API's real asymmetries, plus a direct comparison of the
+  two on the same layer. Writing it found one real gap in the reference layer
+  itself, where every measure happened to compile to a non-column expression and so
+  made a hosted backend look like it could never name a measure's column.
+
+  Install `[semantic-conformance]`, which is pytest and nothing else: the contract
+  reaches neither the dialect engine nor a warehouse client and needs neither
+  semantic extra, and a packaging test holds that floor.
+
+- **The semantic layer and the physical catalog are one warehouse again**
+  ([#360]). `explore` held two unconnected views of it. `inventory`, `profile`,
+  `map`, `diagram` and `query` knew relations, columns, grain, PII flags and
+  inferred joins; `explore semantic` knew semantic models, metrics, dimensions,
+  entities and measures. Nothing joined the two, so "which relation backs this
+  metric", "profile the table under this number" and "which of my relations does
+  the semantic layer actually expose" were all unanswerable, while the engine
+  computed the link in three separate places and exposed it in none.
+
+  A semantic model now carries `relation`, the physical relation it sits on, and
+  every dimension, entity declaration and measure carries `column`. **The relation
+  is carried once, on the model; the element carries only its column**, and joins
+  to the model through the `semantic_model` field it already had. A layer holds
+  many more elements than models and a fully qualified relation is long, so the
+  alternative would have made the link dominate a payload whose budget is still
+  open work. Which relation backs a metric is therefore two hops: the metric names
+  its `semantic_models`, and each of those names its `relation`. A metric spanning
+  several models has several, which is a fact worth seeing rather than a value to
+  pick one from.
+
+  **A computed expression carries no column.** A measure defined as
+  `if(is_complete, elapsed, null)` has no single column, so
+  `column` is absent rather than guessed. That is not tidiness: the PII
+  request-gate resolves a dimension to a column and reads that column's profiled
+  evidence, so a column guessed out of an expression makes the gate screen the
+  wrong column and report the verdict as evidence-backed. The same absence holds
+  for a dimension row no single declaration explains, which is a path reached
+  through more than one declaring model, and for `metric_time`, which is one token
+  over as many columns as the layer has time dimensions.
+
+  Measured on the layer this was built against: 11 of 11 semantic models resolve
+  to a relation, 63 of 65 dimension rows and 26 of 26 entity declarations carry a
+  column, and the two dimensions that do not are `metric_time` and one defined as
+  a boolean expression. The whole link costs **3.3 KB on a 70 KB catalog** (1.05x),
+  because a relation is written once per model rather than once per element.
+
+  **The hosted backend declares the gap rather than guessing at it.** dbt Cloud's
+  `SemanticModel` GraphQL type carries only a name, so `relation` joins the other
+  fields in `unavailable` and the payload says so as data, not only in a note. Its
+  `Dimension`, `Entity` and `Measure` types do carry `expr`, so a hosted catalog
+  names the column behind every element and simply cannot say which table that
+  column is in. One asymmetry is worth knowing about: for a measure the hosted API
+  returns the expression dbt *compiled*, so a plain `count` measure comes back as
+  a `CASE WHEN ... IS NOT NULL` and carries no column, where `--local` reads what
+  the author wrote and carries one. Both are correct about what they read.
+
+  In the other direction, `explore map --use-project` marks each object with
+  `semantic_models`, the models that sit on it. Empty is an answer: a relation
+  nothing in the layer reads is a different object from one several metrics are
+  built on, and row counts and PII flags cannot tell them apart. Every object in
+  view is rewritten whenever the layer was read, so a model dropped from the layer
+  clears rather than leaving a stale claim.
+
+- **`explore map` and `explore relationships` draw the joins the semantic layer
+  declares** ([#361]). `explore diagram` was inferring joins by scanning while an
+  authoritative, free join graph sat in a manifest dex already parsed. Every entity
+  two semantic models share is a join the layer performs, with the physical key
+  named per model, and the keys routinely differ between the two sides for the same
+  entity, which is exactly the join a name-matching rule can never find. Measured
+  live against one layer of 11 semantic models: 15 declared joins across 4
+  entities, of which **12 were not reached by name-based inference at all**, and 13
+  were also declared by a `relationships` test and therefore counted once. So the
+  channel is nearly free on a well-tested project and is worth most where the tests
+  are thinner than the semantic layer.
+
+  Those joins now arrive at the **declared** tier beside the project's
+  `relationships` tests, through the same endpoint resolution and the same
+  never-guess rule: an endpoint matching nothing or matching several objects is
+  reported in `notes` instead of drawn. `declared_by` on the edge names the
+  entity, which is the part a reader can look up with `explore semantic list` and
+  the only part the edge does not already carry; a `relationships` test leaves it
+  unset, because it declares exactly the two columns the edge already names. An
+  edge both channels declare is counted once. `explore relationships` reports
+  `semantic_join_count`, and the notes call out how many of those name-based
+  inference did not find, which is the set that matters.
+
+  `explore diagram` draws them solid, with the entity in the edge label. **The
+  cardinality rules are unchanged**: an entity marked primary is the layer's
+  claim, and the diagram may still say "exactly one" only where the cache proved
+  the parent key unique. That is what let these in at the declared tier without
+  loosening anything.
+
+  Both directions are gated on `--use-project`, because exploration starts bare
+  and a warehouse observation must not depend on which repo dex runs from, and
+  both cost the warehouse nothing: the whole link is a read of the compiled
+  semantic manifest. A safety-spine case pins that, by asserting the map issues
+  the same number of statements with the flag as without it.
+
+- **`explore semantic values <dimension>` returns a dimension's value domain**
+  ([#358]). Naming a value is the precondition for writing a filter, and dex could
+  not name one. `list` returns names, types and prose; `explore profile` cannot see
+  a semantic dimension at all; and on a hosted layer there was no SQL path of any
+  kind, because dbt Cloud is not a connector. On the layer this was measured
+  against, several metric descriptions instruct the reader to filter one dimension
+  to one of a handful of values, and no dex command could say which.
+
+  It takes exactly one dimension, accepts a grain suffix
+  (`user__created_at__month`) split against the grains the layer reports, and
+  returns the distinct values capped and columnar like `explore query`. The token
+  is resolved against the layer's own catalog first, so a misspelling is refused by
+  name and the refusal says the token is entity-qualified, which is the likelier
+  mistake.
+
+  **`scoped_to` says how the values were reached, and that changes what they
+  mean.** A dimension of one semantic model is answerable on its own and
+  `scoped_to` is empty: these are the values of the column behind it. A dimension
+  reached through a join is not answerable that way at all, because there is no
+  measure to join from, and both layers refuse the request. The only shape that
+  exists is one scoped to a metric that reaches the dimension, and it answers a
+  narrower question: the values present for that metric. So dex tries the cheap
+  shape first, falls back once to the first metric that reaches it, and names that
+  metric in `scoped_to` and in a note along with the `--metric` flag that overrides
+  the choice. On the hosted backend the fallback is settled with a free
+  `compileDimensionValuesSql` before any query is created, because dbt Cloud
+  accepts the values mutation and reports a resolution failure asynchronously, at
+  poll time; deciding afterwards would mean running a second query once the first
+  had already been submitted.
+
+  **PII is screened harder here than on a metric query.** A metric query returns
+  aggregates that a dimension merely slices, so a flagged dimension can be dropped
+  from the grouping and the query still answers something. Here the result *is* the
+  values, so a flagged dimension refuses the command, and the refusal names the
+  durable ways to clear a dimension reviewed as not PII. The evidence is unchanged
+  on each backend: the `.dex/` cache's flag on the resolved physical column
+  locally, the layer's own `config.meta` hosted, asked one metric at a time and
+  unioned across every metric that reaches the dimension, with the name heuristic
+  as the fail-closed floor and disclosed on the result when it was all that ran.
+
+  dex reports the values that came back and never claims an exact cardinality,
+  which would cost a second scan of the same table on every connector: a large
+  domain arrives cut at `query.max_rows`, `truncated`, and saying so. Local renders
+  through MetricFlow and takes the full cost handshake, so it needs the `[semantic]`
+  extra unlike `list`; hosted is executed by dbt Cloud and carries the same
+  cost-guard-unavailable warning every hosted result carries.
+
+- **`explore semantic list --for-dimension <d>` answers the reverse question**
+  ([#359]). The catalog says what a metric can be grouped by. A caller more often
+  arrives with "I want to slice by pricing tier, what can I slice", and answering
+  that meant reading every metric's dimension list and inverting it by hand, which
+  is the whole catalog read to ask about one dimension. It is also the cheapest way
+  to find the metrics that can go on one chart against one axis, since metrics that
+  share a group-by are exactly those.
+
+  The flag is repeatable and comma-separated, returns the metrics groupable by
+  **all** the named tokens, and then narrows the catalog exactly as `--metric` does,
+  so what comes back is a catalog rather than a list of names. The two compose, and
+  a named metric that cannot be grouped that way is dropped with a note naming it
+  rather than silently. `for_dimensions` names the scope in the payload.
+
+  It is an **inversion of the `dimensions` list each metric already carries**, not a
+  call to the layer, so it costs no extra round trip and no warehouse query on
+  either backend. The dbt Cloud API has a field for this and dex does not use it:
+  `metricsForDimensions` answers the empty list both for a name the layer does not
+  have and for a real dimension no metric shares, so a typo would come back
+  indistinguishable from a fact about the layer, and it does not accept a metric's
+  own time token at all. Inverting the catalog closes both. Measured against that
+  field on the live layer, the inversion reproduced it exactly on every case tried
+  (24 metrics for one dimension, 14 for another, 14 for the pair, 11 for a joined
+  one), and additionally answered 27 for `metric_time`, where the API answers none.
+
+- **A metric now says what `metric_time` resolves to for it** ([#354]).
+  `metric_time` is not a dimension of the layer: it resolves per metric to that
+  metric's measures' own aggregation time dimension, so on a layer of a dozen
+  semantic models one token stands for a dozen different physical columns. dex
+  presented it as one global time dimension carrying nothing but a type.
+
+  Every metric now carries `time_axis`, the time columns a time grouping on it
+  actually aggregates by. Measured on one layer, that is 7 distinct columns across
+  27 metrics. **More than one entry means the metric's measures disagree**, which
+  happens whenever a ratio's two sides sit in different models: part of the number
+  is then bucketed by one timestamp and the rest by another, invisibly, in a
+  result that looks like any other. The disagreement is reported rather than
+  resolved, because picking one column would be right about half the number, and
+  the catalog carries a note naming the metrics it affects. On the hosted backend
+  it costs one more field on a selection set dex already sends; locally it is read
+  from the compiled manifest and needs no extra.
+
+- **A grain is validated against the grains the layer reports, per metric, instead
+  of against a five-value tuple** ([#355]). `--grain` was checked against
+  `("day", "week", "month", "quarter", "year")`, which is narrower than the dbt
+  Cloud API's own enum (that runs from a nanosecond to a year) and can never
+  contain a granularity a project defined for itself. So dex refused grains the
+  layer accepts, on its own authority, before the layer was ever asked.
+
+  Metrics and dimensions now carry `queryable_granularities`, and a refusal names
+  what that metric actually offers. An **empty list is an answer**: a categorical
+  dimension has no grain, which is what stops an agent asking one for a month.
+  Where the layer said nothing, the grain passes through and the layer refuses it,
+  because refusing what the layer never spoke about is dex guessing on its behalf;
+  a grain still has to be an identifier before it can reach a query. Hosted reads
+  this from the same metadata request the PII gate already posts, so it costs no
+  round trip; locally it is derived from the grain each time dimension declares.
+  A metric that cannot be queried without a time axis at all now says so, under
+  the vendor key as `requires_metric_time`.
+
+- **`explore semantic list` returns the semantic layer's objects, not three lists
+  of names** ([#349], [#351], [#352]). A semantic layer is a graph: semantic
+  models each sit on one physical relation and own the entities they join on, the
+  dimensions they can be sliced by and the measures their metrics are built from,
+  and a metric is composed out of those measures and may span several models. Both
+  the project YAML and the dbt Cloud API are organized that way. The catalog was
+  organized around none of it, and had no semantic model in it at all, so on a
+  layer of a dozen models it was one undifferentiated list of dimension names with
+  nothing saying which part of the layer any of them came from.
+
+  Three objects arrive and every element gains provenance. `semantic_models` is the
+  layer's organizing unit, carrying the transformation-layer model it sits on and
+  the default time dimension that decides what a time grouping means for every
+  metric over its measures. `measures` is what a metric actually counts: the
+  aggregation, the expression, and the resolved time dimension. Every dimension,
+  entity and measure now names the semantic model it belongs to, and a metric names
+  the models it draws on. **The lists stay flat**, with provenance as a field
+  rather than elements nested inside their model, because a flat lookup is what
+  the PII gate and every existing consumer already do and it is also the shape a
+  non-dbt semantic layer can satisfy.
+
+  A metric also carries what it is built from. `input_measures` resolves through
+  any ratio or derived chain to the aggregations the number really reads, and
+  `composition` carries a ratio's numerator and denominator, a derived metric's
+  expression and inputs, and a simple metric's measure. A ratio metric used to
+  arrive as a name and the word `ratio`, which is not enough to tell whether the
+  ratio is additive, whether two ratios share a denominator, or whether the two
+  sides come from different semantic models, and that last one is what decides
+  whether a given group-by is valid on both. A metric's `filter` is carried too, so
+  a metric that measures a subset says so instead of looking like one that does
+  not.
+
+  Composition stays portable and this vendor's own vocabulary stays separate. A
+  ratio's two sides and a derived metric's inputs mean the same thing in any
+  semantic-layer format, so they are in the shared shape; MetricFlow's cumulative
+  `window`, its `grain_to_date` and a derived metric's per-input offset windows only
+  mean something here, so they travel under one declared `vendor_params` key rather
+  than being promoted into a core that a second format could not fill.
+
+  Nothing here costs a warehouse query, and nothing costs an extra round trip: the
+  hosted catalog is a wider selection set on the one request dex already issued,
+  and the local one is a single read of the compiled artifact. There is a test
+  pinning that, because the temptation in each of the follow-on changes is to reach
+  for a scan.
+
+- **`explore semantic list --metric <m>` narrows the catalog to the metrics a
+  caller came for**. Discovery on a large layer is one payload and most of it is
+  about something else, and widening every element made that worse. The scope keeps
+  the named metrics and everything reachable from them: the measures they read, the
+  semantic models those live in, the dimensions they can be grouped by, and the
+  entities declared in any surviving model. Measured on a layer of 11 semantic
+  models and 27 metrics, one metric's catalog is a tenth of the whole layer's.
+
+  It costs no extra round trip and no warehouse query, the shape is unchanged, and
+  the payload names the scope in `scoped_to` so a subset is never mistaken for the
+  layer. An entity keeps **all** of its declarations even where the scope dropped
+  the model they name, because pruning them would turn a primary entity into a
+  foreign one, which is a false statement about the layer rather than a smaller
+  one. A metric name the layer does not have is refused by name rather than
+  answered with a plausible empty catalog.
+
+- **Two legitimate differences between the backends are declared in the payload
+  rather than left to be inferred** ([#349]). `dimension_scope` says what one
+  dimension row is: `--local` returns one row per declaration, single-hop
+  qualified, while `--api` returns one row per token a query may group by,
+  join-resolved, so a dimension reached through a join appears once per path that
+  reaches it. On one identical layer that is a 44% difference in the dimension
+  count, and until now nothing in the payload explained it. `definition` and
+  `semantic_model` on each row are what let a caller see that several paths reach
+  one declaration.
+
+  `unavailable` names the fields a backend structurally cannot supply, per element
+  kind. The dbt Cloud API's `SemanticModel` type carries only a name, its `Entity`
+  type has no label at all, and its `Measure` type carries no words, so a hosted
+  catalog says which fields those are. A note was the only carrier for this before,
+  and a note is the part of a payload a caller with a context window truncates
+  first: an absence a consumer has to branch on has to be machine-readable.
+
+- **`semantic.vendor` and `semantic.deployment` separate which semantic-layer
+  format answers from which of its endpoints is read** ([#348]). One
+  `semantic.backend` enum carried three things at once: the vendor, the
+  deployment, and who executes the query, which is what decides whether dex's
+  cost guard can apply at all. That works only while there is exactly one
+  vendor, and it makes the guard-relevant property unreadable from the value
+  without a lookup table.
+
+  Who executes is now derived and never configured. Each backend declares it,
+  and every result and catalog reports it as `execution`: `dex` means dex
+  rendered the statement and ran it through its own connector, so the full cost
+  handshake applied; `vendor` means the semantic layer owns the warehouse
+  connection and dex never held a statement it could price or cap. The whole
+  no-cost-guard posture now follows from that one declaration rather than being
+  restated by each backend, so a future backend inherits it instead of a
+  reviewer having to notice it was forgotten. `backend`, `vendor` and
+  `deployment` are reported alongside it.
+
+  `--local` and `--api` are unchanged and are the **execution** axis: dex
+  renders and runs, versus the vendor runs. There is deliberately no per-vendor
+  flag. The format is chosen once and is then ambient, exactly like
+  `connector:`, and a per-command vendor flag would present two different layers
+  as one command's two modes.
+
+### Changed
+
+- **`explore semantic list --local` reads the project through the project seam
+  instead of parsing dbt's artifacts itself** ([#353]). Both the catalog read and
+  the PII gate's column resolution called a private function on the dbt module and
+  re-parsed the compiled semantic manifest, so the local semantic read path was
+  hardwired to dbt while a format-neutral seam designed for exactly this sat unused
+  beside it.
+
+  A project format now answers `semantic_catalog()`, one optional protocol beside
+  tier 2, and the format owns the reduction from whatever it holds on disk into the
+  neutral catalog. That deletes a parser rather than adding one, makes the local
+  catalog format-agnostic as a side effect, and means a second semantic-layer
+  format inherits a working local read path instead of needing a third parser. The
+  same seam carries the `(relation, column)` map the PII request-gate resolves a
+  dimension token through, which puts that resolution where the knowledge is.
+
+  **Beside tier 2 rather than a third member of it.** The project protocols are
+  `runtime_checkable` and the tier is checked structurally, so adding a member to
+  `MaintainProject` would have silently dropped every format implementing the two
+  existing ones to tier 1, and `maintain` would have degraded to "cannot be a
+  drift baseline" for a format that is one. It is also a second channel rather than
+  a widening of `semantic_layer()`, which is a fingerprint: it hashes what the
+  author wrote so a stored baseline survives a dbt upgrade, and it is right to
+  throw away the types, labels, aggregations and composition a reader needs.
+  Widening it to serve reads would have cost it the stability it exists for.
+
+  A format that reads no semantic layer implements nothing here and is refused by
+  name, rather than returning an empty catalog that reads as a layer with nothing
+  in it. `SemanticCatalogContract` is the conformance suite for the new channel,
+  and there is now a control asserting `explore semantic list --local` actually
+  routes through the seam, which is what the tier-2 layers already had.
+
+- **Three behavior changes that come with the semantic-layer work, none of which
+  breaks the contract.** A metric query whose backend cannot read its own filter
+  dialect is now refused rather than screened on its group-by half alone
+  ([#357]); both shipped backends read theirs, so no shipped path changes. On an
+  install with the `[semantic]` extra, `explore semantic list --local` returns
+  more dimension rows than before and reports `queryable_paths` rather than
+  `declarations`, because the join graph is now resolved ([#356]); the payload says
+  which of the two it is holding either way. And the grain vocabulary a group-by
+  token is read against widened from five values to the layer's own, so a token
+  ending in something like `__hour` is now read as a grain suffix ([#355]).
+
+- **`semantic.backend` is still accepted, and reads as one spelling of the two
+  new axes** ([#348]). `backend: local` is dbt plus the local deployment,
+  `backend: dbt_cloud` is dbt plus the hosted one, and `api` and `cloud` remain
+  accepted spellings of the latter. Nothing in an existing `.dex/config.yml`
+  needs to change. Setting `backend` and `deployment` together is fine while
+  they agree and refused when they contradict: they are two spellings of one
+  choice, and picking a winner would leave the other accepted and ignored, which
+  reads as a setting that took effect. A vendor or deployment dex does not ship
+  is refused by name rather than resolving to the default.
+
 ## [1.8.0] - 2026-08-25
 
 ### Added
 
+- **A governed macro for dropping orphan relations** ([#151]), the execution
+  half PR #146 deferred when it shipped `orphan_relation` detection
+  ([#113]). `maintain reconcile` used to hand back a bare `DROP TABLE ...;`
+  string for a human to type by hand; it now proposes scaffolding
+  `transform macro drop_orphan_relations` and running it through `dbt
+  run-operation`, with the exact invocation (the finding's identifier
+  already filled into `--args`) spelled out in the proposal. Reconciling
+  more than one orphan in a run adds one more warning naming a single
+  batched invocation for all of them.
+
+  The macro itself takes an explicit list of relations (nothing inferred),
+  is dry-run by default, resolves and drops through `adapter.get_relation`/
+  `adapter.drop_relation` rather than a hand-written DDL string, and refuses
+  to run at all if any named relation is still a live model, seed, or
+  snapshot in the current manifest, so a typo in the list cannot delete
+  something real. A relation that no longer exists in the warehouse is
+  skipped rather than raised on, so the same list is safe to re-run per
+  target. dex still never executes it: authoring the macro and printing the
+  invocation is as far as dex's role goes, the same boundary `transform
+  macro` already draws for every other shipped macro, and the human runs it
+  under the project's own deploy identity.
+
+  Two pieces of the original issue are explicitly deferred rather than
+  bundled in here, matching the scope PR #146 itself drew: a three-state
+  classification (provable dbt orphan / foreign object / unknown) needs dex
+  to retain more than the single most-recent `maintain snapshot`, which
+  today's storage protocol does not keep; and running the macro directly on
+  a dev target through the existing build preflight is a separate, bounded
+  addition to `transform build`'s dbt-invocation surface.
 - **An opt-in SQLite cache backend** ([#139]). `FilesystemStore` writes loose
   JSON under `.dex/`, which is right for the CLI (persistence is git, a reviewer
   reads the state in a pull request) and wrong for a host that wants durable

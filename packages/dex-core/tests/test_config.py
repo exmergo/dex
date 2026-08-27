@@ -11,6 +11,7 @@ from exmergo_dex_core.config import (
     CacheConfig,
     DexConfig,
     PIIOverride,
+    SemanticConfig,
     blob_override_paths,
     load_config,
     pii_override_paths,
@@ -168,3 +169,73 @@ def test_an_unset_cache_block_is_not_written_into_the_committed_file(tmp_path: P
     save_config(DexConfig(connector="duckdb"), tmp_path)
     raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     assert "cache" not in raw
+
+
+def test_the_semantic_block_derives_the_deployment_from_the_released_spelling(
+    tmp_path: Path,
+):
+    # `backend` collapsed vendor, deployment and who executes into one enum. It
+    # keeps working, and it now reads as one spelling of the deployment axis, so
+    # a repo that committed it before the split needs no edit.
+    assert DexConfig().semantic.vendor == "dbt"
+    assert DexConfig().semantic.deployment == "local"
+
+    for spelling in ("dbt_cloud", "api", "cloud"):
+        assert SemanticConfig(backend=spelling).deployment == "dbt_cloud"
+
+    config = DexConfig(
+        semantic=SemanticConfig(
+            backend="dbt_cloud", host="sl.example.com", environment_id="7"
+        )
+    )
+    save_config(config, tmp_path)
+    loaded = load_config(tmp_path)
+    assert loaded is not None
+    assert loaded.semantic.deployment == "dbt_cloud"
+    assert loaded.semantic.host == "sl.example.com"
+
+
+def test_the_semantic_deployment_axis_round_trips_on_its_own(tmp_path: Path):
+    config = DexConfig(semantic=SemanticConfig(vendor="dbt", deployment="dbt_cloud"))
+    # Either spelling answers correctly, so a reader of one is never told the
+    # other's stale value.
+    assert config.semantic.backend == "dbt_cloud"
+    save_config(config, tmp_path)
+    loaded = load_config(tmp_path)
+    assert loaded is not None
+    assert loaded.semantic.deployment == "dbt_cloud"
+
+
+def test_a_contradictory_semantic_block_is_refused_rather_than_resolved():
+    # Two spellings of one choice. Picking a winner would leave the other
+    # accepted and ignored, which reads as a setting that took effect.
+    with pytest.raises(ValueError, match="different deployments"):
+        SemanticConfig(backend="local", deployment="dbt_cloud")
+    # Agreeing is fine; only a contradiction is refused.
+    assert SemanticConfig(backend="dbt_cloud", deployment="dbt_cloud").deployment == (
+        "dbt_cloud"
+    )
+
+
+def test_a_semantic_vendor_or_deployment_dex_does_not_ship_is_refused():
+    with pytest.raises(ValueError, match=r"semantic\.vendor"):
+        SemanticConfig(vendor="cube")
+    with pytest.raises(ValueError, match=r"semantic\.deployment"):
+        SemanticConfig(deployment="dbt_core")
+    with pytest.raises(ValueError, match=r"semantic\.backend"):
+        SemanticConfig(backend="dbt_core")
+
+
+def test_an_unset_semantic_block_is_not_written_into_the_committed_file(
+    tmp_path: Path,
+):
+    # The derived deployment is derived, not chosen, so it must not appear in the
+    # committed file as though the author had picked it.
+    save_config(DexConfig(connector="duckdb"), tmp_path)
+    raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    assert "semantic" not in raw
+
+    save_config(DexConfig(semantic=SemanticConfig(deployment="dbt_cloud")), tmp_path)
+    raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    assert "deployment: dbt_cloud" in raw
+    assert "vendor" not in raw
