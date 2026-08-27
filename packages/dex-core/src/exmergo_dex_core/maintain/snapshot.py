@@ -132,6 +132,15 @@ class TransformLayer(BaseModel):
     warehouse-level finding is traced to the models it lands on without
     re-reading the project at detection time.
 
+    ``model_paths`` maps each name in ``models`` to the file that builds it, so
+    :func:`~.drift.transform_drift` can look up that model's entry in ``files``
+    without guessing: a model and its schema YAML routinely share a filename
+    stem (``stg_orders.sql`` next to ``stg_orders.yml``), so recovering the path
+    from the name by stem alone would risk hashing the wrong file. A baseline
+    pinned before this field existed has an empty ``model_paths``, and a model
+    missing from it is a model ``transform_drift`` cannot content-diff, not one
+    it reports changed.
+
     ``notes`` is how a project format says what it could not supply, the way
     ``ProjectDefinitions.notes`` does on the declarations channel. A format whose
     layer is faithful but narrower than a dbt project's (no file hashes because it
@@ -144,6 +153,7 @@ class TransformLayer(BaseModel):
 
     files: dict[str, str] = Field(default_factory=dict)
     models: list[str] = Field(default_factory=list)
+    model_paths: dict[str, str] = Field(default_factory=dict)
     sources: list[SourceTable] = Field(default_factory=list)
     model_sources: dict[str, list[str]] = Field(default_factory=dict)
     model_refs: dict[str, list[str]] = Field(default_factory=dict)
@@ -288,16 +298,21 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
     or seed from being missed now that both are loaded.
 
     ``files`` stays the whole editable surface: it is a change fingerprint of
-    what a human can edit, not a node list, and nothing compares it across
-    snapshots to raise a finding.
+    what a human can edit, not a node list. ``model_paths`` is the narrower
+    index from a node's name back to the one entry in ``files`` that builds
+    it, which is what lets :func:`~.drift.transform_drift` diff a model's
+    content hash across snapshots without guessing at a path from the name
+    alone.
     """
 
     models: list[str] = []
+    model_paths: dict[str, str] = {}
     model_sources: dict[str, list[str]] = {}
     model_refs: dict[str, list[str]] = {}
     for path, source in node_files(view).items():
         model = node_name(path)
         models.append(model)
+        model_paths[model] = path
         source_calls = sorted(
             {
                 f"{name}.{table}"
@@ -334,6 +349,7 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
     return TransformLayer(
         files={path: source.sha256 for path, source in view.files.items()},
         models=models,
+        model_paths=model_paths,
         sources=sources,
         model_sources=model_sources,
         model_refs=model_refs,

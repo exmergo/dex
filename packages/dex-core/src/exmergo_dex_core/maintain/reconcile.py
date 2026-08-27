@@ -119,7 +119,12 @@ def build(
     for finding in findings:
         if finding.axis == "schema" and finding.code in _PATCHABLE:
             schema_patches.setdefault(finding.identifier, []).append(finding)
-        elif finding.code.startswith("definition_"):
+        elif finding.code.startswith("definition_") or finding.code.startswith(
+            "model_"
+        ):
+            # A model added, removed, or content-changed is the project's own
+            # edit, the same as a semantic definition changing: there is no
+            # warehouse-side fix to propose, only a baseline to catch up.
             definition_churn = True
         else:
             if finding.code == "orphan_relation":
@@ -215,9 +220,9 @@ def build(
 
     if definition_churn:
         warnings.append(
-            "definition changes since the baseline are recorded but not "
-            "reconciled: if the current definitions are intended, re-run "
-            "`maintain snapshot` to accept them as the new baseline"
+            "definition or model changes since the baseline are recorded but "
+            "not reconciled: if the current project state is intended, "
+            "re-run `maintain snapshot` to accept it as the new baseline"
         )
     if len(orphan_identifiers) > 1:
         warnings.append(

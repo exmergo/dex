@@ -182,7 +182,8 @@ dex maintain snapshot             -> capture/refresh the known-good baseline in 
 dex maintain check                -> sweep every drift axis vs the snapshot; ranked report (read-only;
                                      two-phase on billed connectors: free axes now, one estimate for scans)
 dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed;
-                                     nullability; dangling sources (metadata, free everywhere)
+                                     nullability; dangling sources; a model added, removed, or
+                                     content-changed since the baseline (metadata, free everywhere)
 dex maintain volume [<objects>]   -> freshness drift: row counts that collapsed, emptied, or spiked (free)
 dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join
                                      fanout, and the grains the project declares re-verified

@@ -20,7 +20,16 @@ from .snapshot import Snapshot
 
 
 class LayerFingerprint(BaseModel):
-    """Counts from a fingerprinted dbt layer, or nothing when there was none."""
+    """Counts from a fingerprinted dbt layer, or nothing when there was none.
+
+    ``model_count`` and ``file_count`` are also what the ``schema`` axis's
+    ``model_added``/``model_removed``/``model_changed`` findings diff against
+    the next time ``maintain check``/``maintain schema`` runs (see
+    :func:`~.drift.transform_drift`); these counters are the pinned side of
+    that comparison, legible on their own so a reviewer glancing at the
+    snapshot's shape is not left guessing what a ``file_count`` of zero
+    beside a dozen models means.
+    """
 
     file_count: int | None = None
     model_count: int | None = None
