@@ -755,6 +755,8 @@ class DexEngine:
         *,
         metrics: list[str] | None = None,
         for_dimensions: list[str] | None = None,
+        search: list[str] | None = None,
+        full: bool = False,
         api: bool = False,
         local: bool = False,
     ) -> SemanticListResult:
@@ -764,6 +766,8 @@ class DexEngine:
             self,
             metrics=metrics,
             for_dimensions=for_dimensions,
+            search=search,
+            full=full,
             api=api,
             local=local,
         )

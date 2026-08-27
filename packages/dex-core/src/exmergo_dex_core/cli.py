@@ -270,6 +270,15 @@ def _build_parser() -> argparse.ArgumentParser:
                     # be grouped by all of these. `list` only, and refused rather
                     # than dropped in the other two modes.
                     sp.add_argument("--for-dimension", action="append", default=None)
+                    # A word rather than a name, matched against every element's
+                    # own name and the project's words about it. `list` only, and
+                    # refused in the other two modes rather than dropped.
+                    sp.add_argument("--search", action="append", default=None)
+                    # Lifts the catalog's payload caps. Deliberately `--full`
+                    # rather than `--detail`: nothing here scans, so the word
+                    # carries its usual sense on this surface (stop selecting,
+                    # take everything) with no cost attached to it.
+                    sp.add_argument("--full", action="store_true", default=False)
                     sp.add_argument("--group-by", action="append", default=None)
                     sp.add_argument("--where", action="append", default=None)
                     sp.add_argument("--order-by", action="append", default=None)
