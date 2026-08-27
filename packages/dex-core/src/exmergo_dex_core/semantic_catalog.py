@@ -36,10 +36,20 @@ The flat lists are deliberate. Nesting each element inside its semantic model
 would read better and break the flat lookup the PII gate and every existing
 consumer do, so provenance is a field on the element (``semantic_model``) and the
 semantic models are a list of their own carrying their own metadata.
+
+**The physical link uses that same shape.** A semantic model carries the relation
+it sits on and each element carries only its own column, so the address of any
+element is its column plus its model's relation, joined by the ``semantic_model``
+field the element already had. A relation is long and a layer holds many more
+elements than models, so carrying it once per model rather than once per element
+is what keeps the link from dominating the payload. It is also what connects this
+catalog to the physical one: ``explore map`` describes relations, and a metric
+reaches them through its semantic models.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -64,6 +74,14 @@ class SemanticModelInfo:
     Both arrive from a project read and neither is available over the dbt Cloud
     API, whose ``SemanticModel`` type carries only a name; a backend declares
     that rather than letting the absence read as "the project declared none".
+
+    ``relation`` is the physical relation underneath, fully qualified, and it is
+    **the only place a relation appears in the catalog**. Every dimension, entity
+    declaration and measure names its own column and points at its semantic model
+    by name, so a caller joins the two rather than reading a fully qualified
+    relation repeated on every element of a large layer. That is what connects a
+    metric to the objects ``explore map`` and ``explore profile`` describe: a
+    metric names its semantic models, and they name their relations.
     """
 
     name: str
@@ -72,6 +90,7 @@ class SemanticModelInfo:
     model_ref: str | None = None
     agg_time_dimension: str | None = None
     primary_entity: str | None = None
+    relation: str | None = None
 
 
 @dataclass
@@ -83,6 +102,11 @@ class MeasureInfo:
     measure is often a conditional expression rather than a bare column, and
     ``agg_time_dimension`` is what a time grouping on any metric over this
     measure resolves to.
+
+    ``column`` is the physical column behind it, and it is absent wherever
+    ``expr`` is a computed expression rather than a column reference: see
+    :func:`column_reference`. Read it together with the owning semantic model's
+    ``relation`` for the full physical address.
     """
 
     name: str
@@ -92,6 +116,7 @@ class MeasureInfo:
     label: str | None = None
     description: str | None = None
     semantic_model: str | None = None
+    column: str | None = None
 
 
 @dataclass
@@ -113,6 +138,13 @@ class DimensionInfo:
     which is what stops a caller asking for one and getting a refusal it could
     have predicted. Absent means the layer was not asked or could not say, which
     is a different thing and reads differently.
+
+    ``column`` is the physical column behind the declaration this row reaches,
+    on that declaration's semantic model. It is absent for a computed expression
+    and absent wherever ``semantic_model`` is, because a path reachable from more
+    than one declaring model has no single column to name and a synthesized token
+    has no declaration at all. Absent is the honest answer in both cases; guessing
+    a column out of an expression is what makes a reader over-claim.
     """
 
     name: str
@@ -122,6 +154,7 @@ class DimensionInfo:
     definition: str | None = None
     semantic_model: str | None = None
     queryable_granularities: list[str] | None = None
+    column: str | None = None
 
 
 @dataclass
@@ -134,6 +167,12 @@ class EntityRole:
     model's own join, including how much of the model is lost to a nullable key,
     which is the metadata an author writes most carefully and the one a flat
     merge silently discards.
+
+    ``column`` is that join key resolved to a plain column on this model's
+    relation, which is ``expr`` where ``expr`` is a bare column reference and the
+    entity's own name where it declares none. It is what turns a declared entity
+    into a drawable join edge, and it is absent rather than guessed where the key
+    is an expression.
     """
 
     semantic_model: str
@@ -141,6 +180,7 @@ class EntityRole:
     expr: str | None = None
     role: str | None = None
     description: str | None = None
+    column: str | None = None
 
 
 @dataclass
@@ -381,6 +421,7 @@ def merge_element_fields(
         "definition",
         "semantic_model",
         "queryable_granularities",
+        "column",
     ):
         if fields.get(name) is None:
             fields[name] = element.get(name)
@@ -401,6 +442,122 @@ def derive_entity_type(roles: list[EntityRole]) -> str:
         if role.type:
             return role.type
     return ""
+
+
+# What counts as "this element references a plain column" rather than "this
+# element computes something". Anchored with fullmatch, so `order_id` is a column
+# and `lower(order_id)` or `a + b` is not.
+_BARE_COLUMN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def column_reference(expr: str | None, name: str | None) -> str | None:
+    """The single physical column an element references, or None.
+
+    Three cases, and the third is the one that matters. A bare-identifier ``expr``
+    is the column; an element with no ``expr`` at all references the column its own
+    name spells, which is how every format worth supporting reads an undecorated
+    declaration; and a computed expression resolves to **nothing**, because a
+    column guessed out of an expression makes every reader downstream over-claim.
+    The PII gate reaches a column this way, so over-claiming there means screening
+    the wrong column and reporting that as evidence.
+
+    Here rather than in the dbt reader because two very different callers apply it:
+    a project format holding manifest dicts, and a query backend holding a GraphQL
+    payload. One rule, one place, so the two cannot drift about what "the column
+    behind this" means.
+    """
+
+    if expr is None:
+        return name if isinstance(name, str) and name else None
+    if isinstance(expr, str) and _BARE_COLUMN.fullmatch(expr.strip()):
+        return expr.strip()
+    return None
+
+
+@dataclass(frozen=True)
+class EntityJoin:
+    """One join the semantic layer declares outright, resolved to two relations.
+
+    A semantic layer states its join graph: every entity shared by two semantic
+    models is a join, with the physical key named per model, and the key routinely
+    differs between the two sides for the same entity. That graph is authoritative
+    and free to read, which makes it a strictly better answer than a name-based
+    inference over the same warehouse.
+
+    ``parent`` is the side the entity keys and ``child`` the side that joins to
+    it, matching the direction :class:`~.cache.Relationship` is written in, so a
+    caller building an edge does not have to work out which end is which.
+    """
+
+    entity: str
+    parent_model: str
+    parent_relation: str
+    parent_column: str
+    child_model: str
+    child_relation: str
+    child_column: str
+
+
+def entity_joins(view: SemanticCatalogView) -> list[EntityJoin]:
+    """Every join this layer declares, as resolved relation-to-relation edges.
+
+    Neutral, over the neutral view, so a second semantic-layer format that fills
+    the same catalog produces the same graph without a second implementation and
+    without teaching the explore surface anything about a vendor.
+
+    **The parent is the declaration that keys the entity**, which is the one typed
+    ``primary``, or the single ``unique`` declaration where the layer names no
+    primary. An entity with several primaries, or with several uniques and no
+    primary, yields nothing: which side keys the join is then not a fact the layer
+    states, and resolution here never guesses, exactly as declared-endpoint
+    resolution does not.
+
+    Children are the ``foreign`` declarations and only those. A ``natural`` key
+    identifies a row in a slowly-changing table, where a correct join also needs a
+    validity window the catalog does not carry, so drawing it as a plain equi-join
+    would be an edge that is wrong rather than merely unproven.
+
+    A side missing its relation or its column yields nothing rather than a partial
+    edge: an element whose reference is a computed expression has no column to join
+    on (see :func:`column_reference`), and a backend that cannot say which relation
+    a model sits on has nothing to draw between.
+    """
+
+    relations = {m.name: m.relation for m in view.semantic_models if m.relation}
+    joins: list[EntityJoin] = []
+    for entity in view.entities:
+        keyed = [r for r in entity.roles if r.type == "primary"] or [
+            r for r in entity.roles if r.type == "unique"
+        ]
+        if len(keyed) != 1:
+            continue
+        parent = keyed[0]
+        parent_relation = relations.get(parent.semantic_model)
+        if not parent_relation or not parent.column:
+            continue
+        for role in entity.roles:
+            if role.type != "foreign" or role.semantic_model == parent.semantic_model:
+                continue
+            child_relation = relations.get(role.semantic_model)
+            if not child_relation or not role.column:
+                continue
+            joins.append(
+                EntityJoin(
+                    entity=entity.name,
+                    parent_model=parent.semantic_model,
+                    parent_relation=parent_relation,
+                    parent_column=parent.column,
+                    child_model=role.semantic_model,
+                    child_relation=child_relation,
+                    child_column=role.column,
+                )
+            )
+    # Sorted so one layer always produces one edge order, which is what keeps a
+    # cache written from it byte-identical across runs.
+    return sorted(
+        joins,
+        key=lambda j: (j.entity, j.child_relation, j.child_column, j.parent_relation),
+    )
 
 
 def qualified_dimension(entity: str | None, name: str) -> str:
