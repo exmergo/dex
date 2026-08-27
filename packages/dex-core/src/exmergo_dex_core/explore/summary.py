@@ -61,6 +61,12 @@ class MapObject(BaseModel):
     ``pii_column_count`` and the elision counts are over the object's whole
     profile, not over what survived the cap, so a caller reading a trimmed entry
     still learns the true totals.
+
+    ``semantic_models`` is which semantic models the project's semantic layer
+    exposes this object through, and it is why the map can answer "is this table
+    load-bearing" rather than only "how big is it". Empty means the layer reaches
+    it through none, or that no project was read, which is the ordinary case: the
+    link is folded in only under ``--use-project``.
     """
 
     identifier: str
@@ -70,6 +76,7 @@ class MapObject(BaseModel):
     profiled_at: str | None = None
     grain: list[str] | None = None
     candidate_key: list[str] | None = None
+    semantic_models: list[str] = Field(default_factory=list)
     columns: list[MapColumn] = Field(default_factory=list)
     elided_column_count: int = 0
     pii_column_count: int = 0
@@ -148,6 +155,7 @@ def summarize_map(
                 profiled_at=dataset.profiled_at,
                 grain=dataset.grain,
                 candidate_key=_best_key(dataset),
+                semantic_models=list(dataset.semantic_models),
                 columns=[
                     MapColumn(
                         name=column.name,
