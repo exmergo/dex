@@ -247,6 +247,15 @@ class MetricInfo:
 
     ``queryable_granularities`` is the grains a time grouping may ask for, which
     the layer knows per metric and a fixed list cannot.
+
+    ``elided_dimension_count`` is how many groupable tokens the payload cap cut
+    from ``dimensions``, and it is **absent rather than zero** where nothing was
+    cut. That breaks the rule the rest of dex follows for elision counts, on
+    purpose: this one repeats once per metric, and a catalog is the payload a cap
+    exists to keep small, so paying for a zero on every metric would spend bytes
+    to say nothing. The positive statement lives once, on the catalog's own
+    ``elided`` block, which is unconditional and carries the layer-wide total; a
+    reader that sees zero there knows no metric carries this field.
     """
 
     name: str
@@ -254,6 +263,7 @@ class MetricInfo:
     label: str | None = None
     description: str | None = None
     dimensions: list[str] = field(default_factory=list)
+    elided_dimension_count: int | None = None
     semantic_models: list[str] | None = None
     input_measures: list[str] | None = None
     composition: MetricComposition | None = None
@@ -347,6 +357,113 @@ class SemanticCatalogView:
             ),
             unknown,
         )
+
+    def matching(self, terms: list[str]) -> tuple[SemanticCatalogView, list[str]]:
+        """This catalog narrowed to what the search terms touch, as
+        ``(catalog, unmatched)``.
+
+        A caller arriving at a large layer usually knows a word rather than a
+        name: "revenue", "session", "tier". Every element carries the project's
+        own label and description, so a substring search over those words is the
+        cheapest way from a word to the metrics it concerns, and it costs no call
+        to the layer because the whole catalog is already in hand.
+
+        **A search resolves to metrics and then scopes exactly as ``--metric``
+        does.** A term that matches a dimension, measure, entity or semantic model
+        keeps the metrics that reach it, because a matched dimension with no
+        metric beside it answers nothing a caller can query. That also keeps one
+        shape for every way of narrowing this catalog: whatever the caller asked
+        by, what comes back is a catalog rather than a filtered list.
+
+        The union across terms, not the intersection. Two terms are two searches,
+        and a caller writing "revenue session" is widening rather than
+        constraining, which is the opposite of ``--for-dimension``, where the
+        intersection is the whole question.
+
+        Unmatched terms come back rather than being dropped. Unlike a misspelled
+        metric name, a search term that matches nothing is an honest answer, so
+        the caller is told which terms were the empty ones instead of the command
+        being refused; a search for three words where one was a typo should still
+        answer for the other two.
+
+        Matching is case-insensitive substring over each element's name, label and
+        description, plus a metric's own groupable tokens, so searching a
+        dimension token finds the metrics that can be grouped by it.
+        """
+
+        wanted = list(
+            dict.fromkeys(term.strip().lower() for term in terms if term.strip())
+        )
+        if not wanted:
+            return self, []
+
+        def hits(term: str, *values: Any) -> bool:
+            return any(term in str(value).lower() for value in values if value)
+
+        matched: set[str] = set()
+        unmatched: list[str] = []
+        for term in wanted:
+            found: set[str] = set()
+            for metric in self.metrics:
+                if hits(
+                    term,
+                    metric.name,
+                    metric.label,
+                    metric.description,
+                    *metric.dimensions,
+                ):
+                    found.add(metric.name)
+            # An element other than a metric is matched for the metrics that
+            # reach it: a dimension through the groupable list each metric
+            # carries, a measure through the metrics that read it, and a semantic
+            # model through the metrics built on it. An entity is reached through
+            # every model that declares it, which is wide on purpose: an entity is
+            # the layer's join hub, so a search for one is a search for what can be
+            # sliced by it. A measure deliberately does not widen to its model,
+            # because "in the same model as" is not "made of".
+            models = {
+                model.name
+                for model in self.semantic_models
+                if hits(term, model.name, model.label, model.description)
+            }
+            models.update(
+                role.semantic_model
+                for entity in self.entities
+                if hits(term, entity.name, entity.label, entity.description)
+                for role in entity.roles
+            )
+            measures = {
+                measure.name
+                for measure in self.measures
+                if hits(term, measure.name, measure.label, measure.description)
+            }
+            dimensions = {
+                dimension.name
+                for dimension in self.dimensions
+                if hits(
+                    term,
+                    dimension.name,
+                    dimension.definition,
+                    dimension.label,
+                    dimension.description,
+                )
+            }
+            for metric in self.metrics:
+                if (
+                    dimensions.intersection(metric.dimensions)
+                    or measures.intersection(metric.input_measures or ())
+                    or models.intersection(metric.semantic_models or ())
+                ):
+                    found.add(metric.name)
+            if found or models or measures or dimensions:
+                matched.update(found)
+            else:
+                unmatched.append(term)
+
+        narrowed, _unknown = self.narrowed_to(
+            [metric.name for metric in self.metrics if metric.name in matched]
+        )
+        return narrowed, unmatched
 
     def metrics_for_dimensions(
         self, dimensions: list[str]
