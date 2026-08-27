@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-08-27
+
 ### Changed
 
 - **Three behavior changes that come with the row-count and ledger fixes, none of
