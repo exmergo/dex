@@ -80,16 +80,26 @@ dex explore cluster <object>      -> k-means over a bounded sample of numeric no
 dex explore semantic list         -> the semantic layer as the object graph it is, in one shape from either
   [--metric <m>]                     backend: semantic models, metrics (composition, the measures behind the
   [--for-dimension <d>]              number, the grains it can be queried at, and the time column a time
-  [--local|--api]                    grouping resolves to), dimensions, entities with one declaration per
-                                     semantic model, and measures. Each semantic model carries the physical
+  [--search <t>] [--full]            grouping resolves to), dimensions, entities with one declaration per
+  [--local|--api]                    semantic model, and measures. Each semantic model carries the physical
                                      relation it sits on and each element the column behind it, which is what
                                      connects a metric to the objects `explore map` describes; the hosted API
                                      exposes no relation and declares that gap. Costs no warehouse query on
                                      either backend.
-                                     --metric narrows to those metrics and what they reach; --for-dimension is
-                                     the reverse lookup, the metrics groupable by all the named tokens, which
-                                     is also the cheapest way to find the metrics that share an axis. Both name
-                                     the scope in the payload, so a subset is never mistaken for the layer
+                                     Three ways to narrow it, all free and all composable, and all named in
+                                     the payload so a subset is never mistaken for the layer. --metric keeps
+                                     those metrics and what they reach; --for-dimension is the reverse lookup,
+                                     the metrics groupable by all the named tokens, which is also the cheapest
+                                     way to find the metrics that share an axis; --search matches a word
+                                     against every element's name and the project's own words about it, and
+                                     resolves to the metrics it touches. A search term that matches nothing is
+                                     named in a note rather than refusing, unlike an unknown metric name.
+                                     Budgeted like `explore map`: 50 semantic models, 60 metrics, 150
+                                     dimension rows, 50 entities, 60 measures, 40 groupable tokens per metric.
+                                     Every cut is counted in `elided` and named in `notes`, `elided` is present
+                                     with its zeros so a complete catalog says so, and --full lifts the caps.
+                                     The defaults leave an ordinary layer uncut, so a cap only bites one that
+                                     was already too large to read in one payload
 dex explore semantic values <d>   -> one dimension's value domain: what a filter on it may be filtered to,
   [--metric <m>] [--local|--api]     capped and columnar like `explore query`. A PII-flagged dimension refuses
                                      the command rather than being screened, because the whole output is
