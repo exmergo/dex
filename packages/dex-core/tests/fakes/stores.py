@@ -98,3 +98,24 @@ def explodes(context: StoreContext) -> TenantStore:
 
 
 NOT_CALLABLE = "a string, not a factory"
+
+
+class UnreachableLedgerStore(TenantStore):
+    """A backend whose documents work and whose spend ledger does not.
+
+    The shape a network-backed store takes during an outage of the ledger alone,
+    and the reason it is worth having: a store that fails wholesale is easy to
+    reason about, while one whose ledger is unreachable while its cache still
+    answers is the case where the question "which commands should die?" has a
+    wrong answer that looks fine. Writes are allowed to land so a test can put a
+    gate through settlement without the write being the thing that fails.
+    """
+
+    def spend_since(
+        self,
+        cutoff_iso: str,
+        *,
+        field: str = "billed_bytes",
+        connector: str | None = None,
+    ) -> float:
+        raise ConnectionError("the ledger backend is unreachable")

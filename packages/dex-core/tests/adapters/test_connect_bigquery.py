@@ -150,6 +150,123 @@ def test_views_report_no_stored_row_count(fake_bq_client):
     assert meta.row_count is None
 
 
+@pytest.mark.parametrize(
+    ("table_type", "counted"),
+    [
+        # BigQuery maintains counts for a base table and for nothing else. An
+        # absent table_type is the client not having been told yet, which is a
+        # base table; a kind nobody anticipated is unknown, which is the only
+        # direction that cannot fabricate a number.
+        ("TABLE", True),
+        (None, True),
+        ("EXTERNAL", False),
+        ("SNAPSHOT", False),
+    ],
+)
+def test_only_a_base_table_reports_a_stored_row_count(
+    fake_bq_client, table_type, counted
+):
+    """Issue #375: an external table's `num_rows` is a real zero, not an absent
+    value, so storing it is a claim the table is empty. Verified live against
+    BigQuery: an external table over GCS parquet holding rows reports
+    `num_rows == 0` and `num_bytes == 0`, exactly as a genuinely empty table
+    does, while its profiling aggregate returns correct column statistics."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="lakehouse_orders",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=0,
+        table_type=table_type,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    adapter = make_adapter(fake_bq_client)
+    meta = next(o for o in adapter.list_objects() if o.name == "lakehouse_orders")
+    assert meta.row_count == (0 if counted else None)
+    assert meta.byte_size == (0 if counted else None)
+
+
+def test_the_aggregate_supplies_the_count_the_metadata_does_not_maintain(
+    fake_bq_client,
+):
+    """The donor pattern issue #375 cites did not exist: BigQuery read `n_total`
+    off every aggregate batch and discarded it, so a view's count never arrived
+    and the probes that need one could never run. Now it supersedes the metadata
+    for the rest of the command, as it does on Postgres."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_orders",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=5_000,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"n_total": 42, "nn_0": 42, "nd_0": 42}]
+    adapter = make_adapter(fake_bq_client)
+    meta, columns = adapter.table_metadata(table.identifier)
+    assert meta.row_count is None
+    adapter.column_aggregates(table.identifier, columns)
+    refreshed, _ = adapter.table_metadata(table.identifier)
+    assert refreshed.row_count == 42
+
+
+def test_a_sampled_aggregate_never_becomes_the_tables_row_count(fake_bq_client):
+    """The sample's count describes the sample. Writing it back would hand every
+    downstream uniqueness proof a denominator smaller than the table."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    huge = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_huge",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=100 * MB,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[huge.identifier] = huge
+    fake_bq_client.row_resolver = lambda sql: [{"n_total": 7, "nn_0": 7, "nd_0": 7}]
+    adapter = make_adapter(
+        fake_bq_client,
+        ceiling=500 * MB,
+        target=BigQueryTarget(max_full_profile_bytes=10 * MB),
+    )
+    _meta, columns = adapter.table_metadata(huge.identifier)
+    assert adapter._sample_percent(huge.identifier) is not None, "sampling must engage"
+    adapter.column_aggregates(huge.identifier, columns)
+    refreshed, _ = adapter.table_metadata(huge.identifier)
+    assert refreshed.row_count is None
+
+
+def test_connect_test_reports_the_day_or_says_it_cannot(fake_bq_client):
+    """Issue #374: the capability report is the one free surface that still reads
+    the ledger, because saying what the budget looks like is its whole job. An
+    unreachable ledger makes that one field unavailable rather than failing the
+    command."""
+
+    adapter = make_adapter(fake_bq_client, session_spent=125.0)
+    assert adapter.capabilities()["budget"]["session_spent_today"] == 125.0
+
+    def unreachable() -> float:
+        raise ConnectionError("the ledger backend is unreachable")
+
+    adapter.cost_gate._read_session_spent = unreachable
+    assert adapter.capabilities()["budget"]["session_spent_today"] is None
+
+
 # --- the billed door --------------------------------------------------------------
 
 
@@ -648,14 +765,19 @@ def test_profile_estimate_skips_the_reserve_for_a_provably_empty_table(fake_bq_c
     assert total == 10 * MB
 
 
-def test_profile_estimate_reserves_nothing_for_a_view_with_unknown_row_count(
+def test_profile_estimate_reserves_for_an_unknown_row_count_but_not_an_empty_one(
     fake_bq_client,
 ):
-    """BigQuery reports no stored row count for a view, and nothing fills one
-    in later: the profiling aggregate's own COUNT(*) is read per batch and
-    never written back to the object. All three escalation probes return early
-    on a falsy row count, so a view provably cannot escalate and the floors it
-    used to reserve were money no run could spend (issue #299)."""
+    """An unknown row count is not an empty one, and only the second rules out
+    escalation.
+
+    BigQuery maintains no row count for a view, and the aggregate's own COUNT(*)
+    is now captured off the batch, so the count exists by the time the probes are
+    asked and every one of them can run. There is no number at estimate time to
+    narrow the reserve with, so the maximum is the honest hold. This reverses the
+    view half of issue #299: the reserve was dropped for these objects on the
+    grounds that the probes provably could not run, which stopped being true.
+    """
 
     from fakes.bigquery import FakeBigQueryClient, FakeTable
 
@@ -678,9 +800,14 @@ def test_profile_estimate_reserves_nothing_for_a_view_with_unknown_row_count(
     )
     adapter = make_adapter(client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.a_view"])
-    # Aggregate batch floor only; the unknown row count rules out all three.
-    assert per_table["test-proj.shop.a_view"] == 10 * MB
-    assert total == 10 * MB
+    # Aggregate batch floor plus all three escalation floors: exact distinct
+    # counts, the value domain, and the composite-key probe (two countable
+    # columns), none of which the unknown count can rule out.
+    assert per_table["test-proj.shop.a_view"] == 40 * MB
+    assert total == 40 * MB
+    reserve = adapter.profile_reserve(total)
+    assert reserve["reserved_queries"] == 3
+    assert reserve["reserved_bytes"] == 30 * MB
 
 
 def _sized_table_client(**table_kwargs):
@@ -1126,3 +1253,83 @@ def test_list_namespace_objects_lists_one_dataset_from_metadata(fake_bq_client):
     # Bare names qualify against the adapter's project; absence reads as empty.
     assert adapter.list_namespace_objects("not_there") == []
     assert fake_bq_client.query_calls == []
+
+
+def test_an_external_table_with_a_composite_grain_scaffolds_the_right_tests(
+    fake_bq_client,
+):
+    """Issue #375 named the wrong mechanism, and the real one is narrower.
+
+    Its claim was that a zero row count stops candidate-key detection so
+    `candidate_keys` comes back empty and the scaffold never emits a `unique`
+    test. Verified live on BigQuery, that is not what happens: `is_unique` comes
+    from the aggregate's own COUNT(*) rather than from the metadata, so
+    single-column keys are found and their `unique` test is emitted. What a zero
+    count really costs is the two probes that take the row count as an argument:
+    the exact-distinct escalation, so every uniqueness verdict stays an
+    approximation that nothing is allowed to draw a hard conclusion from, and the
+    composite-key probe, so a table whose grain is a pair reports no grain at all
+    and its staging model ships with no key test of any kind.
+    """
+
+    from fakes.bigquery import FakeTable
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore.relationships import candidate_keys
+    from exmergo_dex_core.transform.scaffold import _model_yaml
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_order_items",
+        schema=[
+            bigquery.SchemaField("order_id", "INTEGER"),
+            bigquery.SchemaField("line_number", "INTEGER"),
+            bigquery.SchemaField("amount", "NUMERIC"),
+        ],
+        num_rows=0,
+        num_bytes=0,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[table.identifier] = table
+
+    # Six rows over four orders: (order_id, line_number) is the only grain, and
+    # no single column comes close, which is the shape whose grain went missing.
+    def rows(sql: str) -> list[dict]:
+        if "ARRAY_AGG" in sql:  # the value-domain probe
+            row: dict = {}
+            for i in range(3):
+                row[f"d_{i}"] = []
+                row[f"n_{i}"] = 6
+            return [row]
+        if "SELECT DISTINCT" in sql:  # the composite-combination probe
+            # The pair covers all six rows; neither single column does.
+            return [{"d_0": 6}]
+        if "COUNT(DISTINCT" in sql:  # the exact-distinct escalation
+            return [{"d_0": 6}]
+        aggregate = {"n_total": 6}
+        for i, distinct in enumerate((4, 2, 4)):
+            aggregate[f"nn_{i}"] = 6
+            aggregate[f"nd_{i}"] = distinct
+            aggregate[f"mn_{i}"] = 1
+            aggregate[f"mx_{i}"] = 100
+        return [aggregate]
+
+    fake_bq_client.row_resolver = rows
+    adapter = make_adapter(fake_bq_client, ceiling=500 * MB)
+    datasets = profile_mod.profile(adapter, [table.identifier])
+    dataset = datasets[0]
+
+    assert dataset.row_count == 6  # from the aggregate, not the metadata
+    assert "empty table (no rows)" not in dataset.data_quality
+    # The composite probe ran, so the pair is proven and reported as the grain.
+    assert [list(k) for k in dataset.composite_keys] == [["order_id", "line_number"]]
+    keys = candidate_keys(dataset)
+    assert keys[0] == ["order_id", "line_number"]
+
+    dataset.candidate_keys = keys
+    yaml_text = _model_yaml(dataset)
+    # A composite key means not_null on each member and no column-level unique,
+    # which is the test suite a lakehouse staging model should ship with.
+    assert "tests: [unique, not_null]" not in yaml_text
+    assert yaml_text.count("tests: [not_null]") == 3

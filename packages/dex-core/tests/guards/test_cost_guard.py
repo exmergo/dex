@@ -648,3 +648,129 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
     )
     tight.preflight_command(5.0)
     assert tight.remaining_for_statement() == 5
+
+
+# --- the ledger is a dependency of billing, not of every command -----------------
+
+
+class _Outage:
+    """A ledger reader that fails, and counts how often it was asked.
+
+    The count is the assertion that matters for issue #374: the defect was not
+    that the reader raised, it was that it was called at all on a command with no
+    stake in the answer.
+    """
+
+    def __init__(self, *, fail: bool = True, total: float = 0.0) -> None:
+        self.calls = 0
+        self.fail = fail
+        self.total = total
+
+    def __call__(self) -> float:
+        self.calls += 1
+        if self.fail:
+            raise ConnectionError("the ledger backend is unreachable")
+        return self.total
+
+
+def test_building_a_gate_reads_no_ledger():
+    """Issue #374: a gate is built for every command on a billed connector,
+    including the ones that cannot spend, so construction that reads the ledger
+    puts a free cache-served answer behind the ledger's availability. The
+    constructor holds a reader; only admission calls it."""
+
+    reader = _Outage()
+    gate = _gate(session_spent=reader, session_ceiling=1_000.0)
+    assert reader.calls == 0
+    assert gate.session_spent is None
+
+
+def test_a_fixed_session_spend_is_seeded_at_construction():
+    """A caller who passed a number passed the answer, not a way to get it, so
+    there is nothing to defer and nothing that can fail."""
+
+    gate = _gate(session_spent=250.0, session_ceiling=1_000.0)
+    assert gate.session_spent == 250.0
+    assert gate.effective_ceiling() == 750.0
+
+
+def test_an_unread_session_spend_leaves_the_ceiling_to_the_command_budget():
+    """The session bound needs a reading to exist. Its absence is not a loosened
+    ceiling: admission always reads before it decides, so what reaches here
+    unread is a command reporting a cost it never priced."""
+
+    gate = _gate(
+        session_spent=_Outage(fail=False, total=900.0), session_ceiling=1_000.0
+    )
+    assert gate.effective_ceiling() == 1_000.0  # the per-command budget alone
+    assert gate.cost().ceiling == 1_000.0
+
+
+def test_admitting_billed_work_against_an_unreadable_ledger_refuses():
+    """Fail closed, and say which guard refused rather than reading as a crash.
+
+    Before this the reader was called bare, so a backend's own exception
+    travelled out of gate construction as an unclassified internal error.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import LedgerUnreadableError
+
+    ledger = _Ledger()
+    reader = _Outage()
+    gate = _ledger_gate(ledger, session_spent=reader)
+    with pytest.raises(LedgerUnreadableError) as exc_info:
+        gate.preflight_command(10.0)
+    assert "re-issuing the same command is safe" in str(exc_info.value)
+    assert exc_info.value.cost.paradigm is Paradigm.BYTES_SCANNED
+    # A refusal books nothing, the same as every other refusal in this suite.
+    assert ledger.entries == []
+
+
+def test_settling_survives_a_ledger_that_went_away_mid_command():
+    """Settlement re-reads only so the summary can report the day's total, and
+    the release needs no reading at all, so a backend that failed after the work
+    ran must not turn a completed command into a refusal."""
+
+    ledger = _Ledger()
+    reader = _Outage(fail=False)
+    gate = _ledger_gate(ledger, session_spent=reader)
+    gate.preflight_command(100.0)
+    gate.record_billed(80.0)
+    reader.fail = True
+    gate.settle()  # does not raise
+    summary = gate.spend_summary()
+    assert summary["bytes_billed"] == 80.0
+    # What this command billed is exact (the warehouse said so); only the day's
+    # total is unavailable, and it says so rather than reporting this one's share.
+    assert summary["session_spent_today"] is None
+    assert "release" in ledger.kinds()
+
+
+def test_reporting_the_day_never_fails_the_command_that_asks():
+    """``connect test`` exists to say what the budget looks like, so a ledger it
+    cannot reach is an "unavailable" on an otherwise healthy report."""
+
+    gate = _gate(session_spent=_Outage())
+    assert gate.session_spent_now() is None
+    healthy = _gate(session_spent=_Outage(fail=False, total=42.0))
+    assert healthy.session_spent_now() == 42.0
+
+
+def test_a_cumulative_cap_binds_on_a_statement_charged_without_a_handshake():
+    """The unread session bound must not read as an absent one.
+
+    A caller that charges a statement without going through the handshake has no
+    booking, so the cheap local path applies, and a ceiling computed there would
+    have the session bound simply missing. That would let a configured cumulative
+    cap silently not apply, which is the failure the whole guard exists to
+    prevent, so the reading is taken here instead.
+    """
+
+    ledger = _Ledger()
+    ledger.append({"entry": "settlement", "billed_bytes": 950.0})
+    gate = _ledger_gate(ledger, session_spent=ledger.total)
+    assert gate.session_spent is None  # a reader, so nothing read yet
+    # 100 against a 1_000 cumulative cap with 950 already spent: the per-command
+    # ceiling of 1_000 would admit it, the cumulative cap must not.
+    with pytest.raises(OverCeilingError):
+        gate.charge(100.0)
