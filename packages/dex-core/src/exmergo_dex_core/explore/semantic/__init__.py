@@ -125,6 +125,7 @@ __all__ = [
     "SemanticModelInfo",
     "SemanticQuery",
     "SemanticQueryRefusedError",
+    "ValuesRequest",
     "backend_axes",
     "cap_columnar",
     "cost_posture",
@@ -134,8 +135,12 @@ __all__ = [
     "queryable_grains",
     "requested_dimension_refs",
     "resolve_backend",
+    "resolve_values_request",
     "screen_dimension_refs",
+    "screen_values_request",
     "validate_grain",
+    "values_gap",
+    "values_reach_note",
 ]
 
 
@@ -199,6 +204,11 @@ class SemanticCatalog(SemanticCatalogView):
     # complete answer is the failure mode worth designing against: a caller
     # reading a scoped catalog as the layer concludes the rest does not exist.
     scoped_to: list[str] = field(default_factory=list)
+    # Which dimensions that scope was derived from, when the caller asked the
+    # reverse question ("what can I slice by pricing tier") rather than naming
+    # metrics. Beside `scoped_to` rather than folded into it, because the two are
+    # different statements: one is what was asked, the other is what answered.
+    for_dimensions: list[str] = field(default_factory=list)
 
     @classmethod
     def from_backend(cls, backend: Any, **fields: Any) -> SemanticCatalog:
@@ -253,6 +263,8 @@ class SemanticCatalog(SemanticCatalogView):
             "execution": self.execution,
             "dimension_scope": self.dimension_scope,
         }
+        if self.for_dimensions:
+            payload["for_dimensions"] = self.for_dimensions
         if self.scoped_to:
             payload["scoped_to"] = self.scoped_to
         if self.unavailable:
@@ -305,6 +317,12 @@ class SemanticBackend(Protocol):
     backend that answers ``vendor`` inherits the whole no-guard posture from
     :func:`cost_posture` instead of assembling it again.
 
+    ``values`` answers the other half of "what can I filter to": a dimension's
+    value domain, which is the one precondition for writing a filter that no other
+    dex surface can reach on a hosted layer. It takes a metric list because a
+    dimension reached through a join is only answerable in the context of a metric
+    that reaches it, and both layers refuse it otherwise.
+
     ``filter_refs`` is where the query dialect stays the backend's own. A filter
     clause is written in the answering layer's language, and the PII gate has to
     know which dimensions one names before it can screen them, so a backend reads
@@ -331,6 +349,8 @@ class SemanticBackend(Protocol):
     def list_definitions(self) -> SemanticCatalog: ...
 
     def query(self, q: SemanticQuery): ...
+
+    def values(self, dimension: str, metrics: list[str]): ...
 
     def filter_refs(self, clauses: list[str]) -> list[str] | None:
         """The dimension and entity tokens these filter clauses name, or None when
@@ -396,6 +416,25 @@ def cost_posture(backend: Any) -> tuple[Any, list[str]]:
 
     warning = getattr(backend, "cost_guard_warning", None)
     return env.Cost(paradigm=env.Paradigm.HOSTED), [warning] if warning else []
+
+
+def values_gap(backend: Any) -> str:
+    """Why this backend cannot answer a dimension's value domain, named rather
+    than implied.
+
+    The counterpart to :func:`~...adapters.project.semantic_catalog_gap`, for the
+    other seam a third backend may reach only partly. ``resolve_backend`` has
+    already returned this object by the time a caller asks, so without it the
+    alternative is an ``AttributeError`` raised inside a command the resolution let
+    through, which names neither the missing member nor a way forward.
+    """
+
+    named = getattr(backend, "name", type(backend).__name__)
+    return (
+        f"the '{named}' semantic backend does not read a dimension's value "
+        "domain; implement `values(dimension, metrics)` on it, or ask a backend "
+        "that does (`--local` / `--api`)"
+    )
 
 
 # ---- shared PII screening --------------------------------------------------
@@ -609,6 +648,159 @@ def unadjudicated_refs(
         if not _meta_says_pii(meta) and not _meta_clears(meta):
             unknown.append(ref)
     return unknown
+
+
+def screen_values_request(
+    dimension: str,
+    *,
+    meta_lookup: Callable[[str], Any] | None = None,
+) -> list[str]:
+    """Clear one dimension for a values request, or refuse it. Returns the
+    disclosure notes for screening that ran on the name heuristic alone.
+
+    The same policy as a metric query's gate with a harder consequence, because the
+    output differs in kind. A metric query returns aggregates that a dimension
+    merely slices, so a flagged dimension can be dropped from the grouping and the
+    query still answers something. Here the result *is* the values, so there is no
+    reduced answer to fall back to and a flagged dimension refuses the command.
+
+    Worded once, here, rather than in each backend: the two differ in where the
+    evidence comes from (a profiled column's cached flag, or the layer's own
+    ``config.meta``) and not at all in what the refusal means.
+    """
+
+    blocked = screen_dimension_refs([dimension], meta_lookup=meta_lookup)
+    if blocked:
+        _ref, reason = blocked[0]
+        raise SemanticQueryRefusedError(
+            f"refused: {dimension} is PII ({reason}), and this command returns "
+            "nothing but the values of one dimension, so there is no aggregate to "
+            "fall back to. PII is flagged, never surfaced. Ask for a different "
+            "dimension; one reviewed as not PII is cleared durably with a "
+            "pii_overrides entry in .dex/config.yml, or with `meta: {pii: false}` "
+            "on the dimension in the project that declares it."
+        )
+    if not unadjudicated_refs([dimension], meta_lookup=meta_lookup):
+        return []
+    return [
+        f"PII screening used the name heuristic alone for {dimension}: no "
+        "authoritative source spoke to it, so its values passed on the shape of "
+        "its name. Profile the column behind it, or mark it in the project that "
+        "declares it, to make the screening evidence-backed."
+    ]
+
+
+@dataclass(frozen=True)
+class ValuesRequest:
+    """A values request resolved against the layer that will answer it.
+
+    ``token`` is what the caller wrote, grain suffix and all, and it is what the
+    result reports back. ``name`` and ``grain`` are that token split, which is the
+    form both layers take. ``metrics`` is the caller's own scope, checked, and
+    ``reachable`` is every metric that can reach the dimension, which is what makes
+    a joined dimension answerable at all.
+    """
+
+    token: str
+    name: str
+    grain: str | None
+    metrics: list[str]
+    reachable: list[str]
+    grains: tuple[str, ...]
+
+
+def resolve_values_request(
+    view: SemanticCatalogView, dimension: str, metrics: list[str]
+) -> ValuesRequest:
+    """Resolve a values request against a catalog, or refuse it by name.
+
+    Shared by both backends over the same neutral view, so the two resolve a token
+    identically and a refusal is worded once. That matters more here than it looks:
+    the resolution decides which metrics can reach a dimension, and a backend that
+    computed that differently would answer a different question under the same
+    command.
+
+    The grain is split off for the lookup and carried separately for the query. No
+    dimension name carries a grain, so validating the spelled token would refuse
+    ``user__created_at__month``, which both layers answer; and the vocabulary comes
+    from the layer rather than a constant, because a project may define a
+    granularity of its own and spell it into a token the same way.
+    """
+
+    from ...metricflow_dialect import STANDARD_GRAINS, split_grain
+
+    token = (dimension or "").strip()
+    if not token:
+        raise SemanticBackendError(
+            "a values request needs one dimension (discover them with "
+            "`explore semantic list`)"
+        )
+    grains = (
+        tuple(
+            dict.fromkeys(
+                grain
+                for element in (*view.metrics, *view.dimensions)
+                for grain in (element.queryable_granularities or ())
+            )
+        )
+        or STANDARD_GRAINS
+    )
+    name, grain = split_grain(token, None, grains=grains)
+    reachable, unknown = view.metrics_for_dimensions([name])
+    if unknown:
+        raise SemanticBackendError(
+            f"no such dimension in this semantic layer: {name}. List what it "
+            "exposes with `explore semantic list`, and note that the token is "
+            "entity-qualified (user__pricing_tier) rather than the bare column "
+            "name"
+        )
+
+    wanted = list(dict.fromkeys(metrics or []))
+    known = {metric.name for metric in view.metrics}
+    missing = [metric for metric in wanted if metric not in known]
+    if missing:
+        raise SemanticBackendError(
+            f"no such metric in this semantic layer: {', '.join(missing)}. "
+            "List what it exposes with `explore semantic list`"
+        )
+    return ValuesRequest(
+        token=token,
+        name=name,
+        grain=grain,
+        metrics=wanted,
+        reachable=sorted(reachable),
+        grains=grains,
+    )
+
+
+def values_reach_note(dimension: str, used: list[str], reachable: list[str]) -> str:
+    """The disclosure that dex reached a dimension's values through a metric it
+    picked itself.
+
+    Both layers refuse a distinct-values query for a dimension reached through a
+    join: there is no measure to join from, so the only rendering that exists is
+    one scoped to a metric. That rendering answers a slightly different question,
+    the values present for that metric rather than the domain of the column, and
+    the difference is invisible in a one-column result. So the metric is named,
+    the alternatives are named, and the flag that overrides the choice is named.
+
+    Kept beside the screening policy rather than in a backend, because both
+    backends hit the same refusal for the same reason and a note worded twice
+    drifts.
+    """
+
+    others = [name for name in sorted(reachable) if name not in used]
+    alternatives = (
+        f" {len(others)} other metric(s) reach it, including {', '.join(others[:3])}."
+        if others
+        else ""
+    )
+    return (
+        f"{dimension} is reached through a join, so its values could only be read "
+        f"in the context of a metric; dex used {', '.join(used)}. These are "
+        "therefore the values present for that metric, which can be narrower than "
+        f"the column's own domain.{alternatives} Pass --metric to choose."
+    )
 
 
 def cap_columnar(
