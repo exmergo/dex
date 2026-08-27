@@ -660,6 +660,80 @@ class SemanticCatalogContract:
                 "primary wherever any declaration is primary"
             )
 
+    def test_the_catalog_resolves_a_semantic_model_to_its_relation(self) -> None:
+        """A semantic model that names no relation leaves the layer disconnected.
+
+        The catalog and the physical catalog are two views of one warehouse, and
+        the relation on a semantic model is the whole join between them: it is what
+        answers "which table is behind this metric", what lets ``explore map`` say
+        an object is exposed, and what an entity's declared join is drawn between.
+        A format that reads a layer but resolves none of it to a relation returns a
+        catalog that cannot be connected to anything the rest of ``explore``
+        describes.
+
+        Declining is still possible and is not this: a backend that structurally
+        cannot know the relation declares that gap, which is a different statement
+        from a format that could and did not.
+        """
+
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        model = next(m for m in catalog.semantic_models if m.name == name)
+        assert model.relation, (
+            f"semantic model {name!r} resolves to no physical relation, so nothing "
+            "connects this layer to the objects explore profiles and maps"
+        )
+
+    def test_an_element_carries_its_column_and_never_invents_one(self) -> None:
+        """The same rule the fingerprint follows, on the read catalog.
+
+        Two failures, opposite in direction and both live. A catalog whose columns
+        are all absent cannot reach a physical column at all, which is what the PII
+        gate needs to adjudicate a dimension from evidence rather than from the
+        shape of its name. A catalog that invents a column out of an expression is
+        worse: the gate then screens a column that is not the one behind the
+        element and reports the verdict as evidence-backed.
+
+        The fixture's own mapping is the oracle, including its ``None`` entries, so
+        a format is held to what it said its layer contains rather than to a shape.
+        """
+
+        project, name, dimensions, measures = (
+            self.a_project_declaring_a_semantic_model()
+        )
+        catalog = project.semantic_catalog()
+
+        for element, expected in (
+            (
+                {
+                    d.definition: d.column
+                    for d in catalog.dimensions
+                    if d.semantic_model == name
+                },
+                dimensions,
+            ),
+            (
+                {
+                    m.name: m.column
+                    for m in catalog.measures
+                    if m.semantic_model == name
+                },
+                measures,
+            ),
+        ):
+            for field, column in expected.items():
+                assert field in element, (
+                    f"the catalog carries no entry for {field!r} on {name!r}; the "
+                    "fixture declares it, so the read dropped it"
+                )
+                assert element[field] == column, (
+                    f"{field!r} on {name!r} carries column {element[field]!r} where "
+                    f"the fixture says {column!r}. None is the honest answer for an "
+                    "expression: a column guessed out of one makes the PII gate "
+                    "screen the wrong column and call it evidence"
+                )
+
     def test_a_dimension_row_names_the_token_a_query_groups_by(self) -> None:
         """The catalog's ``name`` is a query token, not a display name.
 

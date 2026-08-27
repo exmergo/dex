@@ -240,7 +240,13 @@ writing back to `.dex/config.yml`. It also reads and queries the dbt semantic la
 semantic models and metrics and their composition and measures and dimensions and
 the declared entity graph, in one shape from either backend, scopeable to the
 metrics a caller came for (or, with `--for-dimension`, to the metrics a given slice
-is available on) and costing no warehouse query. `values` returns one dimension's
+is available on) and costing no warehouse query. Each semantic model carries the
+relation it sits on and each element the column behind it, which is what connects a
+metric to the objects `explore map` and `explore profile` describe; the hosted
+backend exposes columns but no relations, and declares that gap rather than leaving
+it to be inferred. That link runs both ways: with `--use-project`, `explore map`
+marks each object with the semantic models that expose it and draws the joins the
+layer declares, at the declared tier and with the entity named. `values` returns one dimension's
 value domain, which is what you need before writing a filter and the only way to
 reach it at all on a hosted layer. Metric queries run either locally
 through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt

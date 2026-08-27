@@ -10,6 +10,7 @@ logic arrives.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -5789,3 +5790,124 @@ def test_duckdb_cannot_be_reached_through_an_injected_connection(duckdb_file: Pa
 
     with pytest.raises(ValueError, match="read-only"):
         DexEngine(config=config, connection=writable)._adapter("explore inventory")
+
+
+def test_the_semantic_layer_read_costs_the_warehouse_nothing(
+    tmp_path: Path, monkeypatch, capsys
+):
+    # Family 2: `--use-project` now folds a semantic layer into the map, and that
+    # read is a compiled-artifact parse and nothing else. A project read that
+    # quietly issued a statement would be spend the cost handshake never priced
+    # and the estimate never covered, which is the failure mode the guard exists
+    # for and the one a "free" read is most likely to introduce.
+    #
+    # Asserted as a delta rather than as an absolute: the map's own profiling
+    # statements are the subject of other tests, and what has to hold here is that
+    # adding the semantic read adds none of them.
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE customers (id INTEGER, region VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'eu')")
+    conn.execute("CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "target").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n', encoding="utf-8"
+    )
+    (repo / "target" / "semantic_manifest.json").write_text(
+        json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "customers_sm",
+                        "node_relation": {
+                            "alias": "customers",
+                            "relation_name": '"a"."main"."customers"',
+                        },
+                        "entities": [
+                            {"name": "customer", "type": "primary", "expr": "id"}
+                        ],
+                        "dimensions": [{"name": "region", "type": "categorical"}],
+                        "measures": [{"name": "n", "agg": "count", "expr": "id"}],
+                    },
+                    {
+                        "name": "orders_sm",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": '"a"."main"."orders"',
+                        },
+                        "entities": [
+                            {"name": "order", "type": "primary", "expr": "order_id"},
+                            {
+                                "name": "customer",
+                                "type": "foreign",
+                                "expr": "buyer_id",
+                            },
+                        ],
+                        "dimensions": [],
+                        "measures": [{"name": "m", "agg": "count"}],
+                    },
+                ],
+                "metrics": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    statements: list[str] = []
+    original = DuckDBAdapter._run_select
+
+    def counting(self, sql, params=None):
+        statements.append(sql)
+        return original(self, sql, params)
+
+    monkeypatch.setattr(DuckDBAdapter, "_run_select", counting)
+
+    def run(*extra: str) -> int:
+        statements.clear()
+        cache = repo / ".dex"
+        if cache.is_dir():
+            shutil.rmtree(cache)
+        _run(
+            [
+                "explore",
+                "map",
+                "--path",
+                str(db),
+                "--repo-root",
+                str(repo),
+                *extra,
+            ],
+            capsys,
+        )
+        return len(statements)
+
+    bare = run()
+    with_layer = run("--use-project")
+
+    assert with_layer == bare, (
+        "folding the semantic layer into the map changed how many statements "
+        f"reached the warehouse ({bare} -> {with_layer}). The link is a read of a "
+        "compiled artifact; a version of it that scans is spend nothing priced"
+    )
+
+    # And the read did happen, so the equality above is not the trivial one.
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    edges = [e for e in payload["data"]["edges"] if e["declared_by"]]
+    assert edges and edges[0]["declared_by"] == "semantic entity 'customer'"

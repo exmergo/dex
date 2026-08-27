@@ -271,9 +271,19 @@ def _edge(rel: Relationship, kept: list[Dataset]) -> str:
 
 
 def _edge_label(rel: Relationship) -> str:
+    """The edge annotation: the key, the kind, and what earned the claim.
+
+    ``declared_by`` is drawn where the cache carries one, which is a semantic
+    layer's shared entity. A reader looking at a solid line otherwise has no way to
+    tell a foreign-key test from a declared join the semantic layer performs, and
+    the entity name is the handle for looking the second one up.
+    """
+
     parts = [", ".join(rel.from_columns) or "join", rel.kind.value]
     if rel.kind is not RelationshipKind.DECLARED and rel.confidence is not None:
         parts[-1] = f"{rel.kind.value} {rel.confidence:.2f}"
+    if rel.declared_by:
+        parts[-1] = f"{parts[-1]}: {rel.declared_by}"
     if rel.verified:
         if rel.orphan_fraction is None:
             parts.append("verified, no non-null keys")
@@ -391,8 +401,8 @@ def _header_comments(cache: DexCache, ids: dict[str, str]) -> list[str]:
     lines = [
         f"    %% dex exploration map, connector: {provenance.connector or 'unknown'}, "
         f"cached: {stamp}",
-        "    %% solid lines are relationships declared in the dbt project; "
-        "dotted lines are inferred",
+        "    %% solid lines are joins the project declares, by a relationships "
+        "test or a shared semantic-layer entity; dotted lines are inferred",
         "    %% a cardinality is drawn only where the cache proved it; "
         "}o..o{ means unproven",
     ]

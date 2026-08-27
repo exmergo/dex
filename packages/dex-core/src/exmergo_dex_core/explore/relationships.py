@@ -6,10 +6,13 @@ confidence, so every inferred join carries a confidence the agent can weigh. The
 one deliberate exception is the opt-in ``--verify`` pass
 (:func:`verify_relationships`), which runs one bounded, engine-authored aggregate
 probe per join to measure the actual key overlap. Declared joins come from the
-dbt project; absent one, they are simply empty (explore is designed to work
-without a dbt project). They are probed too: a declaration is a claim about the
-data, so it is measurable, and only what the measurement may *change* differs by
-kind (see :func:`verify_relationships`).
+project, from two channels that are equally authoritative and that this module
+keeps apart: a ``relationships`` test (:func:`declared_relationships`) and a
+semantic layer's shared entity (:func:`semantic_relationships`). Absent a project
+they are simply empty, since explore is designed to work without one. They are
+probed too: a declaration is a claim about the data, so it is measurable, and only
+what the measurement may *change* differs by kind (see
+:func:`verify_relationships`).
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from ..cache import (
 from ..config import EntityAffixes
 from ..dbt_project import ProjectDefinitions
 from ..progress import ProgressReporter
+from ..semantic_catalog import EntityJoin
 from .profile import NEAR_UNIQUE_RATIO
 
 # Warehouse-layer prefixes stripped from a table name before entity matching, so
@@ -956,6 +960,81 @@ def declared_relationships(
                 to_columns=[fk.to_column],
                 kind=RelationshipKind.DECLARED,
                 confidence=1.0,
+            )
+        )
+    return relationships, notes
+
+
+def semantic_relationships(
+    joins: list[EntityJoin], known_identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """The semantic layer's declared entity graph, resolved against this
+    connection's identifiers.
+
+    A shared entity is a join the layer states outright, with the physical key
+    named per model, so these arrive at the **declared** tier beside the project's
+    ``relationships`` tests rather than at the inferred one. That is not a
+    generosity: a name-based inference is a guess about whether a join exists,
+    while this is the layer telling dex which join it performs, and the key
+    routinely differs between the two sides in a way no name-matching rule would
+    ever find.
+
+    Resolution is :func:`resolve_declared`, the same function and the same
+    never-guess rule the ``relationships`` tests go through, so an endpoint
+    matching nothing or matching several objects yields a note instead of an edge.
+    A semantic model pointing at a relation this connection does not hold is a real
+    signal (the project was compiled against a different target), which is why it
+    is said rather than dropped.
+
+    ``declared_by`` names the entity, because that is the part a reader can look up
+    with ``explore semantic list`` and the only part the edge does not already
+    carry.
+    """
+
+    relationships: list[Relationship] = []
+    notes: list[str] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for join in joins:
+        child, child_ambiguous = resolve_declared(
+            join.child_relation, join.child_model, known_identifiers
+        )
+        parent, parent_ambiguous = resolve_declared(
+            join.parent_relation, join.parent_model, known_identifiers
+        )
+        label = (
+            f"semantic entity '{join.entity}' joins {join.child_model}."
+            f"{join.child_column} -> {join.parent_model}.{join.parent_column}"
+        )
+        if child is None or parent is None:
+            if child_ambiguous or parent_ambiguous:
+                notes.append(
+                    f"{label}, and at least one side matches more than one object "
+                    "here; skipped rather than guessed"
+                )
+            else:
+                notes.append(
+                    f"{label}, and at least one side is not in this connection's "
+                    "inventory"
+                )
+            continue
+        key = (
+            child.lower(),
+            join.child_column.lower(),
+            parent.lower(),
+            join.parent_column.lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        relationships.append(
+            Relationship(
+                from_dataset=child,
+                from_columns=[join.child_column],
+                to_dataset=parent,
+                to_columns=[join.parent_column],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+                declared_by=f"semantic entity '{join.entity}'",
             )
         )
     return relationships, notes

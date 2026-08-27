@@ -463,7 +463,7 @@ def test_hosted_catalog_query_never_asks_for_an_entity_label():
         posted
     )
     assert (
-        "dimensions { name type label description semanticModel { name } "
+        "dimensions { name type label description expr semanticModel { name } "
         "queryableGranularities queryableTimeGranularities }" in posted
     )
     assert "measures { name agg expr aggTimeDimension }" in posted

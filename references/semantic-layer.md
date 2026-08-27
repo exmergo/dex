@@ -69,11 +69,11 @@ unset one is absent rather than null:
 
 | list | fields |
 |---|---|
-| `semantic_models` | `name`, `label`, `description`, `model_ref` (the transformation-layer model it sits on), `agg_time_dimension` (the model's default time dimension), `primary_entity` |
+| `semantic_models` | `name`, `label`, `description`, `model_ref` (the transformation-layer model it sits on), `agg_time_dimension` (the model's default time dimension), `primary_entity`, `relation` (the physical relation underneath) |
 | `metrics` | `name`, `type`, `label`, `description`, `dimensions` (the tokens it can be grouped by), `semantic_models`, `input_measures` (resolved through any ratio or derived chain), `composition`, `filter`, `time_axis` (what a time grouping resolves to), `queryable_granularities`, `vendor_params` |
-| `dimensions` | `name` (the token a query groups by), `type`, `label`, `description`, `definition` (the bare dimension name), `semantic_model`, `queryable_granularities` |
+| `dimensions` | `name` (the token a query groups by), `type`, `label`, `description`, `definition` (the bare dimension name), `semantic_model`, `queryable_granularities`, `column` |
 | `entities` | `name`, `type` (**derived**, see below), `label`, `description`, `roles` |
-| `measures` | `name`, `agg`, `expr`, `agg_time_dimension`, `label`, `description`, `semantic_model` |
+| `measures` | `name`, `agg`, `expr`, `agg_time_dimension`, `label`, `description`, `semantic_model`, `column` |
 
 `composition` is what a metric is built out of, in portable terms: `measure`,
 `numerator`, `denominator`, `expr`, `input_metrics`. It is sparse, and an absent key
@@ -107,13 +107,57 @@ into the shared shape. `requires_metric_time` is written only when true, so an
 absent key is a false.
 
 `roles` is one entry per `(entity, semantic model)` declaration, each carrying
-`semantic_model`, `type`, `expr`, `role`, `description`. That is the unit the layer
+`semantic_model`, `type`, `expr`, `role`, `description`, `column`. That is the unit the layer
 declares, and it is why an entity cannot be reduced to a single record: an entity is
 `primary` in the one model that keys it and `foreign` in every model that joins to
 it, `expr` is the physical join key and differs per model for the same entity, and
 each declaration is where a project documents that model's own join, including a
-nullable key. The top-level `type` is kept and is **derived**: primary wherever any
-declaration is primary. Read `roles` for the join graph; read `type` for a summary.
+nullable key. `column` is that key resolved to a plain column, which is what makes a
+declared entity a drawable join. The top-level `type` is kept and is **derived**:
+primary wherever any declaration is primary. Read `roles` for the join graph; read
+`type` for a summary.
+
+### The physical link
+
+A semantic layer describes a warehouse the rest of `explore` also describes, and
+the catalog carries the join between the two views.
+
+**The relation is on the semantic model. The column is on the element.** A
+dimension, an entity declaration and a measure each carry `column`, the physical
+column behind them, and each already names its `semantic_model`; that model
+carries `relation`. So the address of any element is its column plus its model's
+relation, and a relation appears once per model rather than once per element,
+which is what keeps the link from dominating a catalog whose byte budget is still
+open work.
+
+Which relation backs a metric is therefore two hops, and deliberately so: a
+metric names its `semantic_models`, and each of those names its `relation`. A
+metric spanning several models has several, which is a fact worth seeing rather
+than a value to pick one from.
+
+**A computed expression carries no column.** A measure defined as
+`gross - discounts`, or a dimension defined as `base_rate * 2`, has no single
+column to name, so `column` is absent rather than guessed. That is not tidiness:
+the PII request-gate resolves a dimension to a column and reads that column's
+profiled evidence, so a column guessed out of an expression makes the gate screen
+the wrong column and report the verdict as evidence-backed. `column` is absent for
+the same reason on a dimension row that no single declaration explains: a path
+reached through two joins, or `metric_time`, which is one token over as many
+columns as the layer has time dimensions.
+
+**A measure's `column` can differ between the backends, and the reason is real.**
+`--local` reads the expression the project's author wrote, so a `count` measure on
+a plain column carries that column. The hosted API returns the expression dbt
+compiled, which for the same measure is a `CASE WHEN ... IS NOT NULL THEN 1 ELSE 0
+END`, and that has no single column. Both answers are correct about what they read;
+neither backend is guessing. Dimensions and entity declarations do not diverge this
+way, because their expressions are passed through rather than compiled.
+
+The link runs in the other direction too. `explore map --use-project` marks each
+object with the semantic models that sit on it (`semantic_models` on a map
+object), and folds the layer's declared entity graph into the map's join edges;
+see [the command contract](command-contract.md). Both are opt-in, because
+exploration starts bare.
 
 ### Two things the two backends legitimately disagree about
 
@@ -135,10 +179,14 @@ it see that several paths reach one declaration.
 
 **`unavailable`.** The hosted `SemanticModel` GraphQL type carries only a name, its
 `Entity` type has no `label` at all, and its `Measure` type carries no words, so a
-hosted catalog declares those gaps per element kind. A hosted catalog is also
-reached metric by metric, so a measure, entity declaration or semantic model that no
-metric draws on is absent from it; that one is a note, because it is a property of
-the layer's shape rather than a field that cannot exist.
+hosted catalog declares those gaps per element kind. `relation` is in that list,
+which makes the physical link the sharpest asymmetry between the two backends: the
+hosted API returns `expr` on dimensions, entities and measures, so a hosted catalog
+names the column behind every element and cannot say which table that column is in.
+Read `--local` for the relations. A hosted catalog is also reached metric by metric,
+so a measure, entity declaration or semantic model that no metric draws on is absent
+from it; that one is a note, because it is a property of the layer's shape rather
+than a field that cannot exist.
 
 ### Scoping a large layer
 
@@ -464,6 +512,9 @@ heuristic at once) wants retrying.
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
 | Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` |
 | Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else |
+| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads |
+| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three |
+| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none |
 | `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved |
 | Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always |
 | `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric |

@@ -75,8 +75,19 @@ class ProfileResult(Result):
 
 
 class RelationshipsResult(Result):
+    """Joins across the objects in scope, with what earned each one.
+
+    ``declared_count`` is every join the project states, from either channel: a
+    ``relationships`` test or a semantic layer's shared entity.
+    ``semantic_join_count`` is how many of those the second channel contributed,
+    which is worth its own number because it is the one that appears only under
+    ``--use-project`` on a project with a semantic layer, and a reader comparing
+    two runs otherwise sees `declared_count` move with no field explaining it.
+    """
+
     relationships: list[Relationship] = Field(default_factory=list)
     declared_count: int = 0
+    semantic_join_count: int = 0
     profiled_count: int = 0
     cache_hit_count: int = 0
     carried_relationship_count: int = 0
@@ -87,6 +98,7 @@ class RelationshipsResult(Result):
         return {
             "relationships": [r.model_dump(mode="json") for r in self.relationships],
             "declared_count": self.declared_count,
+            "semantic_join_count": self.semantic_join_count,
             "inferred_count": len(self.relationships) - self.declared_count,
             "profiled_count": self.profiled_count,
             "cache_hit_count": self.cache_hit_count,

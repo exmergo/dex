@@ -57,10 +57,12 @@ time. `dex` owns exactly that loop.
   infer and verify joins, answer ad-hoc questions with guarded SQL probes behind
   a PII-aware query firewall, read the semantic layer as the object graph it is
   (semantic models, metrics with their composition, measures, dimensions, and the
-  declared join graph), read a dimension's value domain before filtering on it,
+  declared join graph, each resolved to the relation and column behind it), read a
+  dimension's value domain before filtering on it,
   and query its metrics (locally via
   MetricFlow or against a hosted dbt Cloud deployment), and render the map as a
-  Mermaid ER diagram that never claims a cardinality the data has not proven.
+  Mermaid ER diagram that draws the joins the semantic layer declares and never
+  claims a cardinality the data has not proven.
   Persist a draft map. Fully read-only.
 
 <img width="522" height="343" alt="image" src="https://github.com/user-attachments/assets/7f16b370-66ed-4596-ae01-041cf3db3525" />

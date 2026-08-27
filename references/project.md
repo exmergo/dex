@@ -156,7 +156,7 @@ fingerprint to serve it would push presentation metadata into a persisted baseli
 and cost it the stability it exists for, so the two are separate reductions of one
 layer and your format performs both.
 
-Three things to get right, all of them things dex itself got wrong first:
+Four things to get right, all of them things dex itself got wrong first:
 
 **An entity is not one record.** `EntityInfo.roles` carries one entry per
 `(entity, semantic model)` declaration, with that model's own `type`, `expr` and
@@ -173,6 +173,20 @@ into `--group-by`. If your layer requires a qualified path, return the path;
 `SemanticCatalogContract` asserts that every dimension a metric claims to be
 groupable by appears as a dimension row, because the two have to be one vocabulary
 or neither can be acted on.
+
+**Resolve the layer to the warehouse, and never invent the resolution.**
+`SemanticModelInfo.relation` is the physical relation the model sits on, and it is
+the only place a relation appears in the catalog: a dimension, an entity
+declaration and a measure each carry `column` and each already names its
+`semantic_model`, so an element's address is its column plus its model's relation.
+That is what connects your layer to the objects `explore map` and
+`explore profile` describe, and what lets a caller answer "which table is behind
+this metric". Leave `column` unset wherever the reference is a computed expression
+rather than a plain column, because the PII gate resolves a dimension to a column
+and reads that column's evidence: a guessed column makes it screen the wrong one
+and report the verdict as authoritative. A backend that structurally cannot know
+the relation declares that gap instead, which is a different statement from a
+format that could resolve it and did not.
 
 **Say what one dimension row is.** `dimension_scope` is `declarations` (one row per
 declared dimension) or `queryable_paths` (one row per groupable token, so a dimension
