@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Protocol
 
 from ...errors import DexError
@@ -113,6 +113,12 @@ class SemanticQuery:
 __all__ = [
     "DIMENSIONS_PER_DECLARATION",
     "DIMENSIONS_PER_QUERYABLE_PATH",
+    "MAX_DIMENSIONS",
+    "MAX_DIMENSIONS_PER_METRIC",
+    "MAX_ENTITIES",
+    "MAX_MEASURES",
+    "MAX_METRICS",
+    "MAX_SEMANTIC_MODELS",
     "DimensionInfo",
     "EntityInfo",
     "EntityRole",
@@ -175,6 +181,103 @@ def _element_data(element: Any) -> dict[str, Any]:
     return prune(asdict(element))
 
 
+# How much of a semantic layer comes back in one envelope.
+#
+# Every other explore command budgets its payload and this one did not, so a
+# layer an order of magnitude larger than the one these were calibrated against
+# returned an order of magnitude more bytes with no flag to narrow it and nothing
+# saying anything had been left out.
+#
+# The defaults are set so a layer of the size these were measured on comes back
+# **whole**: a dozen semantic models, a few dozen metrics, a hundred-odd groupable
+# dimension paths. A cap that trims an ordinary layer would be worse than no cap,
+# because a consumer that silently loses catalog entries reads the remainder as
+# the layer. So these bite only where one payload was already too large to read,
+# `--metric`, `--for-dimension` and `--search` are the ways to ask a narrower
+# question, and `--full` lifts them for a caller that genuinely wants everything.
+MAX_SEMANTIC_MODELS = 50
+MAX_METRICS = 60
+MAX_DIMENSIONS = 150
+MAX_ENTITIES = 50
+MAX_MEASURES = 60
+# The one cap on a repeating block rather than on a list: a join-resolved
+# dimension list is carried once per metric, so on a wide layer this is where the
+# bytes actually are.
+MAX_DIMENSIONS_PER_METRIC = 40
+
+# The `elided` block's keys, in payload order: the five element lists, then the
+# repeating per-metric block. Named once so the zeros a complete catalog reports
+# and the counts a capped one reports cannot drift apart.
+_ELIDED_KINDS = (
+    "semantic_models",
+    "metrics",
+    "dimensions",
+    "entities",
+    "measures",
+    "dimensions_per_metric",
+)
+
+
+def _elision_notes(
+    elided: dict[str, int], limits: dict[str, int], per_metric: int
+) -> list[str]:
+    """One note per non-empty cut, naming what was dropped and the way past it.
+
+    A count in a payload field says how much is missing; it does not say how to
+    get it, and the caller reading a capped catalog is usually one command away
+    from the narrower question that would have fit. So each note names the cap it
+    hit and the flag that answers it, and a caller that genuinely wants the whole
+    layer is pointed at ``--full`` rather than left to re-run and compare.
+    """
+
+    ways_out = (
+        "narrow the question with --metric, --for-dimension or --search, or pass "
+        "--full for the whole layer"
+    )
+    notes: list[str] = []
+    if elided["semantic_models"]:
+        notes.append(
+            f"{elided['semantic_models']} semantic model(s) are not listed: the "
+            f"catalog is capped at {limits['semantic_models']}. Every element still "
+            f"names its own semantic_model, so a metric can point at a model this "
+            f"payload does not describe; {ways_out}"
+        )
+    if elided["metrics"]:
+        notes.append(
+            f"{elided['metrics']} metric(s) are not listed: the catalog is capped "
+            f"at {limits['metrics']} metrics. This is not the layer's whole metric "
+            f"set; "
+            f"{ways_out}"
+        )
+    if elided["dimensions"]:
+        notes.append(
+            f"{elided['dimensions']} dimension row(s) are not listed: the catalog "
+            f"is capped at {limits['dimensions']}. A token named in a metric's "
+            f"dimensions may therefore have no row of its own here; {ways_out}"
+        )
+    if elided["entities"]:
+        notes.append(
+            f"{elided['entities']} entity(ies) are not listed: the catalog is "
+            f"capped at {limits['entities']}. The declared join graph is incomplete in "
+            f"this payload; {ways_out}"
+        )
+    if elided["measures"]:
+        notes.append(
+            f"{elided['measures']} measure(s) are not listed: the catalog is "
+            f"capped at {limits['measures']}. A metric's input_measures may name a "
+            f"measure this payload does not describe; {ways_out}"
+        )
+    if elided["dimensions_per_metric"]:
+        notes.append(
+            f"{elided['dimensions_per_metric']} groupable token(s) are not listed "
+            f"across the metrics here: each metric's dimension list is capped at "
+            f"{per_metric}, and elided_dimension_count on a metric "
+            f"says how many of its own are missing. A token absent from a capped "
+            f"list is not a token the metric cannot be grouped by; {ways_out}"
+        )
+    return notes
+
+
 @dataclass
 class SemanticCatalog(SemanticCatalogView):
     """What ``explore semantic list`` returns: enough for an agent to discover what
@@ -209,6 +312,17 @@ class SemanticCatalog(SemanticCatalogView):
     # metrics. Beside `scoped_to` rather than folded into it, because the two are
     # different statements: one is what was asked, the other is what answered.
     for_dimensions: list[str] = field(default_factory=list)
+    # Which search terms narrowed it, empty when none did. Same reason as
+    # `scoped_to`: a catalog narrowed by a word a caller half-remembered is a
+    # subset, and a subset that cannot be told from the layer is the failure mode
+    # every field here exists to prevent.
+    searched_for: list[str] = field(default_factory=list)
+    # What the payload cap cut, per element kind, and always present including its
+    # zeros. That is the point of it: an empty `notes` and a zeroed `elided`
+    # together are the positive statement "this is the whole layer", which a caller
+    # cannot get from the absence of a key. Filled by :meth:`capped`, which is the
+    # only thing that ever cuts.
+    elided: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_backend(cls, backend: Any, **fields: Any) -> SemanticCatalog:
@@ -265,10 +379,13 @@ class SemanticCatalog(SemanticCatalogView):
         }
         if self.for_dimensions:
             payload["for_dimensions"] = self.for_dimensions
+        if self.searched_for:
+            payload["searched_for"] = self.searched_for
         if self.scoped_to:
             payload["scoped_to"] = self.scoped_to
         if self.unavailable:
             payload["unavailable"] = self.unavailable
+        payload["elided"] = self.elided or dict.fromkeys(_ELIDED_KINDS, 0)
         payload.update(
             {
                 "semantic_models": [_element_data(m) for m in self.semantic_models],
@@ -280,6 +397,81 @@ class SemanticCatalog(SemanticCatalogView):
             }
         )
         return payload
+
+    def capped(
+        self,
+        *,
+        full: bool = False,
+        max_semantic_models: int = MAX_SEMANTIC_MODELS,
+        max_metrics: int = MAX_METRICS,
+        max_dimensions: int = MAX_DIMENSIONS,
+        max_entities: int = MAX_ENTITIES,
+        max_measures: int = MAX_MEASURES,
+        max_dimensions_per_metric: int = MAX_DIMENSIONS_PER_METRIC,
+    ) -> SemanticCatalog:
+        """This catalog trimmed to what one envelope should carry, with every cut
+        counted in ``elided`` and named in ``notes``.
+
+        Applied at the command layer rather than inside a backend, so a library
+        caller reading ``list_definitions()`` gets the layer and only the surface
+        that has to fit an agent's context pays the cap. ``full`` lifts every cap
+        and still fills ``elided`` with its zeros, because "nothing was cut" is a
+        statement the payload should make in the same shape either way. The caps
+        themselves are arguments, the way ``summarize_map`` takes the map's, so a
+        host embedding the engine can budget its own context and the conformance
+        contract can assert a cut against a layer smaller than the shipped
+        defaults.
+
+        Elements are kept in the order the backend produced them, which both
+        shipped backends sort by name. Two reads of one layer therefore cut the
+        same set, and a caller can page past the cut with ``--search`` or
+        ``--metric`` rather than re-running and hoping for a different half. Rank
+        would be the better rule and there is nothing here to rank by: a semantic
+        layer declares no importance order, and inventing one (metric count,
+        description length) would bury a rarely-referenced metric that happens to
+        be the one asked about.
+        """
+
+        limits = {
+            "semantic_models": max_semantic_models,
+            "metrics": max_metrics,
+            "dimensions": max_dimensions,
+            "entities": max_entities,
+            "measures": max_measures,
+        }
+        elided = dict.fromkeys(_ELIDED_KINDS, 0)
+        kept: dict[str, list[Any]] = {}
+        for kind, limit in limits.items():
+            elements = getattr(self, kind)
+            if full or len(elements) <= limit:
+                kept[kind] = list(elements)
+                continue
+            kept[kind] = list(elements[:limit])
+            elided[kind] = len(elements) - limit
+
+        metrics = []
+        for metric in kept["metrics"]:
+            dropped = (
+                0
+                if full
+                else max(0, len(metric.dimensions) - max_dimensions_per_metric)
+            )
+            if not dropped:
+                metrics.append(metric)
+                continue
+            elided["dimensions_per_metric"] += dropped
+            metrics.append(
+                replace(
+                    metric,
+                    dimensions=metric.dimensions[:max_dimensions_per_metric],
+                    elided_dimension_count=dropped,
+                )
+            )
+        kept["metrics"] = metrics
+
+        notes = list(self.notes)
+        notes.extend(_elision_notes(elided, limits, max_dimensions_per_metric))
+        return replace(self, **kept, elided=elided, notes=notes)
 
 
 class SemanticBackendError(DexError):
