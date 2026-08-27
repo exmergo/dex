@@ -16,7 +16,12 @@ logic.
   holds the envelope contract even there: with no `uv` on `PATH` it refuses with a
   `reason: prerequisite` error envelope naming the install command, rather than
   failing the exec. It is the one refusal built by hand, because the engine that
-  would otherwise build it is what is missing.
+  would otherwise build it is what is missing. Two commands need more than a
+  warehouse client, and both are resolved the same way, from the command being run
+  rather than installed always: `explore cluster` adds `[cluster]`, and
+  `explore semantic` adds `[semantic-api]` plus, where a statement might be
+  rendered locally (any mode but `list`, without `--api`), `[semantic]`. A repo
+  that runs neither resolves neither scikit-learn nor MetricFlow.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.
