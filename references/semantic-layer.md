@@ -573,6 +573,35 @@ dimension wants `meta: {pii: true}` on it in the dbt project, while a
 dimension-metadata call that never answered (which degrades every ref to the
 heuristic at once) wants retrying.
 
+## Internal architecture
+
+The semantic surface is split into dependency-directed layers. The package root
+only re-exports names, so importing the hosted backend cannot pull in MetricFlow or
+a SQL dialect as a side effect.
+
+- `semantic_catalog` is the neutral domain: semantic objects, graph operations,
+  search, scoping, physical-column resolution and entity joins. It has no explore,
+  backend or dbt dependency.
+- `explore.semantic.catalog` composes a neutral view with a backend descriptor and
+  keeps response-only state such as `scoped_to`, `searched_for` and `elided` out
+  of the neutral domain model.
+- `explore.semantic.policy` owns the decisions that must agree across backends:
+  PII adjudication, grain validation, values resolution and columnar limits. A
+  backend supplies evidence and a filter-dialect reader, not a second policy.
+- `explore.semantic.backend` owns backend identity, capabilities, cost posture and
+  selection. Hosted catalog decoding, hosted GraphQL transport and local
+  MetricFlow loading are leaf modules behind their respective backend
+  orchestrators.
+- `dbt_semantic` reads the compiled semantic manifest and optionally asks
+  MetricFlow to resolve queryable paths. The general dbt project module delegates
+  that work rather than owning the resolver.
+
+`BackendDescriptor` is the single declaration of a backend's name, vendor,
+deployment, execution owner, catalog gaps, dimension scope and hosted cost
+warning. Test doubles may still expose the individual attributes, but application
+code consumes the descriptor. `execution` remains the fact from which cost posture
+is derived.
+
 ## Writing a third backend: the conformance contract
 
 `SemanticBackend` is a Protocol, and a Protocol asserts nothing. Two backends can
