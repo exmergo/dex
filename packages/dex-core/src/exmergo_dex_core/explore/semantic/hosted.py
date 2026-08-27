@@ -25,7 +25,8 @@ from typing import Any
 from ... import envelope as env
 from ... import metricflow_dialect
 from ...config import QueryLimits
-from ..results import SemanticQueryResult
+from ...semantic_catalog import SemanticCatalogView
+from ..results import SemanticQueryResult, SemanticValuesResult
 from . import (
     DIMENSIONS_PER_QUERYABLE_PATH,
     EXECUTION_VENDOR,
@@ -40,6 +41,7 @@ from . import (
     SemanticModelInfo,
     SemanticQuery,
     SemanticQueryRefusedError,
+    ValuesRequest,
     cap_columnar,
     cost_posture,
     derive_entity_type,
@@ -47,9 +49,12 @@ from . import (
     merge_pii_meta,
     queryable_grains,
     requested_dimension_refs,
+    resolve_values_request,
     screen_dimension_refs,
+    screen_values_request,
     unadjudicated_refs,
     validate_grain,
+    values_reach_note,
 )
 
 # The very explicit line the founder asked for: wherever a reader or agent might
@@ -593,6 +598,156 @@ class HostedDbtCloudBackend:
             cost=cost,
             warnings=warnings,
         )
+
+    # ---- the value domain --------------------------------------------------
+
+    def values(self, dimension: str, metrics: list[str]) -> SemanticValuesResult:
+        """One dimension's value domain, executed by dbt Cloud.
+
+        `createDimensionValuesQuery` returns a query id that polls exactly like an
+        ordinary metric query, so everything after the request is the path this
+        backend already has. What is different is in front of it: the dimension has
+        to be resolved before it can be asked for, both to refuse a token the layer
+        does not have and to know which metrics can reach it.
+
+        The resolution inverts the catalog's own `metrics { dimensions }` rather
+        than calling `metricsForDimensions`, which answers the same question. The
+        API's field returns an empty list for an unknown name and for a metric's own
+        time token alike, so a typo would come back as "no metric can be grouped by
+        this" with nothing to distinguish the two, and the inversion is also what
+        the local backend uses, which keeps the two answering identically.
+        """
+
+        request = resolve_values_request(self._values_view(), dimension, metrics)
+
+        # Asked about every metric that can reach the dimension, not one of them:
+        # `dimensions(metrics:)` returns the intersection across the metrics it is
+        # given, so one call per metric unioned is what keeps the layer's own
+        # metadata authoritative here, exactly as it is on a metric query.
+        meta, _reported = self._query_metadata(request.metrics or request.reachable)
+        notes = screen_values_request(
+            request.name, meta_lookup=self._meta_lookup(meta, request.grains)
+        )
+
+        used = self._values_shape(request)
+        query_id = self._create_values_query(request, used)
+        if used and not request.metrics:
+            notes.append(values_reach_note(request.token, used, request.reachable))
+        json_result = self._await_result(query_id)
+        cost, warnings = cost_posture(self)
+        return SemanticValuesResult.from_capped(
+            self._shape(json_result, extra_notes=notes),
+            backend=self,
+            dimension=request.token,
+            scoped_to=used,
+            query_id=query_id,
+            cost=cost,
+            warnings=warnings,
+        )
+
+    def _values_view(self) -> SemanticCatalogView:
+        """The narrow slice of the catalog a values request needs, one free round
+        trip: which metrics reach which tokens, and the grains the layer names.
+
+        Narrow rather than the whole catalog because none of the rest is read here,
+        and a values request should not pay for the layer's prose. The two fields
+        answer each other: a token has to be split into a name and a grain before it
+        can be looked up, and only the layer knows whether a trailing word is a
+        granularity this project defined for itself or part of a dimension name.
+
+        Returned as the neutral view so the resolution that follows is the same code
+        the local backend runs. That is what keeps the two backends resolving one
+        token identically, which matters because the resolution decides which
+        metrics can reach a dimension and so what the answer is.
+        """
+
+        data = self._post(
+            "{ metrics(environmentId: "
+            + self._env
+            + ") { name queryableGranularities queryableTimeGranularities "
+            "dimensions { name } } }"
+        )
+        return SemanticCatalogView(
+            metrics=[
+                MetricInfo(
+                    name=m.get("name"),
+                    type="",
+                    dimensions=[
+                        d.get("name") for d in (m.get("dimensions") or []) if d
+                    ],
+                    queryable_granularities=_grains(m),
+                )
+                for m in (data.get("metrics") or [])
+                if m.get("name")
+            ]
+        )
+
+    def _values_shape(self, request: ValuesRequest) -> list[str]:
+        """Which metrics the layer will accept for this request, settled for free.
+
+        A dimension of one semantic model is answerable on its own: the layer reads
+        the distinct values of one relation. A dimension reached through a join is
+        not, because there is no measure to join from, and the layer refuses the
+        request. Scoping it to a metric that reaches it is the only shape that
+        exists, and it answers a narrower question, so it is the fallback rather
+        than the default.
+
+        Settled with ``compileDimensionValuesSql``, which resolves the request and
+        returns the SQL **without executing anything**, because dbt Cloud accepts
+        the values mutation and reports a resolution failure asynchronously, at
+        poll time. Deciding after that would mean running a second query only once
+        the first had already been submitted; deciding here costs one free call and
+        never sends a request the layer has said it will refuse. It is a resolution
+        check and nothing more: no cost is claimed from it, and the SQL is not
+        selected.
+
+        A deployment that cannot answer the probe at all falls through to the
+        caller's own shape and lets the query report the layer's own words, which
+        is what happened before this existed.
+        """
+
+        attempts: list[list[str]] = [request.metrics] if request.metrics else [[]]
+        if not request.metrics and request.reachable:
+            attempts.append(request.reachable[:1])
+        if len(attempts) == 1:
+            return attempts[0]
+        for used in attempts:
+            try:
+                self._post(
+                    "mutation { compileDimensionValuesSql("
+                    + ", ".join(self._values_arguments(request, used))
+                    + ") { queryId } }"
+                )
+                return used
+            except SemanticBackendError:
+                continue
+        return attempts[0]
+
+    def _create_values_query(self, request: ValuesRequest, used: list[str]) -> str:
+        mutation = (
+            "mutation { createDimensionValuesQuery("
+            + ", ".join(self._values_arguments(request, used))
+            + ") { queryId } }"
+        )
+        data = self._post(mutation)
+        query_id = (data.get("createDimensionValuesQuery") or {}).get("queryId")
+        if not query_id:
+            raise SemanticBackendError(
+                "the semantic layer returned no queryId for a values request"
+            )
+        return query_id
+
+    def _values_arguments(self, request: ValuesRequest, used: list[str]) -> list[str]:
+        """The arguments both values mutations take, built once so the shape the
+        probe resolved is exactly the shape that gets executed."""
+
+        group_by = f'{{name: "{_ident(request.name)}"'
+        group_by += f", grain: {request.grain.upper()}}}" if request.grain else "}"
+        parts = [f"environmentId: {self._env}", f"groupBy: [{group_by}]"]
+        if used:
+            named = ", ".join(f'{{name: "{_ident(metric)}"}}' for metric in used)
+            parts.append(f"metrics: [{named}]")
+        return parts
 
     def _query_metadata(
         self, metrics: list[str]

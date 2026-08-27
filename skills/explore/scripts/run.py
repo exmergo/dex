@@ -21,8 +21,10 @@ Two execution modes, chosen automatically:
   - Installed plugin: no local package is present, so the pinned PyPI release is
     installed hermetically by uv.
 
-The engine version is pinned; the connector *extra* is chosen at runtime from the
-active connector, so one published release serves every warehouse. This wrapper is
+The engine version is pinned; the *extras* are chosen at runtime, so one published
+release serves every warehouse and the default install stays light. The connector
+extra comes from the active connector; two commands need more than a warehouse
+client and say so by being run (see _feature_extras). This wrapper is
 stdlib-only and runs before the engine is installed, so it resolves the connector
 itself (it cannot import the engine) with the same precedence the engine uses:
 an explicit --connector flag, then the top-level `connector:` in the
@@ -129,8 +131,11 @@ def _resolve_connector(argv: list[str], cwd: Path) -> str:
     return connector if connector in _KNOWN_CONNECTORS else _DEFAULT_CONNECTOR
 
 
-# Value-taking global flags: declared only so their values are not mistaken for
-# the group/subcommand positionals when we peek at the command being run.
+# Every value-taking flag this peek has to consume, so a flag's *value* is never
+# mistaken for the group, subcommand, or mode being run. The global connection
+# flags, plus the ones `explore semantic` takes, because a metric read as a mode
+# picks the wrong extras. `tests/test_skill_wrapper.py` holds this list to the
+# real parser, since a flag added there and forgotten here fails silently.
 _VALUE_FLAGS = (
     "--connector",
     "--path",
@@ -139,21 +144,63 @@ _VALUE_FLAGS = (
     "--dataset",
     "--repo-root",
     "--budget",
+    "--metric",
+    "--for-dimension",
+    "--group-by",
+    "--where",
+    "--order-by",
+    "--grain",
+    "--limit",
 )
 
+# The `explore semantic` modes that can render a statement here. Bare
+# `explore semantic` lists, so an absent mode is `list`, which renders none on
+# either backend and therefore never needs the renderer.
+_SEMANTIC_RENDERING_MODES = ("values", "query")
 
-def _wants_cluster_extra(argv: list[str]) -> bool:
-    """Whether this invocation is `explore cluster`, which needs the [cluster]
-    extra (scikit-learn) on top of the connector. Flag-position agnostic: the
-    value flags above are consumed so the first two bare tokens are the group and
-    subcommand, wherever the connection flags sit."""
+
+def _positionals(argv: list[str]) -> list[str]:
+    """The bare tokens of an invocation: group, subcommand, and whatever follows.
+
+    Flag-position agnostic, which is the point: the value flags above are consumed
+    so the group and subcommand are the first two bare tokens wherever the
+    connection flags sit."""
 
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     for flag in _VALUE_FLAGS:
         parser.add_argument(flag)
     _, remaining = parser.parse_known_args(argv)
-    positionals = [tok for tok in remaining if not tok.startswith("-")]
-    return positionals[:2] == ["explore", "cluster"]
+    return [tok for tok in remaining if not tok.startswith("-")]
+
+
+def _feature_extras(argv: list[str]) -> list[str]:
+    """The extras this invocation needs on top of the connector's.
+
+    Two commands need more than a warehouse client, and both are resolved from the
+    command rather than installed always, so a repo that never clusters and never
+    queries a semantic layer resolves neither scikit-learn nor MetricFlow.
+
+    `explore semantic` needs the hosted client on any of its subcommands, which is
+    an httpx and nothing heavier. It needs MetricFlow only where a statement might
+    be rendered *here*: `list` renders none on either backend, and `--api` sends
+    the request to dbt Cloud, which renders and executes it there.
+
+    Where the flag is absent the backend is ambient, chosen by `semantic.deployment`
+    in a nested config block this bootstrap deliberately does not parse, so a mode
+    that could execute either way takes both. That errs toward a heavier install
+    and never toward a command that refuses for want of a dependency, which is the
+    failure this exists to prevent.
+    """
+
+    positionals = _positionals(argv)
+    if positionals[:2] == ["explore", "cluster"]:
+        return ["cluster"]
+    if positionals[:2] != ["explore", "semantic"]:
+        return []
+    mode = positionals[2] if len(positionals) > 2 else "list"
+    if mode in _SEMANTIC_RENDERING_MODES and "--api" not in argv:
+        return ["semantic-api", "semantic"]
+    return ["semantic-api"]
 
 
 def _engine_spec(extras: str, skill_dir: Path | None = None) -> list[str]:
@@ -198,9 +245,10 @@ def main() -> int:
         )
         return 1
     connector = _resolve_connector(argv, Path.cwd())
-    # The connector extra is always installed; `explore cluster` adds the
-    # scikit-learn [cluster] extra so the light default install stays light.
-    extras = f"{connector},cluster" if _wants_cluster_extra(argv) else connector
+    # The connector extra is always installed; `explore cluster` and
+    # `explore semantic` add what only they need, so the default install stays
+    # light for every repo that runs neither.
+    extras = ",".join([connector, *_feature_extras(argv)])
     cmd = [
         "uv",
         "run",

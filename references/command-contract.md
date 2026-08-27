@@ -16,7 +16,12 @@ logic.
   holds the envelope contract even there: with no `uv` on `PATH` it refuses with a
   `reason: prerequisite` error envelope naming the install command, rather than
   failing the exec. It is the one refusal built by hand, because the engine that
-  would otherwise build it is what is missing.
+  would otherwise build it is what is missing. Two commands need more than a
+  warehouse client, and both are resolved the same way, from the command being run
+  rather than installed always: `explore cluster` adds `[cluster]`, and
+  `explore semantic` adds `[semantic-api]` plus, where a statement might be
+  rendered locally (any mode but `list`, without `--api`), `[semantic]`. A repo
+  that runs neither resolves neither scikit-learn nor MetricFlow.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.
@@ -68,6 +73,27 @@ dex explore cluster <object>      -> k-means over a bounded sample of numeric no
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows
                                      (--features to choose columns, -k to fix the cluster count)
+dex explore semantic list         -> the semantic layer as the object graph it is, in one shape from either
+  [--metric <m>]                     backend: semantic models, metrics (composition, the measures behind the
+  [--for-dimension <d>]              number, the grains it can be queried at, and the time column a time
+  [--local|--api]                    grouping resolves to), dimensions, entities with one declaration per
+                                     semantic model, and measures. Costs no warehouse query on either backend.
+                                     --metric narrows to those metrics and what they reach; --for-dimension is
+                                     the reverse lookup, the metrics groupable by all the named tokens, which
+                                     is also the cheapest way to find the metrics that share an axis. Both name
+                                     the scope in the payload, so a subset is never mistaken for the layer
+dex explore semantic values <d>   -> one dimension's value domain: what a filter on it may be filtered to,
+  [--metric <m>] [--local|--api]     capped and columnar like `explore query`. A PII-flagged dimension refuses
+                                     the command rather than being screened, because the whole output is
+                                     values. `scoped_to` says whether these are the column's own values or the
+                                     ones present for a metric, which is the only way a dimension behind a
+                                     join can be read at all
+dex explore semantic query <m,m>  -> one governed metric query, capped and row-major like `explore query`.
+  [--group-by <d>] [--where <f>]     --local renders the SQL with MetricFlow and executes it through dex's own
+  [--order-by <c>] [--grain <g>]     connector, PII gate, read-only assertion, relation pre-check and cost
+  [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
+                                     server-side where dex's cost guard is structurally unavailable and every
+                                     result says so
 dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their
@@ -419,6 +445,29 @@ name the objects, and `snapshot` reports `column_detail_count` beside
 warn when the baseline was pinned from a cache older than
 `profile_freshness_hours`, judged on the capture time recorded in the baseline
 rather than on which file was written last, so re-pinning cannot silence it.
+
+**`explore semantic` queries the semantic layer; `transform` and the `semantic`
+group author it, and `maintain semantic` detects drift in it.** Two backends answer
+the same three subcommands through one abstraction, chosen ambiently by
+`semantic.vendor` and `semantic.deployment` in `.dex/config.yml` (the released
+`semantic.backend` spelling of the two is still accepted) and overridable per
+command with `--local` / `--api`. Those two flags name **who executes**, not which
+vendor: every catalog and every result reports it as `execution` (`dex` or
+`vendor`), and that is the axis the guards read. A vendor-executed backend owns the
+warehouse connection, so dex never holds a statement it could price or cap, and
+every hosted result carries a warning saying exactly that.
+
+`list` costs no warehouse query on either backend, and neither does the reverse
+lookup, which inverts the dimension list each metric already carries rather than
+asking the layer a second question. `values` and `query` each execute one, and both
+screen every dimension a request would touch before it is sent: on `query` a
+flagged dimension is refused from the grouping or the filter, and on `values` it
+refuses the command outright, since there is no aggregate to fall back to when the
+whole output is values. Where only the name heuristic could screen a dimension, the
+result says so, so weaker screening is never mistaken for evidence. The
+field-by-field catalog contract, the two backends' declared asymmetries, and what
+`dimension_scope` and `scoped_to` mean are in
+[`semantic-layer.md`](semantic-layer.md).
 
 `explore relationships` and `explore map` accept `--verify`, which measures each
 inferred join with one aggregate overlap probe (non-null foreign keys, orphan

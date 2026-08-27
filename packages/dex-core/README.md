@@ -236,10 +236,13 @@ dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
 writing back to `.dex/config.yml`. It also reads and queries the dbt semantic layer
-(`explore semantic list` / `query`). `list` returns the layer's objects, semantic
-models and metrics and their composition and measures and dimensions and the
-declared entity graph, in one shape from either backend, scopeable to the metrics a
-caller came for and costing no warehouse query. Metric queries run either locally
+(`explore semantic list` / `values` / `query`). `list` returns the layer's objects,
+semantic models and metrics and their composition and measures and dimensions and
+the declared entity graph, in one shape from either backend, scopeable to the
+metrics a caller came for (or, with `--for-dimension`, to the metrics a given slice
+is available on) and costing no warehouse query. `values` returns one dimension's
+value domain, which is what you need before writing a filter and the only way to
+reach it at all on a hosted layer. Metric queries run either locally
 through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt
 Cloud deployment (`--api`), where dbt Cloud executes server-side and every result
 warns that dex's cost guard does not apply there.

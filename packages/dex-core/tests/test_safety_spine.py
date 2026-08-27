@@ -5130,6 +5130,163 @@ def test_hosted_semantic_pii_dimension_refused_not_surfaced():
     assert not any("createQuery" in posted for posted in backend.posted)
 
 
+def test_a_dimensions_values_are_refused_when_the_layer_flags_it():
+    # Family 3, at its sharpest. `explore semantic values` returns nothing but the
+    # values of one dimension, so there is no aggregate for a flagged dimension to
+    # hide behind and no reduced answer to fall back to: the command is refused.
+    # The gate that decides is the authoritative one, asked per metric and unioned,
+    # so a dimension whose NAME gives nothing away is still caught.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQueryRefusedError,
+        screen_dimension_refs,
+    )
+
+    flagged = {"name": "agent__operator_handle", "config": {"meta": {"pii": True}}}
+    backend = FakeHostedBackend(
+        metrics=[
+            {
+                "name": "agent_runs",
+                "dimensions": [{"name": "agent__operator_handle"}],
+            }
+        ],
+        dimensions_meta=[flagged],
+    )
+    assert not screen_dimension_refs(["agent__operator_handle"])
+
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.values("agent__operator_handle", [])
+    # Refused before the values query was ever submitted for execution, so the
+    # warehouse never read the column.
+    assert not any("createDimensionValuesQuery" in q for q in backend.posted)
+
+
+def test_a_local_dimensions_values_are_refused_on_the_columns_own_evidence(
+    tmp_path: Path,
+):
+    # The same refusal on the other backend, decided by the other authority: the
+    # .dex cache's value-evidence flag on the physical column the dimension
+    # resolves to, reached through the project seam. Refused before anything is
+    # rendered, so no statement exists that could reach a connection.
+    import json as _json
+
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import SemanticQueryRefusedError
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "proj"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "orders",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": "wh.main.orders",
+                        },
+                        "entities": [{"name": "order", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [{"name": "order_count", "agg": "count"}],
+                    }
+                ],
+                "metrics": [
+                    {
+                        "name": "orders",
+                        "type": "simple",
+                        "type_params": {"input_measures": [{"name": "order_count"}]},
+                    }
+                ],
+            }
+        )
+    )
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
+    backend._load_cache = lambda: DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.orders",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+
+    def _never(*_args, **_kwargs):
+        raise AssertionError("rendering was reached past the gate")
+
+    backend._metricflow_engine = _never
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.values("order__contact", [])
+
+
+def test_a_values_result_is_columnar_and_passes_the_sanitizer(capsys):
+    # Family 5. A values result is the one payload on this surface whose whole
+    # point is column values, so it is exactly the shape the sanitizer exists to
+    # judge: columnar, never row dicts, and never keyed by anything a caller named.
+    from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core import envelope as env
+    from exmergo_dex_core.results import to_envelope
+
+    backend = FakeHostedBackend(
+        metrics=[{"name": "sessions", "dimensions": [{"name": "user__pricing_tier"}]}],
+        result=table_json_result(
+            ["user__pricing_tier"], ["string"], [["free"], ["pro"]]
+        ),
+    )
+    env.emit(to_envelope(backend.values("user__pricing_tier", [])))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["cells"] == [["free"], ["pro"]]
+    assert SECRET_TOKEN not in json.dumps(payload)
+
+
+def test_hosted_values_is_warn_only_never_silently_priced():
+    # Family 4, on the second hosted command. dbt Cloud owns the warehouse
+    # connection here too, so there is no estimate dex could honestly report and
+    # no ceiling it could have enforced, and every result has to say so rather
+    # than report a zero that reads as free.
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core import envelope as env
+
+    backend = FakeHostedBackend(
+        metrics=[{"name": "sessions", "dimensions": [{"name": "user__pricing_tier"}]}],
+        result=table_json_result(["user__pricing_tier"], ["string"], [["free"]]),
+    )
+    record = backend.values("user__pricing_tier", [])
+    assert record.cost.paradigm == env.Paradigm.HOSTED
+    assert record.cost.estimate is None and record.cost.ceiling is None
+    assert any("cost guard unavailable" in w for w in record.warnings)
+
+
 def test_the_hosted_pii_map_covers_every_metric_in_a_multi_metric_query():
     # Family 3, and the reason the gate asks one metric at a time. The API's
     # `dimensions(metrics: [a, b])` returns the dimensions common to ALL the

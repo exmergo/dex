@@ -31,7 +31,7 @@ from ... import envelope as env
 from ...adapters import get_dialect
 from ...cache import match_identifier
 from ...config import QueryLimits, pii_override_paths
-from ..results import SemanticQueryResult
+from ..results import SemanticQueryResult, SemanticValuesResult
 from . import (
     DIMENSIONS_PER_DECLARATION,
     EXECUTION_DEX,
@@ -40,11 +40,15 @@ from . import (
     SemanticCatalog,
     SemanticQuery,
     SemanticQueryRefusedError,
+    ValuesRequest,
     cap_columnar,
     queryable_grains,
     requested_dimension_refs,
+    resolve_values_request,
     screen_dimension_refs,
+    screen_values_request,
     validate_grain,
+    values_reach_note,
 )
 
 # Said only when the join graph could not be resolved, which is an install that
@@ -278,6 +282,108 @@ class LocalMetricFlowBackend:
                 f"could not resolve the metric query: {env.redact(str(exc))}"
             ) from exc
 
+        return self._run_rendered(
+            sql,
+            cache,
+            command="explore semantic query",
+            result_type=SemanticQueryResult,
+        )
+
+    def values(self, dimension: str, metrics: list[str]) -> SemanticValuesResult:
+        """One dimension's value domain, rendered by MetricFlow and executed here.
+
+        Everything after the render is the metric-query spine unchanged, because
+        this is the same kind of statement reaching the same warehouse: proven
+        read-only, pre-checked against the connection, priced, and capped. What
+        differs is in front of it, and it is resolved against the project's own
+        catalog so a token the layer does not have is refused by name rather than
+        surfacing as a MetricFlow resolution error about something else.
+        """
+
+        request = resolve_values_request(self._semantic_view(), dimension, metrics)
+        cache = self._load_cache()
+        notes = screen_values_request(
+            request.name, meta_lookup=self._cache_pii_lookup(cache)
+        )
+
+        used, sql = self._render_values(request)
+        if used and not request.metrics:
+            notes.append(values_reach_note(request.token, used, request.reachable))
+        return self._run_rendered(
+            sql,
+            cache,
+            command="explore semantic values",
+            result_type=SemanticValuesResult,
+            extra_notes=notes,
+            dimension=request.token,
+            scoped_to=used,
+        )
+
+    def _render_values(self, request: ValuesRequest) -> tuple[list[str], str]:
+        """``(the metrics the rendering used, the SQL)``, cheapest form first.
+
+        A dimension of one semantic model renders as a distinct scan of that model
+        alone, which is the cheapest and most direct answer to "what can I filter
+        to". A dimension reached through a join has no such rendering: MetricFlow
+        refuses a distinct-values query it cannot reach without a measure, and the
+        hosted layer refuses the same request for the same reason. What makes it
+        answerable is a metric that reaches it, which turns the statement into a
+        join and an aggregate.
+
+        So the cheap form is tried first and the scoped form is the fallback rather
+        than the default. Rendering costs nothing (no connection is opened and
+        nothing is priced until the caller's handshake), so the second attempt is
+        free, and the metric it settled on travels back to be reported: the values
+        of a dimension *for a metric* can be narrower than the column's own domain,
+        and a caller must not have to guess which of the two it is holding.
+        """
+
+        attempts: list[list[str]] = [request.metrics] if request.metrics else [[]]
+        if not request.metrics and request.reachable:
+            attempts.append(request.reachable[:1])
+        failure: Exception | None = None
+        for used in attempts:
+            try:
+                return used, self._render_dimension_values(request.token, used)
+            except SemanticBackendError:  # missing extra or uncompiled manifest
+                raise
+            except Exception as exc:
+                failure = exc
+        raise SemanticBackendError(
+            f"could not resolve the values of {request.token}: "
+            f"{env.redact(str(failure))}"
+        ) from failure
+
+    def _render_dimension_values(self, dimension: str, metrics: list[str]) -> str:
+        return (
+            self._metricflow_engine()
+            .explain_get_dimension_values(
+                metric_names=metrics or None, get_group_by_values=dimension
+            )
+            .sql_statement.sql
+        )
+
+    def _run_rendered(
+        self,
+        sql: str,
+        cache,
+        *,
+        command: str,
+        result_type,
+        extra_notes: list[str] | None = None,
+        **fields,
+    ):
+        """Everything that happens to rendered SQL between MetricFlow and a result.
+
+        The order here is the safety contract rather than a sequence that happens to
+        be written this way. Read-only is proven before anything touches the
+        connection, the relation pre-check runs before the handshake so a namespace
+        mismatch never bills a failed job, and the spend is settled onto the record
+        that comes back. Both commands that render metric SQL run through this for
+        that reason: a second copy of the order is a second place for it to drift,
+        and the drift would be silent.
+        """
+
         from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
 
         dialect = get_dialect(self._connector)
@@ -291,7 +397,7 @@ class LocalMetricFlowBackend:
         # One adapter for the whole command: the pre-check may introspect the
         # connection, and `_adapter` rebuilds the cost gate on every call, so
         # asking twice would settle and rebuild a gate for nothing.
-        adapter = self._dex._adapter("explore semantic query")
+        adapter = self._dex._adapter(command)
         refusal, unprofiled = self._relation_precheck(
             sql,
             cache,
@@ -303,7 +409,7 @@ class LocalMetricFlowBackend:
 
         estimate_fn = getattr(adapter, "query_estimate", None)
         estimate = estimate_fn(sql) if estimate_fn else 0.0
-        command_args.billed_handshake("explore semantic query", adapter, estimate)
+        command_args.billed_handshake(command, adapter, estimate)
         result = adapter.run_query(
             sql,
             max_rows=self._limits.max_rows,
@@ -317,9 +423,9 @@ class LocalMetricFlowBackend:
             max_cell_chars=self._limits.max_cell_chars,
             max_payload_bytes=self._limits.max_payload_bytes,
             truncated_by_source=result.truncated,
-            extra_notes=_unprofiled_note(unprofiled),
+            extra_notes=[*(extra_notes or []), *_unprofiled_note(unprofiled)],
         )
-        record = SemanticQueryResult.from_capped(capped, backend=self)
+        record = result_type.from_capped(capped, backend=self, **fields)
         return command_args.stamp_spend(record, adapter)
 
     def _load_cache(self):

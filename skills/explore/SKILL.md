@@ -160,7 +160,13 @@ Subcommands, in the usual order:
    timestamps and grouping by `metric_time` splits the number between them. On a large layer, `list --metric <m>` narrows
    the catalog to those metrics and what they reach, at no extra cost; the
    payload names the scope in `scoped_to`, so a scoped catalog is never mistaken
-   for the whole layer. Two payload fields carry differences between the
+   for the whole layer. `list --for-dimension <d>` asks the reverse question,
+   returning the metrics groupable by all the named tokens: use it when you know
+   the slice you want rather than the metric, and to find the metrics that can go
+   on one chart against one axis. It inverts the dimension list each metric
+   already carries, so it costs nothing extra and refuses an unknown token by
+   name rather than answering "no metrics". Two payload fields carry differences
+   between the
    backends rather than leaving them to be inferred: `dimension_scope` says
    whether a dimension row is one declaration or one groupable path (which is
    why the two backends report different dimension counts for one layer), and
@@ -175,7 +181,16 @@ Subcommands, in the usual order:
    flags take a comma-separated list or a repeated flag (`--group-by a,b` is
    `--group-by a --group-by b`); `--where` is never split. `--grain` is checked
    against the grains the layer reports for the metrics queried, so a refusal
-   names the ones that metric has. Two backends answer
+   names the ones that metric has. `values <dimension>` returns that dimension's
+   value domain, which is what you need before you can write a `--where` filter
+   and the one thing no other dex command can reach on a hosted layer (`profile`
+   cannot see a semantic dimension). Read `scoped_to` on the result before
+   trusting the list: empty means these are the column's own values, and a metric
+   name means dex had to reach the dimension through that metric because it is
+   only reachable through a join, so the values are the ones present for that
+   metric. Pass `--metric` to choose it yourself. A PII-flagged dimension refuses
+   this command outright rather than being screened, because the whole output is
+   values. Two backends answer
    these, chosen by `.dex/config.yml` `semantic.vendor` and `semantic.deployment`
    (the older `semantic.backend` spelling of the two still works), and overridable
    with `--local` / `--api`. Those two flags name who executes, not which vendor:

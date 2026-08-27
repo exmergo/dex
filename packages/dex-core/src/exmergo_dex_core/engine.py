@@ -67,6 +67,7 @@ if TYPE_CHECKING:
         RelationshipsResult,
         SemanticListResult,
         SemanticQueryResult,
+        SemanticValuesResult,
     )
     from .maintain.results import DriftResult, ReconcileResult, SnapshotResult
     from .references import ReferencesResult
@@ -753,12 +754,33 @@ class DexEngine:
         self,
         *,
         metrics: list[str] | None = None,
+        for_dimensions: list[str] | None = None,
         api: bool = False,
         local: bool = False,
     ) -> SemanticListResult:
         from .explore.semantic import commands as semantic_cmds
 
-        return semantic_cmds.semantic_list(self, metrics=metrics, api=api, local=local)
+        return semantic_cmds.semantic_list(
+            self,
+            metrics=metrics,
+            for_dimensions=for_dimensions,
+            api=api,
+            local=local,
+        )
+
+    def semantic_values(
+        self,
+        dimension: str,
+        *,
+        metrics: list[str] | None = None,
+        api: bool = False,
+        local: bool = False,
+    ) -> SemanticValuesResult:
+        from .explore.semantic import commands as semantic_cmds
+
+        return semantic_cmds.semantic_values(
+            self, dimension, metrics=metrics, api=api, local=local
+        )
 
     def semantic_query(
         self,

@@ -308,6 +308,44 @@ class SemanticCatalogView:
             unknown,
         )
 
+    def metrics_for_dimensions(
+        self, dimensions: list[str]
+    ) -> tuple[list[str], list[str]]:
+        """The metrics groupable by **all** the named tokens, as ``(metrics, unknown)``.
+
+        The catalog answers "what can this metric be grouped by". A caller more
+        often arrives with the reverse, "I want to slice by pricing tier, what can
+        I slice", and answering that by hand means reading every metric's dimension
+        list and inverting it, which is the whole catalog read to ask about one
+        dimension.
+
+        It is an inversion of ``metrics[].dimensions`` rather than a second call to
+        the layer, and that is a property worth keeping: both backends already
+        carry that list join-resolved, so the answer costs nothing, means the same
+        thing on either one, and covers a metric's own time token, which the dbt
+        Cloud API's equivalent field does not accept.
+
+        The intersection, not the union. Metrics that share a group-by are the ones
+        that can be put on one chart against one axis, which is the question being
+        asked, and a union would answer a different and less useful one.
+
+        Unknown names come back rather than being dropped, and none is resolved
+        when any is unknown. A token the layer does not have and a token no metric
+        can be grouped by are both the empty answer, so a caller that misspelled
+        one would otherwise read "no metric" as a fact about the layer.
+        """
+
+        wanted = list(dict.fromkeys(dimensions))
+        known = {d.name for d in self.dimensions}
+        known.update(d for m in self.metrics for d in m.dimensions)
+        unknown = [name for name in wanted if name not in known]
+        if unknown:
+            return [], unknown
+        return (
+            [m.name for m in self.metrics if all(d in m.dimensions for d in wanted)],
+            [],
+        )
+
 
 def merge_element_fields(
     store: dict[str, dict[str, Any]], key: str, element: dict[str, Any]

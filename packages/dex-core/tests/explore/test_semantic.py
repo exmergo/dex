@@ -2011,6 +2011,202 @@ def test_a_misspelled_metric_is_refused_rather_than_returning_nothing(
         semantic_commands.semantic_list(_engine(), metrics=["ordrs"])
 
 
+# ---- the reverse lookup: which metrics can be sliced this way ---------------
+#
+# The catalog answers "what can this metric be grouped by". A caller more often
+# arrives with the reverse, and answering it by hand means reading every metric's
+# dimension list. It is an inversion of a list both backends already carry, which
+# is why it costs nothing and means the same thing on either one.
+
+
+def test_the_reverse_lookup_inverts_what_each_metric_can_be_grouped_by(tmp_path: Path):
+    """Each backend inverts its own dimension lists, which is what makes the
+    answer as good as the catalog it came from and no better.
+
+    The token differs between them on purpose: this layer's refund reason is
+    reached through a join, so the hosted read names the two-hop path the API
+    resolves and the project read names the single-hop qualification. Both are
+    real tokens a query can group by on the backend that reported them.
+    """
+
+    catalogs = _catalogs(tmp_path)
+    shared = {
+        "local": "refund__reason",
+        "hosted": "order__refund__reason",
+    }
+    for name, catalog in catalogs.items():
+        every, unknown = catalog.metrics_for_dimensions(["order__status"])
+        assert unknown == [] and len(every) == 4, name
+        narrow, unknown = catalog.metrics_for_dimensions([shared[name]])
+        assert unknown == [] and narrow == ["refund_rate"], name
+
+
+def test_the_reverse_lookup_intersects_rather_than_unions(tmp_path: Path):
+    """Metrics that share a group-by are the ones that can go on one chart against
+    one axis, which is the question being asked. A union would answer a different
+    and less useful one."""
+
+    catalogs = _catalogs(tmp_path)
+    for name, token in (
+        ("local", "refund__reason"),
+        ("hosted", "order__refund__reason"),
+    ):
+        both, _ = catalogs[name].metrics_for_dimensions(["order__status", token])
+        assert both == ["refund_rate"], name
+
+
+def test_the_reverse_lookup_answers_for_a_metrics_own_time_token(tmp_path: Path):
+    """`metric_time` is a token a query groups by and a token this resolves, which
+    the hosted API's own reverse-lookup field does not: it answers the empty list
+    for it, indistinguishably from a name the layer does not have. That is one of
+    the reasons this is an inversion rather than a call."""
+
+    for name, catalog in _catalogs(tmp_path).items():
+        timed, unknown = catalog.metrics_for_dimensions(["metric_time"])
+        assert unknown == [], name
+        assert timed, name
+
+
+def test_an_unknown_dimension_is_refused_rather_than_answering_none(
+    tmp_path: Path, monkeypatch
+):
+    """A misspelled token and a token no metric shares are both the empty answer,
+    and only one of them is a fact about the layer."""
+
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    with pytest.raises(sem.SemanticBackendError, match="no such dimension"):
+        semantic_commands.semantic_list(_engine(), for_dimensions=["order__statuz"])
+
+
+def test_several_dimensions_narrow_to_the_metrics_that_carry_all_of_them(
+    tmp_path: Path, monkeypatch
+):
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    envelope = to_envelope(
+        semantic_commands.semantic_list(
+            _engine(), for_dimensions=["refund__reason", "order__status"]
+        )
+    )
+    assert [m["name"] for m in envelope.data["metrics"]] == ["refund_rate"]
+    assert envelope.data["for_dimensions"] == ["refund__reason", "order__status"]
+    assert envelope.data["scoped_to"] == ["refund_rate"]
+
+
+def test_a_dimension_no_metric_can_be_grouped_by_is_an_answer_not_a_refusal(
+    tmp_path: Path, monkeypatch
+):
+    """A dimension the project declares but no metric reaches is real, and "no
+    metric" is the true answer for it. Only an unknown *name* is refused, which is
+    the distinction the empty list cannot make on its own."""
+
+    backend = _local(_graph_manifest(tmp_path))
+    catalog = backend.list_definitions()
+    for metric in catalog.metrics:
+        metric.dimensions = [d for d in metric.dimensions if d != "refund__reason"]
+    backend.list_definitions = lambda: catalog
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+
+    envelope = to_envelope(
+        semantic_commands.semantic_list(_engine(), for_dimensions=["refund__reason"])
+    )
+    assert envelope.data["metrics"] == []
+    assert envelope.data["for_dimensions"] == ["refund__reason"]
+    assert any(
+        "no metric in this layer can be grouped by" in note
+        for note in envelope.data["notes"]
+    )
+
+
+def test_the_reverse_lookup_narrows_the_whole_catalog(tmp_path: Path, monkeypatch):
+    """It resolves to metrics and then narrows exactly as `--metric` does, so the
+    answer is a catalog rather than a list of names: the measures those metrics
+    read, the models they live in, and what they can be grouped by."""
+
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    envelope = to_envelope(
+        semantic_commands.semantic_list(_engine(), for_dimensions=["refund__reason"])
+    )
+    assert [m["name"] for m in envelope.data["semantic_models"]] == [
+        "orders",
+        "refunds",
+    ]
+    assert {m["name"] for m in envelope.data["measures"]} == {
+        "order_count",
+        "refund_count",
+    }
+    assert any("1 of 4 metrics can be grouped by" in n for n in envelope.data["notes"])
+
+
+def test_the_two_scopes_compose_and_a_dropped_metric_is_named(
+    tmp_path: Path, monkeypatch
+):
+    """ "Of these metrics, which can I slice this way" is a real question, and
+    "none of them" is a real answer. A metric dropped by the dimension scope is
+    named, because a silently shorter list reads as the layer's own answer."""
+
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    envelope = to_envelope(
+        semantic_commands.semantic_list(
+            _engine(),
+            metrics=["orders", "refund_rate"],
+            for_dimensions=["refund__reason"],
+        )
+    )
+    assert envelope.data["scoped_to"] == ["refund_rate"]
+    assert any("orders cannot be grouped by" in n for n in envelope.data["notes"])
+
+
+def test_the_reverse_lookup_costs_no_extra_round_trip():
+    """It reads the catalog the command already fetched. A second call to the
+    layer would also answer this, and would answer it differently."""
+
+    hosted = FakeHostedBackend(metrics=_graph_metrics())
+    catalog = hosted.list_definitions()
+    before = len(hosted.posted)
+    catalog.metrics_for_dimensions(["order__status"])
+    assert len(hosted.posted) == before
+
+
+def test_cli_reverse_lookup_through_every_spelling(tmp_path: Path, monkeypatch):
+    from exmergo_dex_core.cli import _build_parser
+
+    backend = _local(_graph_manifest(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    parser = _build_parser()
+
+    for argv in (
+        ["explore", "semantic", "list", "--local", "--for-dimension", "refund__reason"],
+        ["explore", "semantic", "--local", "--for-dimension", "refund__reason"],
+    ):
+        envelope = semantic_commands.cmd_semantic(parser.parse_args(argv), _engine())
+        assert envelope.data["scoped_to"] == ["refund_rate"], argv
+
+    # Comma-joined and repeated mean the same thing here as everywhere else.
+    for tail in (
+        ["--for-dimension", "refund__reason,order__status"],
+        ["--for-dimension", "refund__reason", "--for-dimension", "order__status"],
+    ):
+        envelope = semantic_commands.cmd_semantic(
+            parser.parse_args(["explore", "semantic", "list", "--local", *tail]),
+            _engine(),
+        )
+        assert envelope.data["for_dimensions"] == [
+            "refund__reason",
+            "order__status",
+        ], tail
+
+    # An unscoped list carries neither key, so a complete answer is never shaped
+    # like a subset.
+    whole = semantic_commands.cmd_semantic(
+        parser.parse_args(["explore", "semantic", "list", "--local"]), _engine()
+    )
+    assert "for_dimensions" not in whole.data and "scoped_to" not in whole.data
+
+
 # ---- local guards: cache-backed PII + namespace pre-check -------------------
 
 

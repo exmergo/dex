@@ -418,3 +418,41 @@ class SemanticQueryResult(Result):
         if self.query_id is not None:
             payload["query_id"] = self.query_id
         return payload
+
+
+class SemanticValuesResult(SemanticQueryResult):
+    """One semantic dimension's value domain, from whichever backend answered.
+
+    A subclass rather than a sibling. The envelope shape, the four provenance
+    axes, and the capped-columnar construction are the same object; what differs is
+    what the result is about, and inheriting is what keeps a new provenance field
+    from having to be added twice.
+
+    ``dimension`` is the token that was asked for, grain suffix included, so a
+    caller reading a stored result knows which question it answers.
+
+    ``scoped_to`` is the metrics the values were reached through, and it changes
+    what the answer *means* rather than only how it was obtained: unscoped, these
+    are the values of the column behind the dimension; scoped, they are the values
+    present for those metrics, which on a filtered or sparsely joined metric is a
+    subset. Empty means the first. That is why it is a payload field and not a
+    note, and why the notes name the metric when dex chose one itself.
+
+    ``notes`` is always reported, like ``query`` and ``diagram``: an empty list is
+    the positive statement that nothing was capped and nothing was narrowed.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    dimension: str = ""
+    scoped_to: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        # The two fields that say what was asked lead, for the reason the catalog
+        # leads with its provenance: key order means nothing to a parser and
+        # everything to an agent reading a truncated result.
+        return {
+            "dimension": self.dimension,
+            "scoped_to": self.scoped_to,
+            **super().data(),
+        }

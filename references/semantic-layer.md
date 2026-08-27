@@ -6,7 +6,7 @@ it *queries* the layer, so an agent can discover metrics and run governed metric
 queries. Two backends answer the same commands through one abstraction, and the
 difference between them is load-bearing, so it is spelled out here.
 
-## The two commands
+## The three commands
 
 Every result and catalog names which layer answered on all four: `backend` (the
 released one-value spelling), plus `vendor`, `deployment`, and `execution`.
@@ -18,7 +18,12 @@ released one-value spelling), plus `vendor`, `deployment`, and `execution`.
   dbt project's own words, so an undocumented project returns identifiers and
   types alone; an unset field is omitted from the payload rather than returned as
   a null. `--metric <m>` narrows the catalog to those metrics and what they reach,
-  which is the whole layer's worth of context down to the part a caller came for.
+  which is the whole layer's worth of context down to the part a caller came for,
+  and `--for-dimension <d>` asks the reverse question, "what can I slice by this".
+- `explore semantic values <dimension> [--metric <m>]` returns one dimension's
+  value domain: what a filter on it may be filtered to. It takes exactly one
+  dimension, accepts a grain suffix (`user__created_at__month`), and is the only
+  dex command that can answer this on a hosted layer at all.
 - `explore semantic query` runs a metric query and returns a capped, row-major
   result, the same envelope shape as `explore query`. It takes a metric
   positionally after the explicit `query` mode, keeps `--metric <m>` as a
@@ -147,8 +152,102 @@ they name, because pruning them would turn a primary entity into a foreign one,
 which is a false statement about the layer rather than a smaller one. A metric name
 the layer does not have is refused by name rather than returning an empty catalog.
 
+### The reverse lookup
+
+`explore semantic list --for-dimension <d>` (repeatable, comma-separated) answers
+the question the catalog does not: not "what can this metric be grouped by" but "I
+want to slice by pricing tier, what can I slice". It resolves to the metrics
+groupable by **all** the named tokens and then narrows the catalog exactly as
+`--metric` does, so what comes back is a catalog rather than a list of names. The
+two compose, and a named metric that cannot be grouped that way is dropped with a
+note naming it rather than silently.
+
+The intersection rather than the union, because metrics that share a group-by are
+the ones that can go on one chart against one axis, which is what the question is
+usually for.
+
+It is an **inversion of the `dimensions` list each metric already carries**, not a
+second call to the layer. That is worth stating because the dbt Cloud API has a
+field for this (`metricsForDimensions`) and dex does not use it: the field answers
+the empty list both for a name the layer does not have and for a real dimension no
+metric shares, so a typo would come back indistinguishable from a fact about the
+layer, and it does not accept a metric's own time token at all. Inverting the
+catalog closes both, refuses an unknown token by name, and gives the same answer on
+either backend. On the layer this was measured against, the inversion reproduced
+that field exactly on every case tried.
+
+A token reached only through a join is in the list only when the read resolved the
+join graph, so on `--local` without the `[semantic]` extra `--for-dimension` can
+refuse a token `--api` accepts; `dimension_scope` is what says which read you have.
+
 Nothing in `list` costs a warehouse query on either backend: one GraphQL round trip
 hosted, one compiled-artifact read locally.
+
+## What `values` returns
+
+`explore semantic values <dimension>` returns the distinct values of one semantic
+dimension, capped and columnar like every other value-carrying result. It exists
+because naming a value is the precondition for writing a filter and nothing else in
+dex could reach one: `explore profile` cannot see a semantic dimension, and on a
+hosted layer there is no SQL path at all, since dbt Cloud is not a connector.
+
+The payload leads with what was asked:
+
+| field | meaning |
+|---|---|
+| `dimension` | the token that was asked for, grain suffix included |
+| `scoped_to` | the metrics the values were reached through, empty when none were needed |
+| `columns`, `types`, `cells`, `row_count`, `truncated` | the domain, capped like `explore query` |
+| `backend`, `vendor`, `deployment`, `execution` | which layer answered |
+| `query_id` | dbt Cloud's handle for the executed query, hosted only |
+
+**The dimension is resolved before it is asked for.** Both backends look the token
+up in the layer's own catalog first, so a misspelling is refused by name (and the
+refusal says the token is entity-qualified, which is the likelier mistake), and an
+unknown metric passed to `--metric` is refused as a metric rather than surfacing as
+a resolution error about the dimension. A trailing grain is split off for that
+lookup and put back for the query, against the grains the layer reports rather than
+a list dex keeps, so a granularity a project defined for itself works like any
+other.
+
+**`scoped_to` changes what the answer means, which is why it is a field and not a
+note.** A dimension of one semantic model is answerable on its own: the layer reads
+the distinct values of that one relation, and `scoped_to` is empty. A dimension
+reached through a join is not answerable that way at all. There is no measure to
+join from, so MetricFlow refuses the distinct-values query and dbt Cloud refuses the
+same request for the same reason, and the only rendering that exists is one scoped
+to a metric that reaches it. That rendering answers a slightly narrower question,
+the values present for that metric rather than the domain of the column.
+
+So dex renders the cheap form first and escalates once, to the first metric that
+reaches the dimension in name order. Rendering costs nothing on either backend
+(nothing is priced until the handshake, and dbt Cloud charges nothing to refuse a
+request), so the second attempt is free. The metric it settled on is in `scoped_to`
+and named in a note along with the alternatives and the `--metric` flag that
+overrides the choice, because the narrowing must never be silent.
+
+**PII is screened harder here than on a metric query.** A metric query returns
+aggregates that a dimension merely slices, so a flagged dimension can be dropped
+from the grouping and the query still answers something. Here the result *is* the
+values, so a flagged dimension refuses the command, and the refusal names the
+durable ways to clear a dimension reviewed as not PII (a `pii_overrides` entry in
+`.dex/config.yml`, or `meta: {pii: false}` in the project). The evidence is the same
+on each backend as it is for a query: the `.dex/` cache's flag on the resolved
+physical column locally, the layer's own `config.meta` hosted, fetched one metric at
+a time and unioned across every metric that reaches the dimension, with the name
+heuristic as the fail-closed floor and disclosed on the result when it was all that
+ran.
+
+**The cardinality reported is what came back.** Neither backend's primitive takes a
+limit, and an exact distinct count costs a second scan of the same table on every
+connector, so dex does not report a number it would have to bill for. A
+high-cardinality dimension comes back cut at `query.max_rows` with `truncated` true
+and a note saying so, which is the same capping every other columnar result takes.
+
+Cost follows the backend, unchanged: `--local` renders the SQL and runs it through
+the full handshake (and needs the `[semantic]` extra, unlike `list`), `--api` is
+executed by dbt Cloud and carries the cost-guard-unavailable warning on every
+result.
 
 ## Choosing a backend (ambient, like a connector)
 
@@ -368,6 +467,8 @@ heuristic at once) wants retrying.
 | `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved |
 | Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always |
 | `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric |
+| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud |
+| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal |
 | Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent |
 | Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |
