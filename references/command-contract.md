@@ -756,6 +756,20 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   plus `session_spent_today`, which is what the next command's cumulative
   ceiling will start from. A failed build reports it too: dbt bills for the
   statements it ran before it stopped.
+- **The spend ledger is a dependency of billing, not of every command.** A gate
+  is built at every connection assembly on a billed connector, free commands
+  included, but nothing reads the ledger until something needs the day's total.
+  Billed admission reads it and fails closed if it cannot: the refusal is named
+  (`reason: guard`), carries the cost, and says nothing ran, so re-issuing the
+  same command is safe. Settlement tolerates a read failure instead, so a backend
+  that goes away mid-command does not turn a command that already ran into a
+  refusal. A command that cannot spend never reaches the ledger, so a store
+  keeping it on a network can be unreachable without taking down a cache-served
+  answer. Two fields can therefore report `null`: `data.spend.session_spent_today`
+  when the ledger failed at settlement (what that command billed is still exact,
+  because the warehouse said so; only the day's total is unavailable), and
+  `connect test`'s `budget.session_spent_today`, which takes one guarded read
+  because reporting the budget is that command's job.
 - **The cumulative ceiling binds across commands that overlap in time**, not
   only across commands that follow one another. An admitted command books its
   estimate against the day's headroom before it runs and releases the unspent
