@@ -272,6 +272,17 @@ class ExploreStore(Protocol):
         useful without it, and the reason an optional member is tolerable here
         is that dex detects its absence and says so, rather than relying on
         every implementer to have read a paragraph.
+
+        **This call is allowed to fail, and where it fails decides what
+        happens.** A ledger on a network is a ledger that can be unreachable, so
+        raising is a legitimate outcome and a backend should not swallow one into
+        a zero: a zero is a claim that nothing has been spent today, and a guard
+        that admits work on a fabricated zero is the failure this ledger exists
+        to prevent. Only billed admission is entitled to fail closed on it, and
+        it does, as a named refusal that says nothing ran. A command that cannot
+        spend never reaches this call, and settlement tolerates a failure rather
+        than turning a command that already ran into a refusal, so an outage
+        costs the day's total on one envelope and no correctness.
         """
         ...
 
