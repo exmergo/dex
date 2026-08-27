@@ -200,6 +200,11 @@ class SnowflakeAdapter:
         # confirmed run share table facts, and each SHOW is free but a
         # round-trip.
         self._objects: dict[str, dict] = {}
+        # Row counts learned from a profiling aggregate, which for a view is the
+        # only count there is: SHOW TABLES maintains none. Supersedes the SHOW
+        # figure for the rest of the command, so uniqueness proofs and grain
+        # verdicts compare against rows that were counted rather than reported.
+        self._exact_rows: dict[str, int] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
         self._inventory_loaded = False
         self._resolved_scopes: list[str] | None = None
@@ -234,7 +239,7 @@ class SnowflakeAdapter:
         cost = self.cost_gate.cost()
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if self.target.warehouse:
             info = self._warehouse()
@@ -334,14 +339,13 @@ class SnowflakeAdapter:
         name = row.get("table_name") or row.get("name")
         return f"{row['database_name']}.{row['schema_name']}.{name}"
 
-    @staticmethod
-    def _object_meta(entry: dict) -> ObjectMeta:
+    def _object_meta(self, entry: dict) -> ObjectMeta:
         return ObjectMeta(
             identifier=entry["identifier"],
             object_type=entry["object_type"],
             schema=entry["schema"],
             name=entry["name"],
-            row_count=entry["row_count"],
+            row_count=self._exact_rows.get(entry["identifier"], entry["row_count"]),
             byte_size=entry["byte_size"],
             column_count=entry["column_count"],
         )
@@ -782,6 +786,13 @@ class SnowflakeAdapter:
                 sql, estimate=self._scan_seconds(meta.byte_size)
             )
             values = dict(zip(labels, rows[0], strict=True))
+            if sample_percent is None:
+                # The batch counted the table exactly, and for a view that is the
+                # only count available: capture it so the metadata re-read after
+                # this scan can hand it to the probes that decline to run without
+                # a row count. Not under sampling, where the count is the
+                # sample's rather than the table's.
+                self._exact_rows[identifier] = int(values["n_total"])
             results.extend(
                 self._read_aggregates(values, plan, sampled=sample_percent is not None)
             )
