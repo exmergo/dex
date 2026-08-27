@@ -60,13 +60,22 @@ Subcommands, in the usual order:
 4. `explore relationships` returns inferred and declared joins with confidences,
    plus notes explaining what the inference examined (so an empty list is
    meaningful). Add `--verify` to measure each inferred join with an aggregate
-   overlap probe (orphan fraction, confidence adjusted).
+   overlap probe (orphan fraction, confidence adjusted). A declared join has two
+   sources: a `relationships` test, and (with `--use-project`) an entity two
+   semantic models share, which the layer states outright with the key named per
+   model. `declared_by` on an edge names that entity, `semantic_join_count` says
+   how many came that way, and the notes call out the ones name-based inference
+   did not find, which is the interesting set: a semantic layer routinely joins
+   columns that share no name at all.
 5. `explore map` writes or updates the `.dex/` cache and returns the map
    (`--verify` works here too). Alongside the counts, `data.objects` gives each
    top-ranked object its row count, detected grain, candidate key, notable
    columns (each carrying the role that earned it a place: `grain`, `key`,
    `join`, or a PII flag) and data-quality findings, and `data.edges` gives the
-   join edges in the same shape `explore relationships` returns. **Read that
+   join edges in the same shape `explore relationships` returns. With
+   `--use-project` each object also carries `semantic_models`, the semantic models
+   that sit on that relation, which is what separates a load-bearing table from a
+   merely large one: empty means nothing in the layer reads it. **Read that
    payload instead of chaining `profile` and `relationships` to re-derive it**;
    go to those two when you need one object in full, or a value domain, which
    `map` never carries. It is budgeted: 25 objects by rank, 12 columns per
@@ -95,7 +104,9 @@ Subcommands, in the usual order:
    by hand. The glyphs are claims the engine derived from evidence, and a
    plausible-looking cardinality you supplied is exactly the overclaim this
    command exists to prevent: declared joins are solid, inferred dotted, and an
-   unverified inference never says "exactly one". Read `notes` before presenting
+   unverified inference never says "exactly one". A solid line labelled with a
+   semantic entity is a join the semantic layer declares; look the entity up with
+   `explore semantic list`. Read `notes` before presenting
    it, since it states any object or column that was left out; `--full` widens
    from the default (profiled, joined objects and their grain, key, join, and
    PII columns) to everything eligible.
@@ -153,7 +164,14 @@ Subcommands, in the usual order:
    entities (one declaration per semantic model, each with its own join key, so
    the declared join graph is readable), and measures (the aggregation and
    expression the number is made of, which is often a conditional rather than a
-   column). Read a metric's `input_measures` through to those measures before
+   column). It also reaches the warehouse the rest of `explore` describes: a
+   semantic model carries the `relation` it sits on and each dimension, entity
+   declaration and measure carries its `column`, so "which table is behind this
+   metric" is the metric's `semantic_models` followed to their relations, and
+   `explore profile <relation>` is the next call. An element defined as an
+   expression carries no column rather than a guessed one. The hosted backend
+   exposes no relation at all and declares that in `unavailable`, so use `--local`
+   when you need the physical side. Read a metric's `input_measures` through to those measures before
    trusting what a number counts, and read its `time_axis` before trusting a time
    series: `metric_time` is not one column but each metric's own aggregation time
    dimension, so two entries there mean the metric's measures bucket by different
