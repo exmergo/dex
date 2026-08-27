@@ -9,23 +9,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
-**Payload growth, and the budget that now bounds it.** Widening every element grew
-the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
-measures, `--local` grew 1.8x and `--api` 1.4x, almost all of it new objects and
-the project's own prose rather than placeholders. The time axis and the queryable
-grains added a further 1.10x on the same layer (about 5.5 KB), resolving the local
-join graph took its dimension list from 45 rows to 65, and the physical link added
-a further 1.05x (about 3.3 KB), because a relation is carried once per semantic
-model rather than once per element. That layer's unscoped catalog now measures
-71.4 KB on `--local` and 62.2 KB on `--api`, against roughly 40 KB before this
-round.
-
-The budget below closes that out. It comes back **uncut** at those sizes, because
-the caps are calibrated so an ordinary layer is emitted whole and only a layer that
-was already too large to read in one payload is trimmed. `--metric` brings that same
-layer to 10% of its unscoped size, and the payload now states what was cut in every
-case, zeros included.
-
 ### Changed
 
 - **Three behavior changes that come with the row-count and ledger fixes, none of
