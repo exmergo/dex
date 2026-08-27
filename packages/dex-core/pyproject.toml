@@ -154,6 +154,18 @@ storage-conformance = ["pytest>=8", "exmergo-dex-core[sql]"]
 # holds it true, because the cheapest way for this to acquire a heavier floor is for
 # an assertion to start building something that parses SQL.
 project-conformance = ["pytest>=8"]
+# The semantic-backend conformance contract
+# (`exmergo_dex_core.explore.semantic.conformance`), for anyone implementing a
+# semantic-layer backend outside this distribution. Named on the same rule as the
+# two above: an install line answers "conformance to what?" alone.
+#
+# Pytest and nothing else, and that floor is the point rather than a coincidence.
+# The contract reads a catalog and asserts on its shape, so it reaches neither the
+# dialect engine nor a warehouse client, and it does not need either semantic
+# extra: the reference layer is data in the module, so an implementer runs the
+# suite against their own backend without installing MetricFlow or httpx to do it.
+# A packaging test holds that true.
+semantic-conformance = ["pytest>=8"]
 # One command for users who want every optional capability at once: every
 # connector, both semantic-layer backends, and clustering. Self-references the
 # other extras so their requirement lists stay defined in exactly one place, which
