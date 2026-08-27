@@ -312,10 +312,10 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     dbt adapters and MetricFlow in one environment, it is also the only place a
     version conflict between them can surface at all.
 
-    `dev` and the two `*-conformance` extras are excluded deliberately: contributor
-    tooling, not capabilities. They carry a test runner for people implementing a
-    storage backend or a project format, and nobody installing "everything dex can
-    do" wants pytest.
+    `dev` and the three `*-conformance` extras are excluded deliberately:
+    contributor tooling, not capabilities. They carry a test runner for people
+    implementing a storage backend, a project format, or a semantic backend, and
+    nobody installing "everything dex can do" wants pytest.
     """
 
     extras = _project_metadata()["optional-dependencies"]
@@ -323,7 +323,13 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     referenced = set(
         extras["all"][0].removeprefix("exmergo-dex-core[").removesuffix("]").split(",")
     )
-    tooling = {"all", "dev", "storage-conformance", "project-conformance"}
+    tooling = {
+        "all",
+        "dev",
+        "storage-conformance",
+        "project-conformance",
+        "semantic-conformance",
+    }
     assert referenced == set(extras) - tooling, (
         f"[all] does not cover {sorted(set(extras) - tooling - referenced)}"
     )
@@ -1079,6 +1085,53 @@ def test_the_project_contract_needs_only_a_test_runner(wheel: str, tmp_path: Pat
         encoding="utf-8",
     )
     spec = f"exmergo-dex-core[project-conformance] @ {wheel}"
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
+
+
+def test_the_semantic_contract_needs_only_a_test_runner(wheel: str, tmp_path: Path):
+    """`[semantic-conformance]` is pytest and nothing else, held by installing it.
+
+    The same floor the project contract has, checked the same way and for the same
+    reason: this repo's dev environment carries sqlglot, MetricFlow and httpx, so
+    an assertion that started reaching one of them would quietly make the extra
+    heavier for every implementer while staying green here. The reference layer
+    being data in the module is what keeps the floor this low, and it is also what
+    lets an implementer run the suite before their backend can reach anything.
+    """
+
+    suite = tmp_path / "test_light_floor.py"
+    suite.write_text(
+        "import sys\n\n"
+        "from exmergo_dex_core.explore.semantic import conformance\n\n\n"
+        "def test_the_contract_imports_nothing_heavy():\n"
+        "    assert 'sqlglot' not in sys.modules\n"
+        "    assert 'metricflow' not in sys.modules\n"
+        "    assert 'httpx' not in sys.modules\n"
+        "    assert conformance.SemanticBackendContract\n"
+        "    assert conformance.reference_dbt_manifest()['metrics']\n",
+        encoding="utf-8",
+    )
+    spec = f"exmergo-dex-core[semantic-conformance] @ {wheel}"
 
     done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
         [

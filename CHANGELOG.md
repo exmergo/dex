@@ -9,17 +9,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
-**Payload growth, called out because nothing caps it yet.** Widening every element
-grows the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
+**Payload growth, and the budget that now bounds it.** Widening every element grew
+the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
 measures, `--local` grew 1.8x and `--api` 1.4x, almost all of it new objects and
 the project's own prose rather than placeholders. The time axis and the queryable
-grains below add a further 1.10x on the same layer (about 5.5 KB), and resolving
-the local join graph takes its dimension list from 45 rows to 65. `--metric`
-scoping ships with the change rather than after it for that reason, and brings a
-single metric's catalog to a tenth of the layer's. A budget for the unscoped
-payload is still open work. The physical link below adds a further 1.05x on the
-same layer (about 3.3 KB), because a relation is carried once per semantic model
-rather than once per element.
+grains added a further 1.10x on the same layer (about 5.5 KB), resolving the local
+join graph took its dimension list from 45 rows to 65, and the physical link added
+a further 1.05x (about 3.3 KB), because a relation is carried once per semantic
+model rather than once per element. That layer's unscoped catalog now measures
+71.4 KB on `--local` and 62.2 KB on `--api`, against roughly 40 KB before this
+round.
+
+The budget below closes that out. It comes back **uncut** at those sizes, because
+the caps are calibrated so an ordinary layer is emitted whole and only a layer that
+was already too large to read in one payload is trimmed. `--metric` brings that same
+layer to 10% of its unscoped size, and the payload now states what was cut in every
+case, zeros included.
 
 ### Fixed
 
@@ -161,6 +166,107 @@ rather than once per element.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
+
+- **`explore semantic list` is capped, searchable, and accounts for what it left
+  out** ([#362]). It was the one explore command that budgeted nothing: every
+  metric, dimension, entity, semantic model and measure serialized with no cap, no
+  way to narrow it beyond naming metrics, and nothing in the payload saying
+  anything had been left out. `explore map` caps objects, columns, edges and
+  findings and counts every elision; `explore inventory --rank` is open as the same
+  bug class. Five rounds of object-model work then widened every element in it.
+
+  Three things ship together, because a cap without a way to ask a narrower
+  question is just a smaller wrong answer.
+
+  `--search <term>` (repeatable, comma-separated) takes a word rather than a name
+  and matches it case-insensitively against every element's name and against the
+  project's own label and description. A search resolves to metrics and narrows the
+  catalog exactly as `--metric` does, so what comes back is a catalog whichever way
+  it was asked; an element other than a metric is matched for the metrics that reach
+  it, and a measure deliberately does not widen to its own semantic model, because
+  "in the same model as" is not "made of". The union across terms, unlike
+  `--for-dimension`, where the intersection is the whole question. A term that
+  matches nothing is named in a note rather than refusing the command, which is
+  where it differs from an unknown metric name: a substring matching nothing is an
+  honest answer about the layer's words, so a search for three terms with one typo
+  still answers for the other two. It is applied after the two name-based scopes,
+  so `--metric x --search y` reads as "within x, the parts about y", and
+  `searched_for` names the terms in the payload. dex does not pass it to the dbt
+  Cloud API's own `search` argument, which sits on each root field separately: a
+  hosted search would filter the metrics list and leave the dimensions nested under
+  each metric unfiltered, which is a different answer from the local one for the
+  same command, and the whole catalog arrives in one round trip either way.
+
+  Caps, in the shape `explore map` uses: 50 semantic models, 60 metrics, 150
+  dimension rows, 50 entities, 60 measures, and 40 groupable tokens per metric.
+  That last one is the only cap on a repeating block and it is where the bytes are
+  on a wide layer: on the layer measured, the per-metric dimension lists are 441
+  tokens and 15 to 17% of the whole payload. **The defaults leave an ordinary layer
+  uncut**, verified on both backends against a live layer of a dozen models and 27
+  metrics, so a cap only bites one that was already unusable in a single payload; a
+  consumer that silently loses catalog entries is a worse outcome than a large
+  payload. `--full` lifts them.
+
+  `elided` counts every cut per element kind and is **always present, zeros
+  included**. That is the point of it: a zeroed `elided` with no cap notes is the
+  positive statement "this is the whole layer", which a caller cannot get from a
+  missing key. Each non-empty cut also gets a note naming the cap, the count, the
+  consequence (a capped catalog can name a measure or a groupable token the payload
+  no longer describes) and the flags that answer it. The one exception is
+  `elided_dimension_count` on a metric, absent where nothing was cut, because that
+  field repeats once per metric and the layer-wide total is what makes its absence
+  readable.
+
+  A library caller reading `list_definitions()` off a backend still gets the layer
+  uncapped. The budget is applied at the command layer, so only the surface that has
+  to fit in an agent's context pays it, and `SemanticCatalog.capped()` takes each cap
+  as an argument for a host that wants to budget its own.
+
+- **An executable conformance contract for semantic backends** ([#363]).
+  `SemanticBackend` was a Protocol, and a Protocol asserts nothing. The two shipped
+  backends disagreed about one identical layer: 45 dimension rows against 65, a
+  metric reporting 6 groupable dimensions where 11 were queryable, an entity
+  reported `primary` by one and `foreign` by the other. Some of that was genuine
+  asymmetry that should have been declared and some was a bug, and nothing told them
+  apart.
+
+  `exmergo_dex_core.explore.semantic.conformance` is the third of dex's shipped
+  contracts, after storage and project formats, in the same shape: a pytest module
+  a backend author outside this distribution subclasses.
+  `SemanticBackendContract` asserts what holds of any catalog;
+  `SemanticCatalogContract` asserts content against `REFERENCE_LAYER`, a small
+  neutral description of a layer that exercises every field the catalog can carry,
+  including two models joined by a shared entity whose key is spelled differently on
+  each side, three measure shapes, a filtered metric, a ratio, and a PII-shaped
+  dimension. `reference_dbt_manifest()` renders it in dbt's compiled form;
+  MetricFlow's own resolver accepts it and resolves exactly the groupable token sets
+  the description declares. Pinning the layer as committed data rather than a hosted
+  deployment is what keeps the suite from re-documenting itself whenever someone
+  edits the project behind it.
+
+  **The assertion worth the most is the one about silence.** For every field the
+  reference layer declares, a backend either answers it on some element or names it
+  in `catalog_gaps`. Undeclared silence fails, because an absent field and a
+  declared gap are indistinguishable to a consumer: "the hosted API has no entity
+  labels" reads as "this project labelled no entities" and the reader stops looking.
+  The rest covers the four provenance axes, a repeatable read, `dimension_scope` as
+  a promise rather than a label, referential integrity across the five lists, an
+  entity's derived `type`, a ratio's two sides, `time_axis` naming a measure the
+  metric reads, a payload that never carries the PII gate's own column lookup, caps
+  that count what they cut and leave the catalog they were given alone,
+  `filter_refs` answering or declining without raising, and a values request for a
+  PII-flagged dimension refused.
+
+  dex binds its own backends three times: `--local` with MetricFlow resolving the
+  join graph, `--local` with no resolver, and `--api` against a transport
+  reproducing the dbt Cloud API's real asymmetries, plus a direct comparison of the
+  two on the same layer. Writing it found one real gap in the reference layer
+  itself, where every measure happened to compile to a non-column expression and so
+  made a hosted backend look like it could never name a measure's column.
+
+  Install `[semantic-conformance]`, which is pytest and nothing else: the contract
+  reaches neither the dialect engine nor a warehouse client and needs neither
+  semantic extra, and a packaging test holds that floor.
 
 - **The semantic layer and the physical catalog are one warehouse again**
   ([#360]). `explore` held two unconnected views of it. `inventory`, `profile`,

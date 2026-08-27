@@ -152,80 +152,91 @@ Subcommands, in the usual order:
    sample clause reads a fraction), so surface the estimate and get a budget
    first. Needs the `[cluster]` extra (scikit-learn); the wrapper installs it
    automatically for this subcommand.
-9. `explore semantic list` and `explore semantic query` reach the dbt semantic
-   layer. `list` is discovery, and it returns the layer's objects rather than
-   three lists of names: semantic models (the unit the layer is organized
-   around, each with the transformation model it sits on and its default time
-   dimension), metrics (which dimensions each can be grouped by, the measures it
-   reads, a ratio's two sides, any filter that makes it a subset, the grains it
-   can be queried at, and the time column a time grouping resolves to),
-   dimensions (the token to group by, plus the definition, owning model, and
-   queryable grains behind it),
-   entities (one declaration per semantic model, each with its own join key, so
-   the declared join graph is readable), and measures (the aggregation and
-   expression the number is made of, which is often a conditional rather than a
-   column). It also reaches the warehouse the rest of `explore` describes: a
-   semantic model carries the `relation` it sits on and each dimension, entity
-   declaration and measure carries its `column`, so "which table is behind this
-   metric" is the metric's `semantic_models` followed to their relations, and
-   `explore profile <relation>` is the next call. An element defined as an
-   expression carries no column rather than a guessed one. The hosted backend
-   exposes no relation at all and declares that in `unavailable`, so use `--local`
-   when you need the physical side. Read a metric's `input_measures` through to those measures before
-   trusting what a number counts, and read its `time_axis` before trusting a time
-   series: `metric_time` is not one column but each metric's own aggregation time
-   dimension, so two entries there mean the metric's measures bucket by different
-   timestamps and grouping by `metric_time` splits the number between them. On a large layer, `list --metric <m>` narrows
-   the catalog to those metrics and what they reach, at no extra cost; the
-   payload names the scope in `scoped_to`, so a scoped catalog is never mistaken
-   for the whole layer. `list --for-dimension <d>` asks the reverse question,
-   returning the metrics groupable by all the named tokens: use it when you know
-   the slice you want rather than the metric, and to find the metrics that can go
-   on one chart against one axis. It inverts the dimension list each metric
-   already carries, so it costs nothing extra and refuses an unknown token by
-   name rather than answering "no metrics". Two payload fields carry differences
-   between the
-   backends rather than leaving them to be inferred: `dimension_scope` says
-   whether a dimension row is one declaration or one groupable path (which is
-   why the two backends report different dimension counts for one layer), and
-   `unavailable` names fields a backend structurally cannot supply. `--local`
-   resolves the join graph through MetricFlow where the `[semantic]` extra is
-   installed, which is what makes its dimension lists the tokens a query can
-   actually use; without it the payload says `declarations` and a note names the
-   extra. `query` takes a positional
-   metric after the explicit mode (with `--metric` kept for compatibility) and a
-   `--group-by <entity__dim>` (plus optional `--where`, `--grain`, and
-   `--limit`) and returns a metric's values as a capped, columnar result. Name
-   flags take a comma-separated list or a repeated flag (`--group-by a,b` is
-   `--group-by a --group-by b`); `--where` is never split. `--grain` is checked
+9. `explore semantic list|values|query` reach the semantic layer: the metrics an
+   author defined, and the semantic models, measures, dimensions and entities
+   they are built out of. Distinct from the warehouse commands above, and from
+   the top-level `semantic` group, which *authors* the layer where this *queries*
+   it.
+
+   `list` is discovery and returns the layer's objects rather than three lists of
+   names: semantic models (the unit the layer is organized around, each with the
+   transformation model it sits on, its default time dimension, and the physical
+   `relation` underneath), metrics (which dimensions each can be grouped by, the
+   measures it reads, a ratio's two sides, any filter that makes it a subset, the
+   grains it can be queried at, and `time_axis`, the physical time column a time
+   grouping resolves to), dimensions (the token to group by, plus the bare
+   definition, owning model, queryable grains and `column` behind it), entities
+   (one declaration per semantic model, each with its own join key, so the
+   declared join graph is readable), and measures (the aggregation and expression
+   the number is actually made of, which is often a conditional rather than a
+   column). An element defined as an expression carries no column rather than a
+   guessed one. So "which table is behind this metric" is the metric's
+   `semantic_models` followed to their relations, and `explore profile <relation>`
+   is the next call; `--api` exposes no relation at all and declares that in
+   `unavailable`, so use `--local` when you need the physical side.
+
+   Three free ways to narrow it, and they compose. `--metric <m>` keeps those
+   metrics and what they reach. `--for-dimension <d>` asks the reverse question,
+   returning the metrics groupable by all the named tokens, which is what you want
+   when you know the slice rather than the metric and is also the cheapest way to
+   find the metrics that can go on one chart against one axis. `--search <t>`
+   takes a word rather than a name and matches it against every element's name and
+   against the project's own label and description. Each names its scope in the
+   payload (`scoped_to`, `for_dimensions`, `searched_for`), so a subset is never
+   mistaken for the layer; an unknown metric or dimension is refused by name,
+   while a search term that matched nothing comes back as a note. The catalog is
+   also capped, with every cut counted in `elided` and named in `notes` and
+   `--full` to lift the caps. `elided` is always present, so all zeros and no cap
+   notes is the positive statement that this is the whole layer. Prefer narrowing
+   over `--full`: it decides which part comes back rather than letting a cap
+   decide.
+
+   `values <dimension>` returns that dimension's value domain, which is what you
+   need before writing a `--where` filter and the one thing no other dex command
+   can reach on a hosted layer (`profile` cannot see a semantic dimension). A
+   PII-flagged dimension refuses this command outright rather than being screened,
+   because the whole output is values.
+
+   `query` takes a positional metric after the explicit mode (with `--metric` kept
+   for compatibility), a `--group-by <entity__dim>`, and optional `--where`,
+   `--order-by`, `--grain` and `--limit`, and returns the metric's values as a
+   capped columnar result. Name flags take a comma-separated list or a repeated
+   flag (`--group-by a,b` is `--group-by a --group-by b`); `--where` is never
+   split, because a filter clause carries its own commas. `--grain` is checked
    against the grains the layer reports for the metrics queried, so a refusal
-   names the ones that metric has. `values <dimension>` returns that dimension's
-   value domain, which is what you need before you can write a `--where` filter
-   and the one thing no other dex command can reach on a hosted layer (`profile`
-   cannot see a semantic dimension). Read `scoped_to` on the result before
-   trusting the list: empty means these are the column's own values, and a metric
-   name means dex had to reach the dimension through that metric because it is
-   only reachable through a join, so the values are the ones present for that
-   metric. Pass `--metric` to choose it yourself. A PII-flagged dimension refuses
-   this command outright rather than being screened, because the whole output is
-   values. Two backends answer
-   these, chosen by `.dex/config.yml` `semantic.vendor` and `semantic.deployment`
-   (the older `semantic.backend` spelling of the two still works), and overridable
-   with `--local` / `--api`. Those two flags name who executes, not which vendor:
-   every result reports it as `execution` (`dex` or `vendor`). `--local` renders
-   the SQL with MetricFlow and executes it through dex's own connector and cost
-   handshake, so cost is surfaced before spend (needs a dbt project parsed at
-   least once, and for `query` the `[semantic]` extra; `list` reads the project
-   and needs no extra). `--api` sends the query to a hosted
-   dbt Cloud deployment (needs only a host, an environment id, and a
-   `DBT_SL_TOKEN`, plus the `[semantic-api]` extra, no local project). The hosted
-   backend is the one place the cost guard cannot apply: dbt Cloud executes
-   server-side, so the result carries an explicit warning that spend is governed
-   there, not by dex, and no `--confirm` is asked. Either way a PII-shaped grouped
-   or filtered dimension (e.g. `user__email`) is refused before the query runs,
-   and on `--api` the layer's own PII metadata is fetched per metric so a
-   multi-metric query stays authoritative rather than falling back to names.
-   This queries the layer; authoring it is `transform`'s job.
+   names the ones that metric has.
+
+   Two payload fields carry legitimate differences between the backends rather
+   than leaving them to be inferred: `dimension_scope` says whether a dimension
+   row is one declaration or one groupable path, which is why the two backends can
+   report different dimension counts for one layer, and `unavailable` names fields
+   a backend structurally cannot supply. `--local` resolves the join graph through
+   MetricFlow where the `[semantic]` extra is installed, which is what makes its
+   dimension lists the tokens a query can actually use; without it the payload says
+   `declarations` and a note names the extra.
+
+   Two backends answer all three, chosen by `.dex/config.yml` `semantic.vendor`
+   and `semantic.deployment` (the older `semantic.backend` spelling still works),
+   overridable with `--local` / `--api`. Those two flags name **who executes**, not
+   which vendor, and every result reports it as `execution` (`dex` or `vendor`).
+   `--local` renders the SQL with MetricFlow and executes it through dex's own
+   connector and cost handshake, so cost is surfaced before spend (needs a dbt
+   project parsed at least once, and the `[semantic]` extra for `values` and
+   `query`; `list` reads the project and needs no extra). `--api` sends the query to
+   a hosted dbt Cloud deployment (needs a host, an environment id and a
+   `DBT_SL_TOKEN`, plus `[semantic-api]`, and no local project). The hosted backend
+   is the one place the cost guard cannot apply: dbt Cloud executes server-side, so
+   the result carries an explicit warning that spend is governed there and no
+   `--confirm` is asked. Either way a PII-shaped grouped or filtered dimension (for
+   example `user__email`) is refused before the query runs, and on `--api` the
+   layer's own PII metadata is fetched per metric so a multi-metric query stays
+   authoritative rather than falling back to names.
+
+   Read `${CLAUDE_SKILL_DIR}/references/semantic-playbook.md` before running a
+   metric query: a metric's `time_axis`, `filter` and measures decide what the
+   number *is*, and the playbook covers the discovery order, the additivity and
+   time-axis traps this surface is full of, and when `values` answers rather than
+   a query.
 
 Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single

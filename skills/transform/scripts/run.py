@@ -146,6 +146,7 @@ _VALUE_FLAGS = (
     "--budget",
     "--metric",
     "--for-dimension",
+    "--search",
     "--group-by",
     "--where",
     "--order-by",

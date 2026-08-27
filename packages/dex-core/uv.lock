@@ -1064,6 +1064,9 @@ semantic = [
 semantic-api = [
     { name = "httpx" },
 ]
+semantic-conformance = [
+    { name = "pytest" },
+]
 snowflake = [
     { name = "dbt-snowflake" },
     { name = "snowflake-connector-python" },
@@ -1114,6 +1117,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest", marker = "extra == 'project-conformance'", specifier = ">=8" },
+    { name = "pytest", marker = "extra == 'semantic-conformance'", specifier = ">=8" },
     { name = "pytest", marker = "extra == 'storage-conformance'", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "redshift-connector", marker = "extra == 'all'", specifier = ">=2.1" },
@@ -1137,7 +1141,7 @@ requires-dist = [
     { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'storage-conformance'", specifier = ">=28.6,<31" },
 ]
-provides-extras = ["all", "bigquery", "clickhouse", "cluster", "databricks", "dev", "duckdb", "postgres", "project-conformance", "redshift", "semantic", "semantic-api", "snowflake", "sql", "storage-conformance"]
+provides-extras = ["all", "bigquery", "clickhouse", "cluster", "databricks", "dev", "duckdb", "postgres", "project-conformance", "redshift", "semantic", "semantic-api", "semantic-conformance", "snowflake", "sql", "storage-conformance"]
 
 [[package]]
 name = "fastjsonschema"

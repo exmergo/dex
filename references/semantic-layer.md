@@ -231,6 +231,85 @@ refuse a token `--api` accepts; `dimension_scope` is what says which read you ha
 Nothing in `list` costs a warehouse query on either backend: one GraphQL round trip
 hosted, one compiled-artifact read locally.
 
+### Searching for a word rather than a name
+
+`explore semantic list --search <term>` (repeatable, comma-separated) is for the
+caller who knows a word and not a name. It matches case-insensitively against every
+element's name and against the project's own label and description, and against a
+metric's groupable tokens, so a search finds a dimension by what it is called and a
+metric by what its author wrote about it.
+
+A search resolves to metrics and then narrows the catalog exactly as `--metric`
+does, so what comes back is a catalog whichever way you asked. An element other
+than a metric is matched for the metrics that reach it: a dimension through the
+groupable list, a measure through the metrics that read it, a semantic model
+through the metrics built on it, and an entity through every model that declares
+it. That last one is wide on purpose, because an entity is the layer's join hub and
+a search for one is a search for what can be sliced by it. A measure deliberately
+does not widen to its own model: "in the same model as" is not "made of".
+
+**The union across terms, not the intersection**, which is the opposite of
+`--for-dimension`. Two terms are two searches, and a caller writing `--search
+revenue,session` is widening.
+
+A term that matches nothing is named in a note rather than refusing the command.
+That is where it differs from a misspelled metric name: a substring that matches
+nothing is an honest answer about the layer's words, so a search for three terms
+where one was a typo still answers for the other two, and the note says which one
+was empty. `searched_for` names the terms in the payload, so a searched catalog is
+never mistaken for the layer.
+
+It is applied **after** `--metric` and `--for-dimension`, so `--metric x --search y`
+reads as "within x, the parts about y". The search is over the catalog already in
+hand rather than a second call, so it costs nothing. dex does not pass it to the dbt
+Cloud API's own `search` argument, which sits on each root field separately: a
+hosted search would filter the metrics list and leave the dimensions nested under
+each metric unfiltered, which is a different answer from the local one for the same
+command. The whole catalog arrives in one round trip either way, so nothing is saved
+by filtering server-side, and it is the envelope that the budget is about.
+
+### The payload budget
+
+The catalog is capped, every cut is counted in `elided` and named in a note, and
+`--full` lifts the caps.
+
+| cap | default | subject |
+|---|---|---|
+| semantic models | 50 | `semantic_models` |
+| metrics | 60 | `metrics` |
+| dimension rows | 150 | `dimensions` |
+| entities | 50 | `entities` |
+| measures | 60 | `measures` |
+| groupable tokens per metric | 40 | `metrics[].dimensions` |
+
+The last one is the only cap on a repeating block, and it is where the bytes
+actually are on a wide layer: a join-resolved dimension list is carried once per
+metric.
+
+**The defaults are set so an ordinary layer comes back whole.** They were
+calibrated against a layer of a dozen semantic models, a few dozen metrics and a
+hundred-odd groupable paths, which is emitted uncut, so a cap only bites a layer
+that was already too large to read in one payload. A consumer that silently loses
+catalog entries is a worse outcome than a large payload, and the narrowing flags
+above are the better answer in either case, because they decide *which* part comes
+back rather than letting a cap decide.
+
+`elided` is **always present, zeros included**. That is the point of it: a zeroed
+`elided` and no cap notes together are the positive statement "this is the whole
+layer", which a caller cannot get from a missing key. The one exception is
+`elided_dimension_count` on a metric, which is absent where nothing was cut,
+because that field repeats once per metric and the layer-wide
+`elided.dimensions_per_metric` total is what makes its absence readable.
+
+A capped catalog breaks referential integrity by design, and says so: a metric can
+name a measure or a groupable token the payload no longer describes. The notes name
+that consequence per cut rather than leaving it to be discovered.
+
+A library caller reading `list_definitions()` off a backend gets the layer uncapped.
+The budget is applied at the command layer, so only the surface that has to fit in
+an agent's context pays it, and `SemanticCatalog.capped()` takes each cap as an
+argument for a host that wants to budget its own.
+
 ## What `values` returns
 
 `explore semantic values <dimension>` returns the distinct values of one semantic
@@ -494,6 +573,84 @@ dimension wants `meta: {pii: true}` on it in the dbt project, while a
 dimension-metadata call that never answered (which degrades every ref to the
 heuristic at once) wants retrying.
 
+## Writing a third backend: the conformance contract
+
+`SemanticBackend` is a Protocol, and a Protocol asserts nothing. Two backends can
+each be internally consistent and disagree with each other about one identical
+layer, which is what the two shipped ones did: 45 dimension rows against 65, a
+metric reporting 6 groupable dimensions where 11 were queryable, and an entity
+reported `primary` by one and `foreign` by the other. Some of that was genuine
+asymmetry that should be declared, and some was a bug, and nothing in either
+payload told them apart.
+
+`exmergo_dex_core.explore.semantic.conformance` is the executable version of the
+rules stated on the protocol, shipped so a backend living outside this
+distribution can run it:
+
+```python
+from exmergo_dex_core.explore.semantic.conformance import (
+    REFERENCE_LAYER,
+    SemanticBackendContract,
+    SemanticCatalogContract,
+)
+
+class TestMyBackend(SemanticBackendContract, SemanticCatalogContract):
+    def make_backend(self):
+        return MyBackend(...)
+
+    def make_reference_backend(self):
+        return MyBackend(seeded_with=REFERENCE_LAYER)
+```
+
+```
+pip install "exmergo-dex-core[semantic-conformance]"
+```
+
+That extra is pytest and nothing else: the contract
+reaches neither the dialect engine nor a warehouse client, and it needs neither
+semantic extra, because the reference layer is data in the module. A packaging test
+holds that floor, since the cheapest way for it to grow is for one assertion to
+start reaching something heavier.
+
+**Two classes, because a backend is a source rather than a sink.** Nothing in the
+suite can put a layer into a vendor's deployment, so `SemanticBackendContract`
+asserts what holds of any catalog and needs only a backend that answers, while
+`SemanticCatalogContract` asserts content and takes one answering
+`REFERENCE_LAYER`. That layer is a small neutral description of two semantic
+models joined by a shared entity whose key is spelled differently on each side,
+three measure shapes, a time and a categorical dimension, a filtered metric, a
+ratio, a PII-shaped dimension, and a label and description on everything. Every
+element is reachable from some metric, so a backend that reads a layer metric by
+metric is not failed for the fixture's shape. `reference_dbt_manifest()` renders it
+in dbt's compiled form for a format that reads that; MetricFlow's own resolver
+accepts it and resolves exactly the groupable token sets the description declares.
+
+**The assertion worth the most is the one about silence.** For every field the
+reference layer declares, a backend either answers it on some element or names it
+in `catalog_gaps`. Undeclared silence fails. That is what turns the next divergence
+into a stated asymmetry a caller can branch on, or a failing test, rather than a
+surprise in the field: an absent field and a declared-gap field are
+indistinguishable to a consumer, so "the hosted API has no entity labels" reads as
+"this project labelled no entities" and the reader stops looking.
+
+The rest, in short: the four provenance axes and `execution` in particular; a
+repeatable read; `dimension_scope` as a promise rather than a label, so
+`queryable_paths` means every groupable token has a row of its own; referential
+integrity across the five lists; an entity's `type` derived from its declarations
+rather than copied from one of them; a ratio's two sides resolving to something the
+same payload describes; a `time_axis` that names a time column of a measure the
+metric actually reads; a payload that serializes, states its shape, and never
+carries the PII gate's own column lookup; caps that count what they cut and leave
+the catalog they were given alone; `filter_refs` answering or declining without
+raising; and a values request for a PII-flagged dimension refused.
+
+dex binds its own two backends to it in
+`tests/explore/test_semantic_conformance.py`, three times: `--local` with
+MetricFlow resolving the join graph, `--local` with no resolver (the declared
+single-hop read), and `--api` against a transport reproducing the dbt Cloud API's
+real asymmetries. A fourth test compares the two backends directly on the same
+layer, which is the thing the per-backend assertions cannot catch.
+
 ## The asymmetry at a glance
 
 | | Local (`--local`) | Hosted (`--api`) |
@@ -523,3 +680,4 @@ heuristic at once) wants retrying.
 | Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent |
 | Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |
+| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries |
