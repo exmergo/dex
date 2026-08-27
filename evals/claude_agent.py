@@ -94,6 +94,41 @@ class ClaudeCliAgent:
 
 
 @dataclass
+class ClaudeCliClassifier:
+    """Runs one prompt with every dex skill available and reports which
+    marker showed up, for the cross-skill corpus (``run_corpus``).
+
+    Unlike :class:`ClaudeCliAgent`, this never suppresses a skill: ``args``
+    is whatever invokes Claude Code with the plugin installed normally, the
+    same condition a real request arrives in. If more than one marker
+    appears, the first (in ``skill_names`` order) wins rather than raising:
+    a genuine tie is exactly the kind of finding this corpus exists to
+    surface, not an error in the harness.
+    """
+
+    skill_names: tuple[str, ...] = ("explore", "transform", "maintain")
+    binary: str = "claude"
+    model: str | None = None
+    timeout: int = 180
+    args: list[str] = field(default_factory=list)
+    plugin: str = "dex"
+
+    def classify(self, prompt: str) -> str | None:
+        binary = _require_claude(self.binary)
+        args = list(self.args)
+        if self.model:
+            args += ["--model", self.model]
+        try:
+            output = _invoke(binary, args, prompt, self.timeout)
+        except Exception:
+            return None
+        for name in self.skill_names:
+            if f"/{self.plugin}:{name}" in output:
+                return name
+        return None
+
+
+@dataclass
 class ClaudeCliJudge:
     """Grades one assertion against an agent result with an LLM yes/no judge."""
 

@@ -1,13 +1,18 @@
-"""CLI: run a skill's Tier-2 eval suite.
+"""CLI: run a skill's Tier-2 eval suite, or the cross-skill triggering corpus.
 
     python -m evals skills/explore                 # full suite (live Claude)
     python -m evals skills/explore --triggering    # triggering only (cheaper)
     python -m evals skills/explore --json          # machine-readable report
+    python -m evals --corpus evals/corpus/ade_bench_triggering.json
+                                                     # cross-skill corpus (#216)
 
 The default backend drives Claude Code headless; it needs the ``claude`` CLI and
 a workspace with the dex plugin installed. Exit code is non-zero if the suite does
 not pass (clean triggering and no regression versus baseline), so the same command
-serves both local runs and the release gate.
+serves both local runs and the release gate. ``--corpus`` always exits 0: it is a
+measurement (per-skill precision/recall against externally authored prompts), not
+a pass/fail gate, per the issue that added it (#216) -- the initial numbers are
+expected to be low, and that is the signal, not a bug to chase away.
 """
 
 from __future__ import annotations
@@ -16,14 +21,21 @@ import argparse
 import json
 import sys
 
-from .claude_agent import ClaudeCliAgent, ClaudeCliJudge, ClaudeNotAvailableError
-from .runner import run_suite, run_triggering
-from .suite import load_suite
+from .claude_agent import (
+    ClaudeCliAgent,
+    ClaudeCliClassifier,
+    ClaudeCliJudge,
+    ClaudeNotAvailableError,
+)
+from .runner import CorpusReport, run_corpus, run_suite, run_triggering
+from .suite import load_corpus, load_suite
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="evals", description="Tier-2 skill evals")
-    parser.add_argument("skill", help="skill dir or path to evals.json")
+    parser.add_argument(
+        "skill", nargs="?", default=None, help="skill dir or path to evals.json"
+    )
     parser.add_argument("--model", default=None, help="model override for the agent")
     parser.add_argument(
         "--triggering", action="store_true", help="run only the triggering check"
@@ -32,14 +44,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout", type=int, default=180, help="per-agent-call timeout (seconds)"
     )
+    parser.add_argument(
+        "--corpus",
+        default=None,
+        help=(
+            "path to a cross-skill triggering corpus (see evals/corpus/); runs "
+            "independently of the skill argument, one live call per prompt"
+        ),
+    )
     args = parser.parse_args(argv)
 
-    suite = load_suite(args.skill)
-    agent = ClaudeCliAgent(
-        skill_name=suite.skill_name, model=args.model, timeout=args.timeout
-    )
-
     try:
+        if args.corpus:
+            corpus = load_corpus(args.corpus)
+            classifier = ClaudeCliClassifier(model=args.model, timeout=args.timeout)
+            report = run_corpus(corpus, classifier)
+            if args.json:
+                print(json.dumps(report.to_dict(), indent=2))
+            else:
+                _print_corpus(report)
+            return 0  # a measurement, never a gate; see the module docstring
+
+        if args.skill is None:
+            parser.error("skill is required unless --corpus is given")
+
+        suite = load_suite(args.skill)
+        agent = ClaudeCliAgent(
+            skill_name=suite.skill_name, model=args.model, timeout=args.timeout
+        )
+
         if args.triggering:
             trig = run_triggering(suite, agent)
             if args.json:
@@ -58,6 +91,26 @@ def main(argv: list[str] | None = None) -> int:
     except ClaudeNotAvailableError as exc:
         print(f"cannot run live evals: {exc}", file=sys.stderr)
         return 2
+
+
+def _print_corpus(report: CorpusReport) -> None:
+    print(
+        f"[{report.corpus_name}] {len(report.results)} cases, "
+        f"accuracy {report.accuracy:.0%}"
+    )
+    for skill in sorted(report.per_skill):
+        pr = report.per_skill[skill]
+        print(
+            f"  {skill:10s} precision {pr.precision:.0%}  recall {pr.recall:.0%}  "
+            f"f1 {pr.f1:.0%}  (tp={pr.true_positives} fp={pr.false_positives} "
+            f"fn={pr.false_negatives})"
+        )
+    misses = [r for r in report.results if not r.correct]
+    if misses:
+        print(f"  {len(misses)} miss(es):")
+        for r in misses:
+            expected, actual = r.expected_skill, r.actual_skill
+            print(f"    {r.task_id}: expected {expected!r}, got {actual!r}")
 
 
 def _print_triggering(skill: str, report) -> None:
