@@ -122,6 +122,18 @@ unique on its own. Declared joins come
 from the dbt project when one is present; absent a dbt project, declared joins are
 simply empty, which is expected because explore is designed to work without one.
 
+A project's declarations refine those verdicts without entering them. A declared
+grain fills in where measurement found none, and is noted where it disagrees, but
+a measurement-proven single column still wins the reported grain and the candidate
+keys stay measurement-only: an unmeasured declared key is a claim, and the cache is
+a drift baseline rather than a record of what the project asserts. The consequence
+is that a declared grain needs verifying somewhere else, which is what `maintain
+grain` does with it, and why that axis reports two different things about
+uniqueness. A key measurement proved unique that no longer is has a before and an
+after, so it lapsed. A declared combination that does not hold has neither: nothing
+changed, the project is asserting a grain the data never had, and the fix is to the
+declaration rather than to the data.
+
 ## The draft map: composing and persisting
 
 `explore map` composes the above into the `.dex/` cache (never the source of

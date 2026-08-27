@@ -777,6 +777,91 @@ def test_a_scope_flag_cannot_widen_the_committed_allowlist():
             narrow_target(target, connector, ["somewhere_else"])
 
 
+def test_the_grain_estimate_prices_every_scan_the_grain_run_executes():
+    """Family 2: cost is surfaced before any spend, and on this axis that rests
+    entirely on one structural claim.
+
+    ``GrainPlan`` promises the estimate and the confirmed run "price and execute
+    exactly the same statements", and the only thing making that true is that both
+    read the same plan. Nothing asserted it. Every list on the plan is a scan, so
+    a list the run iterates and the estimator does not is a table scanned outside
+    the number the operator confirmed, and nothing about it would look wrong: the
+    handshake still appears, the findings still arrive, the bill is just larger
+    than the quote. The plan below carries all three kinds at once so a fourth
+    added to one side and not the other fails here rather than on someone's
+    invoice.
+    """
+
+    from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.drift import GrainPlan, grain_drift, grain_estimate
+
+    columns = ["order_key", "line_number", "shipped_on"]
+
+    class RecordingAdapter:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.priced: list[str] = []
+            self.scanned: list[tuple[str, tuple[str, ...]]] = []
+
+        def query_estimate(self, sql: str) -> float:
+            self.priced.append(sql)
+            return 1.0
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="line_items",
+                row_count=1000,
+                byte_size=None,
+                column_count=len(columns),
+            )
+            return meta, [
+                ColumnMeta(name=n, data_type="INTEGER", nullable=False, ordinal=i)
+                for i, n in enumerate(columns)
+            ]
+
+        def exact_distinct_counts(self, identifier, cols):
+            self.scanned.append((identifier, tuple(cols)))
+            return dict.fromkeys(cols, 1000)
+
+        def distinct_combination_counts(self, identifier, combinations):
+            for combo in combinations:
+                self.scanned.append((identifier, tuple(combo)))
+            return {tuple(c): 1000 for c in combinations}
+
+    dataset = Dataset(identifier="db.s.line_items")
+    plan = GrainPlan(
+        key_checks=[(dataset, ["order_key"], 1000)],
+        fanout_pairs=[],
+        composite_checks=[(dataset, [["order_key", "line_number"]], 1000)],
+        declared_composite_checks=[(dataset, [["line_number", "shipped_on"]], 1000)],
+        notes=[],
+    )
+
+    priced_adapter, run_adapter = RecordingAdapter(), RecordingAdapter()
+    total, per_table = grain_estimate(priced_adapter, plan)
+    grain_drift(run_adapter, plan)
+
+    assert total > 0 and per_table == {"db.s.line_items": total}
+    assert run_adapter.scanned, "the plan executed nothing, so this proves nothing"
+    priced_text = "\n".join(priced_adapter.priced)
+    for identifier, scanned_columns in run_adapter.scanned:
+        assert identifier in per_table, (
+            f"{identifier} was scanned and never priced: the operator confirmed a "
+            "figure that did not include it"
+        )
+        for column in scanned_columns:
+            assert column in priced_text, (
+                f"{identifier}.{column} was scanned and no priced statement names "
+                "it, so the quote covered fewer columns than the run read"
+            )
+
+
 # --- Family 3: PII flagged, never surfaced -----------------------------------
 
 

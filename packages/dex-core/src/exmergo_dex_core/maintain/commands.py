@@ -462,8 +462,15 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         if scope_names
         else None
     )
-    plan = drift_mod.grain_plan(adapter, snap, scope)
-    if plan.key_checks or plan.fanout_pairs or plan.composite_checks:
+    plan = drift_mod.grain_plan(
+        adapter, snap, scope, engine.project_format().definitions()
+    )
+    if (
+        plan.key_checks
+        or plan.fanout_pairs
+        or plan.composite_checks
+        or plan.declared_composite_checks
+    ):
         estimate, per_table = drift_mod.grain_estimate(adapter, plan)
         command_args.billed_handshake(
             "maintain grain", adapter, estimate, per_table=per_table
@@ -472,7 +479,9 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         adapter, plan, timeout_seconds=engine.config.query.timeout_seconds
     )
     noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
-        dataset.identifier for dataset, _combos, _rows in plan.composite_checks
+        dataset.identifier
+        for dataset, _combos, _rows in plan.composite_checks
+        + plan.declared_composite_checks
     }
     notes = _adapter_notes(adapter, sorted(noted))
 
@@ -486,6 +495,7 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         warnings=_grain_baseline_warnings(snap)
         + _column_detail_warnings(snap)
         + _baseline_warnings(store, snap, engine.config.profile_freshness_hours)
+        + plan.notes
         + notes,
     )
     return command_args.stamp_spend(result, adapter)
@@ -637,10 +647,19 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         else []
     )
 
-    plan = drift_mod.grain_plan(adapter, snap, scope)
+    plan = drift_mod.grain_plan(
+        adapter, snap, scope, engine.project_format().definitions()
+    )
+    # Added before both returns, so a declared grain the survey could not reach
+    # is reported whether the scans run or stop at the handshake.
+    warnings.extend(plan.notes)
     checks = drift_mod.cardinality_plan(current_semantic, snap, names)
     scans_needed = bool(
-        plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
+        plan.key_checks
+        or plan.fanout_pairs
+        or plan.composite_checks
+        or plan.declared_composite_checks
+        or checks
     )
     pending: ConfirmationRequest | None = None
     if scans_needed and command_args.cost_gate(adapter) is not None:
@@ -801,6 +820,11 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # refusal raised from inside an argument list reads as though `build` did it.
     cache = readable_cache(store)
 
+    # What the project declares, which is a different question from what its
+    # files contain. `view` carries the bytes an edit is pinned against; this
+    # carries the grain, and an edit that contradicts a declared grain is one no
+    # format is obliged to keep. Tier 1, so it cannot raise.
+    definitions = engine.project_format().definitions()
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
@@ -808,8 +832,15 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
         placement=editable if isinstance(editable, PlacingProject) else None,
+        definitions=definitions,
     )
     warnings.extend(build_warnings)
+    # Reconcile was the one project-reading command that dropped these, and the
+    # declarations channel is one no command read at all: a format that says it
+    # could not supply something says it here too, where an edit is at stake.
+    warnings.extend(
+        _layer_notes(definitions, snap.transform_layer, snap.semantic_layer)
+    )
 
     result = ReconcileResult(proposals=proposals, warnings=warnings)
     # A plan is pinned to the directory its edits were planned against, so there is
@@ -1047,6 +1078,12 @@ def _layer_notes(*layers: object) -> list[str]:
     project. Surfacing one side would leave the other axis's limits unexplained.
     In practice both come from the same format and say the same thing, so the
     common case deduplicates to one line.
+
+    Anything carrying ``notes`` is accepted, not only the two snapshot layers.
+    ``ProjectDefinitions`` carries them on the declarations channel, which is
+    where a format explains an ambiguous or unreadable project, and reconcile
+    reads that one because a declaration it could not see is the difference
+    between declining an edit and proposing a wrong one.
     """
 
     seen: list[str] = []

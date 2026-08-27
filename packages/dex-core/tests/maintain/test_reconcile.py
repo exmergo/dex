@@ -254,6 +254,193 @@ def test_grain_drift_adds_no_test_when_one_already_alerts(maintain_repo):
     assert payload["diffs"] == []
 
 
+# --- a declared composite grain outranks a column-level unique -----------------
+#
+# The reported case (#337). A model declares its grain as a combination, one
+# member of that combination was unique in the data at profile time and no longer
+# is, and reconcile used to propose a column-level `unique` on it. dbt runs that
+# test alongside the composite one, so it fails every build from then on and can
+# only go green by changing the declared grain; a project format that resolves the
+# two the way dbt's semantics imply discards it and the plan applies having
+# changed nothing.
+#
+# Drift is induced on `orders` rather than on `stg_orders`, because the test edit
+# lands in the *staging model's* declaration: a finding on `stg_orders` resolves to
+# `stg_stg_orders.yml` and never reaches the check under test.
+
+_COMPOSITE_GRAIN = (
+    "    tests:\n"
+    "      - dbt_utils.unique_combination_of_columns:\n"
+    "          combination_of_columns: [order_id, customer_id, ordered_at]\n"
+)
+
+_STG_ORDERS_YML = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: stg_orders\n"
+    "{grain}"
+    "    columns:\n"
+    "      - name: order_id\n"
+    "        tests: [not_null]\n"
+    "      - name: customer_id\n"
+    "        tests: [not_null]\n"
+    "      - name: ordered_at\n"
+)
+
+
+def _drift_a_member_of_the_grain(repo, *, grain: str) -> dict:
+    """Reconcile a lost single-column key against ``grain`` on stg_orders.
+
+    The UPDATE breaks `order_id` alone while leaving every declared combination
+    intact, which is the situation the report describes: the grain the project
+    declares still holds, and only a column measurement once proved unique does
+    not.
+    """
+
+    repo.edit("models/staging/stg_orders.yml", _STG_ORDERS_YML.format(grain=grain))
+    repo.dex("explore", "map", "--verify")
+    repo.snapshot()
+    repo.sql("UPDATE orders SET order_id = 1 WHERE order_id BETWEEN 2 AND 5")
+    rc, grain_payload = repo.dex("maintain", "grain")
+    assert rc == 0 and any(
+        f["code"] == "key_lost_uniqueness" and f["column"] == "order_id"
+        for f in grain_payload["data"]["findings"]
+    ), grain_payload
+
+    rc, payload = repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    return payload
+
+
+def test_a_declared_composite_grain_gets_no_column_level_unique(maintain_repo):
+    payload = _drift_a_member_of_the_grain(maintain_repo, grain=_COMPOSITE_GRAIN)
+
+    assert payload["diffs"] == []
+    assert payload["data"].get("plan_id") is None
+    # The warning names the combination, because that is the fact that decides
+    # what the operator does next: re-baseline if this is still the grain, or go
+    # find what relied on the column alone.
+    declined = next(w for w in payload["warnings"] if "declares a composite grain" in w)
+    assert "order_id, customer_id, ordered_at" in declined
+
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "key_lost_uniqueness"
+    )
+    assert proposal["paths"] == []
+    # The advisory used to promise a test unconditionally, so the payload said an
+    # edit was in the plan while the plan was empty.
+    assert "unique test" not in proposal["action"]
+
+
+def test_without_the_composite_the_same_drift_still_gets_the_unique_edit(
+    maintain_repo,
+):
+    """The positive control, and it is not optional.
+
+    A run that reports "no edit" proves nothing unless the same harness reports
+    an edit when one is due. Identical project, identical SQL, identical
+    findings; the composite declaration is the only difference, so anything that
+    differs below is attributable to it.
+    """
+
+    payload = _drift_a_member_of_the_grain(maintain_repo, grain="")
+
+    yml_diff = next(
+        d for d in payload["diffs"] if d["path"] == "models/staging/stg_orders.yml"
+    )
+    assert "unique" in yml_diff["unified"]
+    assert not [w for w in payload["warnings"] if "composite grain" in w]
+
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "key_lost_uniqueness"
+    )
+    assert proposal["paths"] == ["models/staging/stg_orders.yml"]
+    assert "the unique test keeps the break visible in builds" in proposal["action"]
+
+
+def test_a_composite_grain_not_covering_the_drifted_column_still_gets_the_edit(
+    maintain_repo,
+):
+    # The decline is about *this* column being a member, not about the model
+    # carrying a composite test at all: a grain over other columns says nothing
+    # either way about whether order_id is unique.
+    payload = _drift_a_member_of_the_grain(
+        maintain_repo,
+        grain=(
+            "    tests:\n"
+            "      - dbt_utils.unique_combination_of_columns:\n"
+            "          combination_of_columns: [customer_id, ordered_at, status]\n"
+        ),
+    )
+
+    assert [d["path"] for d in payload["diffs"]] == ["models/staging/stg_orders.yml"]
+    assert not [w for w in payload["warnings"] if "composite grain" in w]
+
+
+def test_a_declared_grain_that_never_held_is_advisory_and_proposes_no_edit(
+    maintain_repo,
+):
+    # `declared_grain_not_unique` is a different fact from a lost key: nothing
+    # lapsed, the project asserts a grain the data does not have. Reconcile has no
+    # edit for it either, because widening or narrowing a declared grain is
+    # choosing one.
+    maintain_repo.edit(
+        "models/staging/stg_orders.yml",
+        _STG_ORDERS_YML.format(grain=_COMPOSITE_GRAIN),
+    )
+    maintain_repo.dex("explore", "map", "--verify")
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "INSERT INTO stg_orders SELECT * FROM stg_orders WHERE order_id <= 10"
+    )
+    maintain_repo.dex("maintain", "grain")
+
+    rc, payload = maintain_repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    proposal = next(
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_grain_not_unique"
+    )
+    assert proposal["kind"] == "advisory"
+    assert "declaration to fix" in proposal["action"]
+    assert proposal["paths"] == []
+    # Not the fallback text a code with no entry in the action table would get.
+    assert "no automatic fix applies" not in proposal["action"]
+
+
+def test_reconcile_surfaces_what_the_format_could_not_supply(maintain_repo):
+    """`ProjectDefinitions.notes` reaches the envelope.
+
+    Reconcile was the one project-reading command that dropped layer notes, and
+    the declarations channel was one no command read at all. A stale manifest is
+    the shipped format saying its declarations may lag the files, which is
+    exactly the caveat that matters when the declarations are what decided
+    whether to propose an edit.
+    """
+
+    from conftest import write_manifest
+
+    write_manifest(
+        maintain_repo.project_dir,
+        models={"stg_orders": '"warehouse"."main"."stg_orders"'},
+        generated_at="2020-01-01T00:00:00+00:00",
+    )
+    maintain_repo.snapshot()
+    maintain_repo.sql("INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10")
+    maintain_repo.dex("maintain", "grain")
+
+    rc, payload = maintain_repo.dex("maintain", "reconcile", "grain")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert any("older than the model sources" in w for w in payload["warnings"]), (
+        payload["warnings"]
+    )
+
+
 def test_semantic_and_volume_drift_are_advisory_only(maintain_repo):
     maintain_repo.snapshot()
     maintain_repo.sql(

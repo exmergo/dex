@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-08-25
+
 ### Added
 
 - **A governed macro for dropping orphan relations** ([#151]), the execution
@@ -40,6 +42,29 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   today's storage protocol does not keep; and running the macro directly on
   a dev target through the existing build preflight is a separate, bounded
   addition to `transform build`'s dbt-invocation surface.
+- **An opt-in SQLite cache backend** ([#139]). `FilesystemStore` writes loose
+  JSON under `.dex/`, which is right for the CLI (persistence is git, a reviewer
+  reads the state in a pull request) and wrong for a host that wants durable
+  local state without a directory of files to gitignore and clean up. Select
+  `cache.backend: sqlite` (or `--cache-backend sqlite` for one run) and
+  everything lands in a single `.dex/dex.db` file instead; `filesystem` stays
+  the default.
+
+  It implements the full storage `Protocol` from [#137]: the cache, the
+  snapshot, the drift report, the transform plans, and both ledgers, backed by
+  real tables rather than a directory of loose files, and it passes the same
+  conformance suite the two shipped backends already run against. The spend
+  ledger's `spend_since`, the query the cumulative session budget reads on every
+  billed command, answers from an indexed lookup on `at` and `connector` rather
+  than reading and parsing every line ever appended, which is the gap the
+  filesystem backend's JSONL scan does not close as a ledger grows. The
+  cross-process spend lock is a `BEGIN IMMEDIATE` transaction on the database
+  file itself, so the cumulative ceiling still binds across two CLI processes
+  sharing a repo, the same guarantee the filesystem backend's advisory file lock
+  provides.
+
+  `.dex/dex.db` is a binary file, not a JSON document a reviewer can diff, so it
+  belongs in `.gitignore` the way any local database file does.
 
 - **`transform rename` and `transform remove` generate the whole propagation
   plan** ([#221]). `transform references` could tell you where a name was used
@@ -223,6 +248,48 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   bottom, and putting `completeness` last would make the honesty the first thing
   lost. Capped at 200 occurrences across 50 files with every elision counted in
   `notes`; `--full` lifts both.
+
+- **`maintain grain` re-verifies the grains your project declares** ([#337]). The
+  axis checked what explore had *measured* and nothing else, which left a blind
+  spot on exactly the tables where grain matters most. Explore lets a
+  measurement-proven single column win the reported grain over a declared
+  composite, and its candidate keys stay measurement-only because an unmeasured
+  declared key is a claim rather than a baseline. Both are the right calls for a
+  cache, and together they meant a fact table declaring a four-column grain never
+  had that grain checked, while a member column that happened to be unique in the
+  early data was checked every run.
+
+  A model-level `unique_combination_of_columns` now enters the plan alongside the
+  measured combinations, resolved to a warehouse object the same way explore
+  resolves a declaration for a diagram. It reports under its own code,
+  `declared_grain_not_unique`, because a failure there is not drift:
+  `key_lost_uniqueness` has a measured before and after, so something changed,
+  while a declared combination has neither and the honest reading is that the
+  project asserts a grain the data never had. Reconcile treats them differently
+  for the same reason, and proposes no edit for either, since widening or
+  narrowing a declared grain is choosing one.
+
+  **Declared grains are surveyed against the current warehouse, not against the
+  baseline**, which is the one way they differ structurally from every other check
+  on this axis. A measured check needs a before to compare with, so it can only
+  speak about an object the baseline captured. A declaration needs nothing of the
+  kind: the project's claim is the standard, and the question is whether today's
+  data meets it. So a model built since the last snapshot has its declared grain
+  checked, which is exactly when a freshly declared grain is most likely to be
+  wrong. For the same reason, a declared grain that does not hold is not absorbed
+  by re-running `maintain snapshot`: pinning current state as known-good settles
+  drift, and this was never drift.
+
+  **This costs more on a metered connector, and the cost is surfaced before it is
+  spent.** The declared combinations are surveyed and priced from the same plan
+  the run executes, so the dry-run figure in the handshake covers them and an
+  operator can decline. That parity was promised by construction and asserted by
+  nothing, and is now pinned by a spine test that fails if a scan ever reaches
+  execution without appearing in the estimate. Three ways a declaration can go
+  unverified are each reported as a note rather than dropped, because an
+  unverified grain and a holding one look identical from the envelope: one that
+  resolves to no warehouse object or to several, one naming columns the table does
+  not have, and a connector with no combination probe at all.
 
 ### Changed
 
@@ -481,6 +548,32 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   warehouse is most of them. The suite never saw it because every fake fed a
   plain Python list. Now an explicit `is None` check, with a test that feeds the
   ndarray the driver actually returns.
+
+- **`maintain reconcile` no longer proposes a column-level `unique` against a
+  declared composite grain** ([#337], reported by @catincloudlabs). The proposal
+  applied cleanly, reported `conflicts=0`, and changed nothing the project
+  declared. The edit asserted something the project explicitly does not claim: on
+  the shipped dbt format both tests run independently, so the new one failed every
+  build from then on and could only go green by changing the declared grain, while
+  a format that resolves the two as dbt's semantics imply discarded it and the
+  plan applied having changed nothing. Across a real declarations directory there
+  was no model for which the proposal did anything.
+
+  Reconcile now asks the project what it declares, through the tier-1
+  `definitions()` channel rather than by re-reading YAML, and declines when a
+  declared composite grain covers the drifted column. The warning names the
+  combination, because that is the fact that decides what happens next: either the
+  composite is still the grain and the baseline needs re-taking, or something
+  downstream relied on that column alone and the assumption is now false.
+
+  Two smaller things went with it. The advisory action for `key_lost_uniqueness`
+  promised "the unique test keeps the break visible in builds" unconditionally,
+  while the test edit could be declined on five separate paths, so the payload
+  routinely claimed an edit that was not in the plan; the clause is now appended
+  only where an edit was produced. And reconcile was the one project-reading
+  command that dropped `_layer_notes`, on a channel (`ProjectDefinitions.notes`)
+  that no command read at all, so a format explaining what it could not supply was
+  explaining it to nobody at the moment an edit was at stake.
 
 ## [1.7.0] - 2026-08-25
 
