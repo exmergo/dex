@@ -48,6 +48,7 @@ from .semantic_catalog import (
     MetricInfo,
     SemanticCatalogView,
     SemanticModelInfo,
+    column_reference,
     derive_entity_type,
     merge_element_fields,
     qualified_dimension,
@@ -63,7 +64,6 @@ SEMANTIC_MANIFEST_PATH = Path("target") / "semantic_manifest.json"
 # traces a dbt-level name, so they can never disagree on what counts as a ref.
 REF_PATTERN = re.compile(r"ref\(\s*['\"]([^'\"]+)['\"]")
 SOURCE_PATTERN = re.compile(r"source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]")
-BARE_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # dbt project-root files dex may author outside the model paths: the package
 # manifests (dependency declarations), the project config, and the connection
@@ -1054,20 +1054,17 @@ def semantic_yaml_entries(
 def physical_column(entry: Any) -> str | None:
     """The single physical column a dimension/entity/measure references, if any.
 
-    A bare-identifier ``expr`` is the column; a name with no ``expr`` is treated
-    by dbt as the column itself; a computed expression maps to None. Guessing
-    columns out of expressions would make every reader over-claim.
+    The manifest-dict shape of :func:`~.semantic_catalog.column_reference`, whose
+    docstring carries the rule. It is a thin adapter rather than a second copy
+    because a query backend applies the same rule to a GraphQL payload, and two
+    implementations of "the column behind this element" would eventually disagree
+    about an expression, which is the direction that makes the PII gate screen the
+    wrong column.
     """
 
     if not isinstance(entry, dict):
         return None
-    expr = entry.get("expr")
-    if expr is None:
-        name = entry.get("name")
-        return name if isinstance(name, str) else None
-    if isinstance(expr, str) and BARE_IDENTIFIER.fullmatch(expr.strip()):
-        return expr.strip()
-    return None
+    return column_reference(entry.get("expr"), entry.get("name"))
 
 
 def metric_inputs(entry: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -1751,10 +1748,11 @@ def semantic_catalog(
     # gets. Without it the PII gate would fall back to the name heuristic on every
     # token the join resolution added, which is the weaker screening.
     columns_by_definition: dict[tuple[str, str], tuple[str, str]] = {}
-    # (semantic model, bare dimension name) -> what the project says about it, so a
-    # path that reaches a declaration carries the same words the declaration does.
-    # The hosted API returns them on every path it names, and a caller comparing
-    # the two backends should not find one of them silent.
+    # (semantic model, bare dimension name) -> what the project says about it and
+    # which column it sits on, so a path that reaches a declaration carries the
+    # same words and the same physical column the declaration does. The hosted API
+    # returns the words on every path it names, and a caller comparing the two
+    # backends should not find one of them silent.
     words_by_definition: dict[tuple[str, str], dict[str, Any]] = {}
     custom_grains = _custom_granularities(manifest)
 
@@ -1792,6 +1790,7 @@ def semantic_catalog(
                     expr=element.get("expr"),
                     role=element.get("role"),
                     description=element.get("description"),
+                    column=physical_column(element),
                 )
             )
             # An entity's words are the same wherever it is declared, so the first
@@ -1826,6 +1825,7 @@ def semantic_catalog(
                 "type": kind,
                 "label": element.get("label"),
                 "description": element.get("description"),
+                "column": physical_column(element),
             }
             merge_element_fields(
                 dimensions,
@@ -1837,6 +1837,7 @@ def semantic_catalog(
                     "definition": bare,
                     "semantic_model": model_name,
                     "queryable_granularities": grains,
+                    "column": physical_column(element),
                 },
             )
         model_dimensions[model_name] = qualified
@@ -1864,6 +1865,7 @@ def semantic_catalog(
                     label=element.get("label"),
                     description=element.get("description"),
                     semantic_model=model_name,
+                    column=physical_column(element),
                 )
             )
 
@@ -1886,6 +1888,7 @@ def semantic_catalog(
                 or _parse_relation_ref(str(entry.get("model", ""))),
                 agg_time_dimension=agg_time,
                 primary_entity=primary or entry.get("primary_entity"),
+                relation=relation,
             )
         )
 
@@ -1912,6 +1915,7 @@ def semantic_catalog(
                     "definition": path.definition,
                     "semantic_model": path.semantic_model,
                     "queryable_granularities": list(path.grains),
+                    "column": words.get("column"),
                 },
             )
             column = columns_by_definition.get(declaration)
@@ -1943,6 +1947,7 @@ def semantic_catalog(
                 definition=fields.get("definition"),
                 semantic_model=fields.get("semantic_model"),
                 queryable_granularities=fields.get("queryable_granularities"),
+                column=fields.get("column"),
             )
             for name, fields in sorted(dimensions.items())
         ],
