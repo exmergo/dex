@@ -240,7 +240,10 @@ writing back to `.dex/config.yml`. It also reads and queries the dbt semantic la
 semantic models and metrics and their composition and measures and dimensions and
 the declared entity graph, in one shape from either backend, scopeable to the
 metrics a caller came for (or, with `--for-dimension`, to the metrics a given slice
-is available on) and costing no warehouse query. Each semantic model carries the
+is available on, or, with `--search`, to the metrics a word matches in a name or in
+the project's own prose) and costing no warehouse query. The catalog is budgeted
+like the map, with every cut counted in the payload and `--full` to lift the caps,
+so a complete answer says that it is complete. Each semantic model carries the
 relation it sits on and each element the column behind it, which is what connects a
 metric to the objects `explore map` and `explore profile` describe; the hosted
 backend exposes columns but no relations, and declares that gap rather than leaving

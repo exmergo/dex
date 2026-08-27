@@ -57,7 +57,8 @@ time. `dex` owns exactly that loop.
   infer and verify joins, answer ad-hoc questions with guarded SQL probes behind
   a PII-aware query firewall, read the semantic layer as the object graph it is
   (semantic models, metrics with their composition, measures, dimensions, and the
-  declared join graph, each resolved to the relation and column behind it), read a
+  declared join graph, each resolved to the relation and column behind it, and the
+  whole of it searchable and budgeted), read a
   dimension's value domain before filtering on it,
   and query its metrics (locally via
   MetricFlow or against a hosted dbt Cloud deployment), and render the map as a
