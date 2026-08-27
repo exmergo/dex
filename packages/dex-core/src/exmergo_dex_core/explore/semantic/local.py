@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import ClassVar
 
 from ... import command_args
 from ... import envelope as env
@@ -32,19 +32,25 @@ from ...cache import match_identifier
 from ...config import QueryLimits, pii_override_paths
 from ..results import SemanticQueryResult
 from . import (
+    DIMENSIONS_PER_DECLARATION,
     EXECUTION_DEX,
     PII_BLOCK_CONFIDENCE,
-    DimensionInfo,
-    EntityInfo,
-    MetricInfo,
     SemanticBackendError,
     SemanticCatalog,
     SemanticQuery,
     SemanticQueryRefusedError,
     cap_columnar,
-    merge_element_fields,
     requested_dimension_refs,
     screen_dimension_refs,
+)
+
+# The one caveat a local catalog carries: a metric's groupable dimensions are
+# computed per owning semantic model, single-hop, so a layer with joins has
+# dimensions reachable at query time that this list does not name.
+_LOCAL_LIST_NOTE = (
+    "local list: a metric's dimensions are those of its owning semantic "
+    "model(s), entity-qualified; dimensions reachable only through a join "
+    "resolve at query time (or list with --api)"
 )
 
 _MISSING_EXTRA = (
@@ -107,6 +113,12 @@ class LocalMetricFlowBackend:
     # full cost guard applies here and the cost comes from the adapter, not from
     # `cost_posture`.
     execution = EXECUTION_DEX
+    # Nothing structurally missing: a project read carries every field the
+    # catalog defines, which is the half of the asymmetry worth stating plainly.
+    catalog_gaps: ClassVar[dict[str, list[str]]] = {}
+    # One row per declaration, single-hop qualified, which is why this backend
+    # reports fewer dimensions than the hosted one on an identical layer.
+    dimension_scope = DIMENSIONS_PER_DECLARATION
 
     def __init__(
         self,
@@ -114,8 +126,15 @@ class LocalMetricFlowBackend:
         engine,
         connector: str,
         limits: QueryLimits,
+        project_format=None,
     ) -> None:
+        # The directory, for MetricFlow, which reads the compiled artifact itself.
         self._project = project
+        # The project *format*, for everything dex reads: the catalog and the PII
+        # gate's column resolution both come from it, and injecting it is what
+        # keeps this backend from knowing that the format on the other side is
+        # dbt. Falls back to the engine's, which is the ordinary path.
+        self._format = project_format
         # The dex engine, not an adapter: the connection is opened through it on
         # the one billed path below, so this backend never becomes a second place
         # that discovers credentials or builds a cost gate. Named `_dex` because
@@ -127,17 +146,18 @@ class LocalMetricFlowBackend:
         self._limits = limits
         self._mf_engine = None
         self._dim_columns: dict[str, tuple[str, str]] | None = None
+        self._catalog_view = None
 
     @classmethod
     def from_engine(cls, engine) -> LocalMetricFlowBackend:
-        from ...dbt_project import DbtProjectError
+        from ...errors import ProjectError
 
         config = engine.config
         connector = engine.connector or getattr(config, "connector", "duckdb")
         limits = getattr(config, "query", None) or QueryLimits()
         try:
             project = engine.project_dir()
-        except (ValueError, DbtProjectError) as exc:
+        except (ValueError, ProjectError) as exc:
             # This backend is the default, so a deployment with no dbt project on
             # disk lands here without asking to. It used to surface the raw refusal
             # from `require_repo_root`, which is a bare ValueError and says nothing
@@ -150,105 +170,50 @@ class LocalMetricFlowBackend:
                 "instead: set `semantic.deployment: dbt_cloud` in config (or pass "
                 "--api), which needs no project and no local credential"
             ) from exc
-        return cls(project, engine, connector, limits)
+        return cls(project, engine, connector, limits, engine.project_format())
 
     # ---- discovery ---------------------------------------------------------
 
     def list_definitions(self) -> SemanticCatalog:
-        from ... import dbt_project
+        """The catalog, read through the project seam rather than parsed here.
 
-        manifest = dbt_project._read_semantic_manifest(self._project)
-        if manifest is None:
-            raise SemanticBackendError(
-                "no compiled semantic manifest at target/semantic_manifest.json; "
-                "run `dbt parse` in the project so `explore semantic` can read it "
-                "(or query a hosted deployment with --api)"
-            )
+        The project format owns the reduction from whatever it holds on disk into
+        the neutral catalog, so this backend adds only what it knows: its own
+        provenance, and the caveat about how a metric's groupable dimensions were
+        computed.
+        """
 
-        entities: dict[str, dict[str, Any]] = {}
-        dimensions: dict[str, dict[str, Any]] = {}
-        model_dims: dict[str, list[str]] = {}
-        measure_model: dict[str, str] = {}
-        for model in manifest.get("semantic_models") or []:
-            model_name = model.get("name")
-            primary = None
-            for entity in model.get("entities") or []:
-                # One entity is declared in every semantic model that joins on
-                # it, and only some of those declarations may describe it, so the
-                # merge keeps the first description any of them carries.
-                merge_element_fields(entities, entity.get("name"), entity)
-                if str(entity.get("type", "")).lower() == "primary":
-                    primary = entity.get("name")
-            qualified: list[str] = []
-            for dim in model.get("dimensions") or []:
-                # Entity-qualified name, the form a metric query groups by
-                # (session__created_at). Cross-model joined dimensions resolve
-                # only at query time, hence the catalog note below. The label and
-                # description stay the project's own text, unqualified: they
-                # describe the dimension, not the path a query reaches it by.
-                name = f"{primary}__{dim.get('name')}" if primary else dim.get("name")
-                qualified.append(name)
-                merge_element_fields(dimensions, name, dim)
-            model_dims[model_name] = qualified
-            for measure in model.get("measures") or []:
-                measure_model[measure.get("name")] = model_name
-        # dex's own synthesis, not a manifest entry, so it carries no label or
-        # description: every word in the catalog is the dbt project's.
-        dimensions.setdefault("metric_time", {"type": "time"})
-
-        metrics: list[MetricInfo] = []
-        for metric in manifest.get("metrics") or []:
-            params = metric.get("type_params") or {}
-            owners: set[str] = set()
-            for input_measure in params.get("input_measures") or []:
-                measure_name = (
-                    input_measure.get("name")
-                    if isinstance(input_measure, dict)
-                    else input_measure
-                )
-                owner = measure_model.get(measure_name)
-                if owner:
-                    owners.add(owner)
-            metric_dims = {"metric_time"}
-            for owner in owners:
-                metric_dims.update(model_dims.get(owner, []))
-            metrics.append(
-                MetricInfo(
-                    name=metric.get("name"),
-                    type=(metric.get("type") or "").lower(),
-                    label=metric.get("label"),
-                    description=metric.get("description"),
-                    dimensions=sorted(metric_dims),
-                )
-            )
-
-        return SemanticCatalog.from_backend(
-            self,
-            metrics=metrics,
-            dimensions=[
-                DimensionInfo(
-                    name=name,
-                    type=fields.get("type") or "",
-                    label=fields.get("label"),
-                    description=fields.get("description"),
-                )
-                for name, fields in sorted(dimensions.items())
-            ],
-            entities=[
-                EntityInfo(
-                    name=name,
-                    type=fields.get("type") or "",
-                    label=fields.get("label"),
-                    description=fields.get("description"),
-                )
-                for name, fields in sorted(entities.items())
-            ],
-            notes=[
-                "local list: a metric's dimensions are those of its owning "
-                "semantic model(s), entity-qualified; dimensions reachable only "
-                "through a join resolve at query time (or list with --api)"
-            ],
+        return SemanticCatalog.from_view(
+            self._semantic_view(), self, notes=[_LOCAL_LIST_NOTE]
         )
+
+    def _semantic_view(self):
+        """The project's semantic catalog, read once per command.
+
+        The engine builds a fresh project per call on purpose (a project is a read
+        of files that ``transform apply`` rewrites), so the memo lives here: the
+        catalog read and the PII gate's column resolution want the same view, and
+        parsing it twice for one command would be work for nothing.
+        """
+
+        from ...adapters.project import (
+            SemanticCatalogProject,
+            semantic_catalog_gap,
+        )
+        from ...errors import ProjectError
+
+        if self._catalog_view is not None:
+            return self._catalog_view
+        project = self._format or self._dex.project_format()
+        if not isinstance(project, SemanticCatalogProject):
+            raise SemanticBackendError(semantic_catalog_gap(project))
+        try:
+            self._catalog_view = project.semantic_catalog()
+        except ProjectError as exc:
+            raise SemanticBackendError(
+                f"{exc} (or query a hosted deployment with --api)"
+            ) from exc
+        return self._catalog_view
 
     # ---- query -------------------------------------------------------------
 
@@ -391,39 +356,25 @@ class LocalMetricFlowBackend:
         return lookup
 
     def _dimension_columns(self) -> dict[str, tuple[str, str]]:
-        """``entity-qualified dimension -> (relation, physical column)`` from the
-        compiled manifest. Computed dimensions (an expression rather than a bare
-        column) map to nothing: guessing a column out of an expression would make
-        the gate over-claim, and the name heuristic still covers them."""
+        """``dimension token -> (relation, physical column)``, from the project.
 
-        from ... import dbt_project
+        The format resolves this, not this backend: it is the one place that knows
+        which relation a semantic model sits on and which column each element
+        references. A token whose reference is a computed expression is absent
+        rather than guessed, because guessing a column out of an expression would
+        make the PII gate over-claim; the name heuristic still covers it.
 
-        if self._dim_columns is not None:
-            return self._dim_columns
-        mapping: dict[str, tuple[str, str]] = {}
-        manifest = dbt_project._read_semantic_manifest(self._project)
-        for model in (manifest or {}).get("semantic_models") or []:
-            node_relation = model.get("node_relation") or {}
-            relation = node_relation.get("relation_name") or node_relation.get("alias")
-            if not relation:
-                continue
-            relation = dbt_project._strip_relation_quoting(str(relation))
-            primary = None
-            for entity in model.get("entities") or []:
-                if str(entity.get("type", "")).lower() == "primary":
-                    primary = entity.get("name")
-            for element in (model.get("dimensions") or []) + (
-                model.get("entities") or []
-            ):
-                column = dbt_project.physical_column(element)
-                if not column:
-                    continue
-                name = element.get("name")
-                for token in {name, f"{primary}__{name}" if primary else name}:
-                    if token:
-                        mapping.setdefault(token, (relation, column))
-        self._dim_columns = mapping
-        return mapping
+        A project that cannot answer at all leaves the gate on that heuristic
+        alone, which is the fail-closed floor and the same posture an unprofiled
+        relation already gets.
+        """
+
+        if self._dim_columns is None:
+            try:
+                self._dim_columns = dict(self._semantic_view().physical_columns)
+            except SemanticBackendError:
+                self._dim_columns = {}
+        return self._dim_columns
 
     def _relation_precheck(
         self,

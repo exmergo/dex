@@ -28,13 +28,46 @@ if TYPE_CHECKING:
     from ...engine import DexEngine
 
 
-def semantic_list(engine: DexEngine, *, api: bool = False, local: bool = False):
-    """The metrics, dimensions, and entities the semantic layer exposes."""
+def semantic_list(
+    engine: DexEngine,
+    *,
+    metrics: list[str] | None = None,
+    api: bool = False,
+    local: bool = False,
+):
+    """The semantic layer's objects: semantic models, metrics, dimensions,
+    entities, measures.
 
-    from . import resolve_backend
+    ``metrics`` narrows the catalog to those metrics and what is reachable from
+    them, which is what a caller that already knows the metric wants: a whole
+    layer's catalog is one payload and most of it is about something else. It
+    costs no extra round trip, the shape is unchanged, and the scope is named in
+    the payload so a subset is never mistaken for the layer.
+    """
+
+    from . import SemanticBackendError, SemanticQuery, resolve_backend
 
     backend = resolve_backend(engine, api=api, local=local)
     catalog = backend.list_definitions()
+    # Normalized through the query object so `--metric a,b` and the repeated flag
+    # mean the same thing here as they do on a metric query.
+    wanted = SemanticQuery(metrics=list(metrics or [])).metrics
+    if wanted:
+        # Counted before scoping: asking the backend again for the denominator
+        # would be a second round trip for a sentence.
+        total = len(catalog.metrics)
+        catalog, unknown = catalog.narrowed_to(wanted)
+        if unknown:
+            raise SemanticBackendError(
+                f"no such metric in this semantic layer: {', '.join(unknown)}. "
+                "List without --metric to see what it exposes"
+            )
+        catalog.scoped_to = wanted
+        catalog.notes = [
+            *catalog.notes,
+            f"scoped to {len(wanted)} of {total} metrics and what they reach; "
+            "list without --metric for the whole layer",
+        ]
     return SemanticListResult(catalog=catalog, notes=list(catalog.notes))
 
 
@@ -92,12 +125,14 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     api = bool(getattr(args, "api", False))
     local = bool(getattr(args, "local", False))
     try:
-        if getattr(args, "mode", None) == "list":
-            return to_envelope(semantic_list(engine, api=api, local=local))
         metrics = [
             *(getattr(args, "metrics", None) or []),
             *(getattr(args, "metric", None) or []),
         ]
+        if getattr(args, "mode", None) == "list":
+            return to_envelope(
+                semantic_list(engine, metrics=metrics, api=api, local=local)
+            )
         return to_envelope(
             semantic_query(
                 engine,

@@ -40,14 +40,23 @@ implementation is complete rather than partial.
 `isinstance` rather than declared, so a format cannot claim a tier it has not
 implemented.
 
-One protocol sits beside the tiers rather than in them, `PlacingProject`, and
-reaching `reconcile`'s write path means implementing it as well as tier 3. Its three
-methods are `load()`, `edit_path()` and `editing_surface()`, and they are described
-under [Where an edit lands](#where-an-edit-lands-and-what-you-own) below. It is
-beside rather than on tier 3 because these protocols are `runtime_checkable`: a
-method added to tier 3 would demote every format that has not implemented it yet, so
-`tier_of` would start answering 2 where it answered 3 and the write path would close
-for exactly the implementers who were already passing.
+Two protocols sit beside the tiers rather than in them.
+
+`PlacingProject` is one, and reaching `reconcile`'s write path means implementing it
+as well as tier 3. Its three methods are `load()`, `edit_path()` and
+`editing_surface()`, and they are described under
+[Where an edit lands](#where-an-edit-lands-and-what-you-own) below.
+
+`SemanticCatalogProject` is the other, one method, `semantic_catalog()`, and it is
+what `explore semantic list --local` reads. It is described under
+[Reading the semantic layer twice](#reading-the-semantic-layer-twice-for-two-different-questions).
+
+Both are beside rather than on a tier because these protocols are
+`runtime_checkable`: a method added to a tier would demote every format that has not
+implemented it yet, so `tier_of` would start answering 2 where it answered 3 and the
+write path would close for exactly the implementers who were already passing. A
+capability a format may legitimately decline belongs in its own protocol, where
+declining it is an answer rather than a regression.
 
 That is also why `load()` is there rather than on tier 3, which is where you would
 look for it first. Nothing outside the placement path calls it: both callers reach it
@@ -120,6 +129,71 @@ human the divergence and ask. A result answering neither fails in both direction
 once: a plan recorded as applied that wrote nothing, or a conflict that never reaches
 the person it was raised for. Return `dbt_project.ApplyResult`, or anything exposing
 those two.
+
+## Reading the semantic layer twice, for two different questions
+
+Beside tier 2 sits one optional protocol, `SemanticCatalogProject`, and the reason
+it is a second channel rather than a third member of the tier is worth stating
+before you implement either.
+
+```python
+@runtime_checkable
+class SemanticCatalogProject(Protocol):
+    def semantic_catalog(self) -> SemanticCatalogView: ...
+```
+
+`semantic_layer()` is a **fingerprint**. Its job is to make a change detectable, so
+it reduces the layer to a content hash per definition plus the physical column
+behind each field, and it hashes what the author wrote rather than what a compiler
+produced, which is what keeps a stored baseline stable across a tool upgrade. It
+deliberately throws away everything a reader wants: element types, the project's own
+labels and descriptions, a measure's aggregation, a metric's composition, and the
+token a query actually groups by.
+
+`semantic_catalog()` is the **read view** `explore semantic list` returns, and every
+field it carries is a field the fingerprint is right to drop. Widening the
+fingerprint to serve it would push presentation metadata into a persisted baseline
+and cost it the stability it exists for, so the two are separate reductions of one
+layer and your format performs both.
+
+Three things to get right, all of them things dex itself got wrong first:
+
+**An entity is not one record.** `EntityInfo.roles` carries one entry per
+`(entity, semantic model)` declaration, with that model's own `type`, `expr` and
+`description`. An entity is `primary` in the one model that keys it and `foreign` in
+every model that joins to it, the join key differs per model for the same entity, and
+each declaration is where a project documents that model's join. The single
+top-level `type` is derived, primary wherever any declaration is primary. Returning
+one record per entity means picking a value, and whichever you pick is iteration
+order rather than a fact about the layer.
+
+**`DimensionInfo.name` is a query token, not a display name.** A caller pastes it
+into `--group-by`. If your layer requires a qualified path, return the path;
+`definition` and `semantic_model` are where the declaration behind it goes.
+`SemanticCatalogContract` asserts that every dimension a metric claims to be
+groupable by appears as a dimension row, because the two have to be one vocabulary
+or neither can be acted on.
+
+**Say what one dimension row is.** `dimension_scope` is `declarations` (one row per
+declared dimension) or `queryable_paths` (one row per groupable token, so a dimension
+reached through a join appears once per path). Both are honest and they produce very
+different counts for one layer, which is unreadable to a caller who is not told
+which they hold.
+
+`physical_columns` maps every dimension and entity token, bare and qualified, to the
+`(relation, column)` behind it. It is never serialized: the PII request-gate reads it
+to resolve a token to a profiled column, which is why the resolution belongs to the
+format rather than to a query backend. Leave a token out where the reference is a
+computed expression, on the same principle as the `None` columns on
+`SemanticModelDef`: a guessed column makes the gate over-claim.
+
+Raise `ProjectError` where the layer cannot be read *yet*, as opposed to being
+empty. An uncompiled project and a project that declares no metrics are different
+answers and only one is fixed by running a command, and the caller turns the raise
+into a refusal naming that command. Declining the protocol outright is also a
+complete answer: a format with no semantic layer implements nothing here, and
+`explore semantic list --local` refuses by name rather than returning an empty
+catalog that reads as a layer with nothing in it.
 
 ## Where an edit lands, and what you own
 
@@ -346,8 +420,9 @@ class TestMyProject(ExploreProjectContract):
 pytest collects the inherited assertions and runs the contract against your format.
 Use `MaintainProjectContract` instead if you reach tier 2, `EditableProjectContract`
 if you reach tier 3, mix `DeclaringProjectContract` and `SemanticProjectContract`
-beside it for the content your format declares, mix `PlacingProjectContract` beside
-it if you implement placement, and mix
+beside it for the content your format declares, mix `PlacingProjectContract` and
+`SemanticCatalogContract` beside it for each protocol you implement beside the
+tiers, and mix
 `ProjectFactoryContract` in front of it if dex will build your format from a name
 rather than be handed an instance. Construction is a separate contract, so a format
 that passes the behavioral suite can still be unreachable from configuration; "the

@@ -11,15 +11,14 @@ difference between them is load-bearing, so it is spelled out here.
 Every result and catalog names which layer answered on all four: `backend` (the
 released one-value spelling), plus `vendor`, `deployment`, and `execution`.
 
-- `explore semantic list` returns the catalog in one shape from either backend:
-  metrics (name, type, label, description, and the dimensions each can be grouped
-  by), dimensions (name, type, label, description), and entities (name, type,
-  label, description). This is the discovery surface an agent reads to decide what
-  to query. Every label and description is the dbt project's own words, so an
-  undocumented project returns identifiers and types alone; an unset field is
-  omitted from the payload rather than returned as a null. One divergence: the dbt
-  Cloud API exposes no label on entities, so an entity label arrives only from
-  `--local`, and a hosted catalog that has entities says so in a note.
+- `explore semantic list` returns the layer's objects in one shape from either
+  backend: semantic models, metrics, dimensions, entities, and measures. This is
+  the discovery surface an agent reads to decide what to query, and the schema
+  section below is the field-by-field contract. Every label and description is the
+  dbt project's own words, so an undocumented project returns identifiers and
+  types alone; an unset field is omitted from the payload rather than returned as
+  a null. `--metric <m>` narrows the catalog to those metrics and what they reach,
+  which is the whole layer's worth of context down to the part a caller came for.
 - `explore semantic query` runs a metric query and returns a capped, row-major
   result, the same envelope shape as `explore query`. It takes a metric
   positionally after the explicit `query` mode, keeps `--metric <m>` as a
@@ -35,6 +34,94 @@ to `metric_time`. Positional metrics and the `--metric`, `--group-by`, and
 and the two forms mix freely: `--group-by a,b` and
 `--group-by a --group-by b` are the same query. `--where` never splits, because a
 filter clause carries commas of its own.
+
+## What `list` returns
+
+A semantic layer is a graph, not three lists of names: semantic models each sit on
+one physical relation and own the entities they join on, the dimensions they can be
+sliced by, and the measures their metrics are built from, and a metric is composed
+out of those measures and may span several models. The catalog carries that graph
+as flat lists with provenance on every element, rather than nesting elements inside
+their model, because a flat lookup is what the PII gate and every consumer already
+do and it is also the shape a non-dbt format can satisfy.
+
+Five scalars lead the payload, so a caller reading a truncated result sees them
+first:
+
+| field | meaning |
+|---|---|
+| `backend`, `vendor`, `deployment`, `execution` | which layer answered, on the axes described below |
+| `dimension_scope` | what one `dimensions` row is: `declarations` or `queryable_paths` |
+| `unavailable` | fields this backend structurally cannot supply, per element kind |
+| `scoped_to` | present only when `--metric` narrowed the catalog, naming the metrics |
+
+Then the five lists. Every field below is optional except `name` and `type`, and an
+unset one is absent rather than null:
+
+| list | fields |
+|---|---|
+| `semantic_models` | `name`, `label`, `description`, `model_ref` (the transformation-layer model it sits on), `agg_time_dimension` (the model's default time dimension), `primary_entity` |
+| `metrics` | `name`, `type`, `label`, `description`, `dimensions` (the tokens it can be grouped by), `semantic_models`, `input_measures` (resolved through any ratio or derived chain), `composition`, `filter`, `vendor_params` |
+| `dimensions` | `name` (the token a query groups by), `type`, `label`, `description`, `definition` (the bare dimension name), `semantic_model` |
+| `entities` | `name`, `type` (**derived**, see below), `label`, `description`, `roles` |
+| `measures` | `name`, `agg`, `expr`, `agg_time_dimension`, `label`, `description`, `semantic_model` |
+
+`composition` is what a metric is built out of, in portable terms: `measure`,
+`numerator`, `denominator`, `expr`, `input_metrics`. It is sparse, and an absent key
+means this metric type has no such part rather than that the value is unknown. A
+ratio metric therefore arrives with both of its sides, which is what decides
+whether a group-by is valid on both and whether the ratio is additive.
+
+`vendor_params` is the boundary of that portability, declared rather than blurred.
+MetricFlow's cumulative `window`, its `grain_to_date`, and a derived metric's
+per-input `offset_windows` are real and only mean something under this vendor's
+semantics, so they travel under one key instead of being promoted into the shared
+shape.
+
+`roles` is one entry per `(entity, semantic model)` declaration, each carrying
+`semantic_model`, `type`, `expr`, `role`, `description`. That is the unit the layer
+declares, and it is why an entity cannot be reduced to a single record: an entity is
+`primary` in the one model that keys it and `foreign` in every model that joins to
+it, `expr` is the physical join key and differs per model for the same entity, and
+each declaration is where a project documents that model's own join, including a
+nullable key. The top-level `type` is kept and is **derived**: primary wherever any
+declaration is primary. Read `roles` for the join graph; read `type` for a summary.
+
+### Two things the two backends legitimately disagree about
+
+Both are stated in the payload rather than left to be inferred, because a caller
+that cannot tell a structural absence from an undeclared field will read the first
+as the second.
+
+**`dimension_scope`.** `--local` returns one row per declaration, entity-qualified
+and single-hop, so the count is the number of dimensions the project declares.
+`--api` returns one row per token a query may group by, join-resolved, so a
+dimension reached through a join appears once per path that reaches it and a layer
+with joins reports substantially more rows. Neither is wrong. `definition` plus
+`semantic_model` is what lets a caller see that several paths reach one
+declaration.
+
+**`unavailable`.** The hosted `SemanticModel` GraphQL type carries only a name, its
+`Entity` type has no `label` at all, and its `Measure` type carries no words, so a
+hosted catalog declares those gaps per element kind. A hosted catalog is also
+reached metric by metric, so a measure, entity declaration or semantic model that no
+metric draws on is absent from it; that one is a note, because it is a property of
+the layer's shape rather than a field that cannot exist.
+
+### Scoping a large layer
+
+`explore semantic list --metric <m>` keeps the named metrics and everything
+reachable from them: the measures they read, the semantic models those live in, the
+dimensions they can be grouped by, and the entities declared in any surviving
+model. It costs no extra round trip and no warehouse query, the shape is unchanged,
+and `scoped_to` names the metrics so a subset is never mistaken for the layer. An
+entity keeps **all** of its declarations even where the scope dropped the model
+they name, because pruning them would turn a primary entity into a foreign one,
+which is a false statement about the layer rather than a smaller one. A metric name
+the layer does not have is refused by name rather than returning an empty catalog.
+
+Nothing in `list` costs a warehouse query on either backend: one GraphQL round trip
+hosted, one compiled-artifact read locally.
 
 ## Choosing a backend (ambient, like a connector)
 
@@ -121,9 +208,19 @@ spine, in order:
 4. The **cost-before-spend handshake**, then the active connector.
 
 **dex owns execution here, so the full cost guard applies** exactly as it does for
-`explore query`. `list` is a pure read-view over `target/semantic_manifest.json`
-and needs no extra; `query` needs the `[semantic]` extra (MetricFlow) and a
-compiled manifest (`dbt parse`).
+`explore query`. `list` reads the catalog through the project seam
+(`SemanticCatalogProject.semantic_catalog()`, described in
+[`project.md`](project.md)) rather than parsing dbt's artifacts itself, so it needs
+no extra and a second project format inherits a working local read path instead of
+needing its own parser. For the dbt format that read is
+`target/semantic_manifest.json`, so `list` still wants a project compiled at least
+as far as `dbt parse`, and says so by name when it is not. `query` needs the
+`[semantic]` extra (MetricFlow) and the same compiled manifest.
+
+The PII gate's column resolution comes through the same seam: the format maps every
+dimension and entity token to the `(relation, column)` behind it, and a token whose
+reference is a computed expression is absent rather than guessed, since guessing a
+column out of an expression would make the gate over-claim.
 
 ## Hosted backend (`--api`, dbt Cloud Semantic Layer)
 
@@ -201,5 +298,9 @@ heuristic at once) wants retrying.
 | Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations |
 | Credentials | the connector's, never in context | a dbt Cloud service token, never in context |
 | Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
-| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, noted on the catalog |
+| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` |
+| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else |
+| `dimension_scope` | `declarations`: one row per declaration, single-hop qualified | `queryable_paths`: one row per groupable token, join-resolved |
+| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent |
+| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip |
 | Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |

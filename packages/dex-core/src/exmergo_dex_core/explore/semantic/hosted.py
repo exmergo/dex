@@ -25,16 +25,22 @@ from ... import envelope as env
 from ...config import QueryLimits
 from ..results import SemanticQueryResult
 from . import (
+    DIMENSIONS_PER_QUERYABLE_PATH,
     EXECUTION_VENDOR,
     DimensionInfo,
     EntityInfo,
+    EntityRole,
+    MeasureInfo,
+    MetricComposition,
     MetricInfo,
     SemanticBackendError,
     SemanticCatalog,
+    SemanticModelInfo,
     SemanticQuery,
     SemanticQueryRefusedError,
     cap_columnar,
     cost_posture,
+    derive_entity_type,
     merge_element_fields,
     merge_pii_meta,
     requested_dimension_refs,
@@ -51,9 +57,26 @@ _HOSTED_COST_WARNING = (
     "environment's own limits, not by dex."
 )
 
-# What a hosted catalog cannot answer, said where the reader of the catalog is.
-# Local lists carry entity labels; this backend structurally cannot, and a silent
-# absence would read as a dbt project that declared none.
+# What a hosted catalog cannot answer, declared per element kind rather than left
+# to be inferred from a missing key. Measured by introspecting the live schema:
+# `Entity` has no `label` field at all, `SemanticModel` carries only `name`, and
+# `Measure` carries no words. A silent absence would read as a dbt project that
+# documented none of it, which for a well-documented project is the opposite of
+# the truth, and a note alone is the part of a payload a caller truncates first.
+_HOSTED_CATALOG_GAPS: dict[str, list[str]] = {
+    "semantic_models": [
+        "label",
+        "description",
+        "model_ref",
+        "agg_time_dimension",
+        "primary_entity",
+    ],
+    "entities": ["label"],
+    "measures": ["label", "description"],
+}
+
+# The one gap worth prose as well, because it is the field a caller is most
+# likely to go looking for and there is somewhere better to get it.
 _HOSTED_ENTITY_LABEL_NOTE = (
     "hosted list: the dbt Cloud Semantic Layer API exposes no label on entities "
     "(its Entity type has no such field), so an entity here carries a "
@@ -61,10 +84,118 @@ _HOSTED_ENTITY_LABEL_NOTE = (
     "declares"
 )
 
+# A hosted catalog is reached metric by metric, so an element no metric touches is
+# not in it. Said only when it can actually bite, which is any layer with metrics.
+_HOSTED_REACH_NOTE = (
+    "hosted list: every element is reached through a metric, so a measure, "
+    "entity declaration or semantic model that no metric draws on is absent; "
+    "list with --local for the layer as the project declares it"
+)
+
 _MISSING_EXTRA = (
     "the hosted semantic-layer backend needs the [semantic-api] extra: "
     "pip install 'exmergo-dex-core[semantic-api]'"
 )
+
+
+def _model_name(value: Any) -> str | None:
+    """A ``semanticModel { name }`` selection reduced to the name it carries."""
+
+    return value.get("name") if isinstance(value, dict) else None
+
+
+def _bare_dimension(token: str | None, semantic_model: str | None) -> str | None:
+    """The bare dimension name behind a queryable token.
+
+    The API returns the token a query groups by (``agent__session__created_at``),
+    never the declaration behind it, so the bare name is read off the token: the
+    qualifier is a chain of entity names and ``__`` is the separator MetricFlow
+    itself uses, so what follows the last one is the dimension. Together with the
+    owning semantic model it identifies the declaration, which is what lets a
+    caller see that several paths reach one dimension.
+
+    Only where an owning model is known, which is what keeps dex's own synthesized
+    ``metric_time`` from being given a declaration it does not have.
+    """
+
+    if not token or not semantic_model:
+        return None
+    _, separator, tail = token.rpartition("__")
+    return tail if separator else token
+
+
+def _metric_info(payload: dict[str, Any], owners: list[str]) -> MetricInfo:
+    """One metric from the hosted catalog, composition included.
+
+    Composition is kept portable and MetricFlow's own vocabulary is kept apart:
+    a ratio's two sides and a derived metric's inputs mean the same thing in any
+    semantic layer, while a cumulative window or a grain-to-date only means
+    something here, so it travels under one declared vendor key.
+    """
+
+    params = payload.get("typeParams")
+    params = params if isinstance(params, dict) else {}
+
+    def named(value: Any) -> str | None:
+        return value.get("name") if isinstance(value, dict) else None
+
+    def window(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        count, granularity = value.get("count"), value.get("granularity")
+        if count is None and granularity is None:
+            return None
+        return {"count": count, "granularity": granularity}
+
+    inputs = [
+        name
+        for name in (named(x) for x in params.get("inputMeasures") or [])
+        if name is not None
+    ]
+    input_metrics = [
+        name
+        for name in (named(x) for x in params.get("metrics") or [])
+        if name is not None
+    ]
+
+    vendor: dict[str, Any] = {}
+    if (cumulative := window(params.get("window"))) is not None:
+        vendor["window"] = cumulative
+    if params.get("grainToDate"):
+        vendor["grain_to_date"] = params["grainToDate"]
+    offsets = {
+        x["name"]: offset
+        for x in params.get("metrics") or []
+        if isinstance(x, dict)
+        and isinstance(x.get("name"), str)
+        and (offset := window(x.get("offsetWindow"))) is not None
+    }
+    if offsets:
+        vendor["offset_windows"] = offsets
+
+    metric_filter = payload.get("filter")
+    return MetricInfo(
+        name=payload.get("name"),
+        type=(payload.get("type") or "").lower(),
+        label=payload.get("label"),
+        description=payload.get("description"),
+        dimensions=[d.get("name") for d in (payload.get("dimensions") or [])],
+        semantic_models=owners or None,
+        input_measures=inputs or None,
+        composition=MetricComposition(
+            measure=named(params.get("measure")),
+            numerator=named(params.get("numerator")),
+            denominator=named(params.get("denominator")),
+            expr=params.get("expr"),
+            input_metrics=input_metrics or None,
+        ),
+        filter=(
+            metric_filter.get("whereSqlTemplate")
+            if isinstance(metric_filter, dict)
+            else None
+        ),
+        vendor_params=vendor or None,
+    )
 
 
 def _screening_notes(unknown: list[str], meta: dict[str, Any] | None) -> list[str]:
@@ -137,6 +268,11 @@ class HostedDbtCloudBackend:
     # this one declaration; see `cost_posture`.
     execution = EXECUTION_VENDOR
     cost_guard_warning = _HOSTED_COST_WARNING
+    catalog_gaps = _HOSTED_CATALOG_GAPS
+    # One row per token a query may group by, join-resolved by the API, including
+    # dimensions reached through two joins. That is why this backend reports more
+    # dimensions than a project read of the same layer.
+    dimension_scope = DIMENSIONS_PER_QUERYABLE_PATH
 
     _POLL_ATTEMPTS = 90
     _POLL_INTERVAL = 1.0
@@ -223,39 +359,114 @@ class HostedDbtCloudBackend:
 
     # ---- discovery ---------------------------------------------------------
 
+    # One document, one round trip, and every field on it verified against the
+    # live schema by introspection before it was written here. A field name the
+    # schema does not have fails the *whole* request, so the metrics list goes
+    # down with it: never add one speculatively. `label` on an entity is the
+    # standing example (the API answers "Cannot query field 'label' on type
+    # 'Entity'"), and `Measure` has no words either.
+    _CATALOG_FIELDS = (
+        "name type label description "
+        "filter { whereSqlTemplate } "
+        "typeParams { measure { name } inputMeasures { name } "
+        "numerator { name } denominator { name } expr "
+        "window { count granularity } grainToDate "
+        "metrics { name offsetWindow { count granularity } } } "
+        "measures { name agg expr aggTimeDimension } "
+        "semanticModels { name } "
+        "dimensions { name type label description semanticModel { name } } "
+        "entities { name type description expr role semanticModel { name } }"
+    )
+
     def list_definitions(self) -> SemanticCatalog:
-        # `label` and `description` on the nested dimensions, and `description` on
-        # the nested entities, come free with the catalog query dex already
-        # issues: one round trip either way. Never add `label` to the entity
-        # selection set. The schema has no such field and the server rejects the
-        # entire query, so the metrics list goes down with it.
         query = (
-            "{ metrics(environmentId: " + self._env + ") "
-            "{ name type label description "
-            "dimensions { name type label description } "
-            "entities { name type description } } }"
+            "{ metrics(environmentId: "
+            + self._env
+            + ") { "
+            + self._CATALOG_FIELDS
+            + " } }"
         )
         data = self._post(query)
+
         metrics: list[MetricInfo] = []
         dims: dict[str, dict[str, Any]] = {}
-        ents: dict[str, dict[str, Any]] = {}
+        roles: dict[str, dict[str, EntityRole]] = {}
+        entity_words: dict[str, str | None] = {}
+        measures: dict[str, MeasureInfo] = {}
+        models: set[str] = set()
+
         for m in data.get("metrics") or []:
-            metric_dims = [d.get("name") for d in (m.get("dimensions") or [])]
+            owners = [
+                s["name"]
+                for s in (m.get("semanticModels") or [])
+                if isinstance(s, dict) and s.get("name")
+            ]
+            models.update(owners)
+
             for d in m.get("dimensions") or []:
-                merge_element_fields(dims, d.get("name"), d)
-            for e in m.get("entities") or []:
-                merge_element_fields(ents, e.get("name"), e)
-            metrics.append(
-                MetricInfo(
-                    name=m.get("name"),
-                    type=(m.get("type") or "").lower(),
-                    label=m.get("label"),
-                    description=m.get("description"),
-                    dimensions=metric_dims,
+                owner = _model_name(d.get("semanticModel"))
+                if owner:
+                    models.add(owner)
+                merge_element_fields(
+                    dims,
+                    d.get("name"),
+                    {
+                        "type": d.get("type"),
+                        "label": d.get("label"),
+                        "description": d.get("description"),
+                        "definition": _bare_dimension(d.get("name"), owner),
+                        "semantic_model": owner,
+                    },
                 )
-            )
+
+            for e in m.get("entities") or []:
+                name, owner = e.get("name"), _model_name(e.get("semanticModel"))
+                if not name:
+                    continue
+                if owner:
+                    models.add(owner)
+                # Keyed by (entity, model) because that is the unit the layer
+                # declares: the same declaration is reached through every metric
+                # that can group by it, and two declarations of one entity
+                # genuinely differ in type, join key and description.
+                roles.setdefault(name, {}).setdefault(
+                    owner or "",
+                    EntityRole(
+                        semantic_model=owner or "",
+                        type=str(e.get("type") or "").lower(),
+                        expr=e.get("expr"),
+                        role=e.get("role"),
+                        description=e.get("description"),
+                    ),
+                )
+                if entity_words.get(name) is None:
+                    entity_words[name] = e.get("description")
+
+            for measure in m.get("measures") or []:
+                name = measure.get("name")
+                if not name or name in measures:
+                    continue
+                measures[name] = MeasureInfo(
+                    name=name,
+                    agg=str(measure.get("agg") or "").lower() or None,
+                    expr=measure.get("expr"),
+                    agg_time_dimension=measure.get("aggTimeDimension"),
+                    # Deduced, not returned: the API carries no owning model on a
+                    # measure, and a measure lives in exactly one semantic model,
+                    # so a metric naming one model pins every measure it reads.
+                    # A measure reachable only through metrics that span several
+                    # models stays unset rather than being attributed to a guess.
+                    semantic_model=owners[0] if len(owners) == 1 else None,
+                )
+
+            metrics.append(_metric_info(m, owners))
+
+        notes = [_HOSTED_REACH_NOTE]
+        if roles:
+            notes.append(_HOSTED_ENTITY_LABEL_NOTE)
         return SemanticCatalog.from_backend(
             self,
+            semantic_models=[SemanticModelInfo(name=n) for n in sorted(models)],
             metrics=metrics,
             dimensions=[
                 DimensionInfo(
@@ -263,18 +474,22 @@ class HostedDbtCloudBackend:
                     type=fields.get("type") or "",
                     label=fields.get("label"),
                     description=fields.get("description"),
+                    definition=fields.get("definition"),
+                    semantic_model=fields.get("semantic_model"),
                 )
                 for name, fields in sorted(dims.items())
             ],
             entities=[
                 EntityInfo(
                     name=name,
-                    type=fields.get("type") or "",
-                    description=fields.get("description"),
+                    type=derive_entity_type(list(declared.values())),
+                    description=entity_words.get(name),
+                    roles=[declared[key] for key in sorted(declared)],
                 )
-                for name, fields in sorted(ents.items())
+                for name, declared in sorted(roles.items())
             ],
-            notes=[_HOSTED_ENTITY_LABEL_NOTE] if ents else [],
+            measures=[measures[name] for name in sorted(measures)],
+            notes=notes,
         )
 
     # ---- query -------------------------------------------------------------

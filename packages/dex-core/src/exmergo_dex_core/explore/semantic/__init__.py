@@ -41,6 +41,21 @@ from ...errors import DexError
 # Imported from the guards package, not from the firewall: this package must stay
 # importable without a dialect engine, because the hosted backend parses no SQL.
 from ...guards import PII_BLOCK_CONFIDENCE
+from ...semantic_catalog import (
+    DIMENSIONS_PER_DECLARATION,
+    DIMENSIONS_PER_QUERYABLE_PATH,
+    DimensionInfo,
+    EntityInfo,
+    EntityRole,
+    MeasureInfo,
+    MetricComposition,
+    MetricInfo,
+    SemanticCatalogView,
+    SemanticModelInfo,
+    derive_entity_type,
+    merge_element_fields,
+    qualified_dimension,
+)
 from ..profile import detect_pii
 
 
@@ -86,118 +101,165 @@ class SemanticQuery:
         self.order_by = _split_tokens(self.order_by)
 
 
-@dataclass
-class MetricInfo:
-    name: str
-    type: str
-    label: str | None = None
-    description: str | None = None
-    # The dimensions this metric can be grouped by, entity-qualified. Precise on
-    # the hosted backend (the API resolves the join graph); on the local read-view
-    # it is the per-semantic-model listing, noted as such.
-    dimensions: list[str] = field(default_factory=list)
-
-
-@dataclass
-class DimensionInfo:
-    name: str
-    type: str
-    # The dbt project's own words for this dimension, when it wrote any. Both
-    # backends carry both fields: the compiled semantic manifest declares them,
-    # and the hosted API returns them in the catalog query dex already issues.
-    label: str | None = None
-    description: str | None = None
-
-
-@dataclass
-class EntityInfo:
-    name: str
-    type: str
-    # Local-only. The hosted GraphQL schema has no `label` on its Entity type,
-    # and asking for one fails the whole catalog query ("Cannot query field
-    # 'label' on type 'Entity'"), taking the metrics list down with it, so it
-    # must never enter that selection set. A hosted catalog says so in a note
-    # rather than letting the absence read as "the project declared none".
-    label: str | None = None
-    description: str | None = None
-
-
-def merge_element_fields(
-    store: dict[str, dict[str, Any]], key: str, element: dict[str, Any]
-) -> None:
-    """Fold one dimension or entity into a catalog accumulator keyed by ``key``.
-
-    Both backends meet the same element more than once: the hosted API nests a
-    dimension under every metric that can group by it, and locally the same
-    entity appears in every semantic model that declares it. The copies need not
-    agree, so each field takes the first non-null value seen rather than the
-    first copy outright. Under a plain ``setdefault`` on the whole element,
-    whichever copy happened to come first could blank out a description another
-    one carried.
-
-    ``key`` is passed rather than read off the element because the local backend
-    files a dimension under its entity-qualified name (``session__created_at``)
-    while the element itself carries the bare one.
-    """
-
-    fields = store.setdefault(key, {})
-    if not fields.get("type"):
-        fields["type"] = (element.get("type") or "").lower()
-    for name in ("label", "description"):
-        if fields.get(name) is None:
-            fields[name] = element.get(name)
+# The catalog's element models are neutral and shared with the project seam, so
+# they live in `exmergo_dex_core.semantic_catalog` rather than here. Re-exported
+# because both backends and every existing consumer import them from this module.
+__all__ = [
+    "DIMENSIONS_PER_DECLARATION",
+    "DIMENSIONS_PER_QUERYABLE_PATH",
+    "DimensionInfo",
+    "EntityInfo",
+    "EntityRole",
+    "MeasureInfo",
+    "MetricComposition",
+    "MetricInfo",
+    "SemanticBackend",
+    "SemanticBackendError",
+    "SemanticCatalog",
+    "SemanticModelInfo",
+    "SemanticQuery",
+    "SemanticQueryRefusedError",
+    "backend_axes",
+    "cap_columnar",
+    "cost_posture",
+    "derive_entity_type",
+    "merge_element_fields",
+    "qualified_dimension",
+    "requested_dimension_refs",
+    "resolve_backend",
+    "screen_dimension_refs",
+]
 
 
 def _element_data(element: Any) -> dict[str, Any]:
-    """One catalog element as a dict, with its unset optional fields omitted.
+    """One catalog element as a dict, with its unset optional fields omitted, at
+    every level.
 
     A catalog is agent context, so a project that declares no labels should not
     pay for null placeholders: measured against our own deployment (which
-    populates ``label`` on 0 of 65 dimensions and ``description`` on 1 of 65),
-    they were most of the dimensions and entities blocks. Absent means unset,
-    the same rule on metrics, dimensions and entities alike. An empty list
-    survives, because "no groupable dimensions" is an answer where None is not.
+    populated ``label`` on 0 of 65 dimensions at the time the rule was
+    introduced), they were most of the dimensions and entities blocks. Absent
+    means unset, the same rule on every element kind.
+
+    It recurses because composition is a sparse record: a simple metric has no
+    numerator, and each metric type filling only the parts that apply to it is
+    what makes an absent key mean "this metric has no such part" rather than
+    "unknown". A nested record that prunes away to nothing is dropped whole, so a
+    metric whose composition dex could not read carries no empty shell.
+
+    An empty *list* survives, because "no groupable dimensions" is an answer where
+    None is not.
     """
 
-    return {k: v for k, v in asdict(element).items() if v is not None}
+    def prune(value: Any) -> Any:
+        if isinstance(value, dict):
+            kept = {k: prune(v) for k, v in value.items() if v is not None}
+            return {k: v for k, v in kept.items() if v != {}}
+        if isinstance(value, list):
+            return [prune(v) for v in value]
+        return value
+
+    return prune(asdict(element))
 
 
 @dataclass
-class SemanticCatalog:
+class SemanticCatalog(SemanticCatalogView):
     """What ``explore semantic list`` returns: enough for an agent to discover what
-    it can query, in the same shape from either backend."""
+    it can query, in the same shape from either backend.
 
-    backend: str
-    metrics: list[MetricInfo] = field(default_factory=list)
-    dimensions: list[DimensionInfo] = field(default_factory=list)
-    entities: list[EntityInfo] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)
-    # Which layer answered, on the axes that are actually orthogonal. `backend`
-    # above is the released one-enum spelling and stays; these three say the same
-    # thing without collapsing vendor, deployment and who executes into one value.
+    The five lists and ``dimension_scope`` are the neutral view every project
+    format and every backend produces; this adds what only the answering backend
+    knows. ``backend``, ``vendor``, ``deployment`` and ``execution`` are its
+    provenance. ``unavailable`` is its **declared gaps**: which fields of which
+    element kind it structurally cannot supply, so a caller can tell "the project
+    declared none" from "this path cannot carry it".
+
+    That distinction is in the payload rather than in a note on purpose. A note is
+    prose, and prose is the first thing a caller with a context window truncates;
+    an absence that a consumer must branch on has to be machine-readable. Each
+    backend declares its gaps once, as a class attribute, the way it declares its
+    execution axis.
+    """
+
+    backend: str = ""
     vendor: str = ""
     deployment: str = ""
     execution: str = ""
+    unavailable: dict[str, list[str]] = field(default_factory=dict)
+    # Which metrics this catalog was narrowed to, empty when it is the whole
+    # layer. In the payload because a subset that cannot be told apart from a
+    # complete answer is the failure mode worth designing against: a caller
+    # reading a scoped catalog as the layer concludes the rest does not exist.
+    scoped_to: list[str] = field(default_factory=list)
 
     @classmethod
     def from_backend(cls, backend: Any, **fields: Any) -> SemanticCatalog:
-        """Build with the answering backend's own provenance filled in, so a new
-        backend declares its axes once as class attributes rather than spelling
-        them into every catalog it returns."""
+        """Build with the answering backend's own provenance and declared gaps
+        filled in, so a new backend states both once as class attributes rather
+        than spelling them into every catalog it returns."""
 
-        return cls(**backend_axes(backend), **fields)
+        # Explicit fields win over the declarations, so a backend building from a
+        # project format's own view carries what that format actually produced
+        # rather than what the backend declares in the general case.
+        declared = {**backend_axes(backend), **catalog_declarations(backend)}
+        return cls(**{**declared, **fields})
+
+    @classmethod
+    def from_view(
+        cls, view: SemanticCatalogView, backend: Any, **fields: Any
+    ) -> SemanticCatalog:
+        """Build from a project format's neutral view, adding only what the
+        backend knows.
+
+        ``physical_columns`` is deliberately not carried across: it is how the
+        format resolves a token for the PII gate, not part of the catalog a caller
+        reads, and :meth:`to_data` names its keys explicitly so nothing leaks by
+        being present on the dataclass.
+        """
+
+        notes = [*view.notes, *fields.pop("notes", [])]
+        return cls.from_backend(
+            backend,
+            semantic_models=view.semantic_models,
+            metrics=view.metrics,
+            dimensions=view.dimensions,
+            entities=view.entities,
+            measures=view.measures,
+            dimension_scope=view.dimension_scope,
+            notes=notes,
+            **fields,
+        )
 
     def to_data(self) -> dict[str, Any]:
-        return {
+        """The payload, provenance first.
+
+        Key order in JSON carries no meaning to a parser and is decisive for an
+        agent reading a truncated result, so the scalars that say which layer
+        answered and what it could not answer lead, and the long lists follow.
+        """
+
+        payload: dict[str, Any] = {
             "backend": self.backend,
             "vendor": self.vendor,
             "deployment": self.deployment,
             "execution": self.execution,
-            "metrics": [_element_data(m) for m in self.metrics],
-            "dimensions": [_element_data(d) for d in self.dimensions],
-            "entities": [_element_data(e) for e in self.entities],
-            "notes": self.notes,
+            "dimension_scope": self.dimension_scope,
         }
+        if self.scoped_to:
+            payload["scoped_to"] = self.scoped_to
+        if self.unavailable:
+            payload["unavailable"] = self.unavailable
+        payload.update(
+            {
+                "semantic_models": [_element_data(m) for m in self.semantic_models],
+                "metrics": [_element_data(m) for m in self.metrics],
+                "dimensions": [_element_data(d) for d in self.dimensions],
+                "entities": [_element_data(e) for e in self.entities],
+                "measures": [_element_data(m) for m in self.measures],
+                "notes": self.notes,
+            }
+        )
+        return payload
 
 
 class SemanticBackendError(DexError):
@@ -234,12 +296,22 @@ class SemanticBackend(Protocol):
     runs the statement, and therefore whether dex's cost guard can apply. A
     backend that answers ``vendor`` inherits the whole no-guard posture from
     :func:`cost_posture` instead of assembling it again.
+
+    ``catalog_gaps`` and ``dimension_scope`` are the same idea applied to the
+    catalog. A backend states, once, which fields of which element kind it cannot
+    supply and what one dimension row of its catalog is, and both travel into the
+    payload as data. That is what keeps a structural absence from having to be
+    inferred from a missing key or read out of a note, and it is why two backends
+    reporting different dimension counts for one layer is now an explained
+    difference rather than an unexplained one.
     """
 
     name: str
     vendor: str
     deployment: str
     execution: str
+    catalog_gaps: dict[str, list[str]]
+    dimension_scope: str
 
     def list_definitions(self) -> SemanticCatalog: ...
 
@@ -262,6 +334,23 @@ def backend_axes(backend: Any) -> dict[str, str]:
         "vendor": getattr(backend, "vendor", ""),
         "deployment": getattr(backend, "deployment", ""),
         "execution": getattr(backend, "execution", ""),
+    }
+
+
+def catalog_declarations(backend: Any) -> dict[str, Any]:
+    """A backend's catalog declarations as payload fields, read off the backend.
+
+    Separate from :func:`backend_axes` because the two answer different
+    questions (which layer answered, versus what its catalog can and cannot say)
+    and a backend may reasonably declare one and not the other. Read with
+    ``getattr`` defaults so a duck-typed backend, including a test double
+    narrower than the protocol, still produces a well-formed catalog.
+    """
+
+    return {
+        "unavailable": dict(getattr(backend, "catalog_gaps", None) or {}),
+        "dimension_scope": getattr(backend, "dimension_scope", None)
+        or DIMENSIONS_PER_DECLARATION,
     }
 
 

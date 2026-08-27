@@ -9,7 +9,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+**Payload growth, called out because nothing caps it yet.** Widening every element
+grows the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
+measures, `--local` grew 1.8x and `--api` 1.4x, almost all of it new objects and
+the project's own prose rather than placeholders. `--metric` scoping ships with the
+change rather than after it for that reason, and brings a single metric's catalog
+to a tenth of the layer's. A budget for the unscoped payload is still open work.
+
 ### Fixed
+
+- **An entity's `type` was whichever declaration the iteration reached first, and
+  both backends reported it wrong** ([#350]). `type` is a property of the
+  (entity, semantic model) declaration, not of the entity: one entity is `primary`
+  in the model that keys it and `foreign` in every model that joins to it. The
+  catalog folded every copy into one record and kept the first non-null value, so
+  the reported type was iteration order.
+
+  Measured on one layer: the two backends disagreed with each other on two of three
+  entities checked, and both reported the layer's most-joined entity as `foreign`
+  when it is primary in the model that keys it. An agent reading that catalog to
+  work out the join graph was reading noise.
+
+  An entity now carries `roles`, one entry per declaration, each with that model's
+  own `type`, its `expr` (the physical join key, which differs per model for the
+  same entity) and its `role` and `description`. The same merge had been discarding
+  those descriptions, which is where a project documents each model's own join,
+  including how much of a model is lost to a nullable key: for an entity declared
+  in seven models it kept one description and dropped six, with nothing saying so.
+
+  The top-level `type` is kept, because consumers render it, and is now **derived**:
+  primary wherever any declaration is primary, and documented as derived. A
+  consumer reading it gets a correct summary instead of an order-dependent value,
+  and both backends now agree on the same layer.
+
 
 - **`explore semantic query --api` now holds the semantic layer's own PII
   metadata for every dimension a query touches, not just for the ones all of its
@@ -44,6 +76,84 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`explore semantic list` returns the semantic layer's objects, not three lists
+  of names** ([#349], [#351], [#352]). A semantic layer is a graph: semantic
+  models each sit on one physical relation and own the entities they join on, the
+  dimensions they can be sliced by and the measures their metrics are built from,
+  and a metric is composed out of those measures and may span several models. Both
+  the project YAML and the dbt Cloud API are organized that way. The catalog was
+  organized around none of it, and had no semantic model in it at all, so on a
+  layer of a dozen models it was one undifferentiated list of dimension names with
+  nothing saying which part of the layer any of them came from.
+
+  Three objects arrive and every element gains provenance. `semantic_models` is the
+  layer's organizing unit, carrying the transformation-layer model it sits on and
+  the default time dimension that decides what a time grouping means for every
+  metric over its measures. `measures` is what a metric actually counts: the
+  aggregation, the expression, and the resolved time dimension. Every dimension,
+  entity and measure now names the semantic model it belongs to, and a metric names
+  the models it draws on. **The lists stay flat**, with provenance as a field
+  rather than elements nested inside their model, because a flat lookup is what
+  the PII gate and every existing consumer already do and it is also the shape a
+  non-dbt semantic layer can satisfy.
+
+  A metric also carries what it is built from. `input_measures` resolves through
+  any ratio or derived chain to the aggregations the number really reads, and
+  `composition` carries a ratio's numerator and denominator, a derived metric's
+  expression and inputs, and a simple metric's measure. A ratio metric used to
+  arrive as a name and the word `ratio`, which is not enough to tell whether the
+  ratio is additive, whether two ratios share a denominator, or whether the two
+  sides come from different semantic models, and that last one is what decides
+  whether a given group-by is valid on both. A metric's `filter` is carried too, so
+  a metric that measures a subset says so instead of looking like one that does
+  not.
+
+  Composition stays portable and this vendor's own vocabulary stays separate. A
+  ratio's two sides and a derived metric's inputs mean the same thing in any
+  semantic-layer format, so they are in the shared shape; MetricFlow's cumulative
+  `window`, its `grain_to_date` and a derived metric's per-input offset windows only
+  mean something here, so they travel under one declared `vendor_params` key rather
+  than being promoted into a core that a second format could not fill.
+
+  Nothing here costs a warehouse query, and nothing costs an extra round trip: the
+  hosted catalog is a wider selection set on the one request dex already issued,
+  and the local one is a single read of the compiled artifact. There is a test
+  pinning that, because the temptation in each of the follow-on changes is to reach
+  for a scan.
+
+- **`explore semantic list --metric <m>` narrows the catalog to the metrics a
+  caller came for**. Discovery on a large layer is one payload and most of it is
+  about something else, and widening every element made that worse. The scope keeps
+  the named metrics and everything reachable from them: the measures they read, the
+  semantic models those live in, the dimensions they can be grouped by, and the
+  entities declared in any surviving model. Measured on a layer of 11 semantic
+  models and 27 metrics, one metric's catalog is a tenth of the whole layer's.
+
+  It costs no extra round trip and no warehouse query, the shape is unchanged, and
+  the payload names the scope in `scoped_to` so a subset is never mistaken for the
+  layer. An entity keeps **all** of its declarations even where the scope dropped
+  the model they name, because pruning them would turn a primary entity into a
+  foreign one, which is a false statement about the layer rather than a smaller
+  one. A metric name the layer does not have is refused by name rather than
+  answered with a plausible empty catalog.
+
+- **Two legitimate differences between the backends are declared in the payload
+  rather than left to be inferred** ([#349]). `dimension_scope` says what one
+  dimension row is: `--local` returns one row per declaration, single-hop
+  qualified, while `--api` returns one row per token a query may group by,
+  join-resolved, so a dimension reached through a join appears once per path that
+  reaches it. On one identical layer that is a 44% difference in the dimension
+  count, and until now nothing in the payload explained it. `definition` and
+  `semantic_model` on each row are what let a caller see that several paths reach
+  one declaration.
+
+  `unavailable` names the fields a backend structurally cannot supply, per element
+  kind. The dbt Cloud API's `SemanticModel` type carries only a name, its `Entity`
+  type has no label at all, and its `Measure` type carries no words, so a hosted
+  catalog says which fields those are. A note was the only carrier for this before,
+  and a note is the part of a payload a caller with a context window truncates
+  first: an absence a consumer has to branch on has to be machine-readable.
+
 - **`semantic.vendor` and `semantic.deployment` separate which semantic-layer
   format answers from which of its endpoints is read** ([#348]). One
   `semantic.backend` enum carried three things at once: the vendor, the
@@ -69,6 +179,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   as one command's two modes.
 
 ### Changed
+
+- **`explore semantic list --local` reads the project through the project seam
+  instead of parsing dbt's artifacts itself** ([#353]). Both the catalog read and
+  the PII gate's column resolution called a private function on the dbt module and
+  re-parsed the compiled semantic manifest, so the local semantic read path was
+  hardwired to dbt while a format-neutral seam designed for exactly this sat unused
+  beside it.
+
+  A project format now answers `semantic_catalog()`, one optional protocol beside
+  tier 2, and the format owns the reduction from whatever it holds on disk into the
+  neutral catalog. That deletes a parser rather than adding one, makes the local
+  catalog format-agnostic as a side effect, and means a second semantic-layer
+  format inherits a working local read path instead of needing a third parser. The
+  same seam carries the `(relation, column)` map the PII request-gate resolves a
+  dimension token through, which puts that resolution where the knowledge is.
+
+  **Beside tier 2 rather than a third member of it.** The project protocols are
+  `runtime_checkable` and the tier is checked structurally, so adding a member to
+  `MaintainProject` would have silently dropped every format implementing the two
+  existing ones to tier 1, and `maintain` would have degraded to "cannot be a
+  drift baseline" for a format that is one. It is also a second channel rather than
+  a widening of `semantic_layer()`, which is a fingerprint: it hashes what the
+  author wrote so a stored baseline survives a dbt upgrade, and it is right to
+  throw away the types, labels, aggregations and composition a reader needs.
+  Widening it to serve reads would have cost it the stability it exists for.
+
+  A format that reads no semantic layer implements nothing here and is refused by
+  name, rather than returning an empty catalog that reads as a layer with nothing
+  in it. `SemanticCatalogContract` is the conformance suite for the new channel,
+  and there is now a control asserting `explore semantic list --local` actually
+  routes through the seam, which is what the tier-2 layers already had.
 
 - **`semantic.backend` is still accepted, and reads as one spelling of the two
   new axes** ([#348]). `backend: local` is dbt plus the local deployment,

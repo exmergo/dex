@@ -64,6 +64,7 @@ from ..maintain import snapshot
 if TYPE_CHECKING:
     from ..dbt_project import DbtProjectView, ProjectDefinitions
     from ..maintain.snapshot import SemanticLayer, TransformLayer
+    from ..semantic_catalog import SemanticCatalogView
     from ..transform.plans import EditKind
 
 __all__ = [
@@ -76,8 +77,10 @@ __all__ = [
     "ProjectContext",
     "ProjectFactory",
     "ProjectView",
+    "SemanticCatalogProject",
     "SourceFileView",
     "placement_gap",
+    "semantic_catalog_gap",
     "tier_of",
 ]
 
@@ -135,6 +138,48 @@ class MaintainProject(ExploreProject, Protocol):
     def transform_layer(self) -> TransformLayer: ...
 
     def semantic_layer(self) -> SemanticLayer: ...
+
+
+@runtime_checkable
+class SemanticCatalogProject(Protocol):
+    """Optional beside tier 2: the semantic layer as a catalog a caller reads.
+
+    Tier 2's :meth:`MaintainProject.semantic_layer` is a *fingerprint*: a content
+    hash per definition plus the physical column behind each field, sized for
+    detecting drift and persisted as a baseline. It deliberately reduces away
+    everything a reader wants and a comparison does not, which is types, labels,
+    descriptions, aggregations, metric composition, and the token a query actually
+    groups by. Hashing what the author wrote rather than what a compiler produced
+    is what keeps a baseline stable across tool upgrades, so widening it to serve
+    reads would cost the property it exists for.
+
+    So this is a second channel over the same layer, not a widening of the first.
+    ``explore semantic list --local`` reads it, which is how the local catalog
+    stops re-parsing the dbt artifacts a format was supposed to hide and becomes
+    a read any format can answer.
+
+    **Beside tier 2 rather than a third member of it**, following
+    :class:`PlacingProject`. The tiers are satisfied structurally, so adding a
+    member to ``MaintainProject`` would silently drop every format that already
+    implements the two existing ones to tier 1, and ``maintain`` would degrade to
+    "cannot be a drift baseline" for a format that is one. A capability a format
+    may decline belongs in its own protocol, where declining it is an answer
+    rather than a regression.
+
+    Declining is legitimate: a project format with no semantic layer implements
+    nothing here and `explore semantic --local` refuses by name instead of
+    returning an empty catalog that reads as a layer with nothing in it.
+    """
+
+    def semantic_catalog(self) -> SemanticCatalogView:
+        """The semantic layer as a read catalog.
+
+        May raise :class:`~..errors.ProjectError`, and should where the layer
+        cannot be read *yet* as opposed to being empty. An uncompiled project and
+        a project that declares no metrics are different answers, and only one of
+        them is fixed by running a command.
+        """
+        ...
 
 
 @runtime_checkable
@@ -551,6 +596,26 @@ def placement_gap(project: object) -> str | None:
     )
 
 
+def semantic_catalog_gap(project: object) -> str:
+    """Why this format cannot answer a semantic catalog, named rather than implied.
+
+    Reached only when the format does not satisfy
+    :class:`SemanticCatalogProject`, and phrased for the caller that hit it: a
+    reader asked what the layer contains and the format has no channel for the
+    question. It names the member to implement, because the alternative a caller
+    otherwise gets is an empty catalog, which reads as a semantic layer with
+    nothing in it.
+    """
+
+    named = getattr(project, "name", type(project).__name__)
+    return (
+        f"the '{named}' project format does not read a semantic layer, so there "
+        "is no catalog to list; implement `semantic_catalog()` to reach "
+        "exmergo_dex_core.adapters.project.SemanticCatalogProject, or query a "
+        "hosted deployment instead"
+    )
+
+
 class DbtProject:
     """The dbt implementation of the project seam.
 
@@ -659,6 +724,19 @@ class DbtProject:
 
     def semantic_layer(self) -> SemanticLayer:
         return snapshot.semantic_layer(self.load())
+
+    def semantic_catalog(self) -> SemanticCatalogView:
+        """Read from the compiled artifact directly, without loading the view.
+
+        The one member here that does not go through :meth:`load`, because the
+        catalog lives entirely in ``target/`` and loading would scan and hash
+        every authored file to answer a question none of them can. It also keeps
+        the prerequisite honest: a compiled semantic manifest is what this needs,
+        not a project that parses as a whole.
+        """
+
+        project = self.project_dir or dbt_project.find_project(self.repo_root)
+        return dbt_project.semantic_catalog(Path(project).resolve())
 
     def write_edits(
         self, edits: Any, project_dir: Any = None, *, confirmed: bool = False
