@@ -80,19 +80,25 @@ def test_a_node_is_a_model_a_snapshot_or_a_seed_and_nothing_else(maintain_repo):
     assert layer.model_refs["snap_orders"] == ["stg_orders"]
 
 
-def test_a_baseline_pinned_before_the_widening_reports_no_phantom_drift(
-    maintain_repo,
-):
-    """The risk this change carries, checked rather than assumed.
+def test_a_widened_baseline_now_reports_real_transform_drift(maintain_repo):
+    """The follow-through once ``transform_drift`` exists (#164).
 
-    A baseline pinned before the new families were loaded holds a smaller file
-    set and a models list that counted macros. Adding those files must read as
-    "nothing drifted", because no detector diffs the file set or the model list:
-    they feed `orphan_relation` and the semantic dangling-reference check, both
-    of which ask whether a *warehouse* table is still backed by the project.
+    This used to be the risk-check for the node-family widening: a baseline
+    pinned before snapshots/seeds/tests/analyses were loaded holds a smaller
+    file set and a models list that counted macros, and the claim was that
+    adding those files read as "nothing drifted" because no detector diffed
+    the file set or the model list at all.
 
-    Re-run against every family as they are added, since the widening is what
-    carries the risk and each new one widens it again.
+    That claim is no longer true, deliberately: `transform_drift` (#164) now
+    diffs `models` against the baseline, so the two real new nodes `_populate`
+    adds (a snapshot and a seed; the macro, singular test, and analysis it
+    also adds stay non-models, per this file's other test) read as
+    `model_added`. The macro filename injected into the baseline below reads
+    as `model_removed` once diffed, which is the widening's phantom turned
+    real: the detector cannot tell "this was never a real model" apart from
+    "this model was deleted", the same limitation `semantic_free_drift`'s
+    `definition_removed` already has for a semantic layer's own extraction
+    logic changing between versions.
     """
 
     maintain_repo.snapshot()
@@ -108,4 +114,9 @@ def test_a_baseline_pinned_before_the_widening_reports_no_phantom_drift(
 
     rc, payload = maintain_repo.dex("maintain", "check")
     assert rc == 0 and payload["status"] == "ok"
-    assert payload["data"]["finding_count"] == 0, payload["data"]["findings"]
+    findings = {(f["code"], f["identifier"]) for f in payload["data"]["findings"]}
+    assert findings == {
+        ("model_added", "snap_orders"),
+        ("model_added", "status_labels"),
+        ("model_removed", "cents_to_dollars"),
+    }, payload["data"]["findings"]

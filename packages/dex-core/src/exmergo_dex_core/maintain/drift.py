@@ -150,6 +150,10 @@ def schema_drift(
     enables ``orphan_relation``: a table present at the baseline and now, that
     the baseline's project built or sourced but the live project no longer
     does. Without it (no project available), that check is skipped.
+
+    ``transform_drift`` is the same transform layer compared a second way (a
+    model added, removed, or content-changed since the baseline) and is its
+    own function; every caller here runs both and reports them as one axis.
     """
 
     baseline = {d.identifier: d for d in snap.warehouse.datasets}
@@ -336,6 +340,77 @@ def schema_drift(
                         data=({"declared_in": source.path} if source.path else {}),
                     )
                 )
+    return findings
+
+
+def transform_drift(
+    current_transform: TransformLayer | None,
+    snap: Snapshot,
+) -> list[DriftFinding]:
+    """A model added, removed, or content-changed since the baseline.
+
+    Symmetric with ``semantic_free_drift``'s ``definition_added``/``_removed``/
+    ``_changed``, over ``TransformLayer.models``/``.files`` instead of
+    semantic model/metric definitions. Folded into the ``schema`` axis rather
+    than a new one of its own: ``schema_drift`` already loads the project's
+    transform layer for ``orphan_relation``, and this is the same fingerprint
+    compared a second way.
+
+    ``model_changed`` diffs content hashes through ``model_paths``, so it also
+    catches a rewired ``ref()``/``source()`` call: rewiring one changes the
+    file's text, and so its hash, with no second comparison over
+    ``model_refs``/``model_sources`` needed. A model missing from either
+    side's ``model_paths`` (a baseline pinned before that field existed) is
+    skipped for the content comparison rather than reported changed: an
+    unknown is not a diff.
+    """
+
+    findings: list[DriftFinding] = []
+    baseline = snap.transform_layer
+    if baseline is None or current_transform is None:
+        return findings
+
+    base_models = set(baseline.models)
+    cur_models = set(current_transform.models)
+
+    findings.extend(
+        DriftFinding(
+            axis="schema",
+            code="model_added",
+            identifier=name,
+            severity="low",
+            detail=f"model '{name}' is new since the baseline",
+        )
+        for name in sorted(cur_models - base_models)
+    )
+    findings.extend(
+        DriftFinding(
+            axis="schema",
+            code="model_removed",
+            identifier=name,
+            severity="low",
+            detail=f"model '{name}' was removed since the baseline",
+        )
+        for name in sorted(base_models - cur_models)
+    )
+    for name in sorted(base_models & cur_models):
+        base_path = baseline.model_paths.get(name)
+        cur_path = current_transform.model_paths.get(name)
+        if base_path is None or cur_path is None:
+            continue
+        base_hash = baseline.files.get(base_path)
+        cur_hash = current_transform.files.get(cur_path)
+        if base_hash is not None and cur_hash is not None and base_hash != cur_hash:
+            findings.append(
+                DriftFinding(
+                    axis="schema",
+                    code="model_changed",
+                    identifier=name,
+                    severity="low",
+                    detail=f"model '{name}' changed since the baseline",
+                    data={"path": cur_path},
+                )
+            )
     return findings
 
 

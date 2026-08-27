@@ -410,6 +410,9 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     scope_names = list(objects or [])
     scope = _resolve_scope(scope_names, current, snap)
     findings = drift_mod.schema_drift(current, snap, scope, current_transform)
+    # Not scoped by `objects`: a model's identifier is its project name, not a
+    # warehouse identifier, and `scope` above is resolved against the latter.
+    findings.extend(drift_mod.transform_drift(current_transform, snap))
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
@@ -641,6 +644,9 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     schema_findings = drift_mod.schema_drift(
         current_datasets, snap, scope, current_transform
     )
+    # Not scoped by `objects`, same reason as in schema_drift(): a model's
+    # identifier is its project name, not a warehouse identifier.
+    schema_findings.extend(drift_mod.transform_drift(current_transform, snap))
     volume_findings = drift_mod.volume_drift(current_datasets, snap, scope)
     warnings.extend(drift_mod.uncomparable_volume(current_datasets, snap, scope))
     semantic_findings = (

@@ -13,6 +13,58 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **`explore semantic list --local` reads the project through the project seam
+  instead of parsing dbt's artifacts itself** ([#353]). Both the catalog read and
+  the PII gate's column resolution called a private function on the dbt module and
+  re-parsed the compiled semantic manifest, so the local semantic read path was
+  hardwired to dbt while a format-neutral seam designed for exactly this sat unused
+  beside it.
+
+  A project format now answers `semantic_catalog()`, one optional protocol beside
+  tier 2, and the format owns the reduction from whatever it holds on disk into the
+  neutral catalog. That deletes a parser rather than adding one, makes the local
+  catalog format-agnostic as a side effect, and means a second semantic-layer
+  format inherits a working local read path instead of needing a third parser. The
+  same seam carries the `(relation, column)` map the PII request-gate resolves a
+  dimension token through, which puts that resolution where the knowledge is.
+
+  **Beside tier 2 rather than a third member of it.** The project protocols are
+  `runtime_checkable` and the tier is checked structurally, so adding a member to
+  `MaintainProject` would have silently dropped every format implementing the two
+  existing ones to tier 1, and `maintain` would have degraded to "cannot be a
+  drift baseline" for a format that is one. It is also a second channel rather than
+  a widening of `semantic_layer()`, which is a fingerprint: it hashes what the
+  author wrote so a stored baseline survives a dbt upgrade, and it is right to
+  throw away the types, labels, aggregations and composition a reader needs.
+  Widening it to serve reads would have cost it the stability it exists for.
+
+  A format that reads no semantic layer implements nothing here and is refused by
+  name, rather than returning an empty catalog that reads as a layer with nothing
+  in it. `SemanticCatalogContract` is the conformance suite for the new channel,
+  and there is now a control asserting `explore semantic list --local` actually
+  routes through the seam, which is what the tier-2 layers already had.
+
+- **Three behavior changes that come with the semantic-layer work, none of which
+  breaks the contract.** A metric query whose backend cannot read its own filter
+  dialect is now refused rather than screened on its group-by half alone
+  ([#357]); both shipped backends read theirs, so no shipped path changes. On an
+  install with the `[semantic]` extra, `explore semantic list --local` returns
+  more dimension rows than before and reports `queryable_paths` rather than
+  `declarations`, because the join graph is now resolved ([#356]); the payload says
+  which of the two it is holding either way. And the grain vocabulary a group-by
+  token is read against widened from five values to the layer's own, so a token
+  ending in something like `__hour` is now read as a grain suffix ([#355]).
+
+- **`semantic.backend` is still accepted, and reads as one spelling of the two
+  new axes** ([#348]). `backend: local` is dbt plus the local deployment,
+  `backend: dbt_cloud` is dbt plus the hosted one, and `api` and `cloud` remain
+  accepted spellings of the latter. Nothing in an existing `.dex/config.yml`
+  needs to change. Setting `backend` and `deployment` together is fine while
+  they agree and refused when they contradict: they are two spellings of one
+  choice, and picking a winner would leave the other accepted and ignored, which
+  reads as a setting that took effect. A vendor or deployment dex does not ship
+  is refused by name rather than resolving to the default.
+
 - **Three behavior changes that come with the row-count and ledger fixes, none of
   which breaks the contract.**
 
@@ -108,6 +160,36 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   an object the warehouse does not count. It now names those objects instead of
   returning no finding for them, because an absent finding reads as "checked, and
   nothing moved".
+
+- **A governed macro for dropping orphan relations** ([#151]), the execution
+  half PR #146 deferred when it shipped `orphan_relation` detection
+  ([#113]). `maintain reconcile` used to hand back a bare `DROP TABLE ...;`
+  string for a human to type by hand; it now proposes scaffolding
+  `transform macro drop_orphan_relations` and running it through `dbt
+  run-operation`, with the exact invocation (the finding's identifier
+  already filled into `--args`) spelled out in the proposal. Reconciling
+  more than one orphan in a run adds one more warning naming a single
+  batched invocation for all of them.
+
+  The macro itself takes an explicit list of relations (nothing inferred),
+  is dry-run by default, resolves and drops through `adapter.get_relation`/
+  `adapter.drop_relation` rather than a hand-written DDL string, and refuses
+  to run at all if any named relation is still a live model, seed, or
+  snapshot in the current manifest, so a typo in the list cannot delete
+  something real. A relation that no longer exists in the warehouse is
+  skipped rather than raised on, so the same list is safe to re-run per
+  target. dex still never executes it: authoring the macro and printing the
+  invocation is as far as dex's role goes, the same boundary `transform
+  macro` already draws for every other shipped macro, and the human runs it
+  under the project's own deploy identity.
+
+  Two pieces of the original issue are explicitly deferred rather than
+  bundled in here, matching the scope PR #146 itself drew: a three-state
+  classification (provable dbt orphan / foreign object / unknown) needs dex
+  to retain more than the single most-recent `maintain snapshot`, which
+  today's storage protocol does not keep; and running the macro directly on
+  a dev target through the existing build preflight is a separate, bounded
+  addition to `transform build`'s dbt-invocation surface.
 
 - **The skill wrapper installed neither semantic extra, so most of
   `explore semantic` refused through the skill** ([#358]).
@@ -247,6 +329,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
+
+- **`maintain schema` detects a model added, removed, or content-changed
+  since the baseline** ([#164]). The transform layer's fingerprint (model
+  names, per-file content hashes) was captured on every snapshot and
+  reported back as `file_count`/`model_count`/`source_count`, but nothing
+  ever diffed it: a model added to the project, removed, rewired to a
+  different `ref()`/`source()`, or edited in place all raised zero drift.
+  Only a warehouse table left orphaned by the change was ever caught
+  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
+  existing `definition_added`/`_removed`/`_changed`, closes that gap with
+  `model_added`, `model_removed`, and `model_changed` findings, folded into
+  the existing `schema` axis rather than a new one of its own (it already
+  loads the project's transform layer for `orphan_relation`).
+
+  `model_changed` diffs content hashes through a new `TransformLayer.
+  model_paths` (model name to the one file that builds it), so it also
+  catches a rewired `ref()`/`source()` call without a second comparison:
+  rewiring one changes the file's text, and so its hash. A baseline pinned
+  before this field existed has an empty `model_paths`, and a model missing
+  from it is skipped for the content comparison rather than reported
+  changed.
+
+  Reconcile treats `model_*` findings the same way it already treats a
+  semantic `definition_*` finding: the project's own edit, not a
+  warehouse-side problem to fix, so no proposal is generated, just a nudge
+  to re-run `maintain snapshot` if the change is intended.
+
+  This reverses a previously deliberate, tested design decision (a
+  regression test locked in "no detector diffs the model list" as intended
+  behavior); that test now pins the opposite, and the reasoning for both is
+  recorded on it and on `transform_drift` itself.
 
 - **`explore semantic list` is capped, searchable, and accounts for what it left
   out** ([#362]). It was the one explore command that budgeted nothing: every
@@ -645,60 +758,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   flag. The format is chosen once and is then ambient, exactly like
   `connector:`, and a per-command vendor flag would present two different layers
   as one command's two modes.
-
-### Changed
-
-- **`explore semantic list --local` reads the project through the project seam
-  instead of parsing dbt's artifacts itself** ([#353]). Both the catalog read and
-  the PII gate's column resolution called a private function on the dbt module and
-  re-parsed the compiled semantic manifest, so the local semantic read path was
-  hardwired to dbt while a format-neutral seam designed for exactly this sat unused
-  beside it.
-
-  A project format now answers `semantic_catalog()`, one optional protocol beside
-  tier 2, and the format owns the reduction from whatever it holds on disk into the
-  neutral catalog. That deletes a parser rather than adding one, makes the local
-  catalog format-agnostic as a side effect, and means a second semantic-layer
-  format inherits a working local read path instead of needing a third parser. The
-  same seam carries the `(relation, column)` map the PII request-gate resolves a
-  dimension token through, which puts that resolution where the knowledge is.
-
-  **Beside tier 2 rather than a third member of it.** The project protocols are
-  `runtime_checkable` and the tier is checked structurally, so adding a member to
-  `MaintainProject` would have silently dropped every format implementing the two
-  existing ones to tier 1, and `maintain` would have degraded to "cannot be a
-  drift baseline" for a format that is one. It is also a second channel rather than
-  a widening of `semantic_layer()`, which is a fingerprint: it hashes what the
-  author wrote so a stored baseline survives a dbt upgrade, and it is right to
-  throw away the types, labels, aggregations and composition a reader needs.
-  Widening it to serve reads would have cost it the stability it exists for.
-
-  A format that reads no semantic layer implements nothing here and is refused by
-  name, rather than returning an empty catalog that reads as a layer with nothing
-  in it. `SemanticCatalogContract` is the conformance suite for the new channel,
-  and there is now a control asserting `explore semantic list --local` actually
-  routes through the seam, which is what the tier-2 layers already had.
-
-- **Three behavior changes that come with the semantic-layer work, none of which
-  breaks the contract.** A metric query whose backend cannot read its own filter
-  dialect is now refused rather than screened on its group-by half alone
-  ([#357]); both shipped backends read theirs, so no shipped path changes. On an
-  install with the `[semantic]` extra, `explore semantic list --local` returns
-  more dimension rows than before and reports `queryable_paths` rather than
-  `declarations`, because the join graph is now resolved ([#356]); the payload says
-  which of the two it is holding either way. And the grain vocabulary a group-by
-  token is read against widened from five values to the layer's own, so a token
-  ending in something like `__hour` is now read as a grain suffix ([#355]).
-
-- **`semantic.backend` is still accepted, and reads as one spelling of the two
-  new axes** ([#348]). `backend: local` is dbt plus the local deployment,
-  `backend: dbt_cloud` is dbt plus the hosted one, and `api` and `cloud` remain
-  accepted spellings of the latter. Nothing in an existing `.dex/config.yml`
-  needs to change. Setting `backend` and `deployment` together is fine while
-  they agree and refused when they contradict: they are two spellings of one
-  choice, and picking a winner would leave the other accepted and ignored, which
-  reads as a setting that took effect. A vendor or deployment dex does not ship
-  is refused by name rather than resolving to the default.
 
 ## [1.8.0] - 2026-08-25
 

@@ -115,12 +115,20 @@ def build(
 
     schema_patches: dict[str, list[DriftFinding]] = {}
     definition_churn = False
+    orphan_identifiers: list[str] = []
     for finding in findings:
         if finding.axis == "schema" and finding.code in _PATCHABLE:
             schema_patches.setdefault(finding.identifier, []).append(finding)
-        elif finding.code.startswith("definition_"):
+        elif finding.code.startswith("definition_") or finding.code.startswith(
+            "model_"
+        ):
+            # A model added, removed, or content-changed is the project's own
+            # edit, the same as a semantic definition changing: there is no
+            # warehouse-side fix to propose, only a baseline to catch up.
             definition_churn = True
         else:
+            if finding.code == "orphan_relation":
+                orphan_identifiers.append(finding.identifier)
             proposals.append(_advisory(finding))
 
     for identifier, table_findings in sorted(schema_patches.items()):
@@ -212,9 +220,16 @@ def build(
 
     if definition_churn:
         warnings.append(
-            "definition changes since the baseline are recorded but not "
-            "reconciled: if the current definitions are intended, re-run "
-            "`maintain snapshot` to accept them as the new baseline"
+            "definition or model changes since the baseline are recorded but "
+            "not reconciled: if the current project state is intended, "
+            "re-run `maintain snapshot` to accept it as the new baseline"
+        )
+    if len(orphan_identifiers) > 1:
+        warnings.append(
+            f"{len(orphan_identifiers)} orphan relations found this run; once "
+            "you've confirmed none are read, drop them together in one "
+            "governed pass: dbt run-operation drop_orphan_relations --args "
+            f"'{_run_operation_args(orphan_identifiers)}'"
         )
     return proposals, edits, warnings
 
@@ -222,11 +237,15 @@ def build(
 # --- helpers -------------------------------------------------------------------
 
 
+def _run_operation_args(identifiers: list[str]) -> str:
+    """The ``--args`` payload for ``dbt run-operation drop_orphan_relations``."""
+
+    relations = ", ".join(f'"{identifier}"' for identifier in identifiers)
+    return f"{{relations: [{relations}], dry_run: false}}"
+
+
 def _advisory(finding: DriftFinding) -> Proposal:
     if finding.code == "orphan_relation":
-        drop_statement = finding.data.get(
-            "drop_statement", f"DROP TABLE {finding.identifier};"
-        )
         return Proposal(
             axis=finding.axis,
             kind="advisory",
@@ -235,8 +254,12 @@ def _advisory(finding: DriftFinding) -> Proposal:
             column=finding.column,
             action=(
                 "no dbt model or source declares this relation anymore; once "
-                "you've confirmed nothing reads it, drop it by hand (dex "
-                f"never executes this): {drop_statement}"
+                "you've confirmed nothing reads it, drop it through the "
+                "governed macro (dex never executes this itself): scaffold "
+                "it with `transform macro drop_orphan_relations` if the "
+                "project does not have it yet, then run dbt run-operation "
+                "drop_orphan_relations --args "
+                f"'{_run_operation_args([finding.identifier])}'"
             ),
         )
     actions = {

@@ -125,6 +125,43 @@ def test_generate_schema_name_scaffolds_into_an_existing_project(
     assert (dbt_project_dir / "macros" / "generate_schema_name.sql").is_file()
 
 
+def test_drop_orphan_relations_asset_ships_and_is_balanced():
+    # importlib.resources is how the engine loads it at runtime, so this is the
+    # packaging regression guard: a wheel that drops the asset fails here.
+    asset = (
+        resources.files("exmergo_dex_core.transform")
+        / "assets"
+        / "macros"
+        / "drop_orphan_relations.sql"
+    )
+    content = asset.read_text(encoding="utf-8")
+    assert content.count("{% macro ") == content.count("{% endmacro %}")
+    assert "adapter.get_relation" in content
+    assert "adapter.drop_relation" in content
+
+
+def test_drop_orphan_relations_scaffolds_and_parses_into_an_existing_project(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # dbt's own parser sees the macro in a shadow copy of the project before
+    # the plan is even proposed (transform/commands.py::macro), so a green
+    # run here also proves the Jinja is syntactically valid, not just that the
+    # file scaffolds.
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "macro", "drop_orphan_relations"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["macros/drop_orphan_relations.sql"]
+    unified = envelope["diffs"][0]["unified"]
+    assert "dry_run" in unified
+    assert "graph.nodes" in unified
+
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, envelope
+    assert (dbt_project_dir / "macros" / "drop_orphan_relations.sql").is_file()
+
+
 def test_macro_refuses_an_unknown_name_naming_the_available(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
