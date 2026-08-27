@@ -19,6 +19,7 @@ import json
 import re
 
 from exmergo_dex_core.config import QueryLimits
+from exmergo_dex_core.explore.semantic import SemanticBackendError
 from exmergo_dex_core.explore.semantic.hosted import HostedDbtCloudBackend
 
 # A token shaped like a real dbt Cloud Semantic Layer service token; the no-leak
@@ -72,6 +73,7 @@ class FakeHostedBackend(HostedDbtCloudBackend):
         status: str = "SUCCESSFUL",
         error: str | None = None,
         limits: QueryLimits | None = None,
+        values_need_a_metric: bool = False,
     ) -> None:
         super().__init__("fake.host", "42", SECRET_TOKEN, limits or QueryLimits())
         self._metrics = metrics or []
@@ -79,6 +81,12 @@ class FakeHostedBackend(HostedDbtCloudBackend):
         self._result = result
         self._status = status
         self._error = error
+        # The real layer refuses a distinct-values request for a dimension reached
+        # through a join, because there is no measure to join from, and accepts the
+        # same request once it is scoped to a metric. That refusal is the whole
+        # reason the backend renders twice, so the fake reproduces it rather than
+        # answering both shapes.
+        self._values_need_a_metric = values_need_a_metric
         self.posted: list[str] = []
 
     def _dimensions_for(self, metrics: list[str]) -> list[dict]:
@@ -103,6 +111,22 @@ class FakeHostedBackend(HostedDbtCloudBackend):
 
     def _post(self, query: str) -> dict:
         self.posted.append(query)
+        # The real layer resolves a values request in two places, and the
+        # difference is the whole reason the backend probes before it executes:
+        # `compileDimensionValuesSql` refuses synchronously and for free, while
+        # `createDimensionValuesQuery` accepts the same request and reports the
+        # refusal asynchronously, at poll time. A fake that refused the mutation
+        # would make the probe look unnecessary.
+        if "compileDimensionValuesSql" in query:
+            if self._values_need_a_metric and "metrics:" not in query:
+                raise SemanticBackendError(
+                    "semantic layer error: the given input does not match any of "
+                    "the available group-by-items for a distinct values query "
+                    "without metrics"
+                )
+            return {"compileDimensionValuesSql": {"queryId": "FAKE_CID"}}
+        if "createDimensionValuesQuery" in query:
+            return {"createDimensionValuesQuery": {"queryId": "FAKE_VID"}}
         if "createQuery" in query:
             return {"createQuery": {"queryId": "FAKE_QID"}}
         if "query(environmentId" in query:
