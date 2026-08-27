@@ -25,7 +25,7 @@ from typing import Any
 from ... import envelope as env
 from ... import metricflow_dialect
 from ...config import QueryLimits
-from ...semantic_catalog import SemanticCatalogView
+from ...semantic_catalog import SemanticCatalogView, column_reference
 from ..results import SemanticQueryResult, SemanticValuesResult
 from . import (
     DIMENSIONS_PER_QUERYABLE_PATH,
@@ -79,10 +79,23 @@ _HOSTED_CATALOG_GAPS: dict[str, list[str]] = {
         "model_ref",
         "agg_time_dimension",
         "primary_entity",
+        "relation",
     ],
     "entities": ["label"],
     "measures": ["label", "description"],
 }
+
+# A hosted catalog cannot reach the physical layer at all: no relation on a
+# semantic model, so no address for any element's column either. Worth prose as
+# well as the declaration, because the question it blocks ("which table is behind
+# this metric") is one a caller arrives with rather than discovers.
+_HOSTED_RELATION_NOTE = (
+    "hosted list: the dbt Cloud Semantic Layer API exposes no physical relation "
+    "on a semantic model (its SemanticModel type carries only a name), so every "
+    "element here names the column behind it and none of them can say which table "
+    "that column is in. List with --local for the relations, which is also what "
+    "connects a metric to the objects `explore map` and `explore profile` describe"
+)
 
 # The one gap worth prose as well, because it is the field a caller is most
 # likely to go looking for and there is somewhere better to get it.
@@ -420,7 +433,7 @@ class HostedDbtCloudBackend:
         "metrics { name offsetWindow { count granularity } } } "
         "measures { name agg expr aggTimeDimension } "
         "semanticModels { name } "
-        "dimensions { name type label description semanticModel { name } "
+        "dimensions { name type label description expr semanticModel { name } "
         "queryableGranularities queryableTimeGranularities } "
         "entities { name type description expr role semanticModel { name } }"
     )
@@ -454,6 +467,7 @@ class HostedDbtCloudBackend:
                 owner = _model_name(d.get("semanticModel"))
                 if owner:
                     models.add(owner)
+                bare = _bare_dimension(d.get("name"), owner)
                 merge_element_fields(
                     dims,
                     d.get("name"),
@@ -461,9 +475,14 @@ class HostedDbtCloudBackend:
                         "type": d.get("type"),
                         "label": d.get("label"),
                         "description": d.get("description"),
-                        "definition": _bare_dimension(d.get("name"), owner),
+                        "definition": bare,
                         "semantic_model": owner,
                         "queryable_granularities": _grains(d),
+                        # Resolved against the bare name, never the queryable
+                        # token: a dimension that declares no `expr` references
+                        # the column its own name spells, and `user__pricing_tier`
+                        # is a path rather than a column anyone could select.
+                        "column": column_reference(d.get("expr"), bare),
                     },
                 )
 
@@ -485,6 +504,11 @@ class HostedDbtCloudBackend:
                         expr=e.get("expr"),
                         role=e.get("role"),
                         description=e.get("description"),
+                        # Free: `expr` is already in the selection set, and the
+                        # rule that turns it into a column is the neutral one, so
+                        # a join key means the same thing on either backend even
+                        # though only one of them can name the relation it sits on.
+                        column=column_reference(e.get("expr"), name),
                     ),
                 )
                 if entity_words.get(name) is None:
@@ -499,6 +523,7 @@ class HostedDbtCloudBackend:
                     agg=str(measure.get("agg") or "").lower() or None,
                     expr=measure.get("expr"),
                     agg_time_dimension=measure.get("aggTimeDimension"),
+                    column=column_reference(measure.get("expr"), name),
                     # Deduced, not returned: the API carries no owning model on a
                     # measure, and a measure lives in exactly one semantic model,
                     # so a metric naming one model pins every measure it reads.
@@ -509,7 +534,7 @@ class HostedDbtCloudBackend:
 
             metrics.append(_metric_info(m, owners))
 
-        notes = [_HOSTED_REACH_NOTE]
+        notes = [_HOSTED_REACH_NOTE, _HOSTED_RELATION_NOTE]
         if roles:
             notes.append(_HOSTED_ENTITY_LABEL_NOTE)
         disagreeing = sorted(m.name for m in metrics if len(m.time_axis or ()) > 1)
@@ -533,6 +558,7 @@ class HostedDbtCloudBackend:
                     definition=fields.get("definition"),
                     semantic_model=fields.get("semantic_model"),
                     queryable_granularities=fields.get("queryable_granularities"),
+                    column=fields.get("column"),
                 )
                 for name, fields in sorted(dims.items())
             ],
