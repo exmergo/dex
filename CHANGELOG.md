@@ -17,7 +17,9 @@ grains below add a further 1.10x on the same layer (about 5.5 KB), and resolving
 the local join graph takes its dimension list from 45 rows to 65. `--metric`
 scoping ships with the change rather than after it for that reason, and brings a
 single metric's catalog to a tenth of the layer's. A budget for the unscoped
-payload is still open work.
+payload is still open work. The physical link below adds a further 1.05x on the
+same layer (about 3.3 KB), because a relation is carried once per semantic model
+rather than once per element.
 
 ### Fixed
 
@@ -159,6 +161,94 @@ payload is still open work.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
+
+- **The semantic layer and the physical catalog are one warehouse again**
+  ([#360]). `explore` held two unconnected views of it. `inventory`, `profile`,
+  `map`, `diagram` and `query` knew relations, columns, grain, PII flags and
+  inferred joins; `explore semantic` knew semantic models, metrics, dimensions,
+  entities and measures. Nothing joined the two, so "which relation backs this
+  metric", "profile the table under this number" and "which of my relations does
+  the semantic layer actually expose" were all unanswerable, while the engine
+  computed the link in three separate places and exposed it in none.
+
+  A semantic model now carries `relation`, the physical relation it sits on, and
+  every dimension, entity declaration and measure carries `column`. **The relation
+  is carried once, on the model; the element carries only its column**, and joins
+  to the model through the `semantic_model` field it already had. A layer holds
+  many more elements than models and a fully qualified relation is long, so the
+  alternative would have made the link dominate a payload whose budget is still
+  open work. Which relation backs a metric is therefore two hops: the metric names
+  its `semantic_models`, and each of those names its `relation`. A metric spanning
+  several models has several, which is a fact worth seeing rather than a value to
+  pick one from.
+
+  **A computed expression carries no column.** A measure defined as
+  `if(is_complete, elapsed, null)` has no single column, so
+  `column` is absent rather than guessed. That is not tidiness: the PII
+  request-gate resolves a dimension to a column and reads that column's profiled
+  evidence, so a column guessed out of an expression makes the gate screen the
+  wrong column and report the verdict as evidence-backed. The same absence holds
+  for a dimension row no single declaration explains, which is a path reached
+  through more than one declaring model, and for `metric_time`, which is one token
+  over as many columns as the layer has time dimensions.
+
+  Measured on the layer this was built against: 11 of 11 semantic models resolve
+  to a relation, 63 of 65 dimension rows and 26 of 26 entity declarations carry a
+  column, and the two dimensions that do not are `metric_time` and one defined as
+  a boolean expression. The whole link costs **3.3 KB on a 70 KB catalog** (1.05x),
+  because a relation is written once per model rather than once per element.
+
+  **The hosted backend declares the gap rather than guessing at it.** dbt Cloud's
+  `SemanticModel` GraphQL type carries only a name, so `relation` joins the other
+  fields in `unavailable` and the payload says so as data, not only in a note. Its
+  `Dimension`, `Entity` and `Measure` types do carry `expr`, so a hosted catalog
+  names the column behind every element and simply cannot say which table that
+  column is in. One asymmetry is worth knowing about: for a measure the hosted API
+  returns the expression dbt *compiled*, so a plain `count` measure comes back as
+  a `CASE WHEN ... IS NOT NULL` and carries no column, where `--local` reads what
+  the author wrote and carries one. Both are correct about what they read.
+
+  In the other direction, `explore map --use-project` marks each object with
+  `semantic_models`, the models that sit on it. Empty is an answer: a relation
+  nothing in the layer reads is a different object from one several metrics are
+  built on, and row counts and PII flags cannot tell them apart. Every object in
+  view is rewritten whenever the layer was read, so a model dropped from the layer
+  clears rather than leaving a stale claim.
+
+- **`explore map` and `explore relationships` draw the joins the semantic layer
+  declares** ([#361]). `explore diagram` was inferring joins by scanning while an
+  authoritative, free join graph sat in a manifest dex already parsed. Every entity
+  two semantic models share is a join the layer performs, with the physical key
+  named per model, and the keys routinely differ between the two sides for the same
+  entity, which is exactly the join a name-matching rule can never find. Measured
+  live against one layer of 11 semantic models: 15 declared joins across 4
+  entities, of which **12 were not reached by name-based inference at all**, and 13
+  were also declared by a `relationships` test and therefore counted once. So the
+  channel is nearly free on a well-tested project and is worth most where the tests
+  are thinner than the semantic layer.
+
+  Those joins now arrive at the **declared** tier beside the project's
+  `relationships` tests, through the same endpoint resolution and the same
+  never-guess rule: an endpoint matching nothing or matching several objects is
+  reported in `notes` instead of drawn. `declared_by` on the edge names the
+  entity, which is the part a reader can look up with `explore semantic list` and
+  the only part the edge does not already carry; a `relationships` test leaves it
+  unset, because it declares exactly the two columns the edge already names. An
+  edge both channels declare is counted once. `explore relationships` reports
+  `semantic_join_count`, and the notes call out how many of those name-based
+  inference did not find, which is the set that matters.
+
+  `explore diagram` draws them solid, with the entity in the edge label. **The
+  cardinality rules are unchanged**: an entity marked primary is the layer's
+  claim, and the diagram may still say "exactly one" only where the cache proved
+  the parent key unique. That is what let these in at the declared tier without
+  loosening anything.
+
+  Both directions are gated on `--use-project`, because exploration starts bare
+  and a warehouse observation must not depend on which repo dex runs from, and
+  both cost the warehouse nothing: the whole link is a read of the compiled
+  semantic manifest. A safety-spine case pins that, by asserting the map issues
+  the same number of statements with the flag as without it.
 
 - **`explore semantic values <dimension>` returns a dimension's value domain**
   ([#358]). Naming a value is the precondition for writing a filter, and dex could
