@@ -754,6 +754,89 @@ def test_every_shipped_store_can_serialize_the_spend_admission(tmp_path):
     assert len(unguarded) == 1 and "spend lock" in unguarded[0]
 
 
+def test_an_unreachable_spend_ledger_stops_billing_and_nothing_else(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Issue #374, measured on a deployment with a network-backed ledger: a store
+    outage took down unbilled reads on two hosts while billing correctly failed
+    closed.
+
+    Here rather than only in the cost-guard suite because both halves are the
+    guarantee, and they pull against each other. Billing must not proceed on a
+    day's spend nobody could read, and everything else must not be hostage to a
+    number it never consults. A gate is built for every command on a billed
+    connector, so the eager constructor read made the second half false: the
+    ledger became a single point of failure for commands that cannot spend.
+    """
+
+    from exmergo_dex_core import adapters, command_args
+    from exmergo_dex_core import config as config_mod
+    from exmergo_dex_core import connect as connect_mod
+    from exmergo_dex_core.guards.cost_guard import (
+        ConfirmationRequiredError,
+        LedgerUnreadableError,
+    )
+
+    store = FilesystemStore(tmp_path)
+
+    def unreachable(*_args, **_kwargs) -> float:
+        raise ConnectionError("the ledger backend is unreachable")
+
+    monkeypatch.setattr(FilesystemStore, "spend_since", unreachable)
+
+    config = config_mod.DexConfig()
+    config.budget.ceiling = 500 * 1024 * 1024
+    config.budget.session_ceiling = 5 * 1024 * 1024 * 1024
+
+    def gate(command: str):
+        return connect_mod.new_cost_gate(
+            "bigquery", config, store, confirmed=True, command=command
+        )
+
+    # Free work does not consult the day's spend, so it does not inherit the
+    # ledger's availability. Building the gate is where that used to break.
+    free = gate("explore inventory")
+    adapter = adapters.get_adapter(
+        "bigquery", project="test-proj", cost_gate=free, client=fake_bq_client
+    )
+    assert [o.name for o in adapter.list_objects()]
+    # And the one free surface that does ask reports the field as unavailable
+    # rather than failing the command it is part of.
+    assert adapter.capabilities()["budget"]["session_spent_today"] is None
+    assert command_args.preflight_cost(adapter).paradigm is env.Paradigm.BYTES_SCANNED
+
+    # Billed work refuses, because the cumulative ceiling is measured against the
+    # number that could not be read. A named guard refusal, not a crash.
+    billed = adapters.get_adapter(
+        "bigquery",
+        project="test-proj",
+        cost_gate=gate("explore profile"),
+        client=fake_bq_client,
+    )
+    # Charging a statement without having gone through the handshake first must
+    # not slip past on a ceiling the session bound dropped out of: the cumulative
+    # cap is configured, so it has to bind against a reading or refuse.
+    with pytest.raises(LedgerUnreadableError):
+        billed.run_query(
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+
+    estimate, per_table = billed.profile_estimate(["test-proj.shop.customers"])
+    with pytest.raises(LedgerUnreadableError) as caught:
+        command_args.billed_handshake(
+            "explore profile", billed, estimate, per_table=per_table
+        )
+    # Not the confirmable kind: a bigger budget cannot buy through a ceiling that
+    # could not be measured, so this must never read as needs_confirmation.
+    assert not isinstance(caught.value, ConfirmationRequiredError)
+    assert env.reason_for(caught.value) is env.Reason.GUARD
+    assert caught.value.cost.paradigm is env.Paradigm.BYTES_SCANNED
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
 def test_a_scope_flag_cannot_widen_the_committed_allowlist():
     """The source allowlist in .dex/config.yml is a committed cost boundary. A
     per-command flag scopes work inside it and can never reach outside it, on any
@@ -2957,35 +3040,41 @@ def test_bigquery_over_ceiling_cannot_be_confirmed_through(fake_bq_client):
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
-def test_bigquery_a_narrowed_reserve_still_bounds_what_profiling_bills():
+@pytest.mark.parametrize("table_type", ["VIEW", "EXTERNAL"])
+def test_bigquery_a_reserve_for_an_unknown_row_count_bounds_what_profiling_bills(
+    table_type,
+):
     # Family 2: the estimate is a ceiling actual spend will not exceed (#107),
-    # and that has to survive every reserve the estimator declines to hold
-    # (#299). A view is the sharpest case: it has no row count, so all three
-    # escalation probes bail and the estimator now reserves nothing at all for
-    # it. If any of them could still run, this is where the quoted number would
-    # turn out to be less than the bill.
+    # and the reserve is what makes that true for probes the estimator cannot
+    # yet rule in or out (#299). An object BigQuery keeps no row count for is
+    # the sharpest case, and it used to be sharp in the other direction: the
+    # count never arrived, so the probes provably could not run and nothing was
+    # reserved. Now the aggregate's own COUNT(*) is captured, so all three can
+    # run, and the reserve has to cover them. This is where a reserve narrower
+    # than the probes it must pay for would show up as a bill above the quote.
     from fakes.bigquery import FakeBigQueryClient, FakeTable
 
     from exmergo_dex_core.explore import profile as profile_mod
 
     bigquery = pytest.importorskip("google.cloud.bigquery")
-    client = FakeBigQueryClient(
-        project="test-proj",
-        tables=[
-            FakeTable(
-                project="test-proj",
-                dataset_id="shop",
-                table_id="customers_v",
-                schema=[
-                    bigquery.SchemaField("id", "INTEGER"),
-                    bigquery.SchemaField("tier", "STRING"),
-                ],
-                num_rows=100,  # nulled out for a view, which is the point
-                num_bytes=5_000,
-                table_type="VIEW",
-            )
-        ],
-        row_resolver=lambda sql: [
+
+    def rows(sql: str):
+        # The three escalation statements are distinguishable by shape, and each
+        # answers in its own: an array-valued domain sample, a
+        # distinct-combination count, an exact COUNT(DISTINCT) per column. The
+        # aggregate batch is everything else.
+        if "ARRAY_AGG" in sql:
+            return [
+                {
+                    "d_0": [{"v": 1, "c": 1}],
+                    "n_0": 100,
+                    "d_1": [{"v": "a", "c": 40}],
+                    "n_1": 3,
+                }
+            ]
+        if "SELECT DISTINCT" in sql or "COUNT(DISTINCT" in sql:
+            return [{"d_0": 100, "d_1": 3}]
+        return [
             {
                 "n_total": 100,
                 "nn_0": 100,
@@ -2994,19 +3083,40 @@ def test_bigquery_a_narrowed_reserve_still_bounds_what_profiling_bills():
                 "mx_0": 100,
                 "nn_1": 100,
                 "nd_1": 3,
-                "d_0": 100,
-                "d_1": 3,
             }
+        ]
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="customers_x",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER"),
+                    bigquery.SchemaField("tier", "STRING"),
+                ],
+                # Whatever the metadata says is not a count for these kinds, and
+                # for an external table BigQuery really does report a zero here.
+                num_rows=0,
+                num_bytes=5_000,
+                table_type=table_type,
+            )
         ],
+        row_resolver=rows,
     )
     adapter = _bq_adapter(client)
-    estimate, _per_table = adapter.profile_estimate(["test-proj.shop.customers_v"])
-    profile_mod.profile(adapter, ["test-proj.shop.customers_v"])
+    estimate, _per_table = adapter.profile_estimate(["test-proj.shop.customers_x"])
+    datasets = profile_mod.profile(adapter, ["test-proj.shop.customers_x"])
     billed = adapter.cost_gate.spend_summary()["bytes_billed"]
     assert billed <= estimate
-    # And no escalation was attempted, which is why nothing was reserved.
+    # The escalation the reserve paid for is the escalation that ran, and the
+    # count it ran against came from the aggregate rather than the metadata.
     executed = [c for c in client.query_calls if not c.dry_run]
-    assert len(executed) == 1
+    assert len(executed) > 1
+    assert datasets[0].row_count == 100
+    assert "empty table (no rows)" not in datasets[0].data_quality
 
 
 def test_bigquery_every_executed_job_is_server_capped(fake_bq_client):
