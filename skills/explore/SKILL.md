@@ -150,17 +150,22 @@ Subcommands, in the usual order:
    `--limit`) and returns a metric's values as a capped, columnar result. Name
    flags take a comma-separated list or a repeated flag (`--group-by a,b` is
    `--group-by a --group-by b`); `--where` is never split. Two backends answer
-   these, chosen by `.dex/config.yml` `semantic.backend` and overridable with
-   `--local` / `--api`. `--local` renders the SQL with MetricFlow and executes it
-   through dex's own connector and cost handshake, so cost is surfaced before
-   spend (needs a dbt project and, for `query`, the `[semantic]` extra; `list` is
-   a manifest read-view that needs neither). `--api` sends the query to a hosted
+   these, chosen by `.dex/config.yml` `semantic.vendor` and `semantic.deployment`
+   (the older `semantic.backend` spelling of the two still works), and overridable
+   with `--local` / `--api`. Those two flags name who executes, not which vendor:
+   every result reports it as `execution` (`dex` or `vendor`). `--local` renders
+   the SQL with MetricFlow and executes it through dex's own connector and cost
+   handshake, so cost is surfaced before spend (needs a dbt project and, for
+   `query`, the `[semantic]` extra; `list` is a manifest read-view that needs
+   neither). `--api` sends the query to a hosted
    dbt Cloud deployment (needs only a host, an environment id, and a
    `DBT_SL_TOKEN`, plus the `[semantic-api]` extra, no local project). The hosted
    backend is the one place the cost guard cannot apply: dbt Cloud executes
    server-side, so the result carries an explicit warning that spend is governed
    there, not by dex, and no `--confirm` is asked. Either way a PII-shaped grouped
-   or filtered dimension (e.g. `user__email`) is refused before the query runs.
+   or filtered dimension (e.g. `user__email`) is refused before the query runs,
+   and on `--api` the layer's own PII metadata is fetched per metric so a
+   multi-metric query stays authoritative rather than falling back to names.
    This queries the layer; authoring it is `transform`'s job.
 
 Rules of engagement for `query`: prefer the fixed commands when they answer the

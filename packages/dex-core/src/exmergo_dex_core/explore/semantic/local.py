@@ -32,6 +32,7 @@ from ...cache import match_identifier
 from ...config import QueryLimits, pii_override_paths
 from ..results import SemanticQueryResult
 from . import (
+    EXECUTION_DEX,
     PII_BLOCK_CONFIDENCE,
     DimensionInfo,
     EntityInfo,
@@ -100,6 +101,12 @@ class _RendererOnlySqlClient:
 
 class LocalMetricFlowBackend:
     name = "local"
+    vendor = "dbt"
+    deployment = "local"
+    # dex renders the metric SQL and runs it through its own connector, so the
+    # full cost guard applies here and the cost comes from the adapter, not from
+    # `cost_posture`.
+    execution = EXECUTION_DEX
 
     def __init__(
         self,
@@ -140,7 +147,7 @@ class LocalMetricFlowBackend:
             raise SemanticBackendError(
                 f"the local semantic backend needs a dbt project on disk ({exc}). "
                 "A deployment without one queries a hosted dbt Cloud Semantic Layer "
-                "instead: set `semantic.backend: dbt_cloud` in config (or pass "
+                "instead: set `semantic.deployment: dbt_cloud` in config (or pass "
                 "--api), which needs no project and no local credential"
             ) from exc
         return cls(project, engine, connector, limits)
@@ -215,8 +222,8 @@ class LocalMetricFlowBackend:
                 )
             )
 
-        return SemanticCatalog(
-            backend=self.name,
+        return SemanticCatalog.from_backend(
+            self,
             metrics=metrics,
             dimensions=[
                 DimensionInfo(
@@ -314,7 +321,7 @@ class LocalMetricFlowBackend:
             truncated_by_source=result.truncated,
             extra_notes=_unprofiled_note(unprofiled),
         )
-        record = SemanticQueryResult.from_capped(capped, backend=self.name)
+        record = SemanticQueryResult.from_capped(capped, backend=self)
         return command_args.stamp_spend(record, adapter)
 
     def _load_cache(self):

@@ -15,8 +15,16 @@ and PII are governed:
   says so) and PII is gated from the layer's own metadata plus a name heuristic.
 
 Backend selection is ambient, mirroring how the warehouse connector resolves: the
-``.dex/config.yml`` ``semantic.backend`` default, overridable per command with
-``--local`` / ``--api``.
+``.dex/config.yml`` ``semantic.vendor`` and ``semantic.deployment`` defaults (or
+the released ``semantic.backend`` spelling of the two), overridable per command
+with ``--local`` / ``--api``.
+
+Those two flags name the **execution** axis, not a vendor: dex renders and runs
+the statement, versus the vendor runs it. That is the axis the guards read, so
+every backend declares it as ``execution`` (``dex`` or ``vendor``) and every
+result carries it. A vendor-executed backend cannot be cost-guarded by dex at
+all, and :func:`cost_posture` is where that follows from the declaration rather
+than from each backend restating it.
 """
 
 from __future__ import annotations
@@ -164,10 +172,27 @@ class SemanticCatalog:
     dimensions: list[DimensionInfo] = field(default_factory=list)
     entities: list[EntityInfo] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Which layer answered, on the axes that are actually orthogonal. `backend`
+    # above is the released one-enum spelling and stays; these three say the same
+    # thing without collapsing vendor, deployment and who executes into one value.
+    vendor: str = ""
+    deployment: str = ""
+    execution: str = ""
+
+    @classmethod
+    def from_backend(cls, backend: Any, **fields: Any) -> SemanticCatalog:
+        """Build with the answering backend's own provenance filled in, so a new
+        backend declares its axes once as class attributes rather than spelling
+        them into every catalog it returns."""
+
+        return cls(**backend_axes(backend), **fields)
 
     def to_data(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
+            "vendor": self.vendor,
+            "deployment": self.deployment,
+            "execution": self.execution,
             "metrics": [_element_data(m) for m in self.metrics],
             "dimensions": [_element_data(d) for d in self.dimensions],
             "entities": [_element_data(e) for e in self.entities],
@@ -203,13 +228,65 @@ class SemanticBackend(Protocol):
 
     A backend that cannot answer raises :class:`SemanticBackendError`; the caller
     turns that into a clean error rather than a stack trace.
+
+    The four names are provenance, declared once per backend rather than restated
+    at each construction site. ``execution`` is the load-bearing one: it says who
+    runs the statement, and therefore whether dex's cost guard can apply. A
+    backend that answers ``vendor`` inherits the whole no-guard posture from
+    :func:`cost_posture` instead of assembling it again.
     """
 
     name: str
+    vendor: str
+    deployment: str
+    execution: str
 
     def list_definitions(self) -> SemanticCatalog: ...
 
     def query(self, q: SemanticQuery): ...
+
+
+# Who runs the statement. `dex` renders it and executes it through its own
+# connector, so the cost guard applies in full; `vendor` means the semantic layer
+# owns the warehouse connection and dex never sees a statement it could price or
+# cap.
+EXECUTION_DEX = "dex"
+EXECUTION_VENDOR = "vendor"
+
+
+def backend_axes(backend: Any) -> dict[str, str]:
+    """A backend's provenance as payload fields, read off the backend itself."""
+
+    return {
+        "backend": getattr(backend, "name", ""),
+        "vendor": getattr(backend, "vendor", ""),
+        "deployment": getattr(backend, "deployment", ""),
+        "execution": getattr(backend, "execution", ""),
+    }
+
+
+def cost_posture(backend: Any) -> tuple[Any, list[str]]:
+    """The cost stance that follows from who executes, as ``(cost, warnings)``.
+
+    A vendor-executed backend cannot be cost-guarded by dex: there is no dry run
+    to estimate from and no statement to cap, so it reports the ``hosted``
+    paradigm with neither an estimate nor a ceiling and says so on every result,
+    naming the vendor that does govern the spend (``cost_guard_warning`` on the
+    backend). A dex-executed backend takes the ordinary handshake and gets its
+    cost from the adapter, so it gets nothing from here.
+
+    This lives beside the protocol rather than inside one backend because the
+    posture belongs to the ``execution`` axis: a third backend that declares
+    ``vendor`` inherits it, instead of a reviewer having to notice that the new
+    one forgot to warn.
+    """
+
+    if getattr(backend, "execution", None) != EXECUTION_VENDOR:
+        return None, []
+    from ... import envelope as env
+
+    warning = getattr(backend, "cost_guard_warning", None)
+    return env.Cost(paradigm=env.Paradigm.HOSTED), [warning] if warning else []
 
 
 # ---- shared PII screening --------------------------------------------------
@@ -255,6 +332,26 @@ def _meta_clears(meta: Any) -> bool:
     """
 
     return isinstance(meta, dict) and meta.get("pii") is False
+
+
+def merge_pii_meta(store: dict[str, Any], name: str | None, value: Any) -> None:
+    """Fold one copy of a dimension's ``config.meta`` into a PII-gate accumulator.
+
+    The counterpart to :func:`merge_element_fields` for the gate's authoritative
+    map: the same dimension is reachable from several metrics, and the copies are
+    read independently. Two rules, both in the safe direction. **PII wins**, so a
+    copy that flags the dimension can never be overwritten by one that does not;
+    and a copy that says nothing (a ``null`` config, which is what a synthesized
+    dimension returns) never displaces one that speaks.
+    """
+
+    if name is None:
+        return
+    current = store.get(name)
+    if _meta_says_pii(current):
+        return
+    if _meta_says_pii(value) or current is None:
+        store[name] = value
 
 
 def screen_dimension_refs(
@@ -386,32 +483,58 @@ def cap_columnar(
     }
 
 
+# Which deployment of a vendor each execution axis selects. `--local` and `--api`
+# name that axis, not a vendor: a repo has one semantic layer, and a per-vendor
+# flag would present two different layers as one command's two modes, which is an
+# interchange promise dex does not make.
+_EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
+    "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"}
+}
+
+
 def resolve_backend(
     engine, *, api: bool = False, local: bool = False
 ) -> SemanticBackend:
-    """The ambient backend resolution: ``api``/``local`` override the
-    ``.dex/config.yml`` ``semantic.backend`` default. Raises
+    """The ambient backend resolution: ``api``/``local`` pick the execution axis
+    for one command, overriding the ``.dex/config.yml`` ``semantic.deployment``
+    default (or the released ``semantic.backend`` spelling of it). Raises
     :class:`SemanticBackendError` (never a bare import error, and never a bare
     ``ValueError`` from a missing project) when the chosen backend's extra,
     config, or credentials are missing."""
 
+    from ...config import (
+        SEMANTIC_DEPLOYMENTS,
+        canonical_semantic_deployment,
+    )
+
     if api and local:
         raise SemanticBackendError("choose one of --local or --api, not both")
 
-    if api:
-        backend = "dbt_cloud"
-    elif local:
-        backend = "local"
+    semantic = getattr(engine.config, "semantic", None)
+    vendor = (getattr(semantic, "vendor", None) or "dbt").strip().lower()
+    if vendor not in SEMANTIC_DEPLOYMENTS:
+        raise SemanticBackendError(
+            f"unknown semantic vendor '{vendor}'; dex ships "
+            f"{', '.join(sorted(SEMANTIC_DEPLOYMENTS))}"
+        )
+
+    if api or local:
+        execution = EXECUTION_VENDOR if api else EXECUTION_DEX
+        deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
     else:
-        configured = getattr(getattr(engine.config, "semantic", None), "backend", None)
-        backend = (configured or "local").strip().lower()
+        # `backend` is read as the fallback, not the primary, so a duck-typed
+        # config that predates the split still resolves.
+        configured = getattr(semantic, "deployment", None) or getattr(
+            semantic, "backend", None
+        )
+        deployment = canonical_semantic_deployment(configured or "local")
 
     source = getattr(engine, "semantic_source", None)
-    if backend in {"dbt_cloud", "api", "cloud"}:
+    if deployment == "dbt_cloud":
         from .hosted import HostedDbtCloudBackend
 
         return HostedDbtCloudBackend.from_config(engine.config, source)
-    if backend == "local":
+    if deployment == "local":
         if source is not None:
             # Honored or named in an error, never accepted and dropped. A host that
             # believes it supplied this request's principal, and in fact reached
@@ -421,13 +544,13 @@ def resolve_backend(
                 "a semantic source supplies a hosted dbt Cloud token and has no "
                 "meaning for the local backend, which renders metric SQL and runs "
                 "it through this engine's own connector. Select the hosted backend "
-                "(semantic.backend: dbt_cloud, or --api), or drop the source and "
-                "let the connector's credential govern"
+                "(semantic.deployment: dbt_cloud, or --api), or drop the source "
+                "and let the connector's credential govern"
             )
         from .local import LocalMetricFlowBackend
 
         return LocalMetricFlowBackend.from_engine(engine)
     raise SemanticBackendError(
-        f"unknown semantic backend '{backend}'; use 'local' or 'dbt_cloud' "
-        "(or pass --local / --api)"
+        f"vendor '{vendor}' has no deployment '{deployment}'; use one of "
+        f"{', '.join(SEMANTIC_DEPLOYMENTS[vendor])} (or pass --local / --api)"
     )

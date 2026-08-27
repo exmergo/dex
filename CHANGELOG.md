@@ -9,6 +9,77 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore semantic query --api` now holds the semantic layer's own PII
+  metadata for every dimension a query touches, not just for the ones all of its
+  metrics share** ([#347]). The authoritative half of the hosted PII
+  request-gate was built from a single call to the API's `dimensions(metrics:)`
+  field, listing every metric in the query. That field returns the dimensions
+  common to **all** the metrics listed, not their union, so the authoritative
+  map shrank as the query grew: a query over two metrics from two different
+  semantic models held metadata for a small handful of dimensions and screened
+  all the rest on their names alone. A dimension the dbt project had marked
+  `meta: {pii: true}` whose name carried no PII signal was not blocked. It was
+  grouped, or filtered on, and projected.
+
+  The result disclosed the degradation in a note afterwards, so this was a
+  fail-open on the authoritative source with disclosure rather than a silent
+  leak. It was still not "PII is flagged, never surfaced", which is a hard
+  constraint the safety spine asserts, and a note is the part of a payload a
+  caller is least likely to act on.
+
+  The gate now asks about one metric at a time and unions the answers, with PII
+  winning wherever two metrics carry contradictory metadata for the same
+  dimension. That costs no extra round trip: the requests are independent, so
+  they go out as one document carrying one aliased field per metric. A group-by
+  token that carries a time grain (`user__created_at__month`) is looked up under
+  its dimension name as well, since no dimension name carries a grain and a
+  suffix was otherwise enough on its own to drop a flagged dimension back to the
+  name heuristic.
+
+  **Some queries that succeeded before will now be refused.** That is the point
+  of the fix: those queries were reaching dimensions the project had marked as
+  PII, and the refusal names the dimension and suggests a non-PII one.
+
+### Added
+
+- **`semantic.vendor` and `semantic.deployment` separate which semantic-layer
+  format answers from which of its endpoints is read** ([#348]). One
+  `semantic.backend` enum carried three things at once: the vendor, the
+  deployment, and who executes the query, which is what decides whether dex's
+  cost guard can apply at all. That works only while there is exactly one
+  vendor, and it makes the guard-relevant property unreadable from the value
+  without a lookup table.
+
+  Who executes is now derived and never configured. Each backend declares it,
+  and every result and catalog reports it as `execution`: `dex` means dex
+  rendered the statement and ran it through its own connector, so the full cost
+  handshake applied; `vendor` means the semantic layer owns the warehouse
+  connection and dex never held a statement it could price or cap. The whole
+  no-cost-guard posture now follows from that one declaration rather than being
+  restated by each backend, so a future backend inherits it instead of a
+  reviewer having to notice it was forgotten. `backend`, `vendor` and
+  `deployment` are reported alongside it.
+
+  `--local` and `--api` are unchanged and are the **execution** axis: dex
+  renders and runs, versus the vendor runs. There is deliberately no per-vendor
+  flag. The format is chosen once and is then ambient, exactly like
+  `connector:`, and a per-command vendor flag would present two different layers
+  as one command's two modes.
+
+### Changed
+
+- **`semantic.backend` is still accepted, and reads as one spelling of the two
+  new axes** ([#348]). `backend: local` is dbt plus the local deployment,
+  `backend: dbt_cloud` is dbt plus the hosted one, and `api` and `cloud` remain
+  accepted spellings of the latter. Nothing in an existing `.dex/config.yml`
+  needs to change. Setting `backend` and `deployment` together is fine while
+  they agree and refused when they contradict: they are two spellings of one
+  choice, and picking a winner would leave the other accepted and ignored, which
+  reads as a setting that took effect. A vendor or deployment dex does not ship
+  is refused by name rather than resolving to the default.
+
 ## [1.8.0] - 2026-08-25
 
 ### Added

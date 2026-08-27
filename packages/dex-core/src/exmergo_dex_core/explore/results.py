@@ -365,9 +365,18 @@ class SemanticQueryResult(Result):
     while dbt Cloud executes server-side where that guard is structurally
     unavailable, which is why a hosted result carries a ``hosted`` paradigm and
     says so in a warning rather than reporting a number it cannot know.
+
+    ``execution`` is that distinction stated directly rather than left to be
+    inferred from the backend's name: ``dex`` means dex ran the statement and the
+    cost guard applied, ``vendor`` means the semantic layer ran it and no guard
+    could. ``vendor`` and ``deployment`` are the other two axes ``backend``
+    collapses; ``backend`` itself stays, unchanged, as the released spelling.
     """
 
     backend: str = ""
+    vendor: str = ""
+    deployment: str = ""
+    execution: str = ""
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -379,14 +388,20 @@ class SemanticQueryResult(Result):
 
     @classmethod
     def from_capped(
-        cls, payload: dict[str, Any], *, backend: str, **fields: Any
+        cls, payload: dict[str, Any], *, backend: Any, **fields: Any
     ) -> SemanticQueryResult:
         """Build from :func:`~.semantic.cap_columnar` output, whose ``notes``
-        record every cut it made and therefore belong on the result's notes."""
+        record every cut it made and therefore belong on the result's notes.
+
+        ``backend`` is the answering backend itself, not its name: it declares its
+        own provenance as class attributes, so a new one is described correctly
+        without every construction site being taught about it."""
+
+        from .semantic import backend_axes
 
         payload = dict(payload)
         notes = payload.pop("notes", [])
-        return cls(backend=backend, notes=notes, **payload, **fields)
+        return cls(**backend_axes(backend), notes=notes, **payload, **fields)
 
     def data(self) -> dict[str, Any]:
         payload = {
@@ -396,6 +411,9 @@ class SemanticQueryResult(Result):
             "row_count": self.row_count,
             "truncated": self.truncated,
             "backend": self.backend,
+            "vendor": self.vendor,
+            "deployment": self.deployment,
+            "execution": self.execution,
         }
         if self.query_id is not None:
             payload["query_id"] = self.query_id

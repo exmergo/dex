@@ -8,6 +8,9 @@ difference between them is load-bearing, so it is spelled out here.
 
 ## The two commands
 
+Every result and catalog names which layer answered on all four: `backend` (the
+released one-value spelling), plus `vendor`, `deployment`, and `execution`.
+
 - `explore semantic list` returns the catalog in one shape from either backend:
   metrics (name, type, label, description, and the dimensions each can be grouped
   by), dimensions (name, type, label, description), and entities (name, type,
@@ -40,14 +43,36 @@ warehouse connector does. The default is `.dex/config.yml`:
 
 ```yaml
 semantic:
-  backend: local          # or dbt_cloud
+  vendor: dbt             # which semantic-layer format answers
+  deployment: local       # or dbt_cloud
   host: <account>.semantic-layer.<region>.dbt.com   # hosted only, not secret
   environment_id: "70506183145969"                  # hosted only, not secret
 ```
 
-`--local` and `--api` override the default for one command, which is what lets you
-run the same metric both ways and compare (a local build against the deployed
-production layer, for instance).
+Two configured axes, and one that is derived:
+
+| axis | values | what it decides | set how |
+|---|---|---|---|
+| `vendor` | `dbt` | which semantic-layer format answers | configured, ambient per repo |
+| `deployment` | `local`, `dbt_cloud` | which endpoint or artifact is read | configured |
+| `execution` | `dex`, `vendor` | **whether dex's cost guard applies** | derived, never configured |
+
+`execution` is the one the guards read, so it is reported on every result rather
+than left to be inferred from a backend name. `dex` means dex rendered the
+statement and ran it through its own connector, so the full cost handshake
+applied; `vendor` means the semantic layer owns the warehouse connection and dex
+never held a statement it could price or cap.
+
+`semantic.backend` is the released spelling of the first two axes as one value and
+is still accepted: `local` reads as dbt plus the local deployment, `dbt_cloud` as
+dbt plus the hosted one. Setting `backend` and `deployment` together is fine while
+they agree and refused when they contradict, because a config dex accepts and then
+ignores is worse than one it refuses.
+
+`--local` and `--api` override the **execution** axis for one command, which is
+what lets you run the same metric both ways and compare (a local build against the
+deployed production layer, for instance). They are not vendor flags: a repo has one
+semantic layer, chosen once, exactly as it has one connector.
 
 ## Local backend (`--local`)
 
@@ -122,8 +147,8 @@ no connector. When a token is supplied, nothing ambient is read, the coordinates
 included, so a stray `DBT_SL_HOST` cannot redirect the request. The CLI is
 unaffected and discovers exactly as described above.
 
-Selecting this backend is explicit: `semantic.backend` defaults to `local`, so a
-deployment with no dbt project sets `semantic.backend: dbt_cloud` in config or
+Selecting this backend is explicit: the deployment defaults to `local`, so a
+deployment with no dbt project sets `semantic.deployment: dbt_cloud` in config or
 passes `--api`. Leaving the default in place there is refused with that fix named,
 rather than failing further in on a missing project.
 
@@ -143,6 +168,16 @@ profiler uses) is the fail-closed floor for a layer that carries no such metadat
 Grouping or filtering by a PII-shaped dimension (`user__email`) is refused with a
 recovery hint before anything reaches dbt Cloud.
 
+That metadata is fetched one metric at a time and unioned, in a single request
+that carries one aliased field per metric. The API's `dimensions(metrics:)` field
+returns the dimensions common to **all** the metrics listed, not their union, so
+asking about a whole multi-metric query at once shrinks the authoritative map as
+the query grows and drops everything outside the intersection to the name
+heuristic. Asking per metric is what keeps the layer authoritative for every
+dimension a query touches, and the aliases keep it to one round trip. A group-by
+token that carries a time grain (`user__created_at__month`) is looked up under the
+dimension name too, since no dimension name carries a grain.
+
 Where the floor was all that ran, the result says so, the same way the local
 backend discloses an unprofiled relation. The two silences are reported separately
 because their fixes differ: a layer that answered and carries no PII metadata for a
@@ -154,13 +189,14 @@ heuristic at once) wants retrying.
 
 | | Local (`--local`) | Hosted (`--api`) |
 |---|---|---|
+| `execution` reported | `dex` | `vendor` |
 | Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud |
 | Executes the SQL | dex, through the active connector | dbt Cloud, server-side |
 | Needs a local dbt project | yes | no |
 | Cost surfaced before spend | yes, the full handshake | no: cost guard unavailable, warns on every result |
 | Ceiling enforced by dex | yes (`maximum_bytes_billed` / timeout) | no: the dbt Cloud environment's own limits |
 | `--confirm` required | yes, on billed connectors | no (nothing dex can gate) |
-| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata plus a name heuristic |
+| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic |
 | When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about |
 | Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations |
 | Credentials | the connector's, never in context | a dbt Cloud service token, never in context |
