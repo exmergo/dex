@@ -9,6 +9,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain schema` detects a model added, removed, or content-changed
+  since the baseline** ([#164]). The transform layer's fingerprint (model
+  names, per-file content hashes) was captured on every snapshot and
+  reported back as `file_count`/`model_count`/`source_count`, but nothing
+  ever diffed it: a model added to the project, removed, rewired to a
+  different `ref()`/`source()`, or edited in place all raised zero drift.
+  Only a warehouse table left orphaned by the change was ever caught
+  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
+  existing `definition_added`/`_removed`/`_changed`, closes that gap with
+  `model_added`, `model_removed`, and `model_changed` findings, folded into
+  the existing `schema` axis rather than a new one of its own (it already
+  loads the project's transform layer for `orphan_relation`).
+
+  `model_changed` diffs content hashes through a new `TransformLayer.
+  model_paths` (model name to the one file that builds it), so it also
+  catches a rewired `ref()`/`source()` call without a second comparison:
+  rewiring one changes the file's text, and so its hash. A baseline pinned
+  before this field existed has an empty `model_paths`, and a model missing
+  from it is skipped for the content comparison rather than reported
+  changed.
+
+  Reconcile treats `model_*` findings the same way it already treats a
+  semantic `definition_*` finding: the project's own edit, not a
+  warehouse-side problem to fix, so no proposal is generated, just a nudge
+  to re-run `maintain snapshot` if the change is intended.
+
+  This reverses a previously deliberate, tested design decision (a
+  regression test locked in "no detector diffs the model list" as intended
+  behavior); that test now pins the opposite, and the reasoning for both is
+  recorded on it and on `transform_drift` itself.
+
 ## [1.8.0] - 2026-08-25
 
 ### Added

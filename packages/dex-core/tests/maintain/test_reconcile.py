@@ -11,6 +11,43 @@ def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+def test_model_findings_warn_toward_resnapshot_rather_than_propose_a_fix():
+    """A model added/removed/changed (#164's transform_drift) gets the same
+    treatment as a semantic definition_* finding: it is the project's own
+    edit, so there is no warehouse-side fix to propose, only a nudge to
+    re-baseline if the change is intended."""
+
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import build
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    findings = [
+        DriftFinding(
+            axis="schema",
+            code="model_added",
+            identifier="stg_customers",
+            detail="model 'stg_customers' is new since the baseline",
+        ),
+        DriftFinding(
+            axis="schema",
+            code="model_changed",
+            identifier="stg_orders",
+            detail="model 'stg_orders' changed since the baseline",
+        ),
+    ]
+    snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        connector="duckdb",
+        warehouse=WarehouseBaseline(datasets=[]),
+    )
+
+    proposals, edits, warnings = build(findings, snap, None, None)
+
+    assert proposals == []
+    assert edits == []
+    assert any("re-run `maintain snapshot`" in w for w in warnings)
+
+
 def test_drift_added_column_honors_pii_override():
     """A drift-added column gets a name-based flag at base confidence (no
     aggregates exist yet, so it blocks until the next profile); an override
