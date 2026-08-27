@@ -11,6 +11,36 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A governed macro for dropping orphan relations** ([#151]), the execution
+  half PR #146 deferred when it shipped `orphan_relation` detection
+  ([#113]). `maintain reconcile` used to hand back a bare `DROP TABLE ...;`
+  string for a human to type by hand; it now proposes scaffolding
+  `transform macro drop_orphan_relations` and running it through `dbt
+  run-operation`, with the exact invocation (the finding's identifier
+  already filled into `--args`) spelled out in the proposal. Reconciling
+  more than one orphan in a run adds one more warning naming a single
+  batched invocation for all of them.
+
+  The macro itself takes an explicit list of relations (nothing inferred),
+  is dry-run by default, resolves and drops through `adapter.get_relation`/
+  `adapter.drop_relation` rather than a hand-written DDL string, and refuses
+  to run at all if any named relation is still a live model, seed, or
+  snapshot in the current manifest, so a typo in the list cannot delete
+  something real. A relation that no longer exists in the warehouse is
+  skipped rather than raised on, so the same list is safe to re-run per
+  target. dex still never executes it: authoring the macro and printing the
+  invocation is as far as dex's role goes, the same boundary `transform
+  macro` already draws for every other shipped macro, and the human runs it
+  under the project's own deploy identity.
+
+  Two pieces of the original issue are explicitly deferred rather than
+  bundled in here, matching the scope PR #146 itself drew: a three-state
+  classification (provable dbt orphan / foreign object / unknown) needs dex
+  to retain more than the single most-recent `maintain snapshot`, which
+  today's storage protocol does not keep; and running the macro directly on
+  a dev target through the existing build preflight is a separate, bounded
+  addition to `transform build`'s dbt-invocation surface.
+
 - **`transform rename` and `transform remove` generate the whole propagation
   plan** ([#221]). `transform references` could tell you where a name was used
   and then left you to retype the change file by file. These two make the change:
