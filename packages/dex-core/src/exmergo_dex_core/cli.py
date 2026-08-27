@@ -248,9 +248,13 @@ def _build_parser() -> argparse.ArgumentParser:
                 # here with --local / --api.
                 if group == "explore" and name == "semantic":
                     # Bare `explore semantic` lists (discovery is first-class);
-                    # `explore semantic query` runs a metric query.
+                    # `values` returns one dimension's value domain, and `query`
+                    # runs a metric query.
                     sp.add_argument(
-                        "mode", nargs="?", choices=["list", "query"], default="list"
+                        "mode",
+                        nargs="?",
+                        choices=["list", "values", "query"],
+                        default="list",
                     )
                     # Named metrics mean something in both modes, which is why one
                     # pair of spellings serves both: in `query` they are what to
@@ -258,8 +262,14 @@ def _build_parser() -> argparse.ArgumentParser:
                     # and what they reach. A whole layer's catalog is one payload
                     # and mostly about something else, so a caller that already
                     # knows the metric should not have to read past it.
+                    # In `list` and `query` these are metrics; in `values` the
+                    # one positional is the dimension, and `--metric` scopes it.
                     sp.add_argument("metrics", nargs="*")
                     sp.add_argument("--metric", action="append", default=None)
+                    # The reverse of a metric's dimension list: which metrics can
+                    # be grouped by all of these. `list` only, and refused rather
+                    # than dropped in the other two modes.
+                    sp.add_argument("--for-dimension", action="append", default=None)
                     sp.add_argument("--group-by", action="append", default=None)
                     sp.add_argument("--where", action="append", default=None)
                     sp.add_argument("--order-by", action="append", default=None)
