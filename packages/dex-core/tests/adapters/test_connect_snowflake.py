@@ -544,6 +544,34 @@ def test_distinct_combination_counts_batch_into_one_guarded_statement(
     assert adapter.distinct_combination_counts("SHOP.PUBLIC.CUSTOMERS", []) == {}
 
 
+def test_distinct_combination_counts_narrow_to_what_the_budget_covers(
+    fake_sf_connection,
+):
+    """Every combination is another scan, so a budget can cover some of the
+    probe and not all of it. The pairs arrive best-ranked first, so spending on
+    the affordable prefix keeps the grain reachable where refusing the whole
+    probe would have thrown it away; the note names what went unasked."""
+
+    fake_sf_connection.row_resolver = lambda sql: [{"d_0": 97, "d_1": 100}]
+    adapter = make_adapter(fake_sf_connection, ceiling=100.0)
+    meta, _ = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
+    unit = adapter._scan_seconds(meta.byte_size)
+    # Room for two of the four scans asked for.
+    adapter.cost_gate.charge(100.0 - 2.5 * unit)
+
+    pairs = [["ID", "EMAIL"], ["EMAIL", "ID"], ["ID", "PLAN"], ["EMAIL", "PLAN"]]
+    counts = adapter.distinct_combination_counts("SHOP.PUBLIC.CUSTOMERS", pairs)
+
+    assert counts == {("ID", "EMAIL"): 97, ("EMAIL", "ID"): 100}
+    assert any(
+        "composite-key probe narrowed to 2 of 4 candidate pairs" in note
+        for note in adapter.table_notes("SHOP.PUBLIC.CUSTOMERS")
+    )
+    stmts = data_statements(fake_sf_connection)
+    assert len(stmts) == 1
+    assert stmts[0].sql.count("SELECT DISTINCT") == 2
+
+
 def test_distinct_combination_counts_degrade_when_budget_cannot_cover(
     fake_sf_connection,
 ):
