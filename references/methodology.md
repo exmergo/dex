@@ -69,10 +69,16 @@ pair can only be a key if the product of its members' distinct counts reaches th
 row count, so pairs are pruned on that necessary condition using the counts
 already in hand, then ranked (id-shaped members first, smallest product next) and
 capped to a few probes issued as one exact distinct-combination statement. A pair
-whose combination count equals the row count is a proven composite key: it enters
-the candidate keys and, absent any single-column key, becomes the reported grain.
-On metered connectors the probe spends only inside the already-confirmed budget
-and skips with an explanatory note when the remaining budget cannot cover it.
+that reuses a column from a better-ranked pair at a similar product is the same
+hypothesis with different filler, so it ranks behind every pair that is not, but
+it is never removed from the running: the cap is the spend guard, and while it
+has room a discarded candidate costs a grain and saves nothing. A pair whose
+combination count equals the row count is a proven composite key: it enters the
+candidate keys and, absent any single-column key, becomes the reported grain,
+smallest product first so the tightest proven key is the one reported. On metered
+connectors the probe spends only inside the already-confirmed budget, narrowing to
+the best-ranked pairs the budget covers, and skipping with an explanatory note
+only when it cannot cover one.
 
 Two safety rules are enforced at the source, in the SQL that is generated:
 
