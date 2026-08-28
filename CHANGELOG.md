@@ -9,6 +9,76 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore inventory --rank` caps its payload by default** ([#289]). Ranking
+  worked correctly, every object carried a populated `rank_score` sorted
+  descending, but nothing capped how many came back: against a 2,356-model
+  project a single call returned all 3,493 objects in a 464.7 KB payload,
+  and every real invocation observed in an agent benchmark run got piped
+  through `head` by the caller before being read. `--rank` now defaults to
+  the top 30 by score; `--limit N` widens it, `--all` lifts the cap
+  entirely (today's behavior), and both are no-ops without `--rank`, since
+  the unranked list carries no order to cut a shortlist from. Elided
+  objects are counted in `elided_object_count` and named in a note, the
+  same cap-and-count convention `explore map` already uses.
+
+  A ranked call also now states its basis in `notes`: size, naming
+  convention, and shape feed the score, and connectivity does not, because
+  inventory runs no relationship pass (`explore map`'s rank does include
+  it). Per-object one-line rank justifications were part of the original
+  proposal but are deferred: they need `rank()` to expose per-signal
+  contributions rather than only the final score, which is new design work
+  the capping fix does not need.
+
+- **A cross-skill, externally authored triggering corpus for the Tier-2 eval
+  harness** ([#216]). Each skill's own `evals.json` `positive`/`negative` list
+  is written by whoever wrote the description it tests, at the same time,
+  and checked with every other skill disabled; neither weakness is visible
+  from inside that suite. `evals/corpus/ade_bench_triggering.json` sources 30
+  real analytics-engineering requests from
+  [dbt-labs/ade-bench](https://github.com/dbt-labs/ade-bench) (Apache-2.0),
+  hand-labeled with the skill each should fire (or `none`), and run with
+  every skill available at once, one live call per prompt rather than one
+  per prompt-per-skill.
+
+  `python -m evals --corpus evals/corpus/ade_bench_triggering.json` reports
+  per-skill precision and recall plus which cases missed, and always exits
+  0: it is a measurement against externally authored prompts, not a release
+  gate, since the initial pass rate is expected to be low and that is the
+  signal the corpus exists to produce.
+
+- **`maintain schema` detects a model added, removed, or content-changed
+  since the baseline** ([#164]). The transform layer's fingerprint (model
+  names, per-file content hashes) was captured on every snapshot and
+  reported back as `file_count`/`model_count`/`source_count`, but nothing
+  ever diffed it: a model added to the project, removed, rewired to a
+  different `ref()`/`source()`, or edited in place all raised zero drift.
+  Only a warehouse table left orphaned by the change was ever caught
+  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
+  existing `definition_added`/`_removed`/`_changed`, closes that gap with
+  `model_added`, `model_removed`, and `model_changed` findings, folded into
+  the existing `schema` axis rather than a new one of its own (it already
+  loads the project's transform layer for `orphan_relation`).
+
+  `model_changed` diffs content hashes through a new `TransformLayer.
+  model_paths` (model name to the one file that builds it), so it also
+  catches a rewired `ref()`/`source()` call without a second comparison:
+  rewiring one changes the file's text, and so its hash. A baseline pinned
+  before this field existed has an empty `model_paths`, and a model missing
+  from it is skipped for the content comparison rather than reported
+  changed.
+
+  Reconcile treats `model_*` findings the same way it already treats a
+  semantic `definition_*` finding: the project's own edit, not a
+  warehouse-side problem to fix, so no proposal is generated, just a nudge
+  to re-run `maintain snapshot` if the change is intended.
+
+  This reverses a previously deliberate, tested design decision (a
+  regression test locked in "no detector diffs the model list" as intended
+  behavior); that test now pins the opposite, and the reasoning for both is
+  recorded on it and on `transform_drift` itself.
+
 ## [1.9.0] - 2026-08-27
 
 ### Changed
@@ -329,37 +399,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
-
-- **`maintain schema` detects a model added, removed, or content-changed
-  since the baseline** ([#164]). The transform layer's fingerprint (model
-  names, per-file content hashes) was captured on every snapshot and
-  reported back as `file_count`/`model_count`/`source_count`, but nothing
-  ever diffed it: a model added to the project, removed, rewired to a
-  different `ref()`/`source()`, or edited in place all raised zero drift.
-  Only a warehouse table left orphaned by the change was ever caught
-  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
-  existing `definition_added`/`_removed`/`_changed`, closes that gap with
-  `model_added`, `model_removed`, and `model_changed` findings, folded into
-  the existing `schema` axis rather than a new one of its own (it already
-  loads the project's transform layer for `orphan_relation`).
-
-  `model_changed` diffs content hashes through a new `TransformLayer.
-  model_paths` (model name to the one file that builds it), so it also
-  catches a rewired `ref()`/`source()` call without a second comparison:
-  rewiring one changes the file's text, and so its hash. A baseline pinned
-  before this field existed has an empty `model_paths`, and a model missing
-  from it is skipped for the content comparison rather than reported
-  changed.
-
-  Reconcile treats `model_*` findings the same way it already treats a
-  semantic `definition_*` finding: the project's own edit, not a
-  warehouse-side problem to fix, so no proposal is generated, just a nudge
-  to re-run `maintain snapshot` if the change is intended.
-
-  This reverses a previously deliberate, tested design decision (a
-  regression test locked in "no detector diffs the model list" as intended
-  behavior); that test now pins the opposite, and the reasoning for both is
-  recorded on it and on `transform_drift` itself.
 
 - **`explore semantic list` is capped, searchable, and accounts for what it left
   out** ([#362]). It was the one explore command that budgeted nothing: every
