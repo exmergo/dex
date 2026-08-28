@@ -82,6 +82,7 @@ _EXPORTS = {
     "Document": "storage",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "LedgerUnreadableError": "guards.cost_guard",
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
@@ -157,6 +158,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         CeilingRequiredError,
         ConfirmationRequiredError,
         CostGuardError,
+        LedgerUnreadableError,
         OverCeilingError,
         SpendLockTimeoutError,
     )
@@ -224,6 +226,7 @@ __all__ = [
     "Document",
     "ExploreStore",
     "FilesystemStore",
+    "LedgerUnreadableError",
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",

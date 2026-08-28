@@ -17,6 +17,16 @@ estimate is the size signal that feeds ranking. This pass is what makes selectiv
 drill-down possible: you cannot rank what you have not listed, and you should not
 scan what you have not yet decided is worth scanning.
 
+The row count is an estimate where the catalog keeps one and unknown where it does
+not, and the two are never collapsed into each other. A warehouse maintains no
+count for a view, and BigQuery maintains none for an external table either;
+several report that as a zero, which is why the count is decided from the object's
+kind rather than taken at face value. Unknown means the size signal cannot
+participate, so an uncounted object ranks as if it were small until something
+counts it. Empty means the object holds nothing, which is a finding. Reading the
+first as the second was how an external table over object storage came to be
+reported as an empty table with correct column statistics beside the claim.
+
 ## Ranking: turn a list into a shortlist
 
 Ranking scores every object in [0, 1] from cheap signals so attention goes to the

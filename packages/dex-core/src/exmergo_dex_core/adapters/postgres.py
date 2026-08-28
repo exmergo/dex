@@ -240,7 +240,7 @@ class PostgresAdapter:
             ],
             "budget": {
                 "ceiling_seconds": cost.ceiling,
-                "session_spent_today_seconds": self.cost_gate.session_spent,
+                "session_spent_today_seconds": self.cost_gate.session_spent_now(),
             },
         }
 

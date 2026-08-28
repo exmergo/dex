@@ -68,6 +68,15 @@ drifting estimate cannot overrun the budget. Billed bytes are appended to
 or values), and `budget.session_ceiling` binds cumulatively against that
 ledger per UTC day.
 
+The ledger gates billing and nothing else. A gate is built whenever a BigQuery
+connection is assembled, free commands included, but the day's spend is read only
+where it is needed: billed admission reads it and refuses if it cannot (a named
+`reason: guard` refusal saying nothing ran), settlement tolerates a failure, and a
+free command never reaches it. So a store keeping the ledger somewhere that can be
+unreachable does not put `explore inventory` behind it. `connect test` is the one
+free exception, because reporting the budget is its job: it takes one guarded read
+and reports `budget.session_spent_today: null` when the ledger cannot be reached.
+
 BigQuery bills a 10 MB minimum per query; a remaining budget below that is
 refused with the math rather than letting the job fail server-side. Query-cache
 hits bill zero and are recorded as such.
@@ -80,10 +89,18 @@ distinct count for a near-unique column, a value-domain probe for a
 low-cardinality one, and a composite-key probe. Which of them run depends on
 the aggregate scan's own approximate results, so none can be dry-run before it,
 and the estimate holds one 10 MB floor apiece instead. A reserve is dropped only
-where an object's metadata already rules the query out: a view (no row count, so
-no probe can run), a table of nested or repeated columns only (no approximate
-distinct, which every probe starts from), a table too small for a value domain,
-or one with too few countable columns to form a composite pair.
+where an object's metadata already rules the query out: a table known to hold no
+rows, a table of nested or repeated columns only (no approximate distinct, which
+every probe starts from), a table too small for a value domain, or one with too
+few countable columns to form a composite pair.
+
+An object BigQuery keeps no row count for, meaning every view and every external
+table, reserves all three. Unknown is not empty: the count arrives inside the
+aggregate scan, so every probe can run, and at estimate time there is no number
+yet to narrow the hold with. That makes an external table's estimate four 10 MB
+floors rather than one, which is worth knowing before pointing a profile at a
+lakehouse of them. The reserve is released rather than spent when a probe does not
+run, so it costs headroom for the length of the command, not money.
 
 The reserve scales with object count rather than data size, so on a warehouse of
 many small tables it can be most of the number. Both the `needs_confirmation`
@@ -110,6 +127,16 @@ so it reports none rather than repeating the profile's.
   invalid on them); `JSON`/`GEOGRAPHY` are treated as nested.
 - Tables that require a partition filter are never scanned: they get a
   metadata-only profile plus a data-quality note.
+- A row count is read from the metadata only for a base table, which is the only
+  kind BigQuery maintains one for. A view, a materialized view, an external table
+  and a snapshot all report `num_rows` as `0` whatever they hold, so that zero is
+  read as unknown rather than as empty, and the real count comes from the
+  aggregate scan's own `COUNT(*)`, which is already paid for. Until an object is
+  profiled its count and byte size are therefore `null`, which ranks it as if it
+  were small: profile it to rank it on its size. `empty table (no rows)` is
+  reported from the aggregate's zero, so it means the object is empty rather than
+  uncounted, and `maintain volume` names the objects it could not compare instead
+  of returning no finding for them.
 - With `bigquery.max_full_profile_bytes` set, larger tables are profiled from
   a `TABLESAMPLE SYSTEM` block sample, flagged as approximate, and uniqueness
   is not judged.

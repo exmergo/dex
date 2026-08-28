@@ -82,6 +82,10 @@ _BYTES_BILLED_REQUIRED_RE = re.compile(r"(\d+) or higher required")
 # them and plain COUNT is not supported for every one of these types).
 _NESTED_FIELD_TYPES = {"RECORD", "STRUCT", "JSON", "GEOGRAPHY", "RANGE", "INTERVAL"}
 
+# The object kinds whose stored row and byte counts BigQuery maintains. See
+# BigQueryAdapter._maintains_counts for why this is an allowlist.
+_COUNTED_TABLE_TYPES = frozenset({"TABLE"})
+
 
 @dataclass(frozen=True)
 class _EstimateComposition:
@@ -199,6 +203,11 @@ class BigQueryAdapter:
         # confirmed profiling pass do not re-fetch (each fetch is a free API
         # call, but table facts also back the notes and sampling decisions).
         self._tables: dict[str, Any] = {}
+        # Row counts learned from a profiling aggregate, which is the only place
+        # a count exists for an object kind BigQuery keeps no metadata count for.
+        # Per command, like `_tables`, and it supersedes the metadata rather than
+        # merging with it: the aggregate counted, the metadata guessed or lied.
+        self._exact_rows: dict[str, int] = {}
         self._resolved_datasets: list[str] | None = None
         self._notes: dict[str, list[str]] = {}
         # What the last profile estimate was made of, so the handshake and the
@@ -229,7 +238,7 @@ class BigQueryAdapter:
             ],
             "budget": {
                 "ceiling": cost.ceiling,
-                "session_spent_today": self.cost_gate.session_spent,
+                "session_spent_today": self.cost_gate.session_spent_now(),
             },
         }
 
@@ -263,13 +272,21 @@ class BigQueryAdapter:
 
     def _object_meta(self, table: Any, object_type: str) -> ObjectMeta:
         identifier = f"{table.project}.{table.dataset_id}.{table.table_id}"
-        num_rows = getattr(table, "num_rows", None)
-        num_bytes = getattr(table, "num_bytes", None)
-        if object_type == "view":
-            # A view has no stored rows; a COUNT(*) would bill, so the exact
-            # count arrives inside the (already billed) profiling aggregate.
+        # An exact count from a profiling scan supersedes the metadata for the
+        # rest of the command, and for the object kinds below it is the only
+        # count there will ever be, so it is consulted before the metadata is.
+        exact = self._exact_rows.get(identifier)
+        if exact is not None:
+            num_rows: int | None = exact
+        elif self._maintains_counts(getattr(table, "table_type", None)):
+            num_rows = getattr(table, "num_rows", None)
+        else:
             num_rows = None
-            num_bytes = None
+        num_bytes = (
+            getattr(table, "num_bytes", None)
+            if self._maintains_counts(getattr(table, "table_type", None))
+            else None
+        )
         return ObjectMeta(
             identifier=identifier,
             object_type=object_type,
@@ -283,6 +300,28 @@ class BigQueryAdapter:
     @staticmethod
     def _object_type(table_type: str | None) -> str:
         return "view" if (table_type or "").upper().endswith("VIEW") else "table"
+
+    @staticmethod
+    def _maintains_counts(table_type: str | None) -> bool:
+        """Whether BigQuery keeps a stored row and byte count for this kind of object.
+
+        An allowlist rather than a list of exceptions, because the exceptions are
+        the growing side. A base table has counts; a view, a materialized view, an
+        external table over object storage, a snapshot, and whatever the API names
+        next do not, and for all of them ``num_rows`` comes back ``0`` rather than
+        absent. Storing that zero would be a claim the table is empty, which reads
+        the same as a table that genuinely is, so the whole class is classified as
+        unknown instead and the count arrives from the (already billed) profiling
+        aggregate. Testing for the kinds that do have counts means a kind nobody
+        anticipated is treated as unknown, which is the direction that cannot
+        fabricate a number.
+
+        An absent ``table_type`` is a base table: the client leaves the attribute
+        unset until the server fills it in, so it means "not told yet" rather than
+        a kind of its own.
+        """
+
+        return (table_type or "TABLE").upper() in _COUNTED_TABLE_TYPES
 
     @staticmethod
     def _render_type(field: Any) -> str:
@@ -489,6 +528,16 @@ class BigQueryAdapter:
                 )
                 results.extend(self._empty_aggregate(col) for col in batch)
                 continue
+            if sample_percent is None:
+                # The batch just counted the table exactly, and for a view or an
+                # external table that is the only count anyone will ever have:
+                # BigQuery maintains none, and a COUNT(*) issued to find one
+                # would bill a second time for a number already in hand. Capture
+                # it so the metadata re-read after this scan can hand it to the
+                # uniqueness proof, the composite-key probe, and the grain
+                # verdict, all of which decline to run without a row count. Not
+                # under sampling, where the count describes the sample.
+                self._exact_rows[identifier] = int(rows[0]["n_total"])
             results.extend(
                 self._read_aggregates(rows[0], plan, sampled=sample_percent is not None)
             )
@@ -906,11 +955,17 @@ class BigQueryAdapter:
         condition below mirrors one in ``explore.profile``, and moving one
         without the other is the bug to watch for.
 
-        - Nothing at all without a row count. All three probes return early on a
-          falsy one, and a BigQuery view never has one: ``_object_meta`` nulls it
-          and the aggregate's own ``COUNT(*)`` is read per batch, never written
-          back to the object. So a view provably cannot escalate, and the reserve
-          it used to hold was money no run could spend.
+        - Nothing at all for a table known to hold no rows. All three probes
+          return early on a falsy count, so a provably empty table cannot
+          escalate and the reserve would be money no run could spend.
+        - An unknown count is not an empty one, and it reserves. For a view or
+          an external table the aggregate's own ``COUNT(*)`` is what supplies the
+          count, and it lands before the probes are asked, so every one of them
+          can run. Reserving the maximum is the only honest read at estimate
+          time, since the number that decides which probes are eligible does not
+          exist yet. This is the half of issue #299's reasoning that inverted:
+          the reserve was dropped for these objects because the probes provably
+          could not run, and now they can.
         - Nothing for columns BigQuery cannot count distinctly. Nested and
           repeated fields get no approximate distinct in the aggregate batch, and
           every probe's eligibility starts from one, so they can no more trigger
@@ -924,10 +979,10 @@ class BigQueryAdapter:
         """
 
         countable = [c for c in scan_columns if not self._is_nested(c.data_type)]
-        if not countable or not meta.row_count:
+        if not countable or meta.row_count == 0:
             return 0
         reserved = 1  # exact_distinct_counts
-        if meta.row_count >= VALUE_DOMAIN_MIN_ROWS:
+        if meta.row_count is None or meta.row_count >= VALUE_DOMAIN_MIN_ROWS:
             reserved += 1  # value_domain_counts
         if len(countable) >= 2:
             reserved += 1  # distinct_combination_counts

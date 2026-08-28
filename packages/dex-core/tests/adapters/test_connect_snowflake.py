@@ -1008,3 +1008,37 @@ def test_list_namespace_objects_reads_an_absent_schema_as_empty(multi_db_connect
     assert adapter.list_namespace_objects("RAW", "NOT_THERE") == []
     assert adapter.list_namespace_objects("NO_SUCH_DB", "STAGING_DEV") == []
     assert data_statements(multi_db_connection) == []
+
+
+def test_the_aggregate_supplies_the_count_show_tables_does_not_maintain(
+    fake_sf_connection,
+):
+    """The same gap as issue #375's, on the sibling connector nobody reported.
+
+    SHOW TABLES maintains no row count for a view, and the aggregate's own
+    COUNT(*) was read and discarded, so a view's count never arrived and the
+    exact-distinct escalation, the composite-key probe and the grain verdict
+    could never run against one. It now supersedes the SHOW figure the way it
+    already does on Postgres and Redshift.
+    """
+
+    from fakes.snowflake import FakeSnowflakeTable
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="PUBLIC",
+            name="V_CUSTOMERS",
+            columns=[("ID", "FIXED", False)],
+            kind="view",
+        )
+    )
+    fake_sf_connection.row_resolver = lambda sql: [
+        {"N_TOTAL": 42, "NN_0": 42, "ND_0": 42}
+    ]
+    adapter = make_adapter(fake_sf_connection)
+    meta, columns = adapter.table_metadata("SHOP.PUBLIC.V_CUSTOMERS")
+    assert meta.row_count is None
+    adapter.column_aggregates("SHOP.PUBLIC.V_CUSTOMERS", columns)
+    refreshed, _ = adapter.table_metadata("SHOP.PUBLIC.V_CUSTOMERS")
+    assert refreshed.row_count == 42

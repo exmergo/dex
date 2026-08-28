@@ -258,6 +258,7 @@ def verify_handshake(
         )
         if (
             gate.session_ceiling is not None
+            and gate.session_spent is not None
             and gate.session_ceiling - gate.session_spent < exc.cost.estimate
         ):
             data.setdefault("notes", [])
@@ -336,6 +337,7 @@ def overlap_handshake(
         )
         if (
             gate.session_ceiling is not None
+            and gate.session_spent is not None
             and gate.session_ceiling - gate.session_spent < exc.cost.estimate
         ):
             data.setdefault("notes", [])
@@ -409,6 +411,7 @@ def cumulative_handshake(
         )
         if (
             gate.session_ceiling is not None
+            and gate.session_spent is not None
             and gate.session_ceiling - gate.session_spent < exc.cost.estimate
         ):
             data.setdefault("notes", [])

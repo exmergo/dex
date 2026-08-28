@@ -295,6 +295,15 @@ pass the Lint workflow and CI before it can merge.
 
 ## Community
 
+### Community Integrations
+
+#### **[dagster-dex](https://github.com/catincloud-labs/dagster-dex)**
+A rigorously-tested project format that allows `dex` to read a Dagster asset graph, maintained by CatInCloud Labs.  
+Instead of requiring a dbt project, `dagster-dex` maps your Dagster definitions directly into `dex`, allowing you to 
+run schema-drift maintenance and exploration natively against your orchestrated assets.
+
+### Connect with the Community
+
 Connect with the Analytics Engineering Community (Data Engineers welcome as well!) 
 and discover how Exmergo brings AI Agents to Your Data Stack.
 

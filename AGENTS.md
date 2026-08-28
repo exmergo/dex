@@ -85,7 +85,7 @@ credentials and no network.
 | `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` (pins the `.dex/` map + per-layer definition fingerprints) |
 | `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors (free axes now, one estimate for the scanning axes) |
 | `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources; a model added, removed, or content-changed since the baseline (free) |
-| `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata) |
+| `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata). Free metadata carries no count for an object the warehouse does not maintain one for (a view anywhere, an external table on BigQuery), so those are named in `warnings` as not compared rather than returning no finding |
 | `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout, plus the grains the project itself declares (model-level `unique_combination_of_columns`) re-verified against the data (scans; gated on billed connectors). Two codes come out of the uniqueness checks and the difference is the baseline: `key_lost_uniqueness` is a key measurement proved unique and no longer is, `declared_grain_not_unique` is a declared combination that never held, which is a declaration to fix rather than drift to absorb |
 | `maintain semantic [<objects>]` | definition drift and dangling refs (free) plus categorical dimension cardinality change (scans; gated on billed connectors) |
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
@@ -172,7 +172,11 @@ still binds exactly via a server-side statement timeout, except on ClickHouse,
 where it binds via `max_execution_time` **and** `max_bytes_to_read`, because
 time alone is checked only at block boundaries there. Actual spend comes
 back under `data.spend` (`bytes_billed` or `seconds_billed`) and accumulates
-in the `.dex/spend.jsonl` ledger per connector. Credentials never appear in
+in the `.dex/spend.jsonl` ledger per connector. That ledger gates billing and
+nothing else: it is read where work is admitted, not where a connection is
+assembled, so a command that cannot spend does not depend on it, and a ledger
+that cannot be read refuses billed work by name while reporting the day's total
+as `null` on the two surfaces that quote it. Credentials never appear in
 `data` (BigQuery authenticates via discovered Application Default
 Credentials, Snowflake via a discovered `connections.toml` entry,
 environment, or dbt profile, Databricks via the SDK's unified chain, Redshift
@@ -216,7 +220,8 @@ them.
    one another: an admitted command books its estimate against the day's
    headroom before it runs, so issuing several billed commands at once cannot
    spend the same budget twice. If a cache backend cannot serialize that, every
-   billed command says so.
+   billed command says so, and if the ledger it binds against cannot be read,
+   billed admission refuses rather than deciding a ceiling from nothing.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.

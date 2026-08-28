@@ -9,24 +9,90 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
-**Payload growth, and the budget that now bounds it.** Widening every element grew
-the catalog: measured on a layer of 11 semantic models, 27 metrics and 22
-measures, `--local` grew 1.8x and `--api` 1.4x, almost all of it new objects and
-the project's own prose rather than placeholders. The time axis and the queryable
-grains added a further 1.10x on the same layer (about 5.5 KB), resolving the local
-join graph took its dimension list from 45 rows to 65, and the physical link added
-a further 1.05x (about 3.3 KB), because a relation is carried once per semantic
-model rather than once per element. That layer's unscoped catalog now measures
-71.4 KB on `--local` and 62.2 KB on `--api`, against roughly 40 KB before this
-round.
-
-The budget below closes that out. It comes back **uncut** at those sizes, because
-the caps are calibrated so an ordinary layer is emitted whole and only a layer that
-was already too large to read in one payload is trimmed. `--metric` brings that same
-layer to 10% of its unscoped size, and the payload now states what was cut in every
-case, zeros included.
+## [1.9.0] - 2026-08-27
 
 ### Changed
+
+- **`explore semantic list --local` reads the project through the project seam
+  instead of parsing dbt's artifacts itself** ([#353]). Both the catalog read and
+  the PII gate's column resolution called a private function on the dbt module and
+  re-parsed the compiled semantic manifest, so the local semantic read path was
+  hardwired to dbt while a format-neutral seam designed for exactly this sat unused
+  beside it.
+
+  A project format now answers `semantic_catalog()`, one optional protocol beside
+  tier 2, and the format owns the reduction from whatever it holds on disk into the
+  neutral catalog. That deletes a parser rather than adding one, makes the local
+  catalog format-agnostic as a side effect, and means a second semantic-layer
+  format inherits a working local read path instead of needing a third parser. The
+  same seam carries the `(relation, column)` map the PII request-gate resolves a
+  dimension token through, which puts that resolution where the knowledge is.
+
+  **Beside tier 2 rather than a third member of it.** The project protocols are
+  `runtime_checkable` and the tier is checked structurally, so adding a member to
+  `MaintainProject` would have silently dropped every format implementing the two
+  existing ones to tier 1, and `maintain` would have degraded to "cannot be a
+  drift baseline" for a format that is one. It is also a second channel rather than
+  a widening of `semantic_layer()`, which is a fingerprint: it hashes what the
+  author wrote so a stored baseline survives a dbt upgrade, and it is right to
+  throw away the types, labels, aggregations and composition a reader needs.
+  Widening it to serve reads would have cost it the stability it exists for.
+
+  A format that reads no semantic layer implements nothing here and is refused by
+  name, rather than returning an empty catalog that reads as a layer with nothing
+  in it. `SemanticCatalogContract` is the conformance suite for the new channel,
+  and there is now a control asserting `explore semantic list --local` actually
+  routes through the seam, which is what the tier-2 layers already had.
+
+- **Three behavior changes that come with the semantic-layer work, none of which
+  breaks the contract.** A metric query whose backend cannot read its own filter
+  dialect is now refused rather than screened on its group-by half alone
+  ([#357]); both shipped backends read theirs, so no shipped path changes. On an
+  install with the `[semantic]` extra, `explore semantic list --local` returns
+  more dimension rows than before and reports `queryable_paths` rather than
+  `declarations`, because the join graph is now resolved ([#356]); the payload says
+  which of the two it is holding either way. And the grain vocabulary a group-by
+  token is read against widened from five values to the layer's own, so a token
+  ending in something like `__hour` is now read as a grain suffix ([#355]).
+
+- **`semantic.backend` is still accepted, and reads as one spelling of the two
+  new axes** ([#348]). `backend: local` is dbt plus the local deployment,
+  `backend: dbt_cloud` is dbt plus the hosted one, and `api` and `cloud` remain
+  accepted spellings of the latter. Nothing in an existing `.dex/config.yml`
+  needs to change. Setting `backend` and `deployment` together is fine while
+  they agree and refused when they contradict: they are two spellings of one
+  choice, and picking a winner would leave the other accepted and ignored, which
+  reads as a setting that took effect. A vendor or deployment dex does not ship
+  is refused by name rather than resolving to the default.
+
+- **Three behavior changes that come with the row-count and ledger fixes, none of
+  which breaks the contract.**
+
+  **A BigQuery profile estimate rises for any object the warehouse keeps no row
+  count for**, which is every view and every external table. The escalation reserve
+  is held at estimate time, before any aggregate has run, and it was dropped for
+  these objects on the grounds that their probes provably could not run. Now that
+  the aggregate's count reaches them, they can, so the reserve has to cover them,
+  and with no count yet to narrow it the maximum is the only honest hold. Measured
+  on three external tables over GCS parquet: the estimate went from 31,457,280
+  bytes to 125,829,120, of which 94,371,840 is reserve for nine probes that may
+  never be issued. `profile_reserve` attributes that on the handshake and on an
+  over-ceiling refusal, so the number is explained where it is quoted, and a
+  provably empty table (a real metadata zero, on a kind that maintains one) still
+  reserves nothing. Narrow the work or raise the budget; the reserve is released,
+  not spent, when a probe does not run.
+
+  **`cost.ceiling` on a free command no longer tightens to the session
+  remainder.** Computing that bound needs a reading of the day's spend, and a
+  command that cannot spend no longer takes one. Every billed path still reads
+  before it decides, so no ceiling that binds anything has changed.
+
+  **A BigQuery or Snowflake view reports a real row count after it is profiled**,
+  where it previously reported none, and so gains the uniqueness proofs, composite
+  keys and data-quality notes that a row count unlocks. This one is worth calling
+  out because issue #375 predicted the opposite: it asked for a view's behavior to
+  stay unchanged on the grounds that the view branch was the working pattern being
+  copied. It was not working.
 
 - Refactored the unreleased semantic-layer implementation into a neutral catalog
   domain, composed response model, shared request policy, typed backend descriptor,
@@ -37,6 +103,93 @@ case, zeros included.
   longer carries time-axis caveats for metrics outside that scope.
 
 ### Fixed
+
+- **A ledger outage took down commands that never spend** ([#374]).
+  `connect.new_cost_gate` documents the design: the day's spend is passed as a
+  reader rather than a number, so the gate re-reads it when it admits work. But
+  `CostGate.__init__` ended by calling that reader, and a gate is built at every
+  connection assembly on a billed connector, free commands included. On a
+  deployment whose store keeps the ledger on a network, a store outage therefore
+  failed `connect test` and `explore inventory` alongside the billed commands
+  that had a stake in the answer, and it failed them as `reason: internal`,
+  because the backend's own exception was neither a `DexError` nor a `ValueError`.
+
+  Nothing reads the ledger now until something needs the number. Billed admission
+  reads it and fails closed on a failure, as a named `LedgerUnreadableError`
+  carrying the cost and saying nothing ran. Settlement tolerates a failure instead,
+  because it re-reads only so the summary can report the day's total and the
+  release it performs needs no reading, so a backend that went away mid-command no
+  longer turns a command that already ran into a refusal at the end of it. Free
+  commands never reach the ledger at all, with one deliberate exception:
+  `connect test` exists to report what the budget looks like, so its capability
+  payload takes one guarded read and reports `budget.session_spent_today: null`
+  when the ledger cannot be reached, rather than failing the report it is part of.
+
+  One thing that came out of writing the test rather than the fix. `charge` takes a
+  cheap local path for a statement inside what the command already booked, and with
+  no booking that path computed a ceiling with the session bound simply missing. A
+  caller charging a statement without going through the handshake first would have
+  had a configured cumulative cap silently not apply. It now goes through admission
+  whenever a cumulative ceiling is set and no reading stands behind it.
+
+- **BigQuery external tables cached `row_count: 0`, so profiling called them
+  empty and their grain went undetected** ([#375]). BigQuery maintains no row
+  count for an external table and reports `num_rows` as a real `0`, verified live:
+  an external table over GCS parquet holding rows reports `0` rows and `0` bytes,
+  indistinguishable from a table that genuinely is empty, while its profiling
+  aggregate returns correct column statistics. That zero was stored as a count, so
+  the table profiled with a false `empty table (no rows)` note, scored its size
+  signal as `log1p(0)`, and lost the two probes that take a row count as an
+  argument: the exact-distinct escalation, so every uniqueness verdict stayed an
+  approximation nothing is allowed to conclude from, and the composite-key probe,
+  so a table whose grain is a pair reported no grain and scaffolded no key test.
+
+  The classification is now an allowlist of the kinds BigQuery keeps counts for
+  rather than a list of the kinds it does not, so external tables, snapshots and
+  anything the API names next are read as unknown instead of empty. An absent
+  `table_type` still means a base table, which is what "the server has not said
+  yet" means. And the count the report expected to arrive from the aggregate now
+  actually does: `_read_aggregates` read `COUNT(*)` off every batch and discarded
+  it, so the pattern the fix was supposed to copy did not exist for views either.
+  It is captured and supersedes the metadata for the rest of the command, the way
+  it already did on Postgres, Redshift, ClickHouse and Databricks. A genuinely
+  empty external table gets its note from the aggregate's zero instead of the
+  metadata's. Snowflake had the identical gap on views and is fixed with it.
+
+  `maintain volume` runs on free metadata, so it still has nothing to compare for
+  an object the warehouse does not count. It now names those objects instead of
+  returning no finding for them, because an absent finding reads as "checked, and
+  nothing moved".
+
+- **A governed macro for dropping orphan relations** ([#151]), the execution
+  half PR #146 deferred when it shipped `orphan_relation` detection
+  ([#113]). `maintain reconcile` used to hand back a bare `DROP TABLE ...;`
+  string for a human to type by hand; it now proposes scaffolding
+  `transform macro drop_orphan_relations` and running it through `dbt
+  run-operation`, with the exact invocation (the finding's identifier
+  already filled into `--args`) spelled out in the proposal. Reconciling
+  more than one orphan in a run adds one more warning naming a single
+  batched invocation for all of them.
+
+  The macro itself takes an explicit list of relations (nothing inferred),
+  is dry-run by default, resolves and drops through `adapter.get_relation`/
+  `adapter.drop_relation` rather than a hand-written DDL string, and refuses
+  to run at all if any named relation is still a live model, seed, or
+  snapshot in the current manifest, so a typo in the list cannot delete
+  something real. A relation that no longer exists in the warehouse is
+  skipped rather than raised on, so the same list is safe to re-run per
+  target. dex still never executes it: authoring the macro and printing the
+  invocation is as far as dex's role goes, the same boundary `transform
+  macro` already draws for every other shipped macro, and the human runs it
+  under the project's own deploy identity.
+
+  Two pieces of the original issue are explicitly deferred rather than
+  bundled in here, matching the scope PR #146 itself drew: a three-state
+  classification (provable dbt orphan / foreign object / unknown) needs dex
+  to retain more than the single most-recent `maintain snapshot`, which
+  today's storage protocol does not keep; and running the macro directly on
+  a dev target through the existing build preflight is a separate, bounded
+  addition to `transform build`'s dbt-invocation surface.
 
 - **The skill wrapper installed neither semantic extra, so most of
   `explore semantic` refused through the skill** ([#358]).
@@ -606,93 +759,10 @@ case, zeros included.
   `connector:`, and a per-command vendor flag would present two different layers
   as one command's two modes.
 
-### Changed
-
-- **`explore semantic list --local` reads the project through the project seam
-  instead of parsing dbt's artifacts itself** ([#353]). Both the catalog read and
-  the PII gate's column resolution called a private function on the dbt module and
-  re-parsed the compiled semantic manifest, so the local semantic read path was
-  hardwired to dbt while a format-neutral seam designed for exactly this sat unused
-  beside it.
-
-  A project format now answers `semantic_catalog()`, one optional protocol beside
-  tier 2, and the format owns the reduction from whatever it holds on disk into the
-  neutral catalog. That deletes a parser rather than adding one, makes the local
-  catalog format-agnostic as a side effect, and means a second semantic-layer
-  format inherits a working local read path instead of needing a third parser. The
-  same seam carries the `(relation, column)` map the PII request-gate resolves a
-  dimension token through, which puts that resolution where the knowledge is.
-
-  **Beside tier 2 rather than a third member of it.** The project protocols are
-  `runtime_checkable` and the tier is checked structurally, so adding a member to
-  `MaintainProject` would have silently dropped every format implementing the two
-  existing ones to tier 1, and `maintain` would have degraded to "cannot be a
-  drift baseline" for a format that is one. It is also a second channel rather than
-  a widening of `semantic_layer()`, which is a fingerprint: it hashes what the
-  author wrote so a stored baseline survives a dbt upgrade, and it is right to
-  throw away the types, labels, aggregations and composition a reader needs.
-  Widening it to serve reads would have cost it the stability it exists for.
-
-  A format that reads no semantic layer implements nothing here and is refused by
-  name, rather than returning an empty catalog that reads as a layer with nothing
-  in it. `SemanticCatalogContract` is the conformance suite for the new channel,
-  and there is now a control asserting `explore semantic list --local` actually
-  routes through the seam, which is what the tier-2 layers already had.
-
-- **Three behavior changes that come with the semantic-layer work, none of which
-  breaks the contract.** A metric query whose backend cannot read its own filter
-  dialect is now refused rather than screened on its group-by half alone
-  ([#357]); both shipped backends read theirs, so no shipped path changes. On an
-  install with the `[semantic]` extra, `explore semantic list --local` returns
-  more dimension rows than before and reports `queryable_paths` rather than
-  `declarations`, because the join graph is now resolved ([#356]); the payload says
-  which of the two it is holding either way. And the grain vocabulary a group-by
-  token is read against widened from five values to the layer's own, so a token
-  ending in something like `__hour` is now read as a grain suffix ([#355]).
-
-- **`semantic.backend` is still accepted, and reads as one spelling of the two
-  new axes** ([#348]). `backend: local` is dbt plus the local deployment,
-  `backend: dbt_cloud` is dbt plus the hosted one, and `api` and `cloud` remain
-  accepted spellings of the latter. Nothing in an existing `.dex/config.yml`
-  needs to change. Setting `backend` and `deployment` together is fine while
-  they agree and refused when they contradict: they are two spellings of one
-  choice, and picking a winner would leave the other accepted and ignored, which
-  reads as a setting that took effect. A vendor or deployment dex does not ship
-  is refused by name rather than resolving to the default.
-
 ## [1.8.0] - 2026-08-25
 
 ### Added
 
-- **A governed macro for dropping orphan relations** ([#151]), the execution
-  half PR #146 deferred when it shipped `orphan_relation` detection
-  ([#113]). `maintain reconcile` used to hand back a bare `DROP TABLE ...;`
-  string for a human to type by hand; it now proposes scaffolding
-  `transform macro drop_orphan_relations` and running it through `dbt
-  run-operation`, with the exact invocation (the finding's identifier
-  already filled into `--args`) spelled out in the proposal. Reconciling
-  more than one orphan in a run adds one more warning naming a single
-  batched invocation for all of them.
-
-  The macro itself takes an explicit list of relations (nothing inferred),
-  is dry-run by default, resolves and drops through `adapter.get_relation`/
-  `adapter.drop_relation` rather than a hand-written DDL string, and refuses
-  to run at all if any named relation is still a live model, seed, or
-  snapshot in the current manifest, so a typo in the list cannot delete
-  something real. A relation that no longer exists in the warehouse is
-  skipped rather than raised on, so the same list is safe to re-run per
-  target. dex still never executes it: authoring the macro and printing the
-  invocation is as far as dex's role goes, the same boundary `transform
-  macro` already draws for every other shipped macro, and the human runs it
-  under the project's own deploy identity.
-
-  Two pieces of the original issue are explicitly deferred rather than
-  bundled in here, matching the scope PR #146 itself drew: a three-state
-  classification (provable dbt orphan / foreign object / unknown) needs dex
-  to retain more than the single most-recent `maintain snapshot`, which
-  today's storage protocol does not keep; and running the macro directly on
-  a dev target through the existing build preflight is a separate, bounded
-  addition to `transform build`'s dbt-invocation surface.
 - **An opt-in SQLite cache backend** ([#139]). `FilesystemStore` writes loose
   JSON under `.dex/`, which is right for the CLI (persistence is git, a reviewer
   reads the state in a pull request) and wrong for a host that wants durable

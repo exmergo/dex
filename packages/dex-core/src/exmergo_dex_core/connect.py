@@ -227,11 +227,18 @@ def new_cost_gate(
     Kept here, alongside credential discovery, on purpose: a host that supplies
     its own connection must never be the thing that supplies the guard.
 
-    The day's spend is passed as a reader rather than a number, so the gate
-    re-reads it when it admits work instead of deciding the whole command from
-    one reading taken here. The lock comes from the store when the store has
-    one; without it the gate still reserves and says on every billed result that
-    the cumulative ceiling is advisory.
+    The day's spend is passed as a reader rather than a number, and nothing
+    calls it here: the gate reads it when it admits work instead of deciding the
+    whole command from one reading taken at assembly. That is what keeps the
+    ledger out of the availability path of commands that cannot spend, since a
+    gate is built for every command on a billed connector and only the billed
+    ones have any stake in the day's total. A store whose ledger lives on a
+    network can therefore be unreachable without taking down a cache-served
+    answer, while billed admission still refuses.
+
+    The lock comes from the store when the store has one; without it the gate
+    still reserves and says on every billed result that the cumulative ceiling
+    is advisory.
     """
 
     paradigm = paradigm_for(connector)
