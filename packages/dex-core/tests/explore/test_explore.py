@@ -13,7 +13,14 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, Relationship
+from exmergo_dex_core.cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    Relationship,
+    ValueCount,
+    ValueDomain,
+)
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
@@ -152,6 +159,88 @@ def test_pii_flag_structure_from_aggregates(duckdb_file: Path, capsys):
     assert 0 < pii["confidence"] <= 0.95
     assert set(pii) == {"category", "confidence"}  # never an example value
     assert cols["id"]["pii"] is None
+
+
+# --- profile payload order and column summary (#288) --------------------------
+
+
+def test_profile_leads_with_the_verdict_not_columns(duckdb_file: Path, capsys):
+    payload = _run(
+        ["explore", "profile", "customers", "--path", str(duckdb_file)], capsys
+    )
+    keys = list(payload["data"]["datasets"][0].keys())
+    assert keys.index("columns") == len(keys) - 2  # elided_column_count trails it
+    for verdict_field in ("grain", "candidate_keys", "data_quality", "row_count"):
+        assert keys.index(verdict_field) < keys.index("columns")
+
+
+def test_profile_columns_default_summarizes_to_findings(
+    profile_findings_duckdb: Path, capsys
+):
+    payload = _run(
+        ["explore", "profile", "wide_profile", "--path", str(profile_findings_duckdb)],
+        capsys,
+    )
+    dataset = payload["data"]["datasets"][0]
+    names = {c["name"] for c in dataset["columns"]}
+    assert names == {"id", "email"}  # key + PII survive; amount/notes don't
+    assert dataset["elided_column_count"] == 2
+
+
+def test_profile_columns_all_restores_every_column(
+    profile_findings_duckdb: Path, capsys
+):
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "wide_profile",
+            "--columns",
+            "all",
+            "--path",
+            str(profile_findings_duckdb),
+        ],
+        capsys,
+    )
+    dataset = payload["data"]["datasets"][0]
+    names = {c["name"] for c in dataset["columns"]}
+    assert names == {"id", "email", "amount", "tag"}
+    assert dataset["elided_column_count"] == 0
+
+
+def test_columns_with_findings_word_boundary_and_value_domain():
+    """The two triggers a full profiling run can't isolate cleanly: a
+    data-quality mention has to match on a word boundary, not a substring
+    (`am` inside `amount` must not count), and a populated value_domain is a
+    finding on its own even with no PII, no nulls, and no key role."""
+
+    dataset = Dataset(
+        identifier="db.main.t",
+        columns=[
+            ColumnProfile(name="amount", data_type="DOUBLE"),
+            ColumnProfile(name="am", data_type="VARCHAR"),
+            ColumnProfile(
+                name="status",
+                data_type="VARCHAR",
+                value_domain=ValueDomain(values=[ValueCount(value="ok", count=1)]),
+            ),
+            ColumnProfile(name="boring", data_type="VARCHAR"),
+        ],
+        data_quality=["amount is declared DOUBLE but holds only integers"],
+    )
+
+    kept, dropped = dataset.columns_with_findings()
+    kept_names = {c.name for c in kept}
+
+    assert "amount" in kept_names  # named in the note
+    assert "am" not in kept_names  # substring of "amount", not a word match
+    assert "status" in kept_names  # value_domain alone is a finding
+    assert "boring" not in kept_names
+    assert dropped == 2
+
+    everything, dropped_everything = dataset.columns_with_findings(everything=True)
+    assert len(everything) == 4
+    assert dropped_everything == 0
 
 
 # --- relationships -----------------------------------------------------------

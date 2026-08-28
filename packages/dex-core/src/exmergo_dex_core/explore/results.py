@@ -50,12 +50,49 @@ class InventoryResult(Result):
         }
 
 
+def _profile_dataset_payload(
+    dataset: Dataset, *, show_all_columns: bool
+) -> dict[str, Any]:
+    """One profiled dataset, verdict first (#288): the fields a caller asked
+    `explore profile` for -- grain, keys, data quality, row count -- lead the
+    serialized dict, and ``columns``, the field that grows without bound and
+    is the first thing a truncating agent harness cuts off, comes last. Key
+    order means nothing to a parser and everything to an agent reading a
+    truncated result.
+
+    Column detail is summarized the same way: by default only the columns
+    carrying a finding (see :meth:`~..cache.Dataset.columns_with_findings`),
+    with the rest counted rather than silently dropped. ``show_all_columns``
+    (``--columns all``) restores every column.
+    """
+
+    kept, elided = dataset.columns_with_findings(everything=show_all_columns)
+    return {
+        "identifier": dataset.identifier,
+        "object_type": dataset.object_type,
+        "row_count": dataset.row_count,
+        "byte_size": dataset.byte_size,
+        "candidate_keys": dataset.candidate_keys,
+        "grain": dataset.grain,
+        "composite_keys": dataset.composite_keys,
+        "rank_score": dataset.rank_score,
+        "data_quality": dataset.data_quality,
+        "profiled_at": dataset.profiled_at,
+        "semantic_models": dataset.semantic_models,
+        "columns": [c.model_dump(mode="json") for c in kept],
+        "elided_column_count": elided,
+    }
+
+
 class ProfileResult(Result):
     """Profiles for the requested objects, freshly scanned or served from cache.
 
     ``datasets`` is the full requested set either way, so a caller reads one list
     and does not have to reassemble it; ``profiled_count`` and
-    ``cache_hit_count`` say which half each came from.
+    ``cache_hit_count`` say which half each came from. ``datasets`` itself always
+    holds every column, unreduced: ``show_all_columns`` only controls what
+    ``data()`` serializes, so a library caller reading ``ProfileResult.datasets``
+    directly is never affected by the CLI's ``--columns`` default.
     """
 
     datasets: list[Dataset] = Field(default_factory=list)
@@ -63,10 +100,14 @@ class ProfileResult(Result):
     cache_hit_count: int = 0
     cache_path: str = ""
     updated_at: str = ""
+    show_all_columns: bool = False
 
     def data(self) -> dict[str, Any]:
         return {
-            "datasets": [d.model_dump(mode="json") for d in self.datasets],
+            "datasets": [
+                _profile_dataset_payload(d, show_all_columns=self.show_all_columns)
+                for d in self.datasets
+            ],
             "profiled_count": self.profiled_count,
             "cache_hit_count": self.cache_hit_count,
             "cache_path": self.cache_path,

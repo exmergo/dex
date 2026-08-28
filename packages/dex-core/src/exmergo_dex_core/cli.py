@@ -324,6 +324,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=argparse.SUPPRESS,
                     )
+                    # Default summarizes each dataset's columns to the ones that
+                    # carry a finding (#288); --columns all restores the full list.
+                    sp.add_argument(
+                        "--columns", choices=["all"], default=argparse.SUPPRESS
+                    )
                 # Force a full re-profile even when the cache holds a fresh,
                 # schema-matching profile for a requested object (the default is
                 # skip-if-cached; --refresh is the escape hatch when the source

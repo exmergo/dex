@@ -9,6 +9,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore profile` leads with the verdict and summarizes wide tables'
+  columns by default** ([#288]). Measured on a 107-column staging table: the
+  payload's useful fields (`grain`, `candidate_keys`, `data_quality`,
+  `row_count`) sat at 97-98% of the byte offset, behind a `columns` array of
+  every profiled column. An agent harness that truncates a large tool
+  result to a preview plus a spilled file never saw them; the same
+  invocations were observed piped through `head`/`tail`/`jq` before the
+  agent had read any of it, discarding the column list on purpose to reach
+  the part that mattered.
+
+  The verdict fields now lead the serialized payload and `columns` trails,
+  the same "key order means nothing to a parser and everything to an agent
+  reading a truncated result" fix already used elsewhere in this module.
+  Each dataset's `columns` is also summarized by default to the ones
+  carrying a finding: PII, a non-zero null fraction, membership in a
+  candidate or composite key (or being proven unique), a reported value
+  domain, or a mention in one of the dataset's own `data_quality`
+  sentences (a word-boundary match, not a substring, so a column named
+  `am` cannot match a note about `amount`). The rest are counted in
+  `elided_column_count` rather than silently dropped, and `--columns all`
+  restores every column.
+
+  This is a new predicate (`Dataset.columns_with_findings`), not a
+  widening of the existing `notable_columns` that `explore map`/`diagram`
+  already share: that method's notion of "notable" (grain/key/join/PII
+  role) has no concept of null fraction or data-quality mentions, and
+  widening it in place would have changed what those two commands
+  consider notable too.
+
 ## [1.9.0] - 2026-08-27
 
 ### Changed

@@ -18,6 +18,34 @@ def _isolated_repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.chdir(tmp_path)
 
 
+@pytest.fixture
+def profile_findings_duckdb(tmp_path: Path) -> Path:
+    """A table with a clean split between columns that carry a finding and
+    columns that don't, for #288's default column summary.
+
+    ``id`` is a proven key, ``email`` is PII: both must survive the default.
+    ``amount`` and ``tag`` repeat (30 distinct values over 50 rows: not
+    unique, and past both the 25-value cap and the 10%-of-rows fraction that
+    would otherwise earn a value domain), carry no PII and no nulls, and are
+    named in no data-quality note: both must be elided by default and
+    restored under ``--columns all``.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "profile_findings.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE wide_profile (id INTEGER, email VARCHAR, amount DOUBLE, "
+        "tag VARCHAR)"
+    )
+    conn.executemany(
+        "INSERT INTO wide_profile VALUES (?, ?, ?, ?)",
+        [(i, f"u{i}@x.com", (i % 30) * 1.5, f"tag_{i % 30}") for i in range(50)],
+    )
+    conn.close()
+    return path
+
+
 def unreachable_warehouse(monkeypatch) -> None:
     """Every attempt to open a connection fails, the way an uninstalled connector
     extra or an absent credential fails. Applied AFTER the cache exists, because
