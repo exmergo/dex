@@ -64,6 +64,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -1050,31 +1051,33 @@ class ClickHouseAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans, return nothing and let the grain stay unknown."""
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
+        """
 
         if not combinations:
             return {}
         meta, _ = self.table_metadata(identifier)
-        estimate = self._scan_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._scan_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
