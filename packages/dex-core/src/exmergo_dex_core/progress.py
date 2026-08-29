@@ -42,8 +42,12 @@ class ProgressReporter:
     stream, and clock decisions live here so the loop stays ignorant of them.
 
     ``stream`` must never default to stdout: writing there would corrupt the JSON
-    envelope. The ``clock`` seam mirrors the adapters' injected ``time.monotonic``
-    so tests can drive timing deterministically.
+    envelope. It defaults to ``None``, meaning "whatever ``sys.stderr`` is when a
+    line is actually written", which is not the same thing as a ``sys.stderr``
+    default argument: that captures the stream this module saw at import and
+    holds it for the life of the process (see :meth:`_emit`). The ``clock`` seam
+    mirrors the adapters' injected ``time.monotonic`` so tests can drive timing
+    deterministically.
     """
 
     def __init__(
@@ -52,7 +56,7 @@ class ProgressReporter:
         label: str,
         noun: str,
         *,
-        stream: TextIO = sys.stderr,
+        stream: TextIO | None = None,
         clock: Callable[[], float] = time.monotonic,
         first_after: float = PROGRESS_FIRST_AFTER,
         interval: float = PROGRESS_INTERVAL,
@@ -107,5 +111,26 @@ class ProgressReporter:
         self._emit(self.total)
 
     def _emit(self, done: int) -> None:
-        self._stream.write(f"dex: {self.label} {done}/{self.total} {self.noun}\n")
-        self._stream.flush()
+        """Write one line to the *current* stderr, and never fail the caller.
+
+        Resolving the stream here rather than binding it as a default argument
+        is the whole point. A ``stream: TextIO = sys.stderr`` default is
+        evaluated once, when this module is first imported, so the reporter
+        writes to that object forever after: under pytest, the capture buffer
+        live at collection time, which is closed by the time any run is slow
+        enough to cross ``first_after`` (`ValueError: I/O operation on closed
+        file`), and for an embedder that reassigns ``sys.stderr`` or wraps a
+        call in ``contextlib.redirect_stderr``, the wrong destination entirely.
+
+        The write is also best-effort. This line narrates work that has already
+        happened and, on a metered connector, already billed; a diagnostic the
+        caller may not even be reading must not be what turns a finished
+        profiling run into an error envelope.
+        """
+
+        stream = sys.stderr if self._stream is None else self._stream
+        try:
+            stream.write(f"dex: {self.label} {done}/{self.total} {self.noun}\n")
+            stream.flush()
+        except (OSError, ValueError, AttributeError):
+            return

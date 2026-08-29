@@ -495,6 +495,17 @@ _HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
 _CAST_SENTINEL = "'0'"
 
 
+def default_substring_expr(qcol: str, start: int, length: int) -> str:
+    """The positional substring idiom every dialect here accepts *except*
+    Redshift, whose server refuses the name outright ("SUBSTR() function is
+    not supported (Hint: use SUBSTRING instead)") even over a real table, so
+    a connector whose spelling differs supplies its own (see
+    `type_contradiction_expressions`). The reverse swap is not free either:
+    BigQuery has SUBSTR and no SUBSTRING, so neither spelling is universal."""
+
+    return f"SUBSTR({qcol}, {start}, {length})"
+
+
 def type_contradiction_expressions(
     qcol: str,
     i: int,
@@ -503,6 +514,7 @@ def type_contradiction_expressions(
     is_integer: bool,
     regexp_predicate: Callable[[str, str], str],
     bigint_type: str,
+    substring_expr: Callable[[str, int, int], str] = default_substring_expr,
 ) -> list[str]:
     """Declared-type-vs-content aggregate expressions for one column.
 
@@ -579,8 +591,8 @@ def type_contradiction_expressions(
         ]
         slash_either = f"({slash_date_pred} OR {slash_datetime_pred})"
         slash_shaped = shaped(slash_either)
-        first_val = total_cast(slash_either, f"SUBSTR({qcol}, 1, 2)")
-        second_val = total_cast(slash_either, f"SUBSTR({qcol}, 4, 2)")
+        first_val = total_cast(slash_either, substring_expr(qcol, 1, 2))
+        second_val = total_cast(slash_either, substring_expr(qcol, 4, 2))
         exprs += [
             fraction(slash_shaped, f"{first_val} > 12", f"ts_sl1_{i}"),
             fraction(slash_shaped, f"{second_val} > 12", f"ts_sl2_{i}"),

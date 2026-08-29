@@ -9,6 +9,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Redshift: `explore map` and `explore profile` died on any table with a
+  `TIMESTAMPTZ` column, and on any slash-date string column.** Two spellings in
+  the generated profiling statement are refused by the Redshift server, and
+  because both ride the single batched aggregate pass, either one failed the
+  whole profile rather than degrading one statistic.
+
+  `DATEDIFF` resolves to `pg_catalog.date_diff`, declared over
+  `DATE`/`TIME`/`TIMETZ`/`TIMESTAMP` with no `TIMESTAMPTZ` overload, while
+  `DATE_TRUNC` over a `TIMESTAMPTZ` column returns `TIMESTAMPTZ`. So the periods
+  the temporal-continuity probe diffs were exactly the shape it rejects, with
+  `function pg_catalog.date_diff("unknown", timestamp with time zone, timestamp
+  with time zone) does not exist`. Both operands are now cast to `TIMESTAMP`:
+  total for every type that reaches the probe, and shifting nothing, because it
+  applies to both sides by the same rule.
+
+  `SUBSTR`, the spelling the shared type-contradiction expressions use for the
+  slash-date component extraction, is refused by name (`SUBSTR() function is not
+  supported (Hint: use SUBSTRING instead)`) at execution over a real table, not
+  only in a leader-node-only query. The idiom is now a per-connector callable
+  with the shared `SUBSTR` as the default, because the swap is not universal in
+  the other direction either: BigQuery has `SUBSTR` and no `SUBSTRING`.
+
+  Both are pinned offline against the Redshift fake, with a `TIMESTAMPTZ` column
+  added to the fixture: the previous one profiled a bare `TIMESTAMP`, which is
+  why an offline test asserting the generated statement passed while the live
+  one could not run.
+
+- **A progress line could fail a profiling run that had already billed.**
+  `ProgressReporter`'s `stream` was a `TextIO = sys.stderr` default argument, so
+  it captured whatever `sys.stderr` was when the module was first imported and
+  wrote there for the life of the process. Under pytest that object is the
+  capture buffer live at collection, closed long before any run is slow enough
+  to cross the five-second progress gate, so a live `explore map` profiled the
+  whole schema, spent its compute seconds, and then returned
+  `errors: ['I/O operation on closed file.']` instead of the map. The same
+  binding sent progress to the wrong place for any embedder that reassigns
+  `sys.stderr` or wraps a call in `contextlib.redirect_stderr`.
+
+  The stream is now resolved when a line is written, and the write is
+  best-effort. A diagnostic that narrates work already done, and on a metered
+  connector already paid for, is never worth failing that work over.
+
 ## [1.9.0] - 2026-08-27
 
 ### Changed
