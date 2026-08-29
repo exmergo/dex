@@ -132,5 +132,5 @@ class ProgressReporter:
         try:
             stream.write(f"dex: {self.label} {done}/{self.total} {self.noun}\n")
             stream.flush()
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             return
