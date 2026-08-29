@@ -1314,6 +1314,11 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
             # gate's refusal can be lifted the same documented way every other
             # PII refusal is.
             pii_overrides=pii_override_paths(engine.config.pii_overrides),
+            # Which house-convention warnings this project has left on. A style
+            # judgment is the one kind of check a repo gets to decline, and the
+            # decision belongs in the committed config rather than in a flag,
+            # so it holds for every caller rather than for whoever remembered.
+            conventions=engine.config.conventions,
             # Agent-authored edits, which is the caller `editing_surface` exists
             # for: there is no placement to compare a path against here, only the
             # surface the format admits to owning. A format declining the write
