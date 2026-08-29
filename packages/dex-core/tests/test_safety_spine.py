@@ -1837,6 +1837,58 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     assert not new_model.exists()
 
 
+def test_a_house_convention_warns_and_never_imposes(dbt_project_dir: Path):
+    """The one plan-time check that judges style rather than fact.
+
+    Its whole design rests on staying advisory: it reads a convention nobody
+    declared, out of models the caller did not necessarily write, and a check
+    like that turning into a refusal would be dex imposing a house rule it
+    inferred. So it warns, the plan stores, the project is untouched, and it
+    opens no connection to reach any of that conclusion.
+    """
+
+    from exmergo_dex_core import transform
+
+    marts = dbt_project_dir / "models" / "marts"
+    marts.mkdir(parents=True)
+    for name, select in (
+        ("dim_products", "select product_id, brand_id, brand_name"),
+        ("dim_stores", "select store_id, region_id, region_name"),
+        ("dim_users", "select user_id, country_id, country_name"),
+        ("dim_suppliers", "select supplier_id, supplier_name"),
+    ):
+        (marts / f"{name}.sql").write_text(
+            f"{select} from {{{{ ref('stg_{name[4:]}') }}}}\n", encoding="utf-8"
+        )
+    authored = marts / "dim_orders.sql"
+
+    engine = DexEngine(
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector="duckdb"),
+    )
+    with engine:
+        result = engine.plan(
+            "add dim_orders",
+            edits=[
+                transform.PlanEdit(
+                    path="models/marts/dim_orders.sql",
+                    kind=transform.EditKind.MODEL_SQL,
+                    new_content=(
+                        "select order_id, supplier_id, status "
+                        "from {{ ref('stg_orders') }}\n"
+                    ),
+                )
+            ],
+        )
+        # No connection was opened to reach a judgment about naming.
+        assert engine._adapter_instance is None
+
+    assert result.plan_id
+    assert any("supplier_id" in w for w in result.warnings), result.warnings
+    assert not authored.exists()
+
+
 def _attribution_repo(dbt_project_dir: Path, duckdb_file: Path, model_sql: str) -> Path:
     """A project whose one model reads a real warehouse table, cache and all.
 
