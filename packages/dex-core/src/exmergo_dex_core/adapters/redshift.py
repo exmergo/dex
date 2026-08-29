@@ -165,8 +165,28 @@ def _date_trunc_expr(qcol: str, unit: str) -> str:
     return f"DATE_TRUNC('{unit}', {qcol})"
 
 
+def _substring_expr(qcol: str, start: int, length: int) -> str:
+    # Redshift refuses SUBSTR by name -- "SUBSTR() function is not supported
+    # (Hint: use SUBSTRING instead)" -- and does so at execution, over a real
+    # table, not only in a leader-node-only query. SUBSTRING takes the same
+    # positional arguments and is what the hint asks for.
+    return f"SUBSTRING({qcol}, {start}, {length})"
+
+
 def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
-    return f"DATEDIFF({unit}, {earlier}, {later})"
+    # Both operands are cast, and the cast is not decorative: Redshift's
+    # DATEDIFF resolves to pg_catalog.date_diff, which is declared over
+    # DATE/TIME/TIMETZ/TIMESTAMP and has no TIMESTAMPTZ overload, while
+    # DATE_TRUNC over a TIMESTAMPTZ column returns TIMESTAMPTZ. The periods
+    # this diffs are therefore exactly the shape it refuses ("function
+    # pg_catalog.date_diff(\"unknown\", timestamp with time zone, timestamp
+    # with time zone) does not exist"), and a plain DATEDIFF failed the whole
+    # profiling statement for any table carrying a TIMESTAMPTZ column. The cast
+    # is total for every type that reaches here (DATE and TIMESTAMP widen
+    # unchanged; TIME is never temporal-profiled, see `is_temporal_type`), and
+    # it shifts nothing: both operands convert to the session timezone by the
+    # same rule, so their difference is what it was.
+    return f"DATEDIFF({unit}, {earlier}::TIMESTAMP, {later}::TIMESTAMP)"
 
 
 class RedshiftConnectionError(ConnectorError):
@@ -847,6 +867,7 @@ class RedshiftAdapter:
                         is_integer=is_integer_type(col.data_type),
                         regexp_predicate=_regexp_predicate,
                         bigint_type=_BIGINT_TYPE,
+                        substring_expr=_substring_expr,
                     )
                 )
             wants_key_shape = (col.name in key_shape_req) and not degraded
