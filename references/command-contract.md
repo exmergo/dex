@@ -395,6 +395,38 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   valid on its own because it depends on something else in the same edit.
   Authoring a model that does not exist yet produces no findings and opens
   nothing.
+- `transform plan` raises two **advisory warnings about the shape of what was
+  authored**, both free, both static, and neither able to refuse a plan. The
+  first compares the authored SELECT list against the columns the model's
+  `schema.yml` declares, in both directions: a declared column the SELECT does
+  not produce, and a produced column the declaration does not name. A model with
+  no declared columns has no contract and produces nothing; a SELECT list that
+  cannot be resolved statically (a `select *`, a `t.*`, an unaliased macro
+  standing in for a column) says so rather than guessing, and an *aliased* macro
+  call is resolved by its alias. The declaration is read with this same plan's
+  own `schema.yml` edits overlaid, so a model and its documentation edited
+  together are compared against each other rather than against a stale file.
+
+  The second reads a **house convention out of the project's own models**: an
+  authored model exposing a raw foreign key where its siblings all resolve the
+  equivalent key to a descriptive attribute. Siblings are the models sharing the
+  authored one's folder and its layer prefix, widening to that prefix
+  project-wide when the folder is too small to hold a precedent. At least three
+  of them must resolve a key of the same id-suffix shape and none may pass one
+  through, since one counter-example is enough to say the house has not settled
+  the question (a fact table beside the dimensions is that counter-example, and
+  a `*_key` convention says nothing about a `*_id`). A key naming the model's
+  own entity is its identity, not a foreign key. And the project must hold a
+  parent to resolve against, because the fix is a `ref()`. The warning names the
+  siblings and the parent so the inference can be argued with.
+
+  Both read the project as this plan will leave it, so models authored together
+  inform each other, and both judge only what the plan authors: an existing
+  violation elsewhere in the project is not this plan's warning. The convention
+  check is the only one dex raises on a style judgment rather than on a fact,
+  which is why it is the only one a project can decline:
+  `conventions.resolved_keys: false` in `.dex/config.yml`, named in the warning
+  itself.
 - `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
