@@ -4181,7 +4181,14 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
 
     adapter = _redshift_adapter(fake_redshift_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
-    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
+    columns = [
+        *columns,
+        ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns)),
+        # The seeded timestamps are TIMESTAMPTZ, and that is not decoration:
+        # Redshift's DATEDIFF has no TIMESTAMPTZ overload, so a
+        # TIMESTAMP-only fixture asserts a statement the server would refuse.
+        ColumnMeta("created_at", "timestamp with time zone", True, len(columns) + 1),
+    ]
     shape = {
         c.name
         for c in columns
@@ -4195,7 +4202,7 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         if is_string_type(c.data_type) or is_integer_type(c.data_type)
     }
     key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
-    temporal_req = {"signup_ts"}
+    temporal_req = {"signup_ts", "created_at"}
     sql, _plan = adapter._build_aggregate_sql(
         "dexdb.shop.customers",
         columns,
@@ -4215,6 +4222,18 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
     # Temporal-continuity statistics (#206) ride the same statement too.
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
     assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
+    # ...with both DATEDIFF operands cast to TIMESTAMP, because Redshift
+    # resolves DATEDIFF to a pg_catalog.date_diff that is declared over
+    # DATE/TIME/TIMETZ/TIMESTAMP only: DATE_TRUNC over the TIMESTAMPTZ column
+    # yields TIMESTAMPTZ, and an uncast diff of two of those failed the whole
+    # profiling statement server-side.
+    assert "DATEDIFF(day, prev_period::TIMESTAMP, period::TIMESTAMP)" in sql
+    assert "DATEDIFF(month, prev_period::TIMESTAMP, period::TIMESTAMP)" in sql
+    assert "DATEDIFF(hour, prev_period::TIMESTAMP, period::TIMESTAMP)" in sql
+    # SUBSTR is the shared spelling, and Redshift refuses it by name ("SUBSTR()
+    # function is not supported (Hint: use SUBSTRING instead)") at execution
+    # over a real table, so this adapter must emit SUBSTRING and nothing else.
+    assert "SUBSTRING(" in sql and "SUBSTR(" not in sql.replace("SUBSTRING(", "")
     assert assert_select_only(sql, dialect="redshift") == sql
 
 
