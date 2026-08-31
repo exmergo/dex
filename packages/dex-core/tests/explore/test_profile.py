@@ -2004,10 +2004,9 @@ def test_composite_probe_caps_the_pair_count():
     from exmergo_dex_core.explore import profile as profile_mod
 
     # Twelve columns with geometrically spread cardinalities: every pair
-    # survives the product test, and their products are spread widely enough
-    # that redundancy dedup (#168) leaves dozens of genuinely distinct
-    # candidates -- so the cap, not the dedup, is what keeps the probe
-    # bounded here.
+    # survives the product test, so dozens of candidates reach the cut. The cap
+    # is the only thing bounding the probe, which is the point: the redundancy
+    # rule orders candidates and never removes one (#377).
     approx = {}
     for i in range(6):
         approx[f"a{i}_id"] = 32 * (2**i)
@@ -2018,7 +2017,7 @@ def test_composite_probe_caps_the_pair_count():
     assert len(adapter.combo_calls[0]) == 5  # _COMPOSITE_PAIR_CAP
 
 
-def test_composite_probe_dedups_same_anchor_pairs_so_the_true_grain_survives():
+def test_composite_probe_ranks_same_anchor_pairs_last_so_the_true_grain_survives():
     """#168: several pairs crossing one low-cardinality dimension with
     different, equally uninteresting partners must not consume the entire
     cap and crowd out the true grain, which can legitimately score worse on
@@ -2027,9 +2026,9 @@ def test_composite_probe_dedups_same_anchor_pairs_so_the_true_grain_survives():
     from exmergo_dex_core.explore import profile as profile_mod
 
     # dim's five (dim, j_i) pairings all score identically (product == row
-    # count) and are near-duplicates of each other -- only one should survive
-    # as dim's representative. (date, dim) scores 5x worse but is a
-    # genuinely different hypothesis and must still get a slot.
+    # count) and are near-duplicates of each other -- only one should reach the
+    # cap ahead of anything else as dim's representative. (date, dim) scores 5x
+    # worse but is a genuinely different hypothesis and must still get a slot.
     approx = {"dim": 10, "date": 500, **{f"j{i}": 100 for i in range(1, 6)}}
     adapter = _StubAdapter(rows=1000, approx=approx, combos={("date", "dim"): 1000})
     datasets = profile_mod.profile(adapter, ["db.s.t"])
@@ -2096,6 +2095,83 @@ def test_composite_grain_detected_end_to_end(composite_grain_duckdb: Path, capsy
     orders = ds["orders"]
     assert orders["grain"] == ["order_key"]
     assert orders["composite_keys"] == []
+
+
+def test_composite_probe_fills_the_cap_rather_than_discarding_the_grain():
+    """#377: the redundancy rule orders candidates, it does not delete them.
+
+    A parent-plus-line fact table, six rows. ``(customer_id, order_id)`` is two
+    id-shaped columns so it ranks first, claims both anchors, and every pair
+    reusing either scores within the redundancy ratio of it. Dropping those left
+    two pairs probed out of a cap of five, one of them a pair that cannot be a
+    key, and the grain never asked about at all.
+    """
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(
+        rows=6,
+        approx={"order_id": 4, "line_number": 2, "customer_id": 4, "amount": 4},
+        combos={("order_id", "line_number"): 6},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_items"])
+
+    probed = adapter.combo_calls[0]
+    assert ["order_id", "line_number"] in probed
+    # Six pairs clear the necessary condition and the cap is five, so five are
+    # asked: no slot goes unused while a ranked candidate sits dropped.
+    assert len(probed) == profile_mod._COMPOSITE_PAIR_CAP
+
+    ds = datasets[0]
+    assert ds.composite_keys == [["order_id", "line_number"]]
+    assert rel_mod.detect_grain(ds) == ["order_id", "line_number"]
+    assert not any("grain unknown" in n for n in rel_mod.data_quality_notes(ds))
+
+
+def test_composite_probe_reports_the_minimal_grain_when_two_pairs_prove():
+    """Filling the cap makes two proven composites reachable on one table, and
+    consumers read the first entry as the grain. ``(order_id, product_id)`` is
+    two id-shaped columns so it wins the probe ranking, but it is a superkey of
+    the parent-plus-line grain, so the tighter pair has to come back first."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 250, "line_number": 4, "product_id": 900},
+        combos={("order_id", "line_number"): 1000, ("product_id", "order_id"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_items"])
+
+    ds = datasets[0]
+    assert ds.composite_keys == [
+        ["order_id", "line_number"],
+        ["product_id", "order_id"],
+    ]
+    assert rel_mod.detect_grain(ds) == ["order_id", "line_number"]
+
+
+def test_parent_line_grain_detected_end_to_end(parent_line_grain_duckdb: Path, capsys):
+    """The same shape against a real warehouse: the decoy pair outranks the
+    grain, both survive the necessary condition, and the profile reports the
+    grain rather than no key at all."""
+
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "order_items",
+            "--path",
+            str(parent_line_grain_duckdb),
+        ],
+        capsys,
+    )
+    ds = payload["data"]["datasets"][0]
+    assert ds["composite_keys"] == [["order_id", "line_number"]]
+    assert ds["grain"] == ["order_id", "line_number"]
+    assert not any("grain unknown" in n for n in ds["data_quality"])
 
 
 # --- value-domain reporting (#203) -----------------------------------------------

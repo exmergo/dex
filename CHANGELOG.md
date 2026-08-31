@@ -158,6 +158,51 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   best-effort. A diagnostic that narrates work already done, and on a metered
   connector already paid for, is never worth failing that work over.
 
+- **A fact table's parent-plus-line grain was discarded before it could be
+  probed, and the probe spent its budget on a pair that could not be a key**
+  ([#377]). The composite-key probe ranks candidate pairs and then removed any
+  pair sharing a column with a better-ranked one at a similar distinct-count
+  product, as the same hypothesis with different filler. On a fact table it is
+  not: a pair of two id-shaped columns sorts first, claims both its anchors, and
+  every pair reusing either is dropped, including the parent-plus-line pair that
+  is the grain. Measured on BigQuery over a six-row order-items table, dex probed
+  `(customer_id, order_id)` and `(amount, line_number)`, proved neither, left
+  three of five probe slots unused, and reported `composite_keys: []` with the
+  note `no candidate key detected; grain unknown`. The pair it never asked about
+  was the key. This is the successor to #168: raising the cap from three to five
+  did not help, because the removal happens before the cap applies.
+
+  **The redundancy rule now orders candidates instead of removing them.** A
+  near-duplicate pair goes behind every pair that is not one, and the cap is
+  filled from the preferred pairs first and the demoted ones after. The rule was
+  worth keeping, since spending a scarce cap on genuinely different hypotheses is
+  right, but it can only earn that while the cap binds; with slots free, dropping
+  a ranked candidate saves nothing and can cost the grain outright. The cap stays
+  at five and remains the spend guard. The ranking is unchanged: ranking by
+  closeness to the row count instead, which the report also proposed, would put a
+  real two-id grain last rather than first, trading one systematic failure for
+  another.
+
+  Proven pairs now come back smallest product first. Filling the cap makes two
+  proven composites on one table reachable where only one was ever probed before,
+  and `detect_grain`, `explore summary` and the cumulative-metric picker all read
+  the first entry as the grain, so a superkey of two id columns that happen to be
+  unique together must not outrank the tighter key.
+
+- **A metered composite-key probe that the budget could not fully cover gave up
+  the grain instead of narrowing** ([#377]). Every combination is another scan,
+  so the charge scales with how many pairs ride along, and the gate was
+  all-or-nothing: a budget covering four pairs of five bought none of them and
+  the table took `composite-key probe skipped`. The pairs arrive best-ranked
+  first, so that threw away the part most likely to hold the grain for no saving.
+  The probe now spends on the longest affordable prefix and says which pairs went
+  unasked, and skips outright only when it cannot afford one. The search, both
+  notes, and the reasoning live in `adapters.base` rather than in each of the six
+  metered connectors. On BigQuery, where the charge is per statement rather than
+  per pair and floors at the per-query minimum, a probe already priced at that
+  floor and still refused stops the search instead of re-pricing prefixes that
+  cannot cost less.
+
 
 ## [1.9.0] - 2026-08-27
 

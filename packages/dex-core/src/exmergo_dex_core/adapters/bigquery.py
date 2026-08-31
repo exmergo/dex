@@ -33,6 +33,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -773,35 +774,46 @@ class BigQueryAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scan, return nothing and let the grain stay unknown. A metered
-        adapter never self-escalates past its ceiling.
+        already-confirmed budget. Every combination widens the same statement,
+        so when the budget cannot cover it the probe narrows to the pairs it can
+        afford (they arrive best-ranked first) and says so, rather than giving
+        up the grain wholesale. A metered adapter never self-escalates past its
+        ceiling.
 
         Charged at the floored bytes, not the raw dry-run number: this is one
         billed query like any other, so it bills (and must be budgeted
-        against) at least the per-query minimum (issue #107)."""
+        against) at least the per-query minimum (issue #107). That floor is
+        also what bounds the search below: a prefix already priced at the
+        minimum and still refused cannot be rescued by dropping another pair,
+        so only a probe that would genuinely cost less gets re-priced."""
 
         if self._unqueryable(identifier) or not combinations:
             return {}
-        sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
-            dialect=self.dialect,
-        )
-        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
-        if not self.cost_gate.try_charge(floored):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
+        priced: dict[int, tuple[str, float]] = {}
+
+        def price(prefix: list[list[str]]) -> float:
+            statement = assert_select_only(
+                distinct_combination_sql(self._quote(identifier), prefix, _quote_ident),
+                dialect=self.dialect,
             )
+            floored = max(self._dry_run(statement), float(_MIN_BILLED_BYTES))
+            priced[len(prefix)] = (statement, floored)
+            return floored
+
+        probed, note = affordable_combinations(
+            combinations,
+            price,
+            self.cost_gate.try_charge,
+            floor=float(_MIN_BILLED_BYTES),
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
+        sql, floored = priced[len(probed)]
         _job, iterator = self._run(sql, floored)
         rows = list(iterator)
-        return {
-            tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int

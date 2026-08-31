@@ -150,8 +150,9 @@ upgrades the `SVV_TABLE_INFO` row estimate to an exact figure. When no single
 column proves unique, the composite-key probe (a bounded batch of exact
 distinct-combination counts) spends inside the same confirmed budget, and
 like the escalation it carries the pending Serverless wake minimum when it
-bills first; when the remaining budget cannot cover it, the probe skips with
-a note and the grain stays unknown. `SUPER`,
+bills first; when the remaining budget cannot cover every pair, the probe
+narrows to the best-ranked pairs it can afford, and skips with a note only
+when it cannot afford one, in which case the grain stays unknown. `SUPER`,
 `VARBYTE`, `GEOMETRY`, `GEOGRAPHY`, and `HLLSKETCH` columns degrade to
 non-null counts. There is **no sampled-profiling threshold**: Redshift has
 no TABLESAMPLE, so a sampling knob would be a lie; the budget is the only
