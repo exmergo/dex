@@ -388,6 +388,7 @@ def compile_estimate(
     target: str,
     select: str | None = None,
     runner: Runner | None = None,
+    env: dict[str, str] | None = None,
     timeout: float = _COMPILE_TIMEOUT_SECONDS,
 ) -> tuple[float, dict[str, float], list[str]]:
     """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
@@ -439,7 +440,7 @@ def compile_estimate(
     ]
     if select:
         argv += ["--select", select]
-    run = runner or _default_runner(timeout, project)
+    run = runner or _default_runner(timeout, project, env)
     completed = run(argv)
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
@@ -580,7 +581,15 @@ def _build_env(
     database past the budget even if the upfront estimate under-priced it.
     """
 
-    if paradigm is not Paradigm.DB_LOAD or ceiling is None:
+    if ceiling is None:
+        return None
+    # ClickHouse uses the same two server settings under both deployments; only
+    # the meaning of the seconds changes. Other compute-time connectors own
+    # their caps elsewhere, and other db-load connectors remain opt-in below.
+    supported = paradigm is Paradigm.DB_LOAD or (
+        connector == "clickhouse" and paradigm is Paradigm.COMPUTE_TIME
+    )
+    if not supported:
         return None
     builder = _CAP_ENV_BUILDERS.get(connector or "")
     if builder is None:

@@ -419,7 +419,9 @@ class DexEngine:
 
         if self._declared is None and self.connector is None and self.path is None:
             return None
-        return connect.paradigm_for(self.connector or self.config.connector)
+        return connect.paradigm_for(
+            self.connector or self.config.connector, self.config
+        )
 
     def settled_spend(self) -> dict | None:
         """What the command that just ran actually billed, settled and read

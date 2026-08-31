@@ -1,12 +1,11 @@
 # Connector: ClickHouse
 
-The self-hosted analytical database. Namespace: `database.table`, **two parts**,
-because ClickHouse has no catalog level above the database. Cost paradigm:
-**database load**, expressed as database-seconds. Read-only against data,
+The analytical database, self-hosted or ClickHouse Cloud. Namespace:
+`database.table`, **two parts**, because ClickHouse has no catalog level above
+the database. The cost paradigm is deployment-dependent: self-hosted uses
+**database load** in database-seconds; Cloud uses **compute time** in
+compute-seconds with compute-unit-hours alongside. Read-only against data,
 enforced in depth.
-
-ClickHouse Cloud is not yet supported and is refused rather than guarded in the
-wrong unit; see [Deployment](#deployment) below.
 
 ## Authentication: discover, don't ask
 
@@ -49,18 +48,20 @@ clickhouse:
   databases:                     # source allowlist; empty means all visible
     - app
   dev_database: dbt_dev          # where dbt dev builds write (never a source)
-  deployment: self_hosted        # or `cloud`, which is refused for now
+  deployment: self_hosted        # `cloud` selects compute-time guarding
+  compute_unit_price_usd: null   # Cloud only; actual regional/contract CU price
   max_full_profile_bytes: null   # opt-in SAMPLE threshold; see Profiling
 budget:
-  ceiling: 60                    # per-command database-seconds; --budget overrides
+  ceiling: 60                    # per-command seconds; --budget overrides
   session_ceiling: 600           # cumulative seconds per UTC day
 ```
 
 Point dex at a **read-only user** rather than `default`. The documented grant
 shape is SELECT on the source databases plus SELECT on `system.tables`,
 `system.columns` and `system.databases`, with write access only on the dedicated
-dev database for the dbt user. `scripts/clickhouse_seed.sql` shows the shape
-(the `dex_ro` and `dbt_dev` users).
+dev database for the dbt user. `scripts/clickhouse_seed.sql` is the shared,
+parameterized data fixture; `scripts/clickhouse_local_users.sql` shows the local
+`dex_ro` and `dbt_dev` grant shape.
 
 Granting `system.grants` and `system.role_grants` as well is optional and only
 affects the dev-target preflight: without them dex cannot read the dbt user's
@@ -88,7 +89,7 @@ and dbt-clickhouse's `schema:` **is** the ClickHouse database (there is no
 than synthesizing a third component, so every identifier in the inventory, the
 cache, and every drift finding is one you can paste into `clickhouse-client`.
 
-## Cost model: load, not dollars
+## Cost model
 
 Self-hosted ClickHouse bills nothing, but a scan is real load on a server that is
 usually shared and usually serving something latency-sensitive. So the guarded
@@ -140,9 +141,37 @@ flushes on a delay). The seconds in the ledger are what the *server* spent, not
 what the client waited, which is a genuine accuracy improvement over the other
 db-load connector.
 
-There is no currency translation, because nothing is billed in one. Rows and
-bytes actually read are reported as table notes rather than in the spend summary,
-so nothing there carries a magnitude in a unit the ceiling is not in.
+For self-hosted there is no currency translation, because nothing is billed in
+one. Rows and bytes actually read are reported as table notes rather than in the
+spend summary, so nothing there carries a magnitude in a unit the ceiling is not
+in.
+
+Cloud uses the same free estimates, caps, and exact statement-seconds
+settlement. Before any billed work, dex reads `CGroupMemoryTotal` from every
+replica through `clusterAllReplicas('default', system.asynchronous_metrics)` and
+cross-checks the number of answers against `system.clusters`. It derives:
+
+```
+compute_units_per_hour = total_memory_gib / 8
+compute_unit_hours = seconds * compute_units_per_hour / 3600
+```
+
+The capacity read is cached for one command and fails closed when it is denied,
+empty, malformed, partial, or inconsistent. dex never substitutes a configured
+replica count, a guessed tier, or a public price. When
+`compute_unit_price_usd` is present, estimates and settled spend also carry a USD
+translation using that supplied rate.
+
+These fields are explicitly approximate, not an invoice. dex attributes the
+server-reported time of each statement at the capacity observed for that
+command; Cloud bills active capacity per minute and can include wake and idle
+time outside the statement.
+
+The dedicated AWS us-east-1 Scale test service is configured with the actual
+compute rate of $0.29846 per 8-GiB compute unit-hour. Its $25.30/TB-month storage
+rate is documented operational context only: storage persists independently of
+a statement, so dex does not mislabel it as query spend or fold it into the
+per-command confirmation.
 
 ## Deployment
 
@@ -151,20 +180,24 @@ decision rather than a connection one:
 
 - `self_hosted` (default) bills no currency, so dex guards it in
   database-seconds.
-- `cloud` bills compute-unit-hours, which dex does not yet model. It is
-  **refused at connect**, naming the gap, rather than guarded with a
-  database-seconds number that could not bound the spend. A ceiling that reports
-  a number which did not bind is worse than no ceiling.
+- `cloud` is guarded in compute-seconds. Live allocated memory translates the
+  same binding seconds into approximate compute-unit-hours and, when configured,
+  USD.
 
-The field and `compute_unit_price_usd` are accepted now so the committed config
-surface will not have to change shape when Cloud lands;
 `compute_unit_price_usd` is refused under `self_hosted`, where it would be
 accepted and ignored.
 
 Deployment is a **declaration, never a sniff**. At connect dex additionally
-checks the server's own `cloud_mode` setting and refuses when the declaration
-does not match reality, which makes the heuristic a safety net rather than
-load-bearing magic.
+checks the server's own `cloud_mode` setting in both directions and refuses when
+the declaration does not match reality. A declared Cloud endpoint proceeds only
+after that corroboration and the live capacity proof.
+
+For Cloud, `connect test` adds `compute.replica_count`, `total_memory_gib`,
+`compute_units_per_hour`, the metadata source, and `approximate: true`. Its
+budget adds `ceiling_compute_unit_hours`; confirmation adds
+`estimated_compute_unit_hours`, `compute_unit_rate`, and optionally
+`estimated_usd`; settlement adds `compute_unit_hours_billed` and optionally
+`usd_billed`. The binding ceiling and ledger remain seconds.
 
 ## Read-only, enforced in depth
 
@@ -300,6 +333,21 @@ DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
     DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
     uv run pytest tests/integration -q -m clickhouse
 scripts/setup_clickhouse_dev.sh --down
+```
+
+The narrow Cloud suite is repository-gated and serialized with the other live
+cloud jobs. Its protected `clickhouse-cloud-integration` environment is created
+by `scripts/setup_clickhouse_cloud_ci.sh`. Before opening SQL, both CI and the
+local runner call the same read-only usage preflight; it refuses once the exact
+service reaches 2 compute CHC in the current UTC day. The post-run report marks
+unlocked usage records provisional because Cloud metering can lag.
+
+Setup, rotation, local execution, troubleshooting, and bounded teardown are in
+`scripts/clickhouse_cloud/README.md`. To run locally after loading the protected
+environment values:
+
+```bash
+scripts/clickhouse_cloud/run_integration.sh
 ```
 
 The seed is deliberately flawed in ways that make two silent hazards observable:

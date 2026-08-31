@@ -97,7 +97,23 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   regression test locked in "no detector diffs the model list" as intended
   behavior); that test now pins the opposite, and the reasoning for both is
   recorded on it and on `transform_drift` itself.
-  
+
+- **ClickHouse Cloud is now a first-class guarded deployment** ([#312]).
+  `clickhouse.deployment: cloud` selects `compute_time`, corroborates
+  `system.settings.cloud_mode`, and derives live capacity from every replica's
+  `CGroupMemoryTotal`. Binding budgets and the ledger remain seconds; envelopes
+  add approximate compute-unit-hours and optional USD using the configured real
+  CU price. Missing, denied, partial, or inconsistent capacity refuses before
+  billed work, while self-hosted ClickHouse remains backward-compatible
+  `db_load` with no CU or currency fields.
+
+  A parameterized fixture now serves both the exhaustive free container suite
+  and a narrow protected Cloud suite. Versioned automation provisions the exact
+  dedicated service at fixed minimum capacity with five-minute idling, isolated
+  `dex_ci_*` database identities and durable caps, a service-scoped usage API
+  key, GitHub environment configuration, a pre-SQL 2-CHC/day admission check,
+  rotation, local execution, and bounded teardown.
+
 ### Fixed
 
 - **`transform` skill docs claimed BigQuery has no upfront `transform build`
