@@ -586,7 +586,7 @@ def test_each_call_gets_its_own_cost_gate(monkeypatch: pytest.MonkeyPatch, tmp_p
     # labelled with its own command, and has its full budget available.
     assert second.cost_gate is not None
     assert second.cost_gate.command == "explore query"
-    assert second.cost_gate.remaining_for_statement() == 1_000
+    assert second.cost_gate.statement_cap(unit="byte") == 1_000
     second.cost_gate.charge(600.0)  # would raise if the first charge carried over
 
 
