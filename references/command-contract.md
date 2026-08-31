@@ -757,6 +757,12 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   plus `session_spent_today`, which is what the next command's cumulative
   ceiling will start from. A failed build reports it too: dbt bills for the
   statements it ran before it stopped.
+- **ClickHouse's paradigm depends on its declared deployment.** Config-free
+  callers retain the backward-compatible `db_load` default; an effective
+  `clickhouse.deployment: cloud` uses `compute_time`. Cloud keeps seconds as the
+  binding ceiling and ledger unit, and adds approximate compute-unit-hours from
+  live per-replica memory plus optional USD from the configured price. Missing
+  or partial capacity refuses before billed work.
 - **The spend ledger is a dependency of billing, not of every command.** A gate
   is built at every connection assembly on a billed connector, free commands
   included, but nothing reads the ledger until something needs the day's total.
