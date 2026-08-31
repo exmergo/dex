@@ -11,6 +11,12 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **`explore query` results now identify their columnar payload shape in the
+  envelope.** Single-query `data`, batch `data`, and every `data.results[]`
+  entry carry `"shape": "columnar"`, so a successful response points callers
+  to `columns`, `types`, and `cells` without requiring documentation or source
+  inspection. The compact result layout itself is unchanged.
+
 - **`dex --help` now orients a stranger instead of dumping bare flags and
   subcommand names** ([#296]). The top-level help carried a throwaway
   one-line description, a subcommand list with help text on `demo` alone,
