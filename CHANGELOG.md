@@ -110,6 +110,56 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   as independent, and the row-count floor alone satisfies every acceptance
   criterion.
 
+- **`data.spend` is now the only place any command reports what it billed**
+  ([#276]). `transform build` stamped its billed magnitude twice, once under
+  `data.spend` like every other billed command and once as a top-level
+  `data.bytes_billed` that no other command carried:
+
+  | Command | `data.bytes_billed` | `data.spend.bytes_billed` |
+  |---|---|---|
+  | `transform build` | 4750049280 | 4750049280 |
+  | `maintain check` | absent | 891289600 |
+
+  A caller that reads the top-level key and defaults a miss to zero therefore
+  reports that `maintain check` was free. It was not; it had just scanned
+  0.89 GB. That happened in a real session, the wrong figure was reported to a
+  human, and it survived into the first draft of a written cost report before
+  being caught by reconciling the envelopes against `.dex/spend.jsonl`.
+
+  Silently under-reporting spend is the one class of envelope defect that
+  undermines the cost-governance guarantee rather than merely annoying the
+  caller, and this one is invisible from the caller's side: an agent reading one
+  key and getting nothing cannot distinguish "this cost nothing" from "look in
+  the other key", and both readings are plausible. So the duplicate is removed
+  rather than propagated. A key that exists on one command and not another is
+  worse than a key that never exists, because at the top of `data`, where a
+  command's own findings live, an absent key reads as a value.
+
+  The same rule has a second half, which was also broken on builds. A billed
+  command now reports the unit key whatever it settled at, zero included: a
+  build that billed nothing used to omit `data.spend` entirely, which is the
+  identical ambiguity one level down. And where a figure is genuinely
+  unavailable it is reported as `null` with a note saying why, never as zero.
+  That case is real: if dbt executed statements and reported no billing figure
+  for any of them, what the build cost is unknown, nothing is appended to the
+  ledger, and rounding it down to zero would be the same under-report by
+  another route. A build that died before executing anything did bill nothing
+  and still settles at zero.
+
+  Two smaller consequences of making the rule uniform. On ClickHouse Cloud a
+  build's translated figures (compute-unit-hours, USD) are reported at zero
+  seconds too, rather than being the same present-sometimes key one level
+  further down. And a build now tolerates a ledger read failure at settlement
+  the way gate settlement already does, reporting
+  `data.spend.session_spent_today: null`: what the build billed came from dbt
+  and is exact either way, so a store that goes away must not turn a build that
+  already spent into a failure that reports nothing.
+
+  Key parity across `transform build`, `maintain check`, `explore query`,
+  `explore map` and `explore profile` is now a contract test, asserted as an
+  equality between commands rather than against a list of expected keys. What a
+  connector reports is the connector's business; which command asked cannot be.
+
 ### Changed
 
 - **`explore query` now carries compact cache-backed column and query notes
