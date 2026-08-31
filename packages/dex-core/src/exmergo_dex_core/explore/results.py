@@ -39,14 +39,31 @@ class InventoryEntry(BaseModel):
 
 
 class InventoryResult(Result):
+    """A ranked call caps what comes back (#289): a full catalog dump sorted by
+    score is not a shortlist, and at thousands of objects the rank is the one
+    part a caller never reads. ``elided_object_count`` says how many eligible
+    objects the cap left out; ``--limit`` widens the cap and ``--all`` lifts it
+    entirely, both no-ops on an unranked call, which carries no order to cut
+    from and stays uncapped.
+
+    ``notes`` is always reported, the same convention ``map``/``diagram``/
+    ``query`` use: an empty list on an unranked call means there was nothing to
+    say, and on a ranked one it never is, since a ranked call always states its
+    basis (see ``inventory()``).
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
     objects: list[InventoryEntry] = Field(default_factory=list)
     ranked: bool = False
+    elided_object_count: int = 0
 
     def data(self) -> dict[str, Any]:
         return {
             "object_count": len(self.objects),
             "objects": [o.model_dump(mode="json") for o in self.objects],
             "ranked": self.ranked,
+            "elided_object_count": self.elided_object_count,
         }
 
 

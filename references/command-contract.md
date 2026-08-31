@@ -49,7 +49,9 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (7
                                      directory is ever created, and an existing config
                                      at or above the target is left alone with a warning
 dex connect test                  -> {capabilities, dialect, read_only: true}
-dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
+dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
+  [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
+                                     it; both no-ops without --rank
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
