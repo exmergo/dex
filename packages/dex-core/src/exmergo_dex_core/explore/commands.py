@@ -300,24 +300,61 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
     )
 
 
-def inventory(engine: DexEngine, *, rank: bool = False) -> InventoryResult:
+# A ranked call's default cap (#289): a full catalog dump sorted by score is
+# not a shortlist, and on a warehouse of thousands of objects the rank is the
+# one part a caller never reads (every real invocation observed piping this
+# through `head` is the evidence). In the 20-50 range the issue asked for;
+# `--limit` widens it and `--all` lifts it, both no-ops without `--rank`.
+_INVENTORY_RANK_DEFAULT_LIMIT = 30
+
+
+def inventory(
+    engine: DexEngine,
+    *,
+    rank: bool = False,
+    limit: int | None = None,
+    show_all: bool = False,
+) -> InventoryResult:
     """Every object the connection can see, metadata only.
 
     Free on every connector (catalog reads, not scans), so it never needs the
     confirm handshake and is the cheapest way to find out what is out there.
     ``rank`` orders by the same signals ``map`` uses, minus connectivity: there
     is no relationship pass here, so only naming, size, and shape contribute.
+
+    ``limit``/``show_all`` only act on a ranked call: an unranked list carries
+    no order to cut a shortlist from, so it is returned whole either way, the
+    same as it always has been.
     """
 
     adapter = engine._adapter("explore inventory")
     metas = inventory_mod.inventory(adapter)
     cost = command_args.preflight_cost(adapter)
 
+    notes: list[str] = []
+    elided = 0
     if rank:
         # Honor the same configured ranking_hints as `map`; without them, a
         # ranked inventory would silently ignore the user's bias.
         scores = rank_mod.rank(metas, None, engine.config.ranking_hints)
         metas = sorted(metas, key=lambda m: scores.get(m.identifier, 0.0), reverse=True)
+        notes.append(
+            "ranked by size (row count), naming convention (fct/dim/stg-style "
+            "prefixes score higher, tmp/scratch-style lower), and shape (column "
+            "count); connectivity (how many objects it joins to) is not part of "
+            "this score, because inventory runs no relationship pass. `explore "
+            "map` ranks with connectivity included"
+        )
+        if not show_all:
+            cap = limit if limit is not None else _INVENTORY_RANK_DEFAULT_LIMIT
+            elided = max(0, len(metas) - cap)
+            metas = metas[:cap]
+            if elided:
+                notes.append(
+                    f"{elided} more ranked object(s) are not shown: capped at "
+                    f"{cap}, kept by rank. Pass --limit to widen it, or --all "
+                    "for the complete ranking"
+                )
     else:
         scores = {}
 
@@ -333,12 +370,21 @@ def inventory(engine: DexEngine, *, rank: bool = False) -> InventoryResult:
             for m in metas
         ],
         ranked=rank,
+        elided_object_count=elided,
+        notes=notes,
         cost=cost,
     )
 
 
 def cmd_inventory(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return to_envelope(inventory(engine, rank=getattr(args, "rank", False)))
+    return to_envelope(
+        inventory(
+            engine,
+            rank=getattr(args, "rank", False),
+            limit=getattr(args, "limit", None),
+            show_all=getattr(args, "all", False),
+        )
+    )
 
 
 class _ObjectGap:
@@ -2408,6 +2454,14 @@ def cluster(
         seed=limits.sample_seed,
     )
     repeatable = cluster_mod.sample_is_repeatable(adapter.dialect, limits.sample_seed)
+    if sample_method == cluster_mod.UNRECOGNIZED_DIALECT_NOTE:
+        # #313: a connector with no sampling entry silently scanned the whole
+        # table, with the cost showing up only as a bigger bill. An informational
+        # note is easy to miss; a warning is not.
+        warnings.append(
+            f"'{adapter.dialect}' has no sampling clause registered; this reads "
+            "the whole table, bounded only by the cost gate"
+        )
     adapter_name = adapter.name
     query_estimate = getattr(adapter, "query_estimate", None)
     sample_estimate = query_estimate(sample_sql) if query_estimate else 0.0

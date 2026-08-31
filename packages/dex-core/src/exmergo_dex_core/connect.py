@@ -70,9 +70,19 @@ _PARADIGMS = {
 }
 
 
-def paradigm_for(connector: str | None) -> Paradigm:
-    """The cost paradigm a connector bills in, free/local when it bills nothing."""
+def paradigm_for(connector: str | None, config: DexConfig | None = None) -> Paradigm:
+    """The cost paradigm a connector bills in, free/local when it bills nothing.
 
+    ClickHouse is the one connector whose paradigm is deployment-dependent.
+    Config-free callers deliberately retain the historical self-hosted answer;
+    callers that resolved a project config must pass it so Cloud refusals and
+    error envelopes are denominated in compute-seconds before an adapter opens.
+    """
+
+    if connector == "clickhouse" and config is not None:
+        target = config.clickhouse or ClickHouseTarget()
+        if target.deployment == "cloud":
+            return Paradigm.COMPUTE_TIME
     return _PARADIGMS.get(connector or "", Paradigm.FREE_LOCAL)
 
 
@@ -241,7 +251,7 @@ def new_cost_gate(
     is advisory.
     """
 
-    paradigm = paradigm_for(connector)
+    paradigm = paradigm_for(connector, config)
     field = ledger_field(paradigm)
     lock = getattr(store, "spend_lock", None)
     return CostGate(

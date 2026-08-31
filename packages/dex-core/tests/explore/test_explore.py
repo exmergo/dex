@@ -95,6 +95,73 @@ def test_inventory_rank_without_hints_orders_larger_table_first(
     assert scores["orders"] > scores["customers"]
 
 
+def test_inventory_rank_limit_caps_the_ranked_list(duckdb_file: Path, capsys):
+    payload = _run(
+        ["explore", "inventory", "--rank", "--limit", "1", "--path", str(duckdb_file)],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 1
+    assert data["elided_object_count"] == 1
+    assert any("capped at 1" in n for n in payload["data"]["notes"])
+
+
+def test_inventory_rank_all_lifts_the_cap_even_with_a_limit(duckdb_file: Path, capsys):
+    # --all wins over --limit: today's full-unbounded behavior, explicitly asked
+    # for, is not something a smaller --limit passed alongside it can narrow.
+    payload = _run(
+        [
+            "explore",
+            "inventory",
+            "--rank",
+            "--limit",
+            "1",
+            "--all",
+            "--path",
+            str(duckdb_file),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 2
+    assert data["elided_object_count"] == 0
+    assert not any("capped at" in n for n in payload["data"]["notes"])
+
+
+def test_inventory_rank_states_its_basis(duckdb_file: Path, capsys):
+    payload = _run(
+        ["explore", "inventory", "--rank", "--path", str(duckdb_file)], capsys
+    )
+    basis = " ".join(payload["data"]["notes"])
+    assert "naming convention" in basis
+    assert "connectivity" in basis
+
+
+def test_inventory_without_rank_reports_empty_notes(duckdb_file: Path, capsys):
+    # always_reports_notes: an empty list is itself the "nothing to say" signal,
+    # and it must still be present rather than omitted (map/diagram/query convention).
+    payload = _run(["explore", "inventory", "--path", str(duckdb_file)], capsys)
+    assert payload["data"]["notes"] == []
+
+
+def test_inventory_limit_and_all_are_no_ops_without_rank(duckdb_file: Path, capsys):
+    payload = _run(
+        [
+            "explore",
+            "inventory",
+            "--limit",
+            "1",
+            "--all",
+            "--path",
+            str(duckdb_file),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 2
+    assert data["elided_object_count"] == 0
+
+
 def test_inventory_rank_honors_configured_ranking_hints(
     duckdb_file: Path, tmp_path: Path, capsys
 ):

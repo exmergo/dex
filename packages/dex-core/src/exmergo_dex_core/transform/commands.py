@@ -59,6 +59,11 @@ if TYPE_CHECKING:
 # adds an entry instead of nesting a conditional. dex cannot inject a per-build
 # cap through any of these dbt adapters.
 _COMPUTE_TIME_CAP_NOTES = {
+    "clickhouse": (
+        "each statement was capped server-side by max_execution_time and "
+        "max_bytes_to_read set from the ceiling (injected through the "
+        "profile's custom_settings env_var references)"
+    ),
     "redshift": (
         "a statement_timeout on the dbt dev user and a workgroup usage "
         "limit are the server-side caps (dex cannot inject one per build)"
@@ -803,11 +808,13 @@ def build(
     budget), then a billed build is priced by a free ``dbt compile`` dry-run, then
     the same confirm handshake ``explore`` uses gates the spend.
 
-    Pricing is best-effort by design: dex discovers its own connection while dbt
+    Pricing is normally best-effort: dex discovers its own connection while dbt
     reads ``profiles.yml``, and the two can legitimately differ, so a connection
-    dex cannot open (or a compile that fails) must never break a build dbt could
-    have run. It degrades to no-estimate with a note; the ceiling and the
-    server-side per-statement cap still bind.
+    dex cannot open (or a compile that fails) need not break a build dbt could
+    have run. ClickHouse Cloud is the exception: its live capacity is required
+    to translate and report settled spend, so that fact must be proved before
+    dbt runs. After it is cached, a compile failure can still degrade to a
+    no-estimate note; the ceiling and server-side per-statement cap bind.
     """
 
     from ..connect import paradigm_for
@@ -831,12 +838,12 @@ def build(
     target = target or config.dbt_target or "dev"
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
     connector = engine.connector or config.connector
-    paradigm = paradigm_for(connector)
 
     project = engine.project_dir()
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
+    paradigm = paradigm_for(connector, effective)
     dev_check = lambda: dev_target.check(  # noqa: E731
         project,
         target,
@@ -925,6 +932,7 @@ def build(
         extra_notes=[*price_notes, *dev_warnings],
         session_ceiling=config.budget.session_ceiling,
         gate=command_args.cost_gate(adapter) if adapter is not None else None,
+        adapter=adapter,
     )
 
 
@@ -1127,26 +1135,54 @@ def _price_build(engine: DexEngine, project, target: str, select: str | None):
 
     Returns ``(estimate, per_node, notes, adapter)``. ``estimate`` is ``None``
     when pricing could not be produced (no reachable dex connection, a compile
-    failure): the build still runs, gated by the ceiling and the server-side cap,
-    with a note saying why no number was shown.
+    failure): the build normally still runs, gated by the ceiling and the
+    server-side cap, with a note saying why no number was shown. ClickHouse
+    Cloud first proves and caches its mandatory live capacity; failure there is
+    re-raised before dbt can spend.
     """
 
-    from .build import compile_estimate, needs_deps
+    from .build import _build_env, compile_estimate, needs_deps
     from .build import deps as run_deps
 
+    connector = engine.connector or engine.config.connector
+    clickhouse_target = engine.config.clickhouse
+    cloud_capacity_required = (
+        connector == "clickhouse"
+        and clickhouse_target is not None
+        and clickhouse_target.deployment == "cloud"
+    )
+    cloud_capacity_proved = False
     adapter = None
     try:
         adapter = engine._adapter("transform build")
+        if cloud_capacity_required:
+            # Unlike the other build translations, ClickHouse Cloud's rate is
+            # discovered live rather than configured. Prove and cache it before
+            # dbt can spend; a compile failure may still degrade safely after
+            # this point because settlement can use the cached rate.
+            translate = getattr(adapter, "compute_spend_translation", None)
+            if translate is None:
+                raise RuntimeError(
+                    "ClickHouse Cloud adapter cannot prove live compute capacity"
+                )
+            translate(0.0)
+            cloud_capacity_proved = True
         # dbt compile refuses to run with declared-but-uninstalled packages, and
         # deps writes only dbt_packages/ (never the warehouse), so installing it
         # here during the free preflight is consistent and idempotent on the build.
         if needs_deps(project):
             run_deps(project)
+        ceiling = (
+            engine.budget if engine.budget is not None else engine.config.budget.ceiling
+        )
+        compile_env = _build_env(connector, adapter.paradigm, ceiling)
         estimate, per_node, notes = compile_estimate(
-            project, adapter, target=target, select=select
+            project, adapter, target=target, select=select, env=compile_env
         )
         return estimate, per_node, notes, adapter
     except Exception as exc:
+        if cloud_capacity_required and not cloud_capacity_proved:
+            raise
         note = (
             f"could not price this build upfront ({type(exc).__name__}: {exc}); "
             "the budget and the server-side per-statement cap still bind"
@@ -1178,6 +1214,7 @@ def _shape_build_result(
     extra_notes=(),
     session_ceiling: float | None = None,
     gate=None,
+    adapter=None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -1231,6 +1268,9 @@ def _shape_build_result(
         if seconds:
             summary["seconds_billed"] = seconds
             spend = _record_build_spend(store, connector, seconds, paradigm)
+            translate = getattr(adapter, "compute_spend_translation", None)
+            if translate is not None:
+                spend.update(translate(seconds))
     elif paradigm is Paradigm.DB_LOAD:
         notes = [_DB_LOAD_CAP_NOTES.get(connector, _UNCAPPED_BUILD_NOTE), *notes]
         # The db-load dbt adapters report no billing figure; per-node execution

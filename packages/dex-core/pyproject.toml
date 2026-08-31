@@ -221,5 +221,6 @@ markers = [
   "postgres: PostgreSQL-specific integration tests",
   "redshift: Redshift-specific integration tests",
   "clickhouse: ClickHouse-specific integration tests",
+  "clickhouse_cloud: narrow ClickHouse Cloud integration tests (protected credentials required)",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]

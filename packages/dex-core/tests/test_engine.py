@@ -23,14 +23,31 @@ from exmergo_dex_core import (
     MemoryStore,
 )
 from exmergo_dex_core.cache import DexCache
-from exmergo_dex_core.config import CacheConfig, DuckDBTarget, save_config
-from exmergo_dex_core.envelope import Envelope
+from exmergo_dex_core.config import (
+    CacheConfig,
+    ClickHouseTarget,
+    DuckDBTarget,
+    save_config,
+)
+from exmergo_dex_core.envelope import Envelope, Paradigm
 from exmergo_dex_core.explore.results import MapResult, ProfileResult, QueryResult
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "exmergo_dex_core"
 
 
 # --- the surface itself --------------------------------------------------------
+
+
+def test_cloud_clickhouse_paradigm_is_available_before_connection_failure():
+    """An error envelope must still name the binding unit when no adapter opens."""
+
+    engine = DexEngine(
+        config=DexConfig(
+            connector="clickhouse",
+            clickhouse=ClickHouseTarget(deployment="cloud"),
+        )
+    )
+    assert engine.paradigm is Paradigm.COMPUTE_TIME
 
 
 def test_the_public_import_works_and_defaults_to_writing_nothing(

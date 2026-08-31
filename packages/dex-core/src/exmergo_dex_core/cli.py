@@ -162,10 +162,44 @@ def _sub_connection_options() -> argparse.ArgumentParser:
     return common
 
 
+#: One line per group, shown both in --help's subcommand list and as the
+#: onboarding orientation (#296): `dex --help` is where a stranger's first
+#: contact lands, and a bare argparse flag/subcommand dump answered none of
+#: "what do the three verbs do", "how do I point this at data", or "what do
+#: I run first", which is exactly what a caller piping the output into
+#: `head -30` is looking for and not finding.
+_GROUP_HELP: dict[str, str] = {
+    "connect": "check a connector's own credentials and capabilities",
+    "explore": "make sense of a warehouse: rank objects, profile columns, infer joins",
+    "transform": "author and refactor dbt models, tests, and the semantic layer",
+    "semantic": "define dbt semantic models and metrics as reviewable diffs",
+    "maintain": "detect drift against the last snapshot and propose the fix",
+    "viz": "preview the semantic layer (not yet implemented)",
+    "demo": "create a seeded local DuckDB warehouse to try dex against "
+    "(no credentials, no network)",
+}
+
+_EPILOG = """\
+Point it at data with --connector/--path, or commit a connector: block to
+.dex/config.yml (found by walking up from the working directory).
+
+No warehouse yet: `dex demo` seeds a local one, no credentials needed.
+Have one already: `dex explore map` is the command to run first -- it
+ranks what matters, profiles it, and infers how the tables join.
+
+`dex <group> --help` lists a group's own subcommands.
+"""
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dex",
-        description="dex-core command contract (Explore. Transform. Maintain.)",
+        description=(
+            "Explore an unfamiliar warehouse, transform it with reviewable\n"
+            "dbt edits, and maintain it as the world drifts."
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Real defaults live on the top-level parser so every namespace has them.
     parser.add_argument("--connector", default=None)
@@ -182,19 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:
     common = _sub_connection_options()
     groups = parser.add_subparsers(dest="group", required=True)
     for group, subcommands in COMMAND_SURFACE.items():
-        # `demo` is the only group carrying help text, and deliberately so: the
-        # top-level --help is where a stranger's first contact lands, and the one
-        # thing worth saying there is what to run when you have no warehouse yet.
-        gp = groups.add_parser(
-            group,
-            parents=[common],
-            help=(
-                "create a seeded local DuckDB warehouse to try dex against "
-                "(no credentials, no network)"
-                if group == "demo"
-                else None
-            ),
-        )
+        gp = groups.add_parser(group, parents=[common], help=_GROUP_HELP.get(group))
         if group == "demo":
             # Positional rather than --path: --path names the warehouse dex
             # reads, everywhere, and this is the one command that writes one.
@@ -206,6 +228,13 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "explore" and name == "inventory":
                     sp.add_argument(
                         "--rank", action="store_true", default=argparse.SUPPRESS
+                    )
+                    # Ranked inventory is capped by default (#289); --limit widens
+                    # it, --all lifts the cap entirely. Both are no-ops without
+                    # --rank, since the unranked list carries no order to cut from.
+                    sp.add_argument("--limit", type=int, default=None)
+                    sp.add_argument(
+                        "--all", action="store_true", default=argparse.SUPPRESS
                     )
                 if group == "explore" and name == "profile":
                     sp.add_argument("objects", nargs="+")
@@ -607,6 +636,13 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _build_parser()
     raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw:
+        # A bare `dex` still has to pick a group (required=True below), but
+        # argparse's error for that is "the following arguments are required:
+        # group": true, useless to someone who does not know the groups exist
+        # yet. Route it to the same orientation --help gives instead.
+        parser.print_help()
+        return 0
     rewritten = _rewrite_unambiguous_bare_subcommand(raw)
     try:
         args = parser.parse_args(rewritten)
