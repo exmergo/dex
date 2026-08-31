@@ -353,6 +353,47 @@ def test_a_command_with_no_connector_claims_no_paradigm(tmp_path: Path, capsys):
     assert payload["cost"]["paradigm"] is None
 
 
+# --- the top-level orientation (#296) --------------------------------------------
+#
+# `dex --help` is where a stranger's first contact lands, and a bare argparse
+# flag/subcommand dump answered none of "what do the three verbs do", "how do I
+# point this at data", or "what do I run first". A bare `dex` used to spend that
+# same first keystroke on a useless "the following arguments are required: group".
+
+
+def test_bare_invocation_shows_the_orientation_instead_of_an_argparse_error(capsys):
+    assert main([]) == 0
+    out = capsys.readouterr().out
+    assert "required: group" not in out
+    assert "explore map" in out
+    assert "dex demo" in out
+
+
+def test_help_names_the_three_verbs_and_the_first_command_to_run(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--help"])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    for verb in ("explore", "transform", "maintain"):
+        assert verb in out
+    assert "dex demo" in out
+    assert "dex explore map" in out
+
+
+def test_every_group_carries_its_own_help_text():
+    """Each group's help line renders in the top-level listing, not just its own
+    --help, since that listing is the one a stranger with no prior context sees.
+    `demo` already had one; #296 is every other group catching up."""
+
+    from exmergo_dex_core.cli import _GROUP_HELP, _build_parser
+
+    assert set(_GROUP_HELP) == set(COMMAND_SURFACE)
+    # Whitespace-normalized: argparse wraps a long help string across lines.
+    normalized_out = " ".join(_build_parser().format_help().split())
+    for help_text in _GROUP_HELP.values():
+        assert " ".join(help_text.split()) in normalized_out
+
+
 def test_a_refusal_before_the_engine_exists_reports_the_flagged_connector(
     tmp_path: Path, capsys
 ):

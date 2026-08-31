@@ -172,6 +172,24 @@ rejects. It is enforced offline for all six adapters (see
 `assert_every_cast_is_total`), because no unit test can catch a dialect that
 disagrees with the standard about evaluation order.
 
+**Two more spellings the server refuses outright, both verified live.**
+`DATEDIFF` resolves to `pg_catalog.date_diff`, which is declared over
+`DATE`/`TIME`/`TIMETZ`/`TIMESTAMP` and has no `TIMESTAMPTZ` overload, while
+`DATE_TRUNC` over a `TIMESTAMPTZ` column returns `TIMESTAMPTZ`: the periods
+the temporal-continuity probe diffs are exactly the shape it rejects
+(`function pg_catalog.date_diff("unknown", timestamp with time zone,
+timestamp with time zone) does not exist`), which failed the whole profiling
+statement for any table carrying a `TIMESTAMPTZ` column. Both operands are
+therefore cast to `TIMESTAMP`, a conversion that is total for every type
+reaching that path and shifts nothing, since it applies to both sides by the
+same rule. And `SUBSTR`, the spelling the shared expressions use, is refused
+by name (`SUBSTR() function is not supported (Hint: use SUBSTRING instead)`)
+at execution over a real table, not only in a leader-node-only query, so this
+adapter emits `SUBSTRING` for the slash-date component extraction. Neither
+spelling is universal in the other direction: BigQuery has `SUBSTR` and no
+`SUBSTRING`, which is why the idiom is per-connector rather than swapped in
+the shared builder.
+
 ## dbt builds
 
 `transform init` renders a `type: redshift` dev profile from whichever
