@@ -213,7 +213,8 @@ it is better than the one a point below it.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
-<img width="1162" height="225" alt="image" src="https://github.com/user-attachments/assets/32d2311b-b85e-41a5-8431-4edb1f928346" />
+<img width="1093" height="189" alt="Screenshot 2026-08-31 at 14 01 15" src="https://github.com/user-attachments/assets/ea738a4c-f6f6-4061-9bc6-d9743c2dc7a7" />
+
 
 Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake
