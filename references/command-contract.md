@@ -595,7 +595,13 @@ all three accept `--refresh`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,
-`--confirm`, `--budget`.
+`--confirm`, `--budget`, `--session-ceiling` and `--no-session-ceiling`.
+
+`--session-ceiling <value>` and `--no-session-ceiling` are the two answers to the
+one-time cumulative-ceiling ask below. Either one writes the answer into
+`.dex/config.yml` and reports the amendment as an `update` diff; they are answers
+to a question about the project, not per-command overrides, which is why they are
+durable and why `--budget` is unaffected by both.
 
 `.dex/config.yml` is found by walking up from the `--repo-root` directory (default
 the shell cwd) to the enclosing git root, the way git and dbt locate their project,
@@ -816,6 +822,28 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   indistinguishable from outside, and an unset daily cap reads as one that
   bound. Config is read from `<repo_root>/.dex/config.yml` and does not inherit,
   so a second repo root has its own budget or none, and the warning says so.
+- **And a project is asked for one, once.** The warning above is accurate and it
+  is also the default state of every new project, so it repeated on every billed
+  command, which is the condition under which warnings stop being read: several
+  billed commands can run bound by their per-command caps alone, each carrying
+  the same sentence, with the aggregate bounded by nothing. So the first billed
+  command in a project with no recorded decision returns `needs_confirmation`
+  naming a `suggested_session_ceiling` (five times that command's own estimate,
+  in the connector's unit, as a starting point) and a `session_ceiling_hint`
+  spelling out both answers, under its own key because a two-phase command's
+  findings payload owns `hint`. Answer it with `--session-ceiling <value>` to
+  set one or `--no-session-ceiling` to record that the project runs unbounded;
+  either answer is written to `.dex/config.yml` and nothing asks again in that
+  project. The ask is the *last* check before
+  spend, so an unanswered one has run nothing, booked no headroom, and reached
+  the ledger not at all, and the unconfirmed cost ask that precedes it carries
+  the suggestion in `notes` so one re-run can answer both. Three cases are never
+  asked: a project that already set `budget.session_ceiling` (nothing changes
+  for it), one that recorded a decline, and a config-free ad-hoc read, which has
+  no committed file to record an answer in and keeps the warning alone. A
+  decline records a decision and loosens nothing: the warning still fires on
+  every billed command, and now names the decline so a reader can tell a settled
+  choice from a project that was never asked.
 - **`cost.paradigm` names the connector the command ran against**, not what the
   command happened to cost. A free metadata command on BigQuery reports
   `bytes_scanned` with a null estimate, so a caller learns what a billed command

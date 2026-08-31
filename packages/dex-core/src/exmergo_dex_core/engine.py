@@ -41,7 +41,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
-from .config import CacheConfig, DexConfig, ProjectConfig, load_config
+from .config import (
+    CacheConfig,
+    DexConfig,
+    ProjectConfig,
+    load_config,
+    record_session_ceiling_decision,
+)
 from .connect import ConnectionSource, SemanticSource
 from .envelope import Paradigm
 from .errors import RepoRootRequiredError, StoreRequiredError
@@ -159,6 +165,8 @@ class DexEngine:
         datasets: list[str] | None = None,
         budget: float | None = None,
         confirmed: bool = False,
+        session_ceiling: float | None = None,
+        decline_session_ceiling: bool = False,
         connection: ConnectionSource | None = None,
         semantic_source: SemanticSource | None = None,
         project_format: ExploreProject | None = None,
@@ -197,6 +205,11 @@ class DexEngine:
         # reason to prefer confirming the call.
         self.budget = budget
         self.confirmed = confirmed
+        # Config amendments dex performed on the caller's behalf, as reviewable
+        # diffs. Read back into every envelope for the reason
+        # `connection_warnings` is: a write must never be something a caller
+        # discovers later in `git status`.
+        self.config_diffs: list[dict[str, Any]] = []
         self._adapter_instance: Adapter | None = None
         # The project seam, in its two shapes. `_project_format` is an instance a
         # host handed us and always wins; `_project_factory` is what a configured
@@ -208,6 +221,9 @@ class DexEngine:
         self._project_name = "dbt"
         self._project_factory: ProjectFactory | None = None
         self._project_options: Mapping[str, Any] = {}
+        # Last, so it amends a config that is fully assembled. It is the one
+        # thing here that writes: see `_record_budget_decision`.
+        self._record_budget_decision(session_ceiling, decline_session_ceiling)
 
     @classmethod
     def from_repo(
@@ -343,6 +359,43 @@ class DexEngine:
                 command=command,
             )
         return adapter
+
+    def _record_budget_decision(
+        self, session_ceiling: float | None, declined: bool
+    ) -> None:
+        """Record a cumulative-ceiling answer in ``.dex/config.yml``.
+
+        The write half of the one-time ask (issue #283). ``session_ceiling`` and
+        ``decline_session_ceiling`` are answers to a question the guard asked, so
+        they are durable by construction: an answer that lived for one command
+        would leave the next command asking again, which is the repetition the
+        ask exists to end.
+
+        On construction, not on the first connection, because a flag that is
+        accepted and then quietly not applied is worse than one that is rejected:
+        a caller who believes they set the project's daily cap and in fact set
+        nothing has lost exactly the bound they came here for. Deferring to the
+        adapter funnel would make the write depend on whether the command that
+        carried the answer happened to reach a warehouse, so a free command or one
+        that failed first would swallow it. Nothing else here touches the repo,
+        and nothing here does either unless a caller passed an answer.
+
+        Refuses when the two contradict each other, and when there is no
+        committed config to write to, for the same reason and in the same voice
+        as the rest of the config layer.
+        """
+
+        if session_ceiling is None and not declined:
+            return
+        root = self.require_repo_root("recording a cumulative spend ceiling")
+        config, diff = record_session_ceiling_decision(
+            root, session_ceiling=session_ceiling, declined=declined
+        )
+        # The budget alone, not the whole re-read config: this run may hold
+        # overrides (an injected config, `--connector`) that the file does not,
+        # and adopting the file wholesale here would quietly undo them.
+        self.config.budget = config.budget
+        self.config_diffs.append(diff)
 
     def _config_for_open(self) -> DexConfig:
         """The config handed to the opener, refusing when nothing selected one.
