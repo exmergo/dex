@@ -9,6 +9,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`dex --help` now orients a stranger instead of dumping bare flags and
+  subcommand names** ([#296]). The top-level help carried a throwaway
+  one-line description, a subcommand list with help text on `demo` alone,
+  and ten undocumented flags: none of it said what Explore, Transform, and
+  Maintain do, how to point dex at data, or what to run first against an
+  unfamiliar warehouse, which is exactly what the CLI's first-ever caller
+  needs answered.
+
+  The description now names the three verbs, every group carries its own
+  one-line help text in the subcommand listing, and an epilog covers
+  pointing dex at data and the one command to run first (`dex demo` with
+  no warehouse, `dex explore map` with one). A bare `dex` used to fail with
+  argparse's "the following arguments are required: group"; it now prints
+  the same orientation and exits 0, since a stranger's first keystroke
+  should not spend itself on an error about an argument they do not know
+  exists yet.
+  
 ### Added
 
 - **`explore inventory --rank` caps its payload by default** ([#289]). Ranking
