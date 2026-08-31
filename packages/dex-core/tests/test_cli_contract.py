@@ -450,7 +450,10 @@ _TRANSLATED = object()
 # expresses, or `_TRANSLATED`.
 _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     ("connect", "test"): {"method": "connect_test", "args": {}},
-    ("explore", "inventory"): {"method": "inventory", "args": {"rank": "rank"}},
+    ("explore", "inventory"): {
+        "method": "inventory",
+        "args": {"rank": "rank", "limit": "limit", "all": "show_all"},
+    },
     ("explore", "profile"): {
         "method": "profile",
         "args": {

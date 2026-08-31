@@ -635,10 +635,12 @@ class DexEngine:
     # engines it drives, so this class stays a surface a caller can read top to
     # bottom, and the CLI and a library call run identical code.
 
-    def inventory(self, *, rank: bool = False) -> InventoryResult:
+    def inventory(
+        self, *, rank: bool = False, limit: int | None = None, show_all: bool = False
+    ) -> InventoryResult:
         from .explore import commands as explore
 
-        return explore.inventory(self, rank=rank)
+        return explore.inventory(self, rank=rank, limit=limit, show_all=show_all)
 
     def profile(
         self,

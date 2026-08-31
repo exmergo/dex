@@ -189,7 +189,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   preview` is not yet implemented). The rule that a new subcommand needs a
   `DexEngine` method, or an allowlist entry with a reason, is now written next
   to `COMMAND_SURFACE` in `cli.py`, where a contributor adding one will see it.
-  
+
+  That parity test caught a third instance of the same drift the moment this
+  branch met `main`: `explore inventory --limit`/`--all` (#289) reached the
+  CLI and `explore.commands.inventory()`, but `DexEngine.inventory()` was
+  never updated to accept them, so a library caller could not widen or lift
+  the rank cap the way a CLI caller could. `DexEngine.inventory()` now
+  accepts `limit` and `show_all` and passes them through.
+
 - **A fact table's parent-plus-line grain was discarded before it could be
   probed, and the probe spent its budget on a pair that could not be a key**
   ([#377]). The composite-key probe ranks candidate pairs and then removed any
