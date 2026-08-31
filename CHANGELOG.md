@@ -27,6 +27,137 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   the same orientation and exits 0, since a stranger's first keystroke
   should not spend itself on an error about an argument they do not know
   exists yet.
+  
+### Added
+
+- **`explore inventory --rank` caps its payload by default** ([#289]). Ranking
+  worked correctly, every object carried a populated `rank_score` sorted
+  descending, but nothing capped how many came back: against a 2,356-model
+  project a single call returned all 3,493 objects in a 464.7 KB payload,
+  and every real invocation observed in an agent benchmark run got piped
+  through `head` by the caller before being read. `--rank` now defaults to
+  the top 30 by score; `--limit N` widens it, `--all` lifts the cap
+  entirely (today's behavior), and both are no-ops without `--rank`, since
+  the unranked list carries no order to cut a shortlist from. Elided
+  objects are counted in `elided_object_count` and named in a note, the
+  same cap-and-count convention `explore map` already uses.
+
+  A ranked call also now states its basis in `notes`: size, naming
+  convention, and shape feed the score, and connectivity does not, because
+  inventory runs no relationship pass (`explore map`'s rank does include
+  it). Per-object one-line rank justifications were part of the original
+  proposal but are deferred: they need `rank()` to expose per-signal
+  contributions rather than only the final score, which is new design work
+  the capping fix does not need.
+
+- **A cross-skill, externally authored triggering corpus for the Tier-2 eval
+  harness** ([#216]). Each skill's own `evals.json` `positive`/`negative` list
+  is written by whoever wrote the description it tests, at the same time,
+  and checked with every other skill disabled; neither weakness is visible
+  from inside that suite. `evals/corpus/ade_bench_triggering.json` sources 30
+  real analytics-engineering requests from
+  [dbt-labs/ade-bench](https://github.com/dbt-labs/ade-bench) (Apache-2.0),
+  hand-labeled with the skill each should fire (or `none`), and run with
+  every skill available at once, one live call per prompt rather than one
+  per prompt-per-skill.
+
+  `python -m evals --corpus evals/corpus/ade_bench_triggering.json` reports
+  per-skill precision and recall plus which cases missed, and always exits
+  0: it is a measurement against externally authored prompts, not a release
+  gate, since the initial pass rate is expected to be low and that is the
+  signal the corpus exists to produce.
+
+- **`maintain schema` detects a model added, removed, or content-changed
+  since the baseline** ([#164]). The transform layer's fingerprint (model
+  names, per-file content hashes) was captured on every snapshot and
+  reported back as `file_count`/`model_count`/`source_count`, but nothing
+  ever diffed it: a model added to the project, removed, rewired to a
+  different `ref()`/`source()`, or edited in place all raised zero drift.
+  Only a warehouse table left orphaned by the change was ever caught
+  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
+  existing `definition_added`/`_removed`/`_changed`, closes that gap with
+  `model_added`, `model_removed`, and `model_changed` findings, folded into
+  the existing `schema` axis rather than a new one of its own (it already
+  loads the project's transform layer for `orphan_relation`).
+
+  `model_changed` diffs content hashes through a new `TransformLayer.
+  model_paths` (model name to the one file that builds it), so it also
+  catches a rewired `ref()`/`source()` call without a second comparison:
+  rewiring one changes the file's text, and so its hash. A baseline pinned
+  before this field existed has an empty `model_paths`, and a model missing
+  from it is skipped for the content comparison rather than reported
+  changed.
+
+  Reconcile treats `model_*` findings the same way it already treats a
+  semantic `definition_*` finding: the project's own edit, not a
+  warehouse-side problem to fix, so no proposal is generated, just a nudge
+  to re-run `maintain snapshot` if the change is intended.
+
+  This reverses a previously deliberate, tested design decision (a
+  regression test locked in "no detector diffs the model list" as intended
+  behavior); that test now pins the opposite, and the reasoning for both is
+  recorded on it and on `transform_drift` itself.
+  
+### Fixed
+
+- **`transform` skill docs claimed BigQuery has no upfront `transform build`
+  estimate** ([#322]). dbt itself has no dry-run, but the engine compiles the
+  project and dry-runs each node itself, so the first unconfirmed
+  `transform build --target dev` call already returns `needs_confirmation`
+  with `estimated_bytes` and a `per_table_bytes` breakdown, the same shape
+  the scanning `explore` commands use. The doc told an agent to skip that
+  free, immediate estimate and ask a human for a budget figure instead,
+  while the same sentence forbade inventing one, two halves of one
+  instruction that could not both be followed. Corrected to read the
+  reported estimate (`per_table_bytes` names which node drives the cost)
+  and confirm with a budget grounded in it. Checked every sibling
+  connector's wording for the same drift; none repeats it, since their
+  "no dry-run" statements are about the warehouse itself, a true and
+  different claim from this one
+  about the engine's own compile-time estimate.
+
+- **Redshift: `explore map` and `explore profile` died on any table with a
+  `TIMESTAMPTZ` column, and on any slash-date string column.** Two spellings in
+  the generated profiling statement are refused by the Redshift server, and
+  because both ride the single batched aggregate pass, either one failed the
+  whole profile rather than degrading one statistic.
+
+  `DATEDIFF` resolves to `pg_catalog.date_diff`, declared over
+  `DATE`/`TIME`/`TIMETZ`/`TIMESTAMP` with no `TIMESTAMPTZ` overload, while
+  `DATE_TRUNC` over a `TIMESTAMPTZ` column returns `TIMESTAMPTZ`. So the periods
+  the temporal-continuity probe diffs were exactly the shape it rejects, with
+  `function pg_catalog.date_diff("unknown", timestamp with time zone, timestamp
+  with time zone) does not exist`. Both operands are now cast to `TIMESTAMP`:
+  total for every type that reaches the probe, and shifting nothing, because it
+  applies to both sides by the same rule.
+
+  `SUBSTR`, the spelling the shared type-contradiction expressions use for the
+  slash-date component extraction, is refused by name (`SUBSTR() function is not
+  supported (Hint: use SUBSTRING instead)`) at execution over a real table, not
+  only in a leader-node-only query. The idiom is now a per-connector callable
+  with the shared `SUBSTR` as the default, because the swap is not universal in
+  the other direction either: BigQuery has `SUBSTR` and no `SUBSTRING`.
+
+  Both are pinned offline against the Redshift fake, with a `TIMESTAMPTZ` column
+  added to the fixture: the previous one profiled a bare `TIMESTAMP`, which is
+  why an offline test asserting the generated statement passed while the live
+  one could not run.
+
+- **A progress line could fail a profiling run that had already billed.**
+  `ProgressReporter`'s `stream` was a `TextIO = sys.stderr` default argument, so
+  it captured whatever `sys.stderr` was when the module was first imported and
+  wrote there for the life of the process. Under pytest that object is the
+  capture buffer live at collection, closed long before any run is slow enough
+  to cross the five-second progress gate, so a live `explore map` profiled the
+  whole schema, spent its compute seconds, and then returned
+  `errors: ['I/O operation on closed file.']` instead of the map. The same
+  binding sent progress to the wrong place for any embedder that reassigns
+  `sys.stderr` or wraps a call in `contextlib.redirect_stderr`.
+
+  The stream is now resolved when a line is written, and the write is
+  best-effort. A diagnostic that narrates work already done, and on a metered
+  connector already paid for, is never worth failing that work over.
+
 
 ## [1.9.0] - 2026-08-27
 
@@ -348,37 +479,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
-
-- **`maintain schema` detects a model added, removed, or content-changed
-  since the baseline** ([#164]). The transform layer's fingerprint (model
-  names, per-file content hashes) was captured on every snapshot and
-  reported back as `file_count`/`model_count`/`source_count`, but nothing
-  ever diffed it: a model added to the project, removed, rewired to a
-  different `ref()`/`source()`, or edited in place all raised zero drift.
-  Only a warehouse table left orphaned by the change was ever caught
-  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
-  existing `definition_added`/`_removed`/`_changed`, closes that gap with
-  `model_added`, `model_removed`, and `model_changed` findings, folded into
-  the existing `schema` axis rather than a new one of its own (it already
-  loads the project's transform layer for `orphan_relation`).
-
-  `model_changed` diffs content hashes through a new `TransformLayer.
-  model_paths` (model name to the one file that builds it), so it also
-  catches a rewired `ref()`/`source()` call without a second comparison:
-  rewiring one changes the file's text, and so its hash. A baseline pinned
-  before this field existed has an empty `model_paths`, and a model missing
-  from it is skipped for the content comparison rather than reported
-  changed.
-
-  Reconcile treats `model_*` findings the same way it already treats a
-  semantic `definition_*` finding: the project's own edit, not a
-  warehouse-side problem to fix, so no proposal is generated, just a nudge
-  to re-run `maintain snapshot` if the change is intended.
-
-  This reverses a previously deliberate, tested design decision (a
-  regression test locked in "no detector diffs the model list" as intended
-  behavior); that test now pins the opposite, and the reasoning for both is
-  recorded on it and on `transform_drift` itself.
 
 - **`explore semantic list` is capped, searchable, and accounts for what it left
   out** ([#362]). It was the one explore command that budgeted nothing: every

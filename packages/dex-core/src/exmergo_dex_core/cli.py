@@ -229,6 +229,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--rank", action="store_true", default=argparse.SUPPRESS
                     )
+                    # Ranked inventory is capped by default (#289); --limit widens
+                    # it, --all lifts the cap entirely. Both are no-ops without
+                    # --rank, since the unranked list carries no order to cut from.
+                    sp.add_argument("--limit", type=int, default=None)
+                    sp.add_argument(
+                        "--all", action="store_true", default=argparse.SUPPRESS
+                    )
                 if group == "explore" and name == "profile":
                     sp.add_argument("objects", nargs="+")
                 # Variadic like `profile` above it: an agent asking a chain of
