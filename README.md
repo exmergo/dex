@@ -197,7 +197,7 @@ it is better than the one a point below it.
 
 ## Connectors
 
-- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first).
+- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first), **ClickHouse Cloud**.
 - Self-hosted analytical: **ClickHouse**.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
@@ -215,10 +215,13 @@ environment, or a dbt profile, ClickHouse through `CLICKHOUSE_URL`, the
 `CLICKHOUSE_*` environment, or a dbt profile. Every scan is estimated and
 confirmed before it spends, capped server-side (`maximum_bytes_billed` on
 BigQuery; a per-statement statement timeout on Snowflake, Databricks, Redshift,
-and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse,
-whose budgets are warehouse-seconds with credits or DBUs alongside,
-compute-seconds with RPU-hours alongside, and database-seconds for the last
-two), and recorded in a local spend ledger.
+and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse).
+Budgets are bytes on BigQuery, warehouse-seconds with credits or DBUs alongside
+on Snowflake and Databricks, compute-seconds with RPU-hours alongside on
+Redshift, and database-seconds on Postgres and self-hosted ClickHouse.
+ClickHouse Cloud uses compute-seconds with live allocated memory translating to
+approximate compute-unit-hours and optional USD. All settled spend is recorded
+in a local ledger.
 
 The two self-hosted connectors bill no dollars, and dex still gates them: an
 unbounded scan on a production Postgres primary or a shared ClickHouse cluster
@@ -226,7 +229,7 @@ is a real cost even when nothing appears on an invoice.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**, **ClickHouse Cloud**
+- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 

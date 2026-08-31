@@ -1,4 +1,4 @@
-"""The clickhouse adapter: the self-hosted analytical connector (db-load paradigm).
+"""The ClickHouse adapter: self-hosted db-load and Cloud compute-time.
 
 Self-hosted ClickHouse bills no dollars, but a scan is real load on a server that
 is usually shared and usually serving something latency-sensitive. The guarded
@@ -50,6 +50,7 @@ ever declaring one.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -64,6 +65,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -147,7 +149,7 @@ _COLLAPSING_ENGINES = (
     "AggregatingMergeTree",
 )
 
-_ESTIMATE_QUALITY_NOTE = (
+_SELF_HOSTED_ESTIMATE_QUALITY_NOTE = (
     "Self-hosted ClickHouse bills no dollars; the guarded quantity is load on "
     "the server, expressed as database-seconds. Row estimates come from the "
     "free, non-executing EXPLAIN ESTIMATE on MergeTree tables and from "
@@ -156,21 +158,41 @@ _ESTIMATE_QUALITY_NOTE = (
     "max_execution_time and max_bytes_to_read"
 )
 
-_CLOUD_REFUSAL = (
-    "clickhouse.deployment is 'cloud', and dex does not yet model ClickHouse "
-    "Cloud spend. Cloud bills compute-unit-hours; dex guards this connector in "
-    "database-seconds, so a budget you confirmed here would not bound what the "
-    "service charges you. Point the connector at a self-hosted server, or set "
-    "deployment: self_hosted if this endpoint is in fact self-hosted"
+_CLOUD_ESTIMATE_QUALITY_NOTE = (
+    "ClickHouse Cloud is guarded in compute-seconds. Row estimates come from "
+    "the free, non-executing EXPLAIN ESTIMATE on MergeTree tables and from "
+    "system.tables elsewhere; seconds are those rows over a conservative scan "
+    "rate. Compute-unit-hours translate the server-reported statement time at "
+    "the live capacity observed for this command. The translation is "
+    "approximate: Cloud bills active capacity per minute and can include wake "
+    "and idle time outside an individual statement"
 )
+
+_CAPACITY_SOURCE = (
+    "system.asynchronous_metrics.CGroupMemoryTotal across clusterAllReplicas(default)"
+)
+_BYTES_PER_GIB = 1024**3
+_GIB_PER_COMPUTE_UNIT = 8.0
 
 _CLOUD_CORROBORATION_REFUSAL = (
     "this endpoint reports cloud_mode = 1 (ClickHouse Cloud) while "
-    "clickhouse.deployment is 'self_hosted'. Cloud bills compute-unit-hours, "
-    "which dex does not yet model, so the database-seconds budget this "
-    "connector guards with would not bound what the service charges you. dex "
-    "refuses rather than guarding in the wrong unit, because a ceiling that "
-    "reports a number which did not bind is worse than no ceiling at all"
+    "clickhouse.deployment is 'self_hosted'. Set deployment: cloud or point "
+    "the connector at the intended self-hosted endpoint; dex refuses before "
+    "estimation because the declared cost paradigm does not match the server"
+)
+
+_SELF_HOSTED_CORROBORATION_REFUSAL = (
+    "this endpoint reports cloud_mode != 1 while clickhouse.deployment is "
+    "'cloud'. Set deployment: self_hosted or point the connector at the "
+    "intended ClickHouse Cloud endpoint; dex refuses before estimation because "
+    "the declared cost paradigm does not match the server"
+)
+
+_CAPACITY_REFUSAL = (
+    "ClickHouse Cloud capacity could not be proved from "
+    f"{_CAPACITY_SOURCE}. dex refuses before billed work rather than guessing "
+    "a replica count or service size; grant the dex read identity access to "
+    "system.asynchronous_metrics and system.clusters, then retry"
 )
 
 # Wrapper constructors that decorate a type without changing what it holds.
@@ -268,7 +290,6 @@ class ClickHouseAdapter:
 
     name = "clickhouse"
     dialect = DIALECT
-    paradigm = Paradigm.DB_LOAD
 
     def __init__(
         self,
@@ -284,6 +305,19 @@ class ClickHouseAdapter:
         self._owns_connection = owns_connection
         self.cost_gate = cost_gate
         self.target = target or ClickHouseTarget()
+        expected_paradigm = (
+            Paradigm.COMPUTE_TIME
+            if self.target.deployment == "cloud"
+            else Paradigm.DB_LOAD
+        )
+        if cost_gate.paradigm is not expected_paradigm:
+            raise ValueError(
+                "ClickHouse cost gate does not match clickhouse.deployment: "
+                f"expected {expected_paradigm.value}, got {cost_gate.paradigm.value}"
+            )
+        # Instance-derived: ClickHouse is the only adapter whose connector name
+        # spans two cost paradigms.
+        self.paradigm = cost_gate.paradigm
         self.auth_method = auth_method
         # What the scope entries in the target came from, so a refusal names the
         # thing the user has to go edit: a per-command flag or the committed
@@ -307,6 +341,8 @@ class ClickHouseAdapter:
         self._server_version: str | None = None
         self._notes: dict[str, list[str]] = {}
         self._session_asserted = False
+        self._deployment_asserted = False
+        self._capacity: dict[str, object] | None = None
 
     # --- capabilities (free) ---------------------------------------------------
 
@@ -321,7 +357,7 @@ class ClickHouseAdapter:
             "(SELECT value FROM system.settings WHERE name = 'readonly') AS readonly"
         )[0]
         cost = self.cost_gate.cost()
-        return {
+        caps: dict[str, object] = {
             "connector": self.name,
             "dialect": self.dialect,
             "read_only": True,
@@ -339,11 +375,20 @@ class ClickHouseAdapter:
                 "SELECT on system.tables, system.columns and system.databases",
                 "write only on the dedicated dbt dev database (transform build)",
             ],
-            "budget": {
-                "ceiling_seconds": cost.ceiling,
-                "session_spent_today_seconds": self.cost_gate.session_spent_now(),
-            },
         }
+        budget: dict[str, object] = {
+            "ceiling_seconds": cost.ceiling,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
+        }
+        if self.target.deployment == "cloud":
+            capacity = self._cloud_capacity()
+            caps["compute"] = capacity
+            if cost.ceiling is not None:
+                budget["ceiling_compute_unit_hours"] = self._to_compute_unit_hours(
+                    cost.ceiling
+                )
+        caps["budget"] = budget
+        return caps
 
     def _assert_deployment(self) -> None:
         """Refuse an endpoint whose spend this connector cannot bound.
@@ -353,14 +398,110 @@ class ClickHouseAdapter:
         which is the case where guarding in the wrong unit would be silent.
         """
 
-        if self.target.deployment == "cloud":
-            raise ClickHouseConnectionError(_CLOUD_REFUSAL)
+        if self._deployment_asserted:
+            return
         rows = self._catalog(
             "SELECT value FROM system.settings WHERE name = 'cloud_mode'"
         )
         looks_cloud = bool(rows) and str(rows[0]["value"]) == "1"
-        if looks_cloud:
+        if self.target.deployment == "cloud" and not looks_cloud:
+            raise ClickHouseConnectionError(_SELF_HOSTED_CORROBORATION_REFUSAL)
+        if self.target.deployment == "self_hosted" and looks_cloud:
             raise ClickHouseConnectionError(_CLOUD_CORROBORATION_REFUSAL)
+        self._deployment_asserted = True
+
+    def _cloud_capacity(self) -> dict[str, object]:
+        """Live Cloud capacity, cached for this command and failed closed.
+
+        ``system.clusters`` supplies the topology count used only to detect a
+        partial ``clusterAllReplicas`` answer. The billed translation itself is
+        derived solely from the replicas and memory values that answered.
+        """
+
+        if self.target.deployment != "cloud":
+            raise ValueError("Cloud capacity applies only to deployment: cloud")
+        if self._capacity is not None:
+            return self._capacity
+        self._assert_deployment()
+        try:
+            rows = self._catalog(
+                "SELECT hostName() AS replica, toFloat64(value) AS memory_bytes, "
+                "(SELECT count() FROM system.clusters WHERE cluster = 'default') "
+                "AS expected_replicas FROM clusterAllReplicas('default', "
+                "system.asynchronous_metrics) WHERE metric = 'CGroupMemoryTotal' "
+                "ORDER BY replica"
+            )
+        except Exception as exc:
+            raise ClickHouseConnectionError(_CAPACITY_REFUSAL) from exc
+        if not rows:
+            raise ClickHouseConnectionError(
+                f"{_CAPACITY_REFUSAL}; the probe returned no rows"
+            )
+
+        replicas: set[str] = set()
+        expected_values: set[int] = set()
+        memory_values: list[float] = []
+        try:
+            for row in rows:
+                replica = str(row["replica"] or "").strip()
+                memory = float(row["memory_bytes"])
+                expected = int(row["expected_replicas"])
+                if (
+                    not replica
+                    or replica in replicas
+                    or not math.isfinite(memory)
+                    or memory <= 0
+                    or expected <= 0
+                ):
+                    raise ValueError("malformed capacity row")
+                replicas.add(replica)
+                memory_values.append(memory)
+                expected_values.add(expected)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ClickHouseConnectionError(
+                f"{_CAPACITY_REFUSAL}; the probe returned malformed facts"
+            ) from exc
+        if len(expected_values) != 1 or next(iter(expected_values)) != len(replicas):
+            raise ClickHouseConnectionError(
+                f"{_CAPACITY_REFUSAL}; only {len(replicas)} of the expected "
+                f"{next(iter(expected_values), 'unknown')} replicas answered"
+            )
+
+        total_memory_gib = sum(memory_values) / _BYTES_PER_GIB
+        compute_units_per_hour = total_memory_gib / _GIB_PER_COMPUTE_UNIT
+        if not math.isfinite(compute_units_per_hour) or compute_units_per_hour <= 0:
+            raise ClickHouseConnectionError(
+                f"{_CAPACITY_REFUSAL}; the derived compute rate was invalid"
+            )
+        self._capacity = {
+            "replica_count": len(replicas),
+            "total_memory_gib": round(total_memory_gib, 6),
+            "compute_units_per_hour": round(compute_units_per_hour, 6),
+            "source": _CAPACITY_SOURCE,
+            "approximate": True,
+        }
+        return self._capacity
+
+    def _require_cloud_capacity(self) -> None:
+        if self.target.deployment == "cloud":
+            self._cloud_capacity()
+
+    def _to_compute_unit_hours(self, seconds: float) -> float:
+        capacity = self._cloud_capacity()
+        return round(seconds * float(capacity["compute_units_per_hour"]) / 3600.0, 6)
+
+    def compute_spend_translation(self, seconds: float) -> dict[str, float]:
+        """Translate settled compute-seconds for scans and dbt builds."""
+
+        if self.target.deployment != "cloud":
+            return {}
+        hours = self._to_compute_unit_hours(seconds)
+        translated = {"compute_unit_hours_billed": hours}
+        if self.target.compute_unit_price_usd is not None:
+            translated["usd_billed"] = round(
+                hours * self.target.compute_unit_price_usd, 4
+            )
+        return translated
 
     # --- introspection (free system-table metadata; no scans) ------------------
 
@@ -645,6 +786,7 @@ class ClickHouseAdapter:
         actually issue.
         """
 
+        self._require_cloud_capacity()
         blob_paths = include_blobs or set()
         per_table: dict[str, float] = {}
         for identifier in identifiers:
@@ -666,6 +808,7 @@ class ClickHouseAdapter:
         full scan), falling back to summed referenced-table bytes when the
         statement's relations are outside the MergeTree family."""
 
+        self._require_cloud_capacity()
         checked = assert_select_only(sql, dialect=self.dialect)
         seconds, _basis = self._statement_estimate(checked)
         return seconds
@@ -748,8 +891,7 @@ class ClickHouseAdapter:
     def describe_estimate(
         self, estimate: float, per_table: dict[str, float] | None = None
     ) -> dict:
-        """The db-load handshake payload: database-seconds are the binding
-        number; there is no currency translation because nothing is billed.
+        """The seconds handshake, with Cloud compute and USD translations.
 
         ``estimate_quality`` stays "heuristic" even though EXPLAIN ESTIMATE's
         row count is exact, because the number being confirmed is seconds and
@@ -758,19 +900,33 @@ class ClickHouseAdapter:
         from a whole-relation fallback without dex overclaiming the quote.
         """
 
+        cloud = self.target.deployment == "cloud"
         data: dict[str, object] = {
             "estimated_seconds": estimate,
             "estimate_quality": "heuristic",
             "hint": (
                 "review the estimate, then re-run with --confirm --budget "
-                "<seconds> (the ceiling in database-seconds; the same number "
+                f"<seconds> (the ceiling in "
+                f"{'compute' if cloud else 'database'}-seconds; the same number "
                 "becomes the server-side max_execution_time, and the bytes it "
                 "implies become max_bytes_to_read)"
             ),
-            "notes": [_ESTIMATE_QUALITY_NOTE],
+            "notes": [
+                _CLOUD_ESTIMATE_QUALITY_NOTE
+                if cloud
+                else _SELF_HOSTED_ESTIMATE_QUALITY_NOTE
+            ],
         }
         if per_table:
             data["per_table_seconds"] = per_table
+        if cloud:
+            hours = self._to_compute_unit_hours(estimate)
+            data["estimated_compute_unit_hours"] = hours
+            data["compute_unit_rate"] = dict(self._cloud_capacity())
+            if self.target.compute_unit_price_usd is not None:
+                data["estimated_usd"] = round(
+                    hours * self.target.compute_unit_price_usd, 4
+                )
         return data
 
     def spend_display(self) -> dict:
@@ -779,7 +935,9 @@ class ClickHouseAdapter:
         reported as table notes rather than here, so nothing in the spend
         summary carries a magnitude in a unit the ceiling is not in."""
 
-        return {}
+        return self.compute_spend_translation(
+            self.cost_gate.spend_summary()["seconds_billed"]
+        )
 
     # --- profiling (billed; every statement estimated and gated) ----------------
 
@@ -1050,31 +1208,33 @@ class ClickHouseAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans, return nothing and let the grain stay unknown."""
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
+        """
 
         if not combinations:
             return {}
         meta, _ = self.table_metadata(identifier)
-        estimate = self._scan_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._scan_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1138,6 +1298,7 @@ class ClickHouseAdapter:
         is tighter)."""
 
         checked = assert_select_only(sql, dialect=self.dialect)
+        self._require_cloud_capacity()
         seconds, _basis = self._statement_estimate(checked)
         self.cost_gate.charge(seconds)
         rows, labels, types = self._run_rows(
@@ -1154,6 +1315,7 @@ class ClickHouseAdapter:
         """SELECT-only guard, heuristic charge, then the capped run."""
 
         assert_select_only(sql, dialect=self.dialect)
+        self._require_cloud_capacity()
         self.cost_gate.charge(estimate)
         return self._run(sql)
 

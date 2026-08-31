@@ -32,13 +32,16 @@ from exmergo_dex_core.adapters.clickhouse import (
     is_nullable_type,
     unwrap_type,
 )
-from exmergo_dex_core.config import ClickHouseTarget
+from exmergo_dex_core.config import ClickHouseTarget, DexConfig
+from exmergo_dex_core.connect import new_cost_gate, paradigm_for
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
     OverCeilingError,
+    utc_day_start,
 )
+from exmergo_dex_core.storage import MemoryStore
 
 
 def _gate(**kwargs) -> CostGate:
@@ -65,7 +68,11 @@ def make_adapter(
     target: ClickHouseTarget | None = None,
     scope_origin: str | None = None,
 ) -> ClickHouseAdapter:
+    target = target or ClickHouseTarget()
     gate = _gate(
+        paradigm=(
+            Paradigm.COMPUTE_TIME if target.deployment == "cloud" else Paradigm.DB_LOAD
+        ),
         ceiling=ceiling,
         confirmed=confirmed,
         session_ceiling=session_ceiling,
@@ -75,7 +82,7 @@ def make_adapter(
     return ClickHouseAdapter(
         connection=connection,
         cost_gate=gate,
-        target=target or ClickHouseTarget(),
+        target=target,
         auth_method="environment:password",
         scope_origin=scope_origin,
     )
@@ -695,15 +702,73 @@ def test_a_host_supplied_client_is_not_closed(fake_clickhouse_connection):
 # --- the deployment gate -------------------------------------------------------
 
 
-def test_a_cloud_deployment_is_refused_at_connect(fake_clickhouse_connection):
-    """Cloud bills compute-unit-hours, which dex does not model. Guarding it in
-    database-seconds would report a ceiling that did not bind, which is worse
-    than no ceiling at all."""
+def test_clickhouse_paradigm_is_dynamic_only_when_effective_config_is_available():
+    self_hosted = DexConfig(
+        connector="clickhouse", clickhouse=ClickHouseTarget(deployment="self_hosted")
+    )
+    cloud = DexConfig(
+        connector="clickhouse", clickhouse=ClickHouseTarget(deployment="cloud")
+    )
+    assert paradigm_for("clickhouse") is Paradigm.DB_LOAD
+    assert paradigm_for("clickhouse", self_hosted) is Paradigm.DB_LOAD
+    assert paradigm_for("clickhouse", cloud) is Paradigm.COMPUTE_TIME
 
+    store = MemoryStore()
+    gate = new_cost_gate("clickhouse", cloud, store, budget=60, confirmed=True)
+    assert gate.paradigm is Paradigm.COMPUTE_TIME
+    assert gate.cost().paradigm is Paradigm.COMPUTE_TIME
+    gate.record_billed(2.5, statement="SELECT 1")
+    assert store.spend_since(
+        utc_day_start(), field="billed_seconds", connector="clickhouse"
+    ) == pytest.approx(2.5)
+
+
+def test_a_cloud_deployment_is_corroborated_and_reports_live_capacity(
+    fake_clickhouse_connection,
+):
+    fake_clickhouse_connection.cloud_mode = "1"
+    fake_clickhouse_connection.capacity_rows = [
+        {
+            "replica": "r1",
+            "memory_bytes": 8 * 1024**3,
+            "expected_replicas": 2,
+        },
+        {
+            "replica": "r2",
+            "memory_bytes": 16 * 1024**3,
+            "expected_replicas": 2,
+        },
+    ]
+    adapter = make_adapter(
+        fake_clickhouse_connection,
+        ceiling=60.0,
+        target=ClickHouseTarget(deployment="cloud", compute_unit_price_usd=0.29846),
+    )
+    caps = adapter.capabilities()
+    assert adapter.paradigm is Paradigm.COMPUTE_TIME
+    assert caps["paradigm"] == "compute_time"
+    assert caps["deployment"] == "cloud"
+    assert caps["compute"] == {
+        "replica_count": 2,
+        "total_memory_gib": 24.0,
+        "compute_units_per_hour": 3.0,
+        "source": (
+            "system.asynchronous_metrics.CGroupMemoryTotal across "
+            "clusterAllReplicas(default)"
+        ),
+        "approximate": True,
+    }
+    assert caps["budget"]["ceiling_compute_unit_hours"] == 0.05
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_a_self_hosted_endpoint_declared_cloud_is_refused(
+    fake_clickhouse_connection,
+):
     adapter = make_adapter(
         fake_clickhouse_connection, target=ClickHouseTarget(deployment="cloud")
     )
-    with pytest.raises(ClickHouseConnectionError, match="compute-unit-hours"):
+    with pytest.raises(ClickHouseConnectionError, match="cloud_mode != 1"):
         adapter.capabilities()
 
 
@@ -716,6 +781,103 @@ def test_a_cloud_endpoint_declared_self_hosted_is_refused(fake_clickhouse_connec
     adapter = make_adapter(fake_clickhouse_connection)
     with pytest.raises(ClickHouseConnectionError, match="cloud_mode"):
         adapter.capabilities()
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [
+            {
+                "replica": "r1",
+                "memory_bytes": 8 * 1024**3,
+                "expected_replicas": 2,
+            }
+        ],
+        [
+            {
+                "replica": "r1",
+                "memory_bytes": "bad",
+                "expected_replicas": 1,
+            }
+        ],
+        [
+            {
+                "replica": "r1",
+                "memory_bytes": 8 * 1024**3,
+                "expected_replicas": 1,
+            },
+            {
+                "replica": "r1",
+                "memory_bytes": 8 * 1024**3,
+                "expected_replicas": 1,
+            },
+        ],
+    ],
+)
+def test_cloud_capacity_fails_closed_on_empty_partial_or_malformed_facts(
+    fake_clickhouse_connection, rows
+):
+    fake_clickhouse_connection.cloud_mode = "1"
+    fake_clickhouse_connection.capacity_rows = rows
+    adapter = make_adapter(
+        fake_clickhouse_connection, target=ClickHouseTarget(deployment="cloud")
+    )
+    with pytest.raises(ClickHouseConnectionError, match="capacity could not be proved"):
+        adapter.capabilities()
+
+
+def test_cloud_capacity_denial_fails_closed(fake_clickhouse_connection):
+    fake_clickhouse_connection.cloud_mode = "1"
+    fake_clickhouse_connection.capacity_denied = True
+    adapter = make_adapter(
+        fake_clickhouse_connection, target=ClickHouseTarget(deployment="cloud")
+    )
+    with pytest.raises(ClickHouseConnectionError, match="capacity could not be proved"):
+        adapter.profile_estimate(["shop.events"])
+
+
+def test_cloud_estimate_and_spend_translate_compute_and_usd(
+    fake_clickhouse_connection,
+):
+    fake_clickhouse_connection.cloud_mode = "1"
+    fake_clickhouse_connection.capacity_rows = [
+        {
+            "replica": "r1",
+            "memory_bytes": 8 * 1024**3,
+            "expected_replicas": 2,
+        },
+        {
+            "replica": "r2",
+            "memory_bytes": 8 * 1024**3,
+            "expected_replicas": 2,
+        },
+    ]
+    adapter = make_adapter(
+        fake_clickhouse_connection,
+        target=ClickHouseTarget(deployment="cloud", compute_unit_price_usd=0.29846),
+    )
+    estimate = adapter.describe_estimate(60.0, {"shop.events": 60.0})
+    assert estimate["estimated_compute_unit_hours"] == pytest.approx(0.033333)
+    assert estimate["estimated_usd"] == pytest.approx(0.0099)
+    assert estimate["compute_unit_rate"]["compute_units_per_hour"] == 2.0
+    assert "approximate" in estimate["notes"][0]
+
+    adapter.cost_gate.record_billed(30.0, statement="SELECT 1")
+    assert adapter.spend_display() == {
+        "compute_unit_hours_billed": pytest.approx(0.016667),
+        "usd_billed": pytest.approx(0.005),
+    }
+
+    unpriced = make_adapter(
+        fake_clickhouse_connection,
+        target=ClickHouseTarget(deployment="cloud"),
+    )
+    estimate_without_price = unpriced.describe_estimate(60.0)
+    assert estimate_without_price["estimated_compute_unit_hours"] > 0
+    assert "estimated_usd" not in estimate_without_price
+    unpriced.cost_gate.record_billed(30.0, statement="SELECT 1")
+    assert "usd_billed" not in unpriced.spend_display()
 
 
 def test_a_compute_unit_price_under_self_hosted_is_refused_not_ignored():

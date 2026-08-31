@@ -152,6 +152,9 @@ class FakeClickHouseConnection:
         server_version: str = "25.3.14.14",
         readonly: str = "2",
         cloud_mode: str = "0",
+        capacity_memory_gib: list[float] | None = None,
+        expected_replicas: int | None = None,
+        capacity_denied: bool = False,
         grants_readable: bool = True,
         role_grants_readable: bool = True,
     ):
@@ -160,6 +163,16 @@ class FakeClickHouseConnection:
         self.server_version = server_version
         self.readonly = readonly
         self.cloud_mode = cloud_mode
+        memory = capacity_memory_gib if capacity_memory_gib is not None else [8.0]
+        self.capacity_rows: list[dict] = [
+            {
+                "replica": f"replica-{i + 1}",
+                "memory_bytes": gib * 1024**3,
+                "expected_replicas": expected_replicas or len(memory),
+            }
+            for i, gib in enumerate(memory)
+        ]
+        self.capacity_denied = capacity_denied
         self.grants_readable = grants_readable
         self.role_grants_readable = role_grants_readable
         self.queries: list[FakeQuery] = []
@@ -184,6 +197,8 @@ class FakeClickHouseConnection:
 
         if upper.startswith("EXPLAIN ESTIMATE"):
             return self._explain(stripped[len("EXPLAIN ESTIMATE") :].strip())
+        if "CGROUPMEMORYTOTAL" in upper and "CLUSTERALLREPLICAS" in upper:
+            return self._capacity()
         if "SYSTEM.SETTINGS" in upper or "VERSION()" in upper:
             return self._probe(stripped)
         if "SYSTEM.TABLES" in upper:
@@ -238,6 +253,14 @@ class FakeClickHouseConnection:
                 }
             ]
         )
+
+    def _capacity(self):
+        if self.capacity_denied:
+            raise server_error(
+                ACCESS_DENIED,
+                "not enough privileges for system.asynchronous_metrics",
+            )
+        return self._result(list(self.capacity_rows))
 
     def _system_tables(self, sql: str):
         match = re.search(r"database = '([^']+)'", sql)
