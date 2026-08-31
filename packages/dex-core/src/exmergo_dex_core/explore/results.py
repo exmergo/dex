@@ -13,7 +13,7 @@ Counts that a caller can compute from a list it already has (``object_count`` fr
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -263,6 +263,7 @@ class QueryResult(Result):
 
     always_reports_notes: ClassVar[bool] = True
 
+    shape: Literal["columnar"] = "columnar"
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -273,6 +274,7 @@ class QueryResult(Result):
 
     def data(self) -> dict[str, Any]:
         return {
+            "shape": self.shape,
             "columns": self.columns,
             "types": self.types,
             "cells": self.cells,
@@ -300,6 +302,7 @@ class QueryStatementResult(BaseModel):
     index: int
     status: str
     line: int | None = None
+    shape: Literal["columnar"] = "columnar"
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -329,6 +332,7 @@ class QueryBatchResult(Result):
 
     def data(self) -> dict[str, Any]:
         return {
+            "shape": "columnar",
             "results": [r.model_dump(mode="json") for r in self.results],
             "statement_count": len(self.results),
             "ok_count": sum(1 for r in self.results if r.status == "ok"),
