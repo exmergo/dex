@@ -9,6 +9,34 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`explore query` results now carry `column_notes`: what the cache already
+  knows about the columns a query just returned** ([#293]). `query` was the
+  most-reached-for subcommand in a 103-trial agent benchmark, ahead of
+  `explore profile`, despite project instructions naming `profile` explicitly
+  and never mentioning `query`. It was also the one surface carrying no dex
+  judgment at all: a caller living in `query` got a SQL runner and never met
+  the part of the product that is not one.
+
+  `data.column_notes` now reports null fraction (where non-zero) and PII
+  flags, keyed by output column name, for any column that resolves
+  unambiguously to a profiled table's own column. A note is also added to
+  `data.notes` when the selected columns cover a table's known grain.
+  Cache-only and additive: no extra warehouse work, never a second profile,
+  and silent wherever nothing is known.
+
+  A computed or aliased expression, or a `*` spanning more than one joined
+  table, has no single source column to attribute stats to and is silently
+  omitted rather than guessed; the physical result's column order across two
+  tables is not this feature's to guess. The resolver
+  (`resolve_output_columns` in `guards/query_firewall.py`) is deliberately
+  separate from the firewall's own PII taint analysis: that analysis discards
+  identity for any non-PII column (it only needs to know whether a value
+  path exists, not whose column it came from), so annotating every
+  resolvable column needed its own pass over the same parsed SQL rather than
+  a change to the security-critical taint model.
+
 ## [1.9.1] - 2026-08-31
 
 ### Changed

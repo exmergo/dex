@@ -1001,6 +1001,85 @@ def _measures(node: exp.Func) -> bool:
     return name in _MEASURING
 
 
+# --- output-column resolution (#293: annotate, never gate) ---------------------
+
+
+def resolve_output_columns(
+    sql: str, cache: DexCache, *, dialect: str = "duckdb"
+) -> dict[str, tuple[str, str]]:
+    """Best-effort map of a query's bare output columns to their source
+    (dataset identifier, column name), for annotation only.
+
+    Never for taint or access control, which is :func:`inspect_query`'s job
+    over the same SQL; this runs after that has already approved the query,
+    to say what dex already knows about the columns it is about to return.
+    Keyed by output name, lowercased, since a caller matches its own display
+    names case-insensitively.
+
+    Silent by construction: a computed or aliased expression, a multi-table
+    ``SELECT *`` (the physical result's column order across two tables is not
+    this function's to guess), a set operation, a subquery, or anything a
+    plain single-level SELECT does not shape resolves to nothing rather than
+    raising. A caller here only wants to annotate what it safely can, not
+    police what it cannot -- that refusal already happened in
+    :func:`inspect_query`.
+    """
+
+    try:
+        root = sqlglot.parse_one(sql, dialect=dialect)
+    except sqlglot.errors.ParseError:
+        return {}
+    if not isinstance(root, exp.Select):
+        return {}
+
+    known = {d.identifier: d for d in cache.datasets}
+    tables: set[str] = set()
+    try:
+        sources = _resolve_sources(root, {}, known, tables, dialect)
+    except QueryRefusedError:
+        return {}
+
+    datasets = [s for s in sources.values() if isinstance(s, Dataset)]
+
+    def match(dataset: Dataset, name: str) -> str | None:
+        for col in dataset.columns:
+            if col.name.lower() == name.lower():
+                return col.name
+        return None
+
+    resolved: dict[str, tuple[str, str]] = {}
+    for projection in root.expressions:
+        target = projection.this if isinstance(projection, exp.Alias) else projection
+        output_name = (projection.alias_or_name or "").lower()
+
+        if isinstance(target, exp.Star) or (
+            isinstance(target, exp.Column) and isinstance(target.this, exp.Star)
+        ):
+            if len(datasets) == 1:
+                for col in datasets[0].columns:
+                    resolved[col.name.lower()] = (datasets[0].identifier, col.name)
+            continue
+
+        if not isinstance(target, exp.Column) or not output_name:
+            continue  # computed/derived: no single source column to attribute
+
+        name = target.name
+        qualifier = target.table.lower() if target.table else ""
+        if qualifier:
+            source = sources.get(qualifier)
+            if isinstance(source, Dataset):
+                hit = match(source, name)
+                if hit:
+                    resolved[output_name] = (source.identifier, hit)
+            continue
+
+        hits = [(d, hit) for d in datasets if (hit := match(d, name))]
+        if len(hits) == 1:
+            resolved[output_name] = (hits[0][0].identifier, hits[0][1])
+
+    return resolved
+
+
 # --- LIMIT clamp ---------------------------------------------------------------
 
 

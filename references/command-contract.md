@@ -87,7 +87,11 @@ dex explore diagram               -> the cached map as a Mermaid erDiagram, in `
                                      elision is counted in notes; dex writes no file
 dex explore query "<SELECT ...>"  -> firewall-approved SELECTs, capped and row-major
   [more...] | --sql-file <path>      (variadic: one call answers several questions; a file takes
-                                     one statement per line or semicolon-separated statements)
+                                     one statement per line or semicolon-separated statements).
+                                     data.column_notes adds, cache-only and silent where nothing
+                                     is known: null fraction and PII flags for output columns that
+                                     resolve to a profiled table's own columns, plus a note in
+                                     data.notes when the selection covers a known grain
 dex explore cluster <object>      -> k-means over a bounded sample of numeric non-PII non-key columns
                                      (a key is a unique column, a column that joins out, or one named like one);
                                      returns cluster sizes + centroids (means) + silhouette, no rows

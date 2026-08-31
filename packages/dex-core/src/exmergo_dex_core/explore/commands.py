@@ -60,6 +60,7 @@ from ..guards.query_firewall import (
     QueryRefusedError,
     assert_query_shape,
     inspect_query,
+    resolve_output_columns,
 )
 from ..guards.sql_guard import referenced_relations, split_statements
 from ..progress import ProgressReporter
@@ -1255,6 +1256,7 @@ def query_batch(
                         "row_count": statement.result.row_count,
                         "truncated": statement.result.truncated,
                         "tables": statement.result.tables,
+                        "column_notes": statement.result.column_notes,
                         "notes": statement.result.notes,
                         "warnings": statement.result.warnings,
                     }
@@ -1449,7 +1451,7 @@ def _run_statements(
     if not shared.profiled:
         _price_statements(shared.adapter, live, size, ledger)
 
-    _execute(engine, shared, batch, limits, ledger)
+    _execute(engine, shared, batch, limits, ledger, cache, dialect)
     return batch, shared
 
 
@@ -1503,6 +1505,8 @@ def _execute(
     batch: list[_Statement],
     limits: QueryLimits,
     ledger: Callable[[_Statement, dict], None],
+    cache: DexCache | None,
+    dialect: str,
 ) -> None:
     """Run each approved statement in order, against one shared payload budget.
 
@@ -1557,10 +1561,14 @@ def _execute(
         )
         budget -= payload.pop("payload_bytes")
         notes = payload.pop("notes")
+        column_notes, grain_notes = _column_notes(
+            payload["columns"], statement.inspected.sql, cache, dialect
+        )
         statement.result = QueryResult(
             **payload,
+            column_notes=column_notes,
             profiled_on_demand=shared.profiled,
-            notes=notes,
+            notes=[*notes, *grain_notes],
             # A lone statement carries the call's own warnings, because there is no
             # batch record above it to hold them.
             warnings=[
@@ -2809,6 +2817,69 @@ def _select_cluster_features(
             f"choose columns, or profile a table with more numeric columns{why}"
         )
     return features, notes
+
+
+def _column_notes(
+    columns: list[str], sql: str, cache: DexCache | None, dialect: str
+) -> tuple[dict[str, dict], list[str]]:
+    """Per-column facts the cache already knows about a query's own output
+    (#293): null fraction, PII flags. Plus a plain-language note when the
+    selected columns cover a known grain.
+
+    Cache-only, no warehouse work, and silent by construction: a column that
+    does not resolve to a profiled cache column (computed, aliased away from
+    its source, or from an ambiguous multi-table ``*``), or resolves but has
+    nothing worth reporting, is simply absent from the result rather than
+    listed empty. Never a second profile: everything here was already sitting
+    in the cache before this query ran.
+    """
+
+    if cache is None:
+        return {}, []
+    resolved = resolve_output_columns(sql, cache, dialect=dialect)
+    if not resolved:
+        return {}, []
+
+    by_identifier = {d.identifier: d for d in cache.datasets}
+    notes: dict[str, dict] = {}
+    covered: dict[str, set[str]] = {}
+    for output_name in columns:
+        hit = resolved.get(output_name.lower())
+        if hit is None:
+            continue
+        identifier, source_column = hit
+        dataset = by_identifier.get(identifier)
+        if dataset is None:
+            continue
+        column = next(
+            (c for c in dataset.columns if c.name.lower() == source_column.lower()),
+            None,
+        )
+        if column is None:
+            continue
+        covered.setdefault(identifier, set()).add(source_column.lower())
+        entry: dict = {}
+        if column.null_fraction:
+            entry["null_fraction"] = column.null_fraction
+        if column.pii is not None:
+            entry["pii"] = {
+                "category": column.pii.category.value,
+                "confidence": column.pii.confidence,
+            }
+        if entry:
+            notes[output_name] = entry
+
+    grain_notes: list[str] = []
+    for identifier, source_columns in covered.items():
+        dataset = by_identifier[identifier]
+        grain = {c.lower() for c in (dataset.grain or [])}
+        if grain and grain <= source_columns:
+            short = identifier.rsplit(".", 1)[-1]
+            grain_notes.append(
+                f"the selected columns cover {short}'s known grain "
+                f"({', '.join(dataset.grain)})"
+            )
+    return notes, grain_notes
 
 
 def _shape_query_payload(

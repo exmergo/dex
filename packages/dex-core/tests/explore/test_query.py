@@ -483,7 +483,9 @@ def test_agents_own_limit_is_not_reported_as_truncation(
     )
     assert payload["data"]["row_count"] == 1
     assert payload["data"]["truncated"] is False
-    assert payload["data"]["notes"] == []
+    # No truncation note; the ID column note (it is RAW_REVIEWS's own grain,
+    # #293) is expected and unrelated to what this test checks.
+    assert not any("truncat" in n for n in payload["data"]["notes"])
 
 
 def test_cell_and_payload_caps_apply_with_notes(
@@ -685,6 +687,7 @@ def test_a_single_statement_keeps_the_envelope_it_always_had(
         "row_count",
         "truncated",
         "tables",
+        "column_notes",
         "profiled_on_demand",
         "notes",
     }
@@ -994,3 +997,110 @@ def test_arguments_and_a_file_together_are_refused(
     )
     assert payload["reason"] == "request"
     assert "not both" in payload["errors"][0]
+
+
+# --- column_notes: what the cache already knows about the output (#293) ---------
+
+
+@pytest.fixture
+def notes_duckdb(tmp_path: Path) -> Path:
+    """A unique `id` (the grain), a null-bearing `age`, and an `email` column
+    a name-based scan flags as PII, so `explore query` has something of each
+    kind to report in `column_notes`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "people.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE people (id INTEGER, email VARCHAR, age INTEGER)")
+    conn.executemany(
+        "INSERT INTO people VALUES (?, ?, ?)",
+        [
+            (i, f"user{i}@example.com", None if i % 2 == 0 else 30 + i)
+            for i in range(20)
+        ],
+    )
+    conn.close()
+    return path
+
+
+def test_column_notes_reports_null_fraction(notes_duckdb: Path, tmp_path: Path, capsys):
+    repo = _mapped_repo(notes_duckdb, tmp_path, capsys)
+    payload = _query("SELECT age FROM people", notes_duckdb, repo, capsys)
+    notes = payload["data"]["column_notes"]
+    assert notes["age"]["null_fraction"] == pytest.approx(0.5)
+    assert "pii" not in notes["age"]
+
+
+def test_column_notes_reports_a_pii_flag():
+    """A bare projection of a PII column at or above the block threshold never
+    reaches `_column_notes` at all (the firewall refuses it first), so this is
+    a direct unit test against a hand-built cache rather than an end-to-end
+    one: `_column_notes` itself does not gate on confidence, it only reports
+    what the cache says."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+    from exmergo_dex_core.explore.commands import _column_notes
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.people",
+                columns=[
+                    ColumnProfile(
+                        name="email",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="email", confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+    notes, grain_notes = _column_notes(
+        ["email"], "SELECT email FROM people", cache, "duckdb"
+    )
+    assert notes["email"]["pii"] == {"category": "email", "confidence": 0.9}
+    assert grain_notes == []
+
+
+def test_column_notes_names_grain_coverage_in_notes(
+    notes_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(notes_duckdb, tmp_path, capsys)
+    payload = _query("SELECT id FROM people", notes_duckdb, repo, capsys)
+    assert any("known grain" in n for n in payload["data"]["notes"])
+
+
+def test_column_notes_omits_a_clean_column_with_nothing_to_report(
+    notes_duckdb: Path, tmp_path: Path, capsys
+):
+    """`id` is the grain (reported in `notes`, above) but has no nulls and no
+    PII flag of its own, so it carries no entry in `column_notes` itself."""
+
+    repo = _mapped_repo(notes_duckdb, tmp_path, capsys)
+    payload = _query("SELECT id FROM people", notes_duckdb, repo, capsys)
+    assert "id" not in payload["data"]["column_notes"]
+
+
+def test_column_notes_is_silent_for_a_computed_expression(
+    notes_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(notes_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT age * 2 AS doubled FROM people", notes_duckdb, repo, capsys
+    )
+    assert payload["data"]["column_notes"] == {}
+
+
+def test_column_notes_appears_per_statement_in_a_batch(
+    notes_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(notes_duckdb, tmp_path, capsys)
+    payload = _query(
+        ["SELECT age FROM people", "SELECT id FROM people"],
+        notes_duckdb,
+        repo,
+        capsys,
+    )
+    results = payload["data"]["results"]
+    assert results[0]["column_notes"]["age"]["null_fraction"] == pytest.approx(0.5)
+    assert any("known grain" in n for n in results[1]["notes"])

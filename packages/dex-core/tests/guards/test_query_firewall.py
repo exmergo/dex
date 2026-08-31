@@ -11,6 +11,7 @@ from exmergo_dex_core.config import QueryLimits
 from exmergo_dex_core.guards.query_firewall import (
     QueryRefusedError,
     inspect_query,
+    resolve_output_columns,
 )
 
 
@@ -263,6 +264,90 @@ def test_tables_are_reported_for_the_query_log(cache: DexCache):
         LIMITS,
     )
     assert inspected.tables == ["db.main.RAW_HOSTS", "db.main.RAW_LISTINGS"]
+
+
+# --- resolve_output_columns: annotation, never a gate (#293) --------------------
+
+
+def test_resolve_output_columns_bare_column(cache: DexCache):
+    resolved = resolve_output_columns("SELECT ID FROM RAW_LISTINGS", cache)
+    assert resolved == {"id": ("db.main.RAW_LISTINGS", "ID")}
+
+
+def test_resolve_output_columns_honors_an_explicit_alias(cache: DexCache):
+    resolved = resolve_output_columns(
+        "SELECT ID AS listing_id FROM RAW_LISTINGS", cache
+    )
+    assert resolved == {"listing_id": ("db.main.RAW_LISTINGS", "ID")}
+
+
+def test_resolve_output_columns_star_on_a_single_table(cache: DexCache):
+    resolved = resolve_output_columns("SELECT * FROM RAW_LISTINGS", cache)
+    assert resolved == {
+        "id": ("db.main.RAW_LISTINGS", "ID"),
+        "host_id": ("db.main.RAW_LISTINGS", "HOST_ID"),
+    }
+
+
+def test_resolve_output_columns_star_across_a_join_is_silent(cache: DexCache):
+    """The physical result's column order across two tables is not this
+    function's to guess, so a multi-table `*` resolves to nothing rather than
+    risking a wrong attribution."""
+
+    resolved = resolve_output_columns(
+        "SELECT * FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID", cache
+    )
+    assert resolved == {}
+
+
+def test_resolve_output_columns_qualified_column_in_a_join(cache: DexCache):
+    resolved = resolve_output_columns(
+        "SELECT l.HOST_ID, h.NAME FROM RAW_LISTINGS l JOIN RAW_HOSTS h "
+        "ON l.HOST_ID = h.ID",
+        cache,
+    )
+    assert resolved == {
+        "host_id": ("db.main.RAW_LISTINGS", "HOST_ID"),
+        "name": ("db.main.RAW_HOSTS", "NAME"),
+    }
+
+
+def test_resolve_output_columns_unqualified_ambiguous_name_is_silent(cache: DexCache):
+    """Both joined tables carry an ID column; an unqualified `ID` cannot be
+    attributed to either one, so it is omitted rather than guessed."""
+
+    resolved = resolve_output_columns(
+        "SELECT ID FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID", cache
+    )
+    assert resolved == {}
+
+
+def test_resolve_output_columns_computed_expression_is_silent(cache: DexCache):
+    resolved = resolve_output_columns(
+        "SELECT UPPER(NAME) AS shout FROM RAW_HOSTS", cache
+    )
+    assert resolved == {}
+
+
+def test_resolve_output_columns_subquery_source_is_silent(cache: DexCache):
+    """Only a plain SELECT's direct FROM-clause sources resolve; a column read
+    through a nested SELECT is not walked into for identity."""
+
+    resolved = resolve_output_columns(
+        "SELECT ID FROM (SELECT ID, NAME FROM RAW_HOSTS) t", cache
+    )
+    assert resolved == {}
+
+
+def test_resolve_output_columns_unparseable_sql_is_silent(cache: DexCache):
+    assert resolve_output_columns("not valid sql at all (((", cache) == {}
+
+
+def test_resolve_output_columns_never_raises_on_an_unknown_table(cache: DexCache):
+    """`inspect_query` refuses an unknown table; this is annotation only, so
+    the same statement resolves to nothing instead of raising."""
+
+    assert resolve_output_columns("SELECT x FROM NOT_A_TABLE", cache) == {}
 
 
 # --- the confidence threshold: sub-threshold flags warn, never block -------------

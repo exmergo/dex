@@ -270,6 +270,12 @@ class QueryResult(Result):
     row_count: int = 0
     truncated: bool = False
     tables: list[str] = Field(default_factory=list)
+    #: What dex already knows, from the cache alone, about the columns this
+    #: query just returned (#293): null fraction, PII flags, whether the
+    #: selection covers a known grain. Keyed by output column name; a column
+    #: with nothing to report (unprofiled, computed, or plainly clean) is
+    #: absent rather than listed empty.
+    column_notes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     profiled_on_demand: list[str] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
@@ -281,6 +287,7 @@ class QueryResult(Result):
             "row_count": self.row_count,
             "truncated": self.truncated,
             "tables": self.tables,
+            "column_notes": self.column_notes,
             "profiled_on_demand": self.profiled_on_demand,
         }
 
@@ -309,6 +316,7 @@ class QueryStatementResult(BaseModel):
     row_count: int = 0
     truncated: bool = False
     tables: list[str] = Field(default_factory=list)
+    column_notes: dict[str, dict[str, Any]] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
