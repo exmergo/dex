@@ -30,6 +30,26 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   
 ### Added
 
+- **`--warm`, so the engine's install is paid before anyone is waiting on it**
+  ([#201]). The first command in a fresh environment installed the whole
+  dependency closure before doing any work: on the terminal recordings from an
+  agent benchmark run, 28.8s at the median for a session's first call against
+  0.2 to 0.5s once warm. There was no way to pay that anywhere else, so it
+  landed on whoever asked the first question, and an agent budgeting its own
+  wall clock could lose a real share of it to setup.
+
+  The skill wrapper now answers `--warm` itself: it resolves the extras, installs
+  them, prints one envelope naming what it installed and how long it took, and
+  exits without running a command. Run it as a container build step, a CI setup
+  step, or once after installing the plugin. It resolves through the same path a
+  real run does, which is what stops it warming an environment the next command
+  would contradict: bare `--warm` takes the connector the run directory resolves
+  to, `--warm --connector snowflake` names one before a project exists to name it,
+  and `--warm explore cluster` covers what that command adds on top, since a
+  feature extra resolves into an environment of its own and would otherwise stay
+  cold. From an empty uv cache, warm-up then a trivial command is 7.5s then 0.20s,
+  where the same first command was 10.2s.
+
 - **`explore inventory --rank` caps its payload by default** ([#289]). Ranking
   worked correctly, every object carried a populated `rank_score` sorted
   descending, but nothing capped how many came back: against a 2,356-model
@@ -115,6 +135,25 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   rotation, local execution, and bounded teardown.
 
 ### Fixed
+
+- **dex no longer builds, locks, or borrows from the caller's Python project**
+  ([#201]). `uv run` is project-aware, and the wrapper reached the engine from
+  the caller's working directory without opting out. In any repo holding a
+  `pyproject.toml`, uv therefore installed *that project* first and layered the
+  engine on top: a `.venv` (262 MB in a plain dbt-core and pandas project) and a
+  `uv.lock` written into a tree dex was asked only to read, neither of them
+  anything the user reviewed. The same sync put the caller's dependencies on the
+  engine's import path, so the engine ran against whatever the repo happened to
+  have rather than the closure it pinned, and a project that failed to build took
+  every dex command down with it, with a uv build error in place of an envelope.
+
+  Both uv invocations now pass `--no-project`, and the safety spine asserts it
+  structurally on the commands the wrapper builds. This was also where most of a
+  command's latency went, since installing the caller's project is far more work
+  than resolving the engine: a first command in such a repo drops from 10.2s to
+  8.2s cold and from 0.27s to 0.20s warm, and the repo is left exactly as it was
+  found. The wrapper also execs the engine instead of spawning it and waiting,
+  so the exit code and any signal reach the engine directly.
 
 - **`transform` skill docs claimed BigQuery has no upfront `transform build`
   estimate** ([#322]). dbt itself has no dry-run, but the engine compiles the
