@@ -2445,6 +2445,14 @@ def cluster(
         seed=limits.sample_seed,
     )
     repeatable = cluster_mod.sample_is_repeatable(adapter.dialect, limits.sample_seed)
+    if sample_method == cluster_mod.UNRECOGNIZED_DIALECT_NOTE:
+        # #313: a connector with no sampling entry silently scanned the whole
+        # table, with the cost showing up only as a bigger bill. An informational
+        # note is easy to miss; a warning is not.
+        warnings.append(
+            f"'{adapter.dialect}' has no sampling clause registered; this reads "
+            "the whole table, bounded only by the cost gate"
+        )
     adapter_name = adapter.name
     query_estimate = getattr(adapter, "query_estimate", None)
     sample_estimate = query_estimate(sample_sql) if query_estimate else 0.0

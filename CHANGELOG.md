@@ -161,6 +161,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   found. The wrapper also execs the engine instead of spawning it and waiting,
   so the exit code and any signal reach the engine directly.
 
+- **`explore cluster` against a connector with no registered sampling clause
+  silently read the whole table, priced only as a bigger bill.** (#313)
+
+  `_sample_parts` (`explore/cluster.py`) falls through to a plain informational
+  note, `"no sample clause (unrecognized dialect)"`, for any dialect it has no
+  case for. Every shipped connector has one today, so nothing broke; the risk
+  was the next connector, added without a matching entry, degrading silently
+  instead of failing. The note was easy to miss inside `notes`; it is now also
+  escalated to `warnings`, which a caller checking cost cannot miss.
+
+  A new test walks every dialect in the adapter registry against
+  `_sample_parts` directly, so a connector added without a sampling entry now
+  fails at merge rather than at someone's month-end bill.
+
 - **`transform` skill docs claimed BigQuery has no upfront `transform build`
   estimate** ([#322]). dbt itself has no dry-run, but the engine compiles the
   project and dry-runs each node itself, so the first unconfirmed
