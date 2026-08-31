@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-08-31
+
 ### Changed
 
 - **`explore query` results now identify their columnar payload shape in the
@@ -277,7 +279,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   per pair and floors at the per-query minimum, a probe already priced at that
   floor and still refused stops the search instead of re-pricing prefixes that
   cannot cost less.
-
 
 ## [1.9.0] - 2026-08-27
 
