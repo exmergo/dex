@@ -721,6 +721,7 @@ def _install_fake_pricing(
     confirmed: bool,
     ceiling: float | None,
     describe=None,
+    translate=None,
     notes: list[str] = (),
     store=None,
     session_ceiling: float | None = None,
@@ -779,6 +780,8 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
+    if translate is not None:
+        adapter.compute_spend_translation = translate
     monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
     monkeypatch.setattr(
         build_module,
@@ -881,6 +884,121 @@ def test_billed_build_surfaces_estimate_quality_on_compute_time(
     assert envelope["cost"]["estimate"] == 42.0
     assert envelope["data"]["estimated_seconds"] == 42.0
     assert envelope["data"]["estimate_quality"] == "heuristic"
+
+
+def test_clickhouse_cloud_build_uses_compute_time_and_translates_settled_seconds(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: clickhouse\n"
+        "clickhouse:\n"
+        "  deployment: cloud\n"
+        "  compute_unit_price_usd: 0.29846\n",
+        encoding="utf-8",
+    )
+    _install_fake_pricing(
+        monkeypatch,
+        connector="clickhouse",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=1.0,
+        per_node={"stg_customers": 1.0},
+        confirmed=True,
+        ceiling=60,
+        translate=lambda seconds: {
+            "compute_unit_hours_billed": seconds * 2 / 3600,
+            "usd_billed": seconds * 2 / 3600 * 0.29846,
+        },
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 18.0,
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "60",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    spend = envelope["data"]["spend"]
+    assert spend["seconds_billed"] == 18.0
+    assert spend["compute_unit_hours_billed"] == pytest.approx(0.01)
+    assert spend["usd_billed"] == pytest.approx(0.0029846)
+
+
+def test_clickhouse_cloud_build_fails_closed_before_dbt_without_live_capacity(
+    bigquery_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    forbid_dbt,
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: clickhouse\nclickhouse:\n  deployment: cloud\n",
+        encoding="utf-8",
+    )
+
+    def missing_capacity(_seconds):
+        raise RuntimeError("capacity could not be proved")
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="clickhouse",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=1.0,
+        per_node={"stg_customers": 1.0},
+        confirmed=True,
+        ceiling=60,
+        translate=missing_capacity,
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "60",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    assert "capacity could not be proved" in envelope["errors"][0]
 
 
 def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
@@ -1245,7 +1363,12 @@ def test_prod_refusal_still_beats_the_dev_target_check(
 
 
 def _compile_runner(
-    monkeypatch, project: Path, run_results: dict, *, returncode: int = 0
+    monkeypatch,
+    project: Path,
+    run_results: dict,
+    *,
+    returncode: int = 0,
+    expected_env: dict[str, str] | None = None,
 ):
     """Fake ``_default_runner`` for compile: writes the given run_results.json on
     invocation (mirroring real dbt) and returns the requested code."""
@@ -1255,6 +1378,9 @@ def _compile_runner(
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
 
     def fake(timeout: float, cwd, env=None):
+        if expected_env is not None:
+            assert env == expected_env
+
         def run(argv: list[str]):
             (project / "target").mkdir(parents=True, exist_ok=True)
             (project / "target" / "run_results.json").write_text(
@@ -1265,6 +1391,30 @@ def _compile_runner(
         return run
 
     monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
+def test_compile_estimate_forwards_statement_caps_to_dbt_compile(
+    dbt_project_dir: Path, monkeypatch
+):
+    """The pricing compile opens the dev connection, so it needs the same
+    constrained settings as the eventual build."""
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+    env = {
+        "DEX_CLICKHOUSE_MAX_EXECUTION_TIME": "60",
+        "DEX_CLICKHOUSE_MAX_BYTES_TO_READ": str(60 * 200 * 1024 * 1024),
+    }
+    _compile_runner(
+        monkeypatch,
+        dbt_project_dir,
+        {"results": []},
+        expected_env=env,
+    )
+    total, per_node, notes = build_mod.compile_estimate(
+        dbt_project_dir, _EstimatingAdapter(), target="dev", env=env
+    )
+    assert (total, per_node) == (0.0, {})
+    assert notes == ["no scanning build nodes to price; the estimate is zero"]
 
 
 class _EstimatingAdapter:
