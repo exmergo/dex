@@ -16,7 +16,7 @@ Run the engine through the wrapper. It prints one sanitized JSON envelope and
 nothing else; read the envelope and decide the next step.
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
 dex runs its engine through `uv`, which is a prerequisite and is not installed by
@@ -25,6 +25,16 @@ to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
 `brew install uv`, or `pipx install uv`), then re-run. Never fall back to raw
 Python, `pip`, or a database CLI to do the work another way: the guardrails live in
 the engine, so any other path is unguarded.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 If the user has no warehouse to point at and wants to see what dex does, `demo`
 generates one: a seeded local DuckDB warehouse plus the `.dex/config.yml` for it,

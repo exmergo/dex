@@ -2805,6 +2805,63 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
     assert not (repo / ".dex").exists()
 
 
+def test_the_skill_wrapper_never_installs_into_the_repo_it_is_pointed_at(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Every uv invocation the wrapper makes is blind to the caller's own project.
+
+    The wrapper reaches the engine through uv, and uv is project-aware. Without
+    `--no-project` it discovers whatever Python project the caller is standing in,
+    builds it, and leaves a `.venv/` and a `uv.lock` behind: hundreds of megabytes
+    of artifact nobody asked for or reviewed, in a tree dex was asked only to read.
+    The same sync puts the caller's dependencies on the engine's import path, so
+    the engine stops running against the closure it pinned and starts running
+    against whatever the repo happened to have.
+
+    Asserted structurally, on the commands the wrapper builds, because the
+    alternative is provoking a real install into a scratch repo on every CI run.
+    Both paths are covered: the ordinary one that runs a command, and `--warm`,
+    which installs and nothing else.
+    """
+
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "skills"
+        / "explore"
+        / "scripts"
+        / "run.py"
+    )
+    spec = importlib.util.spec_from_file_location("_dex_spine_wrapper", path)
+    wrapper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wrapper)
+
+    monkeypatch.setattr(wrapper.shutil, "which", lambda _name: "/usr/local/bin/uv")
+    monkeypatch.setattr(wrapper.os, "name", "posix")
+    issued: list[list[str]] = []
+    monkeypatch.setattr(
+        wrapper.os, "execvp", lambda _file, cmd: issued.append(cmd) or None
+    )
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda cmd, **_kw: (
+            issued.append(cmd)
+            or wrapper.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        ),
+    )
+
+    monkeypatch.setattr(wrapper.sys, "argv", ["run.py", "explore", "inventory"])
+    wrapper.main()
+    monkeypatch.setattr(wrapper.sys, "argv", ["run.py", "--warm"])
+    wrapper.main()
+
+    assert len(issued) == 2, "both paths must reach uv"
+    for cmd in issued:
+        assert cmd[:3] == ["uv", "run", "--no-project"], cmd
+
+
 def test_an_in_memory_session_budget_still_binds(fake_bq_client):
     """A backend that forgets across processes must not forget within one.
 
