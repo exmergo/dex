@@ -57,7 +57,7 @@ use:
 
 ClickHouse (bills nothing: a local container; db-load gating is exercised for
 real, server-side caps and all). The DSN should be the read-only user from
-scripts/clickhouse_seed.sql; transform additionally needs the dbt_dev user's
+scripts/clickhouse_local_users.sql; transform additionally needs the dbt_dev user's
 password in DEX_TEST_CH_DEV_PASSWORD. One script stands the whole thing up and
 is the same one CI runs, so the local target and the CI target cannot drift:
 
@@ -65,6 +65,14 @@ is the same one CI runs, so the local target and the CI target cannot drift:
     DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
         DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
         uv run pytest tests/integration -q -m clickhouse
+
+ClickHouse Cloud (bills the dedicated Scale service in AWS us-east-1; the
+repository workflow performs the hard daily-usage preflight before any SQL).
+scripts/setup_clickhouse_cloud_ci.sh provisions the two isolated databases,
+least-privilege users, server-side limits, scoped usage reader, and protected
+GitHub environment used by this suite:
+
+    scripts/clickhouse_cloud/run_integration.sh
 """
 
 from __future__ import annotations
@@ -155,6 +163,29 @@ def _require_cloud_env(request):
                 "plus REDSHIFT_* credentials"
             )
         pytest.importorskip("redshift_connector")
+        return
+    if request.node.get_closest_marker("clickhouse_cloud"):
+        required = (
+            "DEX_TEST_CH_CLOUD_ORG_ID",
+            "DEX_TEST_CH_CLOUD_SERVICE_ID",
+            "DEX_TEST_CH_CLOUD_HOST",
+            "DEX_TEST_CH_CLOUD_PORT",
+            "DEX_TEST_CH_CLOUD_DATABASE",
+            "DEX_TEST_CH_CLOUD_DEV_DATABASE",
+            "DEX_TEST_CH_CLOUD_COMPUTE_UNIT_PRICE_USD",
+            "DEX_TEST_CH_CLOUD_MAX_SECONDS",
+            "DEX_TEST_CH_CLOUD_DSN",
+            "DEX_TEST_CH_CLOUD_DEV_PASSWORD",
+            "DEX_TEST_CH_CLOUD_API_KEY",
+            "DEX_TEST_CH_CLOUD_API_SECRET",
+        )
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            pytest.skip(
+                "ClickHouse Cloud integration disabled: required values are "
+                f"missing: {', '.join(missing)}"
+            )
+        pytest.importorskip("clickhouse_connect")
         return
     if request.node.get_closest_marker("clickhouse"):
         if not os.environ.get("DEX_TEST_CH_DSN"):

@@ -322,6 +322,64 @@ def distinct_combination_sql(
     return f"SELECT {', '.join(parts)}"
 
 
+COMPOSITE_PROBE_SKIPPED_NOTE = (
+    "composite-key probe skipped: the remaining budget could not cover the "
+    "extra scan; grain stays unknown"
+)
+
+
+def composite_probe_narrowed_note(probed: int, asked: int) -> str:
+    """The table note for a probe the budget could only partly cover. It has to
+    say what went unasked, because the caller's alternative reading of a missing
+    composite key is that the warehouse answered and there was none."""
+
+    return (
+        f"composite-key probe narrowed to {probed} of {asked} candidate pairs: "
+        "the remaining budget could not cover the rest; a grain outside the "
+        "pairs probed stays unknown"
+    )
+
+
+def affordable_combinations(
+    combinations: list[list[str]],
+    estimate_for: Callable[[list[list[str]]], float],
+    try_charge: Callable[[float], bool],
+    *,
+    floor: float | None = None,
+) -> tuple[list[list[str]], str | None]:
+    """The longest prefix of ``combinations`` the cost gate will cover, paired
+    with the table note the caller owes its reader (None when the whole list
+    fits).
+
+    The probe list arrives best-ranked first, so when the budget cannot cover
+    all of it, narrowing is the honest degradation and refusing is not: refusing
+    gives up the grain entirely, while the affordable prefix is the part most
+    likely to hold it. Every metered adapter reaches this the same way, which is
+    why the search and both notes live here rather than six times over.
+
+    ``estimate_for`` prices one prefix in the adapter's own paradigm. ``floor``
+    is the per-statement billing minimum where the adapter has one: a refusal
+    already at the floor cannot be rescued by a shorter prefix, so the search
+    stops instead of re-pricing prefixes that cannot cost less, which on
+    BigQuery is the difference between one dry run and five.
+
+    Descending attempts are safe because ``CostGate.charge`` raises out of
+    ``preflight`` before it accumulates an estimate or widens a reservation, so
+    a refused ``try_charge`` leaves the gate exactly as it found it.
+    """
+
+    for count in range(len(combinations), 0, -1):
+        prefix = combinations[:count]
+        estimate = estimate_for(prefix)
+        if try_charge(estimate):
+            if count == len(combinations):
+                return prefix, None
+            return prefix, composite_probe_narrowed_note(count, len(combinations))
+        if floor is not None and estimate <= floor:
+            break
+    return [], COMPOSITE_PROBE_SKIPPED_NOTE
+
+
 # Value-shape regex patterns, shared by every adapter so the shape evidence the
 # engine reasons over means the same thing on every connector. Both are plain
 # POSIX-class regexes (no \d, no lookaround) so they parse in every supported
@@ -495,6 +553,17 @@ _HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
 _CAST_SENTINEL = "'0'"
 
 
+def default_substring_expr(qcol: str, start: int, length: int) -> str:
+    """The positional substring idiom every dialect here accepts *except*
+    Redshift, whose server refuses the name outright ("SUBSTR() function is
+    not supported (Hint: use SUBSTRING instead)") even over a real table, so
+    a connector whose spelling differs supplies its own (see
+    `type_contradiction_expressions`). The reverse swap is not free either:
+    BigQuery has SUBSTR and no SUBSTRING, so neither spelling is universal."""
+
+    return f"SUBSTR({qcol}, {start}, {length})"
+
+
 def type_contradiction_expressions(
     qcol: str,
     i: int,
@@ -503,6 +572,7 @@ def type_contradiction_expressions(
     is_integer: bool,
     regexp_predicate: Callable[[str, str], str],
     bigint_type: str,
+    substring_expr: Callable[[str, int, int], str] = default_substring_expr,
 ) -> list[str]:
     """Declared-type-vs-content aggregate expressions for one column.
 
@@ -579,8 +649,8 @@ def type_contradiction_expressions(
         ]
         slash_either = f"({slash_date_pred} OR {slash_datetime_pred})"
         slash_shaped = shaped(slash_either)
-        first_val = total_cast(slash_either, f"SUBSTR({qcol}, 1, 2)")
-        second_val = total_cast(slash_either, f"SUBSTR({qcol}, 4, 2)")
+        first_val = total_cast(slash_either, substring_expr(qcol, 1, 2))
+        second_val = total_cast(slash_either, substring_expr(qcol, 4, 2))
         exprs += [
             fraction(slash_shaped, f"{first_val} > 12", f"ts_sl1_{i}"),
             fraction(slash_shaped, f"{second_val} > 12", f"ts_sl2_{i}"),

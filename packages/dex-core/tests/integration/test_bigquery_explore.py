@@ -1,7 +1,9 @@
 """Live explore against public BigQuery data: free inventory, the confirm
-handshake with a real dry-run estimate, the over-ceiling refusal (free), and a
-firewalled query. Reads only bigquery-public-data; bills to the test project;
-every scan is capped by the suite's byte ceiling."""
+handshake with a real dry-run estimate, the over-ceiling refusal (free), a
+firewalled query, and temporal continuity over a DATETIME column. Reads
+bigquery-public-data plus one tiny table this suite writes into the scratch
+dataset; bills to the test project; every scan is capped by the suite's byte
+ceiling."""
 
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ SHAKESPEARE = "bigquery-public-data.samples.shakespeare"
 # A deliberately large table (tens of GB): its dry-run estimate must blow any
 # sane test budget, proving the refusal live at zero cost.
 WIKIPEDIA = "bigquery-public-data.samples.wikipedia"
+CONTINUITY_TABLE = "dex_temporal_continuity"
 
 
 def test_inventory_is_free_and_ranked(tmp_path: Path, capsys, bq_project: str):
@@ -200,6 +203,111 @@ def test_unnest_of_a_function_derived_array_runs_live(
     )
     assert rc == 1
     assert "query refused" in envelope["errors"][0]
+
+
+# --- temporal continuity over a written fixture (the one shape public data lacks) -----
+
+
+@pytest.fixture
+def bq_continuity_table(bq_project: str, bq_scratch_dataset: str):
+    """One tiny table in the scratch dataset carrying a known hole at both
+    grains, because no public dataset offers a DATETIME column with a hole
+    whose size this suite can state.
+
+    Forty-eight rows are generated and three are dropped, leaving 45.
+    ``occurred_at`` advances one day per row from 2024-03-01, ``recorded_at``
+    one hour per row from 2024-03-01 00:30 (never midnight, so the column is
+    not day-aligned and hour is the grain the engine reports). The three
+    dropped rows are a 3-day hole in one column and a 3-hour hole in the
+    other; four later rows keep their date but carry a NULL ``recorded_at``,
+    so the hour grain has a second, wider hole of 4 that the day grain does
+    not. The two grains therefore report different numbers, and hour
+    statistics that were really the day column's would not pass.
+
+    Written and dropped by this fixture: the CI principal holds dataEditor on
+    the scratch dataset and nowhere else, and its table TTL is the backstop for
+    a crashed run.
+    """
+
+    from google.cloud import bigquery
+
+    identifier = f"{bq_project}.{bq_scratch_dataset}.{CONTINUITY_TABLE}"
+    client = bigquery.Client(project=bq_project)
+    try:
+        # DDL over generated literals: no table is read, so this scans nothing.
+        client.query(
+            f"CREATE OR REPLACE TABLE `{identifier}` AS SELECT "  # noqa: S608
+            "DATE_ADD(DATE '2024-03-01', INTERVAL i DAY) AS occurred_at, "
+            "IF(i BETWEEN 20 AND 23, NULL, DATETIME_ADD("
+            "DATETIME '2024-03-01 00:30:00', INTERVAL i HOUR)) AS recorded_at "
+            "FROM UNNEST(GENERATE_ARRAY(0, 47)) AS i "
+            "WHERE i NOT IN (10, 11, 12)"
+        ).result()
+        yield identifier
+    finally:
+        client.delete_table(identifier, not_found_ok=True)
+        client.close()
+
+
+def test_temporal_continuity_reports_the_seeded_hour_grain_hole(
+    tmp_path: Path,
+    capsys,
+    bq_project: str,
+    bq_scratch_dataset: str,
+    bq_continuity_table: str,
+):
+    """The hazard that reads as a clean result rather than a missing one.
+
+    ``DATETIME`` contains the substring DATE and not TIMESTAMP, so the shared
+    date-only check claimed it and every DATETIME column on BigQuery reported
+    day and month continuity while silently never reporting an hour gap. This
+    is BigQuery's own end-to-end proof that the hour grain is computed and
+    correct, the assertion the ClickHouse suite already carries for
+    ``DateTime`` and the connector that held the bug longest lacked.
+
+    It also pins the other direction: a bare ``DATE`` column must still skip
+    the hour grain, because ``DATE_TRUNC`` is the one truncation function
+    BigQuery gives no HOUR unit, and asking for one is an error, not a wrong
+    number.
+    """
+
+    seed_repo(tmp_path, bq_project, datasets=[f"{bq_project}.{bq_scratch_dataset}"])
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "explore",
+            "profile",
+            CONTINUITY_TABLE,
+            "--confirm",
+            "--budget",
+            str(MAX_BYTES),
+        ],
+        capsys,
+    )
+    assert_ok(rc, envelope)
+    dataset = envelope["data"]["datasets"][0]
+    assert dataset["identifier"] == bq_continuity_table
+    columns = {c["name"]: c for c in dataset["columns"]}
+
+    recorded = columns["recorded_at"]
+    assert recorded["data_type"] == "DATETIME"
+    assert recorded["temporal_granularity"] == "hour", (
+        "a granularity of day here means the date-only check claimed DATETIME "
+        "again: the hour grain was never computed and its absence reads clean"
+    )
+    assert recorded["temporal_span"] == 48
+    assert recorded["temporal_distinct_periods"] == 41
+    assert recorded["temporal_missing_periods"] == 7
+    assert recorded["temporal_largest_gap"] == 4
+
+    occurred = columns["occurred_at"]
+    assert occurred["data_type"] == "DATE"
+    assert occurred["temporal_granularity"] == "day"
+    assert occurred["temporal_span"] == 48
+    assert occurred["temporal_distinct_periods"] == 45
+    assert occurred["temporal_missing_periods"] == 3
+    assert occurred["temporal_largest_gap"] == 3
 
 
 # --- scope resolution against the live project (free: metadata GET, no query) ---------

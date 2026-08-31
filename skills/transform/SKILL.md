@@ -14,7 +14,7 @@ writes only to the repo, as reviewable diffs, and runs against a dev target only
 ## How to drive it
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
 dex runs its engine through `uv`, which is a prerequisite and is not installed by
@@ -23,6 +23,16 @@ to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
 `brew install uv`, or `pipx install uv`), then re-run. Never fall back to editing
 the dbt project by hand instead: the validation, the diffs, and the dev-target
 gating live in the engine, so any other path is unguarded.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 You author the dbt file content; the engine validates it, computes the diffs,
 and stores the proposal as a plan. Hand content over with `--edits-file <path>`
@@ -120,7 +130,7 @@ else: `transform plan` needs a project to edit. Ask the user for the project
 name and **confirm the connector with them**, then run:
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
 ```
 
 The engine renders the whole skeleton (`dbt_project.yml`, `models/staging/` and
@@ -298,11 +308,16 @@ check" note just means no connection was reachable at init time.
   first) is what they actually want.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
-  `--budget` on billed connectors). On BigQuery there is no upfront estimate
-  (dbt has no dry-run), so always get an explicit byte budget from the user and
-  pass it as `--budget <bytes>`; never invent one. Each statement dbt runs is
-  capped server-side by the profile's `maximum_bytes_billed`, and the envelope
-  reports billed bytes afterward. Production-looking targets are refused
+  `--budget` on billed connectors). dbt itself has no dry-run, but the engine
+  compiles the project and dry-runs each node itself, so on BigQuery the first
+  unconfirmed call already returns `needs_confirmation` with `estimated_bytes`
+  and a `per_table_bytes` breakdown, the same shape the scanning `explore`
+  commands use. Never invent a `--budget` figure: read the reported estimate
+  (`per_table_bytes` is the actionable half, since it names which node is
+  driving the cost) and confirm with a `--budget` grounded in that number.
+  Each statement dbt runs is capped server-side by the profile's
+  `maximum_bytes_billed`, and the envelope reports billed bytes afterward.
+  Production-looking targets are refused
   outright; `--confirm` cannot override that. dbt runs with its working
   directory pinned to the project dir, so relative paths in `profiles.yml`
   resolve against the project. When the project declares packages

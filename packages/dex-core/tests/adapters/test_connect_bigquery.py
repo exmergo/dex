@@ -4,6 +4,7 @@ client and the (simulated) server."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -963,6 +964,27 @@ def test_distinct_combination_counts_degrade_when_budget_cannot_cover(fake_bq_cl
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
+def test_distinct_combination_counts_stop_pricing_prefixes_at_the_billing_floor(
+    fake_bq_client,
+):
+    """Narrowing the probe only buys something when it drops a referenced
+    column, and nothing can price below the per-query minimum. A refusal
+    already at that floor is final, so the search stops there: one dry run for
+    five pairs, not one per prefix."""
+
+    adapter = make_adapter(fake_bq_client, ceiling=100 * MB)
+    adapter.cost_gate.charge(100 * MB - 1_000)
+    pairs = [["id", "email"], ["email", "id"], ["id", "plan"], ["email", "plan"]]
+
+    assert adapter.distinct_combination_counts("test-proj.shop.customers", pairs) == {}
+    assert any(
+        "composite-key probe skipped" in note
+        for note in adapter.table_notes("test-proj.shop.customers")
+    )
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    assert len(fake_bq_client.query_calls) == 1
+
+
 def test_value_domain_counts_batch_into_one_guarded_statement(fake_bq_client):
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
@@ -1303,8 +1325,16 @@ def test_an_external_table_with_a_composite_grain_scaffolds_the_right_tests(
                 row[f"n_{i}"] = 6
             return [row]
         if "SELECT DISTINCT" in sql:  # the composite-combination probe
-            # The pair covers all six rows; neither single column does.
-            return [{"d_0": 6}]
+            # Answer every alias the statement actually asked for, keyed by the
+            # pair it names. Several candidate pairs ride in one call, and a
+            # resolver hard-coding `d_0` turns one more of them into a KeyError
+            # out of the profiler rather than a readable assertion.
+            counts = {}
+            for i, cols in enumerate(re.findall(r"SELECT DISTINCT (.+?) FROM", sql)):
+                pair = tuple(c.strip().strip("`") for c in cols.split(","))
+                # Only the parent-plus-line pair covers all six rows.
+                counts[f"d_{i}"] = 6 if pair == ("order_id", "line_number") else 5
+            return [counts]
         if "COUNT(DISTINCT" in sql:  # the exact-distinct escalation
             return [{"d_0": 6}]
         aggregate = {"n_total": 6}

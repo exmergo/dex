@@ -54,6 +54,7 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
@@ -165,8 +166,28 @@ def _date_trunc_expr(qcol: str, unit: str) -> str:
     return f"DATE_TRUNC('{unit}', {qcol})"
 
 
+def _substring_expr(qcol: str, start: int, length: int) -> str:
+    # Redshift refuses SUBSTR by name -- "SUBSTR() function is not supported
+    # (Hint: use SUBSTRING instead)" -- and does so at execution, over a real
+    # table, not only in a leader-node-only query. SUBSTRING takes the same
+    # positional arguments and is what the hint asks for.
+    return f"SUBSTRING({qcol}, {start}, {length})"
+
+
 def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
-    return f"DATEDIFF({unit}, {earlier}, {later})"
+    # Both operands are cast, and the cast is not decorative: Redshift's
+    # DATEDIFF resolves to pg_catalog.date_diff, which is declared over
+    # DATE/TIME/TIMETZ/TIMESTAMP and has no TIMESTAMPTZ overload, while
+    # DATE_TRUNC over a TIMESTAMPTZ column returns TIMESTAMPTZ. The periods
+    # this diffs are therefore exactly the shape it refuses ("function
+    # pg_catalog.date_diff(\"unknown\", timestamp with time zone, timestamp
+    # with time zone) does not exist"), and a plain DATEDIFF failed the whole
+    # profiling statement for any table carrying a TIMESTAMPTZ column. The cast
+    # is total for every type that reaches here (DATE and TIMESTAMP widen
+    # unchanged; TIME is never temporal-profiled, see `is_temporal_type`), and
+    # it shifts nothing: both operands convert to the session timezone by the
+    # same rule, so their difference is what it was.
+    return f"DATEDIFF({unit}, {earlier}::TIMESTAMP, {later}::TIMESTAMP)"
 
 
 class RedshiftConnectionError(ConnectorError):
@@ -847,6 +868,7 @@ class RedshiftAdapter:
                         is_integer=is_integer_type(col.data_type),
                         regexp_predicate=_regexp_predicate,
                         bigint_type=_BIGINT_TYPE,
+                        substring_expr=_substring_expr,
                     )
                 )
             wants_key_shape = (col.name in key_shape_req) and not degraded
@@ -984,9 +1006,11 @@ class RedshiftAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
@@ -994,29 +1018,27 @@ class RedshiftAdapter:
         meta, _ = self.table_metadata(identifier)
         # Like the exact-distinct escalation, this can be a command's first
         # billed statement, so the pending Serverless wake minimum rides the
-        # charge; on refusal it stays pending.
-        estimate = (
-            self._scan_seconds(meta.byte_size) * len(combinations) + self._wake_floor()
+        # charge; it is flat across prefixes, and stays pending unless a prefix
+        # is actually charged.
+        unit = self._scan_seconds(meta.byte_size)
+        wake = self._wake_floor()
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix) + wake,
+            self.cost_gate.try_charge,
         )
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         self._consume_wake_floor()
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int

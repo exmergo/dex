@@ -144,7 +144,16 @@ so it reports none rather than repeating the profile's.
   probe, and the value-domain probe each spend only within the
   already-confirmed budget, and degrade (to an approximate verdict, no
   composite key, or no reported domain) plus a table note when the remaining
-  budget cannot cover them.
+  budget cannot cover them. The composite-key probe degrades in two steps: it
+  first narrows to the best-ranked candidate pairs the budget can cover, and
+  only skips outright when it cannot cover one. Either way the note says which
+  it was, because a missing composite key otherwise reads as a warehouse that
+  answered and had none.
+- The reserve holds one query minimum for the composite-key probe however many
+  pairs it carries, so on a wide table the probe's dry run can price above what
+  the estimate held for it. The per-statement gate, not the reserve, is what
+  bounds that: the probe is priced against the live remaining budget before it
+  runs, and narrows or skips rather than exceeding it.
 
 ## Read-only, in depth
 

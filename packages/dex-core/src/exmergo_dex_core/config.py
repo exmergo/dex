@@ -205,13 +205,11 @@ class ClickHouseTarget(BaseModel):
 
     ``deployment`` declares which ClickHouse this is, and is a cost decision
     rather than a connection one. Self-hosted bills no currency, so dex
-    guards it as database-seconds (``db_load``); ClickHouse Cloud bills
-    compute-unit-hours, which dex does not yet model, so ``cloud`` is
-    accepted here and refused at connect rather than silently guarded with a
-    number that cannot bound it. The field and ``compute_unit_price_usd``
-    exist now so the committed config surface does not have to change shape
-    when Cloud lands; ``compute_unit_price_usd`` is refused under
-    ``self_hosted``, where it would be accepted and ignored.
+    guards it as database-seconds (``db_load``); ClickHouse Cloud is guarded
+    in compute-seconds, with live service capacity translating those seconds
+    to compute-unit-hours. ``compute_unit_price_usd`` adds the optional dollar
+    translation and is refused under ``self_hosted``, where it would otherwise
+    be accepted and ignored.
 
     ``max_full_profile_bytes`` opts large tables into sampled profiling.
     ClickHouse's ``SAMPLE`` clause only works where the table declared a

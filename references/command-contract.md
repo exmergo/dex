@@ -8,9 +8,9 @@ logic.
 ## Shape of the boundary
 
 - A surface (SKILL.md or AGENTS.md) tells the agent which subcommand to run.
-- A thin PEP 723 wrapper (`skills/<skill>/scripts/run.py`) runs it via `uv run`
-  against the pinned engine version, installing the connector extra it resolves at
-  runtime (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
+- A thin PEP 723 wrapper (`skills/<skill>/scripts/run.py`) runs it via
+  `uv run --no-project` against the pinned engine version, installing the connector
+  extra it resolves at runtime (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
   found by walking up from the run directory to the git root, then DuckDB), so the
   pin stays connector-neutral. `uv` is therefore a prerequisite, and the wrapper
   holds the envelope contract even there: with no `uv` on `PATH` it refuses with a
@@ -22,6 +22,19 @@ logic.
   `explore semantic` adds `[semantic-api]` plus, where a statement might be
   rendered locally (any mode but `list`, without `--api`), `[semantic]`. A repo
   that runs neither resolves neither scikit-learn nor MetricFlow.
+- That environment is uv's own, and `--no-project` is what keeps it so. Without it
+  uv discovers whatever Python project the caller is standing in, builds it, leaves
+  a `.venv/` and a `uv.lock` in their repo, and puts their dependencies on the
+  engine's import path: unreviewed writes into a tree dex was asked only to read,
+  and an engine no longer running against the closure it pinned. The invariant is
+  asserted structurally on the commands the wrapper builds, in the safety spine.
+- `--warm` is the wrapper's own flag and the only one it answers itself, stripped
+  before the argv reaches the engine. It resolves extras through the same path a
+  real run does, installs them, prints one envelope naming what it installed, and
+  exits without running a command. That is what lets a container build, a CI setup
+  step, or a first-time install pay a cold resolution once instead of leaving it on
+  an interactive caller's clock, and resolving through the shared path is what
+  keeps it from warming an environment the next command would contradict.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
 - The agent reads the envelope and decides the next step.
@@ -49,7 +62,9 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (7
                                      directory is ever created, and an existing config
                                      at or above the target is left alone with a warning
 dex connect test                  -> {capabilities, dialect, read_only: true}
-dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows)
+dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
+  [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
+                                     it; both no-ops without --rank
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
@@ -789,6 +804,12 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   plus `session_spent_today`, which is what the next command's cumulative
   ceiling will start from. A failed build reports it too: dbt bills for the
   statements it ran before it stopped.
+- **ClickHouse's paradigm depends on its declared deployment.** Config-free
+  callers retain the backward-compatible `db_load` default; an effective
+  `clickhouse.deployment: cloud` uses `compute_time`. Cloud keeps seconds as the
+  binding ceiling and ledger unit, and adds approximate compute-unit-hours from
+  live per-replica memory plus optional USD from the configured price. Missing
+  or partial capacity refuses before billed work.
 - **The spend ledger is a dependency of billing, not of every command.** A gate
   is built at every connection assembly on a billed connector, free commands
   included, but nothing reads the ledger until something needs the day's total.

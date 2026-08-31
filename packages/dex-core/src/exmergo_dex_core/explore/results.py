@@ -13,7 +13,7 @@ Counts that a caller can compute from a list it already has (``object_count`` fr
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -39,14 +39,31 @@ class InventoryEntry(BaseModel):
 
 
 class InventoryResult(Result):
+    """A ranked call caps what comes back (#289): a full catalog dump sorted by
+    score is not a shortlist, and at thousands of objects the rank is the one
+    part a caller never reads. ``elided_object_count`` says how many eligible
+    objects the cap left out; ``--limit`` widens the cap and ``--all`` lifts it
+    entirely, both no-ops on an unranked call, which carries no order to cut
+    from and stays uncapped.
+
+    ``notes`` is always reported, the same convention ``map``/``diagram``/
+    ``query`` use: an empty list on an unranked call means there was nothing to
+    say, and on a ranked one it never is, since a ranked call always states its
+    basis (see ``inventory()``).
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
     objects: list[InventoryEntry] = Field(default_factory=list)
     ranked: bool = False
+    elided_object_count: int = 0
 
     def data(self) -> dict[str, Any]:
         return {
             "object_count": len(self.objects),
             "objects": [o.model_dump(mode="json") for o in self.objects],
             "ranked": self.ranked,
+            "elided_object_count": self.elided_object_count,
         }
 
 
@@ -246,6 +263,7 @@ class QueryResult(Result):
 
     always_reports_notes: ClassVar[bool] = True
 
+    shape: Literal["columnar"] = "columnar"
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -256,6 +274,7 @@ class QueryResult(Result):
 
     def data(self) -> dict[str, Any]:
         return {
+            "shape": self.shape,
             "columns": self.columns,
             "types": self.types,
             "cells": self.cells,
@@ -283,6 +302,7 @@ class QueryStatementResult(BaseModel):
     index: int
     status: str
     line: int | None = None
+    shape: Literal["columnar"] = "columnar"
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -312,6 +332,7 @@ class QueryBatchResult(Result):
 
     def data(self) -> dict[str, Any]:
         return {
+            "shape": "columnar",
             "results": [r.model_dump(mode="json") for r in self.results],
             "statement_count": len(self.results),
             "ok_count": sum(1 for r in self.results if r.status == "ok"),

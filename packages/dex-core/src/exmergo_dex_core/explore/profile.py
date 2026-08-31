@@ -57,14 +57,15 @@ _EXACT_DISTINCT_CAP = 8
 # and the ranking puts a real grain in the first slots when one exists.
 _COMPOSITE_PAIR_CAP = 5
 
-# A later pair that shares a column with an already-kept pair is treated as
-# the same hypothesis tried with different filler ("does this dimension have
-# *a* partner?") when its product is within this multiple of the kept pair's
-# -- not a genuinely different candidate. Keeping the ratio bounded (rather
-# than 1:1) is what stops several near-identical junk pairs from each
-# consuming a cap slot; a pair whose product diverges meaningfully (a real
-# competing hypothesis, not filler) still gets its own slot even if it
-# reuses a column.
+# A later pair that shares a column with a better-ranked one is treated as the
+# same hypothesis tried with different filler ("does this dimension have *a*
+# partner?") when its product is within this multiple of the better-ranked
+# pair's -- not a genuinely different candidate. Keeping the ratio bounded
+# (rather than 1:1) is what sends several near-identical junk pairs to the back
+# together; a pair whose product diverges meaningfully (a real competing
+# hypothesis, not filler) keeps its place even if it reuses a column. This only
+# orders candidates. It decides nothing about which ones get probed while the
+# cap has room, because a discarded candidate cannot be the grain.
 _COMPOSITE_REDUNDANCY_RATIO = 3.0
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
@@ -981,14 +982,27 @@ def _probe_composite_keys(
     id-shaped members first (real grains are key-shaped), smallest product
     next (a minimal grain sits just above the row count; a pair of two
     near-unique columns lands near rows squared and is analytically useless
-    even when technically unique). Before the cut, pairs that share a column
-    with an already-kept pair and score within ``_COMPOSITE_REDUNDANCY_RATIO``
-    of it are dropped as the same hypothesis tried with different filler, so
-    the cap is spent on genuinely distinct candidates rather than several
-    near-identical pairs anchored on one popular column. Bounded to
-    ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a pair is
-    proven when its exact combination count equals the row count. Adapters
-    without ``distinct_combination_counts`` degrade to no composite keys.
+    even when technically unique).
+
+    A pair sharing a column with a better-ranked one at a product within
+    ``_COMPOSITE_REDUNDANCY_RATIO`` of it is the same hypothesis tried with
+    different filler, so it goes behind every pair that is not. **Behind, not
+    away.** That preference is only worth anything while the cap binds, and
+    discarding a ranked candidate with slots still free buys nothing and can
+    cost the grain outright: on a fact table the pair a two-id parent pair
+    blocks is exactly the parent-plus-line grain, which is the one shape this
+    probe exists to find. So the cap is filled from the preferred pairs first
+    and the demoted ones after, and the survivors go back into rank order.
+
+    Bounded to ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a
+    pair is proven when its exact combination count equals the row count.
+    Proven pairs come back smallest product first, which is the minimal grain
+    among them: once a pair is proven, id-shapedness has nothing left to say,
+    and a superkey of two id columns that happen to be unique together must not
+    outrank the tighter key, because callers read the first entry as the grain.
+    Adapters without ``distinct_combination_counts`` degrade to no composite
+    keys, and one that narrows the probe to what its budget covers leaves the
+    pairs it dropped simply unproven.
     """
 
     if not row_count:
@@ -1031,22 +1045,30 @@ def _probe_composite_keys(
         return []
 
     ranked.sort()
-    deduped: list[tuple[int, int, tuple[str, str]]] = []
+    preferred: list[tuple[int, int, tuple[str, str]]] = []
+    demoted: list[tuple[int, int, tuple[str, str]]] = []
     best_product_for: dict[str, int] = {}
-    for ids, product, pair in ranked:
+    for entry in ranked:
+        _ids, product, pair = entry
         if any(
             col in best_product_for
             and product <= best_product_for[col] * _COMPOSITE_REDUNDANCY_RATIO
             for col in pair
         ):
-            continue  # near-duplicate: same anchor, interchangeable filler
-        deduped.append((ids, product, pair))
+            demoted.append(entry)  # same anchor, interchangeable filler
+            continue
+        preferred.append(entry)
         for col in pair:
             best_product_for.setdefault(col, product)
 
-    chosen = [list(pair) for _ids, _product, pair in deduped[:_COMPOSITE_PAIR_CAP]]
-    exact = combo_counts(identifier, chosen)
-    return [combo for combo in chosen if exact.get(tuple(combo)) == row_count]
+    selected = sorted((preferred + demoted)[:_COMPOSITE_PAIR_CAP])
+    exact = combo_counts(identifier, [list(pair) for _ids, _product, pair in selected])
+    proven = sorted(
+        (product, pair)
+        for _ids, product, pair in selected
+        if exact.get(pair) == row_count
+    )
+    return [list(pair) for _product, pair in proven]
 
 
 def _probe_value_domains(

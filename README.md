@@ -30,7 +30,8 @@ Run these commands **inside Claude Code** one at a time
 
 Update later with `/plugin marketplace update exmergo`. The skills appear as
 `/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
-intent.
+intent. Ask it to warm dex once after installing, so the first real command does
+not wait for the engine to install (see [Prerequisite: `uv`](#prerequisite-uv)).
 
 ## `dex`: the agent-native analytics engineering toolkit
 
@@ -142,6 +143,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 supplies the Python and the engine, with the connector extra chosen for you at
 runtime.
 
+The first command in a fresh environment pays for that install, which is tens of
+seconds on a cold `uv` cache. `--warm` pays it up front instead: it materializes
+the environment, prints what it installed, and exits without running anything.
+```
+uv run --no-project --script <skill>/scripts/run.py --warm
+```
+Run it as a container build step or a CI setup step, or ask your agent to warm dex
+once after installing. Add `--connector snowflake` (or any other connector) to warm
+a warehouse before there is a project to read the choice from.
+
 ## Benchmarks
 
 We run `dex` on two public analytics-engineering benchmarks. Every run's raw
@@ -197,12 +208,13 @@ it is better than the one a point below it.
 
 ## Connectors
 
-- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first).
+- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first), **ClickHouse Cloud**.
 - Self-hosted analytical: **ClickHouse**.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
-<img width="1162" height="225" alt="image" src="https://github.com/user-attachments/assets/32d2311b-b85e-41a5-8431-4edb1f928346" />
+<img width="1093" height="189" alt="Screenshot 2026-08-31 at 14 01 15" src="https://github.com/user-attachments/assets/ea738a4c-f6f6-4061-9bc6-d9743c2dc7a7" />
+
 
 Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake
@@ -215,10 +227,13 @@ environment, or a dbt profile, ClickHouse through `CLICKHOUSE_URL`, the
 `CLICKHOUSE_*` environment, or a dbt profile. Every scan is estimated and
 confirmed before it spends, capped server-side (`maximum_bytes_billed` on
 BigQuery; a per-statement statement timeout on Snowflake, Databricks, Redshift,
-and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse,
-whose budgets are warehouse-seconds with credits or DBUs alongside,
-compute-seconds with RPU-hours alongside, and database-seconds for the last
-two), and recorded in a local spend ledger.
+and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse).
+Budgets are bytes on BigQuery, warehouse-seconds with credits or DBUs alongside
+on Snowflake and Databricks, compute-seconds with RPU-hours alongside on
+Redshift, and database-seconds on Postgres and self-hosted ClickHouse.
+ClickHouse Cloud uses compute-seconds with live allocated memory translating to
+approximate compute-unit-hours and optional USD. All settled spend is recorded
+in a local ledger.
 
 The two self-hosted connectors bill no dollars, and dex still gates them: an
 unbounded scan on a production Postgres primary or a shared ClickHouse cluster
@@ -226,7 +241,7 @@ is a real cost even when nothing appears on an invoice.
 
 ### Upcoming Connectors
 
-- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**, **ClickHouse Cloud**
+- Cloud warehouse: **Trino**, **Azure Synapse**, **Microsoft Fabric**
 
 ## The `exmergo-dex-core` package
 

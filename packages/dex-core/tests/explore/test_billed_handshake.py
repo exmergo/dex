@@ -810,7 +810,10 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     # resolver's exact d_i == nd_i) leaves the composite-key probe
     # un-short-circuited, and every filler column is domain-eligible, so
     # every escalation this fixture's estimate reserved for actually runs and
-    # gets charged: 2 tables x (exact-distinct + combination) = 4 charges,
+    # gets charged: 2 tables x (exact-distinct + combination) = 4 charges. The
+    # combination charge is per statement, not per pair, so filling the probe's
+    # cap widens the statement without changing the arithmetic below;
+    # a connector charging per pair would not be safe to count this way.
     # plus 3 value-domain probes (customers.plan_tier, orders.customer_id,
     # orders.total) = 7 charges x ~10 MB =~ 73 MB profiling, which alone
     # already leaves no room for the two-table verify probe's 20 MB floor.
