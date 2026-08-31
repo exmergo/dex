@@ -9,7 +9,94 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`dex --help` now orients a stranger instead of dumping bare flags and
+  subcommand names** ([#296]). The top-level help carried a throwaway
+  one-line description, a subcommand list with help text on `demo` alone,
+  and ten undocumented flags: none of it said what Explore, Transform, and
+  Maintain do, how to point dex at data, or what to run first against an
+  unfamiliar warehouse, which is exactly what the CLI's first-ever caller
+  needs answered.
+
+  The description now names the three verbs, every group carries its own
+  one-line help text in the subcommand listing, and an epilog covers
+  pointing dex at data and the one command to run first (`dex demo` with
+  no warehouse, `dex explore map` with one). A bare `dex` used to fail with
+  argparse's "the following arguments are required: group"; it now prints
+  the same orientation and exits 0, since a stranger's first keystroke
+  should not spend itself on an error about an argument they do not know
+  exists yet.
+  
 ### Added
+
+- **`explore inventory --rank` caps its payload by default** ([#289]). Ranking
+  worked correctly, every object carried a populated `rank_score` sorted
+  descending, but nothing capped how many came back: against a 2,356-model
+  project a single call returned all 3,493 objects in a 464.7 KB payload,
+  and every real invocation observed in an agent benchmark run got piped
+  through `head` by the caller before being read. `--rank` now defaults to
+  the top 30 by score; `--limit N` widens it, `--all` lifts the cap
+  entirely (today's behavior), and both are no-ops without `--rank`, since
+  the unranked list carries no order to cut a shortlist from. Elided
+  objects are counted in `elided_object_count` and named in a note, the
+  same cap-and-count convention `explore map` already uses.
+
+  A ranked call also now states its basis in `notes`: size, naming
+  convention, and shape feed the score, and connectivity does not, because
+  inventory runs no relationship pass (`explore map`'s rank does include
+  it). Per-object one-line rank justifications were part of the original
+  proposal but are deferred: they need `rank()` to expose per-signal
+  contributions rather than only the final score, which is new design work
+  the capping fix does not need.
+
+- **A cross-skill, externally authored triggering corpus for the Tier-2 eval
+  harness** ([#216]). Each skill's own `evals.json` `positive`/`negative` list
+  is written by whoever wrote the description it tests, at the same time,
+  and checked with every other skill disabled; neither weakness is visible
+  from inside that suite. `evals/corpus/ade_bench_triggering.json` sources 30
+  real analytics-engineering requests from
+  [dbt-labs/ade-bench](https://github.com/dbt-labs/ade-bench) (Apache-2.0),
+  hand-labeled with the skill each should fire (or `none`), and run with
+  every skill available at once, one live call per prompt rather than one
+  per prompt-per-skill.
+
+  `python -m evals --corpus evals/corpus/ade_bench_triggering.json` reports
+  per-skill precision and recall plus which cases missed, and always exits
+  0: it is a measurement against externally authored prompts, not a release
+  gate, since the initial pass rate is expected to be low and that is the
+  signal the corpus exists to produce.
+
+- **`maintain schema` detects a model added, removed, or content-changed
+  since the baseline** ([#164]). The transform layer's fingerprint (model
+  names, per-file content hashes) was captured on every snapshot and
+  reported back as `file_count`/`model_count`/`source_count`, but nothing
+  ever diffed it: a model added to the project, removed, rewired to a
+  different `ref()`/`source()`, or edited in place all raised zero drift.
+  Only a warehouse table left orphaned by the change was ever caught
+  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
+  existing `definition_added`/`_removed`/`_changed`, closes that gap with
+  `model_added`, `model_removed`, and `model_changed` findings, folded into
+  the existing `schema` axis rather than a new one of its own (it already
+  loads the project's transform layer for `orphan_relation`).
+
+  `model_changed` diffs content hashes through a new `TransformLayer.
+  model_paths` (model name to the one file that builds it), so it also
+  catches a rewired `ref()`/`source()` call without a second comparison:
+  rewiring one changes the file's text, and so its hash. A baseline pinned
+  before this field existed has an empty `model_paths`, and a model missing
+  from it is skipped for the content comparison rather than reported
+  changed.
+
+  Reconcile treats `model_*` findings the same way it already treats a
+  semantic `definition_*` finding: the project's own edit, not a
+  warehouse-side problem to fix, so no proposal is generated, just a nudge
+  to re-run `maintain snapshot` if the change is intended.
+
+  This reverses a previously deliberate, tested design decision (a
+  regression test locked in "no detector diffs the model list" as intended
+  behavior); that test now pins the opposite, and the reasoning for both is
+  recorded on it and on `transform_drift` itself.
 
 - **ClickHouse Cloud is now a first-class guarded deployment** ([#312]).
   `clickhouse.deployment: cloud` selects `compute_time`, corroborates
@@ -28,6 +115,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   rotation, local execution, and bounded teardown.
 
 ### Fixed
+
+- **`transform` skill docs claimed BigQuery has no upfront `transform build`
+  estimate** ([#322]). dbt itself has no dry-run, but the engine compiles the
+  project and dry-runs each node itself, so the first unconfirmed
+  `transform build --target dev` call already returns `needs_confirmation`
+  with `estimated_bytes` and a `per_table_bytes` breakdown, the same shape
+  the scanning `explore` commands use. The doc told an agent to skip that
+  free, immediate estimate and ask a human for a budget figure instead,
+  while the same sentence forbade inventing one, two halves of one
+  instruction that could not both be followed. Corrected to read the
+  reported estimate (`per_table_bytes` names which node drives the cost)
+  and confirm with a budget grounded in it. Checked every sibling
+  connector's wording for the same drift; none repeats it, since their
+  "no dry-run" statements are about the warehouse itself, a true and
+  different claim from this one
+  about the engine's own compile-time estimate.
 
 - **Redshift: `explore map` and `explore profile` died on any table with a
   `TIMESTAMPTZ` column, and on any slash-date string column.** Two spellings in
@@ -70,6 +173,52 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   The stream is now resolved when a line is written, and the write is
   best-effort. A diagnostic that narrates work already done, and on a metered
   connector already paid for, is never worth failing that work over.
+
+- **A fact table's parent-plus-line grain was discarded before it could be
+  probed, and the probe spent its budget on a pair that could not be a key**
+  ([#377]). The composite-key probe ranks candidate pairs and then removed any
+  pair sharing a column with a better-ranked one at a similar distinct-count
+  product, as the same hypothesis with different filler. On a fact table it is
+  not: a pair of two id-shaped columns sorts first, claims both its anchors, and
+  every pair reusing either is dropped, including the parent-plus-line pair that
+  is the grain. Measured on BigQuery over a six-row order-items table, dex probed
+  `(customer_id, order_id)` and `(amount, line_number)`, proved neither, left
+  three of five probe slots unused, and reported `composite_keys: []` with the
+  note `no candidate key detected; grain unknown`. The pair it never asked about
+  was the key. This is the successor to #168: raising the cap from three to five
+  did not help, because the removal happens before the cap applies.
+
+  **The redundancy rule now orders candidates instead of removing them.** A
+  near-duplicate pair goes behind every pair that is not one, and the cap is
+  filled from the preferred pairs first and the demoted ones after. The rule was
+  worth keeping, since spending a scarce cap on genuinely different hypotheses is
+  right, but it can only earn that while the cap binds; with slots free, dropping
+  a ranked candidate saves nothing and can cost the grain outright. The cap stays
+  at five and remains the spend guard. The ranking is unchanged: ranking by
+  closeness to the row count instead, which the report also proposed, would put a
+  real two-id grain last rather than first, trading one systematic failure for
+  another.
+
+  Proven pairs now come back smallest product first. Filling the cap makes two
+  proven composites on one table reachable where only one was ever probed before,
+  and `detect_grain`, `explore summary` and the cumulative-metric picker all read
+  the first entry as the grain, so a superkey of two id columns that happen to be
+  unique together must not outrank the tighter key.
+
+- **A metered composite-key probe that the budget could not fully cover gave up
+  the grain instead of narrowing** ([#377]). Every combination is another scan,
+  so the charge scales with how many pairs ride along, and the gate was
+  all-or-nothing: a budget covering four pairs of five bought none of them and
+  the table took `composite-key probe skipped`. The pairs arrive best-ranked
+  first, so that threw away the part most likely to hold the grain for no saving.
+  The probe now spends on the longest affordable prefix and says which pairs went
+  unasked, and skips outright only when it cannot afford one. The search, both
+  notes, and the reasoning live in `adapters.base` rather than in each of the six
+  metered connectors. On BigQuery, where the charge is per statement rather than
+  per pair and floors at the per-query minimum, a probe already priced at that
+  floor and still refused stops the search instead of re-pricing prefixes that
+  cannot cost less.
+
 
 ## [1.9.0] - 2026-08-27
 
@@ -391,37 +540,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   PII, and the refusal names the dimension and suggests a non-PII one.
 
 ### Added
-
-- **`maintain schema` detects a model added, removed, or content-changed
-  since the baseline** ([#164]). The transform layer's fingerprint (model
-  names, per-file content hashes) was captured on every snapshot and
-  reported back as `file_count`/`model_count`/`source_count`, but nothing
-  ever diffed it: a model added to the project, removed, rewired to a
-  different `ref()`/`source()`, or edited in place all raised zero drift.
-  Only a warehouse table left orphaned by the change was ever caught
-  ([#113] / PR #146). `transform_drift`, symmetric with the semantic axis's
-  existing `definition_added`/`_removed`/`_changed`, closes that gap with
-  `model_added`, `model_removed`, and `model_changed` findings, folded into
-  the existing `schema` axis rather than a new one of its own (it already
-  loads the project's transform layer for `orphan_relation`).
-
-  `model_changed` diffs content hashes through a new `TransformLayer.
-  model_paths` (model name to the one file that builds it), so it also
-  catches a rewired `ref()`/`source()` call without a second comparison:
-  rewiring one changes the file's text, and so its hash. A baseline pinned
-  before this field existed has an empty `model_paths`, and a model missing
-  from it is skipped for the content comparison rather than reported
-  changed.
-
-  Reconcile treats `model_*` findings the same way it already treats a
-  semantic `definition_*` finding: the project's own edit, not a
-  warehouse-side problem to fix, so no proposal is generated, just a nudge
-  to re-run `maintain snapshot` if the change is intended.
-
-  This reverses a previously deliberate, tested design decision (a
-  regression test locked in "no detector diffs the model list" as intended
-  behavior); that test now pins the opposite, and the reasoning for both is
-  recorded on it and on `transform_drift` itself.
 
 - **`explore semantic list` is capped, searchable, and accounts for what it left
   out** ([#362]). It was the one explore command that budgeted nothing: every

@@ -254,6 +254,35 @@ def composite_grain_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def parent_line_grain_duckdb(tmp_path: Path) -> Path:
+    """The fact-table shape whose grain the pair probe used to discard: a
+    parent-plus-line key sitting beside a second id column that pairs with the
+    parent at a higher distinct-count product.
+
+    Six rows, distinct counts 4 / 2 / 3 / 4, no column unique on its own, and
+    ``(order_id, line_number)`` the only pair whose combinations cover every
+    row. ``(order_id, customer_id)`` is the decoy: two id-shaped columns, so it
+    ranks first, while ``customer_id`` is functionally determined by
+    ``order_id`` and the pair can never be a key.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "parent_line.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(
+        "CREATE TABLE order_items (order_id INTEGER, line_number INTEGER, "
+        "customer_id INTEGER, amount DOUBLE)"
+    )
+    conn.execute(
+        "INSERT INTO order_items VALUES "
+        "(1, 1, 10, 5.0), (1, 2, 10, 5.0), (2, 1, 20, 7.0), "
+        "(2, 2, 20, 8.0), (3, 1, 30, 9.0), (4, 1, 30, 9.0)"
+    )
+    conn.close()
+    return path
+
+
+@pytest.fixture
 def f1_duckdb(tmp_path: Path) -> Path:
     """A camelCase star schema: parents key on <entity>Id (not `id`), and the
     fact table's foreign keys use the same camelCase names."""
