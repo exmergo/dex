@@ -183,6 +183,10 @@ _EPILOG = """\
 Point it at data with --connector/--path, or commit a connector: block to
 .dex/config.yml (found by walking up from the working directory).
 
+DBT_PROFILES_DIR only locates dbt profiles.yml for dbt operations and the
+last-resort credential fallback; it does not select dex's connector or override
+--connector/--path or .dex/config.yml.
+
 No warehouse yet: `dex demo` seeds a local one, no credentials needed.
 Have one already: `dex explore map` is the command to run first -- it
 ranks what matters, profiles it, and infers how the tables join.
@@ -683,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     # reason the paradigm is: `close()` drops the adapter the gate hangs off,
     # and it runs before the handlers below.
     spend: dict | None = None
+    connection = env.Connection()
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -720,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
             # number about it.
             with contextlib.suppress(Exception):
                 spend = engine.settled_spend()
+            connection = engine.connection_provenance()
             engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
@@ -761,6 +767,10 @@ def main(argv: list[str] | None = None) -> int:
     # `free_local`, which is DuckDB's answer and not a way to say nothing.
     if envelope.cost.paradigm is None and paradigm is not None:
         envelope.cost.paradigm = paradigm
+
+    # The connection identity is stamped centrally, just like cost paradigm:
+    # handlers cannot drift, and filling it performs no extra warehouse read.
+    envelope.connection = connection
 
     env.emit(envelope)
     return 0 if envelope.status != env.Status.ERROR else 1

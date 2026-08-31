@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any
 from . import command_args, connect
 from .config import CacheConfig, DexConfig, ProjectConfig, load_config
 from .connect import ConnectionSource, SemanticSource
-from .envelope import Paradigm
+from .envelope import Connection, Paradigm
 from .errors import RepoRootRequiredError, StoreRequiredError
 from .results import ConnectResult
 from .storage import ExploreStore, MemoryStore, Store, StoreContext, build_store
@@ -181,6 +181,7 @@ class DexEngine:
         # the one that happened to trigger it (`_adapter` may be called once and
         # cached, with later commands in the same process never re-resolving).
         self.connection_warnings: list[str] = []
+        self._directory_inferred_connection = False
         self.scopes = scopes
         self.project = project
         self.datasets = datasets
@@ -380,6 +381,7 @@ class DexEngine:
                 found = candidates[0]
                 self.connector = "duckdb"
                 self.path = str(found)
+                self._directory_inferred_connection = True
                 self.connection_warnings.append(
                     f"no connector configured; using the one DuckDB file in "
                     f"this directory ({found.name}) since nothing else named a "
@@ -422,6 +424,148 @@ class DexEngine:
         return connect.paradigm_for(
             self.connector or self.config.connector, self.config
         )
+
+    def connection_provenance(self) -> Connection:
+        """Return the compact, non-secret connection identity for an envelope.
+
+        This is deliberately observational: it reads the adapter and config
+        already resolved by the command and never opens a connection or runs an
+        extra metadata query merely to fill provenance.
+        """
+
+        adapter = self._adapter_instance
+        connector = (
+            getattr(adapter, "name", None)
+            or self.connector
+            or (self.config.connector if self._declared is not None else None)
+        )
+        if connector is None:
+            return Connection()
+
+        target = self._connection_target(connector, adapter)
+        if self._directory_inferred_connection:
+            source = "directory-local inference"
+        elif any(
+            value is not None
+            for value in (
+                self.connector,
+                self.path,
+                self.project,
+                self.datasets,
+                self.scopes,
+            )
+        ):
+            source = "flag"
+        elif self.connection is not None:
+            source = "host-supplied connection"
+        else:
+            source = self._ambient_target_source(connector, adapter)
+            if source is None and self._declared is not None:
+                source = ".dex/config.yml"
+
+        return Connection(connector=connector, target=target, source=source)
+
+    def _ambient_target_source(self, connector: str, adapter: Any) -> str | None:
+        """Name discovery only when ambient state supplied the target itself."""
+
+        if adapter is None:
+            return None
+        configured = {
+            "bigquery": lambda t: bool(t and t.project),
+            "snowflake": lambda t: bool(t and (t.account or t.connection_name)),
+            "databricks": lambda t: bool(t and (t.host or t.profile)),
+            "postgres": lambda t: bool(t and (t.service or t.host or t.dbname)),
+            "redshift": lambda t: bool(
+                t and (t.workgroup or t.cluster_identifier or t.host or t.dbname)
+            ),
+            "clickhouse": lambda t: bool(t and (t.host or t.database)),
+        }
+        target = getattr(self.config, connector, None)
+        if configured.get(connector, lambda _t: False)(target):
+            return None
+
+        method = str(getattr(adapter, "auth_method", ""))
+        origin = method.split(":", 1)[0]
+        if origin in {"environment", "database_url"}:
+            return "environment variable"
+        if origin == "dbt_profile":
+            return "dbt profiles.yml"
+
+        # BigQuery carries principal type rather than auth_method. Its billing
+        # project may come directly from these two documented environment vars.
+        if connector == "bigquery":
+            import os
+
+            if os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get(
+                "GCLOUD_PROJECT"
+            ):
+                return "environment variable"
+        return None
+
+    def _connection_target(self, connector: str, adapter: Any) -> dict[str, Any]:
+        """Render only non-secret coordinates, omitting unknown empty fields."""
+
+        configured = getattr(self.config, connector, None)
+
+        def compact(**values: Any) -> dict[str, Any]:
+            return {
+                key: value
+                for key, value in values.items()
+                if value is not None and value != [] and value != ""
+            }
+
+        if connector == "duckdb":
+            path = getattr(adapter, "path", None) or self.path
+            if path is None and configured is not None:
+                raw = Path(configured.path)
+                path = str(
+                    raw
+                    if raw.is_absolute() or self.repo_root is None
+                    else Path(self.repo_root) / raw
+                )
+            if path is not None:
+                path = str(Path(path).resolve())
+            return compact(path=path)
+        if connector == "bigquery":
+            return compact(
+                project=getattr(adapter, "project", None)
+                or self.project
+                or getattr(configured, "project", None),
+                datasets=self.datasets
+                or self.scopes
+                or getattr(configured, "datasets", None),
+            )
+        if connector == "snowflake":
+            return compact(
+                account=getattr(adapter, "account", None)
+                or getattr(configured, "account", None),
+                warehouse=getattr(configured, "warehouse", None),
+                databases=self.scopes or getattr(configured, "databases", None),
+            )
+        if connector == "databricks":
+            return compact(
+                host=getattr(adapter, "host", None)
+                or getattr(configured, "host", None),
+                warehouse=getattr(configured, "warehouse", None),
+                catalogs=self.scopes or getattr(configured, "catalogs", None),
+            )
+        if connector in {"postgres", "redshift"}:
+            return compact(
+                host=getattr(configured, "host", None),
+                database=getattr(adapter, "_database", None)
+                or getattr(configured, "dbname", None),
+                schemas=self.scopes or getattr(configured, "schemas", None),
+                workgroup=getattr(configured, "workgroup", None),
+                cluster=getattr(configured, "cluster_identifier", None),
+            )
+        if connector == "clickhouse":
+            return compact(
+                host=getattr(configured, "host", None),
+                database=getattr(adapter, "_database", None)
+                or getattr(configured, "database", None),
+                databases=self.scopes or getattr(configured, "databases", None),
+            )
+        return {}
 
     def settled_spend(self) -> dict | None:
         """What the command that just ran actually billed, settled and read

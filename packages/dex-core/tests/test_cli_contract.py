@@ -72,6 +72,7 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
     assert set(payload) == {
         "status",
         "data",
+        "connection",
         "cost",
         "warnings",
         "diffs",
@@ -95,6 +96,11 @@ def test_connect_test_against_duckdb_is_ok(duckdb_file: Path, capsys):
     assert rc == 0
     assert payload["status"] == "ok"
     assert payload["data"]["read_only"] is True
+    assert payload["connection"] == {
+        "connector": "duckdb",
+        "target": {"path": str(duckdb_file)},
+        "source": "flag",
+    }
 
 
 @pytest.mark.parametrize(
@@ -119,6 +125,36 @@ def test_connect_test_without_path_is_clean_error(capsys, tmp_path):
     assert rc == 1
     assert payload["status"] == "error"
     assert payload["errors"]
+    assert "DBT_PROFILES_DIR" in payload["errors"][0]
+
+
+def test_help_says_dbt_profiles_dir_does_not_select_the_connection(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "DBT_PROFILES_DIR only locates dbt profiles.yml" in help_text
+    assert "does not select dex's connector" in help_text
+
+
+def test_committed_duckdb_target_reports_config_source(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    from exmergo_dex_core.config import DexConfig, DuckDBTarget, save_config
+
+    target = duckdb_file
+    save_config(
+        DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=target.name)),
+        tmp_path,
+    )
+
+    assert main(["--repo-root", str(tmp_path), "connect", "test"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["connection"] == {
+        "connector": "duckdb",
+        "target": {"path": str(target)},
+        "source": ".dex/config.yml",
+    }
 
 
 def test_a_lone_duckdb_file_in_the_run_directory_is_used_and_warned_in_the_envelope(
@@ -140,6 +176,11 @@ def test_a_lone_duckdb_file_in_the_run_directory_is_used_and_warned_in_the_envel
     assert payload["status"] == "ok"
     assert any("lone.duckdb" in w for w in payload["warnings"])
     assert payload["cost"]["paradigm"] == "free_local"
+    assert payload["connection"] == {
+        "connector": "duckdb",
+        "target": {"path": str(lone)},
+        "source": "directory-local inference",
+    }
 
 
 @pytest.mark.parametrize(
