@@ -30,7 +30,8 @@ Run these commands **inside Claude Code** one at a time
 
 Update later with `/plugin marketplace update exmergo`. The skills appear as
 `/dex:explore`, `/dex:transform`, and `/dex:maintain` and auto-trigger on matching
-intent.
+intent. Ask it to warm dex once after installing, so the first real command does
+not wait for the engine to install (see [Prerequisite: `uv`](#prerequisite-uv)).
 
 ## `dex`: the agent-native analytics engineering toolkit
 
@@ -142,6 +143,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 supplies the Python and the engine, with the connector extra chosen for you at
 runtime.
 
+The first command in a fresh environment pays for that install, which is tens of
+seconds on a cold `uv` cache. `--warm` pays it up front instead: it materializes
+the environment, prints what it installed, and exits without running anything.
+```
+uv run --no-project --script <skill>/scripts/run.py --warm
+```
+Run it as a container build step or a CI setup step, or ask your agent to warm dex
+once after installing. Add `--connector snowflake` (or any other connector) to warm
+a warehouse before there is a project to read the choice from.
+
 ## Benchmarks
 
 We run `dex` on two public analytics-engineering benchmarks. Every run's raw
@@ -202,7 +213,8 @@ it is better than the one a point below it.
 - Embedded analytical: **DuckDB**.
 - Operational database: **Postgres**.
 
-<img width="1162" height="225" alt="image" src="https://github.com/user-attachments/assets/32d2311b-b85e-41a5-8431-4edb1f928346" />
+<img width="1093" height="189" alt="Screenshot 2026-08-31 at 14 01 15" src="https://github.com/user-attachments/assets/ea738a4c-f6f6-4061-9bc6-d9743c2dc7a7" />
+
 
 Credentials are discovered, never asked for: BigQuery through Application
 Default Credentials (`gcloud auth application-default login`), Snowflake

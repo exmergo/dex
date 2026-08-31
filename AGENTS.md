@@ -28,7 +28,9 @@ single JSON envelope it prints to stdout, decide the next step. State persists i
 ```bash
 uv run python -m exmergo_dex_core <subcommand> [flags]
 # or, with the pinned wrapper a skill ships:
-uv run scripts/run.py <subcommand> [flags]
+uv run --no-project --script scripts/run.py <subcommand> [flags]
+# and once, ahead of the first command, to pay the engine's install out of band:
+uv run --no-project --script scripts/run.py --warm
 ```
 
 Both forms need [`uv`](https://docs.astral.sh/uv/) on `PATH`: it is what installs
@@ -45,11 +47,16 @@ for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
 only the engine version and selects that extra for you at runtime from the active
 connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
 found by walking up from the run directory to the git root, then DuckDB), so a
-release is connector-neutral. The engine resolves the same way but does not default
-silently: with no `.dex/config.yml` anywhere up the tree and no explicit
-`--connector`/`--path`, it refuses and names the fix rather than reading a phantom
-DuckDB target, so a command run from a subdirectory of your project resolves the
-project's real config instead of a wrong default.
+release is connector-neutral. `--warm` resolves that extra the same way and
+installs it without running a command, so a container build, a CI setup step, or
+the first thing you do after installing can pay a cold install once instead of
+leaving it on an interactive caller's clock. `--warm --connector snowflake` warms a
+named warehouse before a project exists to name it, and `--warm explore cluster`
+warms what that command adds on top of the connector. The engine resolves the same
+way but does not default silently: with no `.dex/config.yml` anywhere up the tree
+and no explicit `--connector`/`--path`, it refuses and names the fix rather than
+reading a phantom DuckDB target, so a command run from a subdirectory of your
+project resolves the project's real config instead of a wrong default.
 
 With no warehouse to point at yet, `demo` generates one and writes the config for
 it, so `demo` then `explore map` is a working first run on a machine with no

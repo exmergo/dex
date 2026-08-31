@@ -90,6 +90,30 @@ def test_the_extras_follow_the_command(wrapper, argv, expected):
     assert wrapper._feature_extras(argv) == expected
 
 
+def test_the_extras_are_the_connector_plus_whatever_the_command_needs(
+    wrapper, tmp_path, monkeypatch
+):
+    """`_extras` is the one seam a real run and `--warm` share.
+
+    Warming an environment that disagrees with the one the next command resolves
+    would leave the cold install exactly where it was, so the two must not have
+    separate answers to compare."""
+
+    # An empty directory, so nothing but the argv decides: `_extras` reads the
+    # cwd for a `.dex/config.yml` the way the engine does.
+    monkeypatch.chdir(tmp_path)
+
+    assert wrapper._extras(["explore", "inventory"]) == ["duckdb"]
+    assert wrapper._extras(["explore", "cluster", "orders"]) == ["duckdb", "cluster"]
+    assert wrapper._extras(["--connector", "bigquery", "maintain", "check"]) == [
+        "bigquery"
+    ]
+    assert wrapper._extras(["--connector", "snowflake", "explore", "cluster", "o"]) == [
+        "snowflake",
+        "cluster",
+    ]
+
+
 def test_a_flag_value_is_never_read_as_the_mode(wrapper):
     """The peek has to consume value-taking flags, or `--metric query` reads as
     `explore semantic query` and installs MetricFlow for a catalog read. Worse in
