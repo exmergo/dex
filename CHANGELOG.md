@@ -9,6 +9,38 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`maintain grain` reported `high` severity on relations too small for
+  uniqueness to mean anything.** ([#280]) One `maintain check` produced six
+  high-severity grain findings on a real project, all six artifacts of the
+  data's shape and none a defect: three on a 4-row table's boolean and status
+  columns (only ever unique because the table once held 2 rows), two on a
+  change-data-capture changelog whose repeated identifiers are the entire
+  design, and one on a composite nobody declared. High severity is the signal
+  a triager reads first; six false highs per run trains people to skim the
+  axis most likely to carry a real defect.
+
+  A lost-uniqueness finding (`key_lost_uniqueness` / `declared_grain_not_unique`)
+  is now damped to `low` rather than `high` below `maintain.grain_min_rows`
+  rows (default 100, new in `.dex/config.yml`): on a handful of rows, losing
+  uniqueness means the least, and a 4-row table's boolean column "loses" a
+  uniqueness it never meaningfully had once a fifth row repeats a value.
+  Damped, never dropped: the finding still reports, just not at the severity
+  that trains a triager to stop reading, and the damping is named in the
+  finding's own `data` (`severity_floor_applied`, `grain_min_rows`) and prose
+  rather than being silent. The floor applies uniformly to all three sites
+  that emit a uniqueness-regression finding (the single-key, composite, and
+  declared-composite checks), and not to `join_orphans_increased`, which
+  already grades its own severity from the measured orphan fraction.
+
+  The issue's other two proposed damping rules (never `high` on a
+  boolean-shaped 2-value column regardless of row count; judge an
+  append-only/changelog relation against its declared dedup key rather than
+  every candidate key) are deferred: the issue itself frames the three rules
+  as independent, and the row-count floor alone satisfies every acceptance
+  criterion.
+
 ## [1.9.1] - 2026-08-31
 
 ### Changed

@@ -303,6 +303,22 @@ class ClusterLimits(BaseModel):
     timeout_seconds: float = 60.0
 
 
+class MaintainConfig(BaseModel):
+    """Tuning for `maintain`'s detectors.
+
+    ``grain_min_rows``: below this row count, a lost-uniqueness finding
+    (``key_lost_uniqueness`` / ``declared_grain_not_unique``) is damped to
+    ``low`` rather than reported at ``high`` (issue #280). A handful of rows
+    is exactly the shape where losing uniqueness means the least: a 4-row
+    table with a boolean column "loses" a uniqueness it never meaningfully
+    had once a fifth row repeats a value. The finding is never dropped, only
+    downgraded, and the damping is named in the finding's own `data` so
+    nothing about the run is silent.
+    """
+
+    grain_min_rows: int = 100
+
+
 class PIIOverride(BaseModel):
     """One reviewed column, or a reviewed *class* of structurally identical
     columns, the team has decided is not PII.
@@ -672,6 +688,7 @@ class DexConfig(BaseModel):
     entity_affixes: EntityAffixes = Field(default_factory=EntityAffixes)
     query: QueryLimits = Field(default_factory=QueryLimits)
     cluster: ClusterLimits = Field(default_factory=ClusterLimits)
+    maintain: MaintainConfig = Field(default_factory=MaintainConfig)
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25
