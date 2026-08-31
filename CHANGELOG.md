@@ -126,7 +126,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   not the settings in play; library callers answer through
   `DexEngine(session_ceiling=...)` / `DexEngine(decline_session_ceiling=True)`,
   which refuse rather than silently do nothing when there is no config to write.
-  
+
 - **An exhausted budget is now refused by the cost gate itself, rather than by
   a check each adapter had to remember to write** ([#316]). The server-side cap
   is an integer because every connector's cap setting takes one, and on the
