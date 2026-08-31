@@ -359,13 +359,15 @@ a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
 carries, with the ceiling injected as a statement timeout through
 `PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
 
-ClickHouse: the self-hosted analytical connector. Connects through discovered
+ClickHouse: the self-hosted analytical connector and ClickHouse Cloud warehouse.
+Connects through discovered
 credentials (`CLICKHOUSE_URL`, the `CLICKHOUSE_*` environment, a committed
 non-secret target, or a dbt profile). Identifiers are two-part
 `database.table`, because ClickHouse has no catalog level and dbt-clickhouse's
-`schema:` is the ClickHouse database. Nothing is billed in dollars; the
-guarded quantity is load on a server that is usually shared, so budgets are
-**database-seconds** through the same confirm handshake. Estimates come from
+`schema:` is the ClickHouse database. Self-hosted budgets are
+**database-seconds**; Cloud budgets are **compute-seconds**, with live
+per-replica memory translating them to approximate compute-unit-hours and
+optional USD. Estimates come from
 the free, non-executing `EXPLAIN ESTIMATE`, which prices a statement after
 primary-key pruning, with a `system.tables` fallback for the relations it does
 not cover; the budget is hard-enforced anyway by a per-statement
@@ -375,9 +377,8 @@ the server's own elapsed time, so the ledger records what the server spent
 rather than what the client waited. The session sends `readonly = 2` and
 `allow_ddl = 0` on every statement, and dbt builds go to a dedicated dev
 database via dbt-clickhouse, which the `[clickhouse]` extra carries, with the
-ceiling injected through the profile's `custom_settings`. ClickHouse Cloud
-bills compute-unit-hours, which dex does not yet model, and is refused at
-connect rather than guarded in the wrong unit. See
+ceiling injected through the profile's `custom_settings`. Cloud corroborates
+`cloud_mode` and fails closed unless every replica reports its capacity. See
 [`references/clickhouse.md`](../../references/clickhouse.md).
 
 ## License

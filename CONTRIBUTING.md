@@ -236,7 +236,25 @@ DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
 scripts/setup_clickhouse_dev.sh --down
 ```
 
-There is no `setup_clickhouse_ci.sh`; there is nothing to provision.
+There is no setup script for the free container job; there is nothing to
+provision for that exhaustive path.
+
+### Narrow ClickHouse Cloud tests
+
+The repository also runs `tests/integration/test_clickhouse_cloud.py` under the
+protected `clickhouse-cloud-integration` environment. It is intentionally
+narrow: Cloud mode/capacity and control-plane agreement, confirmation and CU/USD
+translation, read-only enforcement, and one minimal dbt build. The container
+suite remains the exhaustive connector suite.
+
+One-time setup and subsequent atomic credential rotation use
+`scripts/setup_clickhouse_cloud_ci.sh`. The stable non-secret policy and all
+`dex_ci_*` names, dedicated account/service IDs, region, and real Scale-tier
+prices live in that script; flags are reserved for deliberate migration/testing.
+`scripts/clickhouse_cloud/preflight.sh` reads the exact
+service's UTC-day usage before any SQL connection can wake it and refuses at the
+protected 2-CHC limit. See `scripts/clickhouse_cloud/README.md` for setup, local
+execution, rotation, and bounded teardown.
 
 Two assertions in that suite are load-bearing and worth understanding before
 changing the seed. The seed puts exactly 40 of 5,000 `order_items` rows on
