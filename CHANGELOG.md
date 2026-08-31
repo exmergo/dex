@@ -72,7 +72,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   every candidate key) are deferred: the issue itself frames the three rules
   as independent, and the row-count floor alone satisfies every acceptance
   criterion.
-  
+
 ### Changed
 
 - **`explore query` now carries compact cache-backed column and query notes
@@ -81,7 +81,65 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   fractions, PII flags, and selected-grain coverage. Queries that group or join
   can also include `query_notes` comparing grouping keys to known grain and
   reporting verified cached join overlap. The annotations are strictly additive,
-  cache-only, and omitted when dex cannot resolve them without guessing.  
+  cache-only, and omitted when dex cannot resolve them without guessing.
+
+- **An over-ceiling refusal now says how far this connector's estimates have
+  historically run from what they actually billed** ([#278]). A transform build
+  was refused at an estimated 6.9 GB against a 5 GB ceiling. Re-run at a raised
+  ceiling, the same build billed 4.75 GB: the estimate was 45% high, and the
+  refused build would have fit comfortably inside the original ceiling.
+
+  That is systematic rather than unlucky. A BigQuery dry-run estimate on a
+  partitioned or clustered table is an upper bound by construction, which dex
+  documents, so every large build on such a warehouse over-estimates and the
+  ratio is reasonably stable per project.
+
+  The refusal itself is correct and does not move: a ceiling that confirmation
+  can override is not a ceiling. What it lacked was any basis for the decision
+  it hands back. "Raise the budget or narrow the work" is answered by a guess,
+  and the guess is made under the natural, wrong impression that the estimate
+  approximates the cost. Guess low and the command is refused again; guess high
+  and the ceiling stops meaning anything.
+
+  dex already held the answer. `.dex/spend.jsonl` records what every prior
+  command on this connector settled at, and settlements now carry the estimate
+  they were admitted on beside it, so the refusal ends with the observed ratio:
+
+  > The last 8 settled bigquery commands in this project's spend ledger billed
+  > a median 69% of estimate (range 61%-88%), so this estimate is probably an
+  > upper bound rather than the cost. The ceiling binds on the estimate and not
+  > on what settles, so admitting this command takes a budget above
+  > 6,905,293,058, at which it would be expected to bill around 4,764,652,210
+  > bytes_scanned.
+
+  The second half is not decoration: the ceiling is checked against the
+  estimate, so a caller who read only the ratio would set a budget at 69% of
+  the estimate and be refused a second time by arithmetic.
+
+  Three rules bound what the sentence may claim. It is **per connector**, never
+  pooled, so a free DuckDB history cannot calibrate a billed BigQuery refusal
+  (and one level down, a `billed_seconds` history can never divide a
+  `billed_bytes` estimate). One **command** is one data point, not one
+  statement, so a command that settled six times against one estimate is not
+  read as six commands that each billed a sixth. And with fewer than three
+  settled commands to draw on, the refusal **says it has no ratio** rather than
+  inventing one from two data points, which an operator has no way to tell
+  apart from evidence. Two kinds of run are excluded as misleading: a command
+  killed mid-flight, whose reservation stands with no release and whose
+  settlements are partial by definition, and a run that billed zero, which is a
+  cache hit the refused command will not repeat.
+
+  Reading the ledger back is a new **optional** store capability,
+  `SpendHistory` (`spend_entries`), alongside the existing optional `SpendLock`.
+  All three shipped backends implement it and `SpendHistoryContract` ships in
+  the conformance suite. A backend without it loses the sentence and nothing
+  else: no guard is narrower than it looks, so unlike a missing spend lock,
+  nothing warns. A ledger that cannot be read is swallowed for the same reason:
+  the refusal has already been decided, and trading it for a different error
+  would cost the caller the thing they need to keep the thing they merely
+  wanted. Projects upgrading into this see the no-history sentence until they
+  have settled enough new commands, since entries written before this carry no
+  estimate to compare against.
 
 - **A project is now asked once for a cumulative spend ceiling, instead of
   warned about it forever** ([#283]). With `budget.session_ceiling` unset, every
