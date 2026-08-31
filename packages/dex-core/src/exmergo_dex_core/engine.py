@@ -818,10 +818,10 @@ class DexEngine:
 
         return maintain.snapshot(self)
 
-    def check(self) -> DriftResult:
+    def check(self, objects: list[str] | None = None) -> DriftResult:
         from .maintain import commands as maintain
 
-        return maintain.check(self)
+        return maintain.check(self, objects)
 
     def schema_drift(self, objects: list[str] | None = None) -> DriftResult:
         from .maintain import commands as maintain

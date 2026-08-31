@@ -53,6 +53,38 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   best-effort. A diagnostic that narrates work already done, and on a metered
   connector already paid for, is never worth failing that work over.
 
+- **`DexEngine.check()` dropped the object scope its four sibling detectors
+  accept, and `transform place --edits-file` was accepted by the parser and
+  silently did nothing.** (#344)
+
+  The CLI and `DexEngine` are two independent surfaces over the same
+  implementation, and nothing kept them in step: `tests/test_cli_contract.py`
+  tests the CLI's envelope contract, `tests/test_engine.py` tests the engine,
+  and both stayed green while the two drifted apart. `maintain check <objects>`
+  reached the CLI and `maintain.commands.check()` already threaded `objects`
+  through, but `DexEngine.check()` hard-coded the call with no scope, unlike
+  `schema_drift`/`volume_drift`/`grain_drift`/`semantic_drift`, so a library
+  caller could not narrow a drift sweep the way a CLI caller could.
+  `DexEngine.check()` now accepts `objects` and passes it through like its
+  siblings.
+
+  Building the fix surfaced a second, CLI-only instance of the same class of
+  bug: `transform place` inherited `--edits-file` from the block meant for its
+  two neighboring propagation verbs (`rename`, `remove`), but `cmd_place` never
+  read it, so the flag parsed and did nothing. It is no longer accepted there.
+
+  A new parity test (`test_cli_contract.py`) now walks every `COMMAND_SURFACE`
+  subcommand against `DexEngine`, comparing capability rather than flag
+  spelling (the translation between the two surfaces is often deliberate: a
+  shared `argument` positional means a different keyword per subcommand, a
+  negating flag pair collapses into one tri-state parameter, a file path
+  becomes parsed content), with an explicit allowlist naming every CLI-only
+  subcommand and why (`demo` writes a file outside `DexEngine`; `transform
+  test` is scaffold-only and reachable as `test_scaffold`, not a method; `viz
+  preview` is not yet implemented). The rule that a new subcommand needs a
+  `DexEngine` method, or an allowlist entry with a reason, is now written next
+  to `COMMAND_SURFACE` in `cli.py`, where a contributor adding one will see it.
+
 ## [1.9.0] - 2026-08-27
 
 ### Changed

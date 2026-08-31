@@ -33,6 +33,16 @@ from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
 
 # The full command surface. Group -> its subcommands.
+#
+# Adding a subcommand here means adding it to `DexEngine` too (#344): the CLI is
+# a wrapper over the engine, not a parallel implementation of it, so every entry
+# below needs a `DexEngine` method offering the same capability, unless it is
+# named in `_SUBCOMMAND_PARITY`'s CLI-only allowlist with a reason (see
+# `packages/dex-core/tests/test_cli_contract.py`, the section on CLI/DexEngine
+# parity). That test fails on a subcommand with no method and on one whose
+# method cannot express something the CLI can, which is what keeps the two
+# surfaces from drifting apart the way `DexEngine.check()` once had (it dropped
+# the object-scope argument all four of its sibling detectors accept).
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": [
@@ -397,7 +407,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
-                if group == "transform" and name in {"rename", "remove", "place"}:
+                if group == "transform" and name in {"rename", "remove"}:
                     # The write half of `references`, so it sits behind the
                     # dialect gate the read half is routed around: these author
                     # SQL and need the engine that parses it.
@@ -407,7 +417,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     # removes a declaration and refuses while a read survives,
                     # and only the caller knows what a read should become); a
                     # rename accepts it so a related hand-authored change can
-                    # ride in the same atomic plan.
+                    # ride in the same atomic plan. Not `place` (#344): it takes
+                    # no edits_file parameter and never read the flag, so the
+                    # parser accepted it as a silent no-op.
                     sp.add_argument("--edits-file", default=None)
                 if group == "transform" and name == "rename":
                     sp.add_argument("kind")
