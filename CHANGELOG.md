@@ -81,6 +81,22 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   
 ### Fixed
 
+- **`transform` skill docs claimed BigQuery has no upfront `transform build`
+  estimate** ([#322]). dbt itself has no dry-run, but the engine compiles the
+  project and dry-runs each node itself, so the first unconfirmed
+  `transform build --target dev` call already returns `needs_confirmation`
+  with `estimated_bytes` and a `per_table_bytes` breakdown, the same shape
+  the scanning `explore` commands use. The doc told an agent to skip that
+  free, immediate estimate and ask a human for a budget figure instead,
+  while the same sentence forbade inventing one, two halves of one
+  instruction that could not both be followed. Corrected to read the
+  reported estimate (`per_table_bytes` names which node drives the cost)
+  and confirm with a budget grounded in it. Checked every sibling
+  connector's wording for the same drift; none repeats it, since their
+  "no dry-run" statements are about the warehouse itself, a true and
+  different claim from this one
+  about the engine's own compile-time estimate.
+
 - **Redshift: `explore map` and `explore profile` died on any table with a
   `TIMESTAMPTZ` column, and on any slash-date string column.** Two spellings in
   the generated profiling statement are refused by the Redshift server, and
@@ -122,6 +138,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   The stream is now resolved when a line is written, and the write is
   best-effort. A diagnostic that narrates work already done, and on a metered
   connector already paid for, is never worth failing that work over.
+
 
 ## [1.9.0] - 2026-08-27
 
