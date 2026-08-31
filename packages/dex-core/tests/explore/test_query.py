@@ -658,8 +658,10 @@ def test_two_statements_return_two_results(airbnb_duckdb: Path, tmp_path: Path, 
         capsys,
     )
     data = payload["data"]
+    assert data["shape"] == "columnar"
     assert data["statement_count"] == 2 and data["ok_count"] == 2
     assert [r["index"] for r in data["results"]] == [0, 1]
+    assert all(r["shape"] == "columnar" for r in data["results"])
     assert [r["cells"] for r in data["results"]] == [[[3]], [[2]]]
     assert all(r["status"] == "ok" for r in data["results"])
     # Columnar all the way down: the sanitizer's raw-row rule has to survive the
@@ -676,6 +678,7 @@ def test_a_single_statement_keeps_the_envelope_it_always_had(
     repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
     payload = _query("SELECT COUNT(*) AS n FROM RAW_HOSTS", airbnb_duckdb, repo, capsys)
     assert set(payload["data"]) == {
+        "shape",
         "columns",
         "types",
         "cells",
@@ -685,6 +688,7 @@ def test_a_single_statement_keeps_the_envelope_it_always_had(
         "profiled_on_demand",
         "notes",
     }
+    assert payload["data"]["shape"] == "columnar"
     assert payload["data"]["cells"] == [[3]]
 
 
