@@ -37,7 +37,7 @@ mistaken for a clean bill.
 ## How to drive it
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
 
 dex runs its engine through `uv`, which is a prerequisite and is not installed by
@@ -46,6 +46,16 @@ to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
 `brew install uv`, or `pipx install uv`), then re-run. Never fall back to diffing
 the warehouse against the project by hand instead: the drift axes and the baseline
 comparison live in the engine, so any other path is guesswork.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 - `maintain snapshot` captures or refreshes the baseline. Run it after a clean
   explore or transform session so later runs have a known-good reference. It pins

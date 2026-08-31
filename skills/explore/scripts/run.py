@@ -6,7 +6,8 @@
 
 The skill never re-implements logic. It forwards its arguments to the pinned
 `dex-core` engine and lets the engine print the sanitized JSON envelope. Run it
-with `uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <dex subcommand> ...`.
+with `uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <dex
+subcommand> ...`.
 
 `uv` is a hard prerequisite: it is what installs and runs the engine. When it is
 absent this wrapper refuses with an error envelope naming the install command,
@@ -20,6 +21,16 @@ Two execution modes, chosen automatically:
     wrapper work before the package is published.
   - Installed plugin: no local package is present, so the pinned PyPI release is
     installed hermetically by uv.
+
+That environment is uv's own, and `--no-project` is what keeps it that way. Without
+it uv discovers whatever Python project the caller happens to be standing in, builds
+it, writes a `.venv/` and a `uv.lock` into their repo, and puts their dependencies on
+the engine's import path: dex would be leaving unreviewed artifacts in a repo it was
+asked only to read, and running against a closure it did not pin.
+
+`--warm` materializes that environment and exits without running a command, so the
+install can be paid once out of band instead of on the first caller's clock (see
+_warm).
 
 The engine version is pinned; the *extras* are chosen at runtime, so one published
 release serves every warehouse and the default install stays light. The connector
@@ -48,6 +59,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Rewritten by scripts/prepare_release.sh to the tagged version. The connector
@@ -69,6 +81,11 @@ _KNOWN_CONNECTORS = (
     "clickhouse",
 )
 _DEFAULT_CONNECTOR = "duckdb"
+
+# The one flag the wrapper answers itself. It is stripped before anything else
+# reads the argv, so it never reaches the engine and never lands in the positionals
+# that pick the extras.
+_WARM_FLAG = "--warm"
 
 
 def _connector_from_config(config_path: Path) -> str | None:
@@ -216,54 +233,159 @@ def _engine_spec(extras: str, skill_dir: Path | None = None) -> list[str]:
     return ["--with", f"exmergo-dex-core[{extras}]=={DEX_CORE_VERSION}"]
 
 
-def main() -> int:
-    argv = sys.argv[1:]
-    if shutil.which("uv") is None:
-        # The one refusal that happens before the engine exists, so the envelope
-        # is hand-built: `exmergo_dex_core.envelope` is precisely what is not
-        # installed yet. The keys mirror Envelope/Cost and have to stay in step
-        # with them, and `prerequisite` is the engine's own classification for a
-        # missing dependency the user installs and retries (the same one
-        # DemoDependencyError and DialectDependencyError carry). A caller reads
-        # this exactly like any other refusal instead of parsing a traceback.
+def _extras(argv: list[str]) -> list[str]:
+    """The full extras list for an invocation: the connector's, plus whatever the
+    command itself needs.
+
+    Warm-up and a real run both resolve here, on the same argv, which is what stops
+    a warmed environment from disagreeing with the one the next command asks for."""
+
+    return [_resolve_connector(argv, Path.cwd()), *_feature_extras(argv)]
+
+
+def _uv_run(engine_spec: list[str], tail: list[str]) -> list[str]:
+    """The single uv invocation this wrapper makes.
+
+    `--no-project` is a correctness flag before it is a fast one: see the module
+    docstring for what uv does to the caller's repo without it. The latency follows
+    from the same thing, because installing the caller's project is far more work
+    than resolving the engine."""
+
+    return ["uv", "run", "--no-project", *engine_spec, *tail]
+
+
+def _envelope(
+    status: str,
+    *,
+    data: dict[str, object] | None = None,
+    errors: list[str] | None = None,
+    reason: str | None = None,
+) -> str:
+    """One JSON line in the engine's envelope shape, built by hand.
+
+    The wrapper prints an envelope for the few things that happen before the engine
+    exists to print its own: the missing-uv refusal and the warm-up. It cannot
+    import `exmergo_dex_core.envelope` for precisely that reason, so the keys are
+    mirrored here and have to stay in step with Envelope and Cost. `cost.paradigm`
+    stays null throughout, because nothing here opens a connection and `free_local`
+    is a positive claim that the connector in play bills nothing rather than a
+    stand-in for "no connector was involved". `reason` is populated only on an
+    error, the same rule the engine's Reason enum follows.
+    """
+
+    return json.dumps(
+        {
+            "status": status,
+            "data": data or {},
+            "cost": {"paradigm": None, "estimate": None, "ceiling": None},
+            "warnings": [],
+            "diffs": [],
+            "errors": errors or [],
+            "reason": reason,
+        }
+    )
+
+
+def _warm(argv: list[str]) -> int:
+    """Materialize the engine environment and exit, without running a command.
+
+    Nearly all of a first command's latency is uv resolving and installing the
+    engine's closure. This pays it out of band, at container build, plugin install,
+    or a CI setup step, so no interactive caller waits for it.
+
+    The extras come from `_extras` on the argv that remains after `--warm` is
+    stripped, so warm-up can never install something a later command contradicts:
+    bare `--warm` warms the connector this directory resolves to, `--warm
+    --connector snowflake` warms a named one before any project exists, and `--warm
+    explore cluster` warms exactly what that command needs. The last form earns its
+    keep because a feature extra resolves into an environment of its own, so
+    warming the connector alone leaves `explore cluster` and `explore semantic`
+    cold.
+    """
+
+    extras = _extras(argv)
+    spec = _engine_spec(",".join(extras))
+    started = time.monotonic()
+    # Captured rather than inherited: uv narrates resolution and installation, and
+    # stdout here carries one envelope and nothing else.
+    completed = subprocess.run(
+        _uv_run(spec, ["python", "-c", "import exmergo_dex_core"]),
+        capture_output=True,
+        text=True,
+    )
+    elapsed = round(time.monotonic() - started, 3)
+    if completed.returncode != 0:
+        lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
         print(
-            json.dumps(
-                {
-                    "status": "error",
-                    "data": {},
-                    "cost": {"paradigm": None, "estimate": None, "ceiling": None},
-                    "warnings": [],
-                    "diffs": [],
-                    "errors": [
-                        "dex runs its engine through uv, which was not found on "
-                        "PATH. Install it with: "
-                        "curl -LsSf https://astral.sh/uv/install.sh | sh "
-                        "(or `brew install uv`, or `pipx install uv`), then re-run."
-                    ],
-                    "reason": "prerequisite",
-                }
+            _envelope(
+                "error",
+                errors=[
+                    f"warm-up could not install {spec[1]}. uv reported: "
+                    + (" ".join(lines[-3:]) or "nothing on stderr")
+                ],
+                reason="prerequisite",
             )
         )
         return 1
-    connector = _resolve_connector(argv, Path.cwd())
+    print(
+        _envelope(
+            "ok",
+            data={
+                "engine": spec[1],
+                "connector": extras[0],
+                "extras": extras,
+                "elapsed_seconds": elapsed,
+            },
+        )
+    )
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if shutil.which("uv") is None:
+        # The one refusal that happens before the engine exists, which is why the
+        # envelope is hand-built. `prerequisite` is the engine's own classification
+        # for a missing dependency the user installs and retries (the same one
+        # DemoDependencyError and DialectDependencyError carry), so a caller reads
+        # this exactly like any other refusal instead of parsing a traceback.
+        print(
+            _envelope(
+                "error",
+                errors=[
+                    "dex runs its engine through uv, which was not found on "
+                    "PATH. Install it with: "
+                    "curl -LsSf https://astral.sh/uv/install.sh | sh "
+                    "(or `brew install uv`, or `pipx install uv`), then re-run."
+                ],
+                reason="prerequisite",
+            )
+        )
+        return 1
+    # The engine runs in uv's own ephemeral environment, so an inherited
+    # VIRTUAL_ENV (e.g. the user's activated venv) is irrelevant to both paths
+    # below and only makes uv print a mismatch warning on every call. Drop it.
+    os.environ.pop("VIRTUAL_ENV", None)
+    if _WARM_FLAG in argv:
+        return _warm([arg for arg in argv if arg != _WARM_FLAG])
     # The connector extra is always installed; `explore cluster` and
     # `explore semantic` add what only they need, so the default install stays
     # light for every repo that runs neither.
-    extras = ",".join([connector, *_feature_extras(argv)])
-    cmd = [
-        "uv",
-        "run",
-        *_engine_spec(extras),
-        "python",
-        "-m",
-        "exmergo_dex_core",
-        *argv,
-    ]
-    # The engine runs in uv's own ephemeral environment, so an inherited
-    # VIRTUAL_ENV (e.g. the user's activated venv) is irrelevant here and only
-    # makes uv print a mismatch warning on every call. Drop it.
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
-    return subprocess.call(cmd, env=env)
+    cmd = _uv_run(
+        _engine_spec(",".join(_extras(argv))),
+        ["python", "-m", "exmergo_dex_core", *argv],
+    )
+    if os.name != "posix":
+        # Windows keeps the spawn: exec there hands control back to the shell
+        # before the child finishes, and the prompt would interleave with the one
+        # envelope a caller is reading off stdout.
+        return subprocess.call(cmd)
+    # Exec rather than spawn everywhere else: the wrapper has nothing left to do
+    # once the engine starts, and replacing the process hands over the terminal,
+    # the signals, and the exit code directly instead of relaying them through a
+    # parent that is only waiting.
+    os.execvp(cmd[0], cmd)
+    return 0  # os.execvp does not return; this keeps the signature a plain int
 
 
 if __name__ == "__main__":
