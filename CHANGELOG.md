@@ -9,6 +9,38 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain verify`: is the project correct right now, with no drift
+  baseline required** ([#224], [#225]). Every existing `maintain` subcommand
+  answers "what changed", and refuses outright with no `.dex/snapshot.json`
+  to compare against. That has no answer for a project that was never
+  correct in the first place (a model written wrong, a join against the
+  wrong key), which the refusal `no drift baseline yet; run maintain
+  snapshot first` was the most frequent refusal across a 103-trial agent
+  benchmark's archived transcripts.
+
+  The first finding class: nodes that failed to build, nodes skipped
+  because a parent failed (naming it, and walking back through however many
+  transitively-skipped parents it takes when the immediate parent was
+  itself only skipped), and models the project declares that have no
+  relation in the warehouse. All of it is free: the manifest and the last
+  run's `run_results.json` are read off disk, and the relation check reads
+  only cheap object-metadata listing, never a scan.
+
+  A project that fails to compile is reported first and suppresses every
+  other check, since a finding computed from a manifest a broken project
+  could not have produced honestly is not a finding at all. `data.suppressed`
+  names every finding class that did not run and why (no run results yet,
+  no project, an unreachable warehouse), so an empty `data.findings` from a
+  degraded run is never mistaken for a clean project.
+
+  This is the epic's first slice, not the whole of it: row-loss/fanout,
+  NULL columns, join-overlap, and grain findings (#226-230), folding
+  verification into `transform build --verify` (#231), and updating the
+  `maintain` skill's own description to cover this diagnostic intent (#233)
+  are deferred to their own issues, each independently shippable.
+
 ## [1.9.1] - 2026-08-31
 
 ### Changed

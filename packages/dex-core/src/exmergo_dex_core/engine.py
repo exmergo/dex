@@ -69,7 +69,12 @@ if TYPE_CHECKING:
         SemanticQueryResult,
         SemanticValuesResult,
     )
-    from .maintain.results import DriftResult, ReconcileResult, SnapshotResult
+    from .maintain.results import (
+        DriftResult,
+        ReconcileResult,
+        SnapshotResult,
+        VerifyResult,
+    )
     from .references import ReferencesResult
     from .transform.plans import PlanEdit
     from .transform.results import (
@@ -849,6 +854,11 @@ class DexEngine:
         from .maintain import commands as maintain
 
         return maintain.reconcile(self, drift_class)
+
+    def verify(self, objects: list[str] | None = None) -> VerifyResult:
+        from .maintain import commands as maintain
+
+        return maintain.verify(self, objects)
 
     # --- transform --------------------------------------------------------
     #

@@ -73,6 +73,9 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "grain",
         "semantic",
         "reconcile",
+        # verify: is the project correct right now, no baseline required
+        # (#224), unlike every other maintain subcommand above.
+        "verify",
     ],
     "viz": ["preview"],
     # demo: the on-ramp. No subcommands, because there is exactly one thing to
@@ -473,6 +476,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "volume",
                     "grain",
                     "semantic",
+                    "verify",
                 }:
                     sp.add_argument("objects", nargs="*")
                 if group == "maintain" and name == "reconcile":
@@ -578,6 +582,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "grain": maintain_cmds.cmd_grain,
             "semantic": maintain_cmds.cmd_semantic,
             "reconcile": maintain_cmds.cmd_reconcile,
+            "verify": maintain_cmds.cmd_verify,
         }
         return handlers[args.subcommand](args, engine)
 
