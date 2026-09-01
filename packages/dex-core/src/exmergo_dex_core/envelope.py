@@ -72,6 +72,20 @@ class Cost(BaseModel):
     ceiling: float | None = None
 
 
+class Connection(BaseModel):
+    """The non-secret target dex resolved for this command.
+
+    ``target`` contains identifiers only (a DuckDB path, or warehouse namespace
+    coordinates such as project/datasets).  Credential values and principal
+    identities never belong here.  Empty fields mean the command did not resolve
+    a warehouse connection, which is common for repo-only commands.
+    """
+
+    connector: str | None = None
+    target: dict[str, Any] = Field(default_factory=dict)
+    source: str | None = None
+
+
 class Reason(str, Enum):
     """Why an error envelope was refused, coarse enough for a host to branch
     on retry/setup/stop without parsing prose. Derived from the exception's
@@ -98,6 +112,7 @@ class Envelope(BaseModel):
 
     status: Status
     data: dict[str, Any] = Field(default_factory=dict)
+    connection: Connection = Field(default_factory=Connection)
     cost: Cost = Field(default_factory=Cost)
     warnings: list[str] = Field(default_factory=list)
     # Reviewable diffs (propose-don't-impose). Nothing is applied just by being here.
@@ -177,6 +192,14 @@ def sanitize(envelope: Envelope) -> Envelope:
     """
 
     _scan(envelope.data)
+    connection = getattr(envelope, "connection", None)
+    if connection is not None:
+        rendered = (
+            connection.model_dump(mode="python")
+            if hasattr(connection, "model_dump")
+            else connection
+        )
+        _scan(rendered, "connection")
     return envelope
 
 

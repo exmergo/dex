@@ -154,8 +154,14 @@ under `.dex/plans/`; nothing touches the dbt project until `transform apply`. Se
 Every command prints exactly one JSON object and nothing else:
 
 ```json
-{ "status", "data", "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
+{ "status", "data", "connection": { "connector", "target", "source" }, "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
 ```
+
+On success, `connection` names the non-secret target dex resolved and whether it
+came from a flag, `.dex/config.yml`, an environment variable, a dbt profile, or
+directory-local inference. `DBT_PROFILES_DIR` only locates `profiles.yml` for dbt
+operations and last-resort credential discovery; it does not select dex's
+connector or override `--connector`/`--path` or `.dex/config.yml`.
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that
 would spend requires an explicit `--confirm` and a session budget: on a

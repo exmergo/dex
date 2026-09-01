@@ -13,6 +13,15 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **Successful envelopes now identify the resolved connection.** A compact,
+  constant top-level `connection` block reports the connector, non-secret target
+  coordinates, and whether resolution came from a flag, `.dex/config.yml`, an
+  environment variable, a dbt profile, or directory-local DuckDB inference. It
+  is stamped at the shared CLI boundary without an additional warehouse call,
+  and is covered by the envelope secret scanner. CLI help and no-connector
+  errors now also clarify that `DBT_PROFILES_DIR` locates `profiles.yml` for dbt
+  operations and last-resort credential discovery; it does not select dex's
+  connector or override its explicit/configured target.
 - **`explore query` results now identify their columnar payload shape in the
   envelope.** Single-query `data`, batch `data`, and every `data.results[]`
   entry carry `"shape": "columnar"`, so a successful response points callers
