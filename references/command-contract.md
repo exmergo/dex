@@ -65,7 +65,11 @@ dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
   [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
                                      it; both no-ops without --rank
-dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
+dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings.
+  [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
+                                     payload, columns trails; by default columns is summarized to the
+                                     ones carrying a finding, with the rest in elided_column_count.
+                                     --columns all restores every column
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)
