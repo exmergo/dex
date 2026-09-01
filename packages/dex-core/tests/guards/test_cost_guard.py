@@ -206,9 +206,9 @@ def test_gate_phase_zero_estimate_and_no_ceiling_never_raise():
 
 def test_gate_max_bytes_tracks_actual_billing():
     gate = _gate(ceiling=1_000.0)
-    assert gate.remaining_for_statement() == 1_000
+    assert gate.statement_cap(unit="byte") == 1_000
     gate.record_billed(400.0, statement="SELECT 1")
-    assert gate.remaining_for_statement() == 600
+    assert gate.statement_cap(unit="byte") == 600
 
 
 def test_gate_ledger_entries_carry_hashes_never_sql():
@@ -482,9 +482,9 @@ def test_the_server_side_cap_never_exceeds_what_was_booked():
     ledger = _Ledger()
     gate = _ledger_gate(ledger)
     gate.preflight_command(300.0)
-    assert gate.remaining_for_statement() == 300
+    assert gate.statement_cap(unit="byte") == 300
     gate.record_billed(100.0)
-    assert gate.remaining_for_statement() == 200
+    assert gate.statement_cap(unit="byte") == 200
 
 
 def test_settling_is_idempotent():
@@ -588,10 +588,10 @@ def test_the_ledger_and_envelope_spellings_stay_distinct():
 def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
     """A cheap command under a cumulative ceiling must still be runnable.
 
-    `remaining_for_statement` is an integer because every connector's cap
-    setting takes one, and on the time-paradigm connectors a cap of 0 means *no
-    limit* rather than "spend nothing", so the adapters refuse rather than send
-    a 0. Truncating a fractional remainder therefore turned into a refusal of
+    A statement cap is an integer because every connector's cap setting takes
+    one, and on the time-paradigm connectors a cap of 0 means *no limit* rather
+    than "spend nothing", so the gate refuses rather than hand one over.
+    Truncating a fractional remainder therefore turned into a refusal of
     affordable work: setting `session_ceiling` creates a reservation, a cheap
     command books less than a second, and `int(0.5)` is 0, so every small query
     was refused with "the remaining budget is under one database-second" against
@@ -599,8 +599,8 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
 
     The discriminator is which term produced the sub-unit value, so all three
     cases are asserted together: a booking under one unit still yields a usable
-    cap, a genuinely exhausted ceiling still reads as exhausted, and the booking
-    still tightens the cap when it is the smaller of the two. Dropping any one of
+    cap, a genuinely exhausted ceiling still refuses, and the booking still
+    tightens the cap when it is the smaller of the two. Dropping any one of
     them would trade a false refusal for a missing one, or the reverse.
     """
 
@@ -618,7 +618,7 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
     )
     gate.preflight_command(0.5)
     gate.charge(0.5)
-    assert gate.remaining_for_statement() == 1
+    assert gate.statement_cap(unit="database-second") == 1
 
     spent = CostGate(
         paradigm=Paradigm.DB_LOAD,
@@ -630,10 +630,8 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
         session_spent=0.0,
     )
     spent.record_billed(59.5, job_id=None, statement="prior")
-    assert spent.remaining_for_statement() == 0, (
-        "a ceiling with under a unit left is genuinely exhausted and must still "
-        "refuse, which is the half the booking fix must not break"
-    )
+    with pytest.raises(OverCeilingError, match="under one database-second"):
+        spent.statement_cap(unit="database-second")
 
     # And the booking still tightens: 5 booked against a 60-second ceiling caps
     # the statement at 5, not 60.
@@ -647,7 +645,78 @@ def test_a_sub_unit_remainder_caps_at_one_rather_than_reading_as_unlimited():
         session_spent=0.0,
     )
     tight.preflight_command(5.0)
-    assert tight.remaining_for_statement() == 5
+    assert tight.statement_cap(unit="database-second") == 5
+
+
+def test_an_exhausted_budget_refuses_at_the_gate_rather_than_at_each_adapter():
+    """Issue #316: the two states a cap of 0 could mean are told apart here.
+
+    An exhausted budget and "no cap applies" used to be a 0 and a `None` handed
+    back for the caller to tell apart, and every adapter told them apart the
+    same way in its own billed path. That is a convention, not a contract: the
+    connector that forgets the check sends the server a 0, which Postgres,
+    ClickHouse and Databricks all read as *no limit*, so the backstop
+    disappears exactly when the budget is nearly gone and the run looks
+    entirely ordinary while it happens.
+
+    So the shortfall is the call's own refusal. `statement_cap` returns a cap
+    the server will honour or raises, with nothing in between for a caller to
+    misread, and the refusal carries the cost the envelope reports.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    def gate(paradigm: Paradigm, ceiling: float) -> CostGate:
+        return CostGate(
+            paradigm=paradigm,
+            connector="postgres",
+            command="explore query",
+            ceiling=ceiling,
+            confirmed=True,
+            session_ceiling=None,
+            session_spent=0.0,
+        )
+
+    exhausted = gate(Paradigm.DB_LOAD, 60.0)
+    exhausted.record_billed(59.7, job_id=None, statement="prior")
+    with pytest.raises(OverCeilingError) as refusal:
+        exhausted.statement_cap(unit="database-second")
+    # The refusal is priced: an empty cost block on a spend refusal reads as a
+    # claim that nothing was going to be spent.
+    assert refusal.value.cost is not None
+    assert refusal.value.cost.paradigm is Paradigm.DB_LOAD
+    assert refusal.value.cost.ceiling == 60.0
+
+    # A floor above one unit is the same event: BigQuery bills a 10 MB minimum
+    # per query, so a cap under that is refused by the server rather than
+    # honoured by it, and the shortfall names the number to raise --budget past.
+    bytes_gate = gate(Paradigm.BYTES_SCANNED, 12 * 1024 * 1024)
+    bytes_gate.record_billed(4 * 1024 * 1024, job_id=None, statement="prior")
+    with pytest.raises(OverCeilingError, match="10,485,760-byte minimum"):
+        bytes_gate.statement_cap(unit="byte", minimum=10 * 1024 * 1024)
+    # ...and it is a floor, not a rounding: 12 MB of the 12 MB budget is above
+    # it and still prices normally.
+    assert (
+        gate(Paradigm.BYTES_SCANNED, 12 * 1024 * 1024).statement_cap(
+            unit="byte", minimum=10 * 1024 * 1024
+        )
+        == 12 * 1024 * 1024
+    )
+
+    # `None` is the only other answer, and it means no ceiling bounds the
+    # statement at all rather than "spend nothing": distinct from every integer,
+    # so no adapter has to recognise a magnitude to tell them apart.
+    unbounded = CostGate(
+        paradigm=Paradigm.FREE_LOCAL,
+        connector="duckdb",
+        command="explore query",
+        ceiling=None,
+        confirmed=True,
+        session_ceiling=None,
+        session_spent=0.0,
+    )
+    assert unbounded.statement_cap(unit="database-second") is None
 
 
 # --- the ledger is a dependency of billing, not of every command -----------------

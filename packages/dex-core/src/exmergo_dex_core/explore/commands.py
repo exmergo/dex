@@ -587,6 +587,7 @@ def profile(
     refresh: bool = False,
     use_project: bool = False,
     check_cumulative: bool = False,
+    show_all_columns: bool = False,
 ) -> ProfileResult:
     """Profile the named objects, reusing fresh cached profiles where they exist.
 
@@ -598,6 +599,12 @@ def profile(
     measures that look like a running total or point-in-time snapshot; this
     probe is priced only after profiling knows what to test, which is why it
     can come back as ``pending_confirmation`` rather than raising.
+
+    ``show_all_columns`` answers ``--columns all`` (#288): the default
+    summarizes each dataset's payload to the columns carrying a finding (see
+    :meth:`~..cache.Dataset.columns_with_findings`), so the verdict a caller
+    asked for -- grain, keys, data quality -- is not the part a truncating
+    harness cuts off on a wide table.
     """
 
     store = engine.store
@@ -743,6 +750,7 @@ def profile(
         cache_hit_count=len(fresh_reused),
         cache_path=locator,
         updated_at=now.isoformat(),
+        show_all_columns=show_all_columns,
         notes=notes,
         warnings=_override_mismatches(datasets, config.pii_overrides),
         pending_confirmation=cumulative_pending,
@@ -756,6 +764,7 @@ def cmd_profile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             engine,
             args.objects,
             refresh=getattr(args, "refresh", False),
+            show_all_columns=getattr(args, "columns", None) == "all",
             use_project=getattr(args, "use_project", False),
             check_cumulative=getattr(args, "check_cumulative", False),
         )
