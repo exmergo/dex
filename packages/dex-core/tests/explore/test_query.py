@@ -368,9 +368,7 @@ def test_measuring_aggregates_over_pii_are_allowed(
 # --- cache-backed query annotations ----------------------------------------------
 
 
-def test_query_returns_column_notes_from_cached_profiles(
-    tmp_path: Path, capsys
-):
+def test_query_returns_column_notes_from_cached_profiles(tmp_path: Path, capsys):
     """Dropping the cache-backed annotation helper should remove the non-zero
     null fraction from the result, which is the product regression this catches."""
 
