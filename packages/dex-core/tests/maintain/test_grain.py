@@ -84,7 +84,7 @@ def test_clickhouse_collapsing_engine_note_stays_on_uniqueness_finding(
                     )
                 ],
                 relationships=[],
-            )
+            ),
         )
     )
     fake_clickhouse_connection.row_resolver = lambda sql: FakeResult(
@@ -114,9 +114,7 @@ def test_clickhouse_collapsing_engine_note_stays_on_uniqueness_finding(
     result = grain_drift(dex_engine)
 
     assert any("FINAL" in warning for warning in result.warnings)
-    (finding,) = [
-        f for f in result.findings if f.code == "key_lost_uniqueness"
-    ]
+    (finding,) = [f for f in result.findings if f.code == "key_lost_uniqueness"]
     assert finding.severity == "medium"
     assert any(engine in n for n in finding.data["table_notes"])
     assert "stored parts before ClickHouse FINAL" in finding.detail
