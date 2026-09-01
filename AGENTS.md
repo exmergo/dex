@@ -169,7 +169,12 @@ metered connector (BigQuery, Snowflake, Databricks, Redshift, Postgres, and
 ClickHouse)
 the first call returns `needs_confirmation` with a free estimate, and the
 same command is re-issued with `--confirm --budget <magnitude>` once the user
-has agreed to the spend. The magnitude is paradigm-relative: **bytes** on
+has agreed to the spend. The first billed command in a project that has never
+decided whether the *day's* total is bounded also carries a
+`suggested_session_ceiling`, and adding `--session-ceiling <value>` (or
+`--no-session-ceiling`) to that same re-issue answers both asks at once and is
+recorded in `.dex/config.yml`; skip it and the confirmed run stops once to ask.
+The magnitude is paradigm-relative: **bytes** on
 BigQuery (an exact free dry-run figure), **warehouse-seconds** on Snowflake
 (a heuristic labeled `estimate_quality: "heuristic"`, with a credit
 translation alongside) and on Databricks (a floor labeled
@@ -235,7 +240,13 @@ them.
    headroom before it runs, so issuing several billed commands at once cannot
    spend the same budget twice. If a cache backend cannot serialize that, every
    billed command says so, and if the ledger it binds against cannot be read,
-   billed admission refuses rather than deciding a ceiling from nothing.
+   billed admission refuses rather than deciding a ceiling from nothing. And a
+   project is asked for that daily cap once rather than warned about it forever:
+   the first billed command in a project that has never decided returns
+   `needs_confirmation` with a `suggested_session_ceiling`, answered by
+   `--session-ceiling <value>` or `--no-session-ceiling` and recorded in
+   `.dex/config.yml`, so an unbounded day is a decision somebody made rather
+   than the default nobody noticed.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.

@@ -118,6 +118,7 @@ def _rewrite_unambiguous_bare_subcommand(argv: list[str]) -> list[str]:
             "--cache-backend",
             "--project-format",
             "--budget",
+            "--session-ceiling",
         }:
             i += 2
             continue
@@ -169,6 +170,15 @@ def _sub_connection_options() -> argparse.ArgumentParser:
     common.add_argument("--repo-root", default=argparse.SUPPRESS)
     common.add_argument("--confirm", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--budget", type=float, default=argparse.SUPPRESS)
+    # The two answers to the one-time cumulative-ceiling ask (issue #283). Both
+    # write `.dex/config.yml` once and then never matter again, which is why
+    # they sit beside `--budget` rather than under a subcommand of their own:
+    # the ask fires from a billed command, and the answer belongs on the re-run
+    # of that same command.
+    common.add_argument("--session-ceiling", type=float, default=argparse.SUPPRESS)
+    common.add_argument(
+        "--no-session-ceiling", action="store_true", default=argparse.SUPPRESS
+    )
     return common
 
 
@@ -226,6 +236,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-format", default=None)
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--budget", type=float, default=None)
+    parser.add_argument("--session-ceiling", type=float, default=None)
+    parser.add_argument("--no-session-ceiling", action="store_true")
 
     common = _sub_connection_options()
     groups = parser.add_subparsers(dest="group", required=True)
@@ -679,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--cache-backend",
                     "--project-format",
                     "--budget",
+                    "--session-ceiling",
                 }:
                     j += 2
                     continue
@@ -727,6 +740,8 @@ def main(argv: list[str] | None = None) -> int:
             scopes=getattr(args, "scope", None),
             budget=getattr(args, "budget", None),
             confirmed=getattr(args, "confirm", False),
+            session_ceiling=getattr(args, "session_ceiling", None),
+            decline_session_ceiling=getattr(args, "no_session_ceiling", False),
         )
         try:
             envelope = dispatch(args, engine)
@@ -775,6 +790,13 @@ def main(argv: list[str] | None = None) -> int:
     # has nothing to carry.
     if engine is not None and engine.connection_warnings:
         envelope.warnings = list(engine.connection_warnings) + list(envelope.warnings)
+
+    # A config amendment dex performed on the caller's behalf (the answer to the
+    # cumulative-ceiling ask, issue #283) rides out the same way, as a diff:
+    # the write happened before the command did, so even a command that failed
+    # afterwards has to report it or the file changed with nothing saying so.
+    if engine is not None and engine.config_diffs:
+        envelope.diffs = list(engine.config_diffs) + list(envelope.diffs)
 
     # Every command runs against a connector or against none, so every envelope
     # can name the paradigm a later billed command would spend in. Filled only

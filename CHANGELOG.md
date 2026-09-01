@@ -11,6 +11,50 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **A project is now asked once for a cumulative spend ceiling, instead of
+  warned about it forever** ([#283]). With `budget.session_ceiling` unset, every
+  billed command carried a warning that nothing bounded the day's total across
+  commands. The sentence was accurate and well worded. It was also the default
+  state of every new project, and it repeated on every billed command, which is
+  the condition under which warnings stop being read: in one observed session
+  five billed commands ran to 6.60 GB bound by their per-command caps alone,
+  each one carrying the warning, and the aggregate was bounded by nothing.
+
+  `budget.ceiling` is refused when missing, on the stated grounds that nothing
+  runs unbudgeted; `budget.session_ceiling` was only warned about, on the
+  stated grounds that refusing would break every project that never set one.
+  Both positions are defensible on their own, and the gap between them is where
+  an unbounded day lived.
+
+  So the default becomes a decision. The first billed command in a project with
+  no recorded decision returns `needs_confirmation` naming a
+  `suggested_session_ceiling` (five times that command's own estimate, in the
+  connector's unit, offered as a starting point rather than a recommendation:
+  the only figure dex can honestly reason from is what this caller's own work
+  costs). `--session-ceiling <value>` sets one and `--no-session-ceiling`
+  records that the project runs unbounded; either answer is written into
+  `.dex/config.yml`, reported as an `update` diff, and nothing asks again in
+  that project.
+
+  The ask is the last check before spend, after the confirm handshake and the
+  per-command ceiling, so an unanswered one has run nothing, booked no headroom,
+  and reached the spend ledger not at all. The unconfirmed cost ask that
+  precedes it carries the same suggestion in `notes`, so a caller who reads one
+  payload answers both in a single re-run and never meets the second ask.
+
+  Three cases are never asked. A project that already set
+  `budget.session_ceiling` is unaffected in every respect. A project that
+  recorded a decline is never asked again, and the decline loosens nothing: the
+  warning still fires on every billed command, and now names the decline, so a
+  reader can tell a settled choice from a project that was never asked. A
+  config-free ad-hoc read (`--connector`/`--path` with no project) has no
+  committed file to record an answer in, so asking would be asking a question
+  the caller cannot answer, and it keeps the warning alone. A host holding its
+  own `DexConfig` object is likewise never asked, since the file at that root is
+  not the settings in play; library callers answer through
+  `DexEngine(session_ceiling=...)` / `DexEngine(decline_session_ceiling=True)`,
+  which refuse rather than silently do nothing when there is no config to write.
+  
 - **An exhausted budget is now refused by the cost gate itself, rather than by
   a check each adapter had to remember to write** ([#316]). The server-side cap
   is an integer because every connector's cap setting takes one, and on the

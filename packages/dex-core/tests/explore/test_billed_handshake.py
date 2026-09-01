@@ -15,7 +15,13 @@ pytest.importorskip("google.cloud.bigquery")
 
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
-from exmergo_dex_core.config import BigQueryTarget, DexConfig
+from exmergo_dex_core.config import (
+    BigQueryTarget,
+    Budget,
+    DexConfig,
+    load_config,
+    save_config,
+)
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm, Reason
 from exmergo_dex_core.explore import commands as explore_cmds
@@ -82,16 +88,24 @@ def _domain_eligible_resolver(sql: str):
     return [values]
 
 
-def _adapter(fake_bq_client, *, confirmed: bool, budget: float | None, record=None):
+def _adapter(
+    fake_bq_client, *, confirmed: bool, budget: float | None, record=None, config=None
+):
+    # The cumulative-budget half comes off the config the way `new_cost_gate`
+    # reads it, so a test that commits a config gets the gate a real run would:
+    # its ceiling, its recorded decision, and the file an answer is written to.
+    committed = (config or DexConfig()).budget
     gate = CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
         ceiling=budget,
-        session_ceiling=None,
+        session_ceiling=committed.session_ceiling,
         session_spent=0.0,
         confirmed=confirmed,
         connector="bigquery",
         command="explore",
         record=record,
+        session_ceiling_declined=committed.session_ceiling_declined,
+        config_path=None if config is None else config.source_path,
     )
     return BigQueryAdapter(
         project="test-proj",
@@ -132,6 +146,7 @@ def route_adapter(monkeypatch):
                 confirmed=self.confirmed if confirmed is None else confirmed,
                 budget=self.budget if budget is None else budget,
                 record=record,
+                config=self.config,
             )
 
         monkeypatch.setattr(DexEngine, "_adapter", opener)
@@ -1477,6 +1492,208 @@ def test_duckdb_never_warns_about_a_cumulative_cap(duckdb_file: Path, capsys):
     assert main(["explore", "profile", "customers", "--path", str(duckdb_file)]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert _session_warning(payload["warnings"]) == []
+
+
+# --- the one-time cumulative-ceiling decision (#283) -----------------------------
+#
+# The warning above is accurate and it is also the default state of every new
+# project, so it repeated on every billed command, which is the condition under
+# which warnings stop being read. One observed session ran five billed commands
+# to 6.60 GB bound by their per-command caps alone, each carrying that sentence,
+# with the aggregate bounded by nothing. These pin the ask that makes the
+# unbounded case a decision instead of a default.
+
+
+def _project(tmp_path: Path, **budget) -> None:
+    """A committed config at the repo root, which is what arms the ask: without a
+    file to record an answer in, an ad-hoc read is never asked."""
+
+    save_config(DexConfig(connector="bigquery", budget=Budget(**budget)), tmp_path)
+
+
+def _project_engine(tmp_path: Path, **extra) -> DexEngine:
+    return DexEngine(
+        connector="bigquery",
+        repo_root=str(tmp_path),
+        store=FilesystemStore(tmp_path),
+        config=load_config(tmp_path),
+        confirmed=extra.get("confirm", False),
+        budget=extra.get("budget"),
+        session_ceiling=extra.get("session_ceiling"),
+        decline_session_ceiling=extra.get("no_session_ceiling", False),
+    )
+
+
+def _project_dispatch(tmp_path: Path, **extra):
+    from exmergo_dex_core.cli import dispatch
+
+    engine = _project_engine(tmp_path, **extra)
+    envelope = dispatch(_args(tmp_path, **extra), engine)
+    # What `main` does on the way out, so a config amendment is never silent.
+    if engine.config_diffs:
+        envelope.diffs = list(engine.config_diffs) + list(envelope.diffs)
+    return envelope
+
+
+def test_the_first_confirmed_billed_command_stops_to_ask_for_a_daily_cap(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    # Five times this command's own 40 MB estimate, in the paradigm's own unit.
+    assert envelope.data["suggested_session_ceiling"] == 5 * 40 * MB
+    assert "--session-ceiling 209715200" in envelope.data["hint"]
+    assert "--no-session-ceiling" in envelope.data["hint"]
+    # Under its own key too, because `hint` is a channel a two-phase command's
+    # own payload can overwrite on the way into the envelope.
+    assert envelope.data["session_ceiling_hint"] == envelope.data["hint"]
+    # Confirmed and in budget, and still nothing ran: the ask is the last check
+    # before the reservation, so an unanswered one is as free as an unconfirmed
+    # handshake.
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_answering_with_a_ceiling_writes_it_and_runs_the_command(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        session_ceiling=float(500 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert load_config(tmp_path).budget.session_ceiling == float(500 * MB)
+    # Written, so reported: the amendment rides out as a diff rather than as
+    # something the caller finds later in `git status`.
+    assert [d["path"] for d in envelope.diffs] == [".dex/config.yml"]
+    assert "session_ceiling" in envelope.diffs[0]["unified"]
+    # And it binds the very command that answered, so the warning is gone.
+    assert _session_warning(envelope.warnings) == []
+
+
+def test_answering_with_a_decline_records_it_and_runs_the_command(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        no_session_ceiling=True,
+    )
+    assert envelope.status.value == "ok"
+    budget = load_config(tmp_path).budget
+    assert budget.session_ceiling_declined is True
+    assert budget.session_ceiling is None
+    # The decline records a decision; it loosens nothing, so the result still
+    # says the day was bounded by nothing.
+    assert len(_session_warning(envelope.warnings)) == 1
+
+
+def test_a_recorded_decline_is_not_re_asked_on_the_next_command(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        no_session_ceiling=True,
+    )
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        refresh=True,
+    )
+    assert envelope.status.value == "ok"
+    assert envelope.diffs == []
+
+
+def test_a_project_that_already_set_a_ceiling_is_never_asked(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Acceptance: no behaviour change for a repo that already has one set."""
+
+    _project(tmp_path, ceiling=float(100 * MB), session_ceiling=float(500 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert envelope.diffs == []
+    assert _session_warning(envelope.warnings) == []
+
+
+def test_the_unconfirmed_cost_ask_carries_the_suggestion_so_one_re_run_answers_both(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(tmp_path, subcommand="profile", objects=["customers"])
+    assert envelope.status.value == "needs_confirmation"
+    # The cost ask still owns the hint, because that is the flag pair it is
+    # answered with; the cumulative-ceiling advice rides in the notes.
+    assert "--confirm" in envelope.data["hint"]
+    assert envelope.data["suggested_session_ceiling"] == 5 * 40 * MB
+    assert any("--session-ceiling 209715200" in n for n in envelope.data["notes"])
+    assert "--session-ceiling 209715200" in envelope.data["session_ceiling_hint"]
+
+
+def test_an_ad_hoc_read_with_no_committed_config_is_never_asked(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """There is no file to record an answer in, so the ask would be a question
+    the caller cannot answer; it keeps the warning it always had."""
+
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert len(_session_warning(envelope.warnings)) == 1
+
+
+def test_an_answer_with_no_committed_config_is_refused_not_dropped(tmp_path):
+    from exmergo_dex_core.errors import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="to record a"):
+        _project_engine(tmp_path, session_ceiling=float(500 * MB))
 
 
 # --- a statement the server refused (#310) ----------------------------------------

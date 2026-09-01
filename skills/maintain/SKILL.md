@@ -120,6 +120,13 @@ The axes split:
 
 On DuckDB everything is free and local, so nothing prompts.
 
+A `needs_confirmation` envelope carrying `suggested_session_ceiling` is the
+project's one-time ask for a *cumulative* daily cap, separate from the
+per-command `--budget`. Surface it, get the user's answer, and add
+`--session-ceiling <value>` or `--no-session-ceiling` to the same re-issue; it is
+written to `.dex/config.yml` once and never asked again. Never answer it for
+them.
+
 ## Reconcile proposals are mechanical or advisory
 
 Reconcile tags every proposal by `kind`, because the fix differs sharply by axis:
