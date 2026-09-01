@@ -271,9 +271,11 @@ class QueryResult(Result):
     truncated: bool = False
     tables: list[str] = Field(default_factory=list)
     profiled_on_demand: list[str] = Field(default_factory=list)
+    column_notes: dict[str, Any] | None = None
+    query_notes: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload = {
             "shape": self.shape,
             "columns": self.columns,
             "types": self.types,
@@ -283,6 +285,11 @@ class QueryResult(Result):
             "tables": self.tables,
             "profiled_on_demand": self.profiled_on_demand,
         }
+        if self.column_notes:
+            payload["column_notes"] = self.column_notes
+        if self.query_notes:
+            payload["query_notes"] = self.query_notes
+        return payload
 
 
 class QueryStatementResult(BaseModel):
@@ -309,6 +316,8 @@ class QueryStatementResult(BaseModel):
     row_count: int = 0
     truncated: bool = False
     tables: list[str] = Field(default_factory=list)
+    column_notes: dict[str, Any] | None = None
+    query_notes: dict[str, Any] | None = None
     notes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
@@ -331,9 +340,17 @@ class QueryBatchResult(Result):
     profiled_on_demand: list[str] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
+        results = []
+        for result in self.results:
+            payload = result.model_dump(mode="json")
+            if payload["column_notes"] is None:
+                payload.pop("column_notes")
+            if payload["query_notes"] is None:
+                payload.pop("query_notes")
+            results.append(payload)
         return {
             "shape": "columnar",
-            "results": [r.model_dump(mode="json") for r in self.results],
+            "results": results,
             "statement_count": len(self.results),
             "ok_count": sum(1 for r in self.results if r.status == "ok"),
             "failed_count": sum(1 for r in self.results if r.status != "ok"),

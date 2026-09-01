@@ -26,6 +26,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import sqlglot
+from sqlglot import expressions as exp
+
 from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
@@ -33,8 +36,9 @@ from ..adapters.base import Adapter, ObjectMeta, name_list
 
 # Aliased: `QueryResult` here is the explore record, and the adapter's
 # same-named row carrier is only a type hint on one shaping helper.
-from ..adapters.base import QueryResult as AdapterQueryResult  # noqa: F401
+from ..adapters.base import QueryResult as AdapterQueryResult
 from ..cache import (
+    ColumnProfile,
     Dataset,
     DexCache,
     Relationship,
@@ -1255,6 +1259,8 @@ def query_batch(
                         "row_count": statement.result.row_count,
                         "truncated": statement.result.truncated,
                         "tables": statement.result.tables,
+                        "column_notes": statement.result.column_notes,
+                        "query_notes": statement.result.query_notes,
                         "notes": statement.result.notes,
                         "warnings": statement.result.warnings,
                     }
@@ -1449,7 +1455,7 @@ def _run_statements(
     if not shared.profiled:
         _price_statements(shared.adapter, live, size, ledger)
 
-    _execute(engine, shared, batch, limits, ledger)
+    _execute(engine, shared, batch, limits, ledger, cache, dialect)
     return batch, shared
 
 
@@ -1503,6 +1509,8 @@ def _execute(
     batch: list[_Statement],
     limits: QueryLimits,
     ledger: Callable[[_Statement, dict], None],
+    cache: DexCache,
+    dialect: str,
 ) -> None:
     """Run each approved statement in order, against one shared payload budget.
 
@@ -1554,12 +1562,18 @@ def _execute(
             statement.inspected,
             limits,
             budget_bytes=None if len(batch) == 1 else budget,
+            cache=cache,
+            dialect=dialect,
         )
         budget -= payload.pop("payload_bytes")
         notes = payload.pop("notes")
+        column_notes = payload.pop("column_notes", None)
+        query_notes = payload.pop("query_notes", None)
         statement.result = QueryResult(
             **payload,
             profiled_on_demand=shared.profiled,
+            column_notes=column_notes,
+            query_notes=query_notes,
             notes=notes,
             # A lone statement carries the call's own warnings, because there is no
             # batch record above it to hold them.
@@ -2812,11 +2826,13 @@ def _select_cluster_features(
 
 
 def _shape_query_payload(
-    result: QueryResult,
+    result: AdapterQueryResult,
     inspected: InspectedQuery,
     limits: QueryLimits,
     *,
     budget_bytes: int | None = None,
+    cache: DexCache | None = None,
+    dialect: str = "duckdb",
 ) -> dict:
     """Cap the result for agent context: row-major cells, cell-width truncation,
     and a payload byte cap, each announced in `notes` so a cut result is never
@@ -2869,7 +2885,7 @@ def _shape_query_payload(
             "the query, or raise query.max_rows in .dex/config.yml"
         )
 
-    return {
+    payload = {
         "columns": result.columns,
         "types": result.types,
         "cells": cells,
@@ -2879,6 +2895,297 @@ def _shape_query_payload(
         "notes": notes,
         "payload_bytes": len(json.dumps(cells)),
     }
+    if cache is not None:
+        annotations = _query_annotations(result.columns, inspected, cache, dialect)
+        payload.update(annotations)
+    return payload
+
+
+def _query_annotations(
+    output_columns: list[str],
+    inspected: InspectedQuery,
+    cache: DexCache,
+    dialect: str,
+) -> dict[str, dict]:
+    """Attach cache-backed judgment to a successful query result.
+
+    The helper is deliberately conservative: it emits only facts already in the
+    exploration cache and only when a query expression resolves directly to a
+    physical cached column or to a cached verified relationship.
+    """
+
+    try:
+        root = sqlglot.parse_one(inspected.sql, dialect=dialect)
+    except sqlglot.errors.ParseError:
+        return {}
+    if not isinstance(root, exp.Select):
+        return {}
+
+    sources = _query_annotation_sources(root, inspected.tables, cache)
+    if not sources:
+        return {}
+
+    projected = _projected_physical_columns(root, output_columns, sources)
+    column_notes = _column_notes(projected)
+    grouping = _grouping_notes(root, sources)
+    joins = _join_notes(root, sources, cache.relationships)
+
+    payload: dict[str, dict] = {}
+    if column_notes:
+        payload["column_notes"] = column_notes
+    query_notes = {}
+    if grouping:
+        query_notes["grouping"] = grouping
+    if joins:
+        query_notes["joins"] = joins
+    if query_notes:
+        payload["query_notes"] = query_notes
+    return payload
+
+
+def _query_annotation_sources(
+    root: exp.Select, tables: list[str], cache: DexCache
+) -> dict[str, Dataset]:
+    datasets = {d.identifier: d for d in cache.datasets}
+    sources: dict[str, Dataset] = {}
+    for table in root.find_all(exp.Table):
+        matches = match_identifier(table.name, tables)
+        if len(matches) != 1:
+            continue
+        dataset = datasets.get(matches[0])
+        if dataset is None:
+            continue
+        sources[table.alias_or_name.lower()] = dataset
+        sources[table.name.lower()] = dataset
+    return sources
+
+
+def _projected_physical_columns(
+    root: exp.Select,
+    output_columns: list[str],
+    sources: dict[str, Dataset],
+) -> list[tuple[str, Dataset, str]]:
+    projected: list[tuple[str, Dataset, str]] = []
+    for index, projection in enumerate(root.expressions):
+        if index >= len(output_columns):
+            break
+        column = projection
+        if isinstance(projection, exp.Alias):
+            column = projection.this
+        if not isinstance(column, exp.Column):
+            continue
+        resolved = _resolve_query_column(column, sources)
+        if resolved is None:
+            continue
+        dataset, source_column = resolved
+        projected.append((output_columns[index], dataset, source_column.name))
+    return projected
+
+
+def _column_notes(
+    projected: list[tuple[str, Dataset, str]],
+) -> dict[str, list[dict]] | None:
+    notes: list[dict] = []
+    selected_by_dataset: dict[str, tuple[Dataset, list[str]]] = {}
+    for output, dataset, source_name in projected:
+        column = _cached_column(dataset, source_name)
+        if column is None:
+            continue
+        selected_by_dataset.setdefault(dataset.identifier, (dataset, []))[1].append(
+            source_name
+        )
+        note = {
+            "column": output,
+            "table": dataset.identifier,
+            "source_column": column.name,
+        }
+        has_note = False
+        if column.null_fraction:
+            note["null_fraction"] = column.null_fraction
+            has_note = True
+        if column.pii is not None:
+            note["pii"] = column.pii.model_dump(mode="json")
+            has_note = True
+        if has_note:
+            notes.append(note)
+
+    grain_notes: list[dict] = []
+    for dataset, selected in selected_by_dataset.values():
+        if not dataset.grain:
+            continue
+        selected_lower = {c.lower() for c in selected}
+        grain_lower = {c.lower() for c in dataset.grain}
+        if not grain_lower <= selected_lower:
+            continue
+        grain_notes.append(
+            {
+                "table": dataset.identifier,
+                "columns": dataset.grain,
+                "selected_columns": selected,
+                "covered": True,
+            }
+        )
+
+    if not notes and not grain_notes:
+        return None
+    payload: dict[str, list[dict]] = {}
+    if notes:
+        payload["columns"] = notes
+    if grain_notes:
+        payload["grain"] = grain_notes
+    return payload
+
+
+def _grouping_notes(root: exp.Select, sources: dict[str, Dataset]) -> list[dict]:
+    group = root.args.get("group")
+    if group is None:
+        return []
+    grouped: dict[str, tuple[Dataset, list[str]]] = {}
+    for expression in group.expressions:
+        if not isinstance(expression, exp.Column):
+            continue
+        resolved = _resolve_query_column(expression, sources)
+        if resolved is None:
+            continue
+        dataset, column = resolved
+        grouped.setdefault(dataset.identifier, (dataset, []))[1].append(column.name)
+
+    notes = []
+    for dataset, columns in grouped.values():
+        if not dataset.grain:
+            continue
+        grouped_lower = {c.lower() for c in columns}
+        grain_lower = {c.lower() for c in dataset.grain}
+        if grouped_lower == grain_lower:
+            match = "matches_grain"
+        elif grain_lower <= grouped_lower:
+            match = "covers_grain"
+        else:
+            match = "misses_grain"
+        notes.append(
+            {
+                "table": dataset.identifier,
+                "columns": columns,
+                "grain": dataset.grain,
+                "match": match,
+            }
+        )
+    return notes
+
+
+def _join_notes(
+    root: exp.Select,
+    sources: dict[str, Dataset],
+    relationships: list[Relationship],
+) -> list[dict]:
+    notes: list[dict] = []
+    seen: set[tuple[str, tuple[str, ...], str, tuple[str, ...]]] = set()
+    for join in root.find_all(exp.Join):
+        predicate = join.args.get("on")
+        if predicate is None:
+            continue
+        for eq in predicate.find_all(exp.EQ):
+            if not isinstance(eq.left, exp.Column) or not isinstance(
+                eq.right, exp.Column
+            ):
+                continue
+            left = _resolve_query_column(eq.left, sources)
+            right = _resolve_query_column(eq.right, sources)
+            if left is None or right is None:
+                continue
+            left_dataset, left_column = left
+            right_dataset, right_column = right
+            if left_dataset.identifier == right_dataset.identifier:
+                continue
+            relationship = _matching_verified_relationship(
+                relationships,
+                left_dataset.identifier,
+                left_column.name,
+                right_dataset.identifier,
+                right_column.name,
+            )
+            if relationship is None:
+                continue
+            key = (
+                relationship.from_dataset,
+                tuple(relationship.from_columns),
+                relationship.to_dataset,
+                tuple(relationship.to_columns),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            note = {
+                "from_table": relationship.from_dataset,
+                "from_columns": relationship.from_columns,
+                "to_table": relationship.to_dataset,
+                "to_columns": relationship.to_columns,
+                "verified": True,
+            }
+            if relationship.orphan_fraction is not None:
+                note["orphan_fraction"] = relationship.orphan_fraction
+            notes.append(note)
+    return notes
+
+
+def _resolve_query_column(
+    column: exp.Column, sources: dict[str, Dataset]
+) -> tuple[Dataset, ColumnProfile] | None:
+    if column.table:
+        dataset = sources.get(column.table.lower())
+        if dataset is None:
+            return None
+    else:
+        unique_sources = {d.identifier: d for d in sources.values()}
+        if len(unique_sources) != 1:
+            return None
+        dataset = next(iter(unique_sources.values()))
+    cached = _cached_column(dataset, column.name)
+    if cached is None:
+        return None
+    return dataset, cached
+
+
+def _cached_column(dataset: Dataset, name: str) -> ColumnProfile | None:
+    lowered = name.lower()
+    for column in dataset.columns:
+        if column.name.lower() == lowered:
+            return column
+    return None
+
+
+def _matching_verified_relationship(
+    relationships: list[Relationship],
+    left_dataset: str,
+    left_column: str,
+    right_dataset: str,
+    right_column: str,
+) -> Relationship | None:
+    for relationship in relationships:
+        if not relationship.verified:
+            continue
+        if _relationship_matches(
+            relationship, left_dataset, left_column, right_dataset, right_column
+        ) or _relationship_matches(
+            relationship, right_dataset, right_column, left_dataset, left_column
+        ):
+            return relationship
+    return None
+
+
+def _relationship_matches(
+    relationship: Relationship,
+    from_dataset: str,
+    from_column: str,
+    to_dataset: str,
+    to_column: str,
+) -> bool:
+    return (
+        relationship.from_dataset.lower() == from_dataset.lower()
+        and relationship.to_dataset.lower() == to_dataset.lower()
+        and [c.lower() for c in relationship.from_columns] == [from_column.lower()]
+        and [c.lower() for c in relationship.to_columns] == [to_column.lower()]
+    )
 
 
 def _project_definitions(
