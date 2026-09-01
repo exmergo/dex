@@ -9,6 +9,39 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Changed
+
+- **An exhausted budget is now refused by the cost gate itself, rather than by
+  a check each adapter had to remember to write** ([#316]). The server-side cap
+  is an integer because every connector's cap setting takes one, and on the
+  time-paradigm connectors a cap of 0 does not mean "spend nothing" but *no
+  limit* (Postgres `statement_timeout`, ClickHouse `max_execution_time`,
+  Databricks `STATEMENT_TIMEOUT`). Exhaustion and "no cap applies" were already
+  distinguishable at the boundary, 0 against `None`, but telling them apart was
+  still left to the caller, and all six billed adapters did it the same way in
+  their own billed-statement path. That is a convention, not a contract: one
+  forgotten `if` in a new connector hands the server a 0, which removes the
+  backstop at exactly the moment the budget is nearly spent, and fails in the
+  most expensive possible direction while looking like an ordinary run.
+
+  `CostGate.remaining_for_statement` is now the private
+  `_remaining_for_statement`, reached only through `CostGate.statement_cap`,
+  which raises `OverCeilingError` on the shortfall. Its public result is
+  therefore either `None` or a strictly positive cap the server will honour,
+  with nothing in between for a caller to misread. `statement_cap` takes the
+  `unit` the refusal should name in the connector's own vocabulary (a
+  "database-second", a "warehouse-second", a "byte") and an optional `minimum`
+  for the smallest cap that server can usefully be given, which is how
+  BigQuery's 10 MB per-query billing minimum is expressed rather than as a
+  seventh hand-written check. The six per-adapter refusals are deleted, and the
+  property they enforced between them is now tested once, centrally: no code
+  path can hand a server a cap value that the server reads as unlimited.
+
+  The refusal also carries its `Cost` now, which the BigQuery one did not, so a
+  shortfall reports the paradigm and ceiling it was measured against instead of
+  an empty cost block on a spend refusal. The BigQuery shortfall message names
+  the per-query minimum the cap fell under rather than the connector.
+
 ## [1.9.1] - 2026-08-31
 
 ### Changed

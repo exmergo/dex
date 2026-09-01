@@ -1081,12 +1081,7 @@ class PostgresAdapter:
         the cursor and whether the budget (not the wall clock) is the binding
         bound."""
 
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one database-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="database-second")
         self._ensure_session()
         cursor = self._conn.cursor()
         timeout_ms: int | None = None
