@@ -391,6 +391,26 @@ def preflight(
     return cost
 
 
+def _cap_shortfall(remaining: int, floor: int, unit: str) -> str:
+    """The refusal :meth:`CostGate.statement_cap` raises when what is left of
+    the budget cannot be expressed as a cap the server will honour.
+
+    Two sentences rather than one per connector: the shortfall is the same
+    event whether the floor is one second of statement timeout or BigQuery's
+    per-query billing minimum, and the caller's move is the same either way.
+    """
+
+    shortfall = (
+        f"the remaining budget is under one {unit}"
+        if floor == 1
+        else (
+            f"the remaining budget ({remaining:,} {unit}s) is below the "
+            f"{floor:,}-{unit} minimum this connector can cap a statement at"
+        )
+    )
+    return f"{shortfall}; raise --budget or narrow the work"
+
+
 def skipped_handshake_warning(paradigm: Paradigm, confirmed: bool) -> list[str]:
     """The warning a command carries when the confirm handshake would have
     fired but the paradigm cannot bill, so nothing needed confirming
@@ -820,10 +840,55 @@ class CostGate:
             return False
         return True
 
-    def remaining_for_statement(self) -> int | None:
-        """The server-side cap for the next statement, in the paradigm's unit
-        (bytes for ``maximum_bytes_billed``, seconds for a statement timeout):
-        what remains of the effective ceiling after everything already charged.
+    def statement_cap(self, *, unit: str, minimum: int = 1) -> int | None:
+        """The server-side cap to hand the warehouse for the next statement, in
+        the paradigm's unit (bytes for ``maximum_bytes_billed``, seconds for a
+        statement timeout), or ``None`` when no ceiling applies at all.
+
+        **The refusal is part of this call, which is why it is the only way to
+        price a statement.** A cap of 0 does not mean "spend nothing" to a
+        server: Postgres ``statement_timeout``, ClickHouse ``max_execution_time``
+        and Databricks ``STATEMENT_TIMEOUT`` all read it as *no limit*, so a
+        budget with less than one unit left would remove the backstop at exactly
+        the moment it is the only thing between a wrong estimate and an
+        unbounded scan. Each adapter used to test the returned magnitude for
+        itself and refuse, which worked and was a convention rather than a
+        contract: one forgotten ``if`` in a new connector, failing in the most
+        expensive direction while looking like an ordinary run (issue #316). So
+        the shortfall raises :class:`OverCeilingError` from here, and what this
+        returns is only ever a cap the server will honour.
+
+        ``minimum`` is the smallest cap that connector's server can usefully be
+        given: one unit for a statement timeout, and BigQuery's 10 MB per-query
+        billing minimum for ``maximum_bytes_billed``, under which every query is
+        refused by the server rather than bounded by it. ``unit`` names that unit
+        in the refusal in the connector's own vocabulary (a "database-second", a
+        "byte"), because it is what the caller has to raise ``--budget`` in.
+        """
+
+        floor = max(minimum, 1)
+        remaining = self._remaining_for_statement()
+        if remaining is not None and remaining < floor:
+            raise OverCeilingError(
+                _cap_shortfall(remaining, floor, unit),
+                cost=Cost(
+                    paradigm=self.paradigm,
+                    estimate=self._estimated,
+                    ceiling=self.effective_ceiling(),
+                ),
+            )
+        return remaining
+
+    def _remaining_for_statement(self) -> int | None:
+        """What remains of the effective ceiling after everything already
+        charged, as the integer every connector's cap setting takes: ``None``
+        when nothing bounds the statement, 0 when the budget is exhausted, and
+        otherwise at least 1.
+
+        Private, and reached only through :meth:`statement_cap`. Those two
+        answers are one careless comparison apart at a call site and mean
+        opposite things to a server, so the boundary that faces an adapter
+        refuses on the 0 rather than handing it over to be recognised.
 
         Bounded by the booking as well as by the ceiling, when there is one. The
         two differ exactly when another command is holding headroom, and handing
@@ -832,24 +897,17 @@ class CostGate:
         together. :meth:`charge` widens the booking when the estimate genuinely
         drifts, so this tightens the cap without capping honest work.
 
-        **A 0 here is a refusal, so only the ceiling may produce one.** The
-        result is an integer because every connector's cap setting takes one,
-        and on the time-paradigm connectors a cap of 0 does not mean "spend
-        nothing" but *no limit* (Postgres ``statement_timeout``, ClickHouse
-        ``max_execution_time``), so the adapters refuse when this returns under
-        one unit rather than handing the server a 0.
-
-        That makes which term produced a sub-unit value load-bearing, and
-        conflating the two was a real defect. ``effective_ceiling`` minus what
-        has actually been *billed* running low means the budget is genuinely
-        nearly gone, and refusing is right. The booking is a different thing: it
-        is headroom this command reserved for work that has not happened, and a
-        cheap statement legitimately books a fraction of a unit. Letting that
-        truncate to 0 refused perfectly affordable work, and it fired on every
-        small query the moment ``session_ceiling`` was set, since that is what
-        creates a reservation at all. So the exhaustion test reads the ceiling,
-        and the booking is only ever allowed to *tighten* the cap, never to turn
-        it into a refusal.
+        **Only the ceiling may produce the 0.** Which term produced a sub-unit
+        value is load-bearing, and conflating the two was a real defect.
+        ``effective_ceiling`` minus what has actually been *billed* running low
+        means the budget is genuinely nearly gone, and refusing is right. The
+        booking is a different thing: it is headroom this command reserved for
+        work that has not happened, and a cheap statement legitimately books a
+        fraction of a unit. Letting that truncate to 0 refused perfectly
+        affordable work, and it fired on every small query the moment
+        ``session_ceiling`` was set, since that is what creates a reservation at
+        all. So the exhaustion test reads the ceiling, and the booking is only
+        ever allowed to *tighten* the cap, never to turn it into a refusal.
         """
 
         ceiling = self.effective_ceiling()

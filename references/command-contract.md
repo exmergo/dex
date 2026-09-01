@@ -37,6 +37,17 @@ logic.
   keeps it from warming an environment the next command would contradict.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
   else. Diagnostics go to stderr.
+- Every envelope carries a constant `connection` block. On success it names the
+  resolved connector, its non-secret target coordinates, and the source of that
+  resolution (`flag`, `.dex/config.yml`, `environment variable`,
+  `dbt profiles.yml`, or `directory-local inference`). Commands that resolve no
+  warehouse keep the same shape with null/empty fields. The block is assembled
+  from facts already resolved by the command and never opens a connection or
+  spends merely to describe one.
+- `DBT_PROFILES_DIR` locates `profiles.yml` for dbt operations and the
+  last-resort credential fallback. It does **not** select dex's connector or
+  override `--connector`/`--path` or `.dex/config.yml`; help and no-connector
+  refusals say so explicitly.
 - The agent reads the envelope and decides the next step.
 
 State persists in the dbt project (the source of truth) and the `.dex/` cache, so
@@ -65,7 +76,11 @@ dex connect test                  -> {capabilities, dialect, read_only: true}
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
   [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
                                      it; both no-ops without --rank
-dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings
+dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings.
+  [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
+                                     payload, columns trails; by default columns is summarized to the
+                                     ones carrying a finding, with the rest in elided_column_count.
+                                     --columns all restores every column
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)
@@ -852,6 +867,11 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   resolved the field is `null` instead. A refusal carries the paradigm, the
   estimate, and the ceiling that bound it, so "was this refused over money?" is
   answerable from the structured fields without parsing the error prose.
+- **`connection` names the target that answered.** Its connector, safe target
+  coordinates, and resolution source are stamped once at the CLI boundary so
+  individual command handlers cannot omit or reshape them. The sanitizer scans
+  this block as well as `data`; credentials remain forbidden even if a future
+  connector accidentally places one among its target coordinates.
 - **Diffs, not silent writes.** Proposed changes appear in `diffs`; being there
   does not apply them. The user applies through their normal review and PR flow.
 - **No secrets, no uncleared values.** `data` is scanned before printing

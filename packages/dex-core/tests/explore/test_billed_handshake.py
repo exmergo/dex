@@ -724,7 +724,9 @@ def test_a_mid_batch_shortfall_states_the_exact_extra_budget_needed(
     assert statuses.count("ok") >= 1
     assert "failed" in statuses
     failed = next(r for r in results if r["status"] == "failed")
-    assert "is below BigQuery's" in failed["error"]
+    # The shortfall is the cost gate's own refusal (issue #316), so it names
+    # the per-query minimum the cap fell under rather than the connector.
+    assert "is below the 10,485,760-byte minimum" in failed["error"]
     assert "needs at least" in failed["error"]
     assert "bytes_scanned" in failed["error"]
     assert "does not re-pay for them" in failed["error"]

@@ -309,7 +309,8 @@ def no_connector_selected(
         return NoConnectorSelectedError(
             "no connector selected: pass connector= (with path= for duckdb) or a "
             "config= that declares one, or build from a project on disk with "
-            "DexEngine.from_repo(repo_root)"
+            "DexEngine.from_repo(repo_root). DBT_PROFILES_DIR only locates dbt "
+            "profiles.yml; it does not select dex's connector"
         )
     if ambiguous_duckdb:
         names = ", ".join(str(p) for p in ambiguous_duckdb)
@@ -321,7 +322,8 @@ def no_connector_selected(
     return NoConnectorSelectedError(
         f"no .dex/config.yml found searching from '{repo_root}' up to the git "
         "root: run inside your dex project, pass --repo-root, or pass "
-        "--connector/--path for an ad-hoc read"
+        "--connector/--path for an ad-hoc read. DBT_PROFILES_DIR only locates "
+        "dbt profiles.yml; it does not select dex's connector"
     )
 
 

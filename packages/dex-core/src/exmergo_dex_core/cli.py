@@ -33,6 +33,16 @@ from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
 
 # The full command surface. Group -> its subcommands.
+#
+# Adding a subcommand here means adding it to `DexEngine` too (#344): the CLI is
+# a wrapper over the engine, not a parallel implementation of it, so every entry
+# below needs a `DexEngine` method offering the same capability, unless it is
+# named in `_SUBCOMMAND_PARITY`'s CLI-only allowlist with a reason (see
+# `packages/dex-core/tests/test_cli_contract.py`, the section on CLI/DexEngine
+# parity). That test fails on a subcommand with no method and on one whose
+# method cannot express something the CLI can, which is what keeps the two
+# surfaces from drifting apart the way `DexEngine.check()` once had (it dropped
+# the object-scope argument all four of its sibling detectors accept).
 COMMAND_SURFACE: dict[str, list[str]] = {
     "connect": ["test"],
     "explore": [
@@ -192,6 +202,10 @@ _GROUP_HELP: dict[str, str] = {
 _EPILOG = """\
 Point it at data with --connector/--path, or commit a connector: block to
 .dex/config.yml (found by walking up from the working directory).
+
+DBT_PROFILES_DIR only locates dbt profiles.yml for dbt operations and the
+last-resort credential fallback; it does not select dex's connector or override
+--connector/--path or .dex/config.yml.
 
 No warehouse yet: `dex demo` seeds a local one, no credentials needed.
 Have one already: `dex explore map` is the command to run first -- it
@@ -365,6 +379,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=argparse.SUPPRESS,
                     )
+                    # Default summarizes each dataset's columns to the ones that
+                    # carry a finding (#288); --columns all restores the full list.
+                    sp.add_argument(
+                        "--columns", choices=["all"], default=argparse.SUPPRESS
+                    )
                 # Force a full re-profile even when the cache holds a fresh,
                 # schema-matching profile for a requested object (the default is
                 # skip-if-cached; --refresh is the escape hatch when the source
@@ -438,7 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument(
                         "--full", action="store_true", default=argparse.SUPPRESS
                     )
-                if group == "transform" and name in {"rename", "remove", "place"}:
+                if group == "transform" and name in {"rename", "remove"}:
                     # The write half of `references`, so it sits behind the
                     # dialect gate the read half is routed around: these author
                     # SQL and need the engine that parses it.
@@ -448,7 +467,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     # removes a declaration and refuses while a read survives,
                     # and only the caller knows what a read should become); a
                     # rename accepts it so a related hand-authored change can
-                    # ride in the same atomic plan.
+                    # ride in the same atomic plan. Not `place` (#344): it takes
+                    # no edits_file parameter and never read the flag, so the
+                    # parser accepted it as a silent no-op.
                     sp.add_argument("--edits-file", default=None)
                 if group == "transform" and name == "rename":
                     sp.add_argument("kind")
@@ -696,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
     # reason the paradigm is: `close()` drops the adapter the gate hangs off,
     # and it runs before the handlers below.
     spend: dict | None = None
+    connection = env.Connection()
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -735,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
             # number about it.
             with contextlib.suppress(Exception):
                 spend = engine.settled_spend()
+            connection = engine.connection_provenance()
             engine.close()
     except env.SanitizationError:
         # A sanitization failure must never be swallowed: re-raise so it surfaces
@@ -783,6 +806,10 @@ def main(argv: list[str] | None = None) -> int:
     # `free_local`, which is DuckDB's answer and not a way to say nothing.
     if envelope.cost.paradigm is None and paradigm is not None:
         envelope.cost.paradigm = paradigm
+
+    # The connection identity is stamped centrally, just like cost paradigm:
+    # handlers cannot drift, and filling it performs no extra warehouse read.
+    envelope.connection = connection
 
     env.emit(envelope)
     return 0 if envelope.status != env.Status.ERROR else 1
