@@ -748,6 +748,12 @@ class DexConfig(BaseModel):
     # How fresh a cached profile must be to skip re-scanning it (`explore map` /
     # `explore relationships`); 0 disables reuse (always re-profile).
     profile_freshness_hours: float = 24.0
+    # How many values `explore profile` serializes for a column's value domain
+    # (issue #290): the most frequent ones, with the rest folded into that
+    # domain's `elided` count. The default equals the probe's own cap
+    # (`adapters.base.VALUE_DOMAIN_CAP`), so nothing is cut unless a repo asks;
+    # lowering it trims the payload and never what is probed or cached.
+    profile_value_domain_cap: int = 25
     # Whether `explore query` and `explore cluster` may profile an object the
     # connection has but the cache cannot speak for, instead of refusing. Priced
     # and disclosed when it happens. Top-level rather than under `query:` because

@@ -11,6 +11,40 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`explore profile` drops the fields that are null on every column, and caps
+  each value domain** ([#290]). On the 107-column staging table #288 measured,
+  every column carried a 12-field object, and one of those fields,
+  `pii_overridden`, was null on all 107 of them: emitted 107 times and
+  carrying no information in any of them. Several more were null on most
+  (`pii` on 100, `min_value` and `max_value` on 61), and the populated
+  `value_domain` blocks alone were 19% of the 38 KB payload.
+
+  A per-column field that is null on every column the payload serializes is
+  now dropped from each of them and named once, at dataset level, in
+  `suppressed_fields`, so the absence is legible rather than mysterious and an
+  omitted field can never be mistaken for one that was never part of the
+  contract. The judgment is over the columns actually shown, so the payload is
+  consistent with itself under both the default summary and `--columns all`,
+  and the list sits ahead of `columns`, where a truncated read still reaches
+  it. A field that is null on some columns but not all stays on every column:
+  a string column's suppressed `min_value` beside a numeric column's real one
+  is a finding, not padding. `suppressed_fields` is always present, so an
+  empty list is the positive statement that the columns shown carry their
+  full shape.
+
+  Each `value_domain` is also capped at its `profile_value_domain_cap` most
+  frequent values (`.dex/config.yml`, default 25), with the rest folded into
+  the domain's `elided` count, so `values` plus `elided` is still the exact
+  distinct total. The default equals the probe's own cap, so nothing changes
+  until a repo lowers it. Both reductions apply to the serialized payload
+  only: the cached profile keeps every field and every probed value, and a
+  library caller reading `ProfileResult.datasets` sees it unreduced.
+
+  Not taken up here: the issue's separate suggestion to compute `min_value`
+  and `max_value` for VARCHAR columns. That suppression is a guardrail, not
+  an oversight: a string extreme is a raw value, and no raw value crosses
+  this envelope. Date and timestamp columns already report their range.
+
 - **`transform plan` warns when a model passes a raw foreign key through into a
   folder whose siblings all resolve theirs** ([#223]). A dimension exposing
   `supplier_id` where every sibling dimension resolves the equivalent key to
