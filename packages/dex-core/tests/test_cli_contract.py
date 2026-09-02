@@ -657,6 +657,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "method": "semantic_drift",
         "args": {"objects": "objects"},
     },
+    ("maintain", "verify"): {"method": "verify", "args": {"objects": "objects"}},
     ("maintain", "reconcile"): {
         "method": "reconcile",
         "args": {"drift_class": "drift_class"},
