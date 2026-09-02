@@ -192,7 +192,11 @@ still binds exactly via a server-side statement timeout, except on ClickHouse,
 where it binds via `max_execution_time` **and** `max_bytes_to_read`, because
 time alone is checked only at block boundaries there. Actual spend comes
 back under `data.spend` (`bytes_billed` or `seconds_billed`) and accumulates
-in the `.dex/spend.jsonl` ledger per connector. That ledger gates billing and
+in the `.dex/spend.jsonl` ledger per connector. That is the only place spend is
+reported: every command that can bill carries the unit key whatever it settled
+at, zero included, and no command puts a billed magnitude anywhere else in
+`data`, because a key present on one command and absent on another reads as a
+spend of zero rather than as a key to look for elsewhere. That ledger gates billing and
 nothing else: it is read where work is admitted, not where a connection is
 assembled, so a command that cannot spend does not depend on it, and a ledger
 that cannot be read refuses billed work by name while reporting the day's total

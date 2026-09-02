@@ -833,6 +833,19 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   plus `session_spent_today`, which is what the next command's cumulative
   ceiling will start from. A failed build reports it too: dbt bills for the
   statements it ran before it stopped.
+- **And it is the only place spend is reported.** No command puts a billed
+  magnitude anywhere else in `data`, and every command that can bill carries the
+  unit key whatever it settled at, zero included. Both halves are the same rule:
+  a key that exists on one command and not another is worse than one that never
+  exists, because at the top of `data` a missing key reads as a value, and the
+  value it reads as is zero. `transform build` used to stamp `data.bytes_billed`
+  as well, so a caller reading that key saw a build's spend and read a `maintain
+  check` that had just scanned 0.89 GB as free. Under-reporting spend is the one
+  envelope defect that breaks the cost-governance guarantee rather than annoying
+  the caller, so where a figure is genuinely unavailable the key reports `null`
+  and a note says why, rather than rounding an unknown down to zero. Key parity
+  across `transform build`, `maintain check`, `explore query`, `explore map` and
+  `explore profile` is a contract test.
 - **ClickHouse's paradigm depends on its declared deployment.** Config-free
   callers retain the backward-compatible `db_load` default; an effective
   `clickhouse.deployment: cloud` uses `compute_time`. Cloud keeps seconds as the
