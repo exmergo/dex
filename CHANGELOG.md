@@ -43,6 +43,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   
 ### Changed
 
+- **`explore query` now carries compact cache-backed column and query notes
+  beside result cells.** When projected columns resolve to already-profiled
+  cached relations, the payload can include `column_notes` for non-zero null
+  fractions, PII flags, and selected-grain coverage. Queries that group or join
+  can also include `query_notes` comparing grouping keys to known grain and
+  reporting verified cached join overlap. The annotations are strictly additive,
+  cache-only, and omitted when dex cannot resolve them without guessing.
+
 - **A project is now asked once for a cumulative spend ceiling, instead of
   warned about it forever** ([#283]). With `budget.session_ceiling` unset, every
   billed command carried a warning that nothing bounded the day's total across
