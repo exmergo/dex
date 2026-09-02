@@ -502,6 +502,9 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "refresh": "refresh",
             "use_project": "use_project",
             "check_cumulative": "check_cumulative",
+            # --columns takes the literal "all" (argparse `choices=["all"]"),
+            # translated to the engine's boolean `show_all_columns`.
+            "columns": _TRANSLATED,
         },
     },
     ("explore", "relationships"): {
@@ -685,6 +688,10 @@ _CONNECTION_DESTS = {
     "confirm",
     "budget",
     "help",
+    # The one-time cumulative-ceiling ask's two answers (#283), on every
+    # subparser via `_sub_connection_options()` same as --budget.
+    "session_ceiling",
+    "no_session_ceiling",
 }
 
 
