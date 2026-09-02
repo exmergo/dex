@@ -127,8 +127,13 @@ matched.
 
 Relationship inference reads the profiles already gathered and never scans data to
 verify referential integrity, so it stays free and read-only at the cost of
-certainty, which is why every inferred join carries a confidence. A join is
-proposed when a foreign-key-shaped column name matches a parent object whose
+certainty, which is why every inferred join carries a confidence. The opt-in
+verification pass is the one place joins are measured, and it batches: the joins
+sharing a child relation are answered by one read of it, so what verification
+costs follows the relations it touches rather than the number of joins between
+them.
+
+A join is proposed when a foreign-key-shaped column name matches a parent object whose
 corresponding column is a candidate key and the types are compatible; confidence
 reflects how strong the name and key signals are. Candidate keys and the most
 likely grain come from the uniqueness signals: single columns proven unique, plus
