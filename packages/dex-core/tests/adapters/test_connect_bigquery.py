@@ -456,7 +456,7 @@ def test_server_side_cap_translates_when_the_estimate_drifts(fake_bq_client):
 # --- issue #320: the server-side cap must not be pinned below the confirmed
 # budget by BigQuery's own execution-time billing rounding, which no dry run
 # predicts. The bug's actual trigger is a `session_ceiling`: without one,
-# `remaining_for_statement()` already equals the confirmed ceiling directly
+# `statement_cap()` already equals the confirmed ceiling directly
 # (see `test_every_executed_job_carries_maximum_bytes_billed` above); with
 # one, the per-statement cap is additionally bounded by this command's own
 # reservation (booked at confirm time, sized to the dry-run estimate), which

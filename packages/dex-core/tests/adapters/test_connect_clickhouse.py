@@ -366,7 +366,7 @@ def test_a_sub_second_remainder_is_refused_rather_than_sent_as_zero(
     at exactly the moment the budget is nearly spent."""
 
     adapter = make_adapter(fake_clickhouse_connection, ceiling=600.0)
-    # Settled spend, not a booking: remaining_for_statement measures the ceiling
+    # Settled spend, not a booking: the statement cap measures the ceiling
     # against what has actually been billed, which is what the server cap is
     # derived from.
     adapter.cost_gate.record_billed(599.5, job_id=None, statement="prior")

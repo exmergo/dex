@@ -18,7 +18,14 @@ from pathlib import Path
 from .adapters.base import Adapter
 from .config import CONFIG_FILE
 from .envelope import Cost
-from .guards.cost_guard import ConfirmationRequiredError, CostGate, OverCeilingError
+from .guards.cost_guard import (
+    SUGGESTED_SESSION_CEILING_MULTIPLE,
+    ConfirmationRequiredError,
+    CostGate,
+    OverCeilingError,
+    SessionCeilingDecisionRequiredError,
+    suggested_session_ceiling,
+)
 from .results import ConfirmationRequest, Result
 from .storage import DEX_DIR
 
@@ -92,6 +99,81 @@ def preflight_cost(adapter: Adapter) -> Cost:
     return gate.cost() if gate is not None else Cost(paradigm=adapter.paradigm)
 
 
+def _estimate_payload(
+    command: str, adapter: Adapter, estimate: float, per_table: dict | None
+) -> dict:
+    """The connector's own description of an estimate, or the bytes default.
+
+    Shared by the two asks the whole-command handshake can raise, so both speak
+    one vocabulary: an adapter that translates its unit (Snowflake's credits,
+    ClickHouse's compute-unit-hours) describes its estimate the same way
+    whichever ask the caller is answering.
+    """
+
+    describe = getattr(adapter, "describe_estimate", None)
+    if describe is not None:
+        return {"command": command, **describe(estimate, per_table)}
+    data = {
+        "command": command,
+        "estimated_bytes": estimate,
+        "hint": (
+            "review the estimate, then re-run with --confirm --budget "
+            "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
+            "$0.06 on-demand)"
+        ),
+    }
+    if per_table:
+        data["per_table_bytes"] = per_table
+    return data
+
+
+def session_ceiling_ask(
+    command: str,
+    adapter: Adapter,
+    gate: CostGate,
+    estimate: float,
+    *,
+    per_table: dict[str, float] | None = None,
+) -> dict:
+    """The payload for the one-time cumulative-ceiling ask (issue #283).
+
+    Built on the same estimate description the cost ask carries, because picking
+    a ceiling for the day is the same judgement as picking one for the command,
+    made in the same unit and from the same number. The connector's own
+    ``hint`` is replaced rather than appended to: it names ``--confirm
+    --budget``, and a caller who reached this ask has already passed both.
+    """
+
+    suggested = suggested_session_ceiling(estimate)
+    unit = gate.paradigm.value
+    data = _estimate_payload(command, adapter, estimate, per_table)
+    instruction = (
+        "nothing bounds the day's total spend for this project: "
+        "budget.session_ceiling is unset in .dex/config.yml, so this command "
+        "and every one after it is bound by its own budget alone. Re-run with "
+        f"--session-ceiling {suggested:.0f} to set one (in {unit}, "
+        f"{SUGGESTED_SESSION_CEILING_MULTIPLE:.0f}x this command's estimate as "
+        "a starting point -- pass your own number instead), or with "
+        "--no-session-ceiling to record that this project runs unbounded. "
+        "Either answer is written to .dex/config.yml and you are asked once; "
+        "neither changes the per-command --budget"
+    )
+    data.update(
+        {
+            "session_ceiling": None,
+            "suggested_session_ceiling": suggested,
+            "hint": instruction,
+            # The same sentence under a key nothing else writes. `to_envelope`
+            # merges a two-phase command's own payload over the pending ask's,
+            # and a command that returns findings alongside the ask (`maintain
+            # check`, `maintain semantic`) carries its own `hint`, so `hint`
+            # alone is not a channel this ask can rely on reaching the caller.
+            "session_ceiling_hint": instruction,
+        }
+    )
+    return data
+
+
 def billed_handshake(
     command: str,
     adapter: Adapter,
@@ -125,6 +207,18 @@ def billed_handshake(
     reserve = reserve(estimate) if reserve is not None else None
     try:
         gate.preflight_command(estimate)
+    except SessionCeilingDecisionRequiredError as exc:
+        # Before the plain confirmation clause below, which would otherwise
+        # catch this subclass and answer it with the cost ask's payload: the two
+        # asks are re-issued with different flags, so they cannot share a hint.
+        exc.request = ConfirmationRequest(
+            cost=exc.cost,
+            data=session_ceiling_ask(
+                command, adapter, gate, estimate, per_table=per_table
+            ),
+            warnings=gate.warnings(),
+        )
+        raise
     except OverCeilingError as exc:
         # A refusal is the message an operator acts on and the one that carries
         # the least. Without this, an estimate padded with escalation reserve
@@ -140,21 +234,27 @@ def billed_handshake(
         # than the raw magnitude (Snowflake's credit translation, its
         # estimate-quality caveat) describes its own estimate; the bytes shape
         # is the default the bytes-scanned connectors settled on.
-        describe = getattr(adapter, "describe_estimate", None)
-        if describe is not None:
-            data = {"command": command, **describe(estimate, per_table)}
-        else:
-            data = {
-                "command": command,
-                "estimated_bytes": estimate,
-                "hint": (
-                    "review the estimate, then re-run with --confirm --budget "
-                    "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
-                    "$0.06 on-demand)"
-                ),
-            }
-            if per_table:
-                data["per_table_bytes"] = per_table
+        data = _estimate_payload(command, adapter, estimate, per_table)
+        if gate.session_ceiling_pending(estimate):
+            # The cost ask comes first, and a caller who reads it can answer
+            # both in one re-run instead of confirming the cost and meeting the
+            # cumulative-ceiling ask on the next round trip (issue #283).
+            suggested = suggested_session_ceiling(estimate)
+            advice = (
+                "this project has not decided whether the day's total spend is "
+                "bounded, and the confirmed run will stop to ask: add "
+                f"--session-ceiling {suggested:.0f} to set one "
+                f"({SUGGESTED_SESSION_CEILING_MULTIPLE:.0f}x this estimate, in "
+                f"{gate.paradigm.value}) or --no-session-ceiling to record that "
+                "it runs unbounded, and answer both in one re-run"
+            )
+            data["suggested_session_ceiling"] = suggested
+            # `hint` belongs to the cost ask here, since that is what this
+            # payload is answered with; the advice rides in `notes` and again
+            # under its own key, which no merge can overwrite.
+            data["session_ceiling_hint"] = advice
+            data.setdefault("notes", [])
+            data["notes"] = [*data["notes"], advice]
         if reserve is not None:
             # Prose and flat keys both: the note is what a person reads when
             # deciding whether raising the budget buys work or headroom, and

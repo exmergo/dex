@@ -1149,12 +1149,7 @@ class SnowflakeAdapter:
         of the budget, so even a wrong heuristic cannot overrun the ceiling."""
 
         info = self._warehouse()  # refuses when config pins no warehouse
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one warehouse-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         cursor = self._conn.cursor()
         if not self._session_prepared:
             # dex-built session statements, not agent SQL: the warehouse

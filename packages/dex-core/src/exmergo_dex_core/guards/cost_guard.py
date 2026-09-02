@@ -10,6 +10,13 @@ runs without explicit confirmation. The check order is deliberate:
 3. An unconfirmed command on a billed paradigm raises
    :class:`ConfirmationRequiredError` carrying the cost, which the command layer
    maps to a ``needs_confirmation`` envelope.
+4. A confirmed, budgeted command in a project that has never decided whether the
+   *day's* total is bounded raises
+   :class:`SessionCeilingDecisionRequiredError`, a subclass of the above, so the
+   default state of every new project is a decision made once rather than a
+   warning repeated forever (issue #283). Last, because it is the only check
+   whose ask is worth making after the cost has been agreed to, and because the
+   cost ask can then carry its suggestion as advice.
 
 ``FREE_LOCAL`` (DuckDB) skips step 3 (issue #197): the confirm handshake exists to
 gate spend, and a connector that cannot bill has none to gate, so asking for
@@ -37,6 +44,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import UTC, datetime
+from pathlib import Path
 
 from ..envelope import Cost, Paradigm
 from ..errors import DexError
@@ -110,16 +118,116 @@ class ConfirmationRequiredError(CostGuardError):
     # priced gate, so callers read `exc.cost.estimate` without a None check.
     cost: Cost
 
-    def __init__(self, cost: Cost):
+    def __init__(self, cost: Cost, message: str | None = None):
         super().__init__(
-            "confirmation required: re-run with --confirm (and a --budget on "
-            "billed connectors) after reviewing the cost estimate",
+            message
+            or (
+                "confirmation required: re-run with --confirm (and a --budget "
+                "on billed connectors) after reviewing the cost estimate"
+            ),
             cost=cost,
         )
         # Starts as just the cost, which is all the gate knows; the command layer
         # replaces it with the full agent-facing payload on the way out. Never
         # None, so a caller can always read it.
         self.request = ConfirmationRequest(cost=cost)
+
+
+class SessionCeilingDecisionRequiredError(ConfirmationRequiredError):
+    """The project has never decided whether the day's total spend is bounded.
+
+    A subclass of :class:`ConfirmationRequiredError` because it is the same
+    event in the same channel: a priced ask, nothing spent, recoverable by
+    re-issuing the command with one more flag. Every boundary that already turns
+    an unmet confirmation into a ``needs_confirmation`` envelope therefore turns
+    this one into one too, and a host that catches the base class keeps working
+    without knowing this exists.
+
+    Distinct as a class for the one thing that differs: what re-issuing takes.
+    The cost ask is answered by ``--confirm --budget``, this one by
+    ``--session-ceiling <value>`` or ``--no-session-ceiling``, and the command
+    layer has to build a different payload for it.
+
+    ``suggested`` is the starting point the ask names, derived from this
+    command's own estimate (see :func:`suggested_session_ceiling`).
+    """
+
+    def __init__(self, cost: Cost, *, suggested: float):
+        super().__init__(
+            cost,
+            "no cumulative spend ceiling has been decided for this project: "
+            "budget.session_ceiling is unset in .dex/config.yml, so nothing "
+            "bounds the day's total across commands. Re-run with "
+            f"--session-ceiling {suggested:.0f} to set one, or with "
+            "--no-session-ceiling to record that this project runs without "
+            "one. You are asked once either way",
+        )
+        self.suggested = suggested
+
+
+#: What the one-time ask suggests, as a multiple of the asking command's own
+#: estimate. Small on purpose: the number has to be plausible enough to accept
+#: unread and loose enough that accepting it does not refuse the next few
+#: commands, and a day that runs several commands the size of this one is the
+#: shape of an ordinary session. It is a starting point the caller overrides by
+#: passing their own number, never a recommendation dex stands behind.
+SUGGESTED_SESSION_CEILING_MULTIPLE = 5.0
+
+
+def suggested_session_ceiling(estimate: float) -> float:
+    """The cumulative ceiling the one-time ask names, in the paradigm's own unit.
+
+    Derived from the command in hand rather than from a table of per-connector
+    defaults, because the one number dex can honestly reason from is what this
+    caller's own work costs: a byte figure that suits a warehouse of ten tables
+    is meaningless against one of ten thousand, and a default that fits neither
+    would be refused or ignored on its first day.
+    """
+
+    return float(math.ceil(estimate * SUGGESTED_SESSION_CEILING_MULTIPLE))
+
+
+def session_ceiling_undecided(
+    paradigm: Paradigm,
+    session_ceiling: float | None,
+    *,
+    declined: bool,
+    config_path: Path | None,
+    estimate: float,
+) -> bool:
+    """Whether a billed command has to stop and ask for a cumulative ceiling
+    (issue #283).
+
+    ``budget.ceiling`` is refused when missing and ``budget.session_ceiling`` is
+    only warned about, and the gap between those two defensible positions is
+    where an unbounded day lives. The warning was accurate, well worded, and
+    attached to the default state of every new project, which is the condition
+    under which warnings stop being read: five billed commands can run bound by
+    their per-command caps alone, each carrying the same sentence, with the
+    aggregate bounded by nothing. So the default becomes a decision, asked once.
+
+    Four conditions narrow it to exactly that:
+
+    - A billed paradigm with no cumulative ceiling set. ``FREE_LOCAL`` bills
+      nothing, so there is no day's total for a cap to bound.
+    - The decision was never recorded. Set a ceiling or decline one and this is
+      permanently quiet in that project; nothing here re-opens a settled
+      decision.
+    - There is a committed ``.dex/config.yml`` to record it in. An ad-hoc read
+      has nowhere to write an answer, so asking would be asking a question the
+      caller cannot answer, and it keeps the warning instead.
+    - The command actually priced something. A zero estimate bills nothing and
+      gives the ask no honest starting point to name, so the project is asked by
+      the next command that does price work.
+    """
+
+    return (
+        paradigm is not Paradigm.FREE_LOCAL
+        and session_ceiling is None
+        and not declined
+        and config_path is not None
+        and estimate > 0
+    )
 
 
 def ledger_field(paradigm: Paradigm) -> str:
@@ -168,7 +276,7 @@ def utc_day_start() -> str:
 
 
 def no_session_ceiling_warning(
-    paradigm: Paradigm, session_ceiling: float | None
+    paradigm: Paradigm, session_ceiling: float | None, *, declined: bool = False
 ) -> list[str]:
     """The warning a billed command carries when no cumulative cap is set.
 
@@ -179,6 +287,13 @@ def no_session_ceiling_warning(
     enforced from outside, so an unset ``session_ceiling`` reads as a cap that
     bound rather than one that never existed.
 
+    It survives the one-time ask (issue #283) unchanged, including for a project
+    that answered it by declining: what the caller needs to know on a result is
+    that the day's total was bounded by nothing, and that is equally true either
+    way. ``declined`` only names *why* it is unset, so a reader can tell a
+    project that decided this from one that was never asked, and so the sentence
+    does not keep proposing a decision that has already been made.
+
     Module level rather than only a :class:`CostGate` method because ``transform
     build`` prices itself outside the gate on the degraded-pricing path and has
     to reach the same sentence; two spellings would drift.
@@ -186,12 +301,19 @@ def no_session_ceiling_warning(
 
     if paradigm is Paradigm.FREE_LOCAL or session_ceiling is not None:
         return []
+    decided = (
+        " This project recorded that choice deliberately "
+        "(budget.session_ceiling_declined), so nothing will ask again; set "
+        "budget.session_ceiling to bound the day."
+        if declined
+        else ""
+    )
     return [
         "no cumulative spend ceiling: budget.session_ceiling is unset in "
         ".dex/config.yml, so this command was bound by its own budget alone and "
         "nothing bounds the day's total across commands. Config is read from "
         "this repo root only, so a ceiling set in another root does not apply "
-        "here"
+        f"here.{decided}"
     ]
 
 
@@ -269,6 +391,26 @@ def preflight(
     return cost
 
 
+def _cap_shortfall(remaining: int, floor: int, unit: str) -> str:
+    """The refusal :meth:`CostGate.statement_cap` raises when what is left of
+    the budget cannot be expressed as a cap the server will honour.
+
+    Two sentences rather than one per connector: the shortfall is the same
+    event whether the floor is one second of statement timeout or BigQuery's
+    per-query billing minimum, and the caller's move is the same either way.
+    """
+
+    shortfall = (
+        f"the remaining budget is under one {unit}"
+        if floor == 1
+        else (
+            f"the remaining budget ({remaining:,} {unit}s) is below the "
+            f"{floor:,}-{unit} minimum this connector can cap a statement at"
+        )
+    )
+    return f"{shortfall}; raise --budget or narrow the work"
+
+
 def skipped_handshake_warning(paradigm: Paradigm, confirmed: bool) -> list[str]:
     """The warning a command carries when the confirm handshake would have
     fired but the paradigm cannot bill, so nothing needed confirming
@@ -322,10 +464,20 @@ class CostGate:
         command: str | None = None,
         record: Callable[[dict], None] | None = None,
         lock: Callable[[], AbstractContextManager[None]] | None = None,
+        session_ceiling_declined: bool = False,
+        config_path: Path | None = None,
     ):
         self.paradigm = paradigm
         self.ceiling = ceiling
         self.session_ceiling = session_ceiling
+        # The two inputs to the one-time cumulative-ceiling ask (issue #283),
+        # beside `session_ceiling` itself: whether this project already declined
+        # one, and whether there is a committed config to record an answer in.
+        # Both default to the state that keeps the ask silent, so a gate built
+        # directly (a test, a host assembling its own) behaves as it did before
+        # the ask existed.
+        self.session_ceiling_declined = session_ceiling_declined
+        self.config_path = config_path
         self.confirmed = confirmed
         self.connector = connector
         self.command = command
@@ -550,8 +702,57 @@ class CostGate:
                         "pass --budget or set one in .dex/config.yml",
                         cost=cost,
                     )
+                self.require_session_ceiling_decision(estimate, cost=cost)
             self._reserve_to(estimate)
         return cost
+
+    def require_session_ceiling_decision(
+        self, estimate: float, *, cost: Cost | None = None
+    ) -> None:
+        """Ask once, per project, whether the day's total spend is bounded.
+
+        Deliberately last of the four checks in :meth:`preflight_command`. The
+        cost ask comes first because it is how the caller learns the estimate
+        this suggestion is derived from, and it can then carry the suggestion as
+        advice, so a caller who reads its payload answers both asks in one
+        re-run and never sees this exception at all. What reaches here is a
+        command that was confirmed and budgeted while stepping over the one
+        question nothing else in the guard forces: whether anything bounds the
+        day.
+
+        Before the reservation is booked and therefore before any spend, like
+        every other refusal in that method: the ask leaves through the
+        exception, so an unanswered one touches the ledger not at all.
+        """
+
+        if not self.session_ceiling_pending(estimate):
+            return
+        raise SessionCeilingDecisionRequiredError(
+            cost
+            if cost is not None
+            else Cost(
+                paradigm=self.paradigm,
+                estimate=estimate,
+                ceiling=self.effective_ceiling(),
+            ),
+            suggested=suggested_session_ceiling(estimate),
+        )
+
+    def session_ceiling_pending(self, estimate: float) -> bool:
+        """Whether this project still owes the one-time cumulative-ceiling answer.
+
+        Read by the command layer as well as by the raise above: the cost ask
+        fires first and carries the suggestion as advice, which is how a caller
+        that reads one payload answers both asks in one re-run.
+        """
+
+        return session_ceiling_undecided(
+            self.paradigm,
+            self.session_ceiling,
+            declined=self.session_ceiling_declined,
+            config_path=self.config_path,
+            estimate=estimate,
+        )
 
     def preflight_phase(self, estimate: float) -> Cost:
         """Mid-command gate for a phase whose cost is only knowable after
@@ -639,10 +840,55 @@ class CostGate:
             return False
         return True
 
-    def remaining_for_statement(self) -> int | None:
-        """The server-side cap for the next statement, in the paradigm's unit
-        (bytes for ``maximum_bytes_billed``, seconds for a statement timeout):
-        what remains of the effective ceiling after everything already charged.
+    def statement_cap(self, *, unit: str, minimum: int = 1) -> int | None:
+        """The server-side cap to hand the warehouse for the next statement, in
+        the paradigm's unit (bytes for ``maximum_bytes_billed``, seconds for a
+        statement timeout), or ``None`` when no ceiling applies at all.
+
+        **The refusal is part of this call, which is why it is the only way to
+        price a statement.** A cap of 0 does not mean "spend nothing" to a
+        server: Postgres ``statement_timeout``, ClickHouse ``max_execution_time``
+        and Databricks ``STATEMENT_TIMEOUT`` all read it as *no limit*, so a
+        budget with less than one unit left would remove the backstop at exactly
+        the moment it is the only thing between a wrong estimate and an
+        unbounded scan. Each adapter used to test the returned magnitude for
+        itself and refuse, which worked and was a convention rather than a
+        contract: one forgotten ``if`` in a new connector, failing in the most
+        expensive direction while looking like an ordinary run (issue #316). So
+        the shortfall raises :class:`OverCeilingError` from here, and what this
+        returns is only ever a cap the server will honour.
+
+        ``minimum`` is the smallest cap that connector's server can usefully be
+        given: one unit for a statement timeout, and BigQuery's 10 MB per-query
+        billing minimum for ``maximum_bytes_billed``, under which every query is
+        refused by the server rather than bounded by it. ``unit`` names that unit
+        in the refusal in the connector's own vocabulary (a "database-second", a
+        "byte"), because it is what the caller has to raise ``--budget`` in.
+        """
+
+        floor = max(minimum, 1)
+        remaining = self._remaining_for_statement()
+        if remaining is not None and remaining < floor:
+            raise OverCeilingError(
+                _cap_shortfall(remaining, floor, unit),
+                cost=Cost(
+                    paradigm=self.paradigm,
+                    estimate=self._estimated,
+                    ceiling=self.effective_ceiling(),
+                ),
+            )
+        return remaining
+
+    def _remaining_for_statement(self) -> int | None:
+        """What remains of the effective ceiling after everything already
+        charged, as the integer every connector's cap setting takes: ``None``
+        when nothing bounds the statement, 0 when the budget is exhausted, and
+        otherwise at least 1.
+
+        Private, and reached only through :meth:`statement_cap`. Those two
+        answers are one careless comparison apart at a call site and mean
+        opposite things to a server, so the boundary that faces an adapter
+        refuses on the 0 rather than handing it over to be recognised.
 
         Bounded by the booking as well as by the ceiling, when there is one. The
         two differ exactly when another command is holding headroom, and handing
@@ -651,24 +897,17 @@ class CostGate:
         together. :meth:`charge` widens the booking when the estimate genuinely
         drifts, so this tightens the cap without capping honest work.
 
-        **A 0 here is a refusal, so only the ceiling may produce one.** The
-        result is an integer because every connector's cap setting takes one,
-        and on the time-paradigm connectors a cap of 0 does not mean "spend
-        nothing" but *no limit* (Postgres ``statement_timeout``, ClickHouse
-        ``max_execution_time``), so the adapters refuse when this returns under
-        one unit rather than handing the server a 0.
-
-        That makes which term produced a sub-unit value load-bearing, and
-        conflating the two was a real defect. ``effective_ceiling`` minus what
-        has actually been *billed* running low means the budget is genuinely
-        nearly gone, and refusing is right. The booking is a different thing: it
-        is headroom this command reserved for work that has not happened, and a
-        cheap statement legitimately books a fraction of a unit. Letting that
-        truncate to 0 refused perfectly affordable work, and it fired on every
-        small query the moment ``session_ceiling`` was set, since that is what
-        creates a reservation at all. So the exhaustion test reads the ceiling,
-        and the booking is only ever allowed to *tighten* the cap, never to turn
-        it into a refusal.
+        **Only the ceiling may produce the 0.** Which term produced a sub-unit
+        value is load-bearing, and conflating the two was a real defect.
+        ``effective_ceiling`` minus what has actually been *billed* running low
+        means the budget is genuinely nearly gone, and refusing is right. The
+        booking is a different thing: it is headroom this command reserved for
+        work that has not happened, and a cheap statement legitimately books a
+        fraction of a unit. Letting that truncate to 0 refused perfectly
+        affordable work, and it fired on every small query the moment
+        ``session_ceiling`` was set, since that is what creates a reservation at
+        all. So the exhaustion test reads the ceiling, and the booking is only
+        ever allowed to *tighten* the cap, never to turn it into a refusal.
         """
 
         ceiling = self.effective_ceiling()
@@ -696,7 +935,11 @@ class CostGate:
         """
 
         return [
-            *no_session_ceiling_warning(self.paradigm, self.session_ceiling),
+            *no_session_ceiling_warning(
+                self.paradigm,
+                self.session_ceiling,
+                declined=self.session_ceiling_declined,
+            ),
             *unserialized_ledger_warning(
                 self.paradigm, self.session_ceiling, self.serialized
             ),

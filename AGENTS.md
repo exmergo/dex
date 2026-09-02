@@ -67,7 +67,7 @@ credentials and no network.
 | `demo [path]` | generates a seeded local DuckDB warehouse (7 tables, 29,512 rows) plus a `.dex/config.yml` beside it, so a first run needs no warehouse, no credentials, and no network; both artifacts are listed in `data.created` and `data.next_steps` names the commands worth running next. The path is positional and resolves against the working directory, defaulting to `dex_demo.duckdb`; `--path` is refused here rather than honored, since everywhere else it names the warehouse dex *reads*. Create-only, with no `--confirm` that can talk past it: an existing file at the target is a refusal (`reason: guard`), a missing parent directory is a refusal (`reason: request`), no directories are ever created, and a `.dex/config.yml` at or above the target is left untouched with a warning rather than shadowed by a second one. The data is generated from a pinned seed, so the counts quoted in the docs are the counts a user sees, and it is deliberately flawed: a key that lost uniqueness to a double-loaded batch, a key mixing two id schemes, a join whose columns share a name and none of their values, an empty table, two columns whose declared type contradicts their content, and personal data alongside two designed false positives. Needs the `[duckdb]` extra and says so by name when it is absent (`reason: prerequisite`) |
 | `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (a bare database on ClickHouse, whose identifiers are two-part `database.table`) (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate; ClickHouse Cloud reports live replica memory and its derived compute-unit rate |
 | `explore inventory [--rank] [--limit N] [--all]` | ranked object summary (counts, sizes; no rows). `--rank` caps at 30 objects by default so the shortlist stays a shortlist on a large warehouse; `--limit` widens it, `--all` lifts the cap; both are no-ops without `--rank`, since the unranked list carries no order to cut from |
-| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
+| `explore profile <objects> [--columns all]` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; the verdict fields (grain, keys, data quality, row count) lead the serialized payload and `columns` trails, so a truncating harness cuts schema rather than the answer. By default each dataset's `columns` is summarized to the ones carrying a finding (PII, a non-zero null fraction, key membership, a reported value domain, or a mention in a `data_quality` note), with the rest counted in `elided_column_count`; `--columns all` restores every column. `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
 | `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe, declared and inferred alike (a composite-key join is not probed: the probe spans one column pair); `--use-project` folds in the dbt project's declared joins at confidence 1.0 from both channels that state one, its `relationships` tests and its semantic layer's shared entities (a declared join wins over the same inferred edge, and an edge both channels declare is counted once). `declared_by` names the semantic entity behind an edge that came from the layer, which is the part a reader can look up with `explore semantic list` and the only part the edge does not already carry; a `relationships` test leaves it unset, having declared exactly the two columns the edge names. `semantic_join_count` splits the two, and the notes say how many of the layer's joins name-based inference did not find, which is the set that matters: a semantic layer routinely joins columns that share no name. A measurement never revises a declared join's confidence, which stays at the 1.0 the project asserts; a declared join whose probe finds the parent largely missing is reported as a finding instead |
 | `explore map [--detail] [--verify] [--use-project]` | writes/updates the `.dex/` map and returns it: the counts as before, plus `data.objects` (per top-ranked object: row count, detected grain, candidate key, the notable columns with the role that earned each one a place, PII flags as category and confidence, and data-quality findings) and `data.edges` (the join edges, shaped exactly as `explore relationships` returns them). Budgeted like `explore diagram`: 25 objects by rank, 12 columns per object, 40 edges, 5 findings per object, every cap binding in every mode and every elision counted in `notes` and in an `elided_*` field, so a truncated answer never reads as a complete one. `--detail` widens the selection to every column and to objects that were inventoried but never profiled, and lifts no cap; it is not `--full`, which decides how much gets scanned and therefore what the run costs. No column value ever appears: the cache holds min/max and value domains and this command does not read them. `--use-project` additionally applies declared grain, ranks metric-backing models higher, folds the semantic layer's declared entity graph into `data.edges`, and marks each object with `semantic_models`, the semantic models that sit on that relation. Empty there is an answer: a relation nothing in the layer reads is a different object from one several metrics are built on, and row counts and PII flags cannot tell them apart. Every object in view is rewritten whenever the layer was read, so a model dropped from the layer clears rather than leaving a stale claim, and a project with no compiled semantic layer contributes nothing here rather than erroring |
 | `explore diagram [--full]` | the `.dex/` map serialized as a Mermaid `erDiagram` under `data.mermaid`, plus an `entities` legend mapping each entity name back to its fully-qualified identifier. Free and connectionless: it reads the cache and never opens the warehouse, so it needs no credential and cannot spend. Declared joins are solid, inferred joins dotted, and a cardinality is drawn only where the cache proved it (an unverified inference never claims "exactly one"). A solid edge whose label names a semantic entity is a join the semantic layer declares; the cardinality rule is unchanged for it, so a primary entity is the layer's claim and still buys no "exactly one" the cache has not proven. The default draws profiled objects that participate in a join, with their grain, key, join, and PII-flagged columns; `--full` widens to every eligible object and column. An entity cap always binds and every elision is counted in `notes`. No column value ever appears; PII renders as category and confidence. dex writes no file: reproduce the string in a fenced ```mermaid block, or save it yourself |
@@ -154,8 +154,14 @@ under `.dex/plans/`; nothing touches the dbt project until `transform apply`. Se
 Every command prints exactly one JSON object and nothing else:
 
 ```json
-{ "status", "data", "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
+{ "status", "data", "connection": { "connector", "target", "source" }, "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
 ```
+
+On success, `connection` names the non-secret target dex resolved and whether it
+came from a flag, `.dex/config.yml`, an environment variable, a dbt profile, or
+directory-local inference. `DBT_PROFILES_DIR` only locates `profiles.yml` for dbt
+operations and last-resort credential discovery; it does not select dex's
+connector or override `--connector`/`--path` or `.dex/config.yml`.
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that
 would spend requires an explicit `--confirm` and a session budget: on a
@@ -163,7 +169,12 @@ metered connector (BigQuery, Snowflake, Databricks, Redshift, Postgres, and
 ClickHouse)
 the first call returns `needs_confirmation` with a free estimate, and the
 same command is re-issued with `--confirm --budget <magnitude>` once the user
-has agreed to the spend. The magnitude is paradigm-relative: **bytes** on
+has agreed to the spend. The first billed command in a project that has never
+decided whether the *day's* total is bounded also carries a
+`suggested_session_ceiling`, and adding `--session-ceiling <value>` (or
+`--no-session-ceiling`) to that same re-issue answers both asks at once and is
+recorded in `.dex/config.yml`; skip it and the confirmed run stops once to ask.
+The magnitude is paradigm-relative: **bytes** on
 BigQuery (an exact free dry-run figure), **warehouse-seconds** on Snowflake
 (a heuristic labeled `estimate_quality: "heuristic"`, with a credit
 translation alongside) and on Databricks (a floor labeled
@@ -229,7 +240,13 @@ them.
    headroom before it runs, so issuing several billed commands at once cannot
    spend the same budget twice. If a cache backend cannot serialize that, every
    billed command says so, and if the ledger it binds against cannot be read,
-   billed admission refuses rather than deciding a ceiling from nothing.
+   billed admission refuses rather than deciding a ceiling from nothing. And a
+   project is asked for that daily cap once rather than warned about it forever:
+   the first billed command in a project that has never decided returns
+   `needs_confirmation` with a `suggested_session_ceiling`, answered by
+   `--session-ceiling <value>` or `--no-session-ceiling` and recorded in
+   `.dex/config.yml`, so an unbounded day is a decision somebody made rather
+   than the default nobody noticed.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.
