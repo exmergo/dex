@@ -460,7 +460,12 @@ class EntityAffixes(BaseModel):
 # them. One vendor today; the table exists because `backend:` collapsed vendor and
 # deployment into one enum, which only extends while there is exactly one vendor.
 # `api` and `cloud` are released spellings of `dbt_cloud` and stay accepted.
-SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {"dbt": ("local", "dbt_cloud")}
+SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
+    "dbt": ("local", "dbt_cloud"),
+    # Ossie is an interchange format, not a query service.  Its local deployment
+    # means "read the native documents in this repository".
+    "ossie": ("local",),
+}
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",
@@ -476,6 +481,12 @@ def canonical_semantic_deployment(value: str) -> str:
 
     key = (value or "").strip().lower()
     return _SEMANTIC_DEPLOYMENT_SPELLINGS.get(key, key)
+
+
+class OssieSemanticConfig(BaseModel):
+    """The repository-confined native documents behind ``vendor: ossie``."""
+
+    files: list[str] = Field(default_factory=list)
 
 
 class SemanticConfig(BaseModel):
@@ -515,6 +526,7 @@ class SemanticConfig(BaseModel):
     deployment: str | None = None
     host: str | None = None
     environment_id: str | None = None
+    ossie: OssieSemanticConfig = Field(default_factory=OssieSemanticConfig)
 
     @model_validator(mode="after")
     def _check_axes(self) -> SemanticConfig:
@@ -562,6 +574,20 @@ class SemanticConfig(BaseModel):
         object.__setattr__(self, "vendor", vendor)
         object.__setattr__(self, "deployment", deployment)
         object.__setattr__(self, "backend", deployment)
+        if vendor != "ossie" and self.ossie.files:
+            raise ValueError(
+                "semantic.ossie.files is only valid for semantic.vendor: ossie"
+            )
+        if vendor == "ossie" and not self.ossie.files:
+            raise ValueError(
+                "semantic.vendor: ossie needs semantic.ossie.files: a list of "
+                "native .ossie.yaml/.ossie.json files relative to the repository"
+            )
+        if vendor == "ossie" and (self.host or self.environment_id):
+            raise ValueError(
+                "semantic.host and semantic.environment_id belong to the hosted "
+                "dbt semantic layer and are not valid for semantic.vendor: ossie"
+            )
         return self
 
 

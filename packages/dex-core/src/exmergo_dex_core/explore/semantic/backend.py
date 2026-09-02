@@ -122,7 +122,8 @@ def values_gap(backend: Any) -> str:
 
 
 _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
-    "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"}
+    "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"},
+    "ossie": {EXECUTION_DEX: "local"},
 }
 
 
@@ -146,7 +147,13 @@ def resolve_backend(
 
     if api or local:
         execution = EXECUTION_VENDOR if api else EXECUTION_DEX
-        deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
+        try:
+            deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
+        except KeyError as exc:
+            raise SemanticBackendError(
+                f"semantic vendor '{vendor}' has no "
+                f"{'hosted' if api else 'local'} execution override"
+            ) from exc
     else:
         configured = getattr(semantic, "deployment", None) or getattr(
             semantic, "backend", None
@@ -154,6 +161,14 @@ def resolve_backend(
         deployment = canonical_semantic_deployment(configured or "local")
 
     source = getattr(engine, "semantic_source", None)
+    if vendor == "ossie":
+        if source is not None:
+            raise SemanticBackendError(
+                "a hosted semantic source has no meaning for native Ossie files"
+            )
+        from .ossie import LocalOssieBackend
+
+        return LocalOssieBackend.from_engine(engine)
     if deployment == "dbt_cloud":
         from .hosted import HostedDbtCloudBackend
 

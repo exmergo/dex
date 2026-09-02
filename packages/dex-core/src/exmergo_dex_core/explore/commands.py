@@ -2957,6 +2957,14 @@ def _semantic_catalog(engine: DexEngine, use_project: bool):
     if engine.repo_root is None or not use_project:
         return None
     try:
+        if engine.config.semantic.vendor == "ossie":
+            from ..ossie import catalog as ossie_catalog
+
+            return ossie_catalog(
+                engine.repo_root,
+                engine.config.semantic.ossie.files,
+                engine.connector or engine.config.connector,
+            )
         project = engine.project_format()
         if not isinstance(project, SemanticCatalogProject):
             return None
