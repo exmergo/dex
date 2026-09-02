@@ -1157,13 +1157,7 @@ class BigQueryAdapter:
         rather than charging the full requirement a second time on top of it.
         """
 
-        cap = self.cost_gate.remaining_for_statement()
-        if cap is not None and cap < _MIN_BILLED_BYTES:
-            raise OverCeilingError(
-                f"the remaining budget ({cap} bytes) is below BigQuery's "
-                f"{_MIN_BILLED_BYTES}-byte minimum billed per query; raise "
-                "--budget or narrow the work"
-            )
+        cap = self.cost_gate.statement_cap(unit="byte", minimum=_MIN_BILLED_BYTES)
         job_config = self._bq.QueryJobConfig(
             maximum_bytes_billed=cap,
             use_query_cache=True,

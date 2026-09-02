@@ -94,6 +94,21 @@ RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
 CH_MAX_SECONDS = float(os.environ.get("DEX_TEST_CH_MAX_SECONDS", "60"))
 
 
+def integration_budget(ceiling: float | None = None) -> dict[str, float | bool]:
+    """Budget config for one ephemeral live-test project.
+
+    Every integration test gets a fresh ``tmp_path`` and already runs behind a
+    per-command ceiling plus the connector's external CI backstop. Record that
+    these disposable projects deliberately have no cross-command ceiling so the
+    one-time production prompt does not replace the behavior under test.
+    """
+
+    budget: dict[str, float | bool] = {"session_ceiling_declined": True}
+    if ceiling is not None:
+        budget["ceiling"] = ceiling
+    return budget
+
+
 def assert_ok(rc: int, envelope: dict) -> dict:
     """Assert a live command succeeded, and say what the warehouse said if it
     did not. Returns the envelope, so it reads inline.

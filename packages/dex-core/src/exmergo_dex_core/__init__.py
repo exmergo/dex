@@ -103,6 +103,7 @@ _EXPORTS = {
     "SemanticBackendError": "explore.semantic",
     "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
+    "SessionCeilingDecisionRequiredError": "guards.cost_guard",
     "Snapshot": "maintain.snapshot",
     "SpendLock": "storage",
     "SpendLockTimeoutError": "guards.cost_guard",
@@ -160,6 +161,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         CostGuardError,
         LedgerUnreadableError,
         OverCeilingError,
+        SessionCeilingDecisionRequiredError,
         SpendLockTimeoutError,
     )
     from .guards.dialect import DialectDependencyError
@@ -247,6 +249,7 @@ __all__ = [
     "SemanticBackendError",
     "SemanticQueryRefusedError",
     "SemanticSource",
+    "SessionCeilingDecisionRequiredError",
     "Snapshot",
     "SpendLock",
     "SpendLockTimeoutError",
