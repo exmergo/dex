@@ -118,6 +118,24 @@ is dry-run scan
 A mid-command verify checkpoint prices overlap probes, which carry no reserve,
 so it reports none rather than repeating the profile's.
 
+### What a join overlap probe costs
+
+The 10 MB minimum is charged per table a query references, so a probe that reads
+a child and a parent floors at two of them. Issued one per join, a graph's probes
+therefore cost twice its edge count in floors, and a dimension five facts join
+pays its own floor five times. That is a bill set by how many joins exist rather
+than by how much data they cover, and it recurs on every run that verifies.
+
+So the probes are batched: the joins that share a child relation are measured
+against one read of it, and the batch's children are combined into a single
+statement. Each statement then names each of its tables once, and a graph of M
+tables floors at M times 10 MB however many joins connect them. On a nine-edge
+star schema over seven tables the estimate falls from 180 MiB to 70 MiB, against
+32 MiB of scan that both shapes pay: what the batching removes is floor, not
+measurement. The per-join results are identical, and `--infer-by-overlap`'s sweep
+is batched the same way, which matters more there because it runs up to fifty
+probes.
+
 ## Profiling behavior
 
 - Aggregates only (`COUNT`, `APPROX_COUNT_DISTINCT`, `MIN`/`MAX` on safe

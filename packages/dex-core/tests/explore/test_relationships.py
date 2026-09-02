@@ -38,6 +38,7 @@ from exmergo_dex_core.explore.relationships import (
     fk_candidate_count,
     fold_replica_relationships,
     infer_relationships,
+    probe_batches,
     semantic_relationships,
     verify_relationships,
 )
@@ -1004,6 +1005,7 @@ def test_probe_statements_and_verify_cover_the_same_set():
     """
 
     from exmergo_dex_core.explore.relationships import (
+        probe_batches,
         probe_candidates,
         probe_statements,
     )
@@ -1020,7 +1022,12 @@ def test_probe_statements_and_verify_cover_the_same_set():
     ]
 
     candidates = probe_candidates(mixed)
-    assert len(probe_statements(mixed, "duckdb")) == len(candidates)
+    # A statement now answers several joins at once, so "the same set" is about
+    # the joins the statements cover, not how many statements there are. Both
+    # sides flatten to `candidates`, in order.
+    batched = [rel for batch in probe_batches(candidates) for rel in batch]
+    assert batched == candidates
+    assert len(probe_statements(mixed, "duckdb")) == len(probe_batches(candidates))
 
     # The composite is the one excluded, and deliberately: the probe SQL joins
     # on a single column pair, so measuring it would answer about a different
@@ -1373,6 +1380,217 @@ def test_overlap_probe_transpiles_to_postgres_and_stays_select_only():
     # Portable shapes survive the rewrite; DuckDB-only FILTER syntax does not
     # appear (BigQuery lacks it and Postgres parses it differently).
     assert "order_items" in sql and "products" in sql
+
+
+# --- issue #398: overlap probes share their table references ----------------
+
+
+def _probe_rel(child: str, fk: str, parent: str, key: str) -> Relationship:
+    return Relationship(
+        from_dataset=f"wh.main.{child}",
+        from_columns=[fk],
+        to_dataset=f"wh.main.{parent}",
+        to_columns=[key],
+        kind=RelationshipKind.INFERRED,
+        confidence=0.7,
+    )
+
+
+def test_a_batch_costs_the_graph_s_tables_not_twice_its_edges():
+    """The invariant that produces the saving, counted the way the estimator
+    counts it.
+
+    A per-table minimum is charged on the distinct tables a statement reads, so
+    what matters is that one statement's table set is the graph's table set. Five
+    edges unbatched are five statements reading two tables each, ten table
+    references to bill; batched they are one statement reading five.
+    """
+
+    import sqlglot
+
+    from exmergo_dex_core.explore.relationships import probe_statements
+
+    edges = [
+        _probe_rel("order_items", "order_id", "orders", "id"),
+        _probe_rel("order_items", "user_id", "users", "id"),
+        _probe_rel("order_items", "product_id", "products", "id"),
+        _probe_rel("orders", "user_id", "users", "id"),
+        _probe_rel("events", "user_id", "users", "id"),
+    ]
+
+    [sql] = probe_statements(edges, "bigquery")  # five edges, inside the cap
+
+    parsed = sqlglot.parse_one(sql, read="bigquery")
+    referenced = {t.name for t in parsed.find_all(sqlglot.exp.Table)}
+    assert referenced == {"order_items", "orders", "users", "products", "events"}
+    # And the child side is read once per child, not once per edge, which is
+    # what the connectors billing scan time rather than bytes are paying for.
+    assert sql.count("`order_items` AS c") == 1
+
+
+def test_a_child_with_more_edges_than_the_cap_stays_one_statement(monkeypatch):
+    """Splitting a child across statements would read that child twice, which
+    is the thing batching exists to stop, so the cap yields to it."""
+
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    monkeypatch.setattr(rel_mod, "_PROBE_BATCH", 2)
+    edges = [_probe_rel("wide_fact", f"fk_{i}", f"dim_{i}", "id") for i in range(5)] + [
+        _probe_rel("other_fact", "fk_0", "dim_0", "id")
+    ]
+
+    batches = rel_mod.probe_batches(edges)
+
+    assert [len(b) for b in batches] == [5, 1]
+    assert {r.from_dataset for r in batches[0]} == {"wh.main.wide_fact"}
+
+
+def test_batching_never_reorders_or_drops_an_edge(monkeypatch):
+    """`probe_batches` is what keeps the priced statements and the run
+    statements the same statements, so it must be a regrouping of its input and
+    nothing else."""
+
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    monkeypatch.setattr(rel_mod, "_PROBE_BATCH", 3)
+    edges = [
+        _probe_rel("a", "x", "p", "id"),
+        _probe_rel("b", "x", "p", "id"),
+        _probe_rel("a", "y", "q", "id"),
+        _probe_rel("c", "x", "p", "id"),
+        _probe_rel("b", "y", "q", "id"),
+    ]
+
+    flattened = [rel for batch in rel_mod.probe_batches(edges) for rel in batch]
+
+    assert sorted(id(r) for r in flattened) == sorted(id(r) for r in edges)
+    # Edges sharing a child are adjacent, which is what lets one read answer
+    # all of them.
+    children = [r.from_dataset for r in flattened]
+    assert children == sorted(children, key=children.index)
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    ["bigquery", "snowflake", "postgres", "redshift", "databricks", "clickhouse"],
+)
+def test_a_cross_child_batch_transpiles_and_stays_select_only(dialect: str):
+    """The batched statement carries two shapes a single-edge probe never did
+    (several LEFT JOINs over one child, and a CROSS JOIN between children), so
+    every connector's dialect has to survive both."""
+
+    import sqlglot
+
+    from exmergo_dex_core.explore.relationships import probe_statements
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    [sql] = probe_statements(
+        [
+            _probe_rel("order_items", "order_id", "orders", "id"),
+            _probe_rel("order_items", "user_id", "users", "id"),
+            _probe_rel("orders", "user_id", "users", "id"),
+        ],
+        dialect,
+    )
+
+    assert_select_only(sql, dialect=dialect)
+    assert sqlglot.parse_one(sql, read=dialect) is not None
+    assert "FILTER" not in sql.upper()
+
+
+def test_batched_verification_matches_a_probe_per_join(tmp_path: Path):
+    """The acceptance criterion for #398: batching may change how many
+    statements run and nothing else.
+
+    The oracle is the pre-batching probe, written out here rather than reached
+    through a knob, so the comparison is against an independent statement per
+    join and not against the batcher configured small.
+
+    The warehouse carries every case that could plausibly diverge under a
+    batched read: several foreign keys on one child, a dimension shared by two
+    children, a non-unique parent key (which a bare join would fan out on), NULL
+    foreign keys, an entirely orphaned key, and a key with no non-null values at
+    all.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.relationships import verify_relationships
+
+    path = tmp_path / "batched.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2), (2)")  # not unique
+    conn.execute("CREATE TABLE products (id INTEGER)")
+    conn.execute("INSERT INTO products VALUES (100), (101)")
+    conn.execute(
+        "CREATE TABLE orders (customer_id INTEGER, product_id INTEGER, "
+        "promo_id INTEGER, void_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO orders VALUES (1, 100, 900, NULL), (2, 101, 901, NULL), "
+        "(7, 100, 902, NULL), (NULL, 999, 903, NULL)"
+    )
+    conn.execute("CREATE TABLE returns (customer_id INTEGER)")
+    conn.execute("INSERT INTO returns VALUES (1), (55)")
+    conn.close()
+
+    def edges() -> list[Relationship]:
+        return [
+            _probe_rel("orders", "customer_id", "customers", "id"),
+            _probe_rel("orders", "product_id", "products", "id"),
+            _probe_rel("orders", "promo_id", "products", "id"),  # fully orphaned
+            _probe_rel("orders", "void_id", "products", "id"),  # no non-null values
+            _probe_rel("returns", "customer_id", "customers", "id"),
+        ]
+
+    def qualify(rels: list[Relationship]) -> list[Relationship]:
+        for rel in rels:
+            rel.from_dataset = rel.from_dataset.replace("wh.main.", "batched.main.")
+            rel.to_dataset = rel.to_dataset.replace("wh.main.", "batched.main.")
+        return rels
+
+    def one_probe_per_join(adapter, rels: list[Relationship]) -> list[tuple]:
+        """The statement `--verify` issued before #398, one join at a time."""
+
+        def quoted(identifier: str) -> str:
+            return ".".join(f'"{part}"' for part in identifier.split("."))
+
+        measured = []
+        for rel in rels:
+            child, parent = quoted(rel.from_dataset), quoted(rel.to_dataset)
+            fk, key = rel.from_columns[0], rel.to_columns[0]
+            result = adapter.run_query(
+                f'SELECT COUNT(c."{fk}") AS nonnull_fk, '  # noqa: S608
+                f'COUNT(CASE WHEN c."{fk}" IS NOT NULL AND d.pk IS NULL '
+                f"THEN 1 END) AS orphans "
+                f"FROM {child} c LEFT JOIN "
+                f'(SELECT DISTINCT "{key}" AS pk FROM {parent}) d '
+                f'ON d.pk = c."{fk}"',
+                max_rows=1,
+                timeout_seconds=30.0,
+            )
+            values = dict(zip(result.columns, result.cells[0], strict=True))
+            nonnull = int(values["nonnull_fk"] or 0)
+            orphans = int(values["orphans"] or 0)
+            fraction = None if nonnull == 0 else round(orphans / nonnull, 4)
+            measured.append((True, fraction))
+        return measured
+
+    adapter = DuckDBAdapter(str(path))
+    try:
+        expected = one_probe_per_join(adapter, qualify(edges()))
+        batched = qualify(edges())
+        verify_relationships(adapter, batched)
+    finally:
+        adapter.close()
+
+    assert [(r.verified, r.orphan_fraction) for r in batched] == expected
+    assert expected[2][1] == 1.0, "the fully orphaned edge is measured as such"
+    assert expected[3][1] is None, "no non-null values stays unmeasurable"
+    # Five joins, two children: one statement now, five before.
+    assert len(probe_batches(batched)) == 1
 
 
 # --- declared joins from the dbt project -----------------------------------------

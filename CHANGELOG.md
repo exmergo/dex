@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.9.2] - 2026-09-02
+
 ### Added
 
 - **`explore profile` drops the fields that are null on every column, and caps
@@ -112,6 +114,35 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `maintain` skill's own description to cover this diagnostic intent (#233)
   are deferred to their own issues, each independently shippable.
 
+- **`explore profile` leads with the verdict and summarizes wide tables'
+  columns by default** ([#288]). Measured on a 107-column staging table: the
+  payload's useful fields (`grain`, `candidate_keys`, `data_quality`,
+  `row_count`) sat at 97-98% of the byte offset, behind a `columns` array of
+  every profiled column. An agent harness that truncates a large tool
+  result to a preview plus a spilled file never saw them; the same
+  invocations were observed piped through `head`/`tail`/`jq` before the
+  agent had read any of it, discarding the column list on purpose to reach
+  the part that mattered.
+
+  The verdict fields now lead the serialized payload and `columns` trails,
+  the same "key order means nothing to a parser and everything to an agent
+  reading a truncated result" fix already used elsewhere in this module.
+  Each dataset's `columns` is also summarized by default to the ones
+  carrying a finding: PII, a non-zero null fraction, membership in a
+  candidate or composite key (or being proven unique), a reported value
+  domain, or a mention in one of the dataset's own `data_quality`
+  sentences (a word-boundary match, not a substring, so a column named
+  `am` cannot match a note about `amount`). The rest are counted in
+  `elided_column_count` rather than silently dropped, and `--columns all`
+  restores every column.
+
+  This is a new predicate (`Dataset.columns_with_findings`), not a
+  widening of the existing `notable_columns` that `explore map`/`diagram`
+  already share: that method's notion of "notable" (grain/key/join/PII
+  role) has no concept of null fraction or data-quality mentions, and
+  widening it in place would have changed what those two commands
+  consider notable too.
+
 ### Fixed
 
 - **`maintain grain` reported `high` severity on relations too small for
@@ -143,6 +174,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   every candidate key) are deferred: the issue itself frames the three rules
   as independent, and the row-count floor alone satisfies every acceptance
   criterion.
+
+- **`DexEngine.check()` dropped the object scope its four sibling detectors
+  accept, and `transform place --edits-file` was accepted by the parser and
+  silently did nothing.** (#344)
+
+  The CLI and `DexEngine` are two independent surfaces over the same
+  implementation, and nothing kept them in step: `tests/test_cli_contract.py`
+  tests the CLI's envelope contract, `tests/test_engine.py` tests the engine,
+  and both stayed green while the two drifted apart. `maintain check <objects>`
+  reached the CLI and `maintain.commands.check()` already threaded `objects`
+  through, but `DexEngine.check()` hard-coded the call with no scope, unlike
+  `schema_drift`/`volume_drift`/`grain_drift`/`semantic_drift`, so a library
+  caller could not narrow a drift sweep the way a CLI caller could.
+  `DexEngine.check()` now accepts `objects` and passes it through like its
+  siblings.
+
+  Building the fix surfaced a second, CLI-only instance of the same class of
+  bug: `transform place` inherited `--edits-file` from the block meant for its
+  two neighboring propagation verbs (`rename`, `remove`), but `cmd_place` never
+  read it, so the flag parsed and did nothing. It is no longer accepted there.
+
+  A new parity test (`test_cli_contract.py`) now walks every `COMMAND_SURFACE`
+  subcommand against `DexEngine`, comparing capability rather than flag
+  spelling (the translation between the two surfaces is often deliberate: a
+  shared `argument` positional means a different keyword per subcommand, a
+  negating flag pair collapses into one tri-state parameter, a file path
+  becomes parsed content), with an explicit allowlist naming every CLI-only
+  subcommand and why (`demo` writes a file outside `DexEngine`; `transform
+  test` is scaffold-only and reachable as `test_scaffold`, not a method; `viz
+  preview` is not yet implemented). The rule that a new subcommand needs a
+  `DexEngine` method, or an allowlist entry with a reason, is now written next
+  to `COMMAND_SURFACE` in `cli.py`, where a contributor adding one will see it.
+
+  That parity test caught a third instance of the same drift the moment this
+  branch met `main`: `explore inventory --limit`/`--all` (#289) reached the
+  CLI and `explore.commands.inventory()`, but `DexEngine.inventory()` was
+  never updated to accept them, so a library caller could not widen or lift
+  the rank cap the way a CLI caller could. `DexEngine.inventory()` now
+  accepts `limit` and `show_all` and passes them through.
 
 - **`data.spend` is now the only place any command reports what it billed**
   ([#276]). `transform build` stamped its billed magnitude twice, once under
@@ -195,6 +265,53 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   connector reports is the connector's business; which command asked cannot be.
 
 ### Changed
+
+- **Successful envelopes now identify the resolved connection.** A compact,
+  constant top-level `connection` block reports the connector, non-secret target
+  coordinates, and whether resolution came from a flag, `.dex/config.yml`, an
+  environment variable, a dbt profile, or directory-local DuckDB inference. It
+  is stamped at the shared CLI boundary without an additional warehouse call,
+  and is covered by the envelope secret scanner. CLI help and no-connector
+  errors now also clarify that `DBT_PROFILES_DIR` locates `profiles.yml` for dbt
+  operations and last-resort credential discovery; it does not select dex's
+  connector or override its explicit/configured target.
+- **`explore query` results now identify their columnar payload shape in the
+  envelope.** Single-query `data`, batch `data`, and every `data.results[]`
+  entry carry `"shape": "columnar"`, so a successful response points callers
+  to `columns`, `types`, and `cells` without requiring documentation or source
+  inspection. The compact result layout itself is unchanged.
+
+- **Join overlap probes now share their table references, so verification costs
+  what the relations cost rather than what the join count costs** ([#398],
+  reported and diagnosed by [@catincloudlabs](https://github.com/catincloudlabs)).
+  `explore relationships --verify` issued one statement per candidate join, and
+  each of those statements reads two tables. On a connector that charges a
+  minimum per table referenced, a graph's probes therefore settled at twice its
+  edge count in floors, and a dimension five facts join paid its own floor five
+  times. The answers being bought are two aggregates per join, which are
+  kilobytes. Measured on a nine-edge star schema over seven tables: 180 MiB
+  priced, against 32 MiB of scan. Four fifths of the bill was floor, and it
+  recurred on every run that verified.
+
+  The probes are now batched. Joins that share a child relation are measured
+  against one read of that child, and a batch's children are combined into one
+  statement, so each statement names each of its tables once. The same schema
+  now prices at 70 MiB in one statement rather than 180 MiB in nine, and the
+  scan is unchanged at 30 MiB: what went away was floor, not measurement. Every
+  per-join result is identical, which the suite asserts by verifying the same
+  warehouse one statement per join and again in one batch and comparing.
+
+  `--infer-by-overlap`'s sweep is batched the same way, and it is the bigger
+  saving: the sweep runs up to fifty probes, so it was paying a hundred floors
+  for a pool whose answers are two counts apiece. `maintain grain`'s join-fanout
+  re-check goes through the same path and inherits it.
+
+  Nothing about the contract moved. The set of joins that gets priced is still
+  the set that gets run, both still selected through `probe_candidates`;
+  `probe_statements` still returns exactly the SQL that will execute, so a
+  billed caller's dry-run estimate stays truthful; and a budget exhausted
+  part-way through still keeps every measurement taken before it, now at
+  statement rather than join granularity.
 
 - **`explore query` now carries compact cache-backed column and query notes
   beside result cells.** When projected columns resolve to already-profiled
@@ -341,21 +458,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
-- **Successful envelopes now identify the resolved connection.** A compact,
-  constant top-level `connection` block reports the connector, non-secret target
-  coordinates, and whether resolution came from a flag, `.dex/config.yml`, an
-  environment variable, a dbt profile, or directory-local DuckDB inference. It
-  is stamped at the shared CLI boundary without an additional warehouse call,
-  and is covered by the envelope secret scanner. CLI help and no-connector
-  errors now also clarify that `DBT_PROFILES_DIR` locates `profiles.yml` for dbt
-  operations and last-resort credential discovery; it does not select dex's
-  connector or override its explicit/configured target.
-- **`explore query` results now identify their columnar payload shape in the
-  envelope.** Single-query `data`, batch `data`, and every `data.results[]`
-  entry carry `"shape": "columnar"`, so a successful response points callers
-  to `columns`, `types`, and `cells` without requiring documentation or source
-  inspection. The compact result layout itself is unchanged.
-
 - **`dex --help` now orients a stranger instead of dumping bare flags and
   subcommand names** ([#296]). The top-level help carried a throwaway
   one-line description, a subcommand list with help text on `demo` alone,
@@ -479,35 +581,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   key, GitHub environment configuration, a pre-SQL 2-CHC/day admission check,
   rotation, local execution, and bounded teardown.
 
-- **`explore profile` leads with the verdict and summarizes wide tables'
-  columns by default** ([#288]). Measured on a 107-column staging table: the
-  payload's useful fields (`grain`, `candidate_keys`, `data_quality`,
-  `row_count`) sat at 97-98% of the byte offset, behind a `columns` array of
-  every profiled column. An agent harness that truncates a large tool
-  result to a preview plus a spilled file never saw them; the same
-  invocations were observed piped through `head`/`tail`/`jq` before the
-  agent had read any of it, discarding the column list on purpose to reach
-  the part that mattered.
-
-  The verdict fields now lead the serialized payload and `columns` trails,
-  the same "key order means nothing to a parser and everything to an agent
-  reading a truncated result" fix already used elsewhere in this module.
-  Each dataset's `columns` is also summarized by default to the ones
-  carrying a finding: PII, a non-zero null fraction, membership in a
-  candidate or composite key (or being proven unique), a reported value
-  domain, or a mention in one of the dataset's own `data_quality`
-  sentences (a word-boundary match, not a substring, so a column named
-  `am` cannot match a note about `amount`). The rest are counted in
-  `elided_column_count` rather than silently dropped, and `--columns all`
-  restores every column.
-
-  This is a new predicate (`Dataset.columns_with_findings`), not a
-  widening of the existing `notable_columns` that `explore map`/`diagram`
-  already share: that method's notion of "notable" (grain/key/join/PII
-  role) has no concept of null fraction or data-quality mentions, and
-  widening it in place would have changed what those two commands
-  consider notable too.
-
 ### Fixed
 
 - **dex no longer builds, locks, or borrows from the caller's Python project**
@@ -600,45 +673,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   The stream is now resolved when a line is written, and the write is
   best-effort. A diagnostic that narrates work already done, and on a metered
   connector already paid for, is never worth failing that work over.
-
-- **`DexEngine.check()` dropped the object scope its four sibling detectors
-  accept, and `transform place --edits-file` was accepted by the parser and
-  silently did nothing.** (#344)
-
-  The CLI and `DexEngine` are two independent surfaces over the same
-  implementation, and nothing kept them in step: `tests/test_cli_contract.py`
-  tests the CLI's envelope contract, `tests/test_engine.py` tests the engine,
-  and both stayed green while the two drifted apart. `maintain check <objects>`
-  reached the CLI and `maintain.commands.check()` already threaded `objects`
-  through, but `DexEngine.check()` hard-coded the call with no scope, unlike
-  `schema_drift`/`volume_drift`/`grain_drift`/`semantic_drift`, so a library
-  caller could not narrow a drift sweep the way a CLI caller could.
-  `DexEngine.check()` now accepts `objects` and passes it through like its
-  siblings.
-
-  Building the fix surfaced a second, CLI-only instance of the same class of
-  bug: `transform place` inherited `--edits-file` from the block meant for its
-  two neighboring propagation verbs (`rename`, `remove`), but `cmd_place` never
-  read it, so the flag parsed and did nothing. It is no longer accepted there.
-
-  A new parity test (`test_cli_contract.py`) now walks every `COMMAND_SURFACE`
-  subcommand against `DexEngine`, comparing capability rather than flag
-  spelling (the translation between the two surfaces is often deliberate: a
-  shared `argument` positional means a different keyword per subcommand, a
-  negating flag pair collapses into one tri-state parameter, a file path
-  becomes parsed content), with an explicit allowlist naming every CLI-only
-  subcommand and why (`demo` writes a file outside `DexEngine`; `transform
-  test` is scaffold-only and reachable as `test_scaffold`, not a method; `viz
-  preview` is not yet implemented). The rule that a new subcommand needs a
-  `DexEngine` method, or an allowlist entry with a reason, is now written next
-  to `COMMAND_SURFACE` in `cli.py`, where a contributor adding one will see it.
-
-  That parity test caught a third instance of the same drift the moment this
-  branch met `main`: `explore inventory --limit`/`--all` (#289) reached the
-  CLI and `explore.commands.inventory()`, but `DexEngine.inventory()` was
-  never updated to accept them, so a library caller could not widen or lift
-  the rank cap the way a CLI caller could. `DexEngine.inventory()` now
-  accepts `limit` and `show_all` and passes them through.
 
 - **A fact table's parent-plus-line grain was discarded before it could be
   probed, and the probe spent its budget on a pair that could not be a key**
