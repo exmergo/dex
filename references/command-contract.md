@@ -80,7 +80,13 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
   [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
                                      payload, columns trails; by default columns is summarized to the
                                      ones carrying a finding, with the rest in elided_column_count.
-                                     --columns all restores every column
+                                     --columns all restores every column. A per-column field that is
+                                     null on every column shown is dropped from each and named once
+                                     in suppressed_fields (always present; empty means nothing was
+                                     dropped). Each value_domain carries its most frequent
+                                     profile_value_domain_cap values (.dex/config.yml, default 25)
+                                     with the rest counted in its elided. Both reduce the payload
+                                     only, never the cached profile
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)

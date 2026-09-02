@@ -754,6 +754,7 @@ def profile(
         cache_path=locator,
         updated_at=now.isoformat(),
         show_all_columns=show_all_columns,
+        value_domain_cap=config.profile_value_domain_cap,
         notes=notes,
         warnings=_override_mismatches(datasets, config.pii_overrides),
         pending_confirmation=cumulative_pending,
