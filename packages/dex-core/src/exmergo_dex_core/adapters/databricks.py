@@ -1269,12 +1269,7 @@ class DatabricksAdapter:
         cannot overrun the ceiling."""
 
         self._warehouse()  # refuses when config pins no warehouse
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one warehouse-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         bounds = [b for b in (remaining, cap_seconds) if b is not None]
         # Remember which bound won so a timeout kill is reported as the wall
         # limit or the budget, whichever actually fired.
@@ -1286,7 +1281,9 @@ class DatabricksAdapter:
         cursor = self._conn.cursor()
         if bounds:
             # An engine-built session statement, not agent SQL. STATEMENT_TIMEOUT
-            # treats 0 as "no timeout", so the cap never rounds below 1.
+            # treats 0 as "no timeout", so the cap never rounds below 1: the
+            # budget bound cannot (`statement_cap` refuses first) and the wall
+            # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
         return cursor
 

@@ -1365,19 +1365,15 @@ class ClickHouseAdapter:
         refusal.
         """
 
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one database-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="database-second")
         settings: dict[str, Any] = dict(_SESSION_SETTINGS)
         seconds: int | None = None
         budget_bound = False
         if remaining is not None:
-            # int() truncates, and max_execution_time = 0 means *no limit* in
-            # ClickHouse, so a sub-second remainder must never reach the server
-            # as a cap; the guard above is what makes that unreachable.
+            # max_execution_time = 0 means *no limit* in ClickHouse, so a
+            # sub-second remainder must never reach the server as a cap.
+            # `statement_cap` is what makes that unreachable: it refuses rather
+            # than returning anything below one second.
             seconds = int(remaining)
             budget_bound = True
             settings["max_bytes_to_read"] = int(remaining * _SCAN_BYTES_PER_SECOND)

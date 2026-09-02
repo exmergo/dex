@@ -37,12 +37,19 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
-from ..errors import PrerequisiteError, ProjectError, RepoRootRequiredError
+from ..errors import DexError, PrerequisiteError, ProjectError, RepoRootRequiredError
 from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
-from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
+from . import verify as verify_mod
+from .results import (
+    DriftResult,
+    LayerFingerprint,
+    ReconcileResult,
+    SnapshotResult,
+    VerifyResult,
+)
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -485,14 +492,19 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
             "maintain grain", adapter, estimate, per_table=per_table
         )
     findings = drift_mod.grain_drift(
-        adapter, plan, timeout_seconds=engine.config.query.timeout_seconds
+        adapter,
+        plan,
+        timeout_seconds=engine.config.query.timeout_seconds,
+        min_rows=engine.config.maintain.grain_min_rows,
     )
     noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
         dataset.identifier
         for dataset, _combos, _rows in plan.composite_checks
         + plan.declared_composite_checks
     }
-    notes = _adapter_notes(adapter, sorted(noted))
+    notes_by_identifier = _adapter_notes_by_identifier(adapter, sorted(noted))
+    _qualify_uniqueness_findings(findings, notes_by_identifier)
+    notes = _flatten_adapter_notes(notes_by_identifier)
 
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
@@ -512,6 +524,104 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
 
 def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(grain_drift(engine, getattr(args, "objects", None)))
+
+
+def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
+    """Is the project correct right now, with no baseline required (#224).
+
+    The first finding class (#225): build-status gaps read from the compiled
+    manifest and the last run's ``run_results.json`` (failed nodes, nodes
+    skipped by a failed parent), plus models the project declares that have
+    no relation in the warehouse. Entirely free: the manifest/run-results
+    read touches no connection, and the relation check reads only cheap
+    object metadata, never a scan.
+
+    A project that does not compile is reported first and suppresses every
+    other check here, since a finding computed from a manifest a broken
+    project could not have produced honestly is not a finding at all
+    (#172's inertness requirement, #225's third acceptance bullet).
+    """
+
+    from pathlib import Path
+
+    suppressed: dict[str, str] = {}
+    try:
+        project_dir = Path(engine.project_dir())
+    except (ProjectError, RepoRootRequiredError) as exc:
+        return VerifyResult(
+            suppressed={
+                "build_status": str(exc),
+                "no_relation": str(exc),
+                "compile": str(exc),
+            },
+            warnings=[f"maintain verify needs a dbt project: {exc}"],
+        )
+
+    findings: list = []
+    compile_finding, compile_notes = verify_mod.compile_check(project_dir)
+    if compile_finding is not None:
+        findings.append(compile_finding)
+        reason = "the project does not compile"
+        result = VerifyResult(
+            findings=drift_mod.rank_findings(findings),
+            suppressed={"build_status": reason, "no_relation": reason},
+            warnings=[
+                "build-status and no-relation findings suppressed: the project "
+                "does not compile, so its manifest cannot be trusted"
+            ],
+        )
+        return result
+
+    warnings = list(compile_notes)
+    build_findings, build_notes = verify_mod.build_status_findings(project_dir)
+    findings.extend(build_findings)
+    warnings.extend(build_notes)
+    if build_notes:
+        suppressed["build_status"] = build_notes[0]
+
+    definitions = engine.project_format().definitions()
+    cost = None
+    if not definitions.present:
+        suppressed["no_relation"] = "no dbt project found"
+    else:
+        model_relations = {
+            name: relation
+            for name, relation in definitions.model_relations.items()
+            if "." not in name
+        }
+        try:
+            adapter = engine._adapter("maintain verify")
+        except DexError as exc:
+            suppressed["no_relation"] = f"warehouse unreachable: {exc}"
+        else:
+            cost = command_args.preflight_cost(adapter)
+            live = [o.identifier for o in adapter.list_objects()]
+            already = {f.identifier for f in findings if f.identifier}
+            findings.extend(
+                verify_mod.missing_relation_findings(model_relations, live, already)
+            )
+
+    if objects:
+        wanted = {
+            name.strip().lower()
+            for raw in objects
+            for name in raw.split(",")
+            if name.strip()
+        }
+        findings = [f for f in findings if (f.identifier or "").lower() in wanted]
+
+    result = VerifyResult(
+        findings=drift_mod.rank_findings(findings),
+        suppressed=suppressed,
+        warnings=warnings,
+    )
+    if cost is not None:
+        result.cost = cost
+    return result
+
+
+def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(verify(engine, getattr(args, "objects", None)))
 
 
 def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
@@ -710,7 +820,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         return result
 
     grain_findings = drift_mod.grain_drift(
-        adapter, plan, timeout_seconds=config.query.timeout_seconds
+        adapter,
+        plan,
+        timeout_seconds=config.query.timeout_seconds,
+        min_rows=config.maintain.grain_min_rows,
     )
     semantic_findings = semantic_findings + _semantic_scope(
         drift_mod.cardinality_drift(adapter, checks, current_semantic), scope_names
@@ -1117,13 +1230,61 @@ def _adapter_notes(adapter, identifiers: list[str]) -> list[str]:
     """Surface the adapter's per-table notes (e.g. a skipped distinct-count
     escalation on a tight budget) so a silent skip never reads as a clean bill."""
 
+    return _flatten_adapter_notes(_adapter_notes_by_identifier(adapter, identifiers))
+
+
+def _adapter_notes_by_identifier(
+    adapter, identifiers: list[str]
+) -> dict[str, list[str]]:
+    """Collect adapter notes by table so command payloads can attach qualifying
+    facts to the findings they qualify, not only to envelope warnings."""
+
     hook = getattr(adapter, "table_notes", None)
     if hook is None:
-        return []
-    notes: list[str] = []
+        return {}
+    notes: dict[str, list[str]] = {}
     for identifier in identifiers:
-        notes.extend(f"{identifier}: {note}" for note in hook(identifier) or [])
+        table_notes = list(hook(identifier) or [])
+        if table_notes:
+            notes[identifier] = table_notes
     return notes
+
+
+def _flatten_adapter_notes(notes: dict[str, list[str]]) -> list[str]:
+    return [
+        f"{identifier}: {note}"
+        for identifier, table_notes in notes.items()
+        for note in table_notes
+    ]
+
+
+def _qualify_uniqueness_findings(
+    findings: list[drift_mod.DriftFinding], notes_by_identifier: dict[str, list[str]]
+) -> None:
+    for finding in findings:
+        if (
+            finding.code != "key_lost_uniqueness"
+            or finding.identifier not in notes_by_identifier
+        ):
+            continue
+        merge_notes = [
+            note
+            for note in notes_by_identifier[finding.identifier]
+            if _final_note(note)
+        ]
+        if not merge_notes:
+            continue
+        finding.severity = "medium"
+        finding.data["table_notes"] = merge_notes
+        finding.detail = (
+            f"{finding.detail}; this count is over stored parts before "
+            "ClickHouse FINAL, so the adapter note qualifies whether this is "
+            "merge timing or modeled-grain drift"
+        )
+
+
+def _final_note(note: str) -> bool:
+    return "FINAL" in note and "MergeTree" in note
 
 
 def _semantic_names(scope_names: list[str]) -> set[str]:
