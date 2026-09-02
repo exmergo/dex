@@ -41,8 +41,11 @@ def _aggregate_resolver(sql: str):
         # The exact-distinct escalation statement (a near-unique id column
         # triggers it) reads d_<i> aliases.
         values[f"d_{i}"] = 100
-    values["nonnull_fk"] = 100
-    values["orphans"] = 0
+    # Overlap probes are batched, so one statement asks about several joins
+    # under indexed aliases (issue #398).
+    for i in range(10):
+        values[f"nonnull_fk_{i}"] = 100
+        values[f"orphans_{i}"] = 0
     return [values]
 
 
@@ -61,8 +64,11 @@ def _near_unique_not_proven_resolver(sql: str):
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
         values[f"d_{i}"] = 99 if i == 0 else 40
-    values["nonnull_fk"] = 100
-    values["orphans"] = 0
+    # Overlap probes are batched, so one statement asks about several joins
+    # under indexed aliases (issue #398).
+    for i in range(10):
+        values[f"nonnull_fk_{i}"] = 100
+        values[f"orphans_{i}"] = 0
     return [values]
 
 
