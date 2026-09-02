@@ -196,7 +196,14 @@ in the `.dex/spend.jsonl` ledger per connector. That ledger gates billing and
 nothing else: it is read where work is admitted, not where a connection is
 assembled, so a command that cannot spend does not depend on it, and a ledger
 that cannot be read refuses billed work by name while reporting the day's total
-as `null` on the two surfaces that quote it. Credentials never appear in
+as `null` on the two surfaces that quote it. The ledger also records each
+command's estimate beside what it settled at, which is what lets a refusal over
+the ceiling end with this connector's own observed ratio ("the last 8 settled
+bigquery commands billed a median 69% of estimate, range 61%-88%") instead of
+leaving the next budget to a guess; with too little history it says so rather
+than quoting a ratio. The refusal itself is unchanged and still cannot be
+confirmed through, and the ceiling is checked against the estimate, so a budget
+set at that fraction of the estimate is refused again. Credentials never appear in
 `data` (BigQuery authenticates via discovered Application Default
 Credentials, Snowflake via a discovered `connections.toml` entry,
 environment, or dbt profile, Databricks via the SDK's unified chain, Redshift

@@ -250,6 +250,13 @@ def new_cost_gate(
     still reserves and says on every billed result that the cumulative ceiling
     is advisory.
 
+    The history reader is bound the same way and scoped to this connector at the
+    binding, so nothing downstream can widen it: the ratio an over-ceiling
+    refusal quotes has to be this connector's own, and a DuckDB history
+    calibrating a BigQuery refusal would be worse than no calibration at all.
+    Passed as a reader for the same reason the day's spend is, and more so:
+    nothing calls it unless a command is actually refused over its ceiling.
+
     The one-time cumulative-ceiling ask (issue #283) is armed from
     ``config.source_path``, so it fires only where dex itself loaded the config
     from a file it can therefore amend: a config-free ad-hoc read and a
@@ -260,6 +267,7 @@ def new_cost_gate(
     paradigm = paradigm_for(connector, config)
     field = ledger_field(paradigm)
     lock = getattr(store, "spend_lock", None)
+    history = getattr(store, "spend_entries", None)
     return CostGate(
         paradigm=paradigm,
         ceiling=budget if budget is not None else config.budget.ceiling,
@@ -272,6 +280,7 @@ def new_cost_gate(
         command=command,
         record=store.append_spend_log,
         lock=lock if callable(lock) else None,
+        history=(lambda: history(connector=connector)) if callable(history) else None,
         session_ceiling_declined=config.budget.session_ceiling_declined,
         config_path=config.source_path,
     )

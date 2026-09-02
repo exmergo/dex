@@ -315,6 +315,12 @@ check" note just means no connection was reachable at init time.
   commands use. Never invent a `--budget` figure: read the reported estimate
   (`per_table_bytes` is the actionable half, since it names which node is
   driving the cost) and confirm with a `--budget` grounded in that number.
+  If the build is refused over the ceiling, the refusal carries a calibration
+  line from `.dex/spend.jsonl`: what this connector's recent commands billed as
+  a fraction of estimate, or a sentence saying there is too little history to
+  say. Builds over-estimate most on a partitioned or clustered warehouse, so
+  relay it, and note that the ceiling binds on the estimate rather than on what
+  settles, so a budget set at that fraction of the estimate is refused again.
   A `suggested_session_ceiling` on that envelope is the project's one-time ask
   for a cumulative daily cap, separate from `--budget`: relay it and add the
   user's answer (`--session-ceiling <value>` or `--no-session-ceiling`) to the

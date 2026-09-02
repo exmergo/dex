@@ -1143,6 +1143,14 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     # `data.spend` across commands used to count every build as free.
     assert envelope["data"]["spend"]["bytes_billed"] == entry["billed_bytes"]
     assert envelope["data"]["spend"]["session_spent_today"] == 3000
+    # Issue #278: the estimate rides into the ledger beside the settled figure,
+    # so a later over-ceiling refusal on this connector can say how far the two
+    # have run apart. A build is the largest billed command dex has and settles
+    # outside any gate, so without this the command most likely to be refused
+    # over a ceiling would have been the one contributing nothing to calibrating
+    # that refusal.
+    assert entry["entry"] == "settlement"
+    assert entry["estimate"] == envelope["cost"]["estimate"] == 5_000_000.0
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(

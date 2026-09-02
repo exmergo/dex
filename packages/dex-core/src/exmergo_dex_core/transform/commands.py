@@ -1097,7 +1097,11 @@ def _plan_hint(result: PlanResult) -> dict[str, str]:
 
 
 def _record_build_spend(
-    store: Store, connector: str, billed: float, paradigm
+    store: Store,
+    connector: str,
+    billed: float,
+    paradigm,
+    estimate: float | None = None,
 ) -> dict[str, float]:
     """Account a billed dbt build in the spend ledger and report what it cost.
 
@@ -1110,6 +1114,15 @@ def _record_build_spend(
     ``record_billed`` never fires and the gate's own total stays zero for the
     run. The day's total is read back from the ledger this write just landed in,
     which is the number the next command's gate will start from.
+
+    ``estimate`` is what the handshake priced this build at, written beside what
+    it billed exactly as :meth:`CostGate.record_billed` writes it, so a build
+    calibrates a later refusal like any other command. It matters more here than
+    anywhere else: a build is the largest billed command dex has, so it is both
+    the one most likely to be refused over a ceiling and the one whose estimate
+    an operator most needs the history of. ``None`` where pricing degraded and
+    there was no estimate to record, which :func:`settled_ratios` skips rather
+    than counting as a ratio of nothing.
     """
 
     from datetime import UTC, datetime
@@ -1122,7 +1135,13 @@ def _record_build_spend(
             "at": datetime.now(UTC).isoformat(),
             "connector": connector,
             "command": "transform build",
+            # The kind every gate-written settlement carries. A build settles
+            # outside any gate and used to write an entry with no kind at all,
+            # which sums identically (the totals branch on no kind) but reads as
+            # a different sort of record to anything walking the ledger back.
+            "entry": "settlement",
             field: float(billed),
+            "estimate": estimate,
             "job_id": None,
             "statement_sha256": None,
         }
@@ -1252,6 +1271,11 @@ def _shape_build_result(
     messages = summary.pop("messages", [])
     notes = [*extra_notes, *summary.pop("notes", [])]
     spend: dict[str, float] | None = None
+    # What the handshake priced this build at, ledgered beside what it billed so
+    # a later over-ceiling refusal on this connector can say how far the two
+    # have run apart. `None` on the degraded-pricing path, where there was no
+    # estimate to compare against and inventing one would be worse than none.
+    estimate = getattr(cost, "estimate", None)
     if paradigm is Paradigm.BYTES_SCANNED:
         notes = [
             "each statement was capped server-side by the profile's "
@@ -1260,7 +1284,7 @@ def _shape_build_result(
         ]
         billed = summary.get("bytes_billed")
         if billed:
-            spend = _record_build_spend(store, connector, billed, paradigm)
+            spend = _record_build_spend(store, connector, billed, paradigm, estimate)
     elif paradigm is Paradigm.COMPUTE_TIME:
         cap_note = _COMPUTE_TIME_CAP_NOTES.get(
             connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
@@ -1273,7 +1297,7 @@ def _shape_build_result(
         )
         if seconds:
             summary["seconds_billed"] = seconds
-            spend = _record_build_spend(store, connector, seconds, paradigm)
+            spend = _record_build_spend(store, connector, seconds, paradigm, estimate)
             translate = getattr(adapter, "compute_spend_translation", None)
             if translate is not None:
                 spend.update(translate(seconds))
@@ -1286,7 +1310,7 @@ def _shape_build_result(
         )
         if seconds:
             summary["seconds_billed"] = seconds
-            spend = _record_build_spend(store, connector, seconds, paradigm)
+            spend = _record_build_spend(store, connector, seconds, paradigm, estimate)
     notes = [
         *notes,
         *no_session_ceiling_warning(

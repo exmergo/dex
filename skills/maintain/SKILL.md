@@ -113,7 +113,12 @@ The axes split:
   Databricks, compute-seconds on Redshift, database-seconds on Postgres and
   ClickHouse).
   Never invent a budget the user did not agree to, and never retry with a
-  raised budget on an over-ceiling refusal without asking.
+  raised budget on an over-ceiling refusal without asking. An over-ceiling
+  refusal carries a calibration line from `.dex/spend.jsonl` (what this
+  connector's recent commands billed as a fraction of estimate, or a sentence
+  saying there is too little history to say): relay it, and note that the
+  ceiling binds on the estimate, so a budget set at that fraction of the
+  estimate is refused again.
 - **`check` is two-phase on a metered connector**: the free axes complete
   immediately and their findings ride along in the `needs_confirmation` envelope,
   with one combined estimate for the scanning axes. Confirm to complete the sweep.
