@@ -913,7 +913,11 @@ def build(
             exc.cost,
             notes=[
                 *price_notes,
-                *no_session_ceiling_warning(paradigm, config.budget.session_ceiling),
+                *no_session_ceiling_warning(
+                    paradigm,
+                    config.budget.session_ceiling,
+                    declined=config.budget.session_ceiling_declined,
+                ),
                 *unserialized_ledger_warning(
                     paradigm,
                     config.budget.session_ceiling,
@@ -931,6 +935,7 @@ def build(
         store,
         extra_notes=[*price_notes, *dev_warnings],
         session_ceiling=config.budget.session_ceiling,
+        session_ceiling_declined=config.budget.session_ceiling_declined,
         gate=command_args.cost_gate(adapter) if adapter is not None else None,
         adapter=adapter,
     )
@@ -1213,6 +1218,7 @@ def _shape_build_result(
     store: Store,
     extra_notes=(),
     session_ceiling: float | None = None,
+    session_ceiling_declined: bool = False,
     gate=None,
     adapter=None,
 ) -> BuildResult:
@@ -1283,7 +1289,9 @@ def _shape_build_result(
             spend = _record_build_spend(store, connector, seconds, paradigm)
     notes = [
         *notes,
-        *no_session_ceiling_warning(paradigm, session_ceiling),
+        *no_session_ceiling_warning(
+            paradigm, session_ceiling, declined=session_ceiling_declined
+        ),
         *unserialized_ledger_warning(
             paradigm,
             session_ceiling,

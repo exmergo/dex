@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from .diffs import file_diff
 from .envelope import Paradigm
+from .errors import ConfigurationError
 from .storage import DEX_DIR
 
 CONFIG_FILE = "config.yml"
@@ -30,11 +32,22 @@ class Budget(BaseModel):
     ``session_ceiling`` bounds cumulative spend across commands per UTC day,
     settled against the ``.dex/spend.jsonl`` ledger, so a long agent session
     (or a loop of confirmed commands) still has a hard stop.
+
+    ``session_ceiling_declined`` records that this project was asked for a
+    cumulative ceiling and chose to run without one (issue #283). It is the
+    record of a decision, not a permission: it loosens nothing, every billed
+    command still warns that the day's total is unbounded, and the only thing it
+    changes is that the one-time ask does not fire again. It lives in the
+    committed file rather than in the ``.dex/`` cache for two reasons: a
+    decision that a cleared cache re-asks is not a decision, and a project
+    running deliberately unbounded is exactly the kind of thing a reviewer
+    should see in a diff.
     """
 
     paradigm: Paradigm = Paradigm.FREE_LOCAL
     ceiling: float | None = None
     session_ceiling: float | None = None
+    session_ceiling_declined: bool = False
 
 
 class DuckDBTarget(BaseModel):
@@ -646,6 +659,24 @@ class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
 
+    # Where this config was read from, stamped by `load_config` and absent on one
+    # a host built itself. Private, so it never joins a dump and can never be
+    # written back into the file it names.
+    #
+    # It exists for the one-time cumulative-ceiling ask (issue #283), which needs
+    # to know not merely that a config file sits at the repo root but that *this*
+    # config is that file: a host holding its own object has already made the
+    # budget decisions the ask would go looking for, and amending a file whose
+    # settings are not the ones in play would record a decision about the wrong
+    # project's budget. See `session_ceiling_undecided`.
+    _source_path: Path | None = PrivateAttr(default=None)
+
+    @property
+    def source_path(self) -> Path | None:
+        """The file this config was loaded from, or None if it was not loaded."""
+
+        return self._source_path
+
     # The DuckDB on-ramp: a config that omits `connector:` (or a bare `--path`
     # read with no config) means the free local connector. This default only
     # applies to a config that actually exists or an explicit `--path`; it is NOT
@@ -711,12 +742,92 @@ class DexConfig(BaseModel):
     blob_overrides: list[BlobOverride] = Field(default_factory=list)
 
 
+def config_path(repo_root: Path | str = ".") -> Path | None:
+    """The committed config file at ``repo_root``, or None when there is none.
+
+    ``load_config`` answers the same question by returning None, but a caller
+    that means to *amend* the file needs the path without parsing it, and needs
+    to tell "no file" apart from "a file that parsed to nothing".
+    """
+
+    path = Path(repo_root) / DEX_DIR / CONFIG_FILE
+    return path if path.is_file() else None
+
+
+def record_session_ceiling_decision(
+    repo_root: Path | str,
+    *,
+    session_ceiling: float | None = None,
+    declined: bool = False,
+) -> tuple[DexConfig, dict[str, Any]]:
+    """Write the cumulative-ceiling decision into ``.dex/config.yml``.
+
+    Returns the amended config and the file diff, because a write dex performed
+    on the caller's behalf has to be visible: the envelope carries the diff the
+    way ``transform init`` carries the files it created, so the amendment is
+    reviewable rather than something a caller discovers in ``git status``.
+
+    Re-read from disk rather than amended in memory on purpose. The config the
+    engine is holding may have been overridden for this run (``--connector``, an
+    injected object), and writing that back would commit a one-run override as a
+    project setting. Only the budget field the decision names is touched.
+    """
+
+    if (session_ceiling is None) == (not declined):
+        raise ConfigurationError(
+            "a cumulative-ceiling decision is either a ceiling or a decline, "
+            "not both and not neither: pass --session-ceiling <value> or "
+            "--no-session-ceiling"
+        )
+    if session_ceiling is not None and session_ceiling <= 0:
+        raise ConfigurationError(
+            "--session-ceiling must be a positive magnitude, got "
+            f"{session_ceiling}; to run without a cumulative ceiling pass "
+            "--no-session-ceiling instead, which records that choice"
+        )
+
+    root = Path(repo_root)
+    path = config_path(root)
+    if path is None:
+        raise ConfigurationError(
+            f"no {DEX_DIR}/{CONFIG_FILE} at '{root}' to record a "
+            "cumulative-ceiling decision in; commit a config for this project "
+            "first (`dex transform init` writes one), or pass --budget alone "
+            "for an ad-hoc read"
+        )
+    old = path.read_text(encoding="utf-8")
+    config = DexConfig.model_validate(yaml.safe_load(old) or {})
+    if declined:
+        config.budget.session_ceiling = None
+        config.budget.session_ceiling_declined = True
+        config.budget.model_fields_set.discard("session_ceiling")
+    else:
+        config.budget.session_ceiling = session_ceiling
+        # A ceiling supersedes an earlier decline, and once it does, the flag is
+        # noise in a committed file: dropped rather than written as an explicit
+        # `false` that reads like a second setting.
+        config.budget.session_ceiling_declined = False
+        config.budget.model_fields_set.discard("session_ceiling_declined")
+    # `budget` itself has to join `model_fields_set`, or `save_config`'s
+    # `exclude_unset` dump drops the whole block a nested assignment landed in.
+    config.budget = config.budget
+    save_config(config, root)
+    return config, file_diff(
+        f"{DEX_DIR}/{CONFIG_FILE}", old, path.read_text(encoding="utf-8")
+    )
+
+
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:
     path = Path(repo_root) / DEX_DIR / CONFIG_FILE
     if not path.is_file():
         return None
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return DexConfig.model_validate(raw)
+    config = DexConfig.model_validate(raw)
+    # Stamped here and nowhere else: this is the only function that turns a file
+    # into a config, so it is the only one that can honestly say a config came
+    # from one. See `DexConfig.source_path`.
+    config._source_path = path
+    return config
 
 
 def save_config(config: DexConfig, repo_root: Path | str = ".") -> Path:

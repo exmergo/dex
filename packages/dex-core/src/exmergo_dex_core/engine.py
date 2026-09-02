@@ -41,9 +41,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
-from .config import CacheConfig, DexConfig, ProjectConfig, load_config
+from .config import (
+    CacheConfig,
+    DexConfig,
+    ProjectConfig,
+    load_config,
+    record_session_ceiling_decision,
+)
 from .connect import ConnectionSource, SemanticSource
-from .envelope import Paradigm
+from .envelope import Connection, Paradigm
 from .errors import RepoRootRequiredError, StoreRequiredError
 from .results import ConnectResult
 from .storage import ExploreStore, MemoryStore, Store, StoreContext, build_store
@@ -159,6 +165,8 @@ class DexEngine:
         datasets: list[str] | None = None,
         budget: float | None = None,
         confirmed: bool = False,
+        session_ceiling: float | None = None,
+        decline_session_ceiling: bool = False,
         connection: ConnectionSource | None = None,
         semantic_source: SemanticSource | None = None,
         project_format: ExploreProject | None = None,
@@ -181,6 +189,7 @@ class DexEngine:
         # the one that happened to trigger it (`_adapter` may be called once and
         # cached, with later commands in the same process never re-resolving).
         self.connection_warnings: list[str] = []
+        self._directory_inferred_connection = False
         self.scopes = scopes
         self.project = project
         self.datasets = datasets
@@ -197,6 +206,11 @@ class DexEngine:
         # reason to prefer confirming the call.
         self.budget = budget
         self.confirmed = confirmed
+        # Config amendments dex performed on the caller's behalf, as reviewable
+        # diffs. Read back into every envelope for the reason
+        # `connection_warnings` is: a write must never be something a caller
+        # discovers later in `git status`.
+        self.config_diffs: list[dict[str, Any]] = []
         self._adapter_instance: Adapter | None = None
         # The project seam, in its two shapes. `_project_format` is an instance a
         # host handed us and always wins; `_project_factory` is what a configured
@@ -208,6 +222,9 @@ class DexEngine:
         self._project_name = "dbt"
         self._project_factory: ProjectFactory | None = None
         self._project_options: Mapping[str, Any] = {}
+        # Last, so it amends a config that is fully assembled. It is the one
+        # thing here that writes: see `_record_budget_decision`.
+        self._record_budget_decision(session_ceiling, decline_session_ceiling)
 
     @classmethod
     def from_repo(
@@ -344,6 +361,43 @@ class DexEngine:
             )
         return adapter
 
+    def _record_budget_decision(
+        self, session_ceiling: float | None, declined: bool
+    ) -> None:
+        """Record a cumulative-ceiling answer in ``.dex/config.yml``.
+
+        The write half of the one-time ask (issue #283). ``session_ceiling`` and
+        ``decline_session_ceiling`` are answers to a question the guard asked, so
+        they are durable by construction: an answer that lived for one command
+        would leave the next command asking again, which is the repetition the
+        ask exists to end.
+
+        On construction, not on the first connection, because a flag that is
+        accepted and then quietly not applied is worse than one that is rejected:
+        a caller who believes they set the project's daily cap and in fact set
+        nothing has lost exactly the bound they came here for. Deferring to the
+        adapter funnel would make the write depend on whether the command that
+        carried the answer happened to reach a warehouse, so a free command or one
+        that failed first would swallow it. Nothing else here touches the repo,
+        and nothing here does either unless a caller passed an answer.
+
+        Refuses when the two contradict each other, and when there is no
+        committed config to write to, for the same reason and in the same voice
+        as the rest of the config layer.
+        """
+
+        if session_ceiling is None and not declined:
+            return
+        root = self.require_repo_root("recording a cumulative spend ceiling")
+        config, diff = record_session_ceiling_decision(
+            root, session_ceiling=session_ceiling, declined=declined
+        )
+        # The budget alone, not the whole re-read config: this run may hold
+        # overrides (an injected config, `--connector`) that the file does not,
+        # and adopting the file wholesale here would quietly undo them.
+        self.config.budget = config.budget
+        self.config_diffs.append(diff)
+
     def _config_for_open(self) -> DexConfig:
         """The config handed to the opener, refusing when nothing selected one.
 
@@ -380,6 +434,7 @@ class DexEngine:
                 found = candidates[0]
                 self.connector = "duckdb"
                 self.path = str(found)
+                self._directory_inferred_connection = True
                 self.connection_warnings.append(
                     f"no connector configured; using the one DuckDB file in "
                     f"this directory ({found.name}) since nothing else named a "
@@ -422,6 +477,148 @@ class DexEngine:
         return connect.paradigm_for(
             self.connector or self.config.connector, self.config
         )
+
+    def connection_provenance(self) -> Connection:
+        """Return the compact, non-secret connection identity for an envelope.
+
+        This is deliberately observational: it reads the adapter and config
+        already resolved by the command and never opens a connection or runs an
+        extra metadata query merely to fill provenance.
+        """
+
+        adapter = self._adapter_instance
+        connector = (
+            getattr(adapter, "name", None)
+            or self.connector
+            or (self.config.connector if self._declared is not None else None)
+        )
+        if connector is None:
+            return Connection()
+
+        target = self._connection_target(connector, adapter)
+        if self._directory_inferred_connection:
+            source = "directory-local inference"
+        elif any(
+            value is not None
+            for value in (
+                self.connector,
+                self.path,
+                self.project,
+                self.datasets,
+                self.scopes,
+            )
+        ):
+            source = "flag"
+        elif self.connection is not None:
+            source = "host-supplied connection"
+        else:
+            source = self._ambient_target_source(connector, adapter)
+            if source is None and self._declared is not None:
+                source = ".dex/config.yml"
+
+        return Connection(connector=connector, target=target, source=source)
+
+    def _ambient_target_source(self, connector: str, adapter: Any) -> str | None:
+        """Name discovery only when ambient state supplied the target itself."""
+
+        if adapter is None:
+            return None
+        configured = {
+            "bigquery": lambda t: bool(t and t.project),
+            "snowflake": lambda t: bool(t and (t.account or t.connection_name)),
+            "databricks": lambda t: bool(t and (t.host or t.profile)),
+            "postgres": lambda t: bool(t and (t.service or t.host or t.dbname)),
+            "redshift": lambda t: bool(
+                t and (t.workgroup or t.cluster_identifier or t.host or t.dbname)
+            ),
+            "clickhouse": lambda t: bool(t and (t.host or t.database)),
+        }
+        target = getattr(self.config, connector, None)
+        if configured.get(connector, lambda _t: False)(target):
+            return None
+
+        method = str(getattr(adapter, "auth_method", ""))
+        origin = method.split(":", 1)[0]
+        if origin in {"environment", "database_url"}:
+            return "environment variable"
+        if origin == "dbt_profile":
+            return "dbt profiles.yml"
+
+        # BigQuery carries principal type rather than auth_method. Its billing
+        # project may come directly from these two documented environment vars.
+        if connector == "bigquery":
+            import os
+
+            if os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get(
+                "GCLOUD_PROJECT"
+            ):
+                return "environment variable"
+        return None
+
+    def _connection_target(self, connector: str, adapter: Any) -> dict[str, Any]:
+        """Render only non-secret coordinates, omitting unknown empty fields."""
+
+        configured = getattr(self.config, connector, None)
+
+        def compact(**values: Any) -> dict[str, Any]:
+            return {
+                key: value
+                for key, value in values.items()
+                if value is not None and value != [] and value != ""
+            }
+
+        if connector == "duckdb":
+            path = getattr(adapter, "path", None) or self.path
+            if path is None and configured is not None:
+                raw = Path(configured.path)
+                path = str(
+                    raw
+                    if raw.is_absolute() or self.repo_root is None
+                    else Path(self.repo_root) / raw
+                )
+            if path is not None:
+                path = str(Path(path).resolve())
+            return compact(path=path)
+        if connector == "bigquery":
+            return compact(
+                project=getattr(adapter, "project", None)
+                or self.project
+                or getattr(configured, "project", None),
+                datasets=self.datasets
+                or self.scopes
+                or getattr(configured, "datasets", None),
+            )
+        if connector == "snowflake":
+            return compact(
+                account=getattr(adapter, "account", None)
+                or getattr(configured, "account", None),
+                warehouse=getattr(configured, "warehouse", None),
+                databases=self.scopes or getattr(configured, "databases", None),
+            )
+        if connector == "databricks":
+            return compact(
+                host=getattr(adapter, "host", None)
+                or getattr(configured, "host", None),
+                warehouse=getattr(configured, "warehouse", None),
+                catalogs=self.scopes or getattr(configured, "catalogs", None),
+            )
+        if connector in {"postgres", "redshift"}:
+            return compact(
+                host=getattr(configured, "host", None),
+                database=getattr(adapter, "_database", None)
+                or getattr(configured, "dbname", None),
+                schemas=self.scopes or getattr(configured, "schemas", None),
+                workgroup=getattr(configured, "workgroup", None),
+                cluster=getattr(configured, "cluster_identifier", None),
+            )
+        if connector == "clickhouse":
+            return compact(
+                host=getattr(configured, "host", None),
+                database=getattr(adapter, "_database", None)
+                or getattr(configured, "database", None),
+                databases=self.scopes or getattr(configured, "databases", None),
+            )
+        return {}
 
     def settled_spend(self) -> dict | None:
         """What the command that just ran actually billed, settled and read
@@ -637,10 +834,12 @@ class DexEngine:
     # engines it drives, so this class stays a surface a caller can read top to
     # bottom, and the CLI and a library call run identical code.
 
-    def inventory(self, *, rank: bool = False) -> InventoryResult:
+    def inventory(
+        self, *, rank: bool = False, limit: int | None = None, show_all: bool = False
+    ) -> InventoryResult:
         from .explore import commands as explore
 
-        return explore.inventory(self, rank=rank)
+        return explore.inventory(self, rank=rank, limit=limit, show_all=show_all)
 
     def profile(
         self,
@@ -648,6 +847,7 @@ class DexEngine:
         refresh: bool = False,
         use_project: bool = False,
         check_cumulative: bool = False,
+        show_all_columns: bool = False,
     ) -> ProfileResult:
         from .explore import commands as explore
 
@@ -655,6 +855,7 @@ class DexEngine:
             self,
             list(objects),
             refresh=refresh,
+            show_all_columns=show_all_columns,
             use_project=use_project,
             check_cumulative=check_cumulative,
         )
@@ -820,10 +1021,10 @@ class DexEngine:
 
         return maintain.snapshot(self)
 
-    def check(self) -> DriftResult:
+    def check(self, objects: list[str] | None = None) -> DriftResult:
         from .maintain import commands as maintain
 
-        return maintain.check(self)
+        return maintain.check(self, objects)
 
     def schema_drift(self, objects: list[str] | None = None) -> DriftResult:
         from .maintain import commands as maintain

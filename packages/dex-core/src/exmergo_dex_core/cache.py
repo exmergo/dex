@@ -13,6 +13,7 @@ lives behind the storage contract (see storage/base.py). Secrets never live here
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -184,6 +185,57 @@ class Dataset(BaseModel):
                 dropped += 1
                 continue
             kept.append((column, role))
+        return kept, dropped
+
+    def columns_with_findings(
+        self, *, everything: bool = False
+    ) -> tuple[list[ColumnProfile], int]:
+        """The columns of this dataset worth showing by default in `explore
+        profile`'s payload: the ones its own checks already flagged, so the
+        verdict a caller asked for -- grain, keys, data quality -- is not the
+        part 107 columns of schema push past a truncating harness's cutoff.
+
+        Deliberately not `notable_columns`: that method is shared with `map`
+        and `diagram`, where "notable" means a grain/key/join/PII role, and
+        widening it to include null fraction and data-quality mentions would
+        change what those two commands consider notable too. This predicate
+        is `profile`'s own.
+
+        A column carries a finding if it is PII-flagged, has a non-zero null
+        fraction, is a member of a candidate or composite key (or is itself
+        proven unique), carries a reported value domain (a low-cardinality
+        enumeration the profiler specifically computed, so its presence is
+        already the profiler saying this column is worth a look), or is
+        named in one of this dataset's own `data_quality` sentences. The
+        last check is a word-boundary match against the joined notes, not a
+        raw substring (a column named `am` must not match `amount`), and it
+        can still over-include a column merely mentioned in a note about a
+        different one. That is the safe direction to be wrong in: the
+        predicate exists so a real finding is never the reason it gets
+        truncated away, not to be a precise finding-to-column index.
+        ``everything`` keeps every column.
+        """
+
+        keyed = {c.lower() for group in self.candidate_keys for c in group}
+        keyed |= {c.lower() for group in self.composite_keys for c in group}
+        note_text = " ".join(self.data_quality)
+
+        kept: list[ColumnProfile] = []
+        dropped = 0
+        for column in self.columns:
+            has_finding = (
+                column.pii is not None
+                or bool(column.null_fraction)
+                or column.name.lower() in keyed
+                or column.is_unique is True
+                or column.value_domain is not None
+                or re.search(rf"\b{re.escape(column.name)}\b", note_text, re.IGNORECASE)
+                is not None
+            )
+            if everything or has_finding:
+                kept.append(column)
+            else:
+                dropped += 1
         return kept, dropped
 
 

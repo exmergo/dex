@@ -62,6 +62,13 @@ def test_profile_handshake_then_confirmed_run(tmp_path: Path, capsys, bq_project
             "--confirm",
             "--budget",
             str(MAX_BYTES),
+            # This test wants the real schema profiling found, not the
+            # finding-only default summary (#288): none of Shakespeare's four
+            # columns carries a PII flag, a null fraction, key membership, or
+            # a data-quality note, so the default summary would elide all of
+            # them rather than the one this assertion used to catch missing.
+            "--columns",
+            "all",
         ],
         capsys,
     )

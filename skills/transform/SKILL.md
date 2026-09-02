@@ -301,6 +301,10 @@ check" note just means no connection was reachable at init time.
   commands use. Never invent a `--budget` figure: read the reported estimate
   (`per_table_bytes` is the actionable half, since it names which node is
   driving the cost) and confirm with a `--budget` grounded in that number.
+  A `suggested_session_ceiling` on that envelope is the project's one-time ask
+  for a cumulative daily cap, separate from `--budget`: relay it and add the
+  user's answer (`--session-ceiling <value>` or `--no-session-ceiling`) to the
+  same re-issue, which records it in `.dex/config.yml` for good.
   Each statement dbt runs is capped server-side by the profile's
   `maximum_bytes_billed`, and the envelope reports billed bytes afterward.
   Production-looking targets are refused

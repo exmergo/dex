@@ -21,6 +21,8 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
+from .conftest import integration_budget
+
 pytestmark = [pytest.mark.integration, pytest.mark.clickhouse_cloud]
 
 
@@ -35,7 +37,7 @@ def _seed_repo(root: Path) -> None:
     max_seconds = float(os.environ["DEX_TEST_CH_CLOUD_MAX_SECONDS"])
     config = {
         "connector": "clickhouse",
-        "budget": {"ceiling": max_seconds},
+        "budget": integration_budget(max_seconds),
         "clickhouse": {
             "host": os.environ["DEX_TEST_CH_CLOUD_HOST"],
             "port": int(os.environ["DEX_TEST_CH_CLOUD_PORT"]),

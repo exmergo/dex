@@ -161,6 +161,7 @@ _VALUE_FLAGS = (
     "--dataset",
     "--repo-root",
     "--budget",
+    "--session-ceiling",
     "--metric",
     "--for-dimension",
     "--search",
