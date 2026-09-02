@@ -17,6 +17,7 @@ from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
+from ..adapters.base import VALUE_DOMAIN_CAP
 from ..cache import Dataset, DexCache, Relationship
 from ..results import Result
 from .semantic import SemanticCatalog
@@ -68,7 +69,10 @@ class InventoryResult(Result):
 
 
 def _profile_dataset_payload(
-    dataset: Dataset, *, show_all_columns: bool
+    dataset: Dataset,
+    *,
+    show_all_columns: bool,
+    value_domain_cap: int = VALUE_DOMAIN_CAP,
 ) -> dict[str, Any]:
     """One profiled dataset, verdict first (#288): the fields a caller asked
     `explore profile` for -- grain, keys, data quality, row count -- lead the
@@ -81,9 +85,34 @@ def _profile_dataset_payload(
     carrying a finding (see :meth:`~..cache.Dataset.columns_with_findings`),
     with the rest counted rather than silently dropped. ``show_all_columns``
     (``--columns all``) restores every column.
+
+    Two more reductions (#290), both to the serialized shape and never to the
+    cached profile. A per-column field that is null on every column being
+    serialized is dropped from each of them and named once in
+    ``suppressed_fields``, so a caller reading a 107-column table pays for no
+    copy of ``"pii_overridden": null`` and can still tell a field that was
+    omitted from one that was never part of the contract; the judgment is over
+    the columns the payload carries, so it is consistent with itself in both
+    column modes, and ``suppressed_fields`` sits ahead of ``columns`` so a
+    truncated read still explains the absence. And each ``value_domain`` is cut
+    to its ``value_domain_cap`` most frequent values with the remainder folded
+    into the domain's ``elided`` count (``values`` plus ``elided`` stays the
+    exact distinct total), so a wide enumeration reads as a summary rather than
+    a column dump.
     """
 
     kept, elided = dataset.columns_with_findings(everything=show_all_columns)
+    columns = [c.model_dump(mode="json") for c in kept]
+    cap = max(0, value_domain_cap)
+    for column in columns:
+        domain = column.get("value_domain")
+        if domain is not None and len(domain["values"]) > cap:
+            domain["elided"] += len(domain["values"]) - cap
+            domain["values"] = domain["values"][:cap]
+    suppressed = _fields_null_everywhere(columns)
+    for column in columns:
+        for name in suppressed:
+            del column[name]
     return {
         "identifier": dataset.identifier,
         "object_type": dataset.object_type,
@@ -96,9 +125,21 @@ def _profile_dataset_payload(
         "data_quality": dataset.data_quality,
         "profiled_at": dataset.profiled_at,
         "semantic_models": dataset.semantic_models,
-        "columns": [c.model_dump(mode="json") for c in kept],
+        "suppressed_fields": suppressed,
+        "columns": columns,
         "elided_column_count": elided,
     }
+
+
+def _fields_null_everywhere(columns: list[dict[str, Any]]) -> list[str]:
+    """The keys whose value is ``None`` on every one of ``columns``, in the
+    order the column shape declares them. Empty when there are no columns:
+    nothing can be null everywhere on nothing, and an empty list is the
+    positive statement that the columns shown carry their full shape."""
+
+    if not columns:
+        return []
+    return [key for key in columns[0] if all(c.get(key) is None for c in columns)]
 
 
 class ProfileResult(Result):
@@ -107,9 +148,10 @@ class ProfileResult(Result):
     ``datasets`` is the full requested set either way, so a caller reads one list
     and does not have to reassemble it; ``profiled_count`` and
     ``cache_hit_count`` say which half each came from. ``datasets`` itself always
-    holds every column, unreduced: ``show_all_columns`` only controls what
-    ``data()`` serializes, so a library caller reading ``ProfileResult.datasets``
-    directly is never affected by the CLI's ``--columns`` default.
+    holds every column, unreduced: ``show_all_columns`` and ``value_domain_cap``
+    only control what ``data()`` serializes, so a library caller reading
+    ``ProfileResult.datasets`` directly is never affected by the CLI's
+    ``--columns`` default or by a repo's ``profile_value_domain_cap``.
     """
 
     datasets: list[Dataset] = Field(default_factory=list)
@@ -118,11 +160,16 @@ class ProfileResult(Result):
     cache_path: str = ""
     updated_at: str = ""
     show_all_columns: bool = False
+    value_domain_cap: int = VALUE_DOMAIN_CAP
 
     def data(self) -> dict[str, Any]:
         return {
             "datasets": [
-                _profile_dataset_payload(d, show_all_columns=self.show_all_columns)
+                _profile_dataset_payload(
+                    d,
+                    show_all_columns=self.show_all_columns,
+                    value_domain_cap=self.value_domain_cap,
+                )
                 for d in self.datasets
             ],
             "profiled_count": self.profiled_count,

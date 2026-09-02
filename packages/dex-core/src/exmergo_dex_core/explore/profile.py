@@ -1024,7 +1024,7 @@ def _probe_composite_keys(
 
     # Imported here: relationships imports NEAR_UNIQUE_RATIO from this module,
     # so a module-level import would be circular.
-    from .relationships import _is_id_shaped
+    from .relationships import is_id_shaped
 
     ranked: list[tuple[int, int, tuple[str, str]]] = []
     for i, a in enumerate(pool):
@@ -1033,7 +1033,7 @@ def _probe_composite_keys(
             n_approx = sum(1 for m in (a, b) if not m.distinct_count_exact)
             if product < row_count * NEAR_UNIQUE_RATIO**n_approx:
                 continue
-            id_shaped = sum(1 for m in (a, b) if _is_id_shaped(m.name))
+            id_shaped = sum(1 for m in (a, b) if is_id_shaped(m.name))
             # Members ordered by descending cardinality so the key reads
             # parent-then-line, e.g. (L_ORDERKEY, L_LINENUMBER).
             members = sorted(

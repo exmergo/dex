@@ -19,6 +19,7 @@ command here needs a repo root and refuses without one, naming what needed it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from typing import TYPE_CHECKING
@@ -1097,19 +1098,38 @@ def _plan_hint(result: PlanResult) -> dict[str, str]:
 
 
 def _record_build_spend(
-    store: Store, connector: str, billed: float, paradigm
-) -> dict[str, float]:
+    store: Store,
+    connector: str,
+    billed: float | None,
+    paradigm,
+    estimate: float | None = None,
+) -> dict[str, float | None]:
     """Account a billed dbt build in the spend ledger and report what it cost.
 
     The paradigm names both units, so a build draws against the same session
     budget as an explore scan and reports spend under the key every other
     command reports it under.
 
+    ``billed`` is ``None`` only where dbt executed statements and reported no
+    billing figure for any of them, which is unknown spend rather than none.
+    Nothing is ledgered then, because there is no figure to ledger, and the unit
+    key still reports ``None`` so the caller reads "unavailable" instead of the
+    zero that would under-report it.
+
     Returns the summary in :meth:`CostGate.spend_summary`'s shape, because a
     build settles outside any gate: dbt executes the statements, so
     ``record_billed`` never fires and the gate's own total stays zero for the
     run. The day's total is read back from the ledger this write just landed in,
     which is the number the next command's gate will start from.
+
+    ``estimate`` is what the handshake priced this build at, written beside what
+    it billed exactly as :meth:`CostGate.record_billed` writes it, so a build
+    calibrates a later refusal like any other command. It matters more here than
+    anywhere else: a build is the largest billed command dex has, so it is both
+    the one most likely to be refused over a ceiling and the one whose estimate
+    an operator most needs the history of. ``None`` where pricing degraded and
+    there was no estimate to record, which :func:`settled_ratios` skips rather
+    than counting as a ratio of nothing.
     """
 
     from datetime import UTC, datetime
@@ -1117,21 +1137,36 @@ def _record_build_spend(
     from ..guards.cost_guard import ledger_field, spend_field, utc_day_start
 
     field = ledger_field(paradigm)
-    store.append_spend_log(
-        {
-            "at": datetime.now(UTC).isoformat(),
-            "connector": connector,
-            "command": "transform build",
-            field: float(billed),
-            "job_id": None,
-            "statement_sha256": None,
-        }
-    )
-    return {
-        spend_field(paradigm): float(billed),
-        "session_spent_today": store.spend_since(
+    if billed is not None:
+        store.append_spend_log(
+            {
+                "at": datetime.now(UTC).isoformat(),
+                "connector": connector,
+                "command": "transform build",
+                # The kind every gate-written settlement carries. A build settles
+                # outside any gate and used to write an entry with no kind at all,
+                # which sums identically (the totals branch on no kind) but reads
+                # as a different sort of record to anything walking the ledger
+                # back.
+                "entry": "settlement",
+                field: float(billed),
+                "estimate": estimate,
+                "job_id": None,
+                "statement_sha256": None,
+            }
+        )
+    # Read back best-effort, exactly as gate settlement reports the day's total:
+    # what this build billed came from dbt and is exact either way, so a ledger
+    # that cannot be read must not turn a build that already spent into a failure
+    # reporting nothing. `None` is the documented "day's total unavailable".
+    session_spent: float | None = None
+    with contextlib.suppress(Exception):
+        session_spent = store.spend_since(
             utc_day_start(), field=field, connector=connector
-        ),
+        )
+    return {
+        spend_field(paradigm): None if billed is None else float(billed),
+        "session_spent_today": session_spent,
     }
 
 
@@ -1230,6 +1265,13 @@ def _shape_build_result(
     *and* reported on the result, so a host summing settled spend from envelopes
     sees builds rather than silently counting them as free.
 
+    It is reported in exactly one place, ``data.spend``, which every billed
+    command reports under. Anything a caller has to look for in a second key on
+    some commands and not others is a key whose absence reads as a value, and the
+    value it read as here was zero (issue #276). For the same reason a billed
+    paradigm always reports the key, whatever it settled at: a spend of zero and
+    "this command does not report spend" have to be distinguishable.
+
     A failed run reports its spend too: dbt bills for the statements it ran
     before it stopped, and a caller sizing the re-run needs that number more
     than a successful one does.
@@ -1251,32 +1293,61 @@ def _shape_build_result(
         gate.settle()
     messages = summary.pop("messages", [])
     notes = [*extra_notes, *summary.pop("notes", [])]
-    spend: dict[str, float] | None = None
+    spend: dict[str, float | None] | None = None
+    # What the handshake priced this build at, ledgered beside what it billed so
+    # a later over-ceiling refusal on this connector can say how far the two
+    # have run apart. `None` on the degraded-pricing path, where there was no
+    # estimate to compare against and inventing one would be worse than none.
+    estimate = getattr(cost, "estimate", None)
     if paradigm is Paradigm.BYTES_SCANNED:
         notes = [
             "each statement was capped server-side by the profile's "
             "maximum_bytes_billed (a per-statement cap, not per run)",
             *notes,
         ]
-        billed = summary.get("bytes_billed")
-        if billed:
-            spend = _record_build_spend(store, connector, billed, paradigm)
+        # Popped, not read: `data.spend` is the one place any command reports
+        # what it billed, and a second copy at the top of `data` that only this
+        # command carried was worse than no copy at all (issue #276). A caller
+        # reading `data.bytes_billed` saw a build's spend and nothing for a
+        # `maintain check` that had just scanned 0.89 GB, and an absent key
+        # defaulted to zero reads as free.
+        billed = summary.pop("bytes_billed", None)
+        if billed is None and summary.get("nodes"):
+            # Statements ran and not one of them reported a billing figure, so
+            # what this build cost is unknown rather than nothing. Reporting the
+            # key as null says exactly that; zero would under-report spend, which
+            # is the one direction a cost guard must never round. A build that
+            # died before executing anything has an empty `nodes` and really did
+            # bill nothing, so it settles at zero like any other free run.
+            notes = [
+                *notes,
+                "dbt reported no billing figure for any statement in this run, "
+                "so spend is unknown rather than zero and nothing was appended "
+                "to the spend ledger",
+            ]
+        else:
+            billed = float(billed or 0.0)
+        spend = _record_build_spend(store, connector, billed, paradigm, estimate)
     elif paradigm is Paradigm.COMPUTE_TIME:
         cap_note = _COMPUTE_TIME_CAP_NOTES.get(
             connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
         )
         notes = [cap_note, *notes]
         # dbt-snowflake, dbt-databricks, and dbt-redshift report no billing figure;
-        # per-node execution time is the honest compute-seconds actual.
+        # per-node execution time is the honest compute-seconds actual. It is
+        # always known (a run with no nodes burned no seconds), so unlike the
+        # bytes path there is no unknown case to distinguish from zero.
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )
-        if seconds:
-            summary["seconds_billed"] = seconds
-            spend = _record_build_spend(store, connector, seconds, paradigm)
-            translate = getattr(adapter, "compute_spend_translation", None)
-            if translate is not None:
-                spend.update(translate(seconds))
+        spend = _record_build_spend(store, connector, seconds, paradigm, estimate)
+        translate = getattr(adapter, "compute_spend_translation", None)
+        if translate is not None:
+            # Unconditional, including at zero seconds: the translated keys
+            # (compute-unit-hours, USD) are part of this connector's spend shape,
+            # and a run that omitted them would be the same present-sometimes key
+            # this issue is about, one level down.
+            spend.update(translate(seconds))
     elif paradigm is Paradigm.DB_LOAD:
         notes = [_DB_LOAD_CAP_NOTES.get(connector, _UNCAPPED_BUILD_NOTE), *notes]
         # The db-load dbt adapters report no billing figure; per-node execution
@@ -1284,9 +1355,7 @@ def _shape_build_result(
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )
-        if seconds:
-            summary["seconds_billed"] = seconds
-            spend = _record_build_spend(store, connector, seconds, paradigm)
+        spend = _record_build_spend(store, connector, seconds, paradigm, estimate)
     notes = [
         *notes,
         *no_session_ceiling_warning(
@@ -1362,6 +1431,11 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
             # gate's refusal can be lifted the same documented way every other
             # PII refusal is.
             pii_overrides=pii_override_paths(engine.config.pii_overrides),
+            # Which house-convention warnings this project has left on. A style
+            # judgment is the one kind of check a repo gets to decline, and the
+            # decision belongs in the committed config rather than in a flag,
+            # so it holds for every caller rather than for whoever remembered.
+            conventions=engine.config.conventions,
             # Agent-authored edits, which is the caller `editing_surface` exists
             # for: there is no placement to compare a path against here, only the
             # surface the format admits to owning. A format declining the write

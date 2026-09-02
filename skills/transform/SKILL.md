@@ -203,6 +203,20 @@ check" note just means no connection was reachable at init time.
   (then the usual `--confirm --budget` once priced), so ask the user before
   spending. A change reported with `attributed: false` names why it could not be
   measured; treat that as unknown, not as zero.
+- The plan also warns about the **shape** of what you authored, in `warnings`.
+  A SELECT list that diverges from the columns the model's `schema.yml` declares
+  is named in both directions; fix whichever side is actually stale, and say
+  which one you decided it was.
+- A warning that the model **exposes a raw foreign key with no resolved
+  counterpart** is dex reading a convention out of the project's own models: the
+  siblings it names all resolve keys of that shape, and it names the parent
+  model yours could resolve against. Prefer resolving it, by joining that parent
+  the way the siblings do. Where the raw key is deliberate (a fact-shaped model
+  in a dimension folder, a key the consumer needs verbatim), say so plainly to
+  the user rather than quietly leaving it. Never switch the check off to make
+  the warning go away: `conventions.resolved_keys: false` in `.dex/config.yml`
+  is a decision about the house's style, so recommend it for the user to accept,
+  the same way you would a `pii_overrides` entry.
 - `transform apply [plan-id]` writes the plan into the dbt project (the latest
   unapplied plan when no id is given; any plan kind, semantic included). The
   result is still a reviewable git diff for the user. If a human edited a file
@@ -301,6 +315,12 @@ check" note just means no connection was reachable at init time.
   commands use. Never invent a `--budget` figure: read the reported estimate
   (`per_table_bytes` is the actionable half, since it names which node is
   driving the cost) and confirm with a `--budget` grounded in that number.
+  If the build is refused over the ceiling, the refusal carries a calibration
+  line from `.dex/spend.jsonl`: what this connector's recent commands billed as
+  a fraction of estimate, or a sentence saying there is too little history to
+  say. Builds over-estimate most on a partitioned or clustered warehouse, so
+  relay it, and note that the ceiling binds on the estimate rather than on what
+  settles, so a budget set at that fraction of the estimate is refused again.
   A `suggested_session_ceiling` on that envelope is the project's one-time ask
   for a cumulative daily cap, separate from `--budget`: relay it and add the
   user's answer (`--session-ceiling <value>` or `--no-session-ceiling`) to the

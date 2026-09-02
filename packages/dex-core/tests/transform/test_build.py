@@ -1131,7 +1131,11 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     assert rc == 0, envelope
     # The confirmed run's envelope carries the preflight estimate and the actual.
     assert envelope["cost"]["estimate"] == 5_000_000.0
-    assert envelope["data"]["bytes_billed"] == 3000
+    # Issue #276: spend lives at `data.spend` and nowhere else. `transform build`
+    # used to also stamp a top-level `data.bytes_billed` that no other billed
+    # command carried, so a caller reading that key saw a build's spend and read
+    # `maintain check`'s missing key as zero.
+    assert "bytes_billed" not in envelope["data"]
     assert any("maximum_bytes_billed" in w for w in envelope["warnings"])
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
     entry = json_mod.loads(ledger[-1])
@@ -1143,6 +1147,143 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     # `data.spend` across commands used to count every build as free.
     assert envelope["data"]["spend"]["bytes_billed"] == entry["billed_bytes"]
     assert envelope["data"]["spend"]["session_spent_today"] == 3000
+    # Issue #278: the estimate rides into the ledger beside the settled figure,
+    # so a later over-ceiling refusal on this connector can say how far the two
+    # have run apart. A build is the largest billed command dex has and settles
+    # outside any gate, so without this the command most likely to be refused
+    # over a ceiling would have been the one contributing nothing to calibrating
+    # that refusal.
+    assert entry["entry"] == "settlement"
+    assert entry["estimate"] == envelope["cost"]["estimate"] == 5_000_000.0
+
+
+def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Issue #276, the other half: a key present only sometimes is worse than one
+    that never exists, so a billed connector reports `data.spend` whatever the
+    build settled at. A build that billed zero and one that does not report spend
+    have to be distinguishable, and `if billed:` made them identical."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    # dbt ran the node and BigQuery billed nothing for it: a cache hit, or a
+    # no-op incremental. The figure is reported, so it is zero.
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 0},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["spend"]["bytes_billed"] == 0
+    assert envelope["data"]["spend"]["session_spent_today"] == 0
+    entry = json.loads((tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()[-1])
+    assert entry["command"] == "transform build"
+    assert entry["billed_bytes"] == 0
+
+
+def test_a_build_whose_statements_reported_no_billing_figure_says_so(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Statements ran and none of them reported what they billed, so the spend is
+    unknown rather than zero. The key is still there (parity), its value is null
+    (honesty), a note explains it, and nothing reaches the ledger: rounding an
+    unknown spend down to zero is the under-report issue #276 is about."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    # No adapter_response at all: whatever this scanned, dbt is
+                    # not saying.
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["spend"]["bytes_billed"] is None
+    # A build's per-paradigm notes ride in `warnings`, where its cap note does.
+    assert any("no billing figure" in w for w in envelope["warnings"])
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(

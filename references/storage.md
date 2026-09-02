@@ -60,11 +60,13 @@ at runtime. Passing an explore-only store to a transform command refuses with a
 message naming the tier and the missing members, rather than failing on a missing
 attribute several frames down.
 
-Two capabilities sit alongside the tiers rather than inside them, and both are
+Three capabilities sit alongside the tiers rather than inside them, and all are
 optional: `SpendLock`, so the cumulative spend ceiling binds when two commands
-overlap, and the construction contract, so your backend can be named in
-configuration. A backend is a complete backend without either, and the first is
-one every concurrent host wants.
+overlap; `SpendHistory`, so an over-ceiling refusal can say how far this
+connector's past estimates ran from what they actually billed; and the
+construction contract, so your backend can be named in configuration. A backend
+is a complete backend without any of them, and the first is one every concurrent
+host wants.
 
 ## Writing one
 
@@ -160,6 +162,58 @@ skip the lock on anything serving concurrent requests.
 
 `SpendLockContract` in the conformance suite is the executable version of all of
 the above.
+
+## Reading the ledger back
+
+A second optional capability, and a gentler one: skipping it costs a sentence,
+not correctness.
+
+```python
+class MyStore:
+    def spend_entries(self, *, connector=None, limit=500):
+        entries = [e for e in self._entries("spend")
+                   if connector is None or e.get("connector") == connector]
+        return entries[-limit:]
+```
+
+**Why dex wants it.** `spend_since` answers the one question the cumulative
+ceiling asks, "how much today", and answers it as a single float, which is what
+keeps that hot path cheap. There is a second question worth asking of the same
+ledger. A dry-run estimate on a partitioned or clustered table is an upper bound
+by construction, so a build refused at an estimated 6.9 GB against a 5 GB ceiling
+may bill 4.75 GB when it is finally run, and "raise the budget or narrow the
+work" is then answered by a guess made under the impression that the estimate
+approximates the cost. dex records both halves already: every `settlement` entry
+carries an `estimate` beside the figure it settled at. This member is what reads
+them back, so the refusal can end with
+
+> The last 8 settled bigquery commands in this project's spend ledger billed a
+> median 69% of estimate (range 61%-88%) ...
+
+**Three properties.**
+
+- **Return the entries uninterpreted**, as dicts, exactly as they were appended.
+  The guard pairs `estimate` with the settled figure and groups by
+  `reservation_id`; a backend that drops keys it does not recognize breaks that.
+- **Append order, oldest first.** Not sorted by `at`: the ledger is append-only,
+  so insertion order is the true order and it stays right for entries whose stamp
+  is missing.
+- **Filter by connector, then cap.** `limit` takes the *most recent* matching
+  entries. Capping before filtering returns fewer than `limit` of the asked-for
+  connector whenever another connector shares the ledger.
+
+**Failing is allowed**, which is the opposite of `spend_since` and for the reason
+that separates them: nothing is admitted or refused on what this returns. It only
+decides whether an already-decided refusal carries one more sentence, so dex
+swallows an error here and drops the sentence. Raise or return `[]`; both read as
+"no history".
+
+**Without it your backend still works**, and nothing warns: no guard is narrower
+than it looks, so there is nothing to disclose. Over-ceiling refusals simply read
+as they always did.
+
+`SpendHistoryContract` in the conformance suite is the executable version of the
+above.
 
 ## Constructing one
 
@@ -319,6 +373,12 @@ magnitude, and that is the one thing to know here: a backend that clamps or
 filters on sign would leak held headroom for the rest of the UTC day. Sum what
 you are given.
 
+A `settlement` also carries `estimate`, the whole-command preflight figure the
+command was admitted on, so the ledger holds both halves of every "estimated
+this, billed that" pair rather than only the half a budget is measured against.
+It is a plain extra key that no backend has to know is there; `SpendHistory` is
+what reads it back.
+
 Two properties follow, and neither required a change to any backend written
 before reservations existed:
 
@@ -430,6 +490,12 @@ substrate offers (an advisory file lock, a transaction, a conditional write) and
 this contract cannot tell the difference. That gap is real, and it is why the two
 shipped backends carry cross-process assertions of their own rather than treating
 a green contract as the whole answer.
+
+**If your backend implements `spend_entries`**, mix in `SpendHistoryContract` the
+same way. It checks the three properties from
+[Reading the ledger back](#reading-the-ledger-back): entries come back
+uninterpreted, oldest first, and `limit` caps the most recent entries *after* the
+connector filter rather than before it.
 
 ## Which calls need nothing on the filesystem
 

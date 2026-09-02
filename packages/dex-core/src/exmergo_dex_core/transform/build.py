@@ -787,6 +787,11 @@ def _summarize(
         "counts": counts,
         "messages": messages,
     }
+    # Internal hand-off, not envelope shape: `_shape_build_result` pops this to
+    # ledger the build and report it under `data.spend`, the one key every billed
+    # command reports spend under (issue #276). Present only when dbt actually
+    # reported a figure, so the shaper can tell "billed nothing" from "billed an
+    # amount dbt never told us".
     if saw_billing:
         summary["bytes_billed"] = bytes_billed
     return summary

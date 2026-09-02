@@ -13,6 +13,77 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`explore profile` drops the fields that are null on every column, and caps
+  each value domain** ([#290]). On the 107-column staging table #288 measured,
+  every column carried a 12-field object, and one of those fields,
+  `pii_overridden`, was null on all 107 of them: emitted 107 times and
+  carrying no information in any of them. Several more were null on most
+  (`pii` on 100, `min_value` and `max_value` on 61), and the populated
+  `value_domain` blocks alone were 19% of the 38 KB payload.
+
+  A per-column field that is null on every column the payload serializes is
+  now dropped from each of them and named once, at dataset level, in
+  `suppressed_fields`, so the absence is legible rather than mysterious and an
+  omitted field can never be mistaken for one that was never part of the
+  contract. The judgment is over the columns actually shown, so the payload is
+  consistent with itself under both the default summary and `--columns all`,
+  and the list sits ahead of `columns`, where a truncated read still reaches
+  it. A field that is null on some columns but not all stays on every column:
+  a string column's suppressed `min_value` beside a numeric column's real one
+  is a finding, not padding. `suppressed_fields` is always present, so an
+  empty list is the positive statement that the columns shown carry their
+  full shape.
+
+  Each `value_domain` is also capped at its `profile_value_domain_cap` most
+  frequent values (`.dex/config.yml`, default 25), with the rest folded into
+  the domain's `elided` count, so `values` plus `elided` is still the exact
+  distinct total. The default equals the probe's own cap, so nothing changes
+  until a repo lowers it. Both reductions apply to the serialized payload
+  only: the cached profile keeps every field and every probed value, and a
+  library caller reading `ProfileResult.datasets` sees it unreduced.
+
+  Not taken up here: the issue's separate suggestion to compute `min_value`
+  and `max_value` for VARCHAR columns. That suppression is a guardrail, not
+  an oversight: a string extreme is a raw value, and no raw value crosses
+  this envelope. Date and timestamp columns already report their range.
+
+- **`transform plan` warns when a model passes a raw foreign key through into a
+  folder whose siblings all resolve theirs** ([#223]). A dimension exposing
+  `supplier_id` where every sibling dimension resolves the equivalent key to
+  `supplier_name` is a house-convention violation, and nothing noticed until
+  review. The check reads the convention out of the project's own models rather
+  than out of a rule dex invents, names the siblings that set the precedent and
+  the parent model the key could resolve against, and never refuses.
+
+  Four things have to hold together before it speaks, and each one is there to
+  keep it quiet. The authored SELECT list has to resolve statically, so a
+  `select *` produces silence rather than a hedge. At least three siblings, the
+  models sharing the authored one's folder and its layer prefix, each have to
+  resolve a key of the same id-suffix shape, and **none** of them may pass one
+  through: a single counter-example ends it, which is what keeps a marts folder
+  holding both facts and dimensions silent, since a fact table carries raw keys
+  legitimately. The key may not be the model's own, so a dimension is never
+  warned for exposing its own identity, including a variant named for the same
+  entity (`dim_suppliers_eu.supplier_id`) or an aliased spelling of it
+  (`dim_customers.cust_id`). And the project has to hold a parent to resolve
+  against, a model named for the same entity that produces something other than
+  keys, because the fix is a `ref()` and a parent dex cannot name is a warning
+  the caller cannot act on.
+
+  Shapes do not cross: a house that resolves every `*_key` has said nothing
+  about how it treats a `*_id`. Where the folder is too small to hold a
+  precedent, the same convention is read at the layer instead, so a project with
+  one flat `models/` directory is covered. The project as the plan will leave it
+  is what gets read, so two dimensions authored together are each other's
+  precedent and a sibling the same plan deletes is not. Only models the plan
+  authors are judged; an existing violation elsewhere is not this plan's warning.
+
+  This is the only warning dex raises on a style judgment rather than on a fact,
+  which is why it is the only one a project can switch off:
+  `conventions.resolved_keys: false` in `.dex/config.yml`, named in the warning
+  itself so the off-switch is one read away. Leaving it on costs a repo with no
+  consistent convention nothing, since it stays silent unless the project's own
+  models agree unanimously.
 - **`maintain verify`: is the project correct right now, with no drift
   baseline required** ([#224], [#225]). Every existing `maintain` subcommand
   answers "what changed", and refuses outright with no `.dex/snapshot.json`
@@ -142,7 +213,57 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   never updated to accept them, so a library caller could not widen or lift
   the rank cap the way a CLI caller could. `DexEngine.inventory()` now
   accepts `limit` and `show_all` and passes them through.
-  
+
+- **`data.spend` is now the only place any command reports what it billed**
+  ([#276]). `transform build` stamped its billed magnitude twice, once under
+  `data.spend` like every other billed command and once as a top-level
+  `data.bytes_billed` that no other command carried:
+
+  | Command | `data.bytes_billed` | `data.spend.bytes_billed` |
+  |---|---|---|
+  | `transform build` | 4750049280 | 4750049280 |
+  | `maintain check` | absent | 891289600 |
+
+  A caller that reads the top-level key and defaults a miss to zero therefore
+  reports that `maintain check` was free. It was not; it had just scanned
+  0.89 GB. That happened in a real session, the wrong figure was reported to a
+  human, and it survived into the first draft of a written cost report before
+  being caught by reconciling the envelopes against `.dex/spend.jsonl`.
+
+  Silently under-reporting spend is the one class of envelope defect that
+  undermines the cost-governance guarantee rather than merely annoying the
+  caller, and this one is invisible from the caller's side: an agent reading one
+  key and getting nothing cannot distinguish "this cost nothing" from "look in
+  the other key", and both readings are plausible. So the duplicate is removed
+  rather than propagated. A key that exists on one command and not another is
+  worse than a key that never exists, because at the top of `data`, where a
+  command's own findings live, an absent key reads as a value.
+
+  The same rule has a second half, which was also broken on builds. A billed
+  command now reports the unit key whatever it settled at, zero included: a
+  build that billed nothing used to omit `data.spend` entirely, which is the
+  identical ambiguity one level down. And where a figure is genuinely
+  unavailable it is reported as `null` with a note saying why, never as zero.
+  That case is real: if dbt executed statements and reported no billing figure
+  for any of them, what the build cost is unknown, nothing is appended to the
+  ledger, and rounding it down to zero would be the same under-report by
+  another route. A build that died before executing anything did bill nothing
+  and still settles at zero.
+
+  Two smaller consequences of making the rule uniform. On ClickHouse Cloud a
+  build's translated figures (compute-unit-hours, USD) are reported at zero
+  seconds too, rather than being the same present-sometimes key one level
+  further down. And a build now tolerates a ledger read failure at settlement
+  the way gate settlement already does, reporting
+  `data.spend.session_spent_today: null`: what the build billed came from dbt
+  and is exact either way, so a store that goes away must not turn a build that
+  already spent into a failure that reports nothing.
+
+  Key parity across `transform build`, `maintain check`, `explore query`,
+  `explore map` and `explore profile` is now a contract test, asserted as an
+  equality between commands rather than against a list of expected keys. What a
+  connector reports is the connector's business; which command asked cannot be.
+
 ### Changed
 
 - **Successful envelopes now identify the resolved connection.** A compact,
@@ -198,7 +319,65 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   fractions, PII flags, and selected-grain coverage. Queries that group or join
   can also include `query_notes` comparing grouping keys to known grain and
   reporting verified cached join overlap. The annotations are strictly additive,
-  cache-only, and omitted when dex cannot resolve them without guessing.  
+  cache-only, and omitted when dex cannot resolve them without guessing.
+
+- **An over-ceiling refusal now says how far this connector's estimates have
+  historically run from what they actually billed** ([#278]). A transform build
+  was refused at an estimated 6.9 GB against a 5 GB ceiling. Re-run at a raised
+  ceiling, the same build billed 4.75 GB: the estimate was 45% high, and the
+  refused build would have fit comfortably inside the original ceiling.
+
+  That is systematic rather than unlucky. A BigQuery dry-run estimate on a
+  partitioned or clustered table is an upper bound by construction, which dex
+  documents, so every large build on such a warehouse over-estimates and the
+  ratio is reasonably stable per project.
+
+  The refusal itself is correct and does not move: a ceiling that confirmation
+  can override is not a ceiling. What it lacked was any basis for the decision
+  it hands back. "Raise the budget or narrow the work" is answered by a guess,
+  and the guess is made under the natural, wrong impression that the estimate
+  approximates the cost. Guess low and the command is refused again; guess high
+  and the ceiling stops meaning anything.
+
+  dex already held the answer. `.dex/spend.jsonl` records what every prior
+  command on this connector settled at, and settlements now carry the estimate
+  they were admitted on beside it, so the refusal ends with the observed ratio:
+
+  > The last 8 settled bigquery commands in this project's spend ledger billed
+  > a median 69% of estimate (range 61%-88%), so this estimate is probably an
+  > upper bound rather than the cost. The ceiling binds on the estimate and not
+  > on what settles, so admitting this command takes a budget above
+  > 6,905,293,058, at which it would be expected to bill around 4,764,652,210
+  > bytes_scanned.
+
+  The second half is not decoration: the ceiling is checked against the
+  estimate, so a caller who read only the ratio would set a budget at 69% of
+  the estimate and be refused a second time by arithmetic.
+
+  Three rules bound what the sentence may claim. It is **per connector**, never
+  pooled, so a free DuckDB history cannot calibrate a billed BigQuery refusal
+  (and one level down, a `billed_seconds` history can never divide a
+  `billed_bytes` estimate). One **command** is one data point, not one
+  statement, so a command that settled six times against one estimate is not
+  read as six commands that each billed a sixth. And with fewer than three
+  settled commands to draw on, the refusal **says it has no ratio** rather than
+  inventing one from two data points, which an operator has no way to tell
+  apart from evidence. Two kinds of run are excluded as misleading: a command
+  killed mid-flight, whose reservation stands with no release and whose
+  settlements are partial by definition, and a run that billed zero, which is a
+  cache hit the refused command will not repeat.
+
+  Reading the ledger back is a new **optional** store capability,
+  `SpendHistory` (`spend_entries`), alongside the existing optional `SpendLock`.
+  All three shipped backends implement it and `SpendHistoryContract` ships in
+  the conformance suite. A backend without it loses the sentence and nothing
+  else: no guard is narrower than it looks, so unlike a missing spend lock,
+  nothing warns. A ledger that cannot be read is swallowed for the same reason:
+  the refusal has already been decided, and trading it for a different error
+  would cost the caller the thing they need to keep the thing they merely
+  wanted. Projects upgrading into this see the no-history sentence until they
+  have settled enough new commands, since entries written before this carry no
+  estimate to compare against.
 
 - **A project is now asked once for a cumulative spend ceiling, instead of
   warned about it forever** ([#283]). With `budget.session_ceiling` unset, every
@@ -243,7 +422,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   not the settings in play; library callers answer through
   `DexEngine(session_ceiling=...)` / `DexEngine(decline_session_ceiling=True)`,
   which refuse rather than silently do nothing when there is no config to write.
-  
+
 - **An exhausted budget is now refused by the cost gate itself, rather than by
   a check each adapter had to remember to write** ([#316]). The server-side cap
   is an integer because every connector's cap setting takes one, and on the

@@ -27,6 +27,13 @@ one the cumulative session ceiling does not bind across overlapping billed
 commands, and dex warns on every such command rather than letting the ceiling
 look enforced.
 
+**Reading the ledger back is a second optional capability**,
+:class:`SpendHistory`. ``spend_since`` answers the one question the ceiling
+needs (a total) and deliberately answers nothing else; a backend that can also
+hand back the entries themselves lets a refusal say how far past estimates on
+this connector have historically been from what settled. A backend without it
+loses that sentence and nothing else.
+
 **Constructing one is a separate contract**, :class:`StoreFactory` over a
 :class:`StoreContext`, and it is optional. A host that passes its own instance to
 the engine never needs it; it exists so a backend can also be *named* somewhere
@@ -217,6 +224,13 @@ class ExploreStore(Protocol):
         is positive**, and one that clamps or filters would leak held headroom
         for the rest of the UTC day. Sum what you are given, the way
         :func:`spend_total` does.
+
+        A ``settlement`` additionally carries ``estimate``, the whole-command
+        preflight figure the command was admitted on, so the ledger holds both
+        halves of every "estimated this, billed that" pair rather than only the
+        half a budget is measured against. It is a plain extra key on the entry
+        and no backend needs to know it is there; :class:`SpendHistory` is what
+        reads it back.
         """
         ...
 
@@ -383,6 +397,67 @@ class SpendLock(Protocol):
 
     def spend_lock(self, *, timeout: float = 30.0) -> AbstractContextManager[None]:
         """Hold the spend-admission lock for this store's ledger."""
+        ...
+
+
+@runtime_checkable
+class SpendHistory(Protocol):
+    """Optional: hand back spend-ledger entries, so a refusal can calibrate.
+
+    One method, on top of any tier. :meth:`ExploreStore.spend_since` answers the
+    only question the cumulative ceiling asks, "how much today", and answering
+    it as a single float is what keeps that hot path cheap on every backend. It
+    is also all it answers, and there is a second question worth asking of the
+    same ledger: **how far past estimates on this connector have been from what
+    actually settled**.
+
+    That question has an operator behind it. A dry-run estimate on a partitioned
+    or clustered table is an upper bound by construction, so an over-ceiling
+    refusal quotes a number that can be far above what the work would have
+    billed, and "raise the budget or narrow the work" then invites a guess made
+    under the impression that the estimate approximates the cost. dex has the
+    answer already recorded: every settlement entry carries the estimate the
+    command was admitted on beside the figure it settled at. This is the member
+    that lets the guard read them back (see
+    :func:`~..guards.cost_guard.calibration_from_ledger`).
+
+    **A backend stores entries; it does not interpret them**, which is as true
+    here as it is on the append. Return the raw dicts in append order, oldest
+    first, and leave the pairing of reservations with settlements and the
+    arithmetic over them to the guard, so every backend calibrates identically.
+
+    ``limit`` is a bound on the read, not a page size a caller will follow:
+    calibration wants a recent window, and a ledger that has been appended to
+    for months should not be deserialized in full to find it. Return the *most
+    recent* ``limit`` matching entries, still oldest-first.
+
+    Absence is handled the same way :class:`SpendLock`'s is, and more gently:
+    the guard probes for the member, and a backend without one simply produces
+    no calibration. Unlike the lock, nothing is narrower than it looks when this
+    is missing, so nothing warns.
+
+    Failure is tolerated rather than fatal, which is the opposite call from
+    ``spend_since`` and for the reason that separates them: nothing is admitted
+    or refused on what this returns. It only decides whether a refusal that has
+    already been decided carries one more sentence, so a backend that cannot
+    answer costs the sentence and no correctness. Raise or return an empty list;
+    the guard treats both as "no history".
+    """
+
+    def spend_entries(
+        self,
+        *,
+        connector: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """The most recent ``limit`` ledger entries, oldest first.
+
+        ``connector`` filters to one connector's entries and is how the guard
+        keeps a DuckDB history from calibrating a BigQuery refusal. No cutoff:
+        the cumulative ceiling is a property of today and the ratio of estimate
+        to actual is a property of the warehouse, which does not reset at
+        midnight UTC.
+        """
         ...
 
 

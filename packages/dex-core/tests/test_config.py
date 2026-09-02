@@ -9,6 +9,7 @@ import pytest
 from exmergo_dex_core.config import (
     BlobOverride,
     CacheConfig,
+    ConventionWarnings,
     DexConfig,
     PIIOverride,
     SemanticConfig,
@@ -239,3 +240,28 @@ def test_an_unset_semantic_block_is_not_written_into_the_committed_file(
     raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     assert "deployment: dbt_cloud" in raw
     assert "vendor" not in raw
+
+
+def test_the_conventions_block_round_trips_and_defaults_to_on(tmp_path: Path):
+    # House-convention warnings are the only checks a project can decline, so
+    # the default has to be on: a repo with no convention hears nothing from
+    # them anyway, and one that has a convention should not have to opt in to
+    # having it read.
+    assert DexConfig().conventions.resolved_keys is True
+
+    save_config(
+        DexConfig(conventions=ConventionWarnings(resolved_keys=False)), tmp_path
+    )
+    raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    assert "resolved_keys: false" in raw
+    assert load_config(tmp_path).conventions.resolved_keys is False
+
+
+def test_an_unset_conventions_block_is_not_written_into_the_committed_file(
+    tmp_path: Path,
+):
+    # Same rule the other blocks follow: the committed file records the choices
+    # an author made, and leaving a check on is not one of them.
+    save_config(DexConfig(connector="duckdb"), tmp_path)
+    raw = (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
+    assert "conventions" not in raw

@@ -1200,7 +1200,10 @@ def test_pii_override_clears_flag_with_audit_and_survives_reprofile(
         )
         (dataset,) = payload["data"]["datasets"]
         person = {c["name"]: c for c in dataset["columns"]}["name"]
-        assert person["pii"] is None
+        # The override cleared the only flag, so `pii` is null on every column
+        # and is suppressed rather than repeated (#290): absent here, named there.
+        assert "pii" not in person
+        assert "pii" in dataset["suppressed_fields"]
         assert person["pii_overridden"] == "name", "the audit trail"
         assert any("pii_overrides" in n for n in payload["data"]["notes"])
 
@@ -1234,7 +1237,8 @@ def test_pii_override_pattern_clears_flag_with_audit(tpch_names_duckdb: Path, ca
     )
     (dataset,) = payload["data"]["datasets"]
     person = {c["name"]: c for c in dataset["columns"]}["name"]
-    assert person["pii"] is None
+    assert "pii" not in person  # suppressed as null on every column (#290)
+    assert "pii" in dataset["suppressed_fields"]
     assert person["pii_overridden"] == "name", "the audit trail"
     assert any("pii_overrides" in n for n in payload["data"]["notes"])
 

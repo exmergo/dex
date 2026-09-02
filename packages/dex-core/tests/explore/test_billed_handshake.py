@@ -1086,7 +1086,7 @@ def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
 @pytest.fixture
 def overlap_bq_client():
     """A fake warehouse where inference finds *nothing*: both tables' own key
-    is named the bare `id`, which `_fk_stem` never turns into a stem, so the
+    is named the bare `id`, which `fk_stem` never turns into a stem, so the
     per-column inference loop skips it entirely. Both columns are still
     established as proven unique keys by the aggregate resolver (column
     index 0 of every table), which is exactly the "key or near-key, no name
