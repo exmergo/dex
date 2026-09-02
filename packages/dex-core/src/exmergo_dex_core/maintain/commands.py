@@ -485,7 +485,10 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
             "maintain grain", adapter, estimate, per_table=per_table
         )
     findings = drift_mod.grain_drift(
-        adapter, plan, timeout_seconds=engine.config.query.timeout_seconds
+        adapter,
+        plan,
+        timeout_seconds=engine.config.query.timeout_seconds,
+        min_rows=engine.config.maintain.grain_min_rows,
     )
     noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
         dataset.identifier
@@ -712,7 +715,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         return result
 
     grain_findings = drift_mod.grain_drift(
-        adapter, plan, timeout_seconds=config.query.timeout_seconds
+        adapter,
+        plan,
+        timeout_seconds=config.query.timeout_seconds,
+        min_rows=config.maintain.grain_min_rows,
     )
     semantic_findings = semantic_findings + _semantic_scope(
         drift_mod.cardinality_drift(adapter, checks, current_semantic), scope_names

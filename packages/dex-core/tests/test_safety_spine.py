@@ -4943,8 +4943,17 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
     dumped = __import__("json").dumps(payload)
     assert "@example.com" not in dumped  # no PII value ever
     grain = [f for f in payload["data"]["findings"] if f["axis"] == "grain"]
+    # `severity_floor_applied`/`grain_min_rows` (#280) are config-derived flags,
+    # not row-derived values, so they belong on this allowlist same as the rest.
     assert grain and all(
-        set(f["data"]) <= {"distinct_count", "row_count", "was_grain"}
+        set(f["data"])
+        <= {
+            "distinct_count",
+            "row_count",
+            "was_grain",
+            "severity_floor_applied",
+            "grain_min_rows",
+        }
         or f["code"] != "key_lost_uniqueness"
         for f in grain
     )
