@@ -19,6 +19,7 @@ from .conftest import (
     RS_MAX_SECONDS,
     assert_ok,
     assert_unpivot_build,
+    integration_budget,
     unpivot_fixture_edits,
 )
 from .test_redshift_connect import run_cli
@@ -58,7 +59,7 @@ def seed_repo_password_path(
     config = {
         "connector": "redshift",
         "redshift": {"dev_schema": dev_schema, "schemas": schemas},
-        "budget": {"ceiling": budget},
+        "budget": integration_budget(budget),
     }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")

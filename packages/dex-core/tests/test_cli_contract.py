@@ -502,6 +502,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "refresh": "refresh",
             "use_project": "use_project",
             "check_cumulative": "check_cumulative",
+            "columns": "show_all_columns",
         },
     },
     ("explore", "relationships"): {
@@ -684,6 +685,8 @@ _CONNECTION_DESTS = {
     "repo_root",
     "confirm",
     "budget",
+    "session_ceiling",
+    "no_session_ceiling",
     "help",
 }
 
