@@ -130,7 +130,7 @@ def _strip_configured_affixes(name: str, affixes: EntityAffixes) -> str:
     return stripped
 
 
-def _fk_stem(column_name: str) -> str | None:
+def fk_stem(column_name: str) -> str | None:
     """The entity stem of an id-shaped column, or None if not id-shaped.
 
     Recognizes each suffix in :data:`_ID_SUFFIXES` in the three naming shapes
@@ -163,14 +163,14 @@ def _dealias(column_name: str) -> str:
     return _COLUMN_ALIAS_PREFIX.sub("", column_name.lower())
 
 
-def _entity(table_name: str) -> str:
+def entity_of(table_name: str) -> str:
     """The entity a table represents: layer prefix stripped, singularized, lowered."""
 
     return _singularize(_LAYER_PREFIX.sub("", table_name)).lower()
 
 
-def _is_id_shaped(column_name: str) -> bool:
-    return column_name.lower() in _ID_SUFFIXES or _fk_stem(column_name) is not None
+def is_id_shaped(column_name: str) -> bool:
+    return column_name.lower() in _ID_SUFFIXES or fk_stem(column_name) is not None
 
 
 def candidate_keys(dataset: Dataset) -> list[list[str]]:
@@ -204,10 +204,10 @@ def detect_grain(dataset: Dataset) -> list[str] | None:
     if not singles:
         composites = [key for key in keys if len(key) > 1]
         return composites[0] if composites else None
-    entity = _entity(dataset.identifier.rsplit(".", 1)[-1])
+    entity = entity_of(dataset.identifier.rsplit(".", 1)[-1])
     for key in singles:
         name = key[0].lower()
-        if name in ("id", f"{entity}_id", f"{entity}id") or _is_id_shaped(key[0]):
+        if name in ("id", f"{entity}_id", f"{entity}id") or is_id_shaped(key[0]):
             return key
     # Fall back to the lowest-cardinality unique column.
     by_card = sorted(
@@ -267,7 +267,7 @@ def infer_relationships(
 
     for child in datasets:
         for col in child.columns:
-            stem = _fk_stem(col.name)
+            stem = fk_stem(col.name)
             if stem is None:
                 continue
             for parent in datasets:
@@ -342,7 +342,7 @@ def fold_replica_relationships(
         schema = schema_of(dataset.identifier)
         present_schemas.add(schema)
         key = (
-            _entity(bare(dataset.identifier)),
+            entity_of(bare(dataset.identifier)),
             frozenset(c.name.lower() for c in dataset.columns),
         )
         schemas_by_fingerprint.setdefault(key, set()).add(schema)
@@ -375,9 +375,9 @@ def fold_replica_relationships(
 
     def signature(rel: Relationship) -> tuple:
         return (
-            _entity(bare(rel.from_dataset)),
+            entity_of(bare(rel.from_dataset)),
             tuple(c.lower() for c in rel.from_columns),
-            _entity(bare(rel.to_dataset)),
+            entity_of(bare(rel.to_dataset)),
             tuple(c.lower() for c in rel.to_columns),
         )
 
@@ -410,7 +410,7 @@ def fk_candidate_count(datasets: list[Dataset]) -> int:
     inference result so an empty relationships array is distinguishable from
     'nothing id-shaped to try'."""
 
-    return sum(1 for d in datasets for c in d.columns if _fk_stem(c.name) is not None)
+    return sum(1 for d in datasets for c in d.columns if fk_stem(c.name) is not None)
 
 
 def data_quality_notes(dataset: Dataset) -> list[str]:
@@ -426,9 +426,9 @@ def data_quality_notes(dataset: Dataset) -> list[str]:
     if not dataset.row_count:
         return notes
 
-    entity = _entity(dataset.identifier.rsplit(".", 1)[-1])
+    entity = entity_of(dataset.identifier.rsplit(".", 1)[-1])
     for col in dataset.columns:
-        stem = _fk_stem(col.name)
+        stem = fk_stem(col.name)
         own_key = col.name.lower() == "id" or (
             stem is not None and _singularize(stem).lower() == entity
         )

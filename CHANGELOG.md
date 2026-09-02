@@ -11,6 +11,43 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **`transform plan` warns when a model passes a raw foreign key through into a
+  folder whose siblings all resolve theirs** ([#223]). A dimension exposing
+  `supplier_id` where every sibling dimension resolves the equivalent key to
+  `supplier_name` is a house-convention violation, and nothing noticed until
+  review. The check reads the convention out of the project's own models rather
+  than out of a rule dex invents, names the siblings that set the precedent and
+  the parent model the key could resolve against, and never refuses.
+
+  Four things have to hold together before it speaks, and each one is there to
+  keep it quiet. The authored SELECT list has to resolve statically, so a
+  `select *` produces silence rather than a hedge. At least three siblings, the
+  models sharing the authored one's folder and its layer prefix, each have to
+  resolve a key of the same id-suffix shape, and **none** of them may pass one
+  through: a single counter-example ends it, which is what keeps a marts folder
+  holding both facts and dimensions silent, since a fact table carries raw keys
+  legitimately. The key may not be the model's own, so a dimension is never
+  warned for exposing its own identity, including a variant named for the same
+  entity (`dim_suppliers_eu.supplier_id`) or an aliased spelling of it
+  (`dim_customers.cust_id`). And the project has to hold a parent to resolve
+  against, a model named for the same entity that produces something other than
+  keys, because the fix is a `ref()` and a parent dex cannot name is a warning
+  the caller cannot act on.
+
+  Shapes do not cross: a house that resolves every `*_key` has said nothing
+  about how it treats a `*_id`. Where the folder is too small to hold a
+  precedent, the same convention is read at the layer instead, so a project with
+  one flat `models/` directory is covered. The project as the plan will leave it
+  is what gets read, so two dimensions authored together are each other's
+  precedent and a sibling the same plan deletes is not. Only models the plan
+  authors are judged; an existing violation elsewhere is not this plan's warning.
+
+  This is the only warning dex raises on a style judgment rather than on a fact,
+  which is why it is the only one a project can switch off:
+  `conventions.resolved_keys: false` in `.dex/config.yml`, named in the warning
+  itself so the off-switch is one read away. Leaving it on costs a repo with no
+  consistent convention nothing, since it stays silent unless the project's own
+  models agree unanimously.
 - **`maintain verify`: is the project correct right now, with no drift
   baseline required** ([#224], [#225]). Every existing `maintain` subcommand
   answers "what changed", and refuses outright with no `.dex/snapshot.json`
