@@ -11,6 +11,38 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **Join overlap probes now share their table references, so verification costs
+  what the relations cost rather than what the join count costs** ([#398],
+  reported and diagnosed by [@catincloudlabs](https://github.com/catincloudlabs)).
+  `explore relationships --verify` issued one statement per candidate join, and
+  each of those statements reads two tables. On a connector that charges a
+  minimum per table referenced, a graph's probes therefore settled at twice its
+  edge count in floors, and a dimension five facts join paid its own floor five
+  times. The answers being bought are two aggregates per join, which are
+  kilobytes. Measured on a nine-edge star schema over seven tables: 180 MiB
+  priced, against 32 MiB of scan. Four fifths of the bill was floor, and it
+  recurred on every run that verified.
+
+  The probes are now batched. Joins that share a child relation are measured
+  against one read of that child, and a batch's children are combined into one
+  statement, so each statement names each of its tables once. The same schema
+  now prices at 70 MiB in one statement rather than 180 MiB in nine, and the
+  scan is unchanged at 30 MiB: what went away was floor, not measurement. Every
+  per-join result is identical, which the suite asserts by verifying the same
+  warehouse one statement per join and again in one batch and comparing.
+
+  `--infer-by-overlap`'s sweep is batched the same way, and it is the bigger
+  saving: the sweep runs up to fifty probes, so it was paying a hundred floors
+  for a pool whose answers are two counts apiece. `maintain grain`'s join-fanout
+  re-check goes through the same path and inherits it.
+
+  Nothing about the contract moved. The set of joins that gets priced is still
+  the set that gets run, both still selected through `probe_candidates`;
+  `probe_statements` still returns exactly the SQL that will execute, so a
+  billed caller's dry-run estimate stays truthful; and a budget exhausted
+  part-way through still keeps every measurement taken before it, now at
+  statement rather than join granularity.
+
 - **A project is now asked once for a cumulative spend ceiling, instead of
   warned about it forever** ([#283]). With `budget.session_ceiling` unset, every
   billed command carried a warning that nothing bounded the day's total across
