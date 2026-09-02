@@ -187,17 +187,29 @@ def test_a_view_reports_no_row_count_rather_than_zero(fake_clickhouse_connection
     assert view.byte_size is None
 
 
+@pytest.mark.parametrize(
+    "engine",
+    [
+        "ReplacingMergeTree",
+        "CollapsingMergeTree",
+        "VersionedCollapsingMergeTree",
+        "SummingMergeTree",
+        "AggregatingMergeTree",
+    ],
+)
 def test_a_collapsing_engine_is_noted_so_duplicates_do_not_read_as_a_defect(
+    engine,
     fake_clickhouse_connection,
 ):
-    """A ReplacingMergeTree keeps every version until a merge collapses them, so
+    """These engines keep every version until a merge collapses them, so
     a duplicate count describes the stored parts rather than the modeled grain.
     Without the note a key_lost_uniqueness finding here is a permanent false
     alarm."""
 
+    fake_clickhouse_connection.table("shop.order_events_raw").engine = engine
     adapter = make_adapter(fake_clickhouse_connection)
     notes = adapter.table_notes("shop.order_events_raw")
-    assert any("ReplacingMergeTree" in n for n in notes)
+    assert any(engine in n for n in notes)
     assert any("FINAL" in n for n in notes)
     assert adapter.table_notes("shop.customers") == []
 
@@ -354,7 +366,7 @@ def test_a_sub_second_remainder_is_refused_rather_than_sent_as_zero(
     at exactly the moment the budget is nearly spent."""
 
     adapter = make_adapter(fake_clickhouse_connection, ceiling=600.0)
-    # Settled spend, not a booking: remaining_for_statement measures the ceiling
+    # Settled spend, not a booking: the statement cap measures the ceiling
     # against what has actually been billed, which is what the server cap is
     # derived from.
     adapter.cost_gate.record_billed(599.5, job_id=None, statement="prior")

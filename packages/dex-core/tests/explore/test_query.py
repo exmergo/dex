@@ -365,6 +365,137 @@ def test_measuring_aggregates_over_pii_are_allowed(
     assert avg_len > 0
 
 
+# --- cache-backed query annotations ----------------------------------------------
+
+
+def test_query_returns_column_notes_from_cached_profiles(tmp_path: Path, capsys):
+    """Dropping the cache-backed annotation helper should remove the non-zero
+    null fraction from the result, which is the product regression this catches."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "notes.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE items (id INTEGER, code VARCHAR)")
+    conn.execute(
+        "INSERT INTO items VALUES (1, 'a'), (2, NULL), (3, 'c'), (4, NULL), (5, 'e')"
+    )
+    conn.close()
+
+    repo = _profiled_repo(["items"], path, tmp_path, capsys)
+    payload = _query("SELECT id, code FROM items ORDER BY id", path, repo, capsys)
+
+    assert payload["data"]["column_notes"] == {
+        "columns": [
+            {
+                "column": "code",
+                "table": "notes.main.items",
+                "source_column": "code",
+                "null_fraction": 0.4,
+            }
+        ],
+        "grain": [
+            {
+                "table": "notes.main.items",
+                "columns": ["id"],
+                "selected_columns": ["id", "code"],
+                "covered": True,
+            }
+        ],
+    }
+
+
+def test_query_notes_grouping_against_known_grain(tmp_path: Path, capsys):
+    """Changing the parser to ignore GROUP BY should lose the grain comparison
+    for the query shape callers rely on most."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "grain.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE events (id INTEGER, category VARCHAR)")
+    conn.execute("INSERT INTO events VALUES (1, 'a'), (2, 'a'), (3, 'b')")
+    conn.close()
+
+    repo = _profiled_repo(["events"], path, tmp_path, capsys)
+    payload = _query(
+        "SELECT category, COUNT(*) AS n FROM events "
+        "GROUP BY category ORDER BY category",
+        path,
+        repo,
+        capsys,
+    )
+
+    assert payload["data"]["query_notes"] == {
+        "grouping": [
+            {
+                "table": "grain.main.events",
+                "columns": ["category"],
+                "grain": ["id"],
+                "match": "misses_grain",
+            }
+        ]
+    }
+
+
+def test_query_notes_verified_join_overlap_from_cached_relationships(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """Removing relationship lookup should drop the verified overlap already paid
+    for by `explore relationships --verify`."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run(
+        [
+            "explore",
+            "relationships",
+            "--verify",
+            "--path",
+            str(airbnb_duckdb),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+
+    payload = _query(
+        "SELECT l.ID AS listing_id, h.ID AS host_id "
+        "FROM RAW_LISTINGS l JOIN RAW_HOSTS h ON l.HOST_ID = h.ID "
+        "ORDER BY listing_id, host_id",
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+
+    assert payload["data"]["query_notes"]["joins"] == [
+        {
+            "from_table": "airbnb.main.RAW_LISTINGS",
+            "from_columns": ["HOST_ID"],
+            "to_table": "airbnb.main.RAW_HOSTS",
+            "to_columns": ["ID"],
+            "verified": True,
+            "orphan_fraction": 0.0,
+        }
+    ]
+
+
+def test_query_annotations_are_silent_for_derived_outputs(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """Annotating aggregate aliases as physical columns would make this fail by
+    adding misleading cache notes to a derived result."""
+
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT COUNT(*) AS n FROM RAW_LISTINGS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+
+    assert "column_notes" not in payload["data"]
+    assert "query_notes" not in payload["data"]
+
+
 # --- refusals at the boundary ------------------------------------------------------
 
 
@@ -667,6 +798,25 @@ def test_two_statements_return_two_results(airbnb_duckdb: Path, tmp_path: Path, 
     # Columnar all the way down: the sanitizer's raw-row rule has to survive the
     # extra nesting a batch introduces.
     env.sanitize(env.ok(data))
+
+
+def test_batch_annotations_are_silent_when_unknown(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        [
+            "SELECT COUNT(*) AS n FROM RAW_HOSTS",
+            "SELECT COUNT(*) AS n FROM RAW_LISTINGS",
+        ],
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+
+    for result in payload["data"]["results"]:
+        assert "column_notes" not in result
+        assert "query_notes" not in result
 
 
 def test_a_single_statement_keeps_the_envelope_it_always_had(

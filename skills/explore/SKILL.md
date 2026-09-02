@@ -312,6 +312,17 @@ retry with a raised budget on an over-ceiling refusal without asking.
 Metadata is free (`connect test`, `inventory` run immediately), and OK
 envelopes report actual spend under `data.spend`.
 
+When a `needs_confirmation` envelope carries `suggested_session_ceiling`, the
+project has never decided whether the *day's* total spend is bounded, and this is
+the one time it is asked. Surface it beside the per-command estimate and get the
+user's answer: `--session-ceiling <value>` sets a cumulative cap for the project
+(the suggestion is five times this command's estimate, a starting point, not a
+recommendation), and `--no-session-ceiling` records that the project runs
+unbounded. Either one is written to `.dex/config.yml` and reported as a diff, and
+nothing asks again. Add it to the same re-issue that carries `--confirm
+--budget`, or the confirmed run will stop once to ask. Never answer it on the
+user's behalf: it is a durable project setting, not a per-command flag.
+
 On BigQuery a profiling estimate holds a 10 MB floor per table for each
 escalation query a profile may still issue after its aggregate scan, so on a
 warehouse of many small tables most of the number can be reserve for work that

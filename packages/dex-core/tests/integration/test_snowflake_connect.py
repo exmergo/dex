@@ -13,7 +13,7 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
-from .conftest import assert_ok
+from .conftest import assert_ok, integration_budget
 
 pytestmark = [pytest.mark.integration, pytest.mark.snowflake]
 
@@ -36,9 +36,11 @@ def seed_repo(
     }
     if connection_name:
         snowflake["connection_name"] = connection_name
-    config: dict = {"connector": "snowflake", "snowflake": snowflake}
-    if budget is not None:
-        config["budget"] = {"ceiling": budget}
+    config: dict = {
+        "connector": "snowflake",
+        "snowflake": snowflake,
+        "budget": integration_budget(budget),
+    }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
