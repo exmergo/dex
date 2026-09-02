@@ -847,6 +847,7 @@ class DexEngine:
         refresh: bool = False,
         use_project: bool = False,
         check_cumulative: bool = False,
+        show_all_columns: bool = False,
     ) -> ProfileResult:
         from .explore import commands as explore
 
@@ -854,6 +855,7 @@ class DexEngine:
             self,
             list(objects),
             refresh=refresh,
+            show_all_columns=show_all_columns,
             use_project=use_project,
             check_cumulative=check_cumulative,
         )
