@@ -4,11 +4,13 @@ Inference is metadata-only: it reads the profiles already gathered (names, types
 uniqueness signals) and never scans data, which keeps it free at the cost of
 confidence, so every inferred join carries a confidence the agent can weigh. The
 one deliberate exception is the opt-in ``--verify`` pass
-(:func:`verify_relationships`), which runs one bounded, engine-authored aggregate
-probe per join to measure the actual key overlap. Declared joins come from the
-project, from two channels that are equally authoritative and that this module
-keeps apart: a ``relationships`` test (:func:`declared_relationships`) and a
-semantic layer's shared entity (:func:`semantic_relationships`). Absent a project
+(:func:`verify_relationships`), which measures the actual key overlap with
+bounded, engine-authored aggregate probes, batched by child relation so a table
+is read once per statement rather than once per join (:func:`probe_batches`).
+Declared joins come from the project, from two channels that are equally
+authoritative and that this module keeps apart: a ``relationships`` test
+(:func:`declared_relationships`) and a semantic layer's shared entity
+(:func:`semantic_relationships`). Absent a project
 they are simply empty, since explore is designed to work without one. They are
 probed too: a declaration is a claim about the data, so it is measurable, and only
 what the measurement may *change* differs by kind (see
@@ -537,8 +539,8 @@ def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
     :func:`verify_relationships` on confidence.
 
     A composite join is excluded, and the exclusion is load-bearing rather than
-    an oversight. :func:`_overlap_probe_sql` joins on ``from_columns[0]`` and
-    ``to_columns[0]`` only, which was total coverage while inference was the
+    an oversight. :func:`_batched_probe_sql` joins on ``from_columns[0]``
+    and ``to_columns[0]`` only, which was total coverage while inference was the
     sole source (it emits single-column edges by construction) and stops being
     so now that declared edges qualify. Probing the first column of a composite
     key measures a different relationship than the one declared and would
@@ -551,6 +553,61 @@ def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
         for rel in relationships
         if len(rel.from_columns) == 1 and len(rel.to_columns) == 1
     ]
+
+
+# Edges that share one statement. The bound exists so a warehouse with hundreds
+# of joins does not compose one enormous statement; the common graph fits well
+# inside it and verifies in a single round trip.
+_PROBE_BATCH = 25
+
+
+def probe_batches(candidates: list[Relationship]) -> list[list[Relationship]]:
+    """Group already-selected probe candidates into the statements that will
+    measure them, so a table is referenced once per statement instead of once
+    per edge.
+
+    Cost here is a function of edge count rather than of data size, and the
+    grouping is what inverts that back. A warehouse whose probe scans fall under
+    a connector's per-statement or per-table minimum pays that minimum for every
+    table each statement names: unbatched, a shared dimension pays it once per
+    edge that joins it. Grouped, it pays once (issue #398).
+
+    Grouping is by child relation, which is the axis that pays twice over. Every
+    edge sharing a child is measured against one read of that child, and each of
+    its parents is named once in that read. Batches then pack whole child groups
+    up to ``_PROBE_BATCH`` edges; a child with more edges than the cap becomes
+    its own batch rather than being split, because splitting it would put the
+    same child in two statements and read it twice, which is the thing this
+    exists to stop.
+
+    Order is preserved end to end (children in first-seen order, edges in their
+    order within a child), so the flattened batches are exactly ``candidates``.
+    :func:`probe_statements` and :func:`verify_relationships` both go through
+    here, which is what keeps the priced statements and the run statements the
+    same statements.
+
+    Takes candidates rather than raw relationships: ``--verify`` selects with
+    :func:`probe_candidates` and the overlap sweep has already restricted its
+    pool by construction, so the filter belongs to the caller.
+    """
+
+    by_child: dict[str, list[Relationship]] = {}
+    for rel in candidates:
+        by_child.setdefault(rel.from_dataset, []).append(rel)
+
+    batched: list[list[Relationship]] = []
+    current: list[Relationship] = []
+    for group in by_child.values():
+        if current and len(current) + len(group) > _PROBE_BATCH:
+            batched.append(current)
+            current = []
+        current.extend(group)
+        if len(current) >= _PROBE_BATCH:
+            batched.append(current)
+            current = []
+    if current:
+        batched.append(current)
+    return batched
 
 
 def verify_relationships(
@@ -577,81 +634,147 @@ def verify_relationships(
     #163); a declared join that fails its probe surfaces through
     :func:`orphan_findings`, where the disagreement can be stated plainly.
 
+    ``timeout_seconds`` is the budget for one edge. A batch is issued with the
+    sum of the budgets of the edges it carries, so the command's total time
+    bound is what it was when every edge had a statement to itself.
+
     An optional ``progress`` reporter emits a throttled stderr line per probed
     join, so its counts match a ``total`` taken from :func:`probe_candidates`;
     ``None`` (the default) keeps existing callers silent and unchanged.
     """
 
-    for rel in probe_candidates(relationships):
-        sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
-        result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
-        values = dict(zip(result.columns, result.cells[0], strict=True))
-        nonnull = int(values["nonnull_fk"] or 0)
-        orphans = int(values["orphans"] or 0)
+    for batch in probe_batches(probe_candidates(relationships)):
+        for rel, nonnull, orphans in _run_probe_batch(
+            adapter, batch, timeout_seconds=timeout_seconds
+        ):
+            rel.verified = True
+            if nonnull == 0:
+                rel.orphan_fraction = None
+                if progress is not None:
+                    progress.advance()  # this edge was probed; count it
+                continue
+            fraction = orphans / nonnull
+            rel.orphan_fraction = round(fraction, 4)
 
-        rel.verified = True
-        if nonnull == 0:
-            rel.orphan_fraction = None
+            if rel.kind is RelationshipKind.INFERRED:
+                confidence = rel.confidence or 0.5
+                if fraction == 0.0:
+                    confidence += 0.1
+                elif fraction <= 0.02:
+                    confidence += 0.05
+                elif fraction >= 0.2:
+                    confidence -= 0.25
+                else:
+                    confidence -= 0.1
+                rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
+
             if progress is not None:
-                progress.advance()  # this iteration ran a probe; count it
-            continue
-        fraction = orphans / nonnull
-        rel.orphan_fraction = round(fraction, 4)
-
-        if rel.kind is RelationshipKind.INFERRED:
-            confidence = rel.confidence or 0.5
-            if fraction == 0.0:
-                confidence += 0.1
-            elif fraction <= 0.02:
-                confidence += 0.05
-            elif fraction >= 0.2:
-                confidence -= 0.25
-            else:
-                confidence -= 0.1
-            rel.confidence = round(min(0.95, max(0.05, confidence)), 4)
-
-        if progress is not None:
-            progress.advance()
+                progress.advance()
 
 
 def probe_statements(relationships: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`verify_relationships` will run, one statement per
-    probed join, in the adapter's dialect. Exists so a billed caller can
-    dry-run the probes for a cost estimate before confirming the spend."""
+    batch of probed joins, in the adapter's dialect. Exists so a billed caller
+    can dry-run the probes for a cost estimate before confirming the spend."""
 
     return [
-        _transpile_probe(_overlap_probe_sql(rel), dialect)
-        for rel in probe_candidates(relationships)
+        _transpile_probe(_batched_probe_sql(batch), dialect)
+        for batch in probe_batches(probe_candidates(relationships))
     ]
 
 
-def _overlap_probe_sql(rel: Relationship) -> str:
-    child = _quote_identifier(rel.from_dataset)
-    parent = _quote_identifier(rel.to_dataset)
-    fk = _quote_part(rel.from_columns[0])
-    key = _quote_part(rel.to_columns[0])
-    # Aggregate-only by construction: two counts, no value in the projection.
-    # A LEFT JOIN against the DISTINCT parent keys keeps the orphan count
-    # correct even when the parent key is not unique (a bare join would fan
-    # out and inflate it). Deliberately portable SQL: CASE inside COUNT
-    # rather than FILTER (which BigQuery lacks and sqlglot does not rewrite),
-    # and a join rather than a projected NOT EXISTS, which Redshift refuses
-    # outright (XX000: correlated subquery pattern not supported).
-    return (
-        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
-        f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d.pk IS NULL THEN 1 END) "
-        f"AS orphans "
-        f"FROM {child} c LEFT JOIN ("
-        f"SELECT DISTINCT {key} AS pk FROM {parent}) d ON d.pk = c.{fk}"
+def _batched_probe_sql(batch: list[Relationship]) -> str:
+    """One statement measuring every edge in ``batch``, returning a single row.
+
+    Aggregate-only by construction: two counts per edge, no value in the
+    projection. A LEFT JOIN against the DISTINCT parent keys keeps the orphan
+    count correct even when the parent key is not unique (a bare join would fan
+    out and inflate it), and because each such join matches at most one row per
+    child row, chaining several of them across one child leaves that child's
+    cardinality exactly as it was. That is what makes a batched count identical
+    to the count the edge would have got on its own rather than merely close.
+
+    The edges of one child are measured against one read of that child; the
+    children of one batch are cross-joined, which is well defined because each
+    contributing subquery is an ungrouped aggregate over exactly one row.
+
+    Aliases carry the edge's index within the batch (``nonnull_fk_3``,
+    ``orphans_3``, parent ``d3``), the way the profiling and cumulative probes
+    index theirs, so they stay unique across cross-joined subqueries and the
+    caller unpacks by name rather than by position.
+
+    Deliberately portable SQL: CASE inside COUNT rather than FILTER (which
+    BigQuery lacks and sqlglot does not rewrite), and a join rather than a
+    projected NOT EXISTS, which Redshift refuses outright (XX000: correlated
+    subquery pattern not supported).
+    """
+
+    by_child: dict[str, list[tuple[int, Relationship]]] = {}
+    for index, rel in enumerate(batch):
+        by_child.setdefault(rel.from_dataset, []).append((index, rel))
+
+    aggregates = []
+    for child, edges in by_child.items():
+        counts, joins = [], []
+        for index, rel in edges:
+            fk = _quote_part(rel.from_columns[0])
+            key = _quote_part(rel.to_columns[0])
+            parent = _quote_identifier(rel.to_dataset)
+            counts.append(
+                f"COUNT(c.{fk}) AS nonnull_fk_{index}, "
+                f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d{index}.pk IS NULL "
+                f"THEN 1 END) AS orphans_{index}"
+            )
+            joins.append(
+                f"LEFT JOIN (SELECT DISTINCT {key} AS pk FROM {parent}) "  # noqa: S608
+                f"d{index} ON d{index}.pk = c.{fk}"
+            )
+        aggregates.append(
+            f"SELECT {', '.join(counts)} "  # noqa: S608
+            f"FROM {_quote_identifier(child)} c {' '.join(joins)}"
+        )
+
+    if len(aggregates) == 1:
+        return aggregates[0]
+    joined = " CROSS JOIN ".join(f"({sql}) a{i}" for i, sql in enumerate(aggregates))
+    return f"SELECT * FROM {joined}"  # noqa: S608
+
+
+def _run_probe_batch(
+    adapter: Adapter,
+    batch: list[Relationship],
+    *,
+    timeout_seconds: float,
+) -> list[tuple[Relationship, int, int]]:
+    """Issue one batched probe and return ``(edge, nonnull_fk, orphans)`` per
+    edge, in the batch's own order.
+
+    ``timeout_seconds`` is the per-edge budget; the statement gets the sum of
+    the budgets of the edges it replaces, so batching does not loosen the
+    command's overall time bound. Reads the row by alias, never by position.
+    """
+
+    sql = _transpile_probe(_batched_probe_sql(batch), adapter.dialect)
+    result = adapter.run_query(
+        sql, max_rows=1, timeout_seconds=timeout_seconds * len(batch)
     )
+    values = dict(zip(result.columns, result.cells[0], strict=True))
+    return [
+        (
+            rel,
+            int(values[f"nonnull_fk_{index}"] or 0),
+            int(values[f"orphans_{index}"] or 0),
+        )
+        for index, rel in enumerate(batch)
+    ]
 
 
 def _transpile_probe(sql: str, dialect: str) -> str:
     """Render the DuckDB-flavored probe in the active connector's dialect.
 
-    The probe is authored once in DuckDB SQL (double-quoted identifiers,
-    ``COUNT(*) FILTER``); sqlglot rewrites it per connector (BigQuery gets
-    backticks and COUNTIF). Identity on DuckDB itself.
+    The probe is authored once in DuckDB SQL (double-quoted identifiers);
+    sqlglot rewrites it per connector, so BigQuery gets backticks. Identity on
+    DuckDB itself.
     """
 
     if dialect == "duckdb":
@@ -847,14 +970,21 @@ def overlap_sweep_candidates(
 
 def overlap_sweep_statements(candidates: list[Relationship], dialect: str) -> list[str]:
     """The exact SQL :func:`probe_overlap_candidates` will run, one statement
-    per candidate, in the adapter's dialect. Exists so a billed caller can
-    dry-run the sweep for a cost estimate before confirming the spend.
+    per batch of candidates, in the adapter's dialect. Exists so a billed caller
+    can dry-run the sweep for a cost estimate before confirming the spend.
 
     Every candidate :func:`overlap_sweep_candidates` returns is already
     single-column by construction, so this skips the `probe_candidates`
-    composite-key filter ``--verify`` needs; there is nothing to filter."""
+    composite-key filter ``--verify`` needs; there is nothing to filter. The
+    batching in :func:`probe_batches` is the same, and matters more here: the
+    sweep runs up to ``_OVERLAP_SWEEP_CAP`` probes, so an unbatched sweep on a
+    connector with a per-table minimum pays that minimum a hundred times over
+    for a pool whose answers are two counts apiece."""
 
-    return [_transpile_probe(_overlap_probe_sql(rel), dialect) for rel in candidates]
+    return [
+        _transpile_probe(_batched_probe_sql(batch), dialect)
+        for batch in probe_batches(candidates)
+    ]
 
 
 def probe_overlap_candidates(
@@ -883,7 +1013,7 @@ def probe_overlap_candidates(
     building a return value that a raise would discard.
 
     Only the two aggregate counts the probe itself computes are ever read;
-    reuses :func:`_overlap_probe_sql` verbatim, so this is exactly as
+    reuses :func:`_batched_probe_sql` verbatim, so this is exactly as
     value-blind as :func:`verify_relationships`.
 
     Returns the count rejected by measurement (a candidate the ceiling cut
@@ -891,24 +1021,22 @@ def probe_overlap_candidates(
     """
 
     rejected = 0
-    for rel in candidates:
-        sql = _transpile_probe(_overlap_probe_sql(rel), adapter.dialect)
-        result = adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds)
-        values = dict(zip(result.columns, result.cells[0], strict=True))
-        nonnull = int(values["nonnull_fk"] or 0)
-        orphans = int(values["orphans"] or 0)
-        if progress is not None:
-            progress.advance()
-        if nonnull < _OVERLAP_MIN_OBSERVATIONS:
-            rejected += 1
-            continue
-        fraction = orphans / nonnull
-        if fraction > _OVERLAP_ORPHAN_CEILING:
-            rejected += 1
-            continue
-        rel.verified = True
-        rel.orphan_fraction = round(fraction, 4)
-        rel.confidence = round(min(0.95, max(0.05, 1.0 - fraction)), 4)
+    for batch in probe_batches(candidates):
+        for rel, nonnull, orphans in _run_probe_batch(
+            adapter, batch, timeout_seconds=timeout_seconds
+        ):
+            if progress is not None:
+                progress.advance()
+            if nonnull < _OVERLAP_MIN_OBSERVATIONS:
+                rejected += 1
+                continue
+            fraction = orphans / nonnull
+            if fraction > _OVERLAP_ORPHAN_CEILING:
+                rejected += 1
+                continue
+            rel.verified = True
+            rel.orphan_fraction = round(fraction, 4)
+            rel.confidence = round(min(0.95, max(0.05, 1.0 - fraction)), 4)
     return rejected
 
 
