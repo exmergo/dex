@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import MAX_BYTES, assert_ok, assert_unpivot_build, unpivot_fixture_edits
+from .conftest import (
+    MAX_BYTES,
+    assert_ok,
+    assert_unpivot_build,
+    integration_budget,
+    unpivot_fixture_edits,
+)
 from .test_bigquery_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.bigquery]
@@ -26,6 +32,7 @@ def _seed_transform_repo(root: Path, project: str, dataset: str) -> None:
         yaml.safe_dump(
             {
                 "connector": "bigquery",
+                "budget": integration_budget(),
                 "bigquery": {"project": project, "dev_dataset": dataset},
             }
         ),
@@ -214,7 +221,7 @@ def test_a_missing_dev_dataset_warns_rather_than_refusing(
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config["bigquery"]["dev_dataset"] = "dex_absent_dev_dataset"
     config["bigquery"]["location"] = "US"
-    config["budget"] = {"ceiling": 100 * 1024 * 1024}
+    config["budget"] = integration_budget(100 * 1024 * 1024)
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     rc, envelope = run_cli(

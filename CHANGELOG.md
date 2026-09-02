@@ -9,6 +9,70 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain verify`: is the project correct right now, with no drift
+  baseline required** ([#224], [#225]). Every existing `maintain` subcommand
+  answers "what changed", and refuses outright with no `.dex/snapshot.json`
+  to compare against. That has no answer for a project that was never
+  correct in the first place (a model written wrong, a join against the
+  wrong key), which the refusal `no drift baseline yet; run maintain
+  snapshot first` was the most frequent refusal across a 103-trial agent
+  benchmark's archived transcripts.
+
+  The first finding class: nodes that failed to build, nodes skipped
+  because a parent failed (naming it, and walking back through however many
+  transitively-skipped parents it takes when the immediate parent was
+  itself only skipped), and models the project declares that have no
+  relation in the warehouse. All of it is free: the manifest and the last
+  run's `run_results.json` are read off disk, and the relation check reads
+  only cheap object-metadata listing, never a scan.
+
+  A project that fails to compile is reported first and suppresses every
+  other check, since a finding computed from a manifest a broken project
+  could not have produced honestly is not a finding at all. `data.suppressed`
+  names every finding class that did not run and why (no run results yet,
+  no project, an unreachable warehouse), so an empty `data.findings` from a
+  degraded run is never mistaken for a clean project.
+
+  This is the epic's first slice, not the whole of it: row-loss/fanout,
+  NULL columns, join-overlap, and grain findings (#226-230), folding
+  verification into `transform build --verify` (#231), and updating the
+  `maintain` skill's own description to cover this diagnostic intent (#233)
+  are deferred to their own issues, each independently shippable.
+
+### Fixed
+
+- **`maintain grain` reported `high` severity on relations too small for
+  uniqueness to mean anything.** ([#280]) One `maintain check` produced six
+  high-severity grain findings on a real project, all six artifacts of the
+  data's shape and none a defect: three on a 4-row table's boolean and status
+  columns (only ever unique because the table once held 2 rows), two on a
+  change-data-capture changelog whose repeated identifiers are the entire
+  design, and one on a composite nobody declared. High severity is the signal
+  a triager reads first; six false highs per run trains people to skim the
+  axis most likely to carry a real defect.
+
+  A lost-uniqueness finding (`key_lost_uniqueness` / `declared_grain_not_unique`)
+  is now damped to `low` rather than `high` below `maintain.grain_min_rows`
+  rows (default 100, new in `.dex/config.yml`): on a handful of rows, losing
+  uniqueness means the least, and a 4-row table's boolean column "loses" a
+  uniqueness it never meaningfully had once a fifth row repeats a value.
+  Damped, never dropped: the finding still reports, just not at the severity
+  that trains a triager to stop reading, and the damping is named in the
+  finding's own `data` (`severity_floor_applied`, `grain_min_rows`) and prose
+  rather than being silent. The floor applies uniformly to all three sites
+  that emit a uniqueness-regression finding (the single-key, composite, and
+  declared-composite checks), and not to `join_orphans_increased`, which
+  already grades its own severity from the measured orphan fraction.
+
+  The issue's other two proposed damping rules (never `high` on a
+  boolean-shaped 2-value column regardless of row count; judge an
+  append-only/changelog relation against its declared dedup key rather than
+  every candidate key) are deferred: the issue itself frames the three rules
+  as independent, and the row-count floor alone satisfies every acceptance
+  criterion.
+  
 ### Changed
 
 - **Join overlap probes now share their table references, so verification costs
@@ -42,6 +106,14 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   billed caller's dry-run estimate stays truthful; and a budget exhausted
   part-way through still keeps every measurement taken before it, now at
   statement rather than join granularity.
+
+- **`explore query` now carries compact cache-backed column and query notes
+  beside result cells.** When projected columns resolve to already-profiled
+  cached relations, the payload can include `column_notes` for non-zero null
+  fractions, PII flags, and selected-grain coverage. Queries that group or join
+  can also include `query_notes` comparing grouping keys to known grain and
+  reporting verified cached join overlap. The annotations are strictly additive,
+  cache-only, and omitted when dex cannot resolve them without guessing.  
 
 - **A project is now asked once for a cumulative spend ceiling, instead of
   warned about it forever** ([#283]). With `budget.session_ceiling` unset, every

@@ -222,6 +222,14 @@ dex maintain semantic [<objects>] -> definition drift and dangling refs (free) +
                                      cardinality change (a scan; gated on billed connectors)
 dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as a stored plan
                                      of diffs tagged mechanical/advisory (applied with transform apply)
+dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
+                                     required (unlike every subcommand above): failed/skipped build
+                                     nodes (naming the failed cause, walking back through transitively
+                                     skipped parents) and models with no relation in the warehouse; all
+                                     free (compiled manifest + last run_results.json + cheap object
+                                     metadata, never a scan). A project that fails to compile is
+                                     reported first and suppresses every other check; data.suppressed
+                                     names each finding class that did not run and why
 dex viz preview                   -> emit the dbt semantic model to the Viz preview (not yet implemented;
                                      the Viz integration arrives later)
 ```
