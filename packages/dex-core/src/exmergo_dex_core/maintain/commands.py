@@ -495,7 +495,9 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         for dataset, _combos, _rows in plan.composite_checks
         + plan.declared_composite_checks
     }
-    notes = _adapter_notes(adapter, sorted(noted))
+    notes_by_identifier = _adapter_notes_by_identifier(adapter, sorted(noted))
+    _qualify_uniqueness_findings(findings, notes_by_identifier)
+    notes = _flatten_adapter_notes(notes_by_identifier)
 
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
@@ -1123,13 +1125,61 @@ def _adapter_notes(adapter, identifiers: list[str]) -> list[str]:
     """Surface the adapter's per-table notes (e.g. a skipped distinct-count
     escalation on a tight budget) so a silent skip never reads as a clean bill."""
 
+    return _flatten_adapter_notes(_adapter_notes_by_identifier(adapter, identifiers))
+
+
+def _adapter_notes_by_identifier(
+    adapter, identifiers: list[str]
+) -> dict[str, list[str]]:
+    """Collect adapter notes by table so command payloads can attach qualifying
+    facts to the findings they qualify, not only to envelope warnings."""
+
     hook = getattr(adapter, "table_notes", None)
     if hook is None:
-        return []
-    notes: list[str] = []
+        return {}
+    notes: dict[str, list[str]] = {}
     for identifier in identifiers:
-        notes.extend(f"{identifier}: {note}" for note in hook(identifier) or [])
+        table_notes = list(hook(identifier) or [])
+        if table_notes:
+            notes[identifier] = table_notes
     return notes
+
+
+def _flatten_adapter_notes(notes: dict[str, list[str]]) -> list[str]:
+    return [
+        f"{identifier}: {note}"
+        for identifier, table_notes in notes.items()
+        for note in table_notes
+    ]
+
+
+def _qualify_uniqueness_findings(
+    findings: list[drift_mod.DriftFinding], notes_by_identifier: dict[str, list[str]]
+) -> None:
+    for finding in findings:
+        if (
+            finding.code != "key_lost_uniqueness"
+            or finding.identifier not in notes_by_identifier
+        ):
+            continue
+        merge_notes = [
+            note
+            for note in notes_by_identifier[finding.identifier]
+            if _final_note(note)
+        ]
+        if not merge_notes:
+            continue
+        finding.severity = "medium"
+        finding.data["table_notes"] = merge_notes
+        finding.detail = (
+            f"{finding.detail}; this count is over stored parts before "
+            "ClickHouse FINAL, so the adapter note qualifies whether this is "
+            "merge timing or modeled-grain drift"
+        )
+
+
+def _final_note(note: str) -> bool:
+    return "FINAL" in note and "MergeTree" in note
 
 
 def _semantic_names(scope_names: list[str]) -> set[str]:

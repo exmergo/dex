@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 
 def test_clean_warehouse_reports_no_grain_drift(maintain_repo):
     maintain_repo.snapshot()
@@ -36,6 +38,86 @@ def test_duplicated_key_is_detected_exactly(maintain_repo):
     # order_id is the semantic model's entity, so every metric on it is at risk.
     assert finding["impacted_models"] == ["stg_orders"]
     assert finding["impacted_metrics"] == ["order_volume", "revenue"]
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        "ReplacingMergeTree",
+        "CollapsingMergeTree",
+        "VersionedCollapsingMergeTree",
+        "SummingMergeTree",
+        "AggregatingMergeTree",
+    ],
+)
+def test_clickhouse_collapsing_engine_note_stays_on_uniqueness_finding(
+    engine,
+    fake_clickhouse_connection,
+):
+    """A severity-ranked consumer may read only findings, so ClickHouse engine
+    notes that qualify duplicate counts must ride on the drift finding itself."""
+
+    pytest.importorskip("clickhouse_connect")
+
+    from fakes.clickhouse import FakeResult
+
+    from exmergo_dex_core import DexConfig, DexEngine, MemoryStore
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.config import Budget
+    from exmergo_dex_core.connect import ConnectionSource
+    from exmergo_dex_core.dbt_project import ProjectDefinitions
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain.commands import grain_drift
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    fake_clickhouse_connection.table("shop.order_events_raw").engine = engine
+    store = MemoryStore()
+    store.save_snapshot(
+        Snapshot(
+            created_at="2024-01-01T00:00:00+00:00",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="shop.order_events_raw",
+                        candidate_keys=[["order_id"]],
+                        grain=["order_id"],
+                    )
+                ],
+                relationships=[],
+            ),
+        )
+    )
+    fake_clickhouse_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 300, "d_0": 298}]
+    )
+    config = DexConfig(
+        connector="clickhouse",
+        budget=Budget(
+            paradigm=Paradigm.DB_LOAD,
+            ceiling=600.0,
+            session_ceiling=None,
+        ),
+    )
+
+    class Project:
+        def definitions(self):
+            return ProjectDefinitions(present=False)
+
+    dex_engine = DexEngine(
+        config=config,
+        store=store,
+        connection=ConnectionSource(connect=lambda: fake_clickhouse_connection),
+        confirmed=True,
+        project_format=Project(),
+    )
+
+    result = grain_drift(dex_engine)
+
+    assert any("FINAL" in warning for warning in result.warnings)
+    (finding,) = [f for f in result.findings if f.code == "key_lost_uniqueness"]
+    assert finding.severity == "medium"
+    assert any(engine in n for n in finding.data["table_notes"])
+    assert "stored parts before ClickHouse FINAL" in finding.detail
 
 
 def test_new_orphans_move_the_verified_join(maintain_repo):
