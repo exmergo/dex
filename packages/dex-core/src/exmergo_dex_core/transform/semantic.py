@@ -15,6 +15,12 @@ has. The definition unit exists because the whole-file one forces a caller
 adding two metrics to restate the twenty-seven it is not touching, which buries
 the real change in the review and puts twenty-seven hand-copied definitions at
 risk of a typo that only ``dbt parse`` would catch.
+
+A definition can also be *removed*: an entry carrying ``"op": "delete"`` names
+one and takes it out of the file that declares it. Removal is always declared
+and never inferred from an omission, because the unit's whole promise is that a
+definition it does not mention is left alone, and a payload that deleted by
+omission would turn that promise inside out.
 """
 
 from __future__ import annotations
@@ -25,7 +31,13 @@ from typing import Any, NamedTuple
 
 import yaml
 
-from ..dbt_project import DbtProjectView
+from ..dbt_project import (
+    DbtProjectView,
+    EditOp,
+    SourceFile,
+    content_hash,
+    metric_inputs,
+)
 from .validate import EditValidationError
 
 
@@ -215,6 +227,7 @@ def check_mode(
     view: DbtProjectView,
     *,
     scope: set[DefinitionKey] | None = None,
+    removed: Sequence[DefinitionKey] | None = None,
 ) -> dict[str, list[str]]:
     """Classify every proposed name; enforce the strict modes.
 
@@ -244,7 +257,20 @@ def check_mode(
     gets here, so without it the file's other definitions would be classified
     too, and a two-definition payload would report the file's other twenty-five
     as ``unchanged``: a quieter version of the noise this class exists to remove.
+
+    ``removed`` names what the payload deletes, which is a fourth class rather
+    than a value of the other three: a removal states no content, so there is
+    nothing to compare it against, and it is the one class a reviewer has to
+    read before approving. ``define`` refuses one outright, because a verb whose
+    job is to add a name cannot coherently take one away in the same call.
     """
+
+    if removed and mode == "define":
+        raise EditValidationError(
+            "semantic define adds definitions and does not remove them: "
+            f"{', '.join(sorted(name for _kind, name in removed))}; use "
+            "`semantic update` or `semantic plan` to remove one"
+        )
 
     existing = existing_semantic_names(view)
     on_disk = project_definitions(view)
@@ -299,6 +325,7 @@ def check_mode(
         "defined": sorted(proposed - existing),
         "updated": sorted(evolving - unchanged),
         "unchanged": sorted(unchanged),
+        "removed": sorted({name for _kind, name in removed or ()}),
     }
 
 
@@ -374,6 +401,118 @@ def check_references(parsed_edits: list[dict[str, Any]], view: DbtProjectView) -
         raise EditValidationError("; ".join(problems))
 
 
+def check_removals(
+    removed: Sequence[DefinitionEdit],
+    edits: Sequence[tuple[str, str]],
+    view: DbtProjectView,
+) -> None:
+    """Refuse a removal the surviving project still reads, atomically.
+
+    The whole-plan delete guard in :mod:`.plans` asks this question about files
+    and ``ref()``; it cannot answer it here, because a definition removal deletes
+    no file, and the name it takes away is a *name in YAML* inside a file that
+    survives. So the same shape is repeated one namespace over: the project
+    *after* this payload is computed in memory (the spliced files overlaid on the
+    current ones) and every metric left standing is re-resolved against it. A
+    payload that removes a metric together with the metrics that read it is
+    accepted; removing it alone is refused, naming each reader and its file, so
+    the fix is to add those definitions' own removals or updates to this same
+    payload. Order inside the payload does not matter, because the guard reads
+    the end state rather than the sequence.
+
+    A removed semantic model takes its measures with it, and a ``create_metric``
+    measure is addressable as a metric, so both namespaces are checked. A name
+    the payload re-declares elsewhere orphans nothing and is not reported, which
+    is what makes a move expressible as a removal plus an addition.
+
+    The references read are the metric inputs, which is the same vocabulary
+    ``transform references`` reports as ``metric_input_measure`` and
+    ``metric_input_metric``, so the guard and the report agree about what counts
+    as reading a name. Anything a reference index cannot see statically is left
+    to dbt's parser, which every semantic plan runs: a ``Metric()`` call inside a
+    filter string is the case that matters, and guessing at one here would trade
+    a precise refusal for an unreliable one.
+
+    **Refusing rather than warning** is the decision, and dbt is the reason. A
+    dangling metric input fails ``dbt parse``, the gate every semantic plan
+    already passes through, so warning instead would change nothing except where
+    that gate is off (``--no-parse``, or no dbt installed), and there it would
+    store a plan dex knows cannot be applied. ``maintain semantic`` reports
+    dangling references too, but detection after the fact is the tool for drift
+    that arrived from the warehouse on its own, not for a break this command is
+    in the middle of authoring.
+
+    Scoped to *declared* removals. A whole-file payload (``--edits-file``) that
+    simply omits a definition removes it too; that stays dbt's parser's to catch,
+    because the file's own diff shows the omission, which is exactly the review a
+    per-definition payload cannot give.
+    """
+
+    if not removed:
+        return
+
+    on_disk = project_definitions(view)
+    metric_names: set[str] = set()
+    measure_names: set[str] = set()
+    for definition in removed:
+        if definition.kind == "metric":
+            metric_names.add(definition.name)
+            continue
+        _path, body = on_disk.get((definition.kind, definition.name), ("", {}))
+        for measure in body.get("measures") or []:
+            if not isinstance(measure, dict) or not measure.get("name"):
+                continue
+            measure_names.add(measure["name"])
+            if measure.get("create_metric"):
+                metric_names.add(measure["name"])
+
+    after = view.model_copy(
+        update={
+            "files": {
+                **view.files,
+                **{
+                    path: SourceFile(
+                        path=path, content=content, sha256=content_hash(content)
+                    )
+                    for path, content in edits
+                },
+            }
+        }
+    )
+    surviving = project_namespace(after)
+    gone = {
+        "metric": metric_names - surviving.metrics,
+        "measure": measure_names - surviving.measures,
+    }
+    if not any(gone.values()):
+        return
+
+    problems: list[str] = []
+    for (kind, name), (path, body) in sorted(project_definitions(after).items()):
+        if kind != "metric":
+            continue
+        measures, metrics = metric_inputs(body)
+        for role, reads in (("measure", measures), ("metric", metrics)):
+            problems.extend(
+                f"metric '{name}' in {path} still reads {role} '{read}'"
+                for read in reads
+                if read in gone[role]
+            )
+    if not problems:
+        return
+    raise EditValidationError(
+        "this payload removes "
+        + ", ".join(
+            f"{definition.kind.replace('_', ' ')} '{definition.name}'"
+            for definition in removed
+        )
+        + " but the project it leaves behind still reads what it removes: "
+        + "; ".join(problems)
+        + ". Add the definitions that drop those references to this same payload "
+        "(or keep the definition)"
+    )
+
+
 def _ref_name(value: Any) -> str | None:
     """A metric/measure input is either a bare name or {name: ...}."""
 
@@ -425,12 +564,18 @@ _TOP_LEVEL_KEY = {"semantic_model": "semantic_models", "metric": "metrics"}
 
 
 class DefinitionEdit(NamedTuple):
-    """One semantic model or metric, authored on its own.
+    """One semantic model or metric, authored (or removed) on its own.
 
     ``content`` is the entry's body as a YAML mapping, not a list item: the
     caller writes ``name: revenue`` at column zero and the splice indents it to
     match its siblings. ``path`` may be ``None`` for a definition the project
     already declares, in which case it is rewritten where it already lives.
+
+    A removal carries ``op`` ``DELETE``, and then there is no body to write:
+    ``name`` is what the caller declared rather than what a body said, and
+    ``content`` and ``parsed`` are empty. The op is dbt's own edit vocabulary
+    (:class:`~..dbt_project.EditOp`) rather than a second spelling of it, so one
+    word means the same thing in both payload units.
     """
 
     kind: str
@@ -438,16 +583,25 @@ class DefinitionEdit(NamedTuple):
     content: str
     parsed: dict[str, Any]
     path: str | None = None
+    op: EditOp = EditOp.UPSERT
 
 
 def parse_definition_payload(entries: Iterable[Any]) -> list[DefinitionEdit]:
     """Read the ``definitions`` payload into typed edits.
 
-    The name is read from the content rather than declared beside it, so the
-    two cannot disagree.
+    The name of an authored definition is read from the content rather than
+    declared beside it, so the two cannot disagree; an entry that declares one
+    anyway is held to it rather than having it quietly ignored.
+
+    ``op`` is ``upsert`` (the default: create or update, carrying ``content``)
+    or ``delete``, which declares the ``name`` and carries no content, there
+    being no body to write. A removal has to be spelled out like that: nothing
+    is ever removed for having gone unmentioned, or the property this unit
+    exists for, that an unmentioned definition is untouched, would not hold.
     """
 
     parsed_entries: list[DefinitionEdit] = []
+    seen: dict[DefinitionKey, int] = {}
     for index, entry in enumerate(entries):
         where = f"definitions[{index}]"
         if not isinstance(entry, dict):
@@ -458,22 +612,64 @@ def parse_definition_payload(entries: Iterable[Any]) -> list[DefinitionEdit]:
                 f"{where}: kind must be one of {', '.join(sorted(_TOP_LEVEL_KEY))}, "
                 f"got {kind!r}"
             )
-        content = entry.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise EditValidationError(f"{where}: needs YAML content")
         try:
-            body = yaml.safe_load(content)
-        except yaml.YAMLError as exc:
-            raise EditValidationError(f"{where}: invalid YAML: {exc}") from exc
-        if not isinstance(body, dict) or not body.get("name"):
+            op = EditOp(entry.get("op") or EditOp.UPSERT.value)
+        except ValueError as exc:
             raise EditValidationError(
-                f"{where}: content must be a YAML mapping with a name; write the "
-                "definition's body alone, without the leading '- '"
-            )
+                f"{where}: unknown op {entry.get('op')!r}: one of "
+                + ", ".join(o.value for o in EditOp)
+            ) from exc
         path = entry.get("path")
         if path is not None and not isinstance(path, str):
             raise EditValidationError(f"{where}: path must be a string")
-        parsed_entries.append(DefinitionEdit(kind, body["name"], content, body, path))
+        declared = entry.get("name")
+        if declared is not None and not isinstance(declared, str):
+            raise EditValidationError(f"{where}: name must be a string")
+
+        if op is EditOp.DELETE:
+            if entry.get("content") is not None:
+                raise EditValidationError(
+                    f"{where}: a delete names the definition to remove and carries "
+                    "no content"
+                )
+            if not declared:
+                raise EditValidationError(
+                    f"{where}: a delete needs the name of the definition to remove"
+                )
+            definition = DefinitionEdit(kind, declared, "", {}, path, op)
+        else:
+            content = entry.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise EditValidationError(f"{where}: needs YAML content")
+            try:
+                body = yaml.safe_load(content)
+            except yaml.YAMLError as exc:
+                raise EditValidationError(f"{where}: invalid YAML: {exc}") from exc
+            if not isinstance(body, dict) or not body.get("name"):
+                raise EditValidationError(
+                    f"{where}: content must be a YAML mapping with a name; write the "
+                    "definition's body alone, without the leading '- '"
+                )
+            if declared and declared != body["name"]:
+                raise EditValidationError(
+                    f"{where}: names '{declared}' but the content defines "
+                    f"'{body['name']}'; the content is the definition, so drop the "
+                    "name or correct it"
+                )
+            definition = DefinitionEdit(kind, body["name"], content, body, path, op)
+
+        # One entry per definition. Two entries for the same name would make the
+        # payload's meaning depend on the order it happens to be read in, and a
+        # delete paired with an upsert of the same name has no meaning to pick.
+        key = (definition.kind, definition.name)
+        if key in seen:
+            raise EditValidationError(
+                f"{where}: {definition.kind} '{definition.name}' is already "
+                f"definitions[{seen[key]}] in this payload; name each definition "
+                "once"
+            )
+        seen[key] = index
+        parsed_entries.append(definition)
     return parsed_entries
 
 
@@ -487,6 +683,11 @@ def splice_definitions(
     and strip the comments a hand-written semantic layer depends on, producing a
     larger diff than the whole-file payload this unit replaces.
 
+    A removal is lowered the same way, into the same unit: the file comes back
+    without that one definition, as an ordinary content edit. Nothing downstream
+    learns a second vocabulary for it, and the plan carries no file-level delete,
+    which the semantic verbs refuse on purpose.
+
     Refuses rather than guesses. A file whose structure the line scanner cannot
     span safely is reported with ``--edits-file`` named as the way to edit it,
     and the spliced result is re-parsed and compared against the incoming body
@@ -497,6 +698,20 @@ def splice_definitions(
     targets: list[tuple[str, DefinitionEdit]] = []
     for definition in definitions:
         current = on_disk.get((definition.kind, definition.name))
+        if definition.op is EditOp.DELETE:
+            if current is None:
+                raise EditValidationError(
+                    f"{definition.kind} '{definition.name}' is not declared in the "
+                    "project, so there is nothing to remove"
+                )
+            if definition.path is not None and definition.path != current[0]:
+                raise EditValidationError(
+                    f"{definition.kind} '{definition.name}' is declared in "
+                    f"'{current[0]}', not '{definition.path}'; drop the path and the "
+                    "removal lands where the definition actually lives"
+                )
+            targets.append((current[0], definition))
+            continue
         if definition.path is None:
             if current is None:
                 raise EditValidationError(
@@ -526,7 +741,28 @@ def splice_definitions(
         text = source.content if source is not None else ""
         applied = [d for target_path, d in targets if target_path == path]
         for definition in applied:
-            text = _splice_entry(path, text, definition)
+            text = (
+                _remove_entry(path, text, definition)
+                if definition.op is EditOp.DELETE
+                else _splice_entry(path, text, definition)
+            )
+        removals = [d for d in applied if d.op is EditOp.DELETE]
+        # A file emptied of its semantic content is a file-level question this
+        # unit has no answer for: whether what is left should stay as plain model
+        # documentation or go away entirely is the caller's call, and both are
+        # whole-file edits. Refusing here also gets ahead of the semantic_yml
+        # validator, which would otherwise refuse the same edit for a reason
+        # ("must declare semantic_models or metrics") that says nothing about the
+        # removal that caused it.
+        if removals and not _declares_semantics(text):
+            raise EditValidationError(
+                f"{path}: removing "
+                + ", ".join(f"{d.kind} '{d.name}'" for d in removals)
+                + " would leave this file declaring no semantic model or metric at "
+                "all. Emptying or deleting a file is a whole-file edit: use "
+                '`transform plan --edits-file` (with `"op": "delete"` to remove the '
+                "file), or keep one definition in it"
+            )
         _verify_splice(path, text, applied)
         spliced.append((path, text))
     return spliced
@@ -686,8 +922,56 @@ def _splice_entry(path: str, text: str, definition: DefinitionEdit) -> str:
     return f"{head}\n{item}{tail}"
 
 
+def _remove_entry(path: str, text: str, definition: DefinitionEdit) -> str:
+    """Take one definition out of the file that declares it, and nothing else.
+
+    The inverse of :func:`_splice_entry` in effect only. An entry's own lines go;
+    the blank lines and comments around it stay where the author put them, on the
+    reasoning :func:`_entry_spans` documents, since a banner heading the next
+    definition is not this one's to move. What does go with the last item in a
+    block is the block's own ``key:`` line and anything between the two, because
+    a ``metrics:`` with nothing under it is not how a file with no metrics reads,
+    and a banner inside an empty block heads nothing.
+    """
+
+    _reject_unspannable(path, text)
+    key = _TOP_LEVEL_KEY[definition.kind]
+    lines = text.splitlines(keepends=True)
+    block = _find_block(path, lines, key)
+    spans = _entry_spans(lines, block) if block is not None else []
+    target = next((span for span in spans if span[0] == definition.name), None)
+    if block is None or target is None:
+        # `project_definitions` said this file declares the name, so not finding
+        # it here means the layout says it in a way this scanner cannot address.
+        raise EditValidationError(
+            f"{path}: {definition.kind} '{definition.name}' is not written there as "
+            "a sequence item this editor can lift out; use --edits-file for it"
+        )
+    _name, start, end = target
+    if len(spans) > 1:
+        return "".join(lines[:start]) + "".join(lines[end:])
+    return "".join(lines[: block.start - 1]) + "".join(lines[end:])
+
+
+def _declares_semantics(text: str) -> bool:
+    """Whether this document still declares a semantic model or a metric.
+
+    A YAML error answers ``True``: what to do about an unparseable result is
+    :func:`_verify_splice`'s to report, and it says so more precisely.
+    """
+
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return True
+    return isinstance(parsed, dict) and bool(
+        parsed.get("semantic_models") or parsed.get("metrics")
+    )
+
+
 def _verify_splice(path: str, text: str, definitions: Sequence[DefinitionEdit]) -> None:
-    """The result must parse, and each definition must be exactly what was sent.
+    """The result must parse, and each definition must be exactly what was sent,
+    or, for a removal, gone.
 
     Cheap insurance against the line scanner landing a definition in the wrong
     item or the wrong block: the comparison is against the caller's own parsed
@@ -714,6 +998,13 @@ def _verify_splice(path: str, text: str, definitions: Sequence[DefinitionEdit]) 
             for entry in parsed.get(key) or []
             if isinstance(entry, dict) and entry.get("name") == definition.name
         ]
+        if definition.op is EditOp.DELETE:
+            if landed:
+                raise EditValidationError(
+                    f"{path}: {definition.kind} '{definition.name}' is still in this "
+                    "file after the removal; use --edits-file for it"
+                )
+            continue
         if len(landed) != 1 or landed[0] != definition.parsed:
             raise EditValidationError(
                 f"{path}: {definition.kind} '{definition.name}' did not write "

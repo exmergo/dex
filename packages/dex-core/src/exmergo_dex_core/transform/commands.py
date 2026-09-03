@@ -1514,6 +1514,10 @@ def _semantic_plan(
     # classification is narrowed to it: a spliced file carries every definition
     # it already held, and those were not part of this change.
     scope: set[semantic_mod.DefinitionKey] | None = None
+    # The removals in this payload, carried past the lowering rather than read
+    # back out of it: a removal's effect is the absence of something, which the
+    # content it produces cannot state.
+    removed: list[semantic_mod.DefinitionEdit] = []
     if definitions:
         # Lowered to the whole-file unit before anything else looks at them, so
         # the validation, classification, parse gate, and plan store below stay
@@ -1523,6 +1527,7 @@ def _semantic_plan(
             for path, content in semantic_mod.splice_definitions(definitions, view)
         ]
         scope = {(d.kind, d.name) for d in definitions}
+        removed = [d for d in definitions if d.op is EditOp.DELETE]
 
     if not edits:
         raise ValueError(
@@ -1545,8 +1550,19 @@ def _semantic_plan(
 
     parsed_by_path = [(e.path, yaml.safe_load(e.new_content)) for e in edits]
     parsed_edits = [parsed for _path, parsed in parsed_by_path]
-    classification = semantic_mod.check_mode(mode, parsed_by_path, view, scope=scope)
+    classification = semantic_mod.check_mode(
+        mode,
+        parsed_by_path,
+        view,
+        scope=scope,
+        removed=[(d.kind, d.name) for d in removed],
+    )
+    # The two reference directions: what this payload's own definitions read,
+    # then what the surviving project reads out of what it removes.
     semantic_mod.check_references(parsed_edits, view)
+    semantic_mod.check_removals(
+        removed, [(e.path, e.new_content or "") for e in edits], view
+    )
     spine_warning = semantic_mod.time_spine_warning(view, parsed_edits)
 
     # The authoritative gate: a plan that dbt cannot parse is never stored.
@@ -1581,6 +1597,7 @@ def _semantic_plan(
     result.defined = classification["defined"]
     result.updated = classification["updated"]
     result.unchanged = classification["unchanged"]
+    result.removed = classification["removed"]
     # `plans.plan` emits one diff per edit whether or not the content moved, so
     # a no-op is an all-empty diff set rather than an absent one.
     if result.unchanged and all(
@@ -1617,6 +1634,11 @@ def _definitions_from_payload(
     ``kind`` is ``semantic_model`` or ``metric``; ``content`` is that one
     definition's YAML body; ``path`` may be omitted for a definition the project
     already declares, which is then rewritten where it already lives.
+
+    An entry's ``op`` is ``upsert`` (the default, carrying ``content``) or
+    ``delete``, which carries ``name`` instead and removes that one definition
+    from the file that declares it. An omitted definition is never removed: only
+    a declared delete removes anything.
     """
 
     if definitions_file is None:
