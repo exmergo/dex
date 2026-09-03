@@ -312,6 +312,16 @@ retry with a raised budget on an over-ceiling refusal without asking.
 Metadata is free (`connect test`, `inventory` run immediately), and OK
 envelopes report actual spend under `data.spend`.
 
+An over-ceiling refusal now carries a calibration line drawn from
+`.dex/spend.jsonl`: what this connector's last few settled commands actually
+billed as a fraction of what they were estimated at, or a sentence saying the
+project has too little history to say. On a partitioned or clustered warehouse a
+dry-run estimate is an upper bound, so this is often the difference between a
+budget that admits the work and one that does not. Relay it verbatim when you
+surface the refusal, and note the part callers get wrong: the ceiling is checked
+against the *estimate*, so a budget set at the observed fraction of the estimate
+is refused again. It is still the user's decision, never yours.
+
 When a `needs_confirmation` envelope carries `suggested_session_ceiling`, the
 project has never decided whether the *day's* total spend is bounded, and this is
 the one time it is asked. Surface it beside the per-command estimate and get the

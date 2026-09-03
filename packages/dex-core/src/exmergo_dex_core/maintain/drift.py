@@ -770,8 +770,32 @@ def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, 
     return sum(per_table.values()), per_table
 
 
+def _grain_severity(row_count: int, min_rows: int) -> tuple[str, dict, str]:
+    """A lost-uniqueness finding's severity, damped below ``min_rows`` (#280).
+
+    A handful of rows is exactly the shape where losing uniqueness means the
+    least: a 4-row table with a boolean column "loses" a uniqueness it never
+    meaningfully had once a fifth row repeats a value. Damped to ``low``
+    rather than dropped, so a real defect on a small table is still visible,
+    just not the first thing a triager reads; the damping is named in the
+    finding's own ``data`` and prose, so nothing about the run is silent.
+    """
+
+    if row_count < min_rows:
+        return (
+            "low",
+            {"severity_floor_applied": True, "grain_min_rows": min_rows},
+            f" (severity capped at low: fewer than {min_rows} rows)",
+        )
+    return "high", {}, ""
+
+
 def grain_drift(
-    adapter: Adapter, plan: GrainPlan, *, timeout_seconds: float = 30.0
+    adapter: Adapter,
+    plan: GrainPlan,
+    *,
+    timeout_seconds: float = 30.0,
+    min_rows: int = 100,
 ) -> list[DriftFinding]:
     """Cardinality and identity drift, from aggregates only: exact distinct
     counts against the baseline's proven keys, the grains the project declares
@@ -784,7 +808,13 @@ def grain_drift(
     explore proved unique and no longer is. ``declared_grain_not_unique`` has no
     before at all, because the combination comes from the project rather than
     from a measurement, so the honest reading of a failure is that the
-    declaration is false rather than that anything changed."""
+    declaration is false rather than that anything changed.
+
+    ``min_rows`` damps a uniqueness-regression finding to ``low`` below that row
+    count (see :func:`_grain_severity`); it does not apply to
+    ``join_orphans_increased``, which already grades its own severity from the
+    measured orphan fraction rather than asserting ``high`` unconditionally.
+    """
 
     findings: list[DriftFinding] = []
     for dataset, keys, row_count in plan.key_checks:
@@ -802,22 +832,25 @@ def grain_drift(
             if count is None or count >= row_count:
                 continue
             duplicates = row_count - count
+            severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             findings.append(
                 DriftFinding(
                     axis="grain",
                     code="key_lost_uniqueness",
                     identifier=dataset.identifier,
                     column=key,
-                    severity="high",
+                    severity=severity,
                     detail=(
                         f"{key} on {dataset.identifier} is no longer unique: "
                         f"{count} distinct over {row_count} rows "
                         f"(~{duplicates} duplicate rows); joins on it will fan out"
+                        f"{floor_note}"
                     ),
                     data={
                         "distinct_count": count,
                         "row_count": row_count,
                         "was_grain": bool(dataset.grain and key in dataset.grain),
+                        **floor_data,
                     },
                 )
             )
@@ -836,18 +869,19 @@ def grain_drift(
                 continue
             duplicates = row_count - count
             members = ", ".join(combo)
+            severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             findings.append(
                 DriftFinding(
                     axis="grain",
                     code="key_lost_uniqueness",
                     identifier=dataset.identifier,
                     column=members,
-                    severity="high",
+                    severity=severity,
                     detail=(
                         f"({members}) on {dataset.identifier} is no longer "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows); "
-                        "joins on it will fan out"
+                        f"joins on it will fan out{floor_note}"
                     ),
                     data={
                         "columns": list(combo),
@@ -856,6 +890,7 @@ def grain_drift(
                         "was_grain": bool(
                             dataset.grain and list(combo) == list(dataset.grain)
                         ),
+                        **floor_data,
                     },
                 )
             )
@@ -877,26 +912,28 @@ def grain_drift(
                 continue
             duplicates = row_count - count
             members = ", ".join(combo)
+            severity, floor_data, floor_note = _grain_severity(row_count, min_rows)
             findings.append(
                 DriftFinding(
                     axis="grain",
                     code="declared_grain_not_unique",
                     identifier=dataset.identifier,
                     column=members,
-                    severity="high",
+                    severity=severity,
                     detail=(
                         f"the project declares ({members}) as the grain of "
                         f"{dataset.identifier}, and the combination is not "
                         f"unique: {count} distinct combinations over "
                         f"{row_count} rows (~{duplicates} duplicate rows). "
                         "Builds asserting this grain will fail and joins on it "
-                        "will fan out"
+                        f"will fan out{floor_note}"
                     ),
                     data={
                         "columns": list(combo),
                         "distinct_count": count,
                         "row_count": row_count,
                         "declared": True,
+                        **floor_data,
                     },
                 )
             )

@@ -316,6 +316,22 @@ class ClusterLimits(BaseModel):
     timeout_seconds: float = 60.0
 
 
+class MaintainConfig(BaseModel):
+    """Tuning for `maintain`'s detectors.
+
+    ``grain_min_rows``: below this row count, a lost-uniqueness finding
+    (``key_lost_uniqueness`` / ``declared_grain_not_unique``) is damped to
+    ``low`` rather than reported at ``high`` (issue #280). A handful of rows
+    is exactly the shape where losing uniqueness means the least: a 4-row
+    table with a boolean column "loses" a uniqueness it never meaningfully
+    had once a fifth row repeats a value. The finding is never dropped, only
+    downgraded, and the damping is named in the finding's own `data` so
+    nothing about the run is silent.
+    """
+
+    grain_min_rows: int = 100
+
+
 class PIIOverride(BaseModel):
     """One reviewed column, or a reviewed *class* of structurally identical
     columns, the team has decided is not PII.
@@ -454,6 +470,24 @@ class EntityAffixes(BaseModel):
     suffixes: list[str] = Field(
         default_factory=lambda: ["history", "data", "raw", "snapshot", "current"]
     )
+
+
+class ConventionWarnings(BaseModel):
+    """Which house conventions ``transform plan`` reads out of the project's own
+    models, and warns when an authored model breaks.
+
+    These are the only warnings dex raises on a style judgment rather than on a
+    fact, which is why they are the only ones a project can switch off. Each
+    fires only where the project's own precedent is unambiguous (see
+    ``transform.conventions``), so leaving them on costs a repo with no
+    consistent convention nothing; turning one off is for a house that has a
+    convention and has decided it is not this one.
+
+    ``resolved_keys``: an authored model exposes a raw foreign key where its
+    siblings all resolve the equivalent key to a descriptive attribute.
+    """
+
+    resolved_keys: bool = True
 
 
 # Which deployments each semantic-layer vendor ships, and the spellings that name
@@ -815,14 +849,25 @@ class DexConfig(BaseModel):
     # purpose; house-specific conventions (a shop's own `_bak`/`ods_`) are the
     # reason this is overridable rather than fixed.
     entity_affixes: EntityAffixes = Field(default_factory=EntityAffixes)
+    # Which house-convention warnings `transform plan` raises (issue #223). All
+    # on by default: each stays silent unless the project's own models agree
+    # unanimously, so a repo with no convention never hears from them.
+    conventions: ConventionWarnings = Field(default_factory=ConventionWarnings)
     query: QueryLimits = Field(default_factory=QueryLimits)
     cluster: ClusterLimits = Field(default_factory=ClusterLimits)
+    maintain: MaintainConfig = Field(default_factory=MaintainConfig)
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25
     # How fresh a cached profile must be to skip re-scanning it (`explore map` /
     # `explore relationships`); 0 disables reuse (always re-profile).
     profile_freshness_hours: float = 24.0
+    # How many values `explore profile` serializes for a column's value domain
+    # (issue #290): the most frequent ones, with the rest folded into that
+    # domain's `elided` count. The default equals the probe's own cap
+    # (`adapters.base.VALUE_DOMAIN_CAP`), so nothing is cut unless a repo asks;
+    # lowering it trims the payload and never what is probed or cached.
+    profile_value_domain_cap: int = 25
     # Whether `explore query` and `explore cluster` may profile an object the
     # connection has but the cache cannot speak for, instead of refusing. Priced
     # and disclosed when it happens. Top-level rather than under `query:` because

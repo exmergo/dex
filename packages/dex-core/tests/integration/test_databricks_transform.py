@@ -138,7 +138,7 @@ def test_init_plan_apply_build_into_the_scratch_catalog(
     statuses = {n["name"]: n["status"] for n in built["data"]["nodes"]}
     assert statuses.get(MODEL_NAME) == "success"
     # Warehouse time is accounted: the compute-time build records seconds.
-    assert built["data"].get("seconds_billed", 0) >= 0
+    assert built["data"]["spend"]["seconds_billed"] >= 0
 
     # The relation exists exactly where the dev target points, then
     # best-effort cleanup through the same discovered connection.

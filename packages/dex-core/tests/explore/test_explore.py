@@ -26,6 +26,7 @@ from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
 from exmergo_dex_core.explore import summary
 from exmergo_dex_core.explore.commands import _annotate_grain, _merged_hints
+from exmergo_dex_core.explore.results import ProfileResult
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -273,6 +274,162 @@ def test_profile_columns_all_restores_every_column(
     names = {c["name"] for c in dataset["columns"]}
     assert names == {"id", "email", "amount", "tag"}
     assert dataset["elided_column_count"] == 0
+
+
+# --- profile payload: all-null fields and the value-domain cap (#290) ----------
+
+
+def test_profile_suppresses_fields_that_are_null_on_every_column(
+    duckdb_file: Path, capsys
+):
+    payload = _run(
+        ["explore", "profile", "customers", "--path", str(duckdb_file)], capsys
+    )
+    dataset = payload["data"]["datasets"][0]
+    # No override applied, no value domain (id is the key, email is PII) and
+    # no temporal column: each of these was null on both columns, so each is
+    # dropped from both and named once, in the order the column shape has them.
+    assert dataset["suppressed_fields"] == [
+        "pii_overridden",
+        "value_domain",
+        "temporal_granularity",
+        "temporal_span",
+        "temporal_distinct_periods",
+        "temporal_missing_periods",
+        "temporal_largest_gap",
+    ]
+    for column in dataset["columns"]:
+        assert not set(dataset["suppressed_fields"]) & set(column)
+    cols = {c["name"]: c for c in dataset["columns"]}
+    # Null on some columns but not all stays on every column: email's
+    # suppressed extremes beside id's real ones are a finding, not padding.
+    assert cols["email"]["min_value"] is None
+    assert cols["id"]["min_value"] == 1
+    assert cols["id"]["pii"] is None
+    assert cols["email"]["pii"]["category"] == "email"
+    # The note sits ahead of `columns`, so a truncated read still explains
+    # the absence, and `columns` keeps its place as second to last.
+    keys = list(dataset)
+    assert keys.index("suppressed_fields") < keys.index("columns")
+    assert keys.index("columns") == len(keys) - 2
+
+
+def test_profile_suppression_is_judged_over_the_serialized_columns():
+    """The all-null test is over the columns the payload carries, not the
+    dataset's full set: a numeric extreme that lives only on a column the
+    default summary elides must not keep `min_value` on the shown columns
+    as a null, and `--columns all` brings the field back with the column.
+    The cached dataset is untouched either way."""
+
+    dataset = Dataset(
+        identifier="db.main.t",
+        row_count=100,
+        candidate_keys=[["ws_id"]],
+        columns=[
+            ColumnProfile(
+                name="ws_id", data_type="VARCHAR", null_fraction=0.0, is_unique=True
+            ),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                null_fraction=0.0,
+                pii={"category": "email", "confidence": 0.9},
+            ),
+            ColumnProfile(
+                name="amount",
+                data_type="DOUBLE",
+                null_fraction=0.0,
+                is_unique=False,
+                min_value=1.5,
+                max_value=99.0,
+            ),
+        ],
+    )
+
+    summary_payload = ProfileResult(datasets=[dataset]).data()["datasets"][0]
+    assert {c["name"] for c in summary_payload["columns"]} == {"ws_id", "email"}
+    assert "min_value" in summary_payload["suppressed_fields"]
+    assert "max_value" in summary_payload["suppressed_fields"]
+    assert all("min_value" not in c for c in summary_payload["columns"])
+
+    full_payload = ProfileResult(datasets=[dataset], show_all_columns=True).data()[
+        "datasets"
+    ][0]
+    assert "min_value" not in full_payload["suppressed_fields"]
+    full = {c["name"]: c for c in full_payload["columns"]}
+    assert full["amount"]["min_value"] == 1.5
+    assert full["ws_id"]["min_value"] is None
+
+    assert dataset.columns[2].min_value == 1.5
+    empty = ProfileResult(datasets=[Dataset(identifier="db.main.empty")]).data()
+    assert empty["datasets"][0]["suppressed_fields"] == []
+
+
+def test_profile_payload_caps_value_domain_values_and_counts_the_rest():
+    domain = ValueDomain(
+        values=[ValueCount(value=f"v{i}", count=10 - i) for i in range(6)],
+        elided=4,
+    )
+    dataset = Dataset(
+        identifier="db.main.t",
+        row_count=100,
+        columns=[
+            ColumnProfile(
+                name="tier", data_type="VARCHAR", distinct_count=10, value_domain=domain
+            )
+        ],
+    )
+
+    def serialized(**kwargs) -> dict:
+        result = ProfileResult(datasets=[dataset], **kwargs).data()
+        return result["datasets"][0]["columns"][0]["value_domain"]
+
+    capped = serialized(value_domain_cap=4)
+    assert [v["value"] for v in capped["values"]] == ["v0", "v1", "v2", "v3"]
+    # The 4 the probe already left out, plus the 2 cut here: still 10 in total.
+    assert capped["elided"] == 6
+    # The default cap is the probe's own, so a domain within it is whole.
+    whole = serialized()
+    assert len(whole["values"]) == 6
+    assert whole["elided"] == 4
+    # A serialization choice only: the cached domain keeps every value.
+    assert len(dataset.columns[0].value_domain.values) == 6
+
+
+def test_profile_value_domain_cap_is_read_from_config(tmp_path: Path, capsys):
+    """`profile_value_domain_cap` in `.dex/config.yml` trims each serialized
+    domain to its most frequent values, with the rest counted in `elided`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "raw.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE raw_workspaces (ws_id VARCHAR, env_tier VARCHAR)")
+    tiers = ["prod"] * 40 + ["staging"] * 30 + ["dev"] * 20 + ["test"] * 10
+    conn.executemany(
+        "INSERT INTO raw_workspaces VALUES (?, ?)",
+        [(f"ws{i}", tiers[i]) for i in range(100)],
+    )
+    conn.close()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_config(DexConfig(profile_value_domain_cap=2), repo)
+
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "raw_workspaces",
+            "--path",
+            str(db_path),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    cols = {c["name"]: c for c in payload["data"]["datasets"][0]["columns"]}
+    domain = cols["env_tier"]["value_domain"]
+    assert [v["value"] for v in domain["values"]] == ["prod", "staging"]
+    assert domain["elided"] == 2
 
 
 def test_columns_with_findings_word_boundary_and_value_domain():
@@ -1060,7 +1217,10 @@ def test_empty_table_and_view_profile_without_error(edge_duckdb: Path, capsys):
     ds = {d["identifier"].split(".")[-1]: d for d in payload["data"]["datasets"]}
     empty = ds["empty_t"]
     assert any("empty" in note for note in empty["data_quality"])
-    assert empty["columns"][0]["null_fraction"] is None  # no rows -> undefined
+    # No rows leaves every statistic undefined on every column, and a field
+    # that is null everywhere is dropped and named rather than repeated (#290).
+    assert "null_fraction" in empty["suppressed_fields"]
+    assert "null_fraction" not in empty["columns"][0]
     assert "people_v" in ds  # a view profiles fine
 
 

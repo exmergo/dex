@@ -9,7 +9,7 @@ axis means something quite different from "no findings" from a full sweep.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -127,6 +127,33 @@ class DriftResult(Result):
                 "from": self.warehouse_from,
             },
             "drift_path": self.drift_path,
+        }
+
+
+class VerifyResult(Result):
+    """A baseline-free sweep's findings: is the project correct right now,
+    not what changed since a snapshot (#224).
+
+    ``suppressed`` names finding classes that did not run and why -- a
+    project that fails to compile suppresses every manifest-derived class,
+    and a class needing dbt artifacts that are not on disk yet (no
+    ``run_results.json``, an unreachable warehouse for the relation check)
+    says so here rather than reporting a silent, indistinguishable "clean"
+    (#172's inertness requirement). Reported even when empty, the same
+    reasoning ``axes_run`` on :class:`DriftResult` already carries: a caller
+    deciding whether to trust an empty ``findings`` needs to know what ran.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    findings: list[DriftFinding] = Field(default_factory=list)
+    suppressed: dict[str, str] = Field(default_factory=dict)
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "findings": [f.model_dump(mode="json") for f in self.findings],
+            "finding_count": len(self.findings),
+            "suppressed": self.suppressed,
         }
 
 

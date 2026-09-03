@@ -13,6 +13,7 @@ plain re-run, and the end-to-end CLI wiring.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from exmergo_dex_core.cache import (
     RelationshipKind,
 )
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.explore import relationships
 from exmergo_dex_core.explore.commands import _carry_forward_overlap_edges
 from exmergo_dex_core.explore.relationships import (
     overlap_sweep_candidates,
@@ -214,7 +216,13 @@ def test_overlap_sweep_statements_transpiles_to_postgres_and_stays_select_only()
 
 class _StubAdapter:
     """Just the surface `probe_overlap_candidates` touches: canned aggregate
-    rows keyed by which table the probe's FROM clause names, in call order."""
+    counts handed out in candidate order.
+
+    A batched statement answers several candidates at once, so the stub reads
+    how many the statement asked about off the statement itself (one
+    `nonnull_fk_{i}` alias per candidate) and answers exactly that many. That
+    keeps the fake honest about the batching rather than assuming a size.
+    """
 
     dialect = "duckdb"
 
@@ -224,11 +232,17 @@ class _StubAdapter:
     def run_query(self, sql: str, *, max_rows: int, timeout_seconds: float):
         from exmergo_dex_core.adapters.base import QueryResult
 
-        nonnull, orphans = self._rows.pop(0)
+        indexes = [int(i) for i in re.findall(r"AS nonnull_fk_(\d+)", sql)]
+        columns: list[str] = []
+        cells: list[int] = []
+        for index in indexes:
+            nonnull, orphans = self._rows.pop(0)
+            columns += [f"nonnull_fk_{index}", f"orphans_{index}"]
+            cells += [nonnull, orphans]
         return QueryResult(
-            columns=["nonnull_fk", "orphans"],
-            types=["BIGINT", "BIGINT"],
-            cells=[[nonnull, orphans]],
+            columns=columns,
+            types=["BIGINT"] * len(columns),
+            cells=[cells],
             truncated=False,
         )
 
@@ -280,7 +294,7 @@ def test_probe_overlap_candidates_accepts_a_small_nonzero_orphan_fraction():
     assert candidate.orphan_fraction == 0.03
 
 
-def test_probe_overlap_candidates_survives_a_mid_loop_ceiling():
+def test_probe_overlap_candidates_survives_a_mid_loop_ceiling(monkeypatch):
     """A candidate already decided before an OverCeilingError hits stays
     decided (in-place mutation), even though the function itself raises."""
 
@@ -297,6 +311,10 @@ def test_probe_overlap_candidates_survives_a_mid_loop_ceiling():
     accepted = _candidate("db.s.a", "db.s.b")
     never_reached = _candidate("db.s.c", "db.s.d")
     adapter = _ExhaustingAdapter([(100, 0)])
+    # One candidate per statement, so the ceiling lands between the two rather
+    # than inside a statement that covers both. Batching coarsens where the
+    # ceiling can bite; it does not change that what was decided stays decided.
+    monkeypatch.setattr(relationships, "_PROBE_BATCH", 1)
     with pytest.raises(OverCeilingError):
         probe_overlap_candidates(adapter, [accepted, never_reached])
     assert accepted.verified is True

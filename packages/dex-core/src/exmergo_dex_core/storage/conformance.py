@@ -40,12 +40,17 @@ against a store built the way dex would build it, and "the suite is green" keeps
 meaning the backend is both correct and constructable rather than only the first.
 
 **If your backend serves concurrent requests**, mix :class:`SpendLockContract` in
-too. It is the only optional capability here, and skipping it costs correctness
-rather than convenience: without a lock two overlapping billed commands are
-admitted against the same headroom and the cumulative session ceiling does not
-bind. dex reports that on every billed result rather than assuming it, so a
-backend without one is honest rather than silently broken, but a hosted backend
-wants the lock.
+too. Skipping it costs correctness rather than convenience: without a lock two
+overlapping billed commands are admitted against the same headroom and the
+cumulative session ceiling does not bind. dex reports that on every billed result
+rather than assuming it, so a backend without one is honest rather than silently
+broken, but a hosted backend wants the lock.
+
+**If your backend can read its own spend ledger back**, mix
+:class:`SpendHistoryContract` in as well. This one is genuinely optional:
+skipping it costs a sentence on an over-ceiling refusal (how far this
+connector's past estimates ran from what they actually billed) and nothing else,
+so a backend that omits it is complete rather than narrow.
 
 This module imports pytest, so it is deliberately not imported by
 ``exmergo_dex_core.storage``: a bare ``import exmergo_dex_core`` must not require
@@ -836,6 +841,137 @@ class SpendLockContract(_KeyedContract):
                 "to the backend rather than to the ledger it protects. Every tenant "
                 "then waits on every other tenant's billed commands"
             )
+
+
+class SpendHistoryContract(_KeyedContract):
+    """The optional capability that lets a refusal calibrate its own estimate.
+
+    Mix it in alongside the contract for your tier::
+
+        class TestMyStore(SpendHistoryContract, ExploreStoreContract):
+            def make_store(self, key):
+                return MyStore(tenant=key)
+
+    ``spend_since`` answers "how much today" as one float, which is all the
+    cumulative ceiling needs. ``spend_entries`` answers a second question off the
+    same ledger: what past commands on one connector were estimated at, and what
+    they settled at. An over-ceiling refusal quotes an estimate that on a
+    partitioned or clustered warehouse is an upper bound, so without this the
+    operator raising a budget is guessing; with it the refusal can say the last
+    eight commands billed a median 69% of estimate.
+
+    Three properties. It must return the raw entries **uninterpreted**, in
+    **append order, oldest first**, and it must **filter by connector** and cap
+    to the **most recent** ``limit`` after filtering, not before, so a ledger
+    shared by two connectors still yields a full window for each.
+    """
+
+    def test_spend_entries_returns_entries_oldest_first(self):
+        store = self.store_for("history")
+        for index in range(3):
+            store.append_spend_log(
+                {
+                    "at": f"2026-07-0{index + 1}T10:00:00+00:00",
+                    "connector": "bigquery",
+                    "entry": "settlement",
+                    "billed_bytes": 100 * (index + 1),
+                }
+            )
+        got = store.spend_entries()
+        assert [entry.get("billed_bytes") for entry in got] == [100, 200, 300], (
+            "spend_entries must return whole ledger entries in append order, "
+            f"oldest first. Got {got!r}"
+        )
+
+    def test_spend_entries_preserves_every_key_it_was_given(self):
+        store = self.store_for("history")
+        entry = {
+            "at": "2026-07-03T10:00:00+00:00",
+            "connector": "bigquery",
+            "command": "transform build",
+            "entry": "settlement",
+            "reservation_id": "abc123",
+            "billed_bytes": 4_750_000_000,
+            "estimate": 6_905_293_058.0,
+        }
+        store.append_spend_log(dict(entry))
+        got = store.spend_entries()
+        assert got and got[0] == entry, (
+            "spend_entries must hand back the entry as appended, uninterpreted: "
+            "the guard pairs `estimate` with the settled figure and groups by "
+            "`reservation_id`, and a backend that drops or rewrites keys it does "
+            f"not recognize breaks that. Got {got!r}"
+        )
+
+    def test_spend_entries_filters_by_connector(self):
+        store = self.store_for("history")
+        store.append_spend_log(
+            {
+                "at": "2026-07-03T10:00:00+00:00",
+                "connector": "duckdb",
+                "billed_bytes": 1,
+            }
+        )
+        store.append_spend_log(
+            {
+                "at": "2026-07-03T11:00:00+00:00",
+                "connector": "bigquery",
+                "billed_bytes": 2,
+            }
+        )
+        got = store.spend_entries(connector="bigquery")
+        assert [entry.get("connector") for entry in got] == ["bigquery"], (
+            "spend_entries(connector=...) must return only that connector's "
+            "entries. A ratio pooled across connectors would let a free DuckDB "
+            f"history calibrate a billed BigQuery refusal. Got {got!r}"
+        )
+
+    def test_spend_entries_limit_takes_the_most_recent_after_filtering(self):
+        store = self.store_for("history")
+        for index in range(4):
+            store.append_spend_log(
+                {
+                    "at": f"2026-07-0{index + 1}T10:00:00+00:00",
+                    "connector": "duckdb",
+                    "billed_bytes": -1,
+                }
+            )
+            store.append_spend_log(
+                {
+                    "at": f"2026-07-0{index + 1}T11:00:00+00:00",
+                    "connector": "bigquery",
+                    "billed_bytes": index,
+                }
+            )
+        got = store.spend_entries(connector="bigquery", limit=2)
+        assert [entry.get("billed_bytes") for entry in got] == [2, 3], (
+            "spend_entries must apply `limit` to the *most recent* entries "
+            "matching the connector, still oldest-first, and cap after "
+            "filtering rather than before: capping first returns fewer than "
+            "`limit` of the asked-for connector whenever another connector "
+            f"shares the ledger. Got {got!r}"
+        )
+
+    def test_spend_entries_is_empty_on_an_empty_ledger(self):
+        store = self.store_for("history")
+        assert store.spend_entries() == [], (
+            "spend_entries must return an empty list when nothing has been "
+            f"appended, not None and not an error. Got {store.spend_entries()!r}"
+        )
+
+    def test_two_keys_do_not_share_spend_entries(self):
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
+        one.append_spend_log(
+            {
+                "at": "2026-07-03T10:00:00+00:00",
+                "connector": "bigquery",
+                "billed_bytes": 500,
+            }
+        )
+        assert two.spend_entries() == [], (
+            "two keys share the spend ledger, so one tenant's settled history "
+            f"would calibrate another tenant's refusal. Got {two.spend_entries()!r}"
+        )
 
 
 class StoreFactoryContract(_KeyedContract):

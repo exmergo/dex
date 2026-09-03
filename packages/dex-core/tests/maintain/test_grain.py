@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 
 def test_clean_warehouse_reports_no_grain_drift(maintain_repo):
     maintain_repo.snapshot()
@@ -36,6 +38,86 @@ def test_duplicated_key_is_detected_exactly(maintain_repo):
     # order_id is the semantic model's entity, so every metric on it is at risk.
     assert finding["impacted_models"] == ["stg_orders"]
     assert finding["impacted_metrics"] == ["order_volume", "revenue"]
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        "ReplacingMergeTree",
+        "CollapsingMergeTree",
+        "VersionedCollapsingMergeTree",
+        "SummingMergeTree",
+        "AggregatingMergeTree",
+    ],
+)
+def test_clickhouse_collapsing_engine_note_stays_on_uniqueness_finding(
+    engine,
+    fake_clickhouse_connection,
+):
+    """A severity-ranked consumer may read only findings, so ClickHouse engine
+    notes that qualify duplicate counts must ride on the drift finding itself."""
+
+    pytest.importorskip("clickhouse_connect")
+
+    from fakes.clickhouse import FakeResult
+
+    from exmergo_dex_core import DexConfig, DexEngine, MemoryStore
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.config import Budget
+    from exmergo_dex_core.connect import ConnectionSource
+    from exmergo_dex_core.dbt_project import ProjectDefinitions
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain.commands import grain_drift
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    fake_clickhouse_connection.table("shop.order_events_raw").engine = engine
+    store = MemoryStore()
+    store.save_snapshot(
+        Snapshot(
+            created_at="2024-01-01T00:00:00+00:00",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="shop.order_events_raw",
+                        candidate_keys=[["order_id"]],
+                        grain=["order_id"],
+                    )
+                ],
+                relationships=[],
+            ),
+        )
+    )
+    fake_clickhouse_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 300, "d_0": 298}]
+    )
+    config = DexConfig(
+        connector="clickhouse",
+        budget=Budget(
+            paradigm=Paradigm.DB_LOAD,
+            ceiling=600.0,
+            session_ceiling=None,
+        ),
+    )
+
+    class Project:
+        def definitions(self):
+            return ProjectDefinitions(present=False)
+
+    dex_engine = DexEngine(
+        config=config,
+        store=store,
+        connection=ConnectionSource(connect=lambda: fake_clickhouse_connection),
+        confirmed=True,
+        project_format=Project(),
+    )
+
+    result = grain_drift(dex_engine)
+
+    assert any("FINAL" in warning for warning in result.warnings)
+    (finding,) = [f for f in result.findings if f.code == "key_lost_uniqueness"]
+    assert finding.severity == "medium"
+    assert any(engine in n for n in finding.data["table_notes"])
+    assert "stored parts before ClickHouse FINAL" in finding.detail
 
 
 def test_new_orphans_move_the_verified_join(maintain_repo):
@@ -238,6 +320,122 @@ def test_estimated_row_counts_cannot_fabricate_duplicates():
     assert findings == []
 
 
+# --- the row-count floor: a small table's lost uniqueness means less (#280) -------
+
+
+class _SmallKeyAdapter:
+    """A single-column key check over a table of a given size, with a fixed
+    distinct count -- exactly what a row-count floor needs to exercise."""
+
+    name = "stub"
+    dialect = "duckdb"
+
+    def __init__(self, row_count: int, distinct: int):
+        self.row_count = row_count
+        self.distinct = distinct
+
+    def table_metadata(self, identifier):
+        from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+
+        meta = ObjectMeta(
+            identifier=identifier,
+            object_type="table",
+            schema="s",
+            name="t",
+            row_count=self.row_count,
+            byte_size=None,
+            column_count=1,
+        )
+        return meta, [
+            ColumnMeta(name="flag", data_type="BOOLEAN", nullable=False, ordinal=0)
+        ]
+
+    def exact_distinct_counts(self, identifier, columns):
+        return dict.fromkeys(columns, self.distinct)
+
+
+def _small_key_plan(row_count: int):
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.drift import GrainPlan
+
+    dataset = Dataset(identifier="db.s.t", candidate_keys=[["flag"]], grain=["flag"])
+    return GrainPlan(
+        key_checks=[(dataset, ["flag"], row_count)],
+        fanout_pairs=[],
+        composite_checks=[],
+        declared_composite_checks=[],
+        notes=[],
+    )
+
+
+def test_lost_uniqueness_below_the_row_floor_is_damped_to_low():
+    """The issue's own example: a 4-row table whose boolean column "loses" a
+    uniqueness it never meaningfully had. Damped, not dropped: it is still a
+    finding, just not at `high`."""
+
+    from exmergo_dex_core.maintain.drift import grain_drift
+
+    findings = grain_drift(_SmallKeyAdapter(4, 2), _small_key_plan(4))
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.severity == "low"
+    assert finding.data["severity_floor_applied"] is True
+    assert finding.data["grain_min_rows"] == 100
+    assert "capped at low" in finding.detail
+
+
+def test_lost_uniqueness_at_or_above_the_row_floor_stays_high():
+    from exmergo_dex_core.maintain.drift import grain_drift
+
+    findings = grain_drift(_SmallKeyAdapter(200, 150), _small_key_plan(200))
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.severity == "high"
+    assert "severity_floor_applied" not in finding.data
+    assert "capped at low" not in finding.detail
+
+
+def test_the_row_floor_is_configurable():
+    """The same shape `test_lost_uniqueness_below_the_row_floor_is_damped_to_low`
+    damps at the default floor stays `high` once the floor is lowered below the
+    table's own row count."""
+
+    from exmergo_dex_core.maintain.drift import grain_drift
+
+    findings = grain_drift(_SmallKeyAdapter(4, 2), _small_key_plan(4), min_rows=2)
+    assert findings[0].severity == "high"
+    assert "severity_floor_applied" not in findings[0].data
+
+
+def test_the_row_floor_is_configurable_via_dex_config(maintain_repo):
+    """The acceptance criterion in its own words: the threshold is
+    configurable in `.dex/config.yml`, exercised through the CLI end to end
+    rather than by calling `grain_drift` directly."""
+
+    # 210 rows after the duplicate insert (test_duplicated_key_is_detected_exactly's
+    # own baseline shape): a floor above that turns the same regression low.
+    # Rewritten in full (matching the fixture's own raw-YAML setup) rather
+    # than via save_config, which would drop the connector/path the fixture
+    # already wrote there.
+    (maintain_repo.root / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {maintain_repo.db_path}\n"
+        "maintain:\n  grain_min_rows: 500\n",
+        encoding="utf-8",
+    )
+    maintain_repo.snapshot()
+    maintain_repo.sql("INSERT INTO orders SELECT * FROM orders WHERE order_id <= 10")
+
+    rc, payload = maintain_repo.dex("maintain", "grain")
+    assert rc == 0 and payload["status"] == "ok"
+    findings = [
+        f for f in payload["data"]["findings"] if f["code"] == "key_lost_uniqueness"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "low"
+    assert findings[0]["data"]["severity_floor_applied"] is True
+    assert findings[0]["data"]["grain_min_rows"] == 500
+
+
 # --- composite keys ---------------------------------------------------------------
 
 
@@ -339,6 +537,28 @@ def test_composite_key_lost_uniqueness_is_detected():
         "row_count": 1000,
         "was_grain": True,
     }
+
+
+def test_composite_lost_uniqueness_below_the_row_floor_is_damped_too():
+    """The same floor applies to the composite path (#280): it is one damping
+    rule shared by every uniqueness-regression finding, not a special case of
+    the single-column one."""
+
+    from exmergo_dex_core.maintain.drift import GrainPlan, grain_drift
+
+    dataset, _snap = _composite_snapshot()
+    plan = GrainPlan(
+        key_checks=[],
+        fanout_pairs=[],
+        composite_checks=[(dataset, [["order_key", "line_number"]], 10)],
+        declared_composite_checks=[],
+        notes=[],
+    )
+    adapter = _ComboAdapter(rows=10, combo_count=8)
+    findings = grain_drift(adapter, plan)
+    assert len(findings) == 1
+    assert findings[0].severity == "low"
+    assert findings[0].data["severity_floor_applied"] is True
 
 
 def test_composite_check_is_quiet_when_the_key_still_holds():
@@ -567,6 +787,28 @@ def test_grain_estimate_prices_composite_checks():
     assert per_table == {"db.s.line_items": 7.0}
     assert len(priced) == 1
     assert "SELECT DISTINCT" in priced[0]
+
+
+def test_declared_grain_not_unique_below_the_row_floor_is_damped_too():
+    """And the third site: a declared grain that fails on a small table is
+    just as much a small-sample artifact as a measured one (#280)."""
+
+    from exmergo_dex_core.maintain.drift import GrainPlan, grain_drift
+
+    dataset, _snap = _composite_snapshot()
+    plan = GrainPlan(
+        key_checks=[],
+        fanout_pairs=[],
+        composite_checks=[],
+        declared_composite_checks=[(dataset, [["order_key", "line_number"]], 10)],
+        notes=[],
+    )
+    adapter = _ComboAdapter(rows=10, combo_count=8)
+    findings = grain_drift(adapter, plan)
+    assert len(findings) == 1
+    assert findings[0].code == "declared_grain_not_unique"
+    assert findings[0].severity == "low"
+    assert findings[0].data["severity_floor_applied"] is True
 
 
 # --- declared grains: the combination the project claims ------------------------

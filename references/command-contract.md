@@ -80,7 +80,13 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
   [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
                                      payload, columns trails; by default columns is summarized to the
                                      ones carrying a finding, with the rest in elided_column_count.
-                                     --columns all restores every column
+                                     --columns all restores every column. A per-column field that is
+                                     null on every column shown is dropped from each and named once
+                                     in suppressed_fields (always present; empty means nothing was
+                                     dropped). Each value_domain carries its most frequent
+                                     profile_value_domain_cap values (.dex/config.yml, default 25)
+                                     with the rest counted in its elided. Both reduce the payload
+                                     only, never the cached profile
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)
@@ -222,6 +228,14 @@ dex maintain semantic [<objects>] -> definition drift and dangling refs (free) +
                                      cardinality change (a scan; gated on billed connectors)
 dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as a stored plan
                                      of diffs tagged mechanical/advisory (applied with transform apply)
+dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
+                                     required (unlike every subcommand above): failed/skipped build
+                                     nodes (naming the failed cause, walking back through transitively
+                                     skipped parents) and models with no relation in the warehouse; all
+                                     free (compiled manifest + last run_results.json + cheap object
+                                     metadata, never a scan). A project that fails to compile is
+                                     reported first and suppresses every other check; data.suppressed
+                                     names each finding class that did not run and why
 dex viz preview                   -> emit the dbt semantic model to the Viz preview (not yet implemented;
                                      the Viz integration arrives later)
 ```
@@ -425,6 +439,38 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   valid on its own because it depends on something else in the same edit.
   Authoring a model that does not exist yet produces no findings and opens
   nothing.
+- `transform plan` raises two **advisory warnings about the shape of what was
+  authored**, both free, both static, and neither able to refuse a plan. The
+  first compares the authored SELECT list against the columns the model's
+  `schema.yml` declares, in both directions: a declared column the SELECT does
+  not produce, and a produced column the declaration does not name. A model with
+  no declared columns has no contract and produces nothing; a SELECT list that
+  cannot be resolved statically (a `select *`, a `t.*`, an unaliased macro
+  standing in for a column) says so rather than guessing, and an *aliased* macro
+  call is resolved by its alias. The declaration is read with this same plan's
+  own `schema.yml` edits overlaid, so a model and its documentation edited
+  together are compared against each other rather than against a stale file.
+
+  The second reads a **house convention out of the project's own models**: an
+  authored model exposing a raw foreign key where its siblings all resolve the
+  equivalent key to a descriptive attribute. Siblings are the models sharing the
+  authored one's folder and its layer prefix, widening to that prefix
+  project-wide when the folder is too small to hold a precedent. At least three
+  of them must resolve a key of the same id-suffix shape and none may pass one
+  through, since one counter-example is enough to say the house has not settled
+  the question (a fact table beside the dimensions is that counter-example, and
+  a `*_key` convention says nothing about a `*_id`). A key naming the model's
+  own entity is its identity, not a foreign key. And the project must hold a
+  parent to resolve against, because the fix is a `ref()`. The warning names the
+  siblings and the parent so the inference can be argued with.
+
+  Both read the project as this plan will leave it, so models authored together
+  inform each other, and both judge only what the plan authors: an existing
+  violation elsewhere in the project is not this plan's warning. The convention
+  check is the only one dex raises on a style judgment rather than on a fact,
+  which is why it is the only one a project can decline:
+  `conventions.resolved_keys: false` in `.dex/config.yml`, named in the warning
+  itself.
 - `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
@@ -814,6 +860,19 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   plus `session_spent_today`, which is what the next command's cumulative
   ceiling will start from. A failed build reports it too: dbt bills for the
   statements it ran before it stopped.
+- **And it is the only place spend is reported.** No command puts a billed
+  magnitude anywhere else in `data`, and every command that can bill carries the
+  unit key whatever it settled at, zero included. Both halves are the same rule:
+  a key that exists on one command and not another is worse than one that never
+  exists, because at the top of `data` a missing key reads as a value, and the
+  value it reads as is zero. `transform build` used to stamp `data.bytes_billed`
+  as well, so a caller reading that key saw a build's spend and read a `maintain
+  check` that had just scanned 0.89 GB as free. Under-reporting spend is the one
+  envelope defect that breaks the cost-governance guarantee rather than annoying
+  the caller, so where a figure is genuinely unavailable the key reports `null`
+  and a note says why, rather than rounding an unknown down to zero. Key parity
+  across `transform build`, `maintain check`, `explore query`, `explore map` and
+  `explore profile` is a contract test.
 - **ClickHouse's paradigm depends on its declared deployment.** Config-free
   callers retain the backward-compatible `db_load` default; an effective
   `clickhouse.deployment: cloud` uses `compute_time`. Cloud keeps seconds as the

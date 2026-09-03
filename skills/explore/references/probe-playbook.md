@@ -48,7 +48,10 @@ FROM child c
 ```
 
 Zero orphans confirms the join; a high orphan fraction says the name-based guess
-was wrong or the parent is incomplete.
+was wrong or the parent is incomplete. `--verify` applies the second habit above
+to this recipe for you: the joins that share a child are measured in one
+statement, so it costs what the relations cost rather than what the join count
+costs.
 
 **2. Duplicate / grain check.** How badly is a key broken, and what does the
 duplication look like?

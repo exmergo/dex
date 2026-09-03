@@ -47,6 +47,7 @@ from .validate import _PLACEHOLDER, find_inlined_secret, strip_jinja, validate_e
 
 if TYPE_CHECKING:
     from ..adapters.project import EditableProject
+    from ..config import ConventionWarnings
     from ..storage import Store
 
 
@@ -344,6 +345,7 @@ def plan(
     store: Store,
     project_format: EditableProject | None = None,
     pii_overrides: Any = None,
+    conventions: ConventionWarnings | None = None,
 ) -> tuple[TransformPlan, list[dict[str, Any]], list[str]]:
     """Validate agent-authored edits and store them as a plan. Writes no project file.
 
@@ -369,6 +371,12 @@ def plan(
     the gate still runs on the seed's own header and on whatever the exploration
     cache already flagged; an override is what a human uses to clear a column,
     not what makes the check happen.
+
+    ``conventions`` is which house-convention warnings the project has left on
+    (see :mod:`.conventions`). Absent means all of them, so a host calling this
+    directly gets the same reading a configured repo gets by default; switching
+    one off is a choice a project makes, not something a caller falls into by
+    not passing it.
     """
 
     if not edits:
@@ -527,6 +535,17 @@ def plan(
 
         warnings.extend(missing_macro_warnings(edits, view))
         warnings.extend(column_contract_warnings(edits, view))
+
+        # The one plan-time check that reads a convention rather than a
+        # declaration, and the only one a project can switch off, because it is
+        # a style judgment rather than a fact. Late-imported with the two above:
+        # it reads this module's own vocabulary, and it reaches into explore for
+        # the foreign-key naming rules, which no command that never plans should
+        # pay for.
+        if conventions is None or conventions.resolved_keys:
+            from .conventions import unresolved_key_warnings
+
+            warnings.extend(unresolved_key_warnings(edits, view, project))
 
     created_at = datetime.now(UTC).isoformat()
     try:
@@ -804,7 +823,7 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
             continue
         declared_lower = {c.lower() for c in declared}
 
-        produced = _select_columns(edit.new_content)
+        produced = select_columns(edit.new_content)
         if produced is None:
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) for {model}, but "
@@ -829,7 +848,7 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
     return warnings
 
 
-def _select_columns(sql: str) -> set[str] | None:
+def select_columns(sql: str) -> set[str] | None:
     """The lowercased output column names of a model's outermost SELECT, or
     ``None`` if they cannot be resolved statically.
 

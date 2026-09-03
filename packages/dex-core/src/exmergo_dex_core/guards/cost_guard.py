@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import hashlib
 import math
+import statistics
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -349,6 +351,235 @@ def unserialized_ledger_warning(
     ]
 
 
+#: How many recent settled commands a calibration is drawn from. Recent rather
+#: than all-time on purpose: the ratio of estimate to actual is a property of
+#: the tables a project queries and the way they are partitioned and clustered,
+#: and both move. Eight is enough for a median to mean something and short
+#: enough to follow the project rather than its history.
+CALIBRATION_WINDOW = 8
+
+#: The fewest settled commands a ratio may be drawn from. Two points are a line
+#: through two points, not a distribution, and a refusal that quotes one has
+#: dressed a coincidence up as evidence. Below this the refusal says it has no
+#: ratio, which is a worse answer to have and a better one to give.
+CALIBRATION_MINIMUM = 3
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """How past estimates on one connector compared with what settled.
+
+    ``median``, ``low`` and ``high`` are fractions of the estimate (0.69 means
+    the command billed 69% of what it was priced at), over ``samples`` commands.
+    The median rather than the mean because the distribution is skewed and
+    thin: one command whose estimate was nearly exact sits beside one that
+    scanned a tenth of its upper bound, and eight samples are few enough that a
+    mean is dragged wherever the outlier happens to be. ``low`` and ``high``
+    are reported alongside so the spread is visible rather than hidden behind
+    the one number.
+    """
+
+    samples: int
+    median: float
+    low: float
+    high: float
+
+
+def _magnitude(value: object) -> float | None:
+    """``value`` as a float when it is honestly a number, else ``None``.
+
+    Booleans are rejected rather than silently read as 1 and 0, which is what
+    ``isinstance(x, int)`` would do with them. The ledger is a JSON file a host
+    or a stray script can write to, so a key holding ``true`` is reachable, and
+    a spend of 1 invented from it would be a fabricated data point rather than a
+    skipped one.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def settled_ratios(entries: list[dict], *, connector: str, field: str) -> list[float]:
+    """One billed-over-estimated ratio per settled command, oldest first.
+
+    Split out of :func:`calibration_from_ledger` because the count is
+    load-bearing on its own: a refusal that cannot draw a ratio still has to say
+    whether the ledger held nothing or held too little, and those are different
+    sentences to an operator deciding whether to look further.
+
+    Four filters decide what counts as a data point, and each closes a way the
+    number could lie.
+
+    **One connector only.** ``connector`` is matched on every entry rather than
+    trusted from the reader, because a DuckDB history calibrating a BigQuery
+    refusal would be worse than no calibration: the two are not the same
+    warehouse, the same pricing, or the same estimator. ``field`` does the same
+    job one level down, so a seconds figure can never divide a bytes estimate.
+
+    **One command per point, not one statement.** A command that ran six
+    statements settled six times against one estimate, and counting each as its
+    own point would report six ratios of a sixth each. Entries are grouped by
+    ``reservation_id``, which is exactly the "these settlements are one
+    command" fact the ledger already records. A settlement without one (a dbt
+    build, which settles once outside any gate) is its own group.
+
+    **Nothing that did not finish paying.** A killed process leaves its
+    reservation standing with no release, which the ledger documents as the safe
+    direction for the ceiling and which here marks a command whose settlements
+    are partial by definition. Counting one would report a ratio far below the
+    truth and calibrate the next refusal into a budget too small to admit
+    anything. Those groups are dropped. An *errored* command is not detectable
+    this way (it settles and releases like any other), so it is counted, and
+    that is the residual bias in this number: it can read low, never high.
+
+    **Nothing that billed zero.** A cache hit bills nothing against a real
+    estimate, which is a true fact about that run and a misleading one about the
+    next: the refused command is not going to hit the cache. Excluding them
+    leaves the median slightly high, which is the direction a spend guard should
+    err in when it is about to influence a budget.
+    """
+
+    reserved: set[str] = set()
+    released: set[str] = set()
+    # Insertion-ordered, so "the last `window` commands" is a slice rather than
+    # a sort on a timestamp that a malformed entry could be missing.
+    groups: dict[object, list[float]] = {}
+
+    for index, entry in enumerate(entries):
+        if entry.get("connector") != connector:
+            continue
+        reservation = entry.get("reservation_id")
+        kind = entry.get("entry")
+        if isinstance(reservation, str):
+            if kind == "reservation":
+                reserved.add(reservation)
+            elif kind == "release":
+                released.add(reservation)
+        estimate = _magnitude(entry.get("estimate"))
+        billed = _magnitude(entry.get(field))
+        if estimate is None or estimate <= 0 or billed is None:
+            continue
+        key: object = reservation if isinstance(reservation, str) else ("solo", index)
+        group = groups.setdefault(key, [estimate, 0.0])
+        group[1] += billed
+
+    abandoned = reserved - released
+    return [
+        billed / estimate
+        for key, (estimate, billed) in groups.items()
+        if key not in abandoned and billed > 0
+    ]
+
+
+def calibration_from_ledger(
+    entries: list[dict],
+    *,
+    connector: str,
+    field: str,
+    window: int = CALIBRATION_WINDOW,
+    minimum: int = CALIBRATION_MINIMUM,
+) -> Calibration | None:
+    """What this connector's settled history says about its own estimates.
+
+    ``None`` when the ledger cannot support a ratio, which is the common case
+    early in a project's life and stays a legitimate answer forever: a caller
+    turns it into a sentence saying there is no ratio, never into a default one.
+    See :func:`settled_ratios` for what counts as a data point.
+    """
+
+    return calibration_of(
+        settled_ratios(entries, connector=connector, field=field),
+        window=window,
+        minimum=minimum,
+    )
+
+
+def calibration_of(
+    ratios: list[float],
+    *,
+    window: int = CALIBRATION_WINDOW,
+    minimum: int = CALIBRATION_MINIMUM,
+) -> Calibration | None:
+    """The summary of an already-computed ratio list, or ``None`` if too short.
+
+    The arithmetic half of :func:`calibration_from_ledger`, separate so a caller
+    that already holds the ratios (to report how many there were) does not walk
+    the ledger a second time to summarize them.
+    """
+
+    sampled = ratios[-window:] if window > 0 else []
+    if len(sampled) < minimum:
+        return None
+    return Calibration(
+        samples=len(sampled),
+        median=statistics.median(sampled),
+        low=min(sampled),
+        high=max(sampled),
+    )
+
+
+def calibration_clause(
+    calibration: Calibration | None,
+    *,
+    connector: str,
+    estimate: float,
+    unit: str,
+    observed: int = 0,
+) -> str:
+    """The sentence an over-ceiling refusal carries about its own estimate.
+
+    The refusal itself is correct and stays: a ceiling that confirmation can
+    talk past is not a ceiling. What it lacked was any basis for the decision it
+    hands back. "Raise the budget or narrow the work" is answered by a guess,
+    and the guess is made under the natural, wrong impression that the estimate
+    approximates the cost, when a dry run against a partitioned or clustered
+    table is an upper bound by construction. Guess low and the command is
+    refused a second time; guess high and the ceiling stops meaning anything.
+
+    Two things are said, and the second is the one that keeps the first from
+    backfiring. The ratio says what past commands on **this** connector actually
+    billed against what they were priced at. Then, because the ceiling is
+    checked against the estimate and not against what settles, a caller reading
+    only the ratio would set a budget at 69% of the estimate and be refused
+    again by arithmetic; so the clause names the figure that admits this
+    command and what it would then be expected to cost.
+
+    With too little history it says so rather than implying a ratio, which is
+    the whole point of the ``minimum``: an operator told nothing knows to look,
+    while one told "about 69%" from two commands has been given a number to
+    trust that nothing stands behind. ``observed`` is how many settled commands
+    the ledger did hold, so "none yet" and "not enough yet" read as the
+    different situations they are.
+    """
+
+    if calibration is None:
+        held = (
+            f"holds only {observed} settled {connector} command"
+            f"{'' if observed == 1 else 's'} carrying an estimate, too few to "
+            "draw a ratio from"
+            if observed
+            else f"holds no settled {connector} command carrying an estimate"
+        )
+        return (
+            f"This project's spend ledger {held}, so dex has no observed "
+            "estimate-to-actual ratio for this connector and this estimate "
+            "should not be read as an approximation of what the work would "
+            "bill: on a partitioned or clustered table it is an upper bound"
+        )
+
+    likely = estimate * calibration.median
+    return (
+        f"The last {calibration.samples} settled {connector} commands in this "
+        f"project's spend ledger billed a median {calibration.median:.0%} of "
+        f"estimate (range {calibration.low:.0%}-{calibration.high:.0%}), so "
+        "this estimate is probably an upper bound rather than the cost. The "
+        "ceiling binds on the estimate and not on what settles, so admitting "
+        f"this command takes a budget above {estimate:,.0f}, at which it would "
+        f"be expected to bill around {likely:,.0f} {unit}"
+    )
+
+
 def preflight(
     estimate: float | None,
     ceiling: float | None,
@@ -444,12 +675,14 @@ class CostGate:
     ledger through ``record`` (functional DI), and the session ceiling is
     settled against spend already in that ledger.
 
-    Three functional dependencies rather than a store, because the gate needs
-    three verbs and a store is sixteen: ``read_session_spent`` for the day's
-    total, ``record`` to append, ``lock`` to make the pair of them atomic. A
-    caller with no ledger (DuckDB, and any gate built directly) passes a plain
-    float for the first and omits the other two, which is why those paths need
-    no store at all.
+    Four functional dependencies rather than a store, because the gate needs
+    four verbs and a store is sixteen: ``read_session_spent`` for the day's
+    total, ``record`` to append, ``lock`` to make the pair of them atomic, and
+    ``history`` to read settled entries back when a refusal wants to say how
+    far this connector's estimates have historically been from what they billed.
+    A caller with no ledger (DuckDB, and any gate built directly) passes a plain
+    float for the first and omits the rest, which is why those paths need no
+    store at all.
     """
 
     def __init__(
@@ -466,6 +699,7 @@ class CostGate:
         lock: Callable[[], AbstractContextManager[None]] | None = None,
         session_ceiling_declined: bool = False,
         config_path: Path | None = None,
+        history: Callable[[], list[dict]] | None = None,
     ):
         self.paradigm = paradigm
         self.ceiling = ceiling
@@ -483,6 +717,11 @@ class CostGate:
         self.command = command
         self._record = record
         self._lock = lock
+        # Optional fourth verb, read on one path only: an over-ceiling refusal,
+        # to say how far this connector's past estimates ran from what settled.
+        # Nothing is admitted or refused on it, which is why a store without
+        # `spend_entries` simply passes None here and loses a sentence.
+        self._history = history
         self._estimated = 0.0
         self._billed = 0.0
         self._command_estimate: float | None = None
@@ -683,28 +922,77 @@ class CostGate:
         """
 
         self._command_estimate = estimate
-        with self._admission():
-            ceiling = self.effective_ceiling()
-            cost = Cost(paradigm=self.paradigm, estimate=estimate, ceiling=ceiling)
-            if ceiling is not None and estimate > ceiling:
-                raise OverCeilingError(
-                    f"estimated cost {estimate} exceeds the ceiling {ceiling} "
-                    f"({self.paradigm.value}); raise the budget or narrow the "
-                    "work",
-                    cost=cost,
-                )
-            if self.paradigm is not Paradigm.FREE_LOCAL:
-                if not self.confirmed:
-                    raise ConfirmationRequiredError(cost)
-                if ceiling is None:
-                    raise CeilingRequiredError(
-                        f"no ceiling set for a {self.paradigm.value} connector; "
-                        "pass --budget or set one in .dex/config.yml",
+        try:
+            with self._admission():
+                ceiling = self.effective_ceiling()
+                cost = Cost(paradigm=self.paradigm, estimate=estimate, ceiling=ceiling)
+                if ceiling is not None and estimate > ceiling:
+                    raise OverCeilingError(
+                        f"estimated cost {estimate} exceeds the ceiling {ceiling} "
+                        f"({self.paradigm.value}); raise the budget or narrow the "
+                        "work",
                         cost=cost,
                     )
-                self.require_session_ceiling_decision(estimate, cost=cost)
-            self._reserve_to(estimate)
+                if self.paradigm is not Paradigm.FREE_LOCAL:
+                    if not self.confirmed:
+                        raise ConfirmationRequiredError(cost)
+                    if ceiling is None:
+                        raise CeilingRequiredError(
+                            f"no ceiling set for a {self.paradigm.value} "
+                            "connector; pass --budget or set one in "
+                            ".dex/config.yml",
+                            cost=cost,
+                        )
+                    self.require_session_ceiling_decision(estimate, cost=cost)
+                self._reserve_to(estimate)
+        except OverCeilingError as exc:
+            # Enriched outside the admission section, not inside it. The clause
+            # reads the ledger back, and the section holds the spend lock: doing
+            # it in there would make every concurrent billed command wait on one
+            # refusal's history read. Re-raised rather than mutated, the way
+            # every other refusal in this engine that gains a clause is, so the
+            # exception stays a plain immutable refusal carrying the same cost.
+            raise self._calibrated(exc) from exc
         return cost
+
+    def _calibrated(self, exc: OverCeilingError) -> OverCeilingError:
+        """``exc`` with what the ledger knows about this connector's estimates.
+
+        Returns ``exc`` untouched where there is nothing honest to add: a free
+        connector, whose refusal is a configuration contradiction rather than a
+        spend question and whose estimates nobody is sizing a budget from; a
+        gate with no history reader, which is every gate built without a store
+        and every store that does not implement the optional capability; and a
+        refusal carrying no estimate to reason about.
+
+        A history read that fails is swallowed, deliberately and broadly. The
+        reader is a backend's own code and this is a refusal that has already
+        been decided: turning a correct, actionable refusal into a different
+        error because a ledger line would not parse would trade the thing the
+        caller needs for a sentence they merely wanted.
+        """
+
+        if self.paradigm is Paradigm.FREE_LOCAL or self._history is None:
+            return exc
+        estimate = exc.cost.estimate if exc.cost is not None else None
+        if estimate is None:
+            return exc
+        try:
+            ratios = settled_ratios(
+                self._history(), connector=self.connector, field=self.ledger_field()
+            )
+        except Exception:
+            return exc
+        clause = calibration_clause(
+            calibration_of(ratios),
+            connector=self.connector,
+            estimate=estimate,
+            unit=self.paradigm.value,
+            observed=len(ratios),
+        )
+        calibrated = OverCeilingError(f"{exc}. {clause}", cost=exc.cost)
+        calibrated.__cause__ = exc
+        return calibrated
 
     def require_session_ceiling_decision(
         self, estimate: float, *, cost: Cost | None = None
@@ -956,12 +1244,24 @@ class CostGate:
         nothing read back, so it races nothing, and taking the lock here would
         hold it once per statement on a path that runs while the warehouse is
         working.
+
+        **The whole-command estimate rides along on every settlement**, which is
+        what makes the ledger hold both halves of an "estimated this, billed
+        that" pair rather than only the half a budget is measured against.
+        Recorded per statement rather than once per command because a command
+        has no single moment that is guaranteed to run (it can die between
+        statements), and the reservation that used to be the only record of an
+        estimate is written only where a cumulative ceiling is set, so a project
+        without one recorded no estimate at all. Every statement of one command
+        carries the same figure and the same ``reservation_id``, which is what
+        :func:`settled_ratios` groups on so six statements read as one command.
         """
 
         self._billed += billed
         self._append(
             "settlement",
             billed,
+            estimate=self._command_estimate,
             job_id=job_id,
             statement_sha256=hashlib.sha256(statement.encode("utf-8")).hexdigest()[:16]
             if statement
