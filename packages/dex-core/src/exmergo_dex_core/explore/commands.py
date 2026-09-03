@@ -777,6 +777,7 @@ def relationships(
     infer_by_overlap: bool = False,
     refresh: bool = False,
     use_project: bool = False,
+    use_hosted_semantic_layer: bool = False,
 ) -> RelationshipsResult:
     """Infer joins across every object in scope, optionally probing them.
 
@@ -795,7 +796,12 @@ def relationships(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
-    catalog = _semantic_catalog(engine, use_project)
+    # The catalog currently annotates exposure only for Ossie beside dbt. #408
+    # owns folding Ossie relationships into declared edges, including agreement
+    # and conflicts with dbt declarations.
+    catalog = _semantic_catalog(
+        engine, use_project, use_hosted_semantic_layer=use_hosted_semantic_layer
+    )
 
     adapter = engine._adapter("explore relationships")
     # Capture pre-run cache state before any checkpoint write, so the success-path
@@ -914,6 +920,10 @@ def relationships(
 
     identifiers = [d.identifier for d in datasets]
     declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    native_edges, native_edge_notes = _native_semantic_edges(
+        engine, use_project, identifiers
+    )
+    declared, _native_already_declared = _fold_semantic_edges(declared, native_edges)
     semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
     declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
     rels, confirmed = _merge_relationships(declared, inferred)
@@ -1039,6 +1049,7 @@ def relationships(
     )
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
+    notes.extend(native_edge_notes)
     notes.extend(semantic_edge_notes)
     notes.extend(
         _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
@@ -1145,6 +1156,7 @@ def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
             infer_by_overlap=getattr(args, "infer_by_overlap", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
+            use_hosted_semantic_layer=getattr(args, "use_hosted_semantic_layer", False),
         )
     )
 
@@ -1883,6 +1895,7 @@ def map(
     infer_by_overlap: bool = False,
     refresh: bool = False,
     use_project: bool = False,
+    use_hosted_semantic_layer: bool = False,
 ) -> MapResult:
     """The whole landscape in one pass: inventory, ranked profiling, and joins.
 
@@ -1904,7 +1917,12 @@ def map(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
-    catalog = _semantic_catalog(engine, use_project)
+    # The catalog currently annotates exposure only for Ossie beside dbt. #408
+    # owns folding Ossie relationships into declared edges, including agreement
+    # and conflicts with dbt declarations.
+    catalog = _semantic_catalog(
+        engine, use_project, use_hosted_semantic_layer=use_hosted_semantic_layer
+    )
     hints = _merged_hints(config.ranking_hints, defs.metric_models)
 
     adapter = engine._adapter("explore map")
@@ -2024,6 +2042,10 @@ def map(
     # about this warehouse, and both channels are read on the same terms.
     identifiers = [m.identifier for m in metas]
     declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    native_edges, native_edge_notes = _native_semantic_edges(
+        engine, use_project, identifiers
+    )
+    declared, _native_already_declared = _fold_semantic_edges(declared, native_edges)
     semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
     declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
     relationship_set, confirmed = _merge_relationships(declared, inferred)
@@ -2175,6 +2197,7 @@ def map(
 
     notes = _relationship_notes(all_selected, declared, inferred, defs)
     notes.extend(declared_notes)
+    notes.extend(native_edge_notes)
     notes.extend(semantic_edge_notes)
     notes.extend(
         _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
@@ -2316,6 +2339,7 @@ def cmd_map(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             infer_by_overlap=getattr(args, "infer_by_overlap", False),
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
+            use_hosted_semantic_layer=getattr(args, "use_hosted_semantic_layer", False),
         )
     )
 
@@ -2934,8 +2958,10 @@ def _project_definitions(
     return engine.project_format().definitions()
 
 
-def _semantic_catalog(engine: DexEngine, use_project: bool):
-    """The project's semantic layer as a read catalog, or None.
+def _semantic_catalog(
+    engine: DexEngine, use_project: bool, *, use_hosted_semantic_layer: bool = False
+):
+    """The repository-local semantic layer as a read catalog, or None.
 
     The optional channel beside tier 2, read the way :func:`_project_definitions`
     reads tier 1, and gated the same way: exploration starts bare, so a project's
@@ -2952,23 +2978,23 @@ def _semantic_catalog(engine: DexEngine, use_project: bool):
     subject *is* the layer, and it is the one that refuses by name instead.
     """
 
-    from ..adapters.project import SemanticCatalogProject
+    from .semantic import resolve_semantic_layer
 
-    if engine.repo_root is None or not use_project:
+    if not use_project and not use_hosted_semantic_layer:
         return None
     try:
-        if engine.config.semantic.vendor == "ossie":
-            from ..ossie import catalog as ossie_catalog
-
-            return ossie_catalog(
-                engine.repo_root,
-                engine.config.semantic.ossie.files,
-                engine.connector or engine.config.connector,
-            )
-        project = engine.project_format()
-        if not isinstance(project, SemanticCatalogProject):
-            return None
-        return project.semantic_catalog()
+        # The local override is intentional: --use-project is a free,
+        # repository-only enrichment read even when semantic execution defaults
+        # to dbt Cloud. SemanticLayer owns the catalog rather than Project.
+        if use_project:
+            return resolve_semantic_layer(engine, local=True).list_definitions().view
+        view = resolve_semantic_layer(engine, api=True).list_definitions().view
+        view.notes.append(
+            "hosted semantic metadata was read by --use-hosted-semantic-layer; "
+            "this backend does not expose physical relations, so it cannot add "
+            "map exposure annotations or relationship edges"
+        )
+        return view
     except (DexError, ValueError, OSError):
         return None
 
@@ -3023,6 +3049,28 @@ def _semantic_edges(
     return rel_mod.semantic_relationships(entity_joins(catalog), identifiers)
 
 
+def _native_semantic_edges(
+    engine: DexEngine, use_project: bool, identifiers: list[str]
+) -> tuple[list[Relationship], list[str]]:
+    """Native layer declarations, including composite pairs, as cached edges."""
+
+    if engine.repo_root is None or not use_project:
+        return [], []
+    try:
+        from .semantic import resolve_semantic_layer
+
+        declarations = resolve_semantic_layer(
+            engine, local=True
+        ).declared_relationships()
+    except (DexError, ValueError, OSError):
+        return [], []
+    if not declarations:
+        return [], []
+    return rel_mod.declared_relationships(
+        dbt_project.ProjectDefinitions(declared_relationships=declarations), identifiers
+    )
+
+
 def _fold_semantic_edges(
     declared: list[Relationship], semantic: list[Relationship]
 ) -> tuple[list[Relationship], int]:
@@ -3041,6 +3089,15 @@ def _fold_semantic_edges(
     for rel in semantic:
         if _relationship_edge_key(rel) in known:
             already += 1
+            existing = next(
+                item
+                for item in merged
+                if _relationship_edge_key(item) == _relationship_edge_key(rel)
+            )
+            sources = sorted(
+                set(existing.declaration_sources) | set(rel.declaration_sources)
+            )
+            existing.declaration_sources = sources
             continue
         known.add(_relationship_edge_key(rel))
         merged.append(rel)
