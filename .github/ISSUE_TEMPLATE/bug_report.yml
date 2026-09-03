@@ -37,6 +37,8 @@ body:
         - Snowflake
         - Databricks
         - PostgreSQL
+        - Amazon Redshift
+        - ClickHouse
         - Not connector-specific
     validations:
       required: true

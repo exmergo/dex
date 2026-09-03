@@ -43,17 +43,31 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "compute_time"
 DIALECT = "databricks"
+
+_BIGINT_TYPE = "BIGINT"
 
 # Columns are profiled in batches so one statement against a very wide table
 # does not balloon (up to 4 expressions per column).
@@ -121,6 +135,32 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     # RLIKE matches substrings; the shared patterns' anchors make it a full
     # match.
     return f"{qcol} RLIKE '{pattern}'"
+
+
+def _date_trunc_expr(qcol: str, unit: str) -> str:
+    return f"date_trunc('{unit.upper()}', {qcol})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
+    # TIMESTAMPDIFF (not the days-only datediff) covers day/month/hour in one
+    # spelling, unlike Spark SQL's native datediff (days only).
+    return f"TIMESTAMPDIFF({unit.upper()}, {earlier}, {later})"
+
+
+def _is_server_error(exc: Exception) -> bool:
+    """Whether the driver labelled this "the warehouse answered with an error".
+
+    Matched on the class name along the MRO rather than with ``isinstance``:
+    the SQL driver is injected into this adapter rather than imported by it
+    (which is what lets the offline suite build the adapter without the
+    library installed), so there is no class object here to compare against.
+    ``ServerOperationError`` is databricks-sql-connector's class for a
+    server-side statement failure; its transport failures (``RequestError``,
+    ``OperationalError``) are deliberately excluded, because a connection that
+    died is not a statement the server refused.
+    """
+
+    return any(cls.__name__ == "ServerOperationError" for cls in type(exc).__mro__)
 
 
 def warehouse_http_path(value: str) -> str:
@@ -231,7 +271,7 @@ class DatabricksAdapter:
         cost = self.cost_gate.cost()
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if self.target.warehouse:
             info = self._warehouse()
@@ -835,9 +875,15 @@ class DatabricksAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         self._ensure_detail(identifier)
         meta, _ = self.table_metadata(identifier)
         sample_percent = self._sample_percent(identifier, meta.byte_size)
@@ -845,7 +891,14 @@ class DatabricksAdapter:
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, sample_percent=sample_percent
+                identifier,
+                batch,
+                safe,
+                shape,
+                type_req,
+                key_shape_req,
+                temporal_req,
+                sample_percent=sample_percent,
             )
             rows, labels = self._execute(
                 sql, estimate=self._statement_seconds(meta.byte_size)
@@ -880,18 +933,25 @@ class DatabricksAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
+        key_shape_req: set[str],
+        temporal_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape fractions only where requested. Pure (no
-        # connection), so the SELECT-only property is testable offline. Nested
-        # and semi-structured columns get the non-null count only
+        # and value-shape/type-contradiction/key-shape/temporal-continuity
+        # fractions only where requested. Pure (no connection), so the
+        # SELECT-only property is testable offline. Nested and
+        # semi-structured columns get the non-null count only
         # (approx_count_distinct and MIN/MAX are invalid or meaningless on
         # them).
+        source = self._quote(identifier)
+        if sample_percent is not None:
+            source += f" TABLESAMPLE ({sample_percent} PERCENT)"
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -906,10 +966,49 @@ class DatabricksAdapter:
             wants_shape = (col.name in shape) and not nested
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
-        source = self._quote(identifier)
-        if sample_percent is not None:
-            source += f" TABLESAMPLE ({sample_percent} PERCENT)"
+            wants_type = (col.name in type_req) and not nested
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            wants_key_shape = (col.name in key_shape_req) and not nested
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = (col.name in temporal_req) and not nested
+            if wants_temporal:
+                select_parts.extend(
+                    temporal_alignment_expressions(qcol, i, _date_trunc_expr)
+                )
+                for unit in temporal_units_for(col.data_type):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol,
+                            i,
+                            unit,
+                            source,
+                            _date_trunc_expr,
+                            _date_diff_expr,
+                        )
+                    )
+            plan.append(
+                (
+                    i,
+                    col,
+                    wants_distinct,
+                    wants_min_max,
+                    wants_shape,
+                    wants_type,
+                    wants_key_shape,
+                    wants_temporal,
+                )
+            )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         sql = f"SELECT {', '.join(select_parts)} FROM {source}"  # noqa: S608
@@ -922,13 +1021,22 @@ class DatabricksAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
+        for (
+            i,
+            col,
+            wants_distinct,
+            wants_min_max,
+            wants_shape,
+            wants_type,
+            wants_key_shape,
+            wants_temporal,
+        ) in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -962,6 +1070,9 @@ class DatabricksAdapter:
                         values, f"sp_{i}", wants_shape
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(values, i, wants_type),
+                    **key_shape_aggregate_kwargs(values, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
                 )
             )
         return aggregates
@@ -1003,34 +1114,34 @@ class DatabricksAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
             return {}
         self._ensure_detail(identifier)
         meta, _ = self.table_metadata(identifier)
-        estimate = self._statement_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._statement_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1076,7 +1187,15 @@ class DatabricksAdapter:
         values = dict(zip(labels, rows[0], strict=True))
         result = {}
         for i, name in enumerate(columns):
-            domain = values[f"d_{i}"] or []
+            # `is None` rather than a truthiness test: `collect_list` returns an
+            # ARRAY, which this driver materializes through pyarrow as a numpy
+            # ndarray, and `ndarray.__bool__` raises on anything longer than one
+            # element. `x or []` therefore crashed the whole command on exactly
+            # the tables the probe exists to describe, while passing on a column
+            # whose domain happened to hold a single value.
+            domain = values[f"d_{i}"]
+            if domain is None:
+                domain = []
             result[name] = ValueDomainSample(
                 values=[(_field(entry, "v"), _field(entry, "c")) for entry in domain],
                 total_distinct=int(values[f"n_{i}"]),
@@ -1150,12 +1269,7 @@ class DatabricksAdapter:
         cannot overrun the ceiling."""
 
         self._warehouse()  # refuses when config pins no warehouse
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one warehouse-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         bounds = [b for b in (remaining, cap_seconds) if b is not None]
         # Remember which bound won so a timeout kill is reported as the wall
         # limit or the budget, whichever actually fired.
@@ -1167,7 +1281,9 @@ class DatabricksAdapter:
         cursor = self._conn.cursor()
         if bounds:
             # An engine-built session statement, not agent SQL. STATEMENT_TIMEOUT
-            # treats 0 as "no timeout", so the cap never rounds below 1.
+            # treats 0 as "no timeout", so the cap never rounds below 1: the
+            # budget bound cannot (`statement_cap` refuses first) and the wall
+            # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
         return cursor
 
@@ -1200,6 +1316,13 @@ class DatabricksAdapter:
                 "remaining budget (STATEMENT_TIMEOUT); raise --budget or "
                 "narrow the work"
             )
+        if _is_server_error(exc):
+            # The warehouse answered with an error. Typed, so the envelope
+            # carries `execution_failure` and Databricks' own words rather
+            # than the `internal` an untyped driver exception falls through
+            # to. Transport failures are left alone deliberately: a connection
+            # that died is not a statement the server refused.
+            return warehouse_refusal(str(exc))
         return exc
 
     # --- helpers ------------------------------------------------------------------

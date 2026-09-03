@@ -13,13 +13,15 @@ Counts that a caller can compute from a list it already has (``object_count`` fr
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
+from ..adapters.base import VALUE_DOMAIN_CAP
 from ..cache import Dataset, DexCache, Relationship
 from ..results import Result
 from .semantic import SemanticCatalog
+from .summary import MapObject
 
 
 class InventoryEntry(BaseModel):
@@ -38,15 +40,106 @@ class InventoryEntry(BaseModel):
 
 
 class InventoryResult(Result):
+    """A ranked call caps what comes back (#289): a full catalog dump sorted by
+    score is not a shortlist, and at thousands of objects the rank is the one
+    part a caller never reads. ``elided_object_count`` says how many eligible
+    objects the cap left out; ``--limit`` widens the cap and ``--all`` lifts it
+    entirely, both no-ops on an unranked call, which carries no order to cut
+    from and stays uncapped.
+
+    ``notes`` is always reported, the same convention ``map``/``diagram``/
+    ``query`` use: an empty list on an unranked call means there was nothing to
+    say, and on a ranked one it never is, since a ranked call always states its
+    basis (see ``inventory()``).
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
     objects: list[InventoryEntry] = Field(default_factory=list)
     ranked: bool = False
+    elided_object_count: int = 0
 
     def data(self) -> dict[str, Any]:
         return {
             "object_count": len(self.objects),
             "objects": [o.model_dump(mode="json") for o in self.objects],
             "ranked": self.ranked,
+            "elided_object_count": self.elided_object_count,
         }
+
+
+def _profile_dataset_payload(
+    dataset: Dataset,
+    *,
+    show_all_columns: bool,
+    value_domain_cap: int = VALUE_DOMAIN_CAP,
+) -> dict[str, Any]:
+    """One profiled dataset, verdict first (#288): the fields a caller asked
+    `explore profile` for -- grain, keys, data quality, row count -- lead the
+    serialized dict, and ``columns``, the field that grows without bound and
+    is the first thing a truncating agent harness cuts off, comes last. Key
+    order means nothing to a parser and everything to an agent reading a
+    truncated result.
+
+    Column detail is summarized the same way: by default only the columns
+    carrying a finding (see :meth:`~..cache.Dataset.columns_with_findings`),
+    with the rest counted rather than silently dropped. ``show_all_columns``
+    (``--columns all``) restores every column.
+
+    Two more reductions (#290), both to the serialized shape and never to the
+    cached profile. A per-column field that is null on every column being
+    serialized is dropped from each of them and named once in
+    ``suppressed_fields``, so a caller reading a 107-column table pays for no
+    copy of ``"pii_overridden": null`` and can still tell a field that was
+    omitted from one that was never part of the contract; the judgment is over
+    the columns the payload carries, so it is consistent with itself in both
+    column modes, and ``suppressed_fields`` sits ahead of ``columns`` so a
+    truncated read still explains the absence. And each ``value_domain`` is cut
+    to its ``value_domain_cap`` most frequent values with the remainder folded
+    into the domain's ``elided`` count (``values`` plus ``elided`` stays the
+    exact distinct total), so a wide enumeration reads as a summary rather than
+    a column dump.
+    """
+
+    kept, elided = dataset.columns_with_findings(everything=show_all_columns)
+    columns = [c.model_dump(mode="json") for c in kept]
+    cap = max(0, value_domain_cap)
+    for column in columns:
+        domain = column.get("value_domain")
+        if domain is not None and len(domain["values"]) > cap:
+            domain["elided"] += len(domain["values"]) - cap
+            domain["values"] = domain["values"][:cap]
+    suppressed = _fields_null_everywhere(columns)
+    for column in columns:
+        for name in suppressed:
+            del column[name]
+    return {
+        "identifier": dataset.identifier,
+        "object_type": dataset.object_type,
+        "row_count": dataset.row_count,
+        "byte_size": dataset.byte_size,
+        "candidate_keys": dataset.candidate_keys,
+        "grain": dataset.grain,
+        "composite_keys": dataset.composite_keys,
+        "rank_score": dataset.rank_score,
+        "data_quality": dataset.data_quality,
+        "profiled_at": dataset.profiled_at,
+        "semantic_models": dataset.semantic_models,
+        "suppressed_fields": suppressed,
+        "columns": columns,
+        "elided_column_count": elided,
+    }
+
+
+def _fields_null_everywhere(columns: list[dict[str, Any]]) -> list[str]:
+    """The keys whose value is ``None`` on every one of ``columns``, in the
+    order the column shape declares them. Empty when there are no columns:
+    nothing can be null everywhere on nothing, and an empty list is the
+    positive statement that the columns shown carry their full shape."""
+
+    if not columns:
+        return []
+    return [key for key in columns[0] if all(c.get(key) is None for c in columns)]
 
 
 class ProfileResult(Result):
@@ -54,7 +147,11 @@ class ProfileResult(Result):
 
     ``datasets`` is the full requested set either way, so a caller reads one list
     and does not have to reassemble it; ``profiled_count`` and
-    ``cache_hit_count`` say which half each came from.
+    ``cache_hit_count`` say which half each came from. ``datasets`` itself always
+    holds every column, unreduced: ``show_all_columns`` and ``value_domain_cap``
+    only control what ``data()`` serializes, so a library caller reading
+    ``ProfileResult.datasets`` directly is never affected by the CLI's
+    ``--columns`` default or by a repo's ``profile_value_domain_cap``.
     """
 
     datasets: list[Dataset] = Field(default_factory=list)
@@ -62,10 +159,19 @@ class ProfileResult(Result):
     cache_hit_count: int = 0
     cache_path: str = ""
     updated_at: str = ""
+    show_all_columns: bool = False
+    value_domain_cap: int = VALUE_DOMAIN_CAP
 
     def data(self) -> dict[str, Any]:
         return {
-            "datasets": [d.model_dump(mode="json") for d in self.datasets],
+            "datasets": [
+                _profile_dataset_payload(
+                    d,
+                    show_all_columns=self.show_all_columns,
+                    value_domain_cap=self.value_domain_cap,
+                )
+                for d in self.datasets
+            ],
             "profiled_count": self.profiled_count,
             "cache_hit_count": self.cache_hit_count,
             "cache_path": self.cache_path,
@@ -74,8 +180,19 @@ class ProfileResult(Result):
 
 
 class RelationshipsResult(Result):
+    """Joins across the objects in scope, with what earned each one.
+
+    ``declared_count`` is every join the project states, from either channel: a
+    ``relationships`` test or a semantic layer's shared entity.
+    ``semantic_join_count`` is how many of those the second channel contributed,
+    which is worth its own number because it is the one that appears only under
+    ``--use-project`` on a project with a semantic layer, and a reader comparing
+    two runs otherwise sees `declared_count` move with no field explaining it.
+    """
+
     relationships: list[Relationship] = Field(default_factory=list)
     declared_count: int = 0
+    semantic_join_count: int = 0
     profiled_count: int = 0
     cache_hit_count: int = 0
     carried_relationship_count: int = 0
@@ -86,6 +203,7 @@ class RelationshipsResult(Result):
         return {
             "relationships": [r.model_dump(mode="json") for r in self.relationships],
             "declared_count": self.declared_count,
+            "semantic_join_count": self.semantic_join_count,
             "inferred_count": len(self.relationships) - self.declared_count,
             "profiled_count": self.profiled_count,
             "cache_hit_count": self.cache_hit_count,
@@ -103,11 +221,23 @@ class RankedObject(BaseModel):
 class MapResult(Result):
     """The whole landscape in one pass: inventory, profiles, and relationships.
 
+    The payload is the map itself, budgeted: what each top-ranked object is, what
+    identifies it, what is wrong with it, and how it joins. The counts stay
+    alongside it unchanged, so a caller reading them today reads the same numbers
+    tomorrow. What the payload never carries is the whole cache, which on a real
+    warehouse is megabytes of stdout, and never a column value; see
+    :mod:`.summary` for the budget and what it deliberately omits.
+
+    ``notes`` is always reported, like ``diagram`` and ``query``: an empty list is
+    the positive statement "nothing was elided", and without it a caller cannot
+    tell a complete map from a capped one.
+
     ``cache`` is the composed cache this run wrote, handed back so a library
     caller has the datasets and relationships without a second read. It stays out
-    of the payload deliberately: the envelope reports the shape of the map and
-    the top objects, and a full cache would be megabytes of stdout.
+    of the payload for the same reason it always did.
     """
+
+    always_reports_notes: ClassVar[bool] = True
 
     cache: DexCache | None = None
     cache_path: str = ""
@@ -123,9 +253,20 @@ class MapResult(Result):
     pii_column_count: int = 0
     data_quality_note_count: int = 0
     top_objects: list[RankedObject] = Field(default_factory=list)
+    objects: list[MapObject] = Field(default_factory=list)
+    edges: list[Relationship] = Field(default_factory=list)
+    elided_object_count: int = 0
+    elided_column_count: int = 0
+    elided_edge_count: int = 0
     updated_at: str = ""
 
     def data(self) -> dict[str, Any]:
+        # `objects` and `edges` are lists of records rather than objects keyed by
+        # identifier, for the reason spelled out on `DiagramResult.data`: a
+        # warehouse object name must never become a JSON key, because the
+        # envelope sanitizer matches key names against secret-like substrings and
+        # a table legitimately called `access_tokens` would take the whole
+        # command down on the way out.
         return {
             "cache_path": self.cache_path,
             "object_count": self.object_count,
@@ -140,6 +281,11 @@ class MapResult(Result):
             "pii_column_count": self.pii_column_count,
             "data_quality_note_count": self.data_quality_note_count,
             "top_objects": [o.model_dump(mode="json") for o in self.top_objects],
+            "objects": [o.model_dump(mode="json") for o in self.objects],
+            "edges": [e.model_dump(mode="json") for e in self.edges],
+            "elided_object_count": self.elided_object_count,
+            "elided_column_count": self.elided_column_count,
+            "elided_edge_count": self.elided_edge_count,
             "updated_at": self.updated_at,
         }
 
@@ -205,21 +351,98 @@ class QueryResult(Result):
 
     always_reports_notes: ClassVar[bool] = True
 
+    shape: Literal["columnar"] = "columnar"
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
     row_count: int = 0
     truncated: bool = False
     tables: list[str] = Field(default_factory=list)
+    profiled_on_demand: list[str] = Field(default_factory=list)
+    column_notes: dict[str, Any] | None = None
+    query_notes: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload = {
+            "shape": self.shape,
             "columns": self.columns,
             "types": self.types,
             "cells": self.cells,
             "row_count": self.row_count,
             "truncated": self.truncated,
             "tables": self.tables,
+            "profiled_on_demand": self.profiled_on_demand,
+        }
+        if self.column_notes:
+            payload["column_notes"] = self.column_notes
+        if self.query_notes:
+            payload["query_notes"] = self.query_notes
+        return payload
+
+
+class QueryStatementResult(BaseModel):
+    """One statement's own outcome inside a call that carried several.
+
+    Carries a verdict beside the payload because a batch is not all-or-nothing:
+    the firewall adjudicates each statement on its own, so the third can be
+    refused while the first two answered, and discarding those two would throw
+    away work the caller has already been billed for. ``status`` is ``ok``,
+    ``refused`` (the guard said no), ``failed`` (the warehouse did), or
+    ``skipped`` (the budget ran out before this statement ran).
+
+    ``line`` is the line the statement started on when it came from a file, and
+    None when it came from argv, where the position is the whole address.
+    """
+
+    index: int
+    status: str
+    line: int | None = None
+    shape: Literal["columnar"] = "columnar"
+    columns: list[str] = Field(default_factory=list)
+    types: list[str] = Field(default_factory=list)
+    cells: list[list[Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+    tables: list[str] = Field(default_factory=list)
+    column_notes: dict[str, Any] | None = None
+    query_notes: dict[str, Any] | None = None
+    notes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+    reason: str | None = None
+
+
+class QueryBatchResult(Result):
+    """Several firewalled SELECTs from one call, each with its own verdict.
+
+    ``profiled_on_demand`` sits here rather than on the statements because the
+    scan is shared: the objects the whole batch needs are resolved as one set and
+    profiled once, so two statements over the same unprofiled table pay for it
+    once. The same is true of ``spend`` and ``cost``, which are the call's, not
+    any one statement's.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    results: list[QueryStatementResult] = Field(default_factory=list)
+    profiled_on_demand: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        results = []
+        for result in self.results:
+            payload = result.model_dump(mode="json")
+            if payload["column_notes"] is None:
+                payload.pop("column_notes")
+            if payload["query_notes"] is None:
+                payload.pop("query_notes")
+            results.append(payload)
+        return {
+            "shape": "columnar",
+            "results": results,
+            "statement_count": len(self.results),
+            "ok_count": sum(1 for r in self.results if r.status == "ok"),
+            "failed_count": sum(1 for r in self.results if r.status != "ok"),
+            "profiled_on_demand": self.profiled_on_demand,
         }
 
 
@@ -244,6 +467,7 @@ class ClusterResult(Result):
     sample_method: str = ""
     sample_repeatable: bool = False
     clustering: dict[str, Any] = Field(default_factory=dict)
+    profiled_on_demand: list[str] = Field(default_factory=list)
 
     def data(self) -> dict[str, Any]:
         return {
@@ -252,6 +476,7 @@ class ClusterResult(Result):
             "dropped_null_rows": self.dropped_null_rows,
             "sample_method": self.sample_method,
             "sample_repeatable": self.sample_repeatable,
+            "profiled_on_demand": self.profiled_on_demand,
             **self.clustering,
         }
 
@@ -278,9 +503,18 @@ class SemanticQueryResult(Result):
     while dbt Cloud executes server-side where that guard is structurally
     unavailable, which is why a hosted result carries a ``hosted`` paradigm and
     says so in a warning rather than reporting a number it cannot know.
+
+    ``execution`` is that distinction stated directly rather than left to be
+    inferred from the backend's name: ``dex`` means dex ran the statement and the
+    cost guard applied, ``vendor`` means the semantic layer ran it and no guard
+    could. ``vendor`` and ``deployment`` are the other two axes ``backend``
+    collapses; ``backend`` itself stays, unchanged, as the released spelling.
     """
 
     backend: str = ""
+    vendor: str = ""
+    deployment: str = ""
+    execution: str = ""
     columns: list[str] = Field(default_factory=list)
     types: list[str] = Field(default_factory=list)
     cells: list[list[Any]] = Field(default_factory=list)
@@ -292,14 +526,20 @@ class SemanticQueryResult(Result):
 
     @classmethod
     def from_capped(
-        cls, payload: dict[str, Any], *, backend: str, **fields: Any
+        cls, payload: dict[str, Any], *, backend: Any, **fields: Any
     ) -> SemanticQueryResult:
         """Build from :func:`~.semantic.cap_columnar` output, whose ``notes``
-        record every cut it made and therefore belong on the result's notes."""
+        record every cut it made and therefore belong on the result's notes.
+
+        ``backend`` is the answering backend itself, not its name: it declares its
+        own provenance as class attributes, so a new one is described correctly
+        without every construction site being taught about it."""
+
+        from .semantic import backend_axes
 
         payload = dict(payload)
         notes = payload.pop("notes", [])
-        return cls(backend=backend, notes=notes, **payload, **fields)
+        return cls(**backend_axes(backend), notes=notes, **payload, **fields)
 
     def data(self) -> dict[str, Any]:
         payload = {
@@ -309,7 +549,48 @@ class SemanticQueryResult(Result):
             "row_count": self.row_count,
             "truncated": self.truncated,
             "backend": self.backend,
+            "vendor": self.vendor,
+            "deployment": self.deployment,
+            "execution": self.execution,
         }
         if self.query_id is not None:
             payload["query_id"] = self.query_id
         return payload
+
+
+class SemanticValuesResult(SemanticQueryResult):
+    """One semantic dimension's value domain, from whichever backend answered.
+
+    A subclass rather than a sibling. The envelope shape, the four provenance
+    axes, and the capped-columnar construction are the same object; what differs is
+    what the result is about, and inheriting is what keeps a new provenance field
+    from having to be added twice.
+
+    ``dimension`` is the token that was asked for, grain suffix included, so a
+    caller reading a stored result knows which question it answers.
+
+    ``scoped_to`` is the metrics the values were reached through, and it changes
+    what the answer *means* rather than only how it was obtained: unscoped, these
+    are the values of the column behind the dimension; scoped, they are the values
+    present for those metrics, which on a filtered or sparsely joined metric is a
+    subset. Empty means the first. That is why it is a payload field and not a
+    note, and why the notes name the metric when dex chose one itself.
+
+    ``notes`` is always reported, like ``query`` and ``diagram``: an empty list is
+    the positive statement that nothing was capped and nothing was narrowed.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    dimension: str = ""
+    scoped_to: list[str] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        # The two fields that say what was asked lead, for the reason the catalog
+        # leads with its provenance: key order means nothing to a parser and
+        # everything to an agent reading a truncated result.
+        return {
+            "dimension": self.dimension,
+            "scoped_to": self.scoped_to,
+            **super().data(),
+        }

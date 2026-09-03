@@ -17,6 +17,8 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
+from .conftest import assert_ok, integration_budget
+
 pytestmark = [pytest.mark.integration, pytest.mark.redshift]
 
 
@@ -38,9 +40,11 @@ def seed_repo(
             redshift["dbname"] = os.environ["DEX_TEST_REDSHIFT_DATABASE"]
     if schemas is not None:
         redshift["schemas"] = schemas
-    config: dict = {"connector": "redshift", "redshift": redshift}
-    if budget is not None:
-        config["budget"] = {"ceiling": budget}
+    config: dict = {
+        "connector": "redshift",
+        "redshift": redshift,
+        "budget": integration_budget(budget),
+    }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
@@ -57,7 +61,7 @@ def test_connect_test_discovers_connection_and_reports_read_only(
 ):
     seed_repo(tmp_path)
     rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["connector"] == "redshift"
     assert data["dialect"] == "redshift"

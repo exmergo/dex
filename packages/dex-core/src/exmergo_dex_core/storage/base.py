@@ -27,6 +27,13 @@ one the cumulative session ceiling does not bind across overlapping billed
 commands, and dex warns on every such command rather than letting the ceiling
 look enforced.
 
+**Reading the ledger back is a second optional capability**,
+:class:`SpendHistory`. ``spend_since`` answers the one question the ceiling
+needs (a total) and deliberately answers nothing else; a backend that can also
+hand back the entries themselves lets a refusal say how far past estimates on
+this connector have historically been from what settled. A backend without it
+loses that sentence and nothing else.
+
 **Constructing one is a separate contract**, :class:`StoreFactory` over a
 :class:`StoreContext`, and it is optional. A host that passes its own instance to
 the engine never needs it; it exists so a backend can also be *named* somewhere
@@ -49,11 +56,43 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from pydantic import ValidationError
+
+from ..errors import PrerequisiteError
+
 if TYPE_CHECKING:
     from ..cache import DexCache
     from ..maintain.drift import DriftReport
     from ..maintain.snapshot import Snapshot
     from ..transform.plans import EditKind, TransformPlan
+
+
+class CacheUnreadableError(PrerequisiteError):
+    """A cache exists and this engine cannot read it.
+
+    The counterpart of :class:`~.explore.commands.CacheRequiredError`, drawing
+    the same distinction :class:`~.maintain.commands.BaselineUnreadableError`
+    draws against :class:`~.maintain.commands.NoBaselineError`. Both remediate
+    the same way, so the status is the same, but "nothing has been explored
+    here" and "what was explored will not parse" are different facts about the
+    deployment, and only one of them suggests something went wrong. A host that
+    wants to page on the second and not the first can tell them apart without
+    matching on prose.
+
+    No ``schema_version`` attribute, unlike the baseline's, and the asymmetry is
+    already reasoned out in ``maintain/snapshot.py``: the cache's version drives
+    a ``<`` comparison in the query firewall that *degrades* (an old cache is
+    still usable, so the firewall widens taint and carries on), where the
+    baseline's is a membership test that *refuses*. A degrading version has no
+    refusal for this class to carry, so the only state that reaches it is a
+    document that did not parse. If a supported-set gate is ever added here,
+    that is when the attribute earns its place.
+
+    Lives here rather than beside ``CacheRequiredError`` because three packages
+    load a cache (``explore``, ``maintain``, ``transform``) and none of them
+    imports ``explore.commands`` today. Storage is the neutral home they already
+    share, and it is where the contract below asks for the raise this classifies.
+    """
 
 
 class Document(str, Enum):
@@ -124,10 +163,11 @@ class ExploreStore(Protocol):
         what the shipped backends raise by validating the model). That is the
         convention the engine reads as "this document will not parse", and it is
         what ``load_snapshot`` is caught on to report a corrupt baseline as a
-        prerequisite failure rather than as a bad request. This load has no such
-        wrapper yet, so what a backend raises here reaches the engine's catch-all
-        either way; raise a ``ValueError`` so the load is classifiable when it
-        gets one, not because it is classified today.
+        prerequisite failure rather than as a bad request. :func:`readable_cache`
+        is the equivalent wrapper for this load, and every engine call site goes
+        through it, so a ``ValueError`` raised here is now classified as
+        :class:`CacheUnreadableError` rather than reaching the CLI catch-all and
+        being reported as a bad request.
         """
         ...
 
@@ -184,6 +224,13 @@ class ExploreStore(Protocol):
         is positive**, and one that clamps or filters would leak held headroom
         for the rest of the UTC day. Sum what you are given, the way
         :func:`spend_total` does.
+
+        A ``settlement`` additionally carries ``estimate``, the whole-command
+        preflight figure the command was admitted on, so the ledger holds both
+        halves of every "estimated this, billed that" pair rather than only the
+        half a budget is measured against. It is a plain extra key on the entry
+        and no backend needs to know it is there; :class:`SpendHistory` is what
+        reads it back.
         """
         ...
 
@@ -239,6 +286,17 @@ class ExploreStore(Protocol):
         useful without it, and the reason an optional member is tolerable here
         is that dex detects its absence and says so, rather than relying on
         every implementer to have read a paragraph.
+
+        **This call is allowed to fail, and where it fails decides what
+        happens.** A ledger on a network is a ledger that can be unreachable, so
+        raising is a legitimate outcome and a backend should not swallow one into
+        a zero: a zero is a claim that nothing has been spent today, and a guard
+        that admits work on a fabricated zero is the failure this ledger exists
+        to prevent. Only billed admission is entitled to fail closed on it, and
+        it does, as a named refusal that says nothing ran. A command that cannot
+        spend never reaches this call, and settlement tolerates a failure rather
+        than turning a command that already ran into a refusal, so an outage
+        costs the day's total on one envelope and no correctness.
         """
         ...
 
@@ -342,6 +400,67 @@ class SpendLock(Protocol):
         ...
 
 
+@runtime_checkable
+class SpendHistory(Protocol):
+    """Optional: hand back spend-ledger entries, so a refusal can calibrate.
+
+    One method, on top of any tier. :meth:`ExploreStore.spend_since` answers the
+    only question the cumulative ceiling asks, "how much today", and answering
+    it as a single float is what keeps that hot path cheap on every backend. It
+    is also all it answers, and there is a second question worth asking of the
+    same ledger: **how far past estimates on this connector have been from what
+    actually settled**.
+
+    That question has an operator behind it. A dry-run estimate on a partitioned
+    or clustered table is an upper bound by construction, so an over-ceiling
+    refusal quotes a number that can be far above what the work would have
+    billed, and "raise the budget or narrow the work" then invites a guess made
+    under the impression that the estimate approximates the cost. dex has the
+    answer already recorded: every settlement entry carries the estimate the
+    command was admitted on beside the figure it settled at. This is the member
+    that lets the guard read them back (see
+    :func:`~..guards.cost_guard.calibration_from_ledger`).
+
+    **A backend stores entries; it does not interpret them**, which is as true
+    here as it is on the append. Return the raw dicts in append order, oldest
+    first, and leave the pairing of reservations with settlements and the
+    arithmetic over them to the guard, so every backend calibrates identically.
+
+    ``limit`` is a bound on the read, not a page size a caller will follow:
+    calibration wants a recent window, and a ledger that has been appended to
+    for months should not be deserialized in full to find it. Return the *most
+    recent* ``limit`` matching entries, still oldest-first.
+
+    Absence is handled the same way :class:`SpendLock`'s is, and more gently:
+    the guard probes for the member, and a backend without one simply produces
+    no calibration. Unlike the lock, nothing is narrower than it looks when this
+    is missing, so nothing warns.
+
+    Failure is tolerated rather than fatal, which is the opposite call from
+    ``spend_since`` and for the reason that separates them: nothing is admitted
+    or refused on what this returns. It only decides whether a refusal that has
+    already been decided carries one more sentence, so a backend that cannot
+    answer costs the sentence and no correctness. Raise or return an empty list;
+    the guard treats both as "no history".
+    """
+
+    def spend_entries(
+        self,
+        *,
+        connector: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """The most recent ``limit`` ledger entries, oldest first.
+
+        ``connector`` filters to one connector's entries and is how the guard
+        keeps a DuckDB history from calibrating a BigQuery refusal. No cutoff:
+        the cumulative ceiling is a property of today and the ratio of estimate
+        to actual is a property of the warehouse, which does not reset at
+        midnight UTC.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class StoreContext:
     """Everything a backend gets to build itself from when dex constructs it.
@@ -398,6 +517,65 @@ class StoreFactory(Protocol):
     """
 
     def __call__(self, context: StoreContext) -> ExploreStore: ...
+
+
+#: Appended wherever the remedy is a fresh cache. Unlike `maintain snapshot`,
+#: which is free on every connector, `explore map` re-profiles the warehouse and
+#: therefore BILLS. An operator deciding between investigating the stored
+#: document and replacing it needs that said before they run it, for the same
+#: reason the baseline's remedy says what a replacement silently absorbs.
+_REMAP_BILLS = (
+    "note that `explore map` re-profiles the warehouse and bills for it, so a "
+    "corrupt document worth investigating is worth copying aside first"
+)
+
+
+def readable_cache(store: ExploreStore) -> DexCache | None:
+    """The stored cache, or a refusal naming the command that rebuilds one.
+
+    :meth:`ExploreStore.load_cache` raises on a document it cannot parse, and
+    pydantic's ``ValidationError`` subclasses ``ValueError``, so an unreadable
+    cache fell through to the CLI catch-all and was classified as a *request*
+    error. That tells an operator they typed something wrong when the fix is
+    `explore map`, and it is exactly the retry-versus-stop distinction
+    :class:`~..errors.PrerequisiteError` exists to carry. The ``load_cache``
+    contract above already asks backends to raise a ``ValueError`` "so the load
+    is classifiable when it gets one, not because it is classified today"; this
+    is the wrapper it was written for.
+
+    **It classifies, it does not require**, and the asymmetry with
+    :func:`~..maintain.commands._require_baseline` is deliberate rather than an
+    omission. Every ``load_snapshot`` caller needs a baseline, so that helper can
+    refuse on ``None``. Absence is *legal* at most cache call sites: `explore
+    profile`, `explore relationships` and `explore map` read a prior cache only
+    to merge pre-run state and a first run has none, `maintain snapshot` falls
+    back to a metadata capture, and ``_baseline_warnings`` merely skips a
+    warning. A ``_require_cache`` refusing on ``None`` would break five commands.
+    So ``None`` is returned unchanged, every caller keeps the absence policy it
+    already had, and only the unparseable case gains a class.
+    """
+
+    try:
+        return store.load_cache()
+    except ValueError as exc:
+        # ValueError rather than pydantic's ValidationError, which it subclasses.
+        # The contract above requires a backend to raise on a document it cannot
+        # parse and has never named the exception; the store protocol is public,
+        # and a backend deserializing its own rows raises whatever `json` or its
+        # driver raises. Catching only pydantic's error would leave every
+        # third-party backend reproducing the exact defect this function fixes,
+        # which is the kind of gap that looks fixed from inside this repo.
+        detail = (
+            f"{exc.error_count()} validation error(s)"
+            if isinstance(exc, ValidationError)
+            else str(exc)
+        )
+        raise CacheUnreadableError(
+            f"the stored exploration cache could not be read ({detail}). It is "
+            "either corrupt or written by a newer dex whose shape this engine "
+            "does not know. Re-run `explore map` to rebuild it, or move to the "
+            f"dex that wrote it if that is what happened; {_REMAP_BILLS}"
+        ) from exc
 
 
 def spend_total(

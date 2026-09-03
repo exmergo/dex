@@ -9,18 +9,27 @@ axis means something quite different from "no findings" from a full sweep.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
 from ..results import Result
-from .drift import DriftFinding
+from .drift import AxisResult, DriftFinding
 from .reconcile import Proposal
 from .snapshot import Snapshot
 
 
 class LayerFingerprint(BaseModel):
-    """Counts from a fingerprinted dbt layer, or nothing when there was none."""
+    """Counts from a fingerprinted dbt layer, or nothing when there was none.
+
+    ``model_count`` and ``file_count`` are also what the ``schema`` axis's
+    ``model_added``/``model_removed``/``model_changed`` findings diff against
+    the next time ``maintain check``/``maintain schema`` runs (see
+    :func:`~.drift.transform_drift`); these counters are the pinned side of
+    that comparison, legible on their own so a reviewer glancing at the
+    snapshot's shape is not left guessing what a ``file_count`` of zero
+    beside a dozen models means.
+    """
 
     file_count: int | None = None
     model_count: int | None = None
@@ -90,11 +99,13 @@ class DriftResult(Result):
 
     ``by_axis`` is the per-axis split and ``findings`` the merged ranking. Both
     are reported because they answer different questions: the ranking says what
-    to look at, the split says what was looked at.
+    to look at, the split says what was looked at. The split carries the actual
+    findings too: an empty per-axis list must mean that axis found nothing, not
+    that its findings live only in the merged ranking.
     """
 
     findings: list[DriftFinding] = Field(default_factory=list)
-    by_axis: dict[str, int] = Field(default_factory=dict)
+    by_axis: dict[str, AxisResult] = Field(default_factory=dict)
     snapshot_created_at: str | None = None
     warehouse_from: str = ""
     drift_path: str = ""
@@ -104,12 +115,45 @@ class DriftResult(Result):
             "findings": [f.model_dump(mode="json") for f in self.findings],
             "finding_count": len(self.findings),
             "axes_run": sorted(self.by_axis),
-            "axes": dict(self.by_axis),
+            "axes": {
+                axis: {
+                    **result.model_dump(mode="json"),
+                    "finding_count": len(result.findings),
+                }
+                for axis, result in self.by_axis.items()
+            },
             "baseline": {
                 "snapshot_created_at": self.snapshot_created_at,
                 "from": self.warehouse_from,
             },
             "drift_path": self.drift_path,
+        }
+
+
+class VerifyResult(Result):
+    """A baseline-free sweep's findings: is the project correct right now,
+    not what changed since a snapshot (#224).
+
+    ``suppressed`` names finding classes that did not run and why -- a
+    project that fails to compile suppresses every manifest-derived class,
+    and a class needing dbt artifacts that are not on disk yet (no
+    ``run_results.json``, an unreachable warehouse for the relation check)
+    says so here rather than reporting a silent, indistinguishable "clean"
+    (#172's inertness requirement). Reported even when empty, the same
+    reasoning ``axes_run`` on :class:`DriftResult` already carries: a caller
+    deciding whether to trust an empty ``findings`` needs to know what ran.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    findings: list[DriftFinding] = Field(default_factory=list)
+    suppressed: dict[str, str] = Field(default_factory=dict)
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "findings": [f.model_dump(mode="json") for f in self.findings],
+            "finding_count": len(self.findings),
+            "suppressed": self.suppressed,
         }
 
 

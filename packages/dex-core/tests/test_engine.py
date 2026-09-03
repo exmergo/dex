@@ -23,14 +23,31 @@ from exmergo_dex_core import (
     MemoryStore,
 )
 from exmergo_dex_core.cache import DexCache
-from exmergo_dex_core.config import CacheConfig, DuckDBTarget, save_config
-from exmergo_dex_core.envelope import Envelope
+from exmergo_dex_core.config import (
+    CacheConfig,
+    ClickHouseTarget,
+    DuckDBTarget,
+    save_config,
+)
+from exmergo_dex_core.envelope import Envelope, Paradigm
 from exmergo_dex_core.explore.results import MapResult, ProfileResult, QueryResult
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "exmergo_dex_core"
 
 
 # --- the surface itself --------------------------------------------------------
+
+
+def test_cloud_clickhouse_paradigm_is_available_before_connection_failure():
+    """An error envelope must still name the binding unit when no adapter opens."""
+
+    engine = DexEngine(
+        config=DexConfig(
+            connector="clickhouse",
+            clickhouse=ClickHouseTarget(deployment="cloud"),
+        )
+    )
+    assert engine.paradigm is Paradigm.COMPUTE_TIME
 
 
 def test_the_public_import_works_and_defaults_to_writing_nothing(
@@ -82,6 +99,61 @@ def test_methods_return_domain_objects_never_envelopes(duckdb_file: Path):
     # The domain objects come back whole, not as dicts a caller has to re-parse.
     assert profiled.datasets[0].identifier.endswith("customers")
     assert isinstance(mapped.cache, DexCache)
+
+
+#: Subcommands that are not engine methods, each for a reason the reader can
+#: check. `test` is `transform test --scaffold`, reached as `test_scaffold`;
+#: `semantic *` is spelled `semantic_*`; `demo` writes a warehouse and is not a
+#: command a library caller drives. Everything else must have a method.
+_NOT_ENGINE_METHODS = {
+    ("transform", "test"),
+    ("semantic", "define"),
+    ("semantic", "update"),
+    ("semantic", "plan"),
+    ("viz", "preview"),
+}
+
+#: Where a subcommand's method is spelled differently from the subcommand.
+_METHOD_NAMES = {
+    ("connect", "test"): "connect_test",
+    ("explore", "semantic"): "semantic_list",
+    ("maintain", "schema"): "schema_drift",
+    ("maintain", "volume"): "volume_drift",
+    ("maintain", "grain"): "grain_drift",
+    ("maintain", "semantic"): "semantic_drift",
+    ("transform", "init"): "init_project",
+}
+
+
+def test_every_cli_subcommand_is_reachable_from_the_python_api():
+    """The CLI is a consumer of this API, not a parallel implementation of it.
+
+    That is the promise this module's own docstring makes, and it is the one a new
+    command quietly breaks: a `cmd_*` shim that calls its module function directly
+    works perfectly through the CLI and leaves the capability unreachable for every
+    library caller. Nothing else in the suite notices, because both surfaces are
+    tested against their own entry point.
+
+    Asserted as a set difference rather than per command so adding a subcommand
+    fails here until it is either given a method or listed above with a reason.
+    """
+
+    from exmergo_dex_core.cli import COMMAND_SURFACE
+
+    missing = []
+    for group, subcommands in COMMAND_SURFACE.items():
+        for sub in subcommands:
+            if (group, sub) in _NOT_ENGINE_METHODS:
+                continue
+            method = _METHOD_NAMES.get((group, sub), sub)
+            if not callable(getattr(DexEngine, method, None)):
+                missing.append(f"{group} {sub} (expected DexEngine.{method})")
+
+    assert missing == [], (
+        "these subcommands are reachable from the CLI and not from the Python "
+        f"API: {missing}. Add the method, or list it in _NOT_ENGINE_METHODS with "
+        "the reason it is CLI-only."
+    )
 
 
 def test_the_engine_module_never_references_the_envelope():
@@ -137,6 +209,115 @@ def test_no_connector_anywhere_refuses_instead_of_defaulting():
 
     with DexEngine() as eng, pytest.raises(ValueError, match="no connector selected"):
         eng.inventory()
+
+
+# --- the run-directory DuckDB auto-detect (issue #199) -------------------------
+
+
+def _make_duckdb(path: Path) -> None:
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE t (id INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.close()
+
+
+def test_lone_duckdb_file_in_run_directory_is_used_and_warned(tmp_path: Path):
+    """Acceptance: one .duckdb present, no config: the command runs and warns,
+    naming the file."""
+
+    lone = tmp_path / "lone.duckdb"
+    _make_duckdb(lone)
+
+    with DexEngine(repo_root=str(tmp_path)) as eng:
+        mapped = eng.inventory()
+        assert len(mapped.objects) == 1
+        assert len(eng.connection_warnings) == 1
+        assert "lone.duckdb" in eng.connection_warnings[0]
+        assert eng.connector == "duckdb"
+        assert eng.path == str(lone)
+
+
+def test_two_duckdb_files_in_run_directory_still_refuses_naming_both(
+    tmp_path: Path,
+):
+    """Acceptance: two present: refused, both listed."""
+
+    a = tmp_path / "a.duckdb"
+    b = tmp_path / "b.duckdb"
+    _make_duckdb(a)
+    _make_duckdb(b)
+
+    with (
+        DexEngine(repo_root=str(tmp_path)) as eng,
+        pytest.raises(ValueError, match="more than one DuckDB file") as refusal,
+    ):
+        eng.inventory()
+    assert "a.duckdb" in str(refusal.value)
+    assert "b.duckdb" in str(refusal.value)
+    # Never a silent guess: a refusal carries no warning to act on.
+    assert eng.connection_warnings == []
+
+
+def test_zero_duckdb_files_in_run_directory_is_the_existing_refusal_unchanged(
+    tmp_path: Path,
+):
+    """Acceptance: zero present: the existing refusal, unchanged."""
+
+    with (
+        DexEngine(repo_root=str(tmp_path)) as eng,
+        pytest.raises(ValueError, match=r"no \.dex/config\.yml found"),
+    ):
+        eng.inventory()
+    assert eng.connection_warnings == []
+
+
+def test_config_present_is_unchanged_even_naming_a_different_file(tmp_path: Path):
+    """Acceptance: config present: unchanged, even if it names a different file.
+
+    A lone real .duckdb file sits right there, but a config was declared (even
+    one naming a relation that does not exist), so the auto-detect must never
+    override it: the failure is a connection failure on the configured path,
+    never a silent switch to the file that happens to be lying around.
+    """
+
+    _make_duckdb(tmp_path / "lone.duckdb")
+    config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path="elsewhere.duckdb"))
+
+    # The configured (nonexistent) file is what fails to open, not a silent
+    # switch to the real lone file sitting right there.
+    with (
+        DexEngine(repo_root=str(tmp_path), config=config) as eng,
+        pytest.raises(Exception, match=r"elsewhere\.duckdb"),
+    ):
+        eng.inventory()
+    assert eng.connection_warnings == []
+
+
+def test_explicit_path_is_unchanged_even_with_a_lone_duckdb_file_present(
+    tmp_path: Path,
+):
+    """Acceptance: --path present: unchanged (no auto-detect note, since
+    nothing was guessed)."""
+
+    lone = tmp_path / "lone.duckdb"
+    _make_duckdb(lone)
+
+    with DexEngine(repo_root=str(tmp_path), connector="duckdb", path=str(lone)) as eng:
+        mapped = eng.inventory()
+        assert len(mapped.objects) == 1
+    assert eng.connection_warnings == []
+
+
+def test_lone_duckdb_auto_detect_does_not_apply_with_no_repo_root_at_all():
+    """A library caller holding no repo concept (``repo_root=None``) is the
+    other spelling of this same refusal, and has no run directory to look in;
+    it must keep refusing exactly as before, never scanning the process's own
+    cwd for a stray .duckdb file that has nothing to do with the caller."""
+
+    with DexEngine() as eng, pytest.raises(ValueError, match="no connector selected"):
+        eng.inventory()
+    assert eng.connection_warnings == []
 
 
 def test_commands_needing_the_project_refuse_without_a_repo_root():
@@ -405,7 +586,7 @@ def test_each_call_gets_its_own_cost_gate(monkeypatch: pytest.MonkeyPatch, tmp_p
     # labelled with its own command, and has its full budget available.
     assert second.cost_gate is not None
     assert second.cost_gate.command == "explore query"
-    assert second.cost_gate.remaining_for_statement() == 1_000
+    assert second.cost_gate.statement_cap(unit="byte") == 1_000
     second.cost_gate.charge(600.0)  # would raise if the first charge carried over
 
 
@@ -504,6 +685,7 @@ def _no_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
         "resolve_databricks_connection",
         "resolve_postgres_connection",
         "resolve_redshift_connection",
+        "resolve_clickhouse_connection",
     ):
         monkeypatch.setattr(connect_mod, name, unreachable)
 
@@ -862,7 +1044,7 @@ def test_importing_the_package_pulls_in_no_connector_library():
         "before={m.split('.')[0] for m in sys.modules};"
         "import exmergo_dex_core;"
         "libs={'google','snowflake','databricks','psycopg','redshift_connector',"
-        "'sklearn','httpx','metricflow','duckdb','sqlglot'};"
+        "'clickhouse_connect','sklearn','httpx','metricflow','duckdb','sqlglot'};"
         "print(sorted(({m.split('.')[0] for m in sys.modules} - before) & libs))"
     )
     out = subprocess.run(  # noqa: S603  (this interpreter, a literal probe)

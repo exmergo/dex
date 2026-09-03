@@ -15,7 +15,13 @@ pytest.importorskip("google.cloud.bigquery")
 
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
-from exmergo_dex_core.config import BigQueryTarget, DexConfig
+from exmergo_dex_core.config import (
+    BigQueryTarget,
+    Budget,
+    DexConfig,
+    load_config,
+    save_config,
+)
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm, Reason
 from exmergo_dex_core.explore import commands as explore_cmds
@@ -35,8 +41,11 @@ def _aggregate_resolver(sql: str):
         # The exact-distinct escalation statement (a near-unique id column
         # triggers it) reads d_<i> aliases.
         values[f"d_{i}"] = 100
-    values["nonnull_fk"] = 100
-    values["orphans"] = 0
+    # Overlap probes are batched, so one statement asks about several joins
+    # under indexed aliases (issue #398).
+    for i in range(10):
+        values[f"nonnull_fk_{i}"] = 100
+        values[f"orphans_{i}"] = 0
     return [values]
 
 
@@ -55,8 +64,11 @@ def _near_unique_not_proven_resolver(sql: str):
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
         values[f"d_{i}"] = 99 if i == 0 else 40
-    values["nonnull_fk"] = 100
-    values["orphans"] = 0
+    # Overlap probes are batched, so one statement asks about several joins
+    # under indexed aliases (issue #398).
+    for i in range(10):
+        values[f"nonnull_fk_{i}"] = 100
+        values[f"orphans_{i}"] = 0
     return [values]
 
 
@@ -82,16 +94,24 @@ def _domain_eligible_resolver(sql: str):
     return [values]
 
 
-def _adapter(fake_bq_client, *, confirmed: bool, budget: float | None, record=None):
+def _adapter(
+    fake_bq_client, *, confirmed: bool, budget: float | None, record=None, config=None
+):
+    # The cumulative-budget half comes off the config the way `new_cost_gate`
+    # reads it, so a test that commits a config gets the gate a real run would:
+    # its ceiling, its recorded decision, and the file an answer is written to.
+    committed = (config or DexConfig()).budget
     gate = CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
         ceiling=budget,
-        session_ceiling=None,
+        session_ceiling=committed.session_ceiling,
         session_spent=0.0,
         confirmed=confirmed,
         connector="bigquery",
         command="explore",
         record=record,
+        session_ceiling_declined=committed.session_ceiling_declined,
+        config_path=None if config is None else config.source_path,
     )
     return BigQueryAdapter(
         project="test-proj",
@@ -132,6 +152,7 @@ def route_adapter(monkeypatch):
                 confirmed=self.confirmed if confirmed is None else confirmed,
                 budget=self.budget if budget is None else budget,
                 record=record,
+                config=self.config,
             )
 
         monkeypatch.setattr(DexEngine, "_adapter", opener)
@@ -171,6 +192,11 @@ def test_unconfirmed_profile_returns_needs_confirmation(
     # columns, 100 rows): 10 + 10 + 10 + 10 = 40 MB.
     assert envelope.cost.estimate == 40 * MB
     assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 40 * MB}
+    # Three of those four floors are reserve, split out so the caller can see
+    # whether a raised budget buys work or headroom (#299).
+    assert envelope.data["reserved_bytes"] == 30 * MB
+    assert envelope.data["reserved_queries"] == 3
+    assert any("escalation reserve" in n for n in envelope.data["notes"])
     assert "--confirm" in envelope.data["hint"]
     # Nothing executed: only free metadata and dry-runs happened.
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -206,9 +232,11 @@ def test_unconfirmed_map_estimates_selected_objects(
     envelope = _dispatch(tmp_path, subcommand="map")
     assert envelope.status.value == "needs_confirmation"
     # customers and events each floor to the per-query minimum plus a floor
-    # per possible escalation query (40 MB apiece); logs.requests needs a
-    # partition filter, so it contributes zero.
-    assert envelope.cost.estimate == 2 * 40 * MB
+    # per escalation query their metadata leaves possible (40 MB for customers,
+    # 30 MB for events, whose only distinct-countable column cannot form a
+    # composite pair); logs.requests needs a partition filter, so it
+    # contributes zero.
+    assert envelope.cost.estimate == 70 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -267,8 +295,9 @@ def test_unconfirmed_map_excludes_fresh_cached_objects(
     envelope = _dispatch(tmp_path, subcommand="map")
     assert envelope.status.value == "needs_confirmation"
     # Only events is priced now (customers is fresh-cached, requests is
-    # partition-filtered to zero), so the estimate halves versus the no-cache run.
-    assert envelope.cost.estimate == 40 * MB
+    # partition-filtered to zero), so the estimate drops to that table's share
+    # of the no-cache run.
+    assert envelope.cost.estimate == 30 * MB
     assert "test-proj.shop.customers" not in envelope.data["per_table_bytes"]
     assert any("fresh-cached" in note for note in envelope.data["notes"])
     assert all(c.dry_run for c in fake_bq_client.query_calls)
@@ -359,6 +388,15 @@ def test_unconfirmed_relationships_recommends_map(
 
 
 def _seed_query_cache(tmp_path: Path) -> None:
+    """A cache that already adjudicates `shop.customers`, so the query path prices
+    the query alone.
+
+    The column signature has to match what the fake warehouse reports, `id`
+    REQUIRED included: a seeded profile that disagrees with the live schema is one
+    the engine re-profiles before trusting it, which is the point of that check and
+    would make this a test of the wrong thing.
+    """
+
     store = FilesystemStore(tmp_path)
     store.save_cache(
         DexCache(
@@ -366,7 +404,7 @@ def _seed_query_cache(tmp_path: Path) -> None:
                 Dataset(
                     identifier="test-proj.shop.customers",
                     columns=[
-                        ColumnProfile(name="id", data_type="INTEGER"),
+                        ColumnProfile(name="id", data_type="INTEGER", nullable=False),
                         ColumnProfile(
                             name="email",
                             data_type="STRING",
@@ -396,7 +434,69 @@ def test_unconfirmed_query_returns_estimate_and_logs(
     assert json.loads(log_lines[-1])["decision"] == "needs_confirmation"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Issue #319: a hyphenated project id, both fully-quoted-per-part and
+        # backtick-wrapped-as-one-identifier, plus the bare unquoted form
+        # copied verbatim out of an `explore inventory` identifier or an
+        # `explore query` `tables` entry. All three must parse in the
+        # connector's own dialect and reach the cost handshake rather than
+        # a "could not parse query" refusal on the hyphen.
+        "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+        "SELECT COUNT(*) AS n FROM `test-proj.shop.customers`",
+        "SELECT COUNT(*) AS n FROM test-proj.shop.customers",
+    ],
+)
+def test_a_hyphenated_project_id_parses_in_every_spelling(
+    fake_bq_client, route_adapter, tmp_path, sql
+):
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(tmp_path, subcommand="query", sql=sql)
+    # A parse failure on the hyphen would come back as an `error` envelope
+    # (`reason: guard`) naming a SQL parser, not this cost checkpoint.
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.cost.estimate == 10 * MB
+
+
+def _clusterable_client():
+    """A fake warehouse whose `customers` carries numeric non-key columns.
+
+    The shared fixture's table is id and email, which clustering has nothing to
+    cluster on. Building the client here rather than widening the shared one keeps
+    every other test's view of that table exactly as it was.
+    """
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+    from google.cloud import bigquery
+
+    return FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="customers",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                    bigquery.SchemaField("amount", "INTEGER"),
+                    bigquery.SchemaField("score", "FLOAT"),
+                ],
+                num_rows=100,
+                num_bytes=5_000,
+            )
+        ],
+    )
+
+
 def _seed_cluster_cache(tmp_path: Path) -> None:
+    """A profile of `shop.customers` matching what `_clusterable_client` reports.
+
+    Signature-exact for the same reason as `_seed_query_cache`: a seeded profile
+    that disagrees with the live schema is re-profiled before it is trusted.
+    """
+
     store = FilesystemStore(tmp_path)
     store.save_cache(
         DexCache(
@@ -405,8 +505,9 @@ def _seed_cluster_cache(tmp_path: Path) -> None:
                     identifier="test-proj.shop.customers",
                     row_count=100,
                     columns=[
+                        ColumnProfile(name="id", data_type="INTEGER", nullable=False),
                         ColumnProfile(name="amount", data_type="INTEGER"),
-                        ColumnProfile(name="score", data_type="FLOAT64"),
+                        ColumnProfile(name="score", data_type="FLOAT"),
                     ],
                 )
             ]
@@ -414,15 +515,14 @@ def _seed_cluster_cache(tmp_path: Path) -> None:
     )
 
 
-def test_unconfirmed_cluster_returns_needs_confirmation(
-    fake_bq_client, route_adapter, tmp_path
-):
+def test_unconfirmed_cluster_returns_needs_confirmation(route_adapter, tmp_path):
     """Clustering scans the feature columns, so on a billed connector it takes
     the same cost-before-spend handshake: an estimate and needs_confirmation,
     with nothing executed."""
 
     pytest.importorskip("sklearn")
     _seed_cluster_cache(tmp_path)
+    fake_bq_client = _clusterable_client()
     route_adapter(fake_bq_client)
     envelope = _dispatch(tmp_path, subcommand="cluster", object="customers")
     assert envelope.status.value == "needs_confirmation"
@@ -456,6 +556,189 @@ def test_confirmed_query_runs_through_the_firewall(
     # Two free dry-runs (the command estimate, then the per-statement charge
     # inside the adapter as defense in depth), then exactly one execution.
     assert [c.dry_run for c in fake_bq_client.query_calls] == [True, True, False]
+
+
+def test_a_batch_is_priced_once_and_itemized_per_statement(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """One question, one number. A caller confirming a batch is confirming all of
+    it, so the ceiling binds on the sum rather than on whichever statement asked
+    first."""
+
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=[
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            "SELECT COUNT(DISTINCT id) AS n FROM `test-proj`.`shop`.`customers`",
+        ],
+    )
+    assert envelope.status.value == "needs_confirmation"
+    # Two statements, each floored to the per-query billing minimum, quoted as one.
+    assert envelope.cost.estimate == 20 * MB
+    assert envelope.data["per_table_bytes"] == {
+        "(statement 1)": 10 * MB,
+        "(statement 2)": 10 * MB,
+    }
+    # The ask is as findable per statement in the ledger as a spend would be.
+    log_lines = (tmp_path / ".dex" / "queries.jsonl").read_text().splitlines()
+    decisions = [json.loads(line) for line in log_lines[-2:]]
+    assert [d["decision"] for d in decisions] == ["needs_confirmation"] * 2
+    assert [d["batch_index"] for d in decisions] == [0, 1]
+
+
+def test_a_confirmed_batch_runs_every_statement_off_one_handshake(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _seed_query_cache(tmp_path)
+    fake_bq_client.row_resolver = lambda sql: [{"n": 100}]
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=[
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            "SELECT COUNT(DISTINCT id) AS n FROM `test-proj`.`shop`.`customers`",
+        ],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert [r["cells"] for r in envelope.data["results"]] == [[[100]], [[100]]]
+    # Two command-level dry-runs (one estimate per statement, summed into a single
+    # handshake), then per statement the adapter's own defense-in-depth dry-run
+    # followed by its execution. One handshake, two runs.
+    assert [c.dry_run for c in fake_bq_client.query_calls] == [
+        True,
+        True,
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert envelope.data["spend"]["bytes_billed"] == 10_000
+
+
+def test_a_cold_batch_prices_the_shared_scan_and_every_statement_together(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Nothing is seeded, so the objects have to be profiled first. Two statements
+    over the same cold table are quoted one scan, not two."""
+
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=[
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            "SELECT COUNT(DISTINCT id) AS n FROM `test-proj`.`shop`.`customers`",
+        ],
+    )
+    assert envelope.status.value == "needs_confirmation"
+    itemized = envelope.data["per_table_bytes"]
+    assert [key for key in itemized if key.startswith("(statement")] == [
+        "(statement 1)",
+        "(statement 2)",
+    ]
+    assert len([key for key in itemized if key.startswith("test-proj")]) == 1
+    assert any("no usable profile" in note for note in envelope.data["notes"])
+
+
+# --- issue #321: the multi-statement per-query floor, and a mid-batch shortfall --
+#
+# BigQuery bills at least its per-query floor no matter how little a statement
+# reads, so an N-statement call needs at least N x that floor of headroom.
+# These tests pin that the estimate already reserves it (acceptance criterion
+# 1), that confirming at exactly that estimate completes every statement in
+# the "reads almost nothing" case the issue describes (acceptance criterion
+# 2), and that a real per-statement billing overage that still strands the
+# tail states the exact extra budget needed to finish, rather than leaving a
+# caller to guess a second time.
+
+
+def _seven_statements_against_customers() -> list[str]:
+    table = "`test-proj`.`shop`.`customers`"
+    return [f"SELECT COUNT(*) AS n{i} FROM {table}" for i in range(7)]  # noqa: S608
+
+
+def test_a_seven_statement_batch_reserves_at_least_n_times_the_floor(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _seed_query_cache(tmp_path)
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path, subcommand="query", sql=_seven_statements_against_customers()
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.cost.estimate >= 7 * 10 * MB
+    assert envelope.cost.estimate == 70 * MB
+
+
+def test_confirming_at_that_estimate_completes_every_statement(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _seed_query_cache(tmp_path)
+    fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
+    route_adapter(fake_bq_client)
+    statements = _seven_statements_against_customers()
+    unconfirmed = _dispatch(tmp_path, subcommand="query", sql=statements)
+    estimate = unconfirmed.cost.estimate
+
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=statements,
+        confirm=True,
+        budget=estimate,
+    )
+    assert envelope.status.value == "ok"
+    assert [r["status"] for r in envelope.data["results"]] == ["ok"] * 7
+
+
+def test_a_mid_batch_shortfall_states_the_exact_extra_budget_needed(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Each statement's real bill sits just above its own floor, and the dry
+    run under-reports enough that the *estimate* floors to exactly the
+    per-query minimum (masking the gap) while the *real* bill stays above
+    it -- the same execution-time variance issue #320 hits within one
+    statement, compounding here across a batch until the tail is stranded.
+    """
+
+    _seed_query_cache(tmp_path)
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = int(10.6 * MB)
+    fake_bq_client.dry_run_underestimate = 0.98
+    fake_bq_client.row_resolver = lambda sql: [{"n": 1}]
+    route_adapter(fake_bq_client)
+    statements = _seven_statements_against_customers()
+    unconfirmed = _dispatch(tmp_path, subcommand="query", sql=statements)
+    estimate = unconfirmed.cost.estimate
+
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="query",
+        sql=statements,
+        confirm=True,
+        budget=estimate,
+    )
+    assert envelope.status.value == "error"
+    results = envelope.data["results"]
+    statuses = [r["status"] for r in results]
+    # Earlier statements completed and are saved; only the tail is stranded.
+    assert statuses.count("ok") >= 1
+    assert "failed" in statuses
+    failed = next(r for r in results if r["status"] == "failed")
+    # The shortfall is the cost gate's own refusal (issue #316), so it names
+    # the per-query minimum the cap fell under rather than the connector.
+    assert "is below the 10,485,760-byte minimum" in failed["error"]
+    assert "needs at least" in failed["error"]
+    assert "bytes_scanned" in failed["error"]
+    assert "does not re-pay for them" in failed["error"]
+    # The already-completed statements' real results are still there.
+    ok_results = [r for r in results if r["status"] == "ok"]
+    assert all(r["cells"] == [[1]] for r in ok_results)
 
 
 def test_duckdb_explore_stays_confirmation_free(duckdb_file: Path, capsys):
@@ -550,7 +833,10 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     # resolver's exact d_i == nd_i) leaves the composite-key probe
     # un-short-circuited, and every filler column is domain-eligible, so
     # every escalation this fixture's estimate reserved for actually runs and
-    # gets charged: 2 tables x (exact-distinct + combination) = 4 charges,
+    # gets charged: 2 tables x (exact-distinct + combination) = 4 charges. The
+    # combination charge is per statement, not per pair, so filling the probe's
+    # cap widens the statement without changing the arithmetic below;
+    # a connector charging per pair would not be safe to count this way.
     # plus 3 value-domain probes (customers.plan_tier, orders.customer_id,
     # orders.total) = 7 charges x ~10 MB =~ 73 MB profiling, which alone
     # already leaves no room for the two-table verify probe's 20 MB floor.
@@ -582,6 +868,11 @@ def test_verify_beyond_budget_checkpoints_before_any_probe(
     cache = FilesystemStore(tmp_path).load_cache()
     assert cache.relationships and not cache.relationships[0].verified
     assert any("unverified" in note for note in envelope.data["notes"])
+    # The verify phase prices overlap probes, which carry no escalation
+    # reserve. The profile estimate earlier in this same command did, and
+    # attributing that one to this number would describe the wrong estimate.
+    assert "reserved_bytes" not in envelope.data
+    assert not any("escalation reserve" in n for n in envelope.data["notes"])
 
 
 def test_relationships_verify_beyond_budget_checkpoints(
@@ -694,10 +985,333 @@ def test_verify_handshake_uses_the_adapters_estimate_description():
     assert pending.cost.estimate == 13.0
 
 
+def test_cumulative_handshake_uses_the_adapters_estimate_description():
+    # `--check-cumulative`'s phase checkpoint, exercised the same way as
+    # `verify_handshake` above: a connector that speaks credits/seconds
+    # describes its own estimate, and the checkpoint payload keeps that shape
+    # while overlaying the check-cumulative phase fields.
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore profile",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+                "notes": ["seconds are a coarse translation"],
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.cumulative_handshake(
+        "explore profile", StubAdapter(), 5.0, candidate_count=2, object_count=2
+    )
+    # A request, not a raise: the profiles this phase follows are already paid for.
+    assert pending is not None
+    assert pending.data["estimated_seconds"] == 5.0
+    assert pending.data["per_table_seconds"] == {"(cumulative-measure probes)": 5.0}
+    assert pending.data["phase"] == "check-cumulative"
+    assert pending.data["candidate_count"] == 2
+    assert pending.data["object_count"] == 2
+    assert "notes" in pending.data
+    assert pending.cost.estimate == 13.0
+
+
+def test_cumulative_handshake_stays_none_on_a_free_connector_or_no_candidates():
+    from exmergo_dex_core import command_args
+
+    class FreeAdapter:
+        cost_gate = None
+
+    assert (
+        command_args.cumulative_handshake(
+            "explore profile", FreeAdapter(), 5.0, candidate_count=1, object_count=1
+        )
+        is None
+    )
+
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore profile",
+    )
+
+    class BilledAdapter:
+        cost_gate = gate
+
+    # Nothing eligible to probe: no checkpoint to ask for even on a billed
+    # connector, so this never blocks a run whose profile found no candidate.
+    assert (
+        command_args.cumulative_handshake(
+            "explore profile", BilledAdapter(), 5.0, candidate_count=0, object_count=0
+        )
+        is None
+    )
+
+
 def test_duckdb_map_verify_stays_confirmation_free(duckdb_file: Path, capsys):
     from exmergo_dex_core.cli import main
 
     rc = main(["explore", "map", "--verify", "--path", str(duckdb_file)])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["status"] == "ok"
+    assert payload["cost"]["paradigm"] == "free_local"
+    assert "phase" not in payload["data"]
+
+
+# --- the overlap-sweep checkpoint (issue #220) ------------------------------------
+#
+# Mirrors the verify-phase checkpoint section above: the sweep's candidate pool
+# can only be priced after inference has run and found nothing to match, so
+# the confirm handshake cannot cover it upfront either. A budget that covers
+# profiling and the probes runs in one pass; one that does not gets
+# needs_confirmation after inference, with the profile already persisted.
+
+
+@pytest.fixture
+def overlap_bq_client():
+    """A fake warehouse where inference finds *nothing*: both tables' own key
+    is named the bare `id`, which `fk_stem` never turns into a stem, so the
+    per-column inference loop skips it entirely. Both columns are still
+    established as proven unique keys by the aggregate resolver (column
+    index 0 of every table), which is exactly the "key or near-key, no name
+    signal" shape the overlap sweep exists for."""
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    tables = [
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="accounts",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("plan", "STRING"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+        FakeTable(
+            project="test-proj",
+            dataset_id="shop",
+            table_id="billing_profiles",
+            schema=[
+                bigquery.SchemaField("id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("payment_method", "STRING"),
+            ],
+            num_rows=100,
+            num_bytes=5_000,
+        ),
+    ]
+    client = FakeBigQueryClient(project="test-proj", tables=tables)
+    client.row_resolver = _aggregate_resolver
+    return client
+
+
+def test_overlap_within_budget_runs_in_one_pass(
+    overlap_bq_client, route_adapter, tmp_path
+):
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert "phase" not in envelope.data
+    assert _probe_executed(overlap_bq_client)
+    cache = FilesystemStore(tmp_path).load_cache()
+    assert cache.relationships
+    assert cache.relationships[0].kind.value == "overlap_inferred"
+    assert cache.relationships[0].verified
+
+
+def test_overlap_beyond_budget_checkpoints_before_any_probe(
+    overlap_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """The sweep's own probe cost can only be priced after inference runs,
+    so it needs its own checkpoint distinct from the base-profile handshake.
+    Forcing the estimate (rather than engineering exact escalation timing,
+    which the fake client's byte accounting makes fragile) pins the
+    checkpoint deterministically on a budget that comfortably covers
+    profiling alone."""
+
+    monkeypatch.setattr(
+        explore_cmds,
+        "_overlap_estimate",
+        lambda adapter, candidates: (999.0 * MB, 1, 2),
+    )
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "overlap"
+    assert envelope.data["candidate_count"] == 1
+    assert envelope.data["object_count"] == 2
+    assert envelope.data["per_table_bytes"] == {"(overlap sweep probes)": 999.0 * MB}
+    assert envelope.data["cap"] == 50
+    assert envelope.data["elided"] == 0
+    assert "--budget" in envelope.data["hint"]
+    assert not _probe_executed(overlap_bq_client)
+    # The map itself completed and persisted, unswept: no relationship yet,
+    # since nothing was found before the sweep's own checkpoint.
+    assert envelope.data["relationship_count"] == 0
+    assert Path(envelope.data["cache_path"]).exists()
+    assert any("unswept" in note for note in envelope.data["notes"])
+
+
+def test_relationships_overlap_beyond_budget_checkpoints(
+    overlap_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        explore_cmds,
+        "_overlap_estimate",
+        lambda adapter, candidates: (999.0 * MB, 1, 2),
+    )
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="relationships",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "overlap"
+    assert envelope.data["command"] == "explore relationships"
+    assert not _probe_executed(overlap_bq_client)
+
+
+def test_overlap_defers_behind_a_pending_verify_checkpoint(
+    overlap_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """--verify and --infer-by-overlap together: a still-pending verify
+    checkpoint must defer the sweep entirely, so it is never even priced.
+    Forced deterministically (this fixture's tables share no name at all,
+    so real verify has nothing to be pending about) by making
+    verify_handshake itself always return a pending request."""
+
+    from exmergo_dex_core.envelope import Cost
+    from exmergo_dex_core.results import ConfirmationRequest
+
+    def fake_verify_handshake(
+        command, adapter, estimate, *, candidate_count, object_count
+    ):
+        return ConfirmationRequest(
+            cost=Cost(paradigm=Paradigm.BYTES_SCANNED, estimate=1.0),
+            data={"phase": "verify", "hint": "confirm verify first"},
+        )
+
+    monkeypatch.setattr(
+        explore_cmds.command_args, "verify_handshake", fake_verify_handshake
+    )
+    route_adapter(overlap_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        verify=True,
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    assert envelope.data["phase"] == "verify"
+    # The sweep never got priced at all, since verify's own checkpoint was
+    # still pending; the note says so rather than silently skipping.
+    assert any("deferred" in n for n in envelope.data["notes"])
+
+
+def test_overlap_with_no_candidates_skips_the_checkpoint(
+    fake_bq_client, route_adapter, tmp_path
+):
+    # The shared fixture's tables share no foreign-key stem and neither
+    # column is key-or-near-key shaped per the aggregate resolver's
+    # defaults, so the sweep finds nothing to probe.
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="map",
+        infer_by_overlap=True,
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert "phase" not in envelope.data
+
+
+def test_overlap_handshake_uses_the_adapters_estimate_description():
+    gate = CostGate(
+        paradigm=Paradigm.COMPUTE_TIME,
+        ceiling=10.0,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=True,
+        connector="snowflake",
+        command="explore map",
+    )
+    gate.charge(8.0)
+
+    class StubAdapter:
+        cost_gate = gate
+
+        def describe_estimate(self, estimate, per_table):
+            return {
+                "estimated_seconds": estimate,
+                "per_table_seconds": per_table,
+                "notes": ["seconds are a coarse translation"],
+            }
+
+    from exmergo_dex_core import command_args
+
+    pending = command_args.overlap_handshake(
+        "explore map",
+        StubAdapter(),
+        5.0,
+        candidate_count=3,
+        object_count=2,
+        cap=50,
+        elided=0,
+    )
+    assert pending is not None
+    assert pending.data["estimated_seconds"] == 5.0
+    assert pending.data["per_table_seconds"] == {"(overlap sweep probes)": 5.0}
+    assert pending.data["phase"] == "overlap"
+    assert pending.data["candidate_count"] == 3
+    assert pending.data["object_count"] == 2
+    assert pending.data["cap"] == 50
+    assert pending.data["elided"] == 0
+    assert "notes" in pending.data
+    assert pending.cost.estimate == 13.0
+
+
+def test_duckdb_map_overlap_stays_confirmation_free(duckdb_file: Path, capsys):
+    from exmergo_dex_core.cli import main
+
+    rc = main(["explore", "map", "--infer-by-overlap", "--path", str(duckdb_file)])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["status"] == "ok"
@@ -735,6 +1349,34 @@ def test_over_ceiling_refusal_reports_the_metered_paradigm(
     assert all(c.dry_run for c in fake_bq_client.query_calls)
     # #170: a machine-readable reason alongside the prose.
     assert envelope.reason is Reason.GUARD
+
+
+def test_over_ceiling_refusal_attributes_the_estimate_it_refused_on(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Three quarters of this estimate is escalation reserve, and a refusal
+    that quotes only the total leaves the operator to reconstruct the split
+    from the spend ledger to find out whether the number grew because the
+    warehouse did (issue #299)."""
+
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(MB),
+    )
+    assert envelope.status.value == "error"
+    message = envelope.errors[0]
+    assert "exceeds the ceiling" in message
+    # 3 of the 4 floors in customers' 40 MB estimate are reserve.
+    assert "31,457,280 bytes of this estimate is escalation reserve" in message
+    assert "3 queries" in message
+    assert "10,485,760 bytes is dry-run scan" in message
+    # Still a refusal that spends nothing and cannot be confirmed through.
+    assert envelope.cost.estimate == 40 * MB
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
 def test_no_ceiling_refusal_reports_the_metered_paradigm(
@@ -856,3 +1498,319 @@ def test_duckdb_never_warns_about_a_cumulative_cap(duckdb_file: Path, capsys):
     assert main(["explore", "profile", "customers", "--path", str(duckdb_file)]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert _session_warning(payload["warnings"]) == []
+
+
+# --- the one-time cumulative-ceiling decision (#283) -----------------------------
+#
+# The warning above is accurate and it is also the default state of every new
+# project, so it repeated on every billed command, which is the condition under
+# which warnings stop being read. One observed session ran five billed commands
+# to 6.60 GB bound by their per-command caps alone, each carrying that sentence,
+# with the aggregate bounded by nothing. These pin the ask that makes the
+# unbounded case a decision instead of a default.
+
+
+def _project(tmp_path: Path, **budget) -> None:
+    """A committed config at the repo root, which is what arms the ask: without a
+    file to record an answer in, an ad-hoc read is never asked."""
+
+    save_config(DexConfig(connector="bigquery", budget=Budget(**budget)), tmp_path)
+
+
+def _project_engine(tmp_path: Path, **extra) -> DexEngine:
+    return DexEngine(
+        connector="bigquery",
+        repo_root=str(tmp_path),
+        store=FilesystemStore(tmp_path),
+        config=load_config(tmp_path),
+        confirmed=extra.get("confirm", False),
+        budget=extra.get("budget"),
+        session_ceiling=extra.get("session_ceiling"),
+        decline_session_ceiling=extra.get("no_session_ceiling", False),
+    )
+
+
+def _project_dispatch(tmp_path: Path, **extra):
+    from exmergo_dex_core.cli import dispatch
+
+    engine = _project_engine(tmp_path, **extra)
+    envelope = dispatch(_args(tmp_path, **extra), engine)
+    # What `main` does on the way out, so a config amendment is never silent.
+    if engine.config_diffs:
+        envelope.diffs = list(engine.config_diffs) + list(envelope.diffs)
+    return envelope
+
+
+def test_the_first_confirmed_billed_command_stops_to_ask_for_a_daily_cap(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "needs_confirmation"
+    # Five times this command's own 40 MB estimate, in the paradigm's own unit.
+    assert envelope.data["suggested_session_ceiling"] == 5 * 40 * MB
+    assert "--session-ceiling 209715200" in envelope.data["hint"]
+    assert "--no-session-ceiling" in envelope.data["hint"]
+    # Under its own key too, because `hint` is a channel a two-phase command's
+    # own payload can overwrite on the way into the envelope.
+    assert envelope.data["session_ceiling_hint"] == envelope.data["hint"]
+    # Confirmed and in budget, and still nothing ran: the ask is the last check
+    # before the reservation, so an unanswered one is as free as an unconfirmed
+    # handshake.
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_answering_with_a_ceiling_writes_it_and_runs_the_command(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        session_ceiling=float(500 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert load_config(tmp_path).budget.session_ceiling == float(500 * MB)
+    # Written, so reported: the amendment rides out as a diff rather than as
+    # something the caller finds later in `git status`.
+    assert [d["path"] for d in envelope.diffs] == [".dex/config.yml"]
+    assert "session_ceiling" in envelope.diffs[0]["unified"]
+    # And it binds the very command that answered, so the warning is gone.
+    assert _session_warning(envelope.warnings) == []
+
+
+def test_answering_with_a_decline_records_it_and_runs_the_command(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        no_session_ceiling=True,
+    )
+    assert envelope.status.value == "ok"
+    budget = load_config(tmp_path).budget
+    assert budget.session_ceiling_declined is True
+    assert budget.session_ceiling is None
+    # The decline records a decision; it loosens nothing, so the result still
+    # says the day was bounded by nothing.
+    assert len(_session_warning(envelope.warnings)) == 1
+
+
+def test_a_recorded_decline_is_not_re_asked_on_the_next_command(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        no_session_ceiling=True,
+    )
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+        refresh=True,
+    )
+    assert envelope.status.value == "ok"
+    assert envelope.diffs == []
+
+
+def test_a_project_that_already_set_a_ceiling_is_never_asked(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Acceptance: no behaviour change for a repo that already has one set."""
+
+    _project(tmp_path, ceiling=float(100 * MB), session_ceiling=float(500 * MB))
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert envelope.diffs == []
+    assert _session_warning(envelope.warnings) == []
+
+
+def test_the_unconfirmed_cost_ask_carries_the_suggestion_so_one_re_run_answers_both(
+    fake_bq_client, route_adapter, tmp_path
+):
+    _project(tmp_path, ceiling=float(100 * MB))
+    route_adapter(fake_bq_client)
+    envelope = _project_dispatch(tmp_path, subcommand="profile", objects=["customers"])
+    assert envelope.status.value == "needs_confirmation"
+    # The cost ask still owns the hint, because that is the flag pair it is
+    # answered with; the cumulative-ceiling advice rides in the notes.
+    assert "--confirm" in envelope.data["hint"]
+    assert envelope.data["suggested_session_ceiling"] == 5 * 40 * MB
+    assert any("--session-ceiling 209715200" in n for n in envelope.data["notes"])
+    assert "--session-ceiling 209715200" in envelope.data["session_ceiling_hint"]
+
+
+def test_an_ad_hoc_read_with_no_committed_config_is_never_asked(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """There is no file to record an answer in, so the ask would be a question
+    the caller cannot answer; it keeps the warning it always had."""
+
+    fake_bq_client.row_resolver = _aggregate_resolver
+    route_adapter(fake_bq_client)
+    envelope = _dispatch(
+        tmp_path,
+        subcommand="profile",
+        objects=["customers"],
+        confirm=True,
+        budget=float(100 * MB),
+    )
+    assert envelope.status.value == "ok"
+    assert len(_session_warning(envelope.warnings)) == 1
+
+
+def test_an_answer_with_no_committed_config_is_refused_not_dropped(tmp_path):
+    from exmergo_dex_core.errors import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="to record a"):
+        _project_engine(tmp_path, session_ceiling=float(500 * MB))
+
+
+# --- a statement the server refused (#310) ----------------------------------------
+#
+# Three defects met on this path and each hid the next: profiling built a CAST
+# Redshift refused, the driver's exception escaped untranslated so the envelope
+# said `internal` with no reason and no object, and the seconds already billed
+# were reported nowhere, so a failed metered command read as a free one. The
+# first is fixed in the SQL (see test_safety_spine); these pin the envelope the
+# other two produce, which is what makes any future one diagnosable from stdout.
+
+
+def test_a_refused_statement_reports_its_reason_its_object_and_its_spend(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        # Cached on the engine the way the real funnel does it: the settlement
+        # that reads spend back on the way out reads the engine's held adapter,
+        # so an opener that handed out a fresh one per call would test nothing.
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(100 * MB)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    fake_bq_client.row_resolver = _aggregate_resolver
+
+    # The first object profiles and bills; the second meets a server refusal,
+    # which is the ordinary shape of this failure (one bad column in one table
+    # of many, on a run that has already spent).
+    original = BigQueryAdapter.column_aggregates
+
+    def refuse_the_second(self, identifier, columns, **kwargs):
+        if identifier.endswith("events"):
+            fake_bq_client.result_error = api_exceptions.BadRequest(
+                "Bad int64 value: pending"
+            )
+        return original(self, identifier, columns, **kwargs)
+
+    monkeypatch.setattr(BigQueryAdapter, "column_aggregates", refuse_the_second)
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "profile",
+            "customers",
+            "events",
+            "--confirm",
+            "--budget",
+            str(float(100 * MB)),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 1
+    assert payload["status"] == "error"
+    # Classified: the server ran the statement and refused it, which is not the
+    # `internal` an untyped driver exception used to fall through to.
+    assert payload["reason"] == Reason.EXECUTION_FAILURE.value
+    error = payload["errors"][0]
+    assert "Bad int64 value" in error  # the server's own diagnosis, verbatim
+    assert "test-proj.shop.events" in error  # and which object it was about
+    # Metered and failed is not the same as free: the first object's scan was
+    # billed and the envelope says so.
+    assert payload["data"]["spend"]["bytes_billed"] > 0
+    assert payload["cost"]["paradigm"] == Paradigm.BYTES_SCANNED.value
+
+
+def test_a_refusal_that_never_reached_the_warehouse_reports_no_spend(
+    fake_bq_client, monkeypatch, tmp_path, capsys
+):
+    """The other side of it: a command refused before the first statement
+    spent nothing, and a spend block of zeroes on that envelope would read as a
+    claim about money where silence is the honest answer."""
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.engine import DexEngine
+
+    def opener(self, command=None, *, budget=None, confirmed=None):
+        if self._adapter_instance is None:
+            self._adapter_instance = _adapter(
+                fake_bq_client, confirmed=True, budget=float(1)
+            )
+        return self._adapter_instance
+
+    monkeypatch.setattr(DexEngine, "_adapter", opener)
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "explore",
+            "profile",
+            "customers",
+            "--confirm",
+            "--budget",
+            "1",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["reason"] == Reason.GUARD.value
+    assert "spend" not in payload["data"]

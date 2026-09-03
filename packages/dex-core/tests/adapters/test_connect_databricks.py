@@ -656,6 +656,38 @@ def test_value_domain_counts_batch_into_one_guarded_statement(fake_databricks):
     assert adapter.value_domain_counts("shop.core.customers", [], limit=25) == {}
 
 
+def test_value_domain_counts_survive_the_ndarray_the_real_driver_returns(
+    fake_databricks,
+):
+    """`collect_list` returns an ARRAY, and this driver materializes one through
+    pyarrow as a numpy ndarray, whose `__bool__` raises above a single element.
+    A truthiness test on it therefore crashed `explore profile` and `explore map`
+    against any real Databricks table with more than one value in a domain, while
+    every fake feeding a plain list passed. Found by dogfooding, not by the suite.
+    """
+
+    numpy = pytest.importorskip("numpy")
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [
+        {
+            "d_0": numpy.array(
+                [{"v": "prod", "c": 60}, {"v": "dev", "c": 40}], dtype=object
+            ),
+            "n_0": 2,
+            "d_1": None,
+            "n_1": 0,
+        }
+    ]
+    adapter = make_adapter(fake_databricks, ceiling=100_000.0)
+    result = adapter.value_domain_counts(
+        "shop.core.customers", ["env_tier", "empty"], limit=25
+    )
+    assert result["env_tier"].values == [("prod", 60), ("dev", 40)]
+    assert result["env_tier"].total_distinct == 2
+    assert result["empty"].values == []
+
+
 def test_value_domain_counts_degrade_when_budget_cannot_cover(fake_databricks):
     warm(fake_databricks)
     adapter = make_adapter(fake_databricks, ceiling=100.0)

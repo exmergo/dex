@@ -16,6 +16,11 @@ def test_envelope_round_trips_to_json():
     payload = json.loads(json.dumps(e.model_dump(mode="json")))
     assert payload["status"] == "ok"
     assert payload["data"] == {"hello": "world"}
+    assert payload["connection"] == {
+        "connector": None,
+        "target": {},
+        "source": None,
+    }
     assert payload["warnings"] == ["heads up"]
     assert payload["diffs"] == [] and payload["errors"] == []
 
@@ -56,6 +61,19 @@ def test_not_implemented_is_a_valid_envelope():
 def test_sanitize_refuses_secret_like_keys(data):
     with pytest.raises(env.SanitizationError):
         env.sanitize(env.ok(data))
+
+
+def test_sanitize_scans_connection_target_too():
+    with pytest.raises(env.SanitizationError):
+        env.sanitize(
+            env.ok(
+                connection=env.Connection(
+                    connector="postgres",
+                    target={"password": "never"},
+                    source="flag",
+                )
+            )
+        )
 
 
 @pytest.mark.parametrize(

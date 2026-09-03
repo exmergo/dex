@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -64,17 +65,47 @@ def forbid_dbt(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(build_module, "_default_runner", exploded)
 
 
-def test_unconfirmed_build_needs_confirmation(
-    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+def test_unconfirmed_build_on_free_local_runs_and_warns_instead_of_asking(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
+    """Issue #197: a confirm handshake is emitted only where spend is possible.
+    DuckDB is free, so an unconfirmed build runs rather than asking the caller
+    to confirm spending nothing, and the envelope says so instead of staying
+    silent about the skipped ask."""
+
+    _fake_runner_factory(monkeypatch, returncode=0)
     rc, envelope = _run(
         ["--repo-root", str(tmp_path), "transform", "build", "--target", "dev"], capsys
     )
-    assert rc == 0
-    assert envelope["status"] == "needs_confirmation"
-    # DuckDB is free, but the gate still runs: the cost is surfaced before spend.
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
     assert envelope["cost"]["paradigm"] == "free_local"
     assert envelope["cost"]["estimate"] == 0.0
+    assert any("no confirm handshake" in w for w in envelope["warnings"])
+
+
+def test_confirmed_build_on_free_local_carries_no_skipped_handshake_note(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Passing --confirm on a free connector does no harm, and nothing was
+    actually skipped that is worth a note about."""
+
+    _fake_runner_factory(monkeypatch, returncode=0)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["status"] == "ok"
+    assert not any("no confirm handshake" in w for w in envelope["warnings"])
 
 
 @pytest.mark.parametrize("target", ["prod", "production", "PRD", "live"])
@@ -690,6 +721,7 @@ def _install_fake_pricing(
     confirmed: bool,
     ceiling: float | None,
     describe=None,
+    translate=None,
     notes: list[str] = (),
     store=None,
     session_ceiling: float | None = None,
@@ -748,6 +780,8 @@ def _install_fake_pricing(
     adapter = FakeAdapter()
     if describe is not None:
         adapter.describe_estimate = describe
+    if translate is not None:
+        adapter.compute_spend_translation = translate
     monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
     monkeypatch.setattr(
         build_module,
@@ -850,6 +884,121 @@ def test_billed_build_surfaces_estimate_quality_on_compute_time(
     assert envelope["cost"]["estimate"] == 42.0
     assert envelope["data"]["estimated_seconds"] == 42.0
     assert envelope["data"]["estimate_quality"] == "heuristic"
+
+
+def test_clickhouse_cloud_build_uses_compute_time_and_translates_settled_seconds(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: clickhouse\n"
+        "clickhouse:\n"
+        "  deployment: cloud\n"
+        "  compute_unit_price_usd: 0.29846\n",
+        encoding="utf-8",
+    )
+    _install_fake_pricing(
+        monkeypatch,
+        connector="clickhouse",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=1.0,
+        per_node={"stg_customers": 1.0},
+        confirmed=True,
+        ceiling=60,
+        translate=lambda seconds: {
+            "compute_unit_hours_billed": seconds * 2 / 3600,
+            "usd_billed": seconds * 2 / 3600 * 0.29846,
+        },
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 18.0,
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "60",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    spend = envelope["data"]["spend"]
+    assert spend["seconds_billed"] == 18.0
+    assert spend["compute_unit_hours_billed"] == pytest.approx(0.01)
+    assert spend["usd_billed"] == pytest.approx(0.0029846)
+
+
+def test_clickhouse_cloud_build_fails_closed_before_dbt_without_live_capacity(
+    bigquery_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    forbid_dbt,
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: clickhouse\nclickhouse:\n  deployment: cloud\n",
+        encoding="utf-8",
+    )
+
+    def missing_capacity(_seconds):
+        raise RuntimeError("capacity could not be proved")
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="clickhouse",
+        paradigm=Paradigm.COMPUTE_TIME,
+        estimate=1.0,
+        per_node={"stg_customers": 1.0},
+        confirmed=True,
+        ceiling=60,
+        translate=missing_capacity,
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "60",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    assert "capacity could not be proved" in envelope["errors"][0]
 
 
 def test_billed_build_degrades_to_no_estimate_when_connection_unavailable(
@@ -982,7 +1131,11 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     assert rc == 0, envelope
     # The confirmed run's envelope carries the preflight estimate and the actual.
     assert envelope["cost"]["estimate"] == 5_000_000.0
-    assert envelope["data"]["bytes_billed"] == 3000
+    # Issue #276: spend lives at `data.spend` and nowhere else. `transform build`
+    # used to also stamp a top-level `data.bytes_billed` that no other billed
+    # command carried, so a caller reading that key saw a build's spend and read
+    # `maintain check`'s missing key as zero.
+    assert "bytes_billed" not in envelope["data"]
     assert any("maximum_bytes_billed" in w for w in envelope["warnings"])
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
     entry = json_mod.loads(ledger[-1])
@@ -994,6 +1147,143 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     # `data.spend` across commands used to count every build as free.
     assert envelope["data"]["spend"]["bytes_billed"] == entry["billed_bytes"]
     assert envelope["data"]["spend"]["session_spent_today"] == 3000
+    # Issue #278: the estimate rides into the ledger beside the settled figure,
+    # so a later over-ceiling refusal on this connector can say how far the two
+    # have run apart. A build is the largest billed command dex has and settles
+    # outside any gate, so without this the command most likely to be refused
+    # over a ceiling would have been the one contributing nothing to calibrating
+    # that refusal.
+    assert entry["entry"] == "settlement"
+    assert entry["estimate"] == envelope["cost"]["estimate"] == 5_000_000.0
+
+
+def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Issue #276, the other half: a key present only sometimes is worse than one
+    that never exists, so a billed connector reports `data.spend` whatever the
+    build settled at. A build that billed zero and one that does not report spend
+    have to be distinguishable, and `if billed:` made them identical."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    # dbt ran the node and BigQuery billed nothing for it: a cache hit, or a
+    # no-op incremental. The figure is reported, so it is zero.
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 0},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["spend"]["bytes_billed"] == 0
+    assert envelope["data"]["spend"]["session_spent_today"] == 0
+    entry = json.loads((tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()[-1])
+    assert entry["command"] == "transform build"
+    assert entry["billed_bytes"] == 0
+
+
+def test_a_build_whose_statements_reported_no_billing_figure_says_so(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Statements ran and none of them reported what they billed, so the spend is
+    unknown rather than zero. The key is still there (parity), its value is null
+    (honesty), a note explains it, and nothing reaches the ledger: rounding an
+    unknown spend down to zero is the under-report issue #276 is about."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=5_000_000.0,
+        per_node={"stg_customers": 5_000_000.0},
+        confirmed=True,
+        ceiling=100_000_000,
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    # No adapter_response at all: whatever this scanned, dbt is
+                    # not saying.
+                    "adapter_response": {},
+                }
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=0,
+        run_results_json=(
+            bigquery_project_dir / "target" / "run_results.json",
+            run_results,
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "100000000",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["spend"]["bytes_billed"] is None
+    # A build's per-paradigm notes ride in `warnings`, where its cap note does.
+    assert any("no billing figure" in w for w in envelope["warnings"])
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
 
 
 def test_billed_build_failure_names_the_real_error_in_errors(
@@ -1050,17 +1340,75 @@ def test_build_env_caps_postgres_statements_via_pgoptions(monkeypatch):
     from exmergo_dex_core.transform.build import _build_env
 
     monkeypatch.delenv("PGOPTIONS", raising=False)
-    env = _build_env(Paradigm.DB_LOAD, 120.0)
+    env = _build_env("postgres", Paradigm.DB_LOAD, 120.0)
     assert env is not None
     assert env["PGOPTIONS"] == "-c statement_timeout=120s"
 
     monkeypatch.setenv("PGOPTIONS", "-c search_path=app")
-    env = _build_env(Paradigm.DB_LOAD, 120.0)
+    env = _build_env("postgres", Paradigm.DB_LOAD, 120.0)
     assert env["PGOPTIONS"] == "-c search_path=app -c statement_timeout=120s"
 
-    assert _build_env(Paradigm.DB_LOAD, None) is None
-    assert _build_env(Paradigm.FREE_LOCAL, 120.0) is None
-    assert _build_env(Paradigm.BYTES_SCANNED, 120.0) is None
+    assert _build_env("postgres", Paradigm.DB_LOAD, None) is None
+    assert _build_env("postgres", Paradigm.FREE_LOCAL, 120.0) is None
+    assert _build_env("postgres", Paradigm.BYTES_SCANNED, 120.0) is None
+
+
+def test_build_env_caps_clickhouse_statements_via_custom_settings(monkeypatch):
+    """The second db-load connector caps by a different mechanism, and the cap
+    is two settings rather than one.
+
+    ClickHouse ignores PGOPTIONS entirely, so a paradigm-keyed lookup would hand
+    it a libpq variable and leave the build uncapped while the envelope claimed
+    otherwise. Both settings are asserted because max_execution_time alone is
+    checked at block boundaries: the byte cap is what binds on a fast scan.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform import init
+    from exmergo_dex_core.transform.build import (
+        _CH_SCAN_BYTES_PER_SECOND,
+        _build_env,
+    )
+
+    env = _build_env("clickhouse", Paradigm.DB_LOAD, 120.0)
+    assert env is not None
+    assert env[init.CH_MAX_EXECUTION_TIME_ENV] == "120"
+    assert env[init.CH_MAX_BYTES_TO_READ_ENV] == str(120 * _CH_SCAN_BYTES_PER_SECOND)
+    assert "PGOPTIONS" not in _build_env("clickhouse", Paradigm.DB_LOAD, 120.0) or (
+        env.get("PGOPTIONS") == os.environ.get("PGOPTIONS")
+    )
+
+    assert _build_env("clickhouse", Paradigm.DB_LOAD, None) is None
+    assert _build_env("clickhouse", Paradigm.FREE_LOCAL, 120.0) is None
+
+
+def test_an_uncapped_db_load_connector_gets_no_cap_and_claims_none(monkeypatch):
+    """The degradation and the non-degraded path, asserted together.
+
+    A db-load connector with no cap mechanism registered must inherit the plain
+    environment rather than another connector's variable, and the build note
+    must say the build was uncapped instead of naming a cap that was never
+    applied. The Postgres assertion above it is the non-degraded sibling:
+    without it, a dispatch table that returned None for everything would make
+    this test pass while silently removing every connector's cap.
+    """
+
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.transform.build import _build_env
+    from exmergo_dex_core.transform.commands import (
+        _DB_LOAD_CAP_NOTES,
+        _UNCAPPED_BUILD_NOTE,
+    )
+
+    assert _build_env("some-future-db", Paradigm.DB_LOAD, 120.0) is None
+    assert _DB_LOAD_CAP_NOTES.get("some-future-db", _UNCAPPED_BUILD_NOTE) == (
+        _UNCAPPED_BUILD_NOTE
+    )
+    # And every connector that does register a mechanism has a note describing
+    # it, so the pair can never drift into claiming a cap it did not inject.
+    from exmergo_dex_core.transform.build import _CAP_ENV_BUILDERS
+
+    assert set(_CAP_ENV_BUILDERS) == set(_DB_LOAD_CAP_NOTES)
 
 
 def test_dev_target_check_runs_before_the_cost_gate(
@@ -1156,7 +1504,12 @@ def test_prod_refusal_still_beats_the_dev_target_check(
 
 
 def _compile_runner(
-    monkeypatch, project: Path, run_results: dict, *, returncode: int = 0
+    monkeypatch,
+    project: Path,
+    run_results: dict,
+    *,
+    returncode: int = 0,
+    expected_env: dict[str, str] | None = None,
 ):
     """Fake ``_default_runner`` for compile: writes the given run_results.json on
     invocation (mirroring real dbt) and returns the requested code."""
@@ -1166,6 +1519,9 @@ def _compile_runner(
     build_module = importlib.import_module("exmergo_dex_core.transform.build")
 
     def fake(timeout: float, cwd, env=None):
+        if expected_env is not None:
+            assert env == expected_env
+
         def run(argv: list[str]):
             (project / "target").mkdir(parents=True, exist_ok=True)
             (project / "target" / "run_results.json").write_text(
@@ -1176,6 +1532,30 @@ def _compile_runner(
         return run
 
     monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
+def test_compile_estimate_forwards_statement_caps_to_dbt_compile(
+    dbt_project_dir: Path, monkeypatch
+):
+    """The pricing compile opens the dev connection, so it needs the same
+    constrained settings as the eventual build."""
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+    env = {
+        "DEX_CLICKHOUSE_MAX_EXECUTION_TIME": "60",
+        "DEX_CLICKHOUSE_MAX_BYTES_TO_READ": str(60 * 200 * 1024 * 1024),
+    }
+    _compile_runner(
+        monkeypatch,
+        dbt_project_dir,
+        {"results": []},
+        expected_env=env,
+    )
+    total, per_node, notes = build_mod.compile_estimate(
+        dbt_project_dir, _EstimatingAdapter(), target="dev", env=env
+    )
+    assert (total, per_node) == (0.0, {})
+    assert notes == ["no scanning build nodes to price; the estimate is zero"]
 
 
 class _EstimatingAdapter:
@@ -1198,7 +1578,7 @@ def _write_manifest(project: Path, nodes: dict) -> None:
     )
 
 
-def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
+def test_compile_estimate_sums_priced_nodes_and_skips_the_unbilled_ones(
     dbt_project_dir: Path, monkeypatch
 ):
     build_mod = importlib.import_module("exmergo_dex_core.transform.build")
@@ -1234,6 +1614,15 @@ def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
             "compiled_code": "",
             "config": {},
         },
+        # Compiled by `dbt compile` and never built, so it has compiled SQL and
+        # still issues no billed statement. Priced at zero on purpose, not by
+        # accident of having no code to price.
+        "analysis.p.scratch": {
+            "resource_type": "analysis",
+            "name": "scratch",
+            "compiled_code": "select 5",
+            "config": {},
+        },
     }
     _write_manifest(dbt_project_dir, nodes)
     _compile_runner(
@@ -1244,7 +1633,8 @@ def test_compile_estimate_sums_priced_nodes_and_skips_seeds_and_ephemeral(
     total, per_node, notes = build_mod.compile_estimate(
         dbt_project_dir, _EstimatingAdapter(), target="dev"
     )
-    # model(view) + snapshot + test priced at 10 each; ephemeral and seed skipped.
+    # model(view) + snapshot + test priced at 10 each; ephemeral, seed and
+    # analysis skipped.
     assert total == 30.0
     assert set(per_node) == {"stg_a", "snap", "not_null_stg_a"}
     assert notes == []

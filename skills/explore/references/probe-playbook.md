@@ -3,16 +3,28 @@
 A probe is one agent-authored SELECT run through the engine's query firewall. The
 firewall guarantees safety; this playbook is about effectiveness: asking the
 question in a shape that returns a small, decisive answer instead of a wall of
-rows. Profile first (`explore map`), probe second; the profile usually already
-holds the answer (null fractions, distinct counts, min/max, candidate keys), and
-probes exist for the questions it does not.
+rows. Map first (`explore map`) when you are getting your bearings: the profile
+usually already holds the answer (null fractions, distinct counts, min/max,
+candidate keys), and probes exist for the questions it does not. But you do not
+have to map before you can probe. A table the engine has not profiled, including
+a model you built moments ago, is profiled as part of answering, so a probe
+against something new costs one call.
 
-Two habits pay for everything else:
+Three habits pay for everything else:
 
 - **One probe, one question.** Decide what you are testing before writing SQL,
   and name the output columns after the answer (`orphans`, `dupes`, `coverage`).
-- **Batch related measures.** Eight aggregates in one SELECT cost one round trip;
-  eight probes cost eight. Combine counts that share a FROM clause.
+- **Batch related measures into one SELECT.** Eight aggregates over the same FROM
+  clause are one scan; eight separate probes are eight, and on a metered
+  warehouse you pay for each. Combine counts that share a FROM clause.
+- **Send unrelated probes in one call.** Questions that do not share a FROM
+  clause cannot share a SELECT, but they can share a call: pass a statement per
+  argument, or `--sql-file <path>` for a longer list. That saves the call, not
+  the scan, which is why it is the second choice and not the first. Each
+  statement is firewalled and answered on its own, `data.results` holds one entry
+  per statement, and a refusal on one leaves the rest intact. The result-size cap
+  is the call's rather than each statement's, so keep a batch aggregated: ten
+  statements share the budget one statement would have had to itself.
 
 Firewall rules that shape your SQL: values may be projected only from profiled,
 PII-cleared columns; over a flagged column use a measuring aggregate (COUNT,
@@ -36,7 +48,10 @@ FROM child c
 ```
 
 Zero orphans confirms the join; a high orphan fraction says the name-based guess
-was wrong or the parent is incomplete.
+was wrong or the parent is incomplete. `--verify` applies the second habit above
+to this recipe for you: the joins that share a child are measured in one
+statement, so it costs what the relations cost rather than what the join count
+costs.
 
 **2. Duplicate / grain check.** How badly is a key broken, and what does the
 duplication look like?
@@ -134,9 +149,10 @@ firewall the same way: the condition is a filter, not a projected value.
 
 The refusal names the column, its PII category, and the fix. Rewrite once: swap
 the value-carrying expression for a measuring one, or drop the column from the
-projection. Do not retry the same shape, do not route around the engine with
-Python or a database CLI, and if the refusal says a table is not profiled, run
-`explore profile <table>` (or `explore map`) and probe again.
+projection. Do not retry the same shape and do not route around the engine with
+Python or a database CLI. A refusal naming a table the connection does not have
+is a real answer: check the name, or build the model into the target you are
+querying. It will not be fixed by profiling.
 
 Two newer paths the refusal may name:
 

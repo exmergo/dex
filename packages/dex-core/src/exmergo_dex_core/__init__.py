@@ -55,6 +55,7 @@ _EXPORTS = {
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
     "CacheRequiredError": "explore.commands",
+    "CacheUnreadableError": "storage.base",
     "CeilingRequiredError": "guards.cost_guard",
     "ClusterDependencyError": "explore.cluster",
     "ClusterError": "explore.cluster",
@@ -67,7 +68,12 @@ _EXPORTS = {
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
     "CredentialDiscoveryError": "connect",
+    "DEMO_FILENAME": "demo",
     "Dataset": "cache",
+    "DemoDependencyError": "demo",
+    "DemoError": "demo",
+    "DemoPathError": "demo",
+    "DemoTargetExistsError": "demo",
     "DexCache": "cache",
     "DexConfig": "config",
     "DexEngine": "engine",
@@ -76,6 +82,7 @@ _EXPORTS = {
     "Document": "storage",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "LedgerUnreadableError": "guards.cost_guard",
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
@@ -96,13 +103,17 @@ _EXPORTS = {
     "SemanticBackendError": "explore.semantic",
     "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
+    "SessionCeilingDecisionRequiredError": "guards.cost_guard",
     "Snapshot": "maintain.snapshot",
+    "SpendHistory": "storage",
     "SpendLock": "storage",
     "SpendLockTimeoutError": "guards.cost_guard",
     "Store": "storage",
     "StoreContext": "storage",
     "StoreFactory": "storage",
     "StoreRequiredError": "errors",
+    "WarehouseQueryError": "errors",
+    "generate_demo_warehouse": "demo",
     "render_er_mermaid": "explore.diagram",
     "to_envelope": "results",
 }
@@ -116,6 +127,14 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScopeError,
         SemanticSource,
     )
+    from .demo import (
+        DEMO_FILENAME,
+        DemoDependencyError,
+        DemoError,
+        DemoPathError,
+        DemoTargetExistsError,
+        generate_demo_warehouse,
+    )
     from .engine import DexEngine
     from .envelope import Cost, Paradigm
     from .errors import (
@@ -128,6 +147,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         RepoRootRequiredError,
         RequestError,
         StoreRequiredError,
+        WarehouseQueryError,
     )
     from .explore.cluster import ClusterDependencyError, ClusterError
     from .explore.commands import CacheRequiredError
@@ -140,7 +160,9 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         CeilingRequiredError,
         ConfirmationRequiredError,
         CostGuardError,
+        LedgerUnreadableError,
         OverCeilingError,
+        SessionCeilingDecisionRequiredError,
         SpendLockTimeoutError,
     )
     from .guards.dialect import DialectDependencyError
@@ -154,11 +176,13 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         to_envelope,
     )
     from .storage import (
+        CacheUnreadableError,
         Document,
         ExploreStore,
         FilesystemStore,
         MaintainStore,
         MemoryStore,
+        SpendHistory,
         SpendLock,
         Store,
         StoreContext,
@@ -176,9 +200,11 @@ except PackageNotFoundError:
 # checker) sees the public surface without executing anything. `tests/
 # test_engine.py` asserts the two stay in step and that every name resolves.
 __all__ = [
+    "DEMO_FILENAME",
     "BaselineUnreadableError",
     "BudgetExhaustedError",
     "CacheRequiredError",
+    "CacheUnreadableError",
     "CeilingRequiredError",
     "ClusterDependencyError",
     "ClusterError",
@@ -192,6 +218,10 @@ __all__ = [
     "CostGuardError",
     "CredentialDiscoveryError",
     "Dataset",
+    "DemoDependencyError",
+    "DemoError",
+    "DemoPathError",
+    "DemoTargetExistsError",
     "DexCache",
     "DexConfig",
     "DexEngine",
@@ -200,6 +230,7 @@ __all__ = [
     "Document",
     "ExploreStore",
     "FilesystemStore",
+    "LedgerUnreadableError",
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
@@ -220,14 +251,18 @@ __all__ = [
     "SemanticBackendError",
     "SemanticQueryRefusedError",
     "SemanticSource",
+    "SessionCeilingDecisionRequiredError",
     "Snapshot",
+    "SpendHistory",
     "SpendLock",
     "SpendLockTimeoutError",
     "Store",
     "StoreContext",
     "StoreFactory",
     "StoreRequiredError",
+    "WarehouseQueryError",
     "__version__",
+    "generate_demo_warehouse",
     "render_er_mermaid",
     "to_envelope",
 ]

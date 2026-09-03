@@ -19,12 +19,15 @@ writes to the project and human edits stay authoritative at apply time.
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 import yaml
 from pydantic import BaseModel, Field
 
+from ..adapters.project import PlacingProject
 from ..cache import ColumnProfile, Dataset, DexCache
 from ..config import PIIOverrideMatcher
-from ..dbt_project import DbtProjectView
+from ..dbt_project import DbtProjectView, ProjectDefinitions
 from ..explore.profile import detect_pii
 from ..transform.plans import EditKind, PlanEdit
 from ..transform.scaffold import model_edits
@@ -53,6 +56,25 @@ class Proposal(BaseModel):
 _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_changed"}
 
 
+def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
+    """Where an edit of ``kind`` for ``table`` goes, asking the format first.
+
+    ``None`` placement is the dbt scaffold convention, which keeps every caller
+    that predates the seam on the paths it already had. A format that answers
+    ``None`` for a kind is declining that kind, and the caller turns it into the
+    same advisory a missing scaffold file produces.
+    """
+
+    if placement is None:
+        # The same two kinds `DbtProject.edit_path` resolves, declined the same
+        # way for the rest: this branch is that method's convention inlined for
+        # callers holding no format, so answering a path where it answers `None`
+        # would make the shim and the format disagree about the same input.
+        suffix = {EditKind.MODEL_SQL: "sql", EditKind.SCHEMA_YML: "yml"}.get(kind)
+        return None if suffix is None else f"models/staging/stg_{table}.{suffix}"
+    return placement.edit_path(kind, table)
+
+
 def build(
     findings: list[DriftFinding],
     snap: Snapshot,
@@ -60,6 +82,8 @@ def build(
     view: DbtProjectView | None,
     *,
     pii_overrides: PIIOverrideMatcher | None = None,
+    placement: PlacingProject | None = None,
+    definitions: ProjectDefinitions | None = None,
 ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
     """Map findings to proposals and plan edits. Pure: writes nothing.
 
@@ -71,7 +95,19 @@ def build(
 
     ``pii_overrides`` carries the config's reviewed non-PII column paths, so a
     drift-added column a human already cleared is not re-flagged into the
-    scaffolded meta."""
+    scaffolded meta.
+
+    ``placement`` is the format answering where each edit lands. ``None`` keeps
+    the dbt scaffold convention this module hard-coded before the seam existed,
+    so a caller that does not pass one is unaffected.
+
+    ``definitions`` is the format answering what the project *declares*, which is
+    the question a file's bytes cannot answer. A model may declare a composite
+    grain, and a column-level ``unique`` on one of its members then asserts
+    something the project explicitly does not claim: dbt runs both tests and the
+    new one fails every build forever, while a format that resolves the two the
+    way dbt's semantics imply discards it. Neither is an edit worth proposing, so
+    without this the module could only propose it and hope."""
 
     proposals: list[Proposal] = []
     edits: list[PlanEdit] = []
@@ -79,24 +115,39 @@ def build(
 
     schema_patches: dict[str, list[DriftFinding]] = {}
     definition_churn = False
+    orphan_identifiers: list[str] = []
     for finding in findings:
         if finding.axis == "schema" and finding.code in _PATCHABLE:
             schema_patches.setdefault(finding.identifier, []).append(finding)
-        elif finding.code.startswith("definition_"):
+        elif finding.code.startswith("definition_") or finding.code.startswith(
+            "model_"
+        ):
+            # A model added, removed, or content-changed is the project's own
+            # edit, the same as a semantic definition changing: there is no
+            # warehouse-side fix to propose, only a baseline to catch up.
             definition_churn = True
         else:
+            if finding.code == "orphan_relation":
+                orphan_identifiers.append(finding.identifier)
             proposals.append(_advisory(finding))
 
     for identifier, table_findings in sorted(schema_patches.items()):
         table = identifier.rsplit(".", 1)[-1]
         base = _base_dataset(identifier, cache, snap)
-        model_path = f"models/staging/stg_{table}.sql"
-        if view is None or base is None or model_path not in view.files:
+        model_path = _placed(placement, EditKind.MODEL_SQL, table)
+        if (
+            view is None
+            or base is None
+            or model_path is None
+            or (model_path not in view.files)
+        ):
             reason = (
                 "this project format cannot receive edits"
                 if view is None
                 else "no profiled baseline to rebuild from"
                 if base is None
+                else "this project format has nowhere for a staging model to land"
+                if model_path is None
                 else f"no dex-scaffolded staging model at {model_path}"
             )
             proposals.extend(
@@ -116,6 +167,32 @@ def build(
             continue
         patched = _patched_dataset(base, table_findings, pii_overrides or set())
         table_edits = model_edits(patched)
+        # The scaffold generates both the path and the dbt SQL inside it, so a
+        # format that places a staging model somewhere else would receive dbt
+        # content written to a path the generator did not agree to. Placement
+        # alone cannot close this channel; authoring the content is the larger
+        # design the seam deliberately does not attempt. Refuse rather than
+        # write the mismatch, and say which of the two is missing.
+        misplaced = any(
+            edit.path != _placed(placement, edit.kind, table) for edit in table_edits
+        )
+        if misplaced:
+            proposals.extend(
+                Proposal(
+                    axis="schema",
+                    kind="advisory",
+                    finding_code=finding.code,
+                    identifier=identifier,
+                    column=finding.column,
+                    action=(
+                        "this project format places a staging model somewhere "
+                        "dex cannot author one for it; re-scaffold "
+                        f"stg_{table} wherever that model is defined"
+                    ),
+                )
+                for finding in table_findings
+            )
+            continue
         edits.extend(table_edits)
         changes = ", ".join(
             f"{f.code.replace('_', ' ')} ({f.column})" for f in table_findings
@@ -135,15 +212,24 @@ def build(
             )
         )
 
-    grain_edits, grain_warnings = _grain_test_edits(proposals, view)
+    grain_edits, grain_warnings = _grain_test_edits(
+        proposals, view, placement, definitions
+    )
     edits.extend(grain_edits)
     warnings.extend(grain_warnings)
 
     if definition_churn:
         warnings.append(
-            "definition changes since the baseline are recorded but not "
-            "reconciled: if the current definitions are intended, re-run "
-            "`maintain snapshot` to accept them as the new baseline"
+            "definition or model changes since the baseline are recorded but "
+            "not reconciled: if the current project state is intended, "
+            "re-run `maintain snapshot` to accept it as the new baseline"
+        )
+    if len(orphan_identifiers) > 1:
+        warnings.append(
+            f"{len(orphan_identifiers)} orphan relations found this run; once "
+            "you've confirmed none are read, drop them together in one "
+            "governed pass: dbt run-operation drop_orphan_relations --args "
+            f"'{_run_operation_args(orphan_identifiers)}'"
         )
     return proposals, edits, warnings
 
@@ -151,11 +237,15 @@ def build(
 # --- helpers -------------------------------------------------------------------
 
 
+def _run_operation_args(identifiers: list[str]) -> str:
+    """The ``--args`` payload for ``dbt run-operation drop_orphan_relations``."""
+
+    relations = ", ".join(f'"{identifier}"' for identifier in identifiers)
+    return f"{{relations: [{relations}], dry_run: false}}"
+
+
 def _advisory(finding: DriftFinding) -> Proposal:
     if finding.code == "orphan_relation":
-        drop_statement = finding.data.get(
-            "drop_statement", f"DROP TABLE {finding.identifier};"
-        )
         return Proposal(
             axis=finding.axis,
             kind="advisory",
@@ -164,8 +254,12 @@ def _advisory(finding: DriftFinding) -> Proposal:
             column=finding.column,
             action=(
                 "no dbt model or source declares this relation anymore; once "
-                "you've confirmed nothing reads it, drop it by hand (dex "
-                f"never executes this): {drop_statement}"
+                "you've confirmed nothing reads it, drop it through the "
+                "governed macro (dex never executes this itself): scaffold "
+                "it with `transform macro drop_orphan_relations` if the "
+                "project does not have it yet, then run dbt run-operation "
+                "drop_orphan_relations --args "
+                f"'{_run_operation_args([finding.identifier])}'"
             ),
         )
     actions = {
@@ -189,9 +283,20 @@ def _advisory(finding: DriftFinding) -> Proposal:
             "check the load or pipeline; if the new volume is expected, re-run "
             "`explore map` and `maintain snapshot` to accept it"
         ),
+        # No promise of a test here. `_grain_test_edits` runs after this and
+        # declines on five separate paths, so a clause asserting an edit would be
+        # false on most of them; it appends the clause itself where it does emit
+        # one.
         "key_lost_uniqueness": (
             "decide: dedup upstream, change the declared grain, or accept the "
-            "duplicates; the unique test keeps the break visible in builds"
+            "duplicates"
+        ),
+        "declared_grain_not_unique": (
+            "the project asserts a grain the data does not have, so this is a "
+            "declaration to fix rather than drift to absorb: widen the "
+            "combination to the real grain, dedup upstream, or drop the claim. "
+            "dex proposes no edit, because narrowing or widening a declared "
+            "grain is choosing one"
         ),
         "join_orphans_increased": (
             "investigate the upstream load; a dbt `relationships` test would "
@@ -275,17 +380,29 @@ def _patched_dataset(
     return patched
 
 
+#: Appended to a key_lost_uniqueness action only where a test edit is actually
+#: in the plan. Kept here rather than in `_advisory`'s table because the two run
+#: in that order and only this side knows the answer.
+_TEST_EDIT_CLAUSE = "; the unique test keeps the break visible in builds"
+
+
 def _grain_test_edits(
-    proposals: list[Proposal], view: DbtProjectView | None
+    proposals: list[Proposal],
+    view: DbtProjectView | None,
+    placement: PlacingProject | None = None,
+    definitions: ProjectDefinitions | None = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Back key_lost_uniqueness proposals with a `unique` test edit when the
-    scaffolded YAML exists and does not already alert. The duplicates
-    themselves stay a human decision; the edit only makes the break visible.
+    scaffolded YAML exists, does not already alert, and the project does not
+    declare a composite grain over that column. The duplicates themselves stay a
+    human decision; the edit only makes the break visible.
 
-    Every path out of this that produces no edit says so in ``warnings``. The
-    proposal itself survives either way, so a silent skip here would leave a
-    reader looking at a `key_lost_uniqueness` proposal with no test edit and no
-    way to tell whether dex declined or failed."""
+    Every path out of this that produces no edit says so in ``warnings``, and the
+    action string gains its "the unique test keeps the break visible" clause only
+    where an edit was produced. The proposal itself survives either way, so a
+    silent skip would leave a reader looking at a `key_lost_uniqueness` proposal
+    with no test edit and no way to tell whether dex declined or failed, and an
+    unconditional promise would tell them an edit landed when none did."""
 
     if view is None:
         return [], []
@@ -296,7 +413,14 @@ def _grain_test_edits(
         if proposal.finding_code != "key_lost_uniqueness" or proposal.column is None:
             continue
         table = (proposal.identifier or "").rsplit(".", 1)[-1]
-        path = f"models/staging/stg_{table}.yml"
+        path = _placed(placement, EditKind.SCHEMA_YML, table)
+        if path is None:
+            warnings.append(
+                f"this project format has nowhere for a test on {proposal.identifier} "
+                "to land, so the lost unique key has no test edit; add a `unique` "
+                "test wherever that model is defined"
+            )
+            continue
         source = view.files.get(path)
         if source is None:
             warnings.append(
@@ -312,18 +436,75 @@ def _grain_test_edits(
             continue
         if not isinstance(parsed, dict):
             continue
+        # The convention leaks through content as well as through paths, and
+        # placement only closes the path half. This matched `stg_{table}` inside
+        # the YAML, so a format that placed the file correctly and names its
+        # model `orders` was still missed, silently, one line before the edit.
+        #
+        # The model is named after the file the format chose. For dbt that is the
+        # same string it always matched, because the scaffold path is
+        # `models/staging/stg_{table}.yml` and its stem is `stg_{table}`; for a
+        # format placing `declarations/orders.yml` it is `orders`. The format
+        # already answered "where does this table's declaration live", and this
+        # reads the answer instead of asserting dbt's spelling over it. A format
+        # that packs many models into one file finds no entry and is warned
+        # below, which is a refusal to guess rather than a wrong write.
+        declared = PurePosixPath(path).stem
         entry = next(
             (
                 column
                 for model in parsed.get("models") or []
-                if isinstance(model, dict) and model.get("name") == f"stg_{table}"
+                if isinstance(model, dict) and model.get("name") == declared
                 for column in model.get("columns") or []
                 if isinstance(column, dict) and column.get("name") == proposal.column
             ),
             None,
         )
-        if entry is None or "unique" in (entry.get("tests") or []):
-            continue  # already alerting (or no scaffolded column entry to extend)
+        if entry is None:
+            # Split from the "already alerting" skip below, which is silent
+            # because it is correct. This one is a miss: the file resolved and
+            # the column entry did not, and a reader looking at the proposal
+            # would otherwise have no way to tell that from dex declining.
+            warnings.append(
+                f"{path} declares no column '{proposal.column}' under a model "
+                f"named '{declared}', so the lost unique key on "
+                f"{proposal.identifier} has no test edit; add a `unique` test "
+                "there by hand"
+            )
+            continue
+        if "unique" in (entry.get("tests") or []):
+            continue  # already alerting
+        composite, unresolved = _declared_grain(definitions, declared, proposal.column)
+        if unresolved:
+            # Not a decline: nothing established that a composite covers this
+            # column, so the edit stands. What is missing is the confidence, and
+            # a reader deciding whether to apply the diff should know the check
+            # could not run rather than read silence as a clean answer.
+            warnings.append(
+                f"the project's declarations for '{declared}' could not be read "
+                f"({unresolved}), so the `unique` test proposed on "
+                f"{proposal.identifier}.{proposal.column} was not checked against "
+                "a declared composite grain; confirm the model's grain before "
+                "applying"
+            )
+        elif composite is not None:
+            # The edit would assert a grain the project does not claim. dbt runs
+            # a column-level `unique` and a `unique_combination_of_columns`
+            # independently, so it would fail every build from here on and could
+            # only go green by changing the declared grain; a format resolving the
+            # two as dbt's semantics imply discards it instead. Proposing it and
+            # letting the format sort it out is how a plan comes back
+            # `conflicts=0` having changed nothing.
+            warnings.append(
+                f"'{declared}' declares a composite grain "
+                f"({', '.join(composite)}), so no column-level `unique` is "
+                f"proposed on {proposal.column}: the project never claimed that "
+                "column is unique on its own. Either the composite is still the "
+                "grain, in which case re-run `explore map` and `maintain "
+                f"snapshot` to re-baseline, or something downstream relied on "
+                f"{proposal.column} alone and that assumption is now false"
+            )
+            continue
         entry.setdefault("tests", []).append("unique")
         edits.append(
             PlanEdit(
@@ -333,4 +514,39 @@ def _grain_test_edits(
             )
         )
         proposal.paths.append(path)
+        proposal.action += _TEST_EDIT_CLAUSE
     return edits, warnings
+
+
+def _declared_grain(
+    definitions: ProjectDefinitions | None, model: str, column: str
+) -> tuple[list[str] | None, str | None]:
+    """The declared composite grain of ``model`` covering ``column``, or why the
+    question could not be answered.
+
+    Matching is by model name against the name the placed file gave, the same
+    answer the caller already took the file's own word for, so the two halves of
+    the check cannot disagree about which model this is. Returning the columns
+    rather than a boolean is deliberate: the warning has to name the combination,
+    because that is the fact that tells an operator whether to re-baseline or to
+    go looking for what relied on the column alone.
+    """
+
+    # `None` is a caller that did not ask for the check, and is silent for the
+    # same reason `placement=None` is: an optional argument left out must not
+    # change what an existing caller sees. An *absent* project is different. The
+    # caller only reaches here holding a loaded view, so a format that answers
+    # "nothing readable" on the declarations channel while handing over that view
+    # is contradicting itself, and the operator is about to apply an edit decided
+    # on the half that came back empty.
+    if definitions is None:
+        return None, None
+    if not definitions.present:
+        return None, "the project format reported no readable project"
+    target = column.lower()
+    for composite in definitions.declared_composite_keys:
+        if composite.model != model:
+            continue
+        if target in {c.lower() for c in composite.columns}:
+            return list(composite.columns), None
+    return None, None

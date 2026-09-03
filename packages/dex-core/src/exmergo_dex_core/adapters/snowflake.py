@@ -41,18 +41,32 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     name_list,
     scope_within,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "compute_time"
 DIALECT = "snowflake"
+
+_BIGINT_TYPE = "BIGINT"
 
 # Snowflake keeps a read-only INFORMATION_SCHEMA in every database and an
 # account-internal SNOWFLAKE database. Neither is ever a source, and neither may
@@ -124,6 +138,14 @@ def _regexp_predicate(qcol: str, pattern: str) -> str:
     return f"RLIKE({qcol}, '{pattern}')"
 
 
+def _date_trunc_expr(qcol: str, unit: str) -> str:
+    return f"DATE_TRUNC('{unit}', {qcol})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
+    return f"DATEDIFF({unit}, {earlier}, {later})"
+
+
 class SnowflakeConnectionError(ConnectorError):
     """Raised when the pinned warehouse (or a queried object) cannot be
     resolved. The message always names the fix, never a credential."""
@@ -179,6 +201,11 @@ class SnowflakeAdapter:
         # confirmed run share table facts, and each SHOW is free but a
         # round-trip.
         self._objects: dict[str, dict] = {}
+        # Row counts learned from a profiling aggregate, which for a view is the
+        # only count there is: SHOW TABLES maintains none. Supersedes the SHOW
+        # figure for the rest of the command, so uniqueness proofs and grain
+        # verdicts compare against rows that were counted rather than reported.
+        self._exact_rows: dict[str, int] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
         self._inventory_loaded = False
         self._resolved_scopes: list[str] | None = None
@@ -213,7 +240,7 @@ class SnowflakeAdapter:
         cost = self.cost_gate.cost()
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if self.target.warehouse:
             info = self._warehouse()
@@ -313,14 +340,13 @@ class SnowflakeAdapter:
         name = row.get("table_name") or row.get("name")
         return f"{row['database_name']}.{row['schema_name']}.{name}"
 
-    @staticmethod
-    def _object_meta(entry: dict) -> ObjectMeta:
+    def _object_meta(self, entry: dict) -> ObjectMeta:
         return ObjectMeta(
             identifier=entry["identifier"],
             object_type=entry["object_type"],
             schema=entry["schema"],
             name=entry["name"],
-            row_count=entry["row_count"],
+            row_count=self._exact_rows.get(entry["identifier"], entry["row_count"]),
             byte_size=entry["byte_size"],
             column_count=entry["column_count"],
         )
@@ -733,21 +759,41 @@ class SnowflakeAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         meta, _ = self.table_metadata(identifier)
         sample_percent = self._sample_percent(identifier, meta.byte_size)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, sample_percent=sample_percent
+                identifier,
+                batch,
+                safe,
+                shape,
+                type_req,
+                key_shape_req,
+                temporal_req,
+                sample_percent=sample_percent,
             )
             rows, labels = self._execute(
                 sql, estimate=self._scan_seconds(meta.byte_size)
             )
             values = dict(zip(labels, rows[0], strict=True))
+            if sample_percent is None:
+                # The batch counted the table exactly, and for a view that is the
+                # only count available: capture it so the metadata re-read after
+                # this scan can hand it to the probes that decline to run without
+                # a row count. Not under sampling, where the count is the
+                # sample's rather than the table's.
+                self._exact_rows[identifier] = int(values["n_total"])
             results.extend(
                 self._read_aggregates(values, plan, sampled=sample_percent is not None)
             )
@@ -772,18 +818,24 @@ class SnowflakeAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
+        key_shape_req: set[str],
+        temporal_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape fractions only where requested. Pure (no
-        # connection), so the SELECT-only property is testable offline.
-        # Semi-structured columns get the non-null count only
-        # (APPROX_COUNT_DISTINCT and MIN/MAX are invalid or meaningless on
-        # them).
+        # and value-shape/type-contradiction/key-shape/temporal-continuity
+        # fractions only where requested. Pure (no connection), so the
+        # SELECT-only property is testable offline. Semi-structured columns
+        # get the non-null count only (APPROX_COUNT_DISTINCT and MIN/MAX are
+        # invalid or meaningless on them).
+        source = self._quote(identifier)
+        if sample_percent is not None:
+            source += f" SAMPLE SYSTEM ({sample_percent})"
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             nested = self._is_nested(col.data_type)
@@ -798,10 +850,49 @@ class SnowflakeAdapter:
             wants_shape = (col.name in shape) and not nested
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
-        source = self._quote(identifier)
-        if sample_percent is not None:
-            source += f" SAMPLE SYSTEM ({sample_percent})"
+            wants_type = (col.name in type_req) and not nested
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            wants_key_shape = (col.name in key_shape_req) and not nested
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = (col.name in temporal_req) and not nested
+            if wants_temporal:
+                select_parts.extend(
+                    temporal_alignment_expressions(qcol, i, _date_trunc_expr)
+                )
+                for unit in temporal_units_for(col.data_type):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol,
+                            i,
+                            unit,
+                            source,
+                            _date_trunc_expr,
+                            _date_diff_expr,
+                        )
+                    )
+            plan.append(
+                (
+                    i,
+                    col,
+                    wants_distinct,
+                    wants_min_max,
+                    wants_shape,
+                    wants_type,
+                    wants_key_shape,
+                    wants_temporal,
+                )
+            )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         sql = f"SELECT {', '.join(select_parts)} FROM {source}"  # noqa: S608
@@ -814,13 +905,22 @@ class SnowflakeAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
+        for (
+            i,
+            col,
+            wants_distinct,
+            wants_min_max,
+            wants_shape,
+            wants_type,
+            wants_key_shape,
+            wants_temporal,
+        ) in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -854,6 +954,9 @@ class SnowflakeAdapter:
                         values, f"sp_{i}", wants_shape
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(values, i, wants_type),
+                    **key_shape_aggregate_kwargs(values, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
                 )
             )
         return aggregates
@@ -894,33 +997,33 @@ class SnowflakeAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
             return {}
         meta, _ = self.table_metadata(identifier)
-        estimate = self._scan_seconds(meta.byte_size) * len(combinations)
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        unit = self._scan_seconds(meta.byte_size)
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix),
+            self.cost_gate.try_charge,
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1046,12 +1149,7 @@ class SnowflakeAdapter:
         of the budget, so even a wrong heuristic cannot overrun the ceiling."""
 
         info = self._warehouse()  # refuses when config pins no warehouse
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one warehouse-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         cursor = self._conn.cursor()
         if not self._session_prepared:
             # dex-built session statements, not agent SQL: the warehouse
@@ -1097,7 +1195,13 @@ class SnowflakeAdapter:
                 f"query exceeded {timeout_seconds:g}s and was cancelled; "
                 "narrow it (tighter filter, fewer columns) and retry"
             )
-        return exc
+        # Everything else the server refused (a compilation error, a missing
+        # grant, an unsupported construct). Typed, so the envelope carries
+        # `execution_failure` and Snowflake's own words rather than the
+        # `internal` an untyped driver exception falls through to. No separate
+        # code: the driver already prefixes its message with the error number
+        # and the SQLSTATE.
+        return warehouse_refusal(message)
 
     @staticmethod
     def _description_type(description: Any) -> str:

@@ -636,3 +636,63 @@ def test_diagram_without_a_cache_refuses_as_a_prerequisite_naming_the_fix(
     )
     assert payload["reason"] == "prerequisite"
     assert "explore map" in payload["errors"][0]
+
+
+# --- a join the semantic layer declares (#361) --------------------------------
+
+
+def test_a_semantic_edge_names_the_entity_it_came_from():
+    """A solid line has two possible sources and a reader cannot tell them apart
+    from the glyph, so the one that carries a lookupable name says it.
+
+    `explore semantic list` is where that name resolves, which is what makes the
+    label actionable rather than decorative.
+    """
+
+    cache = _star(
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declared_by="semantic entity 'customer'",
+    )
+
+    line = _edge_line(render_er_mermaid(cache).mermaid)
+
+    assert "declared: semantic entity 'customer'" in line
+    # Solid, like any declared edge: the layer states this join.
+    assert "--" in line and ".." not in line
+
+
+def test_a_semantic_edge_still_may_not_claim_exactly_one_without_proof():
+    """A primary entity is the layer's claim, and the diagram's rule is that the
+    *cache* must have proven the parent key unique before a crow's foot says
+    "exactly one". Semantic edges inherit that unchanged, which is the whole
+    reason they could be admitted at the declared tier without loosening
+    anything.
+    """
+
+    cache = _star(
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declared_by="semantic entity 'customer'",
+    )
+    parent = next(d for d in cache.datasets if d.identifier.endswith("customers"))
+    parent.candidate_keys = []
+    parent.columns[0].is_unique = None
+
+    line = _edge_line(render_er_mermaid(cache).mermaid)
+
+    assert line.startswith("customers }o--")
+
+
+def test_an_inferred_edge_carries_no_declaration():
+    line = _edge_line(render_er_mermaid(_star(confidence=0.62)).mermaid)
+
+    assert "semantic entity" not in line
+    assert "inferred 0.62" in line
+
+
+def test_the_legend_names_both_sources_of_a_solid_line():
+    mermaid = render_er_mermaid(_star(kind=RelationshipKind.DECLARED)).mermaid
+
+    legend = next(line for line in mermaid.splitlines() if "solid lines" in line)
+    assert "relationships test" in legend and "semantic-layer entity" in legend

@@ -30,6 +30,5 @@ your report; a sanitized reproduction is enough.
 
 ## Supported versions
 
-dex is in early, pre-release development. Security fixes are applied to the
-latest published version only. Pin to a released version and upgrade promptly
-when a security release is announced.
+Security fixes are applied to the latest published version only. 
+Pin to a released version and upgrade promptly when a security release is announced.

@@ -11,6 +11,8 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
+from .conftest import assert_ok, integration_budget
+
 pytestmark = [pytest.mark.integration, pytest.mark.bigquery]
 
 PUBLIC_DATASETS = [
@@ -25,6 +27,7 @@ def seed_repo(root: Path, project: str, datasets: list[str] | None = None) -> No
         yaml.safe_dump(
             {
                 "connector": "bigquery",
+                "budget": integration_budget(),
                 "bigquery": {
                     "project": project,
                     "datasets": datasets if datasets is not None else PUBLIC_DATASETS,
@@ -47,7 +50,7 @@ def test_connect_test_discovers_adc_and_reports_read_only(
 ):
     seed_repo(tmp_path, bq_project)
     rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["connector"] == "bigquery"
     assert data["dialect"] == "bigquery"

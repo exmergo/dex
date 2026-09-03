@@ -17,6 +17,16 @@ estimate is the size signal that feeds ranking. This pass is what makes selectiv
 drill-down possible: you cannot rank what you have not listed, and you should not
 scan what you have not yet decided is worth scanning.
 
+The row count is an estimate where the catalog keeps one and unknown where it does
+not, and the two are never collapsed into each other. A warehouse maintains no
+count for a view, and BigQuery maintains none for an external table either;
+several report that as a zero, which is why the count is decided from the object's
+kind rather than taken at face value. Unknown means the size signal cannot
+participate, so an uncounted object ranks as if it were small until something
+counts it. Empty means the object holds nothing, which is a finding. Reading the
+first as the second was how an external table over object storage came to be
+reported as an empty table with correct column statistics beside the claim.
+
 ## Ranking: turn a list into a shortlist
 
 Ranking scores every object in [0, 1] from cheap signals so attention goes to the
@@ -59,10 +69,16 @@ pair can only be a key if the product of its members' distinct counts reaches th
 row count, so pairs are pruned on that necessary condition using the counts
 already in hand, then ranked (id-shaped members first, smallest product next) and
 capped to a few probes issued as one exact distinct-combination statement. A pair
-whose combination count equals the row count is a proven composite key: it enters
-the candidate keys and, absent any single-column key, becomes the reported grain.
-On metered connectors the probe spends only inside the already-confirmed budget
-and skips with an explanatory note when the remaining budget cannot cover it.
+that reuses a column from a better-ranked pair at a similar product is the same
+hypothesis with different filler, so it ranks behind every pair that is not, but
+it is never removed from the running: the cap is the spend guard, and while it
+has room a discarded candidate costs a grain and saves nothing. A pair whose
+combination count equals the row count is a proven composite key: it enters the
+candidate keys and, absent any single-column key, becomes the reported grain,
+smallest product first so the tightest proven key is the one reported. On metered
+connectors the probe spends only inside the already-confirmed budget, narrowing to
+the best-ranked pairs the budget covers, and skipping with an explanatory note
+only when it cannot cover one.
 
 Two safety rules are enforced at the source, in the SQL that is generated:
 
@@ -111,8 +127,13 @@ matched.
 
 Relationship inference reads the profiles already gathered and never scans data to
 verify referential integrity, so it stays free and read-only at the cost of
-certainty, which is why every inferred join carries a confidence. A join is
-proposed when a foreign-key-shaped column name matches a parent object whose
+certainty, which is why every inferred join carries a confidence. The opt-in
+verification pass is the one place joins are measured, and it batches: the joins
+sharing a child relation are answered by one read of it, so what verification
+costs follows the relations it touches rather than the number of joins between
+them.
+
+A join is proposed when a foreign-key-shaped column name matches a parent object whose
 corresponding column is a candidate key and the types are compatible; confidence
 reflects how strong the name and key signals are. Candidate keys and the most
 likely grain come from the uniqueness signals: single columns proven unique, plus
@@ -121,6 +142,18 @@ preferred as the grain, and a member of a composite key is never treated as
 unique on its own. Declared joins come
 from the dbt project when one is present; absent a dbt project, declared joins are
 simply empty, which is expected because explore is designed to work without one.
+
+A project's declarations refine those verdicts without entering them. A declared
+grain fills in where measurement found none, and is noted where it disagrees, but
+a measurement-proven single column still wins the reported grain and the candidate
+keys stay measurement-only: an unmeasured declared key is a claim, and the cache is
+a drift baseline rather than a record of what the project asserts. The consequence
+is that a declared grain needs verifying somewhere else, which is what `maintain
+grain` does with it, and why that axis reports two different things about
+uniqueness. A key measurement proved unique that no longer is has a before and an
+after, so it lapsed. A declared combination that does not hold has neither: nothing
+changed, the project is asserting a grain the data never had, and the fix is to the
+declaration rather than to the data.
 
 ## The draft map: composing and persisting
 

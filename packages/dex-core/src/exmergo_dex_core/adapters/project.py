@@ -64,15 +64,23 @@ from ..maintain import snapshot
 if TYPE_CHECKING:
     from ..dbt_project import DbtProjectView, ProjectDefinitions
     from ..maintain.snapshot import SemanticLayer, TransformLayer
+    from ..semantic_catalog import SemanticCatalogView
+    from ..transform.plans import EditKind
 
 __all__ = [
     "DbtProject",
     "EditableProject",
     "ExploreProject",
     "MaintainProject",
+    "PlacingProject",
     "ProjectAdapter",
     "ProjectContext",
     "ProjectFactory",
+    "ProjectView",
+    "SemanticCatalogProject",
+    "SourceFileView",
+    "placement_gap",
+    "semantic_catalog_gap",
     "tier_of",
 ]
 
@@ -133,16 +141,70 @@ class MaintainProject(ExploreProject, Protocol):
 
 
 @runtime_checkable
+class SemanticCatalogProject(Protocol):
+    """Optional beside tier 2: the semantic layer as a catalog a caller reads.
+
+    Tier 2's :meth:`MaintainProject.semantic_layer` is a *fingerprint*: a content
+    hash per definition plus the physical column behind each field, sized for
+    detecting drift and persisted as a baseline. It deliberately reduces away
+    everything a reader wants and a comparison does not, which is types, labels,
+    descriptions, aggregations, metric composition, and the token a query actually
+    groups by. Hashing what the author wrote rather than what a compiler produced
+    is what keeps a baseline stable across tool upgrades, so widening it to serve
+    reads would cost the property it exists for.
+
+    So this is a second channel over the same layer, not a widening of the first.
+    ``explore semantic list --local`` reads it, which is how the local catalog
+    stops re-parsing the dbt artifacts a format was supposed to hide and becomes
+    a read any format can answer.
+
+    **Beside tier 2 rather than a third member of it**, following
+    :class:`PlacingProject`. The tiers are satisfied structurally, so adding a
+    member to ``MaintainProject`` would silently drop every format that already
+    implements the two existing ones to tier 1, and ``maintain`` would degrade to
+    "cannot be a drift baseline" for a format that is one. A capability a format
+    may decline belongs in its own protocol, where declining it is an answer
+    rather than a regression.
+
+    Declining is legitimate: a project format with no semantic layer implements
+    nothing here and `explore semantic --local` refuses by name instead of
+    returning an empty catalog that reads as a layer with nothing in it.
+    """
+
+    def semantic_catalog(self) -> SemanticCatalogView:
+        """The semantic layer as a read catalog.
+
+        May raise :class:`~..errors.ProjectError`, and should where the layer
+        cannot be read *yet* as opposed to being empty. An uncompiled project and
+        a project that declares no metrics are different answers, and only one of
+        them is fixed by running a command.
+        """
+        ...
+
+
+@runtime_checkable
 class EditableProject(MaintainProject, Protocol):
     """Tier 3: the write path.
 
     Implemented only by formats whose source of truth can actually receive an edit.
-    A project reduced from a running graph cannot: its source of truth is the code
-    that produced the graph, and writing into the reduction would edit an artifact
-    that is regenerated from something else on the next run.
+    The clearest case that cannot is a project reduced from a running graph, where
+    the reduction is not the source of truth: the code that produced the graph is,
+    and writing into the reduction would edit an artifact regenerated from
+    something else on the next run.
 
-    Declining this tier is the honest answer for such a format, and the reason the
-    tiers exist rather than a ``writeback`` flag. ``maintain reconcile`` reads it:
+    **That test is about the artifact an edit would land in, not about where the
+    project came from**, and the two come apart more often than the graph example
+    suggests. A format may reduce a graph for its model list while reading its
+    declared keys, joins and semantics from hand-authored files that nothing
+    regenerates. Those files are a genuine source of truth, they are exactly the
+    shape ``reconcile`` proposes edits to, and a format holding one can reach this
+    tier for that channel while still declining to author a model. Ask which
+    artifact the edit lands in and whether anything rewrites it; do not infer the
+    answer from the project being graph-derived.
+
+    Declining this tier is the honest answer for a format with no such artifact,
+    and the reason the tiers exist rather than a ``writeback`` flag.
+    ``maintain reconcile`` reads it:
     a format that does not satisfy this protocol gets advisory-only proposals and
     no stored plan, which is the behavior a generated tree previously got by
     naming coincidence.
@@ -181,6 +243,188 @@ class EditableProject(MaintainProject, Protocol):
         made while the plan sat in review.
         :class:`~.conformance.EditableProjectContract` asserts the behavior,
         because no shape check can.
+
+        **What comes back has to say what happened.** ``transform apply`` reads
+        ``written`` to decide whether the plan is now applied, and ``conflicts``
+        to decide whether to show a human the divergence and ask. A return that
+        answers neither leaves the caller unable to tell a refused apply from a
+        successful one, and the safe reading of that ambiguity is the wrong one
+        in both directions: a plan marked applied that was not, or a conflict
+        that never reaches the human it was raised for. Return an object exposing
+        ``written`` (the paths that changed, empty when a conflict refused the
+        apply) and ``conflicts`` (what moved under the plan);
+        :class:`~.dbt_project.ApplyResult` is the shipped one and returning it is
+        the easy answer.
+        """
+        ...
+
+
+class SourceFileView(Protocol):
+    """One entry in a project view: the content an edit is pinned against.
+
+    Two members, because two are what the callers read. ``sha256`` is what an
+    edit is pinned to at plan time and re-checked against at apply time, so a
+    view that omits it hashes every existing file as absent, which renders a
+    one-line change as a whole-file create and turns the next apply into a
+    conflict on a file nobody touched. ``content`` is what the diff is built
+    against and what ``reconcile`` reads before it extends a declaration.
+
+    A format is free to carry more (the shipped ``SourceFile`` also carries its
+    own ``path``); nothing here reads it.
+    """
+
+    content: str
+    sha256: str
+
+
+class ProjectView(Protocol):
+    """What :meth:`PlacingProject.load` returns: the format's keyspace, read once.
+
+    ``files`` is keyed exactly the way :meth:`PlacingProject.edit_path` keys and
+    :meth:`PlacingProject.editing_surface` prefixes. That is the whole point of
+    the type: the three members describe one keyspace, and a format whose view
+    is keyed differently from its placements pins every edit as a create.
+
+    ``root`` is what the plan records as the directory its edits were pinned
+    against, relative to the repository root where that subtraction is possible
+    and verbatim where it is not (``transform.plans`` falls back to the string).
+    A format keyed by a directory returns it; a format keyed by something else
+    returns whatever identifies its root, and the plan carries that.
+
+    **Neither this nor** :class:`SourceFileView` **is** ``runtime_checkable``,
+    and nothing calls ``isinstance`` against them. An isinstance check on a data
+    protocol only asks whether the attribute names exist, which is exactly the
+    check :class:`~.conformance.PlacingProjectContract` makes with a message
+    naming the missing member and what breaks without it. These exist to be
+    read and to annotate, not to gate.
+    """
+
+    root: str
+    files: Mapping[str, SourceFileView]
+
+
+@runtime_checkable
+class PlacingProject(Protocol):
+    """Optional beside tier 3: the keyspace a proposed edit lands in.
+
+    Three members describing one thing: :meth:`load` reads the keyspace,
+    :meth:`edit_path` names a key in it, :meth:`editing_surface` says which
+    region of it the format owns. They are here together because none of them
+    is answerable alone. A key is a key into a view; a surface is a region of
+    the same space; and a view nobody places into is a read dex has no use for
+    on this path.
+
+    Tier 3 says a format *can* receive an edit. It does not say where the edit
+    goes, and ``maintain reconcile`` decides that before it consults the format:
+    both of its mechanical write paths build ``models/staging/stg_<table>.sql``
+    and ``models/staging/stg_<table>.yml`` and then look those up in the view
+    ``load()`` returned. A second format satisfying tier 3 in full is therefore
+    handed edits naming files it does not have, and its only options are to
+    refuse them or to guess a mapping. A wrong guess writes into the wrong file
+    with a hash check that passes, because the file was not there.
+
+    Implementing this says where. It is deliberately not a request to let a
+    format author the edit *content*: reconcile still decides what to write, and
+    a format that cannot accept what reconcile writes says so per kind, below.
+
+    **A protocol rather than a flag, for the reason the tiers are.** A flag is a
+    claim the engine has to interpret and trust. ``isinstance(project,
+    PlacingProject)`` is checkable, and a format that cannot place an edit
+    cannot accidentally claim it can.
+
+    **Separate from** :class:`EditableProject` **rather than methods on it.**
+    The tiers are ``runtime_checkable``, so a method added to tier 3 silently
+    demotes every format that has not implemented it yet: ``tier_of`` would
+    start answering 2 where it answered 3, and the write path would close for
+    exactly the implementers who were already passing. Beside it, the answer for
+    a format that has not implemented this is "tier 3, placement unknown", which
+    is the truth and is what the caller warns about.
+
+    That is also why :meth:`load` is here rather than on tier 3, which is where
+    a reader first looks for it. Nothing calls it outside this path: both
+    callers reach it only for a format that places, so requiring it of tier 3
+    would demote formats that never needed it, to state a requirement that is
+    not theirs. A format holding some of these three and not the others places
+    nothing at all, and :func:`placement_gap` is what names the one that is
+    missing instead of leaving it to surface as ``AttributeError`` from inside
+    a command the tier check already let through.
+    """
+
+    def load(self) -> ProjectView:
+        """Read the project into the keyspace the other two members describe.
+
+        Two callers, and between them they need every member of
+        :class:`ProjectView`. ``transform.plans`` pins each edit to the
+        ``sha256`` of the file at ``files[edit_path(...)]``, and records
+        ``root`` as the directory the plan was pinned against.
+        ``maintain.reconcile`` reads ``files[...].content`` to extend a
+        declaration it is about to propose an edit to, and refuses to guess
+        where the key is absent.
+
+        **Cheap enough to call once per command, and fresh enough to be worth
+        calling.** A project is an artifact a previous command may have just
+        rewritten, so a view cached across commands is a wrong drift report.
+        Memoizing within one instance is the shipped format's answer (see
+        :meth:`DbtProject.load`), and it is a good one precisely because dex
+        builds one project per command.
+
+        Raising is the honest answer when there is no project to read, and the
+        callers handle it: ``reconcile`` turns it into a refusal naming the
+        format. Tier 1 is the channel with the never-raises promise, and this
+        is not it.
+        """
+        ...
+
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        """Where an edit of ``kind`` for ``model`` lives, or ``None``.
+
+        ``model`` is the warehouse table the finding is about, not a model name
+        in any format's vocabulary: the ``stg_`` prefix is dbt's own scaffold
+        convention and applying it here would push that convention through the
+        seam meant to escape it.
+
+        The return is a key into whatever :meth:`EditableProject.load` returns,
+        not a filesystem path. The format already owns that keyspace; reconcile
+        is only guessing keys into it today.
+
+        **``None`` per kind is the point, not a degenerate case.** The kinds are
+        not equally receivable and a format is expected to answer differently
+        across them. The shape this exists for is a format whose models are
+        reduced from a running graph, and so cannot receive an authored
+        ``MODEL_SQL``, while its declared keys and joins are hand-written files
+        that nothing regenerates and can receive a ``SCHEMA_YML`` test. One
+        ``None`` and one path is a complete, honest answer.
+        """
+        ...
+
+    def editing_surface(self) -> list[str]:
+        """The prefixes within which this format's edits may land.
+
+        Placement says where one edit goes. This says which region of the
+        format's keyspace *any* edit may touch, and it exists because the two
+        questions have different callers. ``transform plan`` validates edits an
+        agent authored, so there is no ``(kind, model)`` pair to ask
+        :meth:`edit_path` about and no prior answer to compare against; what it
+        has is a path, and what it needs is whether that path is inside the
+        surface the format admits to owning.
+
+        Containment is a safety property, not a lookup. Writes are confined to a
+        declared surface so a mistaken or adversarial path cannot reach the rest
+        of the repository, and the declaration has to come from the format
+        because only the format knows its own layout. dbt answers with its
+        configured model and macro paths, which is what the engine checked
+        against directly before this seam existed.
+
+        Prefixes are keys into the same space :meth:`edit_path` returns, matched
+        by path segment: ``declarations`` admits ``declarations/orders.yml`` and
+        does not admit ``declarations_backup/orders.yml``. Escapes (absolute
+        paths, ``..``) are refused ahead of this and are not a format's to
+        permit.
+
+        An empty list is a format declaring no editable surface. That is a
+        coherent answer, not a failure, and it refuses every edit rather than
+        admitting all of them: the format is saying it has nowhere for an edit to
+        go, which is the same statement declining tier 3 makes.
         """
         ...
 
@@ -294,6 +538,84 @@ def tier_of(project: object) -> int:
     return 0
 
 
+#: Each :class:`PlacingProject` member, and the one clause that says what dex
+#: cannot do without it. Read by :func:`placement_gap`, which names only the
+#: members a format is actually missing.
+_PLACEMENT_MEMBERS = {
+    "load": (
+        "`load()` returns the view an edit is pinned against: `root`, and "
+        "`files` keyed the way `edit_path` keys, each entry carrying `content` "
+        "and `sha256`"
+    ),
+    "edit_path": (
+        "`edit_path(kind, model)` answers where an edit of that kind for that "
+        "warehouse table lives, or None to decline the kind"
+    ),
+    "editing_surface": (
+        "`editing_surface()` declares the prefixes those paths must stay inside"
+    ),
+}
+
+
+def placement_gap(project: object) -> str | None:
+    """Which :class:`PlacingProject` member a nearly-placing format is missing.
+
+    Placement is satisfied structurally, so a format holding two of the three
+    members places nothing, and the warning its caller would otherwise reach for
+    ("this format does not say where a proposed edit lands") is false of a
+    format that answers ``edit_path`` and cannot be read. Worse, it sends the
+    implementer to the member they already wrote.
+
+    ``None`` in the two cases where there is nothing to add: a format that
+    places has no gap, and a format declaring none of the three is declining
+    placement outright, which is a complete answer the caller already describes.
+
+    This exists because of what the alternative was. A format implementing the
+    declared members and omitting the undeclared one passed the whole
+    conformance suite and then raised ``AttributeError`` on the first real
+    reconcile: after the tier said 3, after the gate let it through, in a
+    command someone ran.
+    """
+
+    if isinstance(project, PlacingProject):
+        return None
+    missing = [
+        member
+        for member in _PLACEMENT_MEMBERS
+        if getattr(project, member, None) is None
+    ]
+    if len(missing) == len(_PLACEMENT_MEMBERS):
+        return None
+    named = getattr(project, "name", type(project).__name__)
+    listed = ", ".join(f"`{member}()`" for member in missing)
+    details = " ".join(f"{_PLACEMENT_MEMBERS[member]}." for member in missing)
+    return (
+        f"the '{named}' project format implements part of PlacingProject and is "
+        f"missing {listed}, so it places no edit at all and every proposal stays "
+        f"advisory. {details}"
+    )
+
+
+def semantic_catalog_gap(project: object) -> str:
+    """Why this format cannot answer a semantic catalog, named rather than implied.
+
+    Reached only when the format does not satisfy
+    :class:`SemanticCatalogProject`, and phrased for the caller that hit it: a
+    reader asked what the layer contains and the format has no channel for the
+    question. It names the member to implement, because the alternative a caller
+    otherwise gets is an empty catalog, which reads as a semantic layer with
+    nothing in it.
+    """
+
+    named = getattr(project, "name", type(project).__name__)
+    return (
+        f"the '{named}' project format does not read a semantic layer, so there "
+        "is no catalog to list; implement `semantic_catalog()` to reach "
+        "exmergo_dex_core.adapters.project.SemanticCatalogProject, or query a "
+        "hosted deployment instead"
+    )
+
+
 class DbtProject:
     """The dbt implementation of the project seam.
 
@@ -367,6 +689,10 @@ class DbtProject:
     def load(self) -> DbtProjectView:
         """Load the project into an in-memory view, once per instance.
 
+        ``DbtProjectView`` is the shipped :class:`ProjectView`: its ``files`` are
+        keyed by the project-relative paths :meth:`edit_path` returns, and its
+        ``SourceFile`` entries are the shipped :class:`SourceFileView`.
+
         Raises ``DbtProjectError`` when there is no project to load, which is what
         every caller of ``dbt_project.load`` already expects. Tier 1 is the channel
         with the never-raises promise.
@@ -399,6 +725,19 @@ class DbtProject:
     def semantic_layer(self) -> SemanticLayer:
         return snapshot.semantic_layer(self.load())
 
+    def semantic_catalog(self) -> SemanticCatalogView:
+        """Read from the compiled artifact directly, without loading the view.
+
+        The one member here that does not go through :meth:`load`, because the
+        catalog lives entirely in ``target/`` and loading would scan and hash
+        every authored file to answer a question none of them can. It also keeps
+        the prerequisite honest: a compiled semantic manifest is what this needs,
+        not a project that parses as a whole.
+        """
+
+        project = self.project_dir or dbt_project.find_project(self.repo_root)
+        return dbt_project.semantic_catalog(Path(project).resolve())
+
     def write_edits(
         self, edits: Any, project_dir: Any = None, *, confirmed: bool = False
     ) -> Any:
@@ -418,3 +757,37 @@ class DbtProject:
             project_dir or self.project_dir or self.repo_root,
             confirmed=confirmed,
         )
+
+    def edit_path(self, kind: EditKind, model: str) -> str | None:
+        """The scaffold convention, which is what reconcile hard-coded before.
+
+        Both kinds resolve, because for dbt both artifacts are the source of
+        truth. A kind reconcile does not propose today returns ``None`` rather
+        than a path this class would be inventing.
+        """
+
+        from ..transform.plans import EditKind as _EditKind
+
+        suffix = {_EditKind.MODEL_SQL: "sql", _EditKind.SCHEMA_YML: "yml"}.get(kind)
+        return None if suffix is None else f"models/staging/stg_{model}.{suffix}"
+
+    def editing_surface(self) -> list[str]:
+        """Everything dbt's own writer accepts: every authored path family, and
+        the four root manifests it admits by name.
+
+        Read rather than assumed: a project that configures ``model-paths`` away
+        from ``models`` moves its editing surface with it, and the containment
+        check has always honored that.
+
+        The root manifests are listed even though they are files rather than
+        regions, because ``transform.plans`` re-checks a stored plan against this
+        declaration before handing it to the writer. A declaration narrower than
+        what the writer accepts is not a modest one: it refuses the project
+        config, the profiles, and the package manifests at apply, every one of
+        which is a path dex authors through a plan. What a format declares here
+        has to be what its writer will take.
+        """
+
+        view = self.load()
+        families = [path for _name, paths in view.path_families() for path in paths]
+        return families + sorted(dbt_project._ALLOWED_ROOT_FILES)

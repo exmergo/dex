@@ -1,6 +1,6 @@
 ---
 name: transform
-description: 'Use this to author and change a dbt project: bootstrap a new dbt project in a repo that has none (`transform init`), write or refactor dbt model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Every change is a reviewable diff to the dbt project; any warehouse build is dev-target only, gated, and cost-surfaced first. Do not use it to explore or profile a warehouse (use explore) or to detect drift and reconcile a project that has fallen out of sync (use maintain).'
+description: 'Use this to author and change a dbt project: bootstrap a project in a repo that has none (`transform init`), write or refactor model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Reach for this rather than editing model files by hand whenever the change spans more than one file or has to stay consistent with the rest of the project: it validates the edit against the real schema before writing, returns the change as a reviewable diff with a plan id, and catches the class of error that only surfaces at `dbt run`, such as wrong column names, broken refs, or a materialization that fights the project config. On a large project that check is worth more than the round trip costs. It applies to bug-fix tickets too: "this model returns wrong numbers, fix it" is a transform task. Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Any warehouse build is dev-target only, gated, and cost-surfaced first. If you do not yet know the source tables'' columns or grain, use explore first, then come back. To reconcile a project that has drifted out of sync with the warehouse, use maintain.'
 ---
 
 # Transform
@@ -14,8 +14,25 @@ writes only to the repo, as reviewable diffs, and runs against a dev target only
 ## How to drive it
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
+
+dex runs its engine through `uv`, which is a prerequisite and is not installed by
+Claude Code. If the shell reports `uv: command not found`, stop and tell the user
+to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
+`brew install uv`, or `pipx install uv`), then re-run. Never fall back to editing
+the dbt project by hand instead: the validation, the diffs, and the dev-target
+gating live in the engine, so any other path is unguarded.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 You author the dbt file content; the engine validates it, computes the diffs,
 and stores the proposal as a plan. Hand content over with `--edits-file <path>`
@@ -25,21 +42,70 @@ and stores the proposal as a plan. Hand content over with `--edits-file <path>`
 {"edits": [
   {"path": "models/staging/stg_orders.sql", "kind": "model_sql", "content": "..."},
   {"path": "models/staging/stg_orders.yml", "kind": "schema_yml", "content": "..."},
+  {"path": "snapshots/snap_orders.sql", "kind": "snapshot_sql", "content": "..."},
+  {"path": "seeds/country_vat.csv", "kind": "seed_csv", "content": "..."},
+  {"path": "tests/assert_totals_reconcile.sql", "kind": "test_sql", "content": "..."},
+  {"path": "analyses/email_skew.sql", "kind": "analysis_sql", "content": "..."},
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
 
 `kind` is `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update|plan`, which imply it), `macro_sql` (a macro file under
-the project's macro paths), `packages_yml`, `project_yml` (the project-root
-`dbt_project.yml`), or `profiles_yml` (the project-root `profiles.yml`). Model
-SQL must be a single read-only SELECT once its jinja is stripped; semantic YAML
-is validated against MetricFlow's schemas, cross-reference-checked, and (when
-dbt is available) parsed by dbt itself before the plan is accepted; a macro file
-must hold only macro definitions and jinja comments. `project_yml` must keep a
-`name`; `profiles_yml` must reference every secret via `{{ env_var('NAME') }}`
-(a literal credential is refused so none reaches the diff), and both config
-kinds are parsed by dbt at plan time.
+the project's macro paths), `snapshot_sql` (a snapshot under the snapshot
+paths), `seed_csv` (a seed's CSV under the seed paths), `test_sql` (a singular
+test or a generic test definition under the test paths), `analysis_sql` (SQL dbt
+compiles but never runs, under the analysis paths), `packages_yml`,
+`project_yml` (the project-root `dbt_project.yml`), or `profiles_yml` (the
+project-root `profiles.yml`). Model SQL must be a single read-only SELECT once
+its jinja is stripped; semantic YAML is validated against MetricFlow's schemas,
+cross-reference-checked, and (when dbt is available) parsed by dbt itself before
+the plan is accepted; a macro file must hold only macro definitions and jinja
+comments. A snapshot must hold exactly one `{% snapshot %}` block whose
+`config()` names a `unique_key` and a `strategy` of `timestamp` (with
+`updated_at`) or `check` (with `check_cols`), and whose body is a single
+read-only SELECT. A seed must parse as CSV with a named, duplicate-free header
+and one field per column on every row, and stays under 5,000 data rows and 1 MiB
+(past that it is data rather than a lookup: load it into the warehouse and
+`source()` it). A `test_sql` file is read to decide which of the two shapes
+sharing the test paths it is: one holding `{% test %}` blocks is a generic test
+definition and must hold only those and jinja comments, balanced; anything else
+is a singular test and must be a single read-only SELECT. A singular test that
+names no `ref()` or `source()` is warned about, not refused, because it runs
+against nothing and passes unconditionally. An analysis must be a single
+read-only SELECT too, even though dbt only compiles it. `project_yml` must keep
+a `name`; `profiles_yml` must reference
+every secret via `{{ env_var('NAME') }}` (a literal credential is refused so
+none reaches the diff). Config kinds, snapshots and seeds are all parsed by dbt
+at plan time.
+
+Each kind is confined to its own family of paths, and filing one in the wrong
+family is refused naming both fixes. `schema_yml` is the exception, accepted
+beside a model, a snapshot, a seed, a test or an analysis, because that is where
+dbt expects a snapshot's tests, a seed's column types, a singular test's severity
+and an analysis's description declared.
+
+**Three things here are called a test, and they are not interchangeable.**
+Generic tests are declared inside a `schema.yml` (`data_tests:` on a model or a
+column). Unit tests come from `transform test --scaffold <model>`, which writes a
+`unit_tests:` block, also `schema_yml`. Singular tests and generic test
+*definitions* are files under `test-paths`, and `test_sql` is the kind for those.
+
+**A seed puts values, not logic, into a diff, and a diff goes into git and stays
+there.** So a seed whose header names a column that looks like personal data is
+refused, and the refusal names the `pii_overrides` entry in `.dex/config.yml`
+that a human can add to clear it. Detection reads names and types and never
+values (everywhere in dex), so it cannot see personal data hiding under a
+neutral column name: do not build a seed out of warehouse rows you have not
+looked at.
+
+`dbt build` runs seeds, snapshots and singular tests natively, so `transform
+build` after an apply is all it takes; there is no separate seed or test step. A
+snapshot writes a table and a test runs a scanning SELECT, so both are priced in
+the cost handshake; a seed scans nothing and an analysis is never built at all,
+so neither is. A singular test and an analysis build no relation and nothing can
+`ref()` either, so neither is a node: neither enters `maintain`'s drift baseline,
+and deleting one raises no dangling-reference guard.
 
 `op` is `upsert` (the default: create or update, carrying `content`) or
 `delete` (remove the file, no `content`). A delete is a first-class reviewable
@@ -52,6 +118,11 @@ point at it, all together) so the post-change project is validated as one unit.
 An unconfirmed delete against a file a human edited after planning surfaces as
 `needs_confirmation`, never a silent removal.
 
+For a rename or a removal, reach for `transform rename` / `transform remove`
+instead of assembling the edits yourself. They generate the whole change from the
+reference graph and refuse when they cannot promise it is complete, which is the
+guarantee hand-assembly cannot give you.
+
 ### Bootstrapping a project
 
 If no dbt project exists in the repo, offer `transform init` before anything
@@ -59,7 +130,7 @@ else: `transform plan` needs a project to edit. Ask the user for the project
 name and **confirm the connector with them**, then run:
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" transform init "<name>" --connector <c>
 ```
 
 The engine renders the whole skeleton (`dbt_project.yml`, `models/staging/` and
@@ -69,7 +140,7 @@ records `connector`, `dbt_project_dir`, and `dbt_target: dev` in
 connector: it errors rather than defaulting, so always pass the user's confirmed
 choice (a `connector:` already committed in `.dex/config.yml` also counts).
 Every connector is supported: DuckDB, BigQuery, Snowflake, Databricks,
-Postgres, and Redshift. DuckDB needs a warehouse path (`--path`, or the
+Postgres, Redshift, and ClickHouse. DuckDB needs a warehouse path (`--path`, or the
 `duckdb.path` config). BigQuery needs a GCP project (usually
 `bigquery.project` in `.dex/config.yml`; confirm it with the user) and writes
 builds to a dedicated dev dataset (`bigquery.dev_dataset`, default
@@ -85,8 +156,14 @@ reaching dbt only through the `PGPASSWORD` environment variable. Redshift
 writes builds to a dedicated `redshift.dev_schema` (default `dbt_dev`): with
 a `redshift.workgroup` pinned the profile renders IAM auth (temporary
 credentials from the AWS chain, nothing persisted), otherwise the password
-reaches dbt only through the `REDSHIFT_PASSWORD` environment variable. All
-of them discover their connections and refuse with the fix named when none
+reaches dbt only through the `REDSHIFT_PASSWORD` environment variable.
+ClickHouse writes builds to a dedicated `clickhouse.dev_database` (default
+`dbt_dev`), rendered as the profile's `schema:` because dbt-clickhouse has no
+`database:` key, with the password reaching dbt only through the
+`CLICKHOUSE_PASSWORD` environment variable; the rendered profile also carries
+a `custom_settings` block whose `env_var` references are how `transform build`
+turns the confirmed budget into a per-statement server-side cap, so do not
+strip them from a profile you edit. All of them discover their connections and refuse with the fix named when none
 resolves. Init refuses if any dbt project already exists.
 
 When the user wants staging/intermediate/marts isolated in their own
@@ -114,6 +191,32 @@ check" note just means no connection was reachable at init time.
   `--scaffold <table>` (repeatable) to generate a staging skeleton
   (`stg_<table>.sql` plus per-model YAML with key tests and PII meta) from the
   `.dex/` cache instead of, or on top of, hand-authored edits.
+- When you edit a model that already exists, the plan reports what your change
+  does to its **row population** under `data.row_attribution`: every predicate,
+  join, source and grain change is named, and each is measured on its own against
+  the prior model. Read it before applying. A change you were not asked to make
+  carrying a non-zero `delta` is the signal to look at: the model still compiles
+  and the columns are still right, and it is now returning a different set of
+  rows. It is advisory, never a refusal, because changing the filter is sometimes
+  the job. On DuckDB the deltas are measured automatically; on a billed connector
+  the changes are named for free and measuring them needs `--attribute-rows`
+  (then the usual `--confirm --budget` once priced), so ask the user before
+  spending. A change reported with `attributed: false` names why it could not be
+  measured; treat that as unknown, not as zero.
+- The plan also warns about the **shape** of what you authored, in `warnings`.
+  A SELECT list that diverges from the columns the model's `schema.yml` declares
+  is named in both directions; fix whichever side is actually stale, and say
+  which one you decided it was.
+- A warning that the model **exposes a raw foreign key with no resolved
+  counterpart** is dex reading a convention out of the project's own models: the
+  siblings it names all resolve keys of that shape, and it names the parent
+  model yours could resolve against. Prefer resolving it, by joining that parent
+  the way the siblings do. Where the raw key is deliberate (a fact-shaped model
+  in a dimension folder, a key the consumer needs verbatim), say so plainly to
+  the user rather than quietly leaving it. Never switch the check off to make
+  the warning go away: `conventions.resolved_keys: false` in `.dex/config.yml`
+  is a decision about the house's style, so recommend it for the user to accept,
+  the same way you would a `pii_overrides` entry.
 - `transform apply [plan-id]` writes the plan into the dbt project (the latest
   unapplied plan when no id is given; any plan kind, semantic included). The
   result is still a reviewable git diff for the user. If a human edited a file
@@ -122,13 +225,109 @@ check" note just means no connection was reachable at init time.
   (or, only when the user says so, re-run with `--confirm`).
 - `transform plans` lists stored plans (pending and applied, newest first), so
   you never need to browse `.dex/plans/` by hand.
+- `transform references <name> [more...]` answers "where is this used" before you
+  change it. **Reach for this whenever a change has to land in more than one
+  place**: removing a project variable, renaming a column, deleting a model,
+  changing what a macro returns. Editing the files you happen to have open and
+  hoping that was all of them is the failure this prevents, and it is a quiet
+  one, because the project still compiles with one use left behind.
+
+  It is repo-only and free on every connector, so there is never a cost reason
+  not to run it. The positional is variadic, so one call covers a whole rename.
+  `--kind` narrows to `model`, `source`, `seed`, `snapshot`, `macro`, `var`,
+  `column`, `metric`, `entity`, `dimension` or `measure`; leave it off when you
+  are not sure what the project calls the thing, and the answer will tell you.
+
+  Read `data.completeness` before you act on the list. When it says `incomplete`,
+  `data.limits` says why and `data.indeterminate` lists the call sites dex could
+  not resolve, each with a file and a line. Those are references that *may* name
+  what you asked about, so open them and decide yourself; do not treat the list
+  of resolved hits as exhaustive when the verdict says it is not. A bare column
+  name is matched across the project (`scope: name_matched`), so qualify it as
+  `model.column` when you want the lineage separated from same-named columns
+  elsewhere.
+
+  Once you know where a name is used, `transform rename` and `transform remove`
+  below make the change; you do not have to carry the list into hand edits.
+- `transform rename <kind> <old> <new>` generates **every** edit the rename needs
+  and stores them as one plan: the definition, every model that selects the name,
+  every `schema.yml` that documents or tests it, every semantic reference, and a
+  seed header. Kinds are `column`, `var`, `model`, `seed`, `snapshot`, `macro`,
+  `source`. Repo-only and free, like `references`.
+
+  **Use this instead of editing the files yourself.** Retyping a rename across
+  nine files and missing the tenth is the failure mode this exists for, and it is
+  a quiet one: the project still compiles.
+
+  Name a column as `model.column`. A bare name is refused, and the refusal lists
+  the models that define a column of that name so you can pick. That asymmetry
+  with `references` is deliberate: a report you read can afford to be imprecise
+  and a rewrite cannot, because renaming a bare `id` project-wide would rewrite
+  every unrelated `id` there is.
+
+  **It refuses rather than half-applying**, and each refusal names what to fix:
+  a reference dex could not resolve statically, a name an installed package also
+  defines, a column handed to a macro as a literal string (dex cannot tell a
+  column argument from a display label), a SELECT list it cannot read. Fix what
+  it names and re-run. There is no override flag, because a completeness
+  guarantee you can switch off is a suggestion. A bare `select *` is *not* a
+  refusal: it carries the column through under the new name with no edit, and the
+  plan's `notes` says so.
+
+  Read `data.sites` against the `transform references` output you ran first. It
+  counts occurrences per reference form in the same vocabulary, so the two
+  agreeing is your evidence that nothing was dropped between reading and writing.
+- `transform remove <kind> <name>` removes the **definition** and verifies every
+  read is gone, refusing while any survives and naming each with a file and line.
+
+  It never rewrites a read, and that boundary is the point rather than a gap.
+  `{% if var('using_department') %}` can be deleted or unguarded, and
+  `{{ var('x') }}` sitting in an expression has no value dex may invent. You are
+  the one who knows. Author those edits yourself and pass them with
+  `--edits-file` in the same call: they are validated and stored in the same
+  plan, so the removal is still atomic.
+- `transform place <column> --targets <a,b> --expr "<sql>"` answers where a
+  derived column that several models need should be *defined*. It walks `ref()`
+  upward from every target, takes the lowest model they all descend from that
+  already projects the inputs your expression reads, defines the column there,
+  and threads it down every chain. The inputs come from parsing `--expr`, so
+  there is no separate list to get out of sync with it.
+
+  **Read `data.reasoning` before you apply.** It names the ancestor, why it is
+  the lowest, which targets descend from it, and the chain. You are supposed to
+  be able to disagree with it; `--explain` gives you the same answer with no plan
+  stored, which is the cheap way to ask.
+
+  When `data.strategy` is `per_target` the shared definition was not available
+  and the reasoning says why: no common ancestor, or the lowest one is missing an
+  input, or two candidates tie. dex will not go further upstream to pull an input
+  down, because that turns one placement into an unbounded rewrite of everything
+  above it. The fallback duplicates the derivation in each target and those
+  copies will drift, so relay the reason to the user rather than applying it on
+  their behalf. Often the named fix (add the missing column to the ancestor
+  first) is what they actually want.
 - `transform build --target dev` runs `dbt build` against a dev target. The
   engine surfaces a cost preflight first and runs only with `--confirm` (plus a
-  `--budget` on billed connectors). On BigQuery there is no upfront estimate
-  (dbt has no dry-run), so always get an explicit byte budget from the user and
-  pass it as `--budget <bytes>`; never invent one. Each statement dbt runs is
-  capped server-side by the profile's `maximum_bytes_billed`, and the envelope
-  reports billed bytes afterward. Production-looking targets are refused
+  `--budget` on billed connectors). dbt itself has no dry-run, but the engine
+  compiles the project and dry-runs each node itself, so on BigQuery the first
+  unconfirmed call already returns `needs_confirmation` with `estimated_bytes`
+  and a `per_table_bytes` breakdown, the same shape the scanning `explore`
+  commands use. Never invent a `--budget` figure: read the reported estimate
+  (`per_table_bytes` is the actionable half, since it names which node is
+  driving the cost) and confirm with a `--budget` grounded in that number.
+  If the build is refused over the ceiling, the refusal carries a calibration
+  line from `.dex/spend.jsonl`: what this connector's recent commands billed as
+  a fraction of estimate, or a sentence saying there is too little history to
+  say. Builds over-estimate most on a partitioned or clustered warehouse, so
+  relay it, and note that the ceiling binds on the estimate rather than on what
+  settles, so a budget set at that fraction of the estimate is refused again.
+  A `suggested_session_ceiling` on that envelope is the project's one-time ask
+  for a cumulative daily cap, separate from `--budget`: relay it and add the
+  user's answer (`--session-ceiling <value>` or `--no-session-ceiling`) to the
+  same re-issue, which records it in `.dex/config.yml` for good.
+  Each statement dbt runs is capped server-side by the profile's
+  `maximum_bytes_billed`, and the envelope reports billed bytes afterward.
+  Production-looking targets are refused
   outright; `--confirm` cannot override that. dbt runs with its working
   directory pinned to the project dir, so relative paths in `profiles.yml`
   resolve against the project. When the project declares packages
@@ -162,11 +361,12 @@ check" note just means no connection was reachable at init time.
   The contract on every connector: one row per top-level key, `key` a plain
   string, `value` the warehouse's native semi-structured type (BigQuery JSON,
   Snowflake VARIANT, Databricks VARIANT, Postgres jsonb, Redshift SUPER,
-  DuckDB JSON), a NULL object yields no rows, and a nested object's own field
+  DuckDB JSON, ClickHouse raw JSON text in a String), a NULL object yields no
+  rows, and a nested object's own field
   names never surface as top-level keys. For a string-typed source column
   pass the parse expression as `json_column` (`parse_json(payload)` on
   BigQuery, Snowflake, and Databricks; `json_parse(payload)` on Redshift);
-  Postgres and DuckDB accept JSON-bearing text directly. Databricks needs
+  Postgres, DuckDB, and ClickHouse accept JSON-bearing text directly. Databricks needs
   VARIANT support (DBR 15.3+ or a current SQL warehouse). Two BigQuery quirks
   are absorbed by the macro, so do not "fix" them back in: a JSON path
   argument must be a compile-time literal (the macro reads values with the
@@ -191,9 +391,12 @@ and both files. Edit one to match the other. The engine never rewrites
 **A dev target that does not exist.** On Snowflake, dbt creates schemas but never
 databases, so a missing `dev_database` is refused with the `CREATE DATABASE`
 statement to run; dex will not create it for you, because its only writes are
-reviewable diffs inside the repo. On Postgres and Redshift, dbt creates the dev
-schema but only if the profile's user may, so the missing privilege is what gets
-refused, with the `CREATE SCHEMA`/`GRANT` statement to run. On DuckDB the dev target is a database file,
+reviewable diffs inside the repo. On Postgres, Redshift, and ClickHouse, dbt creates the dev
+namespace but only if the profile's user may, so the missing privilege is what
+gets refused, with the `CREATE SCHEMA`/`GRANT` statement to run. On ClickHouse
+that check can also come back with no verdict, because a server may not let dex
+read another user's grants; it then warns instead of guessing, and the build
+proceeds with dbt's own error as the backstop. On DuckDB the dev target is a database file,
 and dbt would happily create an empty one, then fail every `source()` relation
 with a confusing catalog error. The convention there: copy the shared source
 warehouse to the dev target path (for example
@@ -247,8 +450,10 @@ database, which is fine for model-only builds.
 
 ## Guardrails (enforced in the engine, not here)
 
-- Writes confined to the repo, and within it to the dbt project's model paths.
-  dex never writes to source warehouse data.
+- Writes confined to the repo, and within it to the dbt project's authored path
+  families (models, macros, snapshots, seeds, tests, analyses) plus the
+  project-root manifests dbt keeps there. dex never writes to source warehouse
+  data.
 - Dev-target only. Prod-target execution is never initiated by dex.
 - Cost surfaced before any spend. A build that would spend requires explicit
   confirmation and a session budget.

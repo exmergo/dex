@@ -41,11 +41,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import sqlglot
 from sqlglot import expressions as exp
 
-from ..cache import CACHE_SCHEMA_VERSION, Dataset, DexCache, match_identifier
+from ..cache import (
+    CACHE_SCHEMA_VERSION,
+    Dataset,
+    DexCache,
+    PIICategory,
+    match_identifier,
+)
 from ..config import QueryLimits
 from ..errors import DexError
 from . import PII_BLOCK_CONFIDENCE
@@ -110,8 +117,39 @@ _MEASURING = frozenset(
         "entropy",
         "kurtosis",
         "skewness",
+        # ClickHouse spellings. sqlglot canonicalizes `uniq` to ApproxDistinct
+        # and `countIf` to CountIf, both already above, but the rest of the
+        # family parses to AnonymousAggFunc carrying its own lowered name.
+        # Every one of these reduces a column to a single number: the distinct
+        # sketches (uniq*), and the dispersion functions ClickHouse spells
+        # without the underscore the ANSI names use. Deliberately absent, and
+        # therefore carrying: `any`, `argMin`/`argMax`, `topK`, `groupArray`,
+        # `median`/`quantile*` and every other order statistic, all of which
+        # return values from rows.
+        "uniqexact",
+        "uniqcombined",
+        "uniqcombined64",
+        "uniqhll12",
+        "uniqtheta",
+        "uniqupto",
+        "stddevpop",
+        "stddevsamp",
+        "varpop",
+        "varsamp",
+        "covarpop",
+        "covarsamp",
     }
 )
+
+# ClickHouse aggregate combinators that wrap a base aggregate without changing
+# whether it measures: `-If` appends a condition, which is a filter exactly as
+# `FILTER (WHERE ...)` is; `-OrNull` and `-OrDefault` only change what an empty
+# input returns; `-Distinct` de-duplicates the input. So `sumIf` measures
+# because `sum` does, and `maxIf` carries because `max` does. Combinators that
+# change the *shape* of the result are deliberately absent, so `-Array`,
+# `-Map`, `-ForEach`, `-State`, `-Merge` and `-Resample` all fall through to
+# the fail-closed carrying rule.
+_AGG_COMBINATORS = ("ifornull", "ifordefault", "if", "ornull", "ordefault", "distinct")
 
 # JSON/array functions whose result a FROM clause may unnest, per dialect:
 # key enumeration (JSON_KEYS, OBJECT_KEYS, jsonb_object_keys), array-element
@@ -163,6 +201,23 @@ _UNNEST_FUNCS: dict[str, tuple[tuple[type, ...], frozenset[str]]] = {
         ),
     ),
     "redshift": ((), frozenset()),
+    # ClickHouse stores JSON as String and navigates it with the JSONExtract*
+    # family; mapKeys/mapValues reach into a Map column. arrayJoin is the
+    # function spelling of ARRAY JOIN and parses to exp.Explode.
+    "clickhouse": (
+        (exp.Explode, exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON),
+        frozenset(
+            {
+                "jsonextractkeysandvaluesraw",
+                "jsonextractkeys",
+                "jsonextractraw",
+                "jsonextractarrayraw",
+                "mapkeys",
+                "mapvalues",
+                "arrayzip",
+            }
+        ),
+    ),
     "duckdb": (
         (exp.JSONKeys, exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON),
         frozenset({"json_each"}),
@@ -193,12 +248,28 @@ _QUERY_ROOTS = tuple(
     if isinstance(c, type)
 )
 
+
 # A derived source (CTE, subquery, set operation) is represented by its output
 # taints: output column name (lowered) -> the flagged columns whose values can
-# reach it, each a (label, confidence) pair. Presence taints; whether a taint
-# blocks or merely warns is decided once, at the projection root, against
-# PII_BLOCK_CONFIDENCE. A physical source is the cached Dataset itself.
-_Taint = tuple[str, float]
+# reach it. Presence taints; whether a taint blocks or merely warns is decided
+# once, at the projection root, against PII_BLOCK_CONFIDENCE. A physical source
+# is the cached Dataset itself.
+#
+# `identifier` and `column` (alongside the display `label` and `confidence`)
+# are what let a blocking refusal name the exact `pii_overrides` entry that
+# would clear the column (issue #217): the label alone is the short table name
+# only, which is not enough to build a fully-qualified override safely (two
+# datasets can share a short name), so the fully-qualified identifier has to
+# ride along on the taint itself rather than being reconstructed later from a
+# string two datasets could both match.
+class _Taint(NamedTuple):
+    label: str
+    confidence: float
+    identifier: str
+    column: str
+    category: PIICategory
+
+
 _Outputs = dict[str, set[_Taint]]
 _Source = Dataset | dict
 
@@ -261,14 +332,63 @@ def recovery_hints(offending: list[str], cache: DexCache) -> list[str]:
     return sorted(suggestions)
 
 
-def inspect_query(
-    sql: str,
-    cache: DexCache,
-    limits: QueryLimits,
-    *,
-    dialect: str = "duckdb",
-) -> InspectedQuery:
-    """Approve (and bound) an agent query, or raise :class:`QueryRefusedError`."""
+def _recurs_elsewhere(cache: DexCache, taint: _Taint) -> bool:
+    """Whether another dataset in the cache also flags a same-named column at
+    the same category, which is the evidence that a pattern override (a scope
+    glob, not one entry per table) is worth suggesting rather than a guess at
+    how far a naming convention actually reaches."""
+
+    return any(
+        dataset.identifier != taint.identifier
+        and any(
+            col.name.lower() == taint.column.lower()
+            and col.pii is not None
+            and col.pii.category == taint.category
+            for col in dataset.columns
+        )
+        for dataset in cache.datasets
+    )
+
+
+def _override_suggestion(taint: _Taint, cache: DexCache) -> str:
+    """The exact ``pii_overrides`` entry that would clear ``taint``'s column,
+    ready to paste into ``.dex/config.yml`` (issue #217).
+
+    Column identity only, in flow-mapping YAML so it fits inline in the
+    refusal's own prose: a fully-qualified path for the exact form, a bare
+    name and scope for the pattern form. Never a value: the taint carries
+    only what :class:`~..cache.PIIFlag` itself does (category and
+    confidence), the same structural guarantee that flag makes.
+
+    The pattern form is offered only when :func:`_recurs_elsewhere` finds the
+    same column name flagged at the same category on another dataset; the
+    suggested scope is that dataset's own schema (its identifier with the
+    table segment replaced by ``*``), never wider than what was actually
+    observed, so a caller who wants it to reach further widens the glob
+    themselves rather than dex guessing a blast radius nothing here proves.
+    """
+
+    exact = f"`- {{column: {taint.identifier}.{taint.column}}}`"
+    clause = f"for {taint.label}: {exact}"
+    if _recurs_elsewhere(cache, taint):
+        scope = taint.identifier.rsplit(".", 1)[0] + ".*"
+        pattern = f"`- {{column_name: {taint.column}, scope: {scope}}}`"
+        clause += f" (or, since it recurs across tables, {pattern})"
+    return clause
+
+
+def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
+    """Prove a statement is one read-only SELECT and return its parsed root.
+
+    Split out of :func:`inspect_query` so a caller that needs to touch the live
+    connection before the cache can adjudicate (resolving a relation, profiling
+    it) can prove the statement read-only first. Whatever else happens to an
+    agent-authored statement, it is never the reason dex introspected a
+    warehouse on its behalf.
+
+    Cache-independent by construction, which is what makes it safe to run early;
+    everything that needs the cache stays in :func:`inspect_query`.
+    """
 
     try:
         assert_select_only(sql, dialect=dialect)
@@ -283,15 +403,30 @@ def inspect_query(
             f"only SELECT queries may run here, got {type(root).__name__}; use "
             "`explore inventory` / `explore profile` for introspection"
         )
+    return root
+
+
+def inspect_query(
+    sql: str,
+    cache: DexCache,
+    limits: QueryLimits,
+    *,
+    dialect: str = "duckdb",
+) -> InspectedQuery:
+    """Approve (and bound) an agent query, or raise :class:`QueryRefusedError`."""
+
+    root = assert_query_shape(sql, dialect=dialect)
 
     known = {d.identifier: d for d in cache.datasets}
     tables: set[str] = set()
     outputs = _query_outputs(root, {}, known, tables, dialect)
 
     flagged = {taint for taints in outputs.values() for taint in taints}
-    offending = sorted(
-        {label for label, conf in flagged if conf >= PII_BLOCK_CONFIDENCE}
+    blocking = sorted(
+        (t for t in flagged if t.confidence >= PII_BLOCK_CONFIDENCE),
+        key=lambda t: t.label,
     )
+    offending = [t.label for t in blocking]
     if offending:
         message = (
             "the projection would carry values from PII-flagged column(s): "
@@ -309,7 +444,9 @@ def inspect_query(
             )
         message += (
             " A column reviewed as not PII can be cleared durably with a "
-            "pii_overrides entry in .dex/config.yml."
+            "pii_overrides entry in .dex/config.yml, e.g. "
+            + "; ".join(_override_suggestion(t, cache) for t in blocking)
+            + "."
         )
         if cache.schema_version < CACHE_SCHEMA_VERSION and any(
             "(name)" in label for label in offending
@@ -321,11 +458,11 @@ def inspect_query(
         raise QueryRefusedError(message)
 
     warnings = [
-        f"{label} is PII-flagged at confidence {conf:g}, below the "
+        f"{t.label} is PII-flagged at confidence {t.confidence:g}, below the "
         f"{PII_BLOCK_CONFIDENCE:g} block threshold, so the projection ran. If "
         "its values are personal data, drop the column; if it is reviewed as "
         "not PII, record a pii_overrides entry in .dex/config.yml."
-        for label, conf in sorted(flagged)
+        for t in sorted(flagged, key=lambda t: t.label)
     ]
 
     new_sql, row_cap, capped = _apply_limit(root, limits.max_rows, dialect)
@@ -421,12 +558,33 @@ def _resolve_sources(
     from_clause = select.args.get("from_") or select.args.get("from")
     if from_clause is not None:
         source_nodes.append(from_clause.this)
-    source_nodes.extend(join.this for join in select.args.get("joins") or [])
+    # ClickHouse's ARRAY JOIN is a join by grammar and an unnest by meaning: it
+    # expands one row per element of an array *already read from the tables in
+    # scope*, so it reshapes without reaching anything new. It is collected
+    # separately because its node is a bare aliased expression rather than one
+    # of the FROM-source classes, and because the taint rule differs: the
+    # produced column inherits whatever the array it came from carries.
+    array_joins = [
+        join
+        for join in select.args.get("joins") or []
+        if str(join.args.get("kind") or "").upper() == "ARRAY"
+    ]
+    source_nodes.extend(
+        join.this for join in select.args.get("joins") or [] if join not in array_joins
+    )
     # LATERAL VIEW (Databricks/Hive) hangs off the select, not the join list.
     source_nodes.extend(select.args.get("laterals") or [])
 
     sources: dict[str, _Source] = {}
-    for node in source_nodes:
+    for raw in source_nodes:
+        # ClickHouse's FROM <table> FINAL wraps the table in exp.Final. It is a
+        # read modifier (collapse the merge tree's duplicate rows before
+        # reading), so it changes which rows a query sees and nothing about
+        # which columns it may project. Unwrapping here rather than adding a
+        # branch keeps every rule below reading the table it always did;
+        # without it an ordinary ClickHouse query is refused as an unsupported
+        # FROM source.
+        node = raw.this if isinstance(raw, exp.Final) else raw
         alias = node.alias_or_name.lower()
         if isinstance(node, exp.Table) and isinstance(node.this, exp.Identifier):
             dotted = ".".join(p for p in (node.catalog, node.db, node.name) if p)
@@ -452,7 +610,71 @@ def _resolve_sources(
                 f"unsupported FROM source: {type(node).__name__}; query cached "
                 "tables and views only"
             )
+    for join in array_joins:
+        merged = env | sources
+        key, outputs = _array_join_source(join.this, merged, known, tables, dialect)
+        if key in sources:
+            raise QueryRefusedError(
+                f"duplicate source alias '{key}'; give each ARRAY JOIN its own alias"
+            )
+        sources[key] = outputs
     return sources
+
+
+def _array_join_source(
+    node: exp.Expression,
+    sources: dict[str, _Source],
+    known: dict[str, Dataset],
+    tables: set[str],
+    dialect: str,
+) -> tuple[str, _Outputs]:
+    """Admit one ClickHouse ``ARRAY JOIN`` element, or refuse it.
+
+    The rule is the one every other dialect's unnest already follows: an
+    unnest reshapes what the query can already read, and cannot launder. So the
+    expression must derive from columns of tables in scope (bare, or through a
+    JSON/array function this dialect allows), and the column it produces
+    inherits the full taint of whatever it derived from. A PII-flagged array
+    exploded into rows is still PII, one value per row instead of one array per
+    row, which is if anything the more exposed shape.
+    """
+
+    if not isinstance(node, exp.Alias):
+        raise QueryRefusedError(
+            "alias the ARRAY JOIN so its output has a column name, e.g. "
+            "ARRAY JOIN tags AS tag"
+        )
+    inner = node.this
+    # An unnest reshapes what the query can already read; it is not a second
+    # way to reach something. A subquery or a bare relation inside one is a
+    # laundering path (the taint of a value read through a nested SELECT is not
+    # the taint the outer resolution computed), and a literal or generator
+    # synthesizes rows from nothing. Every other dialect's unnest refuses these
+    # in `_unnest_source`; ARRAY JOIN reaches this code by a different route and
+    # owes the same refusal.
+    if any(inner.find(cls) for cls in (exp.Subquery, exp.Select, exp.Table)):
+        raise QueryRefusedError(
+            "ARRAY JOIN over a subquery or relation is not allowed; unnest a "
+            "column of a table the query already reads"
+        )
+    if not inner.find(exp.Column):
+        raise QueryRefusedError(
+            "ARRAY JOIN over a literal or generated array is not allowed; "
+            "unnest a column of a table the query already reads"
+        )
+    _classes, names = _UNNEST_FUNCS.get(dialect, ((), frozenset()))
+    if isinstance(inner, exp.Func):
+        name = _func_name(inner)
+        if not (isinstance(inner, _classes) if _classes else False) and (
+            name not in names
+        ):
+            raise QueryRefusedError(
+                f"ARRAY JOIN over '{name}' is not allowed; unnest a column of a "
+                "table the query already reads, bare or through an allowed "
+                "JSON/array function"
+            )
+    taint = _expr_taint(inner, sources, known, tables, dialect)
+    return node.alias.lower(), {node.alias.lower(): taint}
 
 
 def _resolve_dataset(
@@ -495,7 +717,15 @@ def _column_taint(dataset: Dataset, column_name: str) -> set[_Taint]:
                 return set()
             table = dataset.identifier.rsplit(".", 1)[-1]
             label = f"{table}.{col.name} ({col.pii.category.value})"
-            return {(label, col.pii.confidence)}
+            return {
+                _Taint(
+                    label,
+                    col.pii.confidence,
+                    dataset.identifier,
+                    col.name,
+                    col.pii.category,
+                )
+            }
     raise QueryRefusedError(
         f"column '{column_name}' is not in the profiled cache for "
         f"'{dataset.identifier}'; the cache may be stale, re-run `explore map`"
@@ -531,7 +761,7 @@ def _expr_taint(
     if isinstance(node, exp.Window):
         # PARTITION BY / ORDER BY route rows; only the function's output crosses.
         return _expr_taint(node.this, sources, known, tables, dialect)
-    if isinstance(node, exp.Func) and _func_name(node) in _MEASURING:
+    if isinstance(node, exp.Func) and _measures(node):
         return set()
     # Everything else (carrying/unknown functions, operators, CASE, casts)
     # passes taint through from all children: fail closed.
@@ -734,9 +964,41 @@ def _source_column_taint(source: _Source, name: str) -> set[_Taint]:
 
 
 def _func_name(node: exp.Func) -> str:
-    if isinstance(node, exp.Anonymous):
+    # AnonymousAggFunc and CombinedAggFunc are how sqlglot parses every
+    # ClickHouse aggregate it has no canonical class for; like Anonymous they
+    # carry the written name in `this`, and their own sql_name() is the class
+    # name ("anonymous_agg_func"), which would match nothing and silently make
+    # every such aggregate carry.
+    if isinstance(node, (exp.Anonymous, exp.AnonymousAggFunc, exp.CombinedAggFunc)):
         return str(node.this).lower()
     return node.sql_name().lower()
+
+
+def _measures(node: exp.Func) -> bool:
+    """Whether a function cuts the value path from its arguments to its result.
+
+    A named measuring aggregate does. So does a ClickHouse combinator over one,
+    which is why the suffixes are peeled here rather than enumerated as names:
+    the family is open (`sumIfOrNull`), and enumerating it would leave the next
+    spelling refused for no reason while stripping unknown suffixes would leave
+    it accepted for no reason. Peeling only the suffixes that provably preserve
+    the base's measuring property keeps the fail-closed default intact.
+    """
+
+    name = _func_name(node)
+    if name in _MEASURING:
+        return True
+    if not isinstance(node, exp.CombinedAggFunc):
+        return False
+    peeled = True
+    while peeled:
+        peeled = False
+        for suffix in _AGG_COMBINATORS:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                name = name[: -len(suffix)]
+                peeled = True
+                break
+    return name in _MEASURING
 
 
 # --- LIMIT clamp ---------------------------------------------------------------

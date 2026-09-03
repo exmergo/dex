@@ -271,7 +271,7 @@ def test_confirmed_check_completes_the_scanning_axes(
 
     envelope = _dispatch(tmp_path, "check", confirm=True, budget=float(100 * MB))
     assert envelope.status.value == "ok"
-    assert envelope.data["axes"]["grain"] == 0
+    assert envelope.data["axes"]["grain"]["finding_count"] == 0
     report = FilesystemStore(tmp_path).load_drift()
     assert {"schema", "volume", "grain"} <= set(report.axes)
 
@@ -387,3 +387,58 @@ def test_the_offer_carries_the_same_caveats_as_the_settled_answer(
     assert [w for w in confirmed.warnings if stale in w] == [
         w for w in unconfirmed.warnings if stale in w
     ]
+
+
+def test_volume_names_an_external_table_it_could_not_compare(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """Issue #375's downstream half: an external table's row count is unknown to
+    free metadata, so this axis has nothing to diff and says so.
+
+    The baseline holds a real count because the object was profiled once, which is
+    exactly why the silence was misleading: an absent finding on an object a
+    reader knows was mapped reads as "checked, and nothing moved". The axis stays
+    free, so it names the object rather than buying a count for it.
+    """
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    now = datetime.now(UTC).isoformat()
+    FilesystemStore(tmp_path).save_snapshot(
+        Snapshot(
+            created_at=now,
+            connector="bigquery",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="test-proj.shop.ext_orders",
+                        row_count=500,
+                        columns=[ColumnProfile(name="id", data_type="INTEGER")],
+                        profiled_at=now,
+                    )
+                ]
+            ),
+            warehouse_from="cache",
+        )
+    )
+    external = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_orders",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=0,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables = {external.identifier: external}
+    route_adapter(fake_bq_client)
+
+    envelope = _dispatch(tmp_path, "volume")
+    assert envelope.status.value == "ok"
+    assert envelope.data["finding_count"] == 0
+    assert any(
+        "ext_orders" in w and "volume was not compared" in w for w in envelope.warnings
+    ), envelope.warnings
+    # Free, as this axis always is: naming what it skipped costs no query.
+    assert fake_bq_client.query_calls == []

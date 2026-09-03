@@ -72,6 +72,20 @@ class Cost(BaseModel):
     ceiling: float | None = None
 
 
+class Connection(BaseModel):
+    """The non-secret target dex resolved for this command.
+
+    ``target`` contains identifiers only (a DuckDB path, or warehouse namespace
+    coordinates such as project/datasets).  Credential values and principal
+    identities never belong here.  Empty fields mean the command did not resolve
+    a warehouse connection, which is common for repo-only commands.
+    """
+
+    connector: str | None = None
+    target: dict[str, Any] = Field(default_factory=dict)
+    source: str | None = None
+
+
 class Reason(str, Enum):
     """Why an error envelope was refused, coarse enough for a host to branch
     on retry/setup/stop without parsing prose. Derived from the exception's
@@ -98,6 +112,7 @@ class Envelope(BaseModel):
 
     status: Status
     data: dict[str, Any] = Field(default_factory=dict)
+    connection: Connection = Field(default_factory=Connection)
     cost: Cost = Field(default_factory=Cost)
     warnings: list[str] = Field(default_factory=list)
     # Reviewable diffs (propose-don't-impose). Nothing is applied just by being here.
@@ -177,6 +192,14 @@ def sanitize(envelope: Envelope) -> Envelope:
     """
 
     _scan(envelope.data)
+    connection = getattr(envelope, "connection", None)
+    if connection is not None:
+        rendered = (
+            connection.model_dump(mode="python")
+            if hasattr(connection, "model_dump")
+            else connection
+        )
+        _scan(rendered, "connection")
     return envelope
 
 
@@ -231,20 +254,30 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
     # Always safe: no imports of their own (`errors.py`) or explicitly
     # designed to import without the dialect engine (`guards/dialect.py` is
     # the module that checks whether sqlglot is even installed).
+    from .demo.warehouse import (
+        DemoDependencyError,
+        DemoPathError,
+        DemoTargetExistsError,
+    )
     from .errors import (
         ConfigurationError,
         ConnectorError,
         DexError,
         PrerequisiteError,
         RequestError,
+        WarehouseQueryError,
     )
     from .guards.dialect import DialectDependencyError
 
     overrides: list[tuple[type[BaseException], Reason]] = [
+        (DemoTargetExistsError, Reason.GUARD),
+        (DemoDependencyError, Reason.PREREQUISITE),
+        (DemoPathError, Reason.REQUEST),
         (DialectDependencyError, Reason.PREREQUISITE),
         (PrerequisiteError, Reason.PREREQUISITE),  # CacheRequiredError, NoBaselineError
         (ConnectorError, Reason.CONNECTION),  # every *ConnectionError subclass
         (ConfigurationError, Reason.CONFIGURATION),
+        (WarehouseQueryError, Reason.EXECUTION_FAILURE),  # the server said no
         (RequestError, Reason.REQUEST),
         (DexError, Reason.REQUEST),  # generic fallback for any other deliberate refusal
         (ValueError, Reason.REQUEST),  # the pre-typed-error convention: bad input
@@ -281,6 +314,11 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
     # isinstance, so a new DexError subclass only needs an entry when its own
     # reason diverges from its parent's.
     _reason_overrides_cache = [
+        # A demo target that already exists is a safety refusal, not bad input:
+        # the command declines to touch a warehouse it did not create.
+        (DemoTargetExistsError, Reason.GUARD),
+        (DemoDependencyError, Reason.PREREQUISITE),
+        (DemoPathError, Reason.REQUEST),
         (SemanticQueryRefusedError, Reason.GUARD),  # policy, not backend failure
         (ClusterDependencyError, Reason.PREREQUISITE),  # install the extra, retry
         (DialectDependencyError, Reason.PREREQUISITE),
@@ -297,6 +335,9 @@ def _reason_overrides() -> list[tuple[type[BaseException], Reason]]:
         (SemanticBackendError, Reason.CONFIGURATION),  # after SemanticQueryRefusedError
         (BuildFailedError, Reason.EXECUTION_FAILURE),
         (DbtRunError, Reason.EXECUTION_FAILURE),
+        # The statement ran and the server refused it: an execution failure for
+        # the same reason a failed dbt run is one, and never `internal`.
+        (WarehouseQueryError, Reason.EXECUTION_FAILURE),
         (RequestError, Reason.REQUEST),
         (DbtParseError, Reason.REQUEST),
         (PlanError, Reason.REQUEST),  # PlanNotFoundError

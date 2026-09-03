@@ -16,26 +16,42 @@ simply calls no mutating client API, and the docs recommend read-only roles
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import BigQueryTarget
 from ..envelope import Paradigm
-from ..errors import ConnectorError
+from ..errors import ConnectorError, PrerequisiteError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
+    VALUE_DOMAIN_MIN_ROWS,
     ColumnAggregate,
     ColumnMeta,
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "bytes_scanned"
@@ -45,21 +61,88 @@ DIALECT = "bigquery"
 # does not balloon (up to 4 expressions per column).
 _COLUMN_BATCH = 50
 
+_BIGINT_TYPE = "INT64"
+
 # BigQuery bills at least this much for any on-demand query that scans data.
 # A remaining budget below it can never cover a statement, so we refuse with
 # the math instead of letting the server fail the job after the fact.
 _MIN_BILLED_BYTES = 10 * 1024 * 1024
+
+# BigQuery's own refusal names the exact byte count it needed (issue #320):
+# "Query exceeded limit for bytes billed: <cap>. <required> or higher
+# required." No dry run predicts this number, since it reflects the server's
+# own execution-time rounding of bytes billed (observed per table scanned,
+# not per query), which is exactly the gap between a dry-run-based estimate
+# and what the job actually needed. Parsed rather than guessed at with a
+# margin, so the retry below asks for precisely what BigQuery says it needs,
+# whatever the underlying rounding rule turns out to be.
+_BYTES_BILLED_REQUIRED_RE = re.compile(r"(\d+) or higher required")
 
 # Field types whose values are nested or non-scalar: no approx-distinct, no
 # min/max, and non-null counting via COUNTIF (COUNT DISTINCT is invalid on
 # them and plain COUNT is not supported for every one of these types).
 _NESTED_FIELD_TYPES = {"RECORD", "STRUCT", "JSON", "GEOGRAPHY", "RANGE", "INTERVAL"}
 
+# The object kinds whose stored row and byte counts BigQuery maintains. See
+# BigQueryAdapter._maintains_counts for why this is an allowlist.
+_COUNTED_TABLE_TYPES = frozenset({"TABLE"})
+
+
+@dataclass(frozen=True)
+class _EstimateComposition:
+    """What a profile estimate is made of: measured dry-run scan versus
+    escalation reserve.
+
+    The two halves answer different questions and a caller deciding whether to
+    raise a budget needs them apart. The scan half is a dry-run of statements
+    that will certainly run; the reserve half is headroom held for probes that
+    may never be issued (see :meth:`BigQueryAdapter.profile_estimate`). Quoting
+    only the sum is what left a refused nightly run unable to tell a warehouse
+    that had grown from a release that had added a reserve (issue #299).
+    """
+
+    scan_bytes: float
+    scan_queries: int
+    reserved_bytes: float
+    reserved_queries: int
+
 
 def _regexp_predicate(qcol: str, pattern: str) -> str:
     # Raw string literal; REGEXP_CONTAINS matches substrings, so the shared
     # patterns' anchors make it a full match.
     return f"REGEXP_CONTAINS({qcol}, r'{pattern}')"
+
+
+def _trunc_family(data_type: str) -> str:
+    # BigQuery has three truncation functions, one per temporal type, unlike
+    # every other dialect's single date_trunc: DATE_TRUNC only accepts DATE,
+    # and only DATE_TRUNC has no HOUR unit -- which is moot here since
+    # temporal_units_for already skips hour for a bare DATE column.
+    upper = data_type.upper()
+    if "TIMESTAMP" in upper:
+        return "TIMESTAMP_TRUNC"
+    if "DATETIME" in upper:
+        return "DATETIME_TRUNC"
+    return "DATE_TRUNC"
+
+
+def _diff_family(data_type: str) -> str:
+    upper = data_type.upper()
+    if "TIMESTAMP" in upper:
+        return "TIMESTAMP_DIFF"
+    if "DATETIME" in upper:
+        return "DATETIME_DIFF"
+    return "DATE_DIFF"
+
+
+def _date_trunc_expr(qcol: str, unit: str, data_type: str) -> str:
+    # Reversed argument order and a bare unquoted unit keyword: the one
+    # dialect that differs from every other adapter's date_trunc(unit, col).
+    return f"{_trunc_family(data_type)}({qcol}, {unit.upper()})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str, data_type: str) -> str:
+    return f"{_diff_family(data_type)}({later}, {earlier}, {unit.upper()})"
 
 
 class BigQueryConnectionError(ConnectorError):
@@ -104,6 +187,7 @@ class BigQueryAdapter:
         # [bigquery] extra; only this adapter pulls it in.
         try:
             from google.api_core import exceptions as api_exceptions
+            from google.auth import exceptions as auth_exceptions
             from google.cloud import bigquery
         except ImportError as exc:
             raise RuntimeError(
@@ -112,6 +196,7 @@ class BigQueryAdapter:
             ) from exc
         self._bq = bigquery
         self._api_exceptions = api_exceptions
+        self._auth_exceptions = auth_exceptions
         self._client = client or bigquery.Client(
             project=project, credentials=credentials
         )
@@ -119,8 +204,17 @@ class BigQueryAdapter:
         # confirmed profiling pass do not re-fetch (each fetch is a free API
         # call, but table facts also back the notes and sampling decisions).
         self._tables: dict[str, Any] = {}
+        # Row counts learned from a profiling aggregate, which is the only place
+        # a count exists for an object kind BigQuery keeps no metadata count for.
+        # Per command, like `_tables`, and it supersedes the metadata rather than
+        # merging with it: the aggregate counted, the metadata guessed or lied.
+        self._exact_rows: dict[str, int] = {}
         self._resolved_datasets: list[str] | None = None
         self._notes: dict[str, list[str]] = {}
+        # What the last profile estimate was made of, so the handshake and the
+        # over-ceiling refusal can attribute the number they quote. Per command,
+        # like `_notes`: one command builds at most one profile estimate.
+        self._composition: _EstimateComposition | None = None
 
     # --- capabilities ---------------------------------------------------------
 
@@ -145,7 +239,7 @@ class BigQueryAdapter:
             ],
             "budget": {
                 "ceiling": cost.ceiling,
-                "session_spent_today": self.cost_gate.session_spent,
+                "session_spent_today": self.cost_gate.session_spent_now(),
             },
         }
 
@@ -179,13 +273,21 @@ class BigQueryAdapter:
 
     def _object_meta(self, table: Any, object_type: str) -> ObjectMeta:
         identifier = f"{table.project}.{table.dataset_id}.{table.table_id}"
-        num_rows = getattr(table, "num_rows", None)
-        num_bytes = getattr(table, "num_bytes", None)
-        if object_type == "view":
-            # A view has no stored rows; a COUNT(*) would bill, so the exact
-            # count arrives inside the (already billed) profiling aggregate.
+        # An exact count from a profiling scan supersedes the metadata for the
+        # rest of the command, and for the object kinds below it is the only
+        # count there will ever be, so it is consulted before the metadata is.
+        exact = self._exact_rows.get(identifier)
+        if exact is not None:
+            num_rows: int | None = exact
+        elif self._maintains_counts(getattr(table, "table_type", None)):
+            num_rows = getattr(table, "num_rows", None)
+        else:
             num_rows = None
-            num_bytes = None
+        num_bytes = (
+            getattr(table, "num_bytes", None)
+            if self._maintains_counts(getattr(table, "table_type", None))
+            else None
+        )
         return ObjectMeta(
             identifier=identifier,
             object_type=object_type,
@@ -199,6 +301,28 @@ class BigQueryAdapter:
     @staticmethod
     def _object_type(table_type: str | None) -> str:
         return "view" if (table_type or "").upper().endswith("VIEW") else "table"
+
+    @staticmethod
+    def _maintains_counts(table_type: str | None) -> bool:
+        """Whether BigQuery keeps a stored row and byte count for this kind of object.
+
+        An allowlist rather than a list of exceptions, because the exceptions are
+        the growing side. A base table has counts; a view, a materialized view, an
+        external table over object storage, a snapshot, and whatever the API names
+        next do not, and for all of them ``num_rows`` comes back ``0`` rather than
+        absent. Storing that zero would be a claim the table is empty, which reads
+        the same as a table that genuinely is, so the whole class is classified as
+        unknown instead and the count arrives from the (already billed) profiling
+        aggregate. Testing for the kinds that do have counts means a kind nobody
+        anticipated is treated as unknown, which is the direction that cannot
+        fabricate a number.
+
+        An absent ``table_type`` is a base table: the client leaves the attribute
+        unset until the server fills it in, so it means "not told yet" rather than
+        a kind of its own.
+        """
+
+        return (table_type or "TABLE").upper() in _COUNTED_TABLE_TYPES
 
     @staticmethod
     def _render_type(field: Any) -> str:
@@ -229,10 +353,10 @@ class BigQueryAdapter:
 
     def _resolve_datasets(self) -> list[str]:
         if not self.target.datasets:
-            return sorted(
-                f"{self.project}.{item.dataset_id}"
-                for item in self._client.list_datasets(self.project)
+            datasets = self._request(
+                lambda: list(self._client.list_datasets(self.project))
             )
+            return sorted(f"{self.project}.{item.dataset_id}" for item in datasets)
         with blame(self._scope_origin, BigQueryConnectionError):
             return sorted(
                 {self._resolve_dataset(entry) for entry in self.target.datasets}
@@ -259,7 +383,7 @@ class BigQueryAdapter:
         qualified = token if "." in token else f"{self.project}.{token}"
         project, _, dataset = qualified.partition(".")
         try:
-            self._client.get_dataset(qualified)
+            self._request(lambda: self._client.get_dataset(qualified))
         except self._api_exceptions.NotFound as exc:
             raise BigQueryConnectionError(
                 f"scope '{entry}' does not exist: project {project} has no "
@@ -365,17 +489,30 @@ class BigQueryAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         if self._unqueryable(identifier):
             return [self._empty_aggregate(col) for col in columns]
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         sample_percent = self._sample_percent(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
             sql, plan = self._build_aggregate_sql(
-                identifier, batch, safe, shape, sample_percent=sample_percent
+                identifier,
+                batch,
+                safe,
+                shape,
+                type_req,
+                key_shape_req,
+                temporal_req,
+                sample_percent=sample_percent,
             )
             try:
                 _job, iterator = self._execute(sql)
@@ -392,6 +529,16 @@ class BigQueryAdapter:
                 )
                 results.extend(self._empty_aggregate(col) for col in batch)
                 continue
+            if sample_percent is None:
+                # The batch just counted the table exactly, and for a view or an
+                # external table that is the only count anyone will ever have:
+                # BigQuery maintains none, and a COUNT(*) issued to find one
+                # would bill a second time for a number already in hand. Capture
+                # it so the metadata re-read after this scan can hand it to the
+                # uniqueness proof, the composite-key probe, and the grain
+                # verdict, all of which decline to run without a row count. Not
+                # under sampling, where the count describes the sample.
+                self._exact_rows[identifier] = int(rows[0]["n_total"])
             results.extend(
                 self._read_aggregates(rows[0], plan, sampled=sample_percent is not None)
             )
@@ -435,28 +582,39 @@ class BigQueryAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
+        type_req: set[str],
+        key_shape_req: set[str],
+        temporal_req: set[str],
         *,
         sample_percent: float | None = None,
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool]]]:
+    ) -> tuple[
+        str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]]
+    ]:
         # One aggregate statement per batch: COUNT(*) once, then per column a
         # non-null count, an approximate distinct, min/max only where allowed,
-        # and value-shape fractions only where requested. Pure (no client), so
-        # the SELECT-only property is testable without a connection. Repeated
-        # (ARRAY) columns get no aggregates at all: they cannot be NULL in
-        # BigQuery and COUNT/DISTINCT are invalid on them; other nested types
-        # get a COUNTIF non-null count only.
+        # and value-shape/type-contradiction/key-shape/temporal-continuity
+        # fractions only where requested. Pure (no client), so the SELECT-only
+        # property is testable without a connection. Repeated (ARRAY) columns
+        # get no aggregates at all: they cannot be NULL in BigQuery and
+        # COUNT/DISTINCT are invalid on them; other nested types get a
+        # COUNTIF non-null count only.
+        source = self._quote(identifier)
+        if sample_percent is not None:
+            source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]] = []
+        plan: list[
+            tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]
+        ] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             repeated = col.data_type.upper().startswith("ARRAY")
             nested = repeated or self._is_nested(col.data_type)
             if repeated:
-                plan.append((i, col, False, False, False, False))
+                plan.append((i, col, False, False, False, False, False, False, False))
                 continue
             if nested:
                 select_parts.append(f"COUNTIF({qcol} IS NOT NULL) AS nn_{i}")
-                plan.append((i, col, True, False, False, False))
+                plan.append((i, col, True, False, False, False, False, False, False))
                 continue
             select_parts.append(f"COUNT({qcol}) AS nn_{i}")
             select_parts.append(f"APPROX_COUNT_DISTINCT({qcol}) AS nd_{i}")
@@ -467,10 +625,53 @@ class BigQueryAdapter:
             wants_shape = col.name in shape
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, True, True, wants_min_max, wants_shape))
-        source = self._quote(identifier)
-        if sample_percent is not None:
-            source += f" TABLESAMPLE SYSTEM ({sample_percent} PERCENT)"
+            wants_type = col.name in type_req
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                    )
+                )
+            wants_key_shape = col.name in key_shape_req
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = col.name in temporal_req
+            if wants_temporal:
+                dtype = col.data_type
+
+                def date_trunc(q: str, u: str, dtype: str = dtype) -> str:
+                    return _date_trunc_expr(q, u, dtype)
+
+                def date_diff(
+                    u: str, later: str, earlier: str, dtype: str = dtype
+                ) -> str:
+                    return _date_diff_expr(u, later, earlier, dtype)
+
+                select_parts.extend(temporal_alignment_expressions(qcol, i, date_trunc))
+                for unit in temporal_units_for(dtype):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol, i, unit, source, date_trunc, date_diff
+                        )
+                    )
+            plan.append(
+                (
+                    i,
+                    col,
+                    True,
+                    True,
+                    wants_min_max,
+                    wants_shape,
+                    wants_type,
+                    wants_key_shape,
+                    wants_temporal,
+                )
+            )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         sql = f"SELECT {', '.join(select_parts)} FROM {source}"  # noqa: S608
@@ -486,13 +687,23 @@ class BigQueryAdapter:
     def _read_aggregates(
         self,
         row: Any,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]],
         *,
         sampled: bool,
     ) -> list[ColumnAggregate]:
         n_total = int(row["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, has_count, wants_distinct, wants_min_max, wants_shape in plan:
+        for (
+            i,
+            col,
+            has_count,
+            wants_distinct,
+            wants_min_max,
+            wants_shape,
+            wants_type,
+            wants_key_shape,
+            wants_temporal,
+        ) in plan:
             nn = row[f"nn_{i}"] if has_count else None
             has_counts = nn is not None
             null_fraction = (
@@ -517,6 +728,9 @@ class BigQueryAdapter:
                     upper_vocab_fraction=shape_stat_value(row, f"su_{i}", wants_shape),
                     person_shape_fraction=shape_stat_value(row, f"sp_{i}", wants_shape),
                     avg_token_count=shape_stat_value(row, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(row, i, wants_type),
+                    **key_shape_aggregate_kwargs(row, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(row, i, wants_temporal),
                 )
             )
         return aggregates
@@ -552,7 +766,7 @@ class BigQueryAdapter:
                 "not cover the extra scan; uniqueness verdicts stay approximate",
             )
             return {}
-        _job, iterator = self._run(sql)
+        _job, iterator = self._run(sql, floored)
         rows = list(iterator)
         return {name: int(rows[0][f"d_{i}"]) for i, name in enumerate(columns)}
 
@@ -560,35 +774,46 @@ class BigQueryAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scan, return nothing and let the grain stay unknown. A metered
-        adapter never self-escalates past its ceiling.
+        already-confirmed budget. Every combination widens the same statement,
+        so when the budget cannot cover it the probe narrows to the pairs it can
+        afford (they arrive best-ranked first) and says so, rather than giving
+        up the grain wholesale. A metered adapter never self-escalates past its
+        ceiling.
 
         Charged at the floored bytes, not the raw dry-run number: this is one
         billed query like any other, so it bills (and must be budgeted
-        against) at least the per-query minimum (issue #107)."""
+        against) at least the per-query minimum (issue #107). That floor is
+        also what bounds the search below: a prefix already priced at the
+        minimum and still refused cannot be rescued by dropping another pair,
+        so only a probe that would genuinely cost less gets re-priced."""
 
         if self._unqueryable(identifier) or not combinations:
             return {}
-        sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
-            dialect=self.dialect,
-        )
-        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
-        if not self.cost_gate.try_charge(floored):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
+        priced: dict[int, tuple[str, float]] = {}
+
+        def price(prefix: list[list[str]]) -> float:
+            statement = assert_select_only(
+                distinct_combination_sql(self._quote(identifier), prefix, _quote_ident),
+                dialect=self.dialect,
             )
+            floored = max(self._dry_run(statement), float(_MIN_BILLED_BYTES))
+            priced[len(prefix)] = (statement, floored)
+            return floored
+
+        probed, note = affordable_combinations(
+            combinations,
+            price,
+            self.cost_gate.try_charge,
+            floor=float(_MIN_BILLED_BYTES),
+        )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
-        _job, iterator = self._run(sql)
+        sql, floored = priced[len(probed)]
+        _job, iterator = self._run(sql, floored)
         rows = list(iterator)
-        return {
-            tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -626,7 +851,7 @@ class BigQueryAdapter:
                 "cover the extra scan; no value domain reported",
             )
             return {}
-        _job, iterator = self._run(sql)
+        _job, iterator = self._run(sql, floored)
         rows = list(iterator)
         return {
             name: ValueDomainSample(
@@ -651,18 +876,18 @@ class BigQueryAdapter:
         what BigQuery actually bills, and an unfloored estimate would send the
         agent into a ladder of budget rejections.
 
-        The total also reserves one floor per table for each of the two
-        possible escalation queries (``exact_distinct_counts`` for a
-        near-unique column, ``distinct_combination_counts`` for a composite
-        key candidate): whether either actually runs depends on the aggregate
-        batch's own approximate results, which do not exist yet at estimate
-        time, so there is no way to dry-run them here. Reserving their floor
-        unconditionally keeps this total a ceiling profiling will not exceed,
-        rather than a number a run that does escalate blows past -- the exact
-        gap this estimator used to leave open (issue #107). Skipped only when
-        a table is provably empty (``row_count == 0``); an unknown row count
-        (views, whose count is never known before the aggregate that reveals
-        it) still reserves, since escalation is not ruled out.
+        The total also reserves one floor per table for each of the three
+        escalation queries a profile may still issue after that batch
+        (:meth:`exact_distinct_counts`, :meth:`value_domain_counts`,
+        :meth:`distinct_combination_counts`). Whether any of them runs depends
+        on the batch's own approximate results, which do not exist yet at
+        estimate time, so there is no way to dry-run them here. Holding their
+        floor keeps this total a ceiling profiling will not exceed rather than
+        a number a run that does escalate blows past, which is the gap this
+        estimator used to leave open (issue #107). See
+        :meth:`_escalation_reserve` for what narrows each one, and
+        :attr:`_composition` for how the reserve is reported apart from the
+        scan it rides with.
 
         Blob-type columns are excluded from the batches the same way
         ``explore.profile.profile`` excludes them from the scan itself
@@ -671,6 +896,9 @@ class BigQueryAdapter:
 
         blob_paths = include_blobs or set()
         per_table: dict[str, float] = {}
+        scan_bytes = 0.0
+        scan_queries = 0
+        reserved_queries = 0
         for identifier in identifiers:
             meta, columns = self.table_metadata(identifier)
             if self._unqueryable(identifier):
@@ -682,10 +910,14 @@ class BigQueryAdapter:
                 if not is_blob_type(c.data_type)
                 or f"{identifier}.{c.name}".lower() in blob_paths
             ]
-            # min/max and shape fractions add no scanned bytes: columnar
+            # min/max, shape, type-contradiction, key-shape, and
+            # temporal-continuity fractions add no scanned bytes: columnar
             # billing already charges the whole column.
             safe: set[str] = set()
             shape: set[str] = set()
+            type_req: set[str] = set()
+            key_shape_req: set[str] = set()
+            temporal_req: set[str] = set()
             sample_percent = self._sample_percent(identifier)
             total = 0.0
             for start in range(0, len(scan_columns), _COLUMN_BATCH):
@@ -694,23 +926,79 @@ class BigQueryAdapter:
                     scan_columns[start : start + _COLUMN_BATCH],
                     safe,
                     shape,
+                    type_req,
+                    key_shape_req,
+                    temporal_req,
                     sample_percent=sample_percent,
                 )
                 try:
-                    total += max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+                    batch = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
                 except self._api_exceptions.BadRequest:
                     self._note(
                         identifier,
                         "could not estimate an aggregate scan (dry-run failed); "
                         "the object is skipped",
                     )
-            if scan_columns and meta.row_count != 0:
-                total += float(_MIN_BILLED_BYTES)  # exact_distinct_counts
-                total += float(_MIN_BILLED_BYTES)  # value_domain_counts
-                if len(scan_columns) >= 2:
-                    total += float(_MIN_BILLED_BYTES)  # distinct_combination_counts
+                    continue
+                total += batch
+                scan_bytes += batch
+                scan_queries += 1
+            reserved = self._escalation_reserve(meta, scan_columns)
+            total += reserved * float(_MIN_BILLED_BYTES)
+            reserved_queries += reserved
             per_table[identifier] = total
+        self._composition = _EstimateComposition(
+            scan_bytes=scan_bytes,
+            scan_queries=scan_queries,
+            reserved_bytes=reserved_queries * float(_MIN_BILLED_BYTES),
+            reserved_queries=reserved_queries,
+        )
         return sum(per_table.values()), per_table
+
+    def _escalation_reserve(
+        self, meta: ObjectMeta, scan_columns: list[ColumnMeta]
+    ) -> int:
+        """How many escalation queries to hold a billing floor for on one table.
+
+        A reserve is dropped only where the probe's own guard already rules the
+        query out from metadata alone, never as a guess about what is likely: an
+        estimate that reserves for a query that cannot run is merely loose, while
+        one that skips a query that can is the defect issue #107 closed. So each
+        condition below mirrors one in ``explore.profile``, and moving one
+        without the other is the bug to watch for.
+
+        - Nothing at all for a table known to hold no rows. All three probes
+          return early on a falsy count, so a provably empty table cannot
+          escalate and the reserve would be money no run could spend.
+        - An unknown count is not an empty one, and it reserves. For a view or
+          an external table the aggregate's own ``COUNT(*)`` is what supplies the
+          count, and it lands before the probes are asked, so every one of them
+          can run. Reserving the maximum is the only honest read at estimate
+          time, since the number that decides which probes are eligible does not
+          exist yet. This is the half of issue #299's reasoning that inverted:
+          the reserve was dropped for these objects because the probes provably
+          could not run, and now they can.
+        - Nothing for columns BigQuery cannot count distinctly. Nested and
+          repeated fields get no approximate distinct in the aggregate batch, and
+          every probe's eligibility starts from one, so they can no more trigger
+          an escalation than a blob column already excluded from the scan.
+        - No value domain below :data:`VALUE_DOMAIN_MIN_ROWS` rows, which is what
+          the probe's row-relative fraction implies once a domain needs at least
+          one distinct value.
+        - No composite probe below two countable columns, since a combination
+          needs two members. This was already conditioned, but on the raw column
+          count, which counts columns that can never join a pair.
+        """
+
+        countable = [c for c in scan_columns if not self._is_nested(c.data_type)]
+        if not countable or meta.row_count == 0:
+            return 0
+        reserved = 1  # exact_distinct_counts
+        if meta.row_count is None or meta.row_count >= VALUE_DOMAIN_MIN_ROWS:
+            reserved += 1  # value_domain_counts
+        if len(countable) >= 2:
+            reserved += 1  # distinct_combination_counts
+        return reserved
 
     def query_estimate(self, sql: str) -> float:
         """The dry-run byte estimate for one firewall-approved query, floored to
@@ -726,20 +1014,14 @@ class BigQueryAdapter:
         """The bytes-scanned handshake payload: names the per-query billing
         floor baked into every number here, so a small-table estimate reads as
         a trustworthy ceiling instead of one the actual bill will exceed
-        (issue #107). The escalation-reserve clause only applies to a
-        multi-table call (``per_table`` set, i.e. a profile-shaped estimate);
-        a single ad-hoc query or cluster sample has no such reserve to explain.
+        (issue #107).
+
+        Deliberately a pure function of its arguments. What a *profile* estimate
+        is made of is answered by :meth:`profile_reserve` instead, because this
+        method also describes estimates that carry no reserve (an ad-hoc query,
+        a mid-command verify checkpoint) and it cannot tell which it was handed.
         """
 
-        note = (
-            f"BigQuery bills at least {_MIN_BILLED_BYTES:,} bytes (10 MB) per "
-            "query; every number here already reflects that floor"
-        )
-        if per_table:
-            note += (
-                ", including a reserve for the escalation queries a "
-                "multi-table profile may still add after its initial scan"
-            )
         data: dict[str, object] = {
             "estimated_bytes": estimate,
             "hint": (
@@ -747,11 +1029,49 @@ class BigQueryAdapter:
                 "<bytes> (the ceiling in bytes; 10000000000 is 10 GB, about "
                 "$0.06 on-demand)"
             ),
-            "notes": [note],
+            "notes": [
+                f"BigQuery bills at least {_MIN_BILLED_BYTES:,} bytes (10 MB) "
+                "per query; every number here already reflects that floor"
+            ],
         }
         if per_table:
             data["per_table_bytes"] = per_table
         return data
+
+    def profile_reserve(self, estimate: float) -> dict | None:
+        """How much of ``estimate`` is escalation reserve rather than measured
+        scan, as a sentence plus the two numbers behind it. ``None`` when this
+        command priced no profile, so there is nothing to attribute.
+
+        The confirm handshake and the over-ceiling refusal both reach for this,
+        which is the point of it existing: a refusal that quotes a number
+        without saying what it is made of leaves the operator to reconstruct
+        the split from the spend ledger by hand, which is what issue #299
+        reported doing. Only the command-level handshake asks, because only
+        that estimate is the one :meth:`profile_estimate` built.
+
+        The remainder is described rather than the recorded scan half quoted,
+        because a caller may have added statement estimates of its own to the
+        total (``explore query`` prices an auto-profile and its statements in
+        one handshake) and those are dry-run figures too.
+        """
+
+        composition = self._composition
+        if composition is None or not composition.reserved_queries:
+            return None
+        return {
+            "note": (
+                f"{composition.reserved_bytes:,.0f} bytes of this estimate is "
+                f"escalation reserve: {composition.reserved_queries} queries at "
+                f"BigQuery's {_MIN_BILLED_BYTES:,}-byte per-query minimum, held "
+                "for probes a profile may add after its aggregate scan and may "
+                "never issue. The remaining "
+                f"{estimate - composition.reserved_bytes:,.0f} bytes is dry-run "
+                "scan"
+            ),
+            "reserved_bytes": composition.reserved_bytes,
+            "reserved_queries": composition.reserved_queries,
+        }
 
     def _min_billed_floor(self, sql: str) -> float:
         """BigQuery bills at least ``_MIN_BILLED_BYTES`` per table a query
@@ -812,27 +1132,32 @@ class BigQueryAdapter:
         """SELECT-only guard, free dry-run, gate charge, then the capped run."""
 
         assert_select_only(sql, dialect=self.dialect)
-        self.cost_gate.charge(self._dry_run(sql))
-        return self._run(sql, timeout_seconds=timeout_seconds, max_results=max_results)
+        estimate = self._dry_run(sql)
+        self.cost_gate.charge(estimate)
+        return self._run(
+            sql, estimate, timeout_seconds=timeout_seconds, max_results=max_results
+        )
 
     def _run(
         self,
         sql: str,
+        dry_run_estimate: float,
         *,
         timeout_seconds: float | None = None,
         max_results: int | None = None,
+        _retried: bool = False,
     ) -> tuple[Any, Any]:
         """The single billed door past the gate: run with the server-side byte
         cap, wait for completion (bounded when a timeout is given), account the
-        actual billed bytes, and return (job, row iterator)."""
+        actual billed bytes, and return (job, row iterator).
 
-        cap = self.cost_gate.remaining_for_statement()
-        if cap is not None and cap < _MIN_BILLED_BYTES:
-            raise OverCeilingError(
-                f"the remaining budget ({cap} bytes) is below BigQuery's "
-                f"{_MIN_BILLED_BYTES}-byte minimum billed per query; raise "
-                "--budget or narrow the work"
-            )
+        ``dry_run_estimate`` is what :meth:`_execute` already charged for this
+        exact statement; a bytes-billed refusal below widens the charge by the
+        gap between that estimate and what BigQuery says it actually needed,
+        rather than charging the full requirement a second time on top of it.
+        """
+
+        cap = self.cost_gate.statement_cap(unit="byte", minimum=_MIN_BILLED_BYTES)
         job_config = self._bq.QueryJobConfig(
             maximum_bytes_billed=cap,
             use_query_cache=True,
@@ -845,12 +1170,38 @@ class BigQueryAdapter:
             iterator = job.result(timeout=timeout_seconds, max_results=max_results)
         except self._api_exceptions.BadRequest as exc:
             if "bytes billed" in str(exc) or "bytesBilledLimitExceeded" in str(exc):
+                required = _parse_bytes_billed_required(str(exc))
+                if required is not None and not _retried:
+                    # No dry run predicts BigQuery's own execution-time
+                    # rounding of bytes billed (issue #320), so the estimate
+                    # this command already charged for the statement can be
+                    # a genuine underestimate even though nothing was wrong
+                    # with it at dry-run time. BigQuery's own refusal names
+                    # exactly what it needed; widen the charge by the gap and
+                    # retry once with that as the new cap. Raises the same
+                    # OverCeilingError/ConfirmationRequiredError this would
+                    # raise anyway if the confirmed ceiling itself can't
+                    # cover the real requirement, so a genuine over-budget
+                    # query still refuses, correctly, on the real number.
+                    self.cost_gate.charge(required - dry_run_estimate)
+                    return self._run(
+                        sql,
+                        required,
+                        timeout_seconds=timeout_seconds,
+                        max_results=max_results,
+                        _retried=True,
+                    )
                 raise OverCeilingError(
                     "the query would bill more than the remaining budget "
                     "(server-side maximum_bytes_billed); raise --budget or "
                     "narrow the query"
                 ) from exc
-            raise
+            # Every other BadRequest is BigQuery refusing the statement itself
+            # (an invalid query, a type it will not coerce). Typed, so the
+            # envelope carries `execution_failure` and BigQuery's own words
+            # rather than the `internal` an untyped API exception falls
+            # through to.
+            raise warehouse_refusal(str(exc)) from exc
         except TimeoutError as exc:
             # concurrent.futures.TimeoutError is the builtin on Python 3.11+.
             self._cancel(job)
@@ -871,6 +1222,12 @@ class BigQueryAdapter:
             sql, job_config=job_config, location=self.target.location
         )
         return float(getattr(job, "total_bytes_processed", 0) or 0)
+
+    def _request(self, operation: Callable[[], Any]) -> Any:
+        try:
+            return operation()
+        except self._auth_exceptions.RefreshError as exc:
+            raise PrerequisiteError(str(exc)) from exc
 
     def _cancel(self, job: Any) -> None:
         # Best-effort: the timeout is raised regardless, and a failed cancel
@@ -902,3 +1259,12 @@ def _quote_ident(name: str) -> str:
 
     escaped = name.replace("`", "\\`")
     return f"`{escaped}`"
+
+
+def _parse_bytes_billed_required(message: str) -> float | None:
+    """The byte count BigQuery's own bytes-billed refusal names as required,
+    or ``None`` if the message doesn't have the expected shape (a future
+    wording change should degrade to the old flat refusal, not a crash)."""
+
+    match = _BYTES_BILLED_REQUIRED_RE.search(message)
+    return float(match.group(1)) if match else None

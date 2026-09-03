@@ -9,6 +9,8 @@ logic arrives.
 
 from __future__ import annotations
 
+import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -28,6 +30,50 @@ def _memory_engine(**kwargs) -> DexEngine:
     """An engine that touches no disk, for the units that need one to exist."""
 
     return DexEngine(config=DexConfig(), store=MemoryStore(), **kwargs)
+
+
+def cast_arguments(sql: str) -> list[str]:
+    """Every CAST argument in one generated statement.
+
+    Matched by parenthesis balance rather than by regex: the arguments nest
+    (a CASE holding a SUBSTR), so a non-greedy match would stop at the wrong
+    close paren.
+    """
+
+    arguments = []
+    for start in (i for i in range(len(sql)) if sql.startswith("CAST(", i)):
+        depth, i = 1, start + len("CAST(")
+        while depth:
+            depth += {"(": 1, ")": -1}.get(sql[i], 0)
+            i += 1
+        arguments.append(sql[start + len("CAST(") : i - 1].rsplit(" AS ", 1)[0])
+    return arguments
+
+
+def assert_every_cast_is_total(sql: str) -> None:
+    """#310: every CAST in a generated aggregate must be castable for every row
+    of the column, not only for the rows a surrounding CASE would select.
+
+    Redshift evaluates a CASE branch's cast for rows the WHEN never selects,
+    so the shape that reads as safe (``CASE WHEN <digits> THEN CAST(col AS
+    BIGINT) END``) died server-side on any table with one non-numeric string
+    in a profiled column. The invariant that replaced it is structural and
+    dialect-independent: the cast's argument is itself a CASE that yields
+    digits on every row, so no evaluation order can reach the cast with
+    something it cannot parse.
+    """
+
+    from exmergo_dex_core.adapters.base import _CAST_SENTINEL
+
+    for argument in cast_arguments(sql):
+        assert argument.startswith("CASE WHEN "), (
+            f"a CAST argument is not shape-guarded, so a row that fails the "
+            f"shape predicate reaches it raw: {argument}"
+        )
+        assert argument.endswith(f"ELSE {_CAST_SENTINEL} END"), (
+            f"a CAST argument has no digit fallback, so it is NULL-or-value "
+            f"rather than total: {argument}"
+        )
 
 
 # --- Family 1: read-only against data; SELECT-only; prod-target refused -------
@@ -55,9 +101,13 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
             [
                 ColumnMeta("id", "INTEGER", True, 0),
                 ColumnMeta("email", "VARCHAR", True, 1),
+                ColumnMeta("signup_date", "TIMESTAMP", True, 2),
             ],
-            safe={"id"},
+            safe={"id", "signup_date"},
             shape={"email"},
+            type_req={"id", "email"},
+            key_shape_req={"email"},
+            temporal_req={"signup_date"},
         )
     finally:
         adapter.close()
@@ -65,8 +115,218 @@ def test_generated_sql_is_select_only(duckdb_file: Path):
     # Shape statistics ride the same guarded statement (regex predicates inside
     # measuring aggregates, never a raw value in the projection).
     assert "su_1" in sql and "sp_1" in sql and "st_1" in sql
+    # Declared-type-vs-content statistics (#204) ride the same statement too:
+    # string-eligible fractions on the VARCHAR column, epoch fractions on both.
+    assert "ts_ns_1" in sql and "ts_sl1_1" in sql
+    assert "ts_ep_s_0" in sql and "ts_ep_s_1" in sql
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_1" in sql and "ks_hex_1" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too: the
+    # alignment fractions and all three granularity variants for the date column.
+    assert "tc_da_2" in sql and "tc_ma_2" in sql
+    assert "tp_d_2" in sql and "tg_d_2" in sql
+    assert "tp_m_2" in sql and "tg_m_2" in sql
+    assert "tp_h_2" in sql and "tg_h_2" in sql
+    assert_every_cast_is_total(sql)
     # Idempotent: passing it through the guard again must not raise.
     assert assert_select_only(sql) == sql
+
+
+def test_a_shape_gated_cast_never_reaches_a_non_numeric_value(tmp_path: Path):
+    """#310: the profiling aggregate must not depend on lazy CASE evaluation.
+
+    Redshift evaluates a CASE branch's cast for rows the WHEN never selects,
+    which killed `explore map` and `explore profile` on any table holding one
+    ordinary varchar status column, and no offline test could catch it because
+    every other dialect honors the guard. This reproduces that engine here: it
+    lifts each CAST argument out of the generated statement and casts it over
+    every row, which is exactly the work Redshift does eagerly. A raise is the
+    bug; the fixed shape casts digits on every row and cannot raise anywhere.
+    """
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    path = tmp_path / "statuses.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE orders (id INTEGER, status VARCHAR)")
+    conn.executemany(
+        "INSERT INTO orders VALUES (?, ?)",
+        [(1, "pending"), (2, "shipped"), (3, None), (4, "1700000000")],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        sql, _plan = adapter._build_aggregate_sql(
+            "statuses.main.orders",
+            [
+                ColumnMeta("id", "INTEGER", True, 0),
+                ColumnMeta("status", "VARCHAR", True, 1),
+            ],
+            safe={"id"},
+            shape=set(),
+            type_req={"id", "status"},
+            key_shape_req={"status"},
+            temporal_req=set(),
+        )
+        arguments = cast_arguments(sql)
+        assert arguments, "the aggregate should carry the epoch/slash casts to check"
+        for argument in arguments:
+            # No CASE around it: every row of the column reaches the cast, the
+            # way the hostile dialect does it. The interpolation is the
+            # generator's own output, which is what this asserts about (S608).
+            adapter._run_select(f"SELECT CAST({argument} AS BIGINT) FROM orders")  # noqa: S608
+        # The statement itself still runs, and still measures: 1 of the 3
+        # non-null values is epoch-shaped and in range.
+        (row,) = adapter._run_select(sql)
+        values = dict(zip([d[0] for d in adapter._conn.description], row, strict=True))
+        assert values["ts_ep_s_1"] == 1.0  # of the epoch-shaped rows, all in range
+        assert values["ts_ns_1"] == pytest.approx(1 / 3)  # of the non-null rows
+    finally:
+        adapter.close()
+
+
+def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
+    """#204: the concrete epoch integer, and the concrete date-shaped string,
+    must never reach the generated data-quality note text -- only the
+    fraction, the format/unit name, and (for epoch) the *translated* calendar
+    date, which is derived from an aggregate MIN/MAX, not a row value."""
+
+    import duckdb
+
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "epoch.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE events (id INTEGER, crt_ts_epoch VARCHAR)")
+    conn.executemany(
+        "INSERT INTO events VALUES (?, ?)",
+        [(i, str(1_700_000_000 + i)) for i in range(50)],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (dataset,) = profile(adapter, ["epoch.main.events"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "epoch" in notes.lower()
+    for i in range(50):
+        assert str(1_700_000_000 + i) not in notes, (
+            "no concrete epoch value may appear in note text"
+        )
+    # The translated calendar date is what appears, not the integer.
+    assert "2023-11-14" in notes
+
+
+def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):
+    """#205: neither a concrete numeric id nor a concrete hash string may
+    reach the generated data-quality note text -- only fractions and a
+    length-derived shape label."""
+
+    import hashlib
+
+    import duckdb
+
+    from exmergo_dex_core.explore.profile import profile
+
+    path = tmp_path / "heterogeneous_key.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE t (id VARCHAR PRIMARY KEY)")
+    rows = [(str(1000 + i),) for i in range(90)]
+    # md5-shaped test fixture data only, not a security use.
+    hashes = [
+        hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
+        for i in range(10)
+    ]
+    rows += [(h,) for h in hashes]
+    conn.executemany("INSERT INTO t VALUES (?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        (dataset,) = profile(adapter, ["heterogeneous_key.main.t"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "mixes value shapes" in notes
+    for i in range(90):
+        assert str(1000 + i) not in notes, "no concrete numeric id in note text"
+    for h in hashes:
+        assert h not in notes, "no concrete hash value in note text"
+    # Only the fraction and the length-derived shape label appear.
+    assert "90% numeric" in notes and "md5-shaped" in notes
+
+
+# `dex demo` is the one verb that creates a data file, so the read-only rule has
+# to hold around it in a way a reader can check rather than take on trust. Two
+# tests do that: the generator is structurally sealed off from the connector, and
+# the file it produces is opened read-only like any other the moment it exists.
+
+
+def test_the_demo_generator_is_the_only_writable_duckdb_open():
+    """No writable DuckDB connection exists in the engine outside the generator.
+
+    Asserted over the source rather than at runtime because the claim is about
+    what the code can do, not about what one path happened to do: a future
+    `read_only=False` anywhere in the adapter tree is the regression, and it
+    would pass every behavioral test until someone pointed dex at a warehouse
+    they cared about.
+    """
+
+    import exmergo_dex_core
+
+    package_root = Path(exmergo_dex_core.__file__).parent
+    generator = package_root / "demo" / "warehouse.py"
+    openers = [
+        path
+        for path in package_root.rglob("*.py")
+        if "duckdb.connect(" in path.read_text(encoding="utf-8")
+    ]
+    assert generator in openers, "the generator is the one that writes"
+    for path in openers:
+        if path == generator:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "read_only=True" in source, f"{path} opens DuckDB without read_only"
+        assert "read_only=False" not in source, f"{path} opens DuckDB writable"
+
+    # And the generator imports neither the adapter nor the guards, so the
+    # read-only open and the SELECT-only guard have no branch it could take.
+    # Read off the import statements rather than the file text, so the prose
+    # explaining the separation cannot be mistaken for a violation of it.
+    import ast
+
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(generator.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not any("adapters" in name or "guards" in name for name in imported), (
+        f"the generator must stay off the connector path: {sorted(imported)}"
+    )
+
+
+def test_a_generated_demo_warehouse_is_opened_read_only(tmp_path: Path):
+    """The loop closed: the moment the demo file exists it is user data, and the
+    adapter treats it exactly like a warehouse dex did not create."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import generate_demo_warehouse
+
+    warehouse = generate_demo_warehouse(tmp_path / "demo.duckdb")
+    adapter = DuckDBAdapter(warehouse.path)
+    try:
+        with pytest.raises(Exception):
+            adapter._conn.execute("DELETE FROM customers")
+    finally:
+        adapter.close()
 
 
 def test_combination_probe_sql_is_select_only_in_every_dialect():
@@ -84,7 +344,15 @@ def test_combination_probe_sql_is_select_only_in_every_dialect():
         quote,
     )
     assert sql.lstrip().upper().startswith("SELECT")
-    dialects = ("duckdb", "bigquery", "snowflake", "databricks", "postgres", "redshift")
+    dialects = (
+        "duckdb",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "postgres",
+        "redshift",
+        "clickhouse",
+    )
     for dialect in dialects:
         assert assert_select_only(sql, dialect=dialect) == sql
 
@@ -100,6 +368,52 @@ def test_select_only_guard_rejects_writes():
     ):
         with pytest.raises(NotSelectOnlyError):
             assert_select_only(bad)
+
+
+def test_every_authored_sql_kind_runs_through_the_select_only_guard():
+    """No edit kind carrying SQL may reach the repo without the guard.
+
+    dex writes SQL a human reviews and dbt later runs, so the read-only
+    guarantee has to hold at the point of authorship, not only at the point of
+    execution. The failure mode this pins is a new kind added with its own
+    validation branch that forgets the guard: the file lands, the diff reads
+    fine, and a DELETE is sitting in the project waiting for someone to run it.
+
+    An analysis is the sharpest case. dbt never runs one, so nothing downstream
+    would object, and it is still refused: compiled SQL in ``target/`` is one
+    copy-paste from a warehouse, and the guarantee is about what dex writes, not
+    about who presses the button.
+    """
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import EditValidationError, validate_edit
+
+    carriers = {
+        transform.EditKind.MODEL_SQL: "models/staging/stg_x.sql",
+        transform.EditKind.TEST_SQL: "tests/assert_x.sql",
+        transform.EditKind.ANALYSIS_SQL: "analyses/scratch.sql",
+    }
+    for kind, path in carriers.items():
+        for bad in ("delete from customers", "drop table customers"):
+            with pytest.raises(EditValidationError, match="read-only SELECT"):
+                validate_edit(transform.PlanEdit(path=path, kind=kind, new_content=bad))
+
+    # A snapshot carries its query inside the block, and the body gets the same
+    # guard as a standalone one.
+    with pytest.raises(EditValidationError, match="read-only SELECT"):
+        validate_edit(
+            transform.PlanEdit(
+                path="snapshots/snap_x.sql",
+                kind=transform.EditKind.SNAPSHOT_SQL,
+                new_content=(
+                    "{% snapshot snap_x %}\n"
+                    "{{ config(unique_key='id', strategy='timestamp', "
+                    "updated_at='updated_at') }}\n"
+                    "delete from customers\n"
+                    "{% endsnapshot %}\n"
+                ),
+            )
+        )
 
 
 def _firewall_cache():
@@ -141,6 +455,54 @@ def test_query_firewall_refuses_writes_pragmas_and_multistatement():
     ):
         with pytest.raises(QueryRefusedError):
             inspect_query(bad, cache, QueryLimits())
+
+
+def test_a_batch_cannot_launder_a_statement_past_the_firewall(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """`explore query` takes several statements per call, and the guard is
+    per statement or it is nothing.
+
+    Two ways a batch could weaken it, both pinned here. Riding alongside a clean
+    statement must not admit a PII projection, and a semicolon-joined argument
+    must still be refused as the smuggled second statement it is: arguments are
+    never joined into one string, so the multi-statement refusal above keeps
+    exactly the reach it had.
+    """
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base = ["--path", str(duckdb_file), "--repo-root", str(repo)]
+    assert main(["explore", "map", *base]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "explore",
+                "query",
+                "select count(*) as n from customers",
+                "select email from customers",
+                "select 1 as a; drop table customers",
+                *base,
+            ]
+        )
+        == 1
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error" and payload["reason"] == "guard"
+    results = payload["data"]["results"]
+    assert [r["status"] for r in results] == ["ok", "refused", "refused"]
+    assert "PII-flagged" in results[1]["error"]
+    assert "exactly one statement" in results[2]["error"]
+    # No flagged value crossed the boundary anywhere in the payload, including in
+    # the neighbour that was allowed to answer.
+    assert "@" not in json.dumps(payload["data"])
+    env.sanitize(env.ok(payload["data"]))
 
 
 def test_an_install_that_cannot_validate_sql_refuses_rather_than_degrading():
@@ -194,6 +556,52 @@ def test_cost_guard_blocks_over_ceiling():
         cost_guard.preflight(estimate=10_000, ceiling=10, confirmed=True)
     with pytest.raises(cost_guard.OverCeilingError):
         cost_guard.preflight(estimate=10_000, ceiling=10)
+
+
+@pytest.mark.parametrize(
+    "connector",
+    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+)
+def test_row_attribution_never_spends_unasked_on_a_metered_connector(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """Naming a row-affecting change is free; measuring one is a scan. A metered
+    connector must therefore not be touched by planning unless the caller asked,
+    which is what keeps `transform plan` free of a handshake for the edits that
+    cost nothing. The edit here does move rows, so a connection would be opened
+    if the gate were on the wrong side."""
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.row_attribution import attribute
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    model.write_text("select * from raw_customers where id > 0\n", encoding="utf-8")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("planning opened a connection without --attribute-rows")
+
+    monkeypatch.setattr(DexEngine, "_adapter", refuse)
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector=connector),
+    )
+    edits = [
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select * from raw_customers where id > 5\n",
+        )
+    ]
+    # requested=None is the default: follow the connector, and every one of these
+    # bills, so none of them may be opened.
+    outcome = attribute(engine, edits, requested=None)
+    assert outcome.models, "the change is still named, for free"
+    changes = outcome.models[0].changes
+    assert changes and all(not c.attributed for c in changes)
+    assert all("--attribute-rows" in (c.reason or "") for c in changes)
+    assert outcome.adapter is None and outcome.pending is None
 
 
 @pytest.mark.parametrize(
@@ -346,6 +754,89 @@ def test_every_shipped_store_can_serialize_the_spend_admission(tmp_path):
     assert len(unguarded) == 1 and "spend lock" in unguarded[0]
 
 
+def test_an_unreachable_spend_ledger_stops_billing_and_nothing_else(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Issue #374, measured on a deployment with a network-backed ledger: a store
+    outage took down unbilled reads on two hosts while billing correctly failed
+    closed.
+
+    Here rather than only in the cost-guard suite because both halves are the
+    guarantee, and they pull against each other. Billing must not proceed on a
+    day's spend nobody could read, and everything else must not be hostage to a
+    number it never consults. A gate is built for every command on a billed
+    connector, so the eager constructor read made the second half false: the
+    ledger became a single point of failure for commands that cannot spend.
+    """
+
+    from exmergo_dex_core import adapters, command_args
+    from exmergo_dex_core import config as config_mod
+    from exmergo_dex_core import connect as connect_mod
+    from exmergo_dex_core.guards.cost_guard import (
+        ConfirmationRequiredError,
+        LedgerUnreadableError,
+    )
+
+    store = FilesystemStore(tmp_path)
+
+    def unreachable(*_args, **_kwargs) -> float:
+        raise ConnectionError("the ledger backend is unreachable")
+
+    monkeypatch.setattr(FilesystemStore, "spend_since", unreachable)
+
+    config = config_mod.DexConfig()
+    config.budget.ceiling = 500 * 1024 * 1024
+    config.budget.session_ceiling = 5 * 1024 * 1024 * 1024
+
+    def gate(command: str):
+        return connect_mod.new_cost_gate(
+            "bigquery", config, store, confirmed=True, command=command
+        )
+
+    # Free work does not consult the day's spend, so it does not inherit the
+    # ledger's availability. Building the gate is where that used to break.
+    free = gate("explore inventory")
+    adapter = adapters.get_adapter(
+        "bigquery", project="test-proj", cost_gate=free, client=fake_bq_client
+    )
+    assert [o.name for o in adapter.list_objects()]
+    # And the one free surface that does ask reports the field as unavailable
+    # rather than failing the command it is part of.
+    assert adapter.capabilities()["budget"]["session_spent_today"] is None
+    assert command_args.preflight_cost(adapter).paradigm is env.Paradigm.BYTES_SCANNED
+
+    # Billed work refuses, because the cumulative ceiling is measured against the
+    # number that could not be read. A named guard refusal, not a crash.
+    billed = adapters.get_adapter(
+        "bigquery",
+        project="test-proj",
+        cost_gate=gate("explore profile"),
+        client=fake_bq_client,
+    )
+    # Charging a statement without having gone through the handshake first must
+    # not slip past on a ceiling the session bound dropped out of: the cumulative
+    # cap is configured, so it has to bind against a reading or refuse.
+    with pytest.raises(LedgerUnreadableError):
+        billed.run_query(
+            "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+
+    estimate, per_table = billed.profile_estimate(["test-proj.shop.customers"])
+    with pytest.raises(LedgerUnreadableError) as caught:
+        command_args.billed_handshake(
+            "explore profile", billed, estimate, per_table=per_table
+        )
+    # Not the confirmable kind: a bigger budget cannot buy through a ceiling that
+    # could not be measured, so this must never read as needs_confirmation.
+    assert not isinstance(caught.value, ConfirmationRequiredError)
+    assert env.reason_for(caught.value) is env.Reason.GUARD
+    assert caught.value.cost.paradigm is env.Paradigm.BYTES_SCANNED
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
 def test_a_scope_flag_cannot_widen_the_committed_allowlist():
     """The source allowlist in .dex/config.yml is a committed cost boundary. A
     per-command flag scopes work inside it and can never reach outside it, on any
@@ -358,11 +849,101 @@ def test_a_scope_flag_cannot_widen_the_committed_allowlist():
         ("bigquery", "datasets", config_mod.BigQueryTarget(datasets=["analytics"])),
         ("databricks", "catalogs", config_mod.DatabricksTarget(catalogs=["raw"])),
         ("postgres", "schemas", config_mod.PostgresTarget(schemas=["public"])),
+        (
+            "clickhouse",
+            "databases",
+            config_mod.ClickHouseTarget(databases=["app"]),
+        ),
     ):
         narrowed = narrow_target(target, connector, [getattr(target, field)[0]])
         assert getattr(narrowed, field) == getattr(target, field)
         with pytest.raises(ScopeError):
             narrow_target(target, connector, ["somewhere_else"])
+
+
+def test_the_grain_estimate_prices_every_scan_the_grain_run_executes():
+    """Family 2: cost is surfaced before any spend, and on this axis that rests
+    entirely on one structural claim.
+
+    ``GrainPlan`` promises the estimate and the confirmed run "price and execute
+    exactly the same statements", and the only thing making that true is that both
+    read the same plan. Nothing asserted it. Every list on the plan is a scan, so
+    a list the run iterates and the estimator does not is a table scanned outside
+    the number the operator confirmed, and nothing about it would look wrong: the
+    handshake still appears, the findings still arrive, the bill is just larger
+    than the quote. The plan below carries all three kinds at once so a fourth
+    added to one side and not the other fails here rather than on someone's
+    invoice.
+    """
+
+    from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.maintain.drift import GrainPlan, grain_drift, grain_estimate
+
+    columns = ["order_key", "line_number", "shipped_on"]
+
+    class RecordingAdapter:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.priced: list[str] = []
+            self.scanned: list[tuple[str, tuple[str, ...]]] = []
+
+        def query_estimate(self, sql: str) -> float:
+            self.priced.append(sql)
+            return 1.0
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="line_items",
+                row_count=1000,
+                byte_size=None,
+                column_count=len(columns),
+            )
+            return meta, [
+                ColumnMeta(name=n, data_type="INTEGER", nullable=False, ordinal=i)
+                for i, n in enumerate(columns)
+            ]
+
+        def exact_distinct_counts(self, identifier, cols):
+            self.scanned.append((identifier, tuple(cols)))
+            return dict.fromkeys(cols, 1000)
+
+        def distinct_combination_counts(self, identifier, combinations):
+            for combo in combinations:
+                self.scanned.append((identifier, tuple(combo)))
+            return {tuple(c): 1000 for c in combinations}
+
+    dataset = Dataset(identifier="db.s.line_items")
+    plan = GrainPlan(
+        key_checks=[(dataset, ["order_key"], 1000)],
+        fanout_pairs=[],
+        composite_checks=[(dataset, [["order_key", "line_number"]], 1000)],
+        declared_composite_checks=[(dataset, [["line_number", "shipped_on"]], 1000)],
+        notes=[],
+    )
+
+    priced_adapter, run_adapter = RecordingAdapter(), RecordingAdapter()
+    total, per_table = grain_estimate(priced_adapter, plan)
+    grain_drift(run_adapter, plan)
+
+    assert total > 0 and per_table == {"db.s.line_items": total}
+    assert run_adapter.scanned, "the plan executed nothing, so this proves nothing"
+    priced_text = "\n".join(priced_adapter.priced)
+    for identifier, scanned_columns in run_adapter.scanned:
+        assert identifier in per_table, (
+            f"{identifier} was scanned and never priced: the operator confirmed a "
+            "figure that did not include it"
+        )
+        for column in scanned_columns:
+            assert column in priced_text, (
+                f"{identifier}.{column} was scanned and no priced statement names "
+                "it, so the quote covered fewer columns than the run read"
+            )
 
 
 # --- Family 3: PII flagged, never surfaced -----------------------------------
@@ -441,6 +1022,10 @@ def test_query_firewall_unnest_reshapes_but_never_smuggles():
         "postgres": "FROM events, jsonb_object_keys({col}) AS k",
         "redshift": "FROM events e, UNPIVOT e.{col} AS v AT k",
         "duckdb": "FROM events, UNNEST(json_keys({col})) AS u(k)",
+        # ClickHouse has no lateral join: ARRAY JOIN is the expansion, and it
+        # is a Join node rather than a FROM source, so the taint rule reaches
+        # it by a different path than every other dialect here.
+        "clickhouse": "FROM events ARRAY JOIN JSONExtractKeysAndValuesRaw({col}) AS k",
     }
     for dialect, idiom in idioms.items():
         allowed = "SELECT k " + idiom.format(col="doc")
@@ -516,6 +1101,420 @@ def test_firewall_threshold_boundary_and_warning_carry_no_values():
     assert "AFRICA" not in warning and "@" not in warning
 
 
+def test_pii_refusal_s_suggested_override_carries_no_value():
+    # Issue #217: the refusal now names the exact pii_overrides entry that
+    # would clear the column. That entry is built from the dataset identifier,
+    # the column name, and the category only, the same structural guarantee
+    # PIIFlag itself makes (no value field exists anywhere to leak one).
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.region",
+                columns=[
+                    ColumnProfile(
+                        name="r_name",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.9),
+                    ),
+                ],
+            )
+        ]
+    )
+    with pytest.raises(QueryRefusedError) as excinfo:
+        inspect_query("SELECT r_name FROM region", cache, QueryLimits())
+    message = str(excinfo.value)
+    assert "column: db.main.region.r_name" in message
+    assert "AFRICA" not in message and "@" not in message
+
+
+def test_a_seed_s_pii_refusal_fires_before_any_diff_is_built(dbt_project_dir: Path):
+    """A seed is the first edit kind that puts **values** into a reviewable diff,
+    and a diff goes into git and stays there.
+
+    Two things have to hold, and only one of them is the refusal. The other is
+    its position: ``plan`` validates every edit before it builds a single diff,
+    because the envelope sanitizer walks ``data`` and never ``diffs``. If the
+    order were the other way round, a refused seed's values would already be in
+    the diff list, and from there in the transcript. So this asserts the
+    ordering, not just the outcome: nothing was stored, nothing was written, and
+    the message that comes back carries the column name and never a value.
+    """
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import EditValidationError
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    a_person = "someone@example.com"
+    with pytest.raises(EditValidationError) as excinfo:
+        transform.plan(
+            "a lookup built from customer data",
+            [
+                transform.PlanEdit(
+                    path="seeds/contacts.csv",
+                    kind=transform.EditKind.SEED_CSV,
+                    new_content=f"id,email\n1,{a_person}\n",
+                )
+            ],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=store,
+        )
+    message = str(excinfo.value)
+    assert "'email' looks like email" in message
+    assert a_person not in message
+    # Nothing was stored (the plan never got made) and nothing was written.
+    assert store.list_plans() == []
+    assert not (dbt_project_dir / "seeds" / "contacts.csv").exists()
+
+
+def test_the_reference_index_reads_a_seed_s_header_and_never_its_rows(
+    dbt_project_dir: Path,
+):
+    """A seed is project data, and the index walks every file in the project.
+
+    The header names columns, which is what a reference index is for. The rows
+    below it are values, and values never enter agent context. This is the one
+    place in the read path where "scan every file" meets "a seed holds data", so
+    the boundary is asserted here rather than left to the scanner's good manners.
+    """
+
+    from exmergo_dex_core.dbt_project import load
+    from exmergo_dex_core.references import ReferenceIndex
+
+    (dbt_project_dir / "seeds").mkdir(parents=True, exist_ok=True)
+    a_person = "someone@example.com"
+    (dbt_project_dir / "seeds" / "contacts.csv").write_text(
+        f"id,email\n1,{a_person}\n2,other@example.com\n", encoding="utf-8"
+    )
+    index = ReferenceIndex(load(dbt_project_dir))
+
+    header, _limits = index.references_to("email", "column")
+    assert ("seeds/contacts.csv", "seed_header") in {
+        (hit.path, hit.form) for hit in header
+    }
+    indexed = {
+        reference.name
+        for references in index._by_name.values()
+        for reference in references
+    }
+    assert a_person not in indexed
+    assert not any(name and "@example.com" in name for name in indexed)
+
+
+def test_the_reference_index_reports_names_and_never_a_column_value(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Every occurrence carries a path, a line and a form, and no content.
+
+    The command answers "where", so a line number is the whole payload it owes.
+    Echoing the matching source line back would be a small convenience and a
+    standing leak, because the line that names a column is routinely the line
+    that also carries a literal.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    (dbt_project_dir / "models" / "staging" / "stg_secrets.sql").write_text(
+        "select 'hunter2' as token, id from {{ ref('stg_customers') }}\n",
+        encoding="utf-8",
+    )
+    assert main(["--repo-root", str(tmp_path), "transform", "references", "id"]) == 0
+    payload = capsys.readouterr().out
+    assert "hunter2" not in payload
+    occurrences = [
+        occurrence
+        for target in json.loads(payload)["data"]["targets"]
+        for file_entry in target["files"]
+        for occurrence in file_entry["occurrences"]
+    ]
+    assert occurrences
+    assert all(
+        set(occurrence) <= {"line", "form", "resolution", "note"}
+        for occurrence in occurrences
+    )
+
+
+def test_propagation_writes_nothing_to_the_project_before_apply(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Propose-don't-impose, on the one path where dex authors the content itself.
+
+    `transform rename` is the first verb where the engine writes the SQL rather
+    than validating what an agent wrote, so the guarantee that nothing reaches the
+    project until `apply` is asserted here rather than inherited from the plan
+    store's good behaviour.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    model = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    schema = dbt_project_dir / "models" / "staging" / "schema.yml"
+    before = (model.read_text(), schema.read_text())
+
+    assert (
+        main(
+            [
+                "--repo-root",
+                str(tmp_path),
+                "transform",
+                "rename",
+                "column",
+                "stg_customers.id",
+                "customer_id",
+            ]
+        )
+        == 0
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert envelope["status"] == "ok"
+    assert envelope["data"]["plan_id"]
+    assert envelope["diffs"]
+    assert (model.read_text(), schema.read_text()) == before
+
+
+def test_propagation_never_proposes_an_edit_inside_an_installed_package(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """dex reads packages and does not write them.
+
+    The reference index scans `dbt_packages/` on purpose, because a package that
+    ships a model the project shadows is a reference on both sides. That makes an
+    installed package reachable from the same walk that builds edits, so the write
+    boundary is asserted rather than assumed.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    package = dbt_project_dir / "dbt_packages" / "utils"
+    (package / "models").mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        'name: utils\nversion: "1.0.0"\nprofile: utils\n', encoding="utf-8"
+    )
+    (package / "models" / "packaged.sql").write_text(
+        "select 1 as id\n", encoding="utf-8"
+    )
+    packaged_before = (package / "models" / "packaged.sql").read_text()
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "rename",
+            "column",
+            "stg_customers.id",
+            "customer_id",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert not any(
+        path.startswith("dbt_packages/") for path in envelope["data"]["paths"]
+    )
+    assert (package / "models" / "packaged.sql").read_text() == packaged_before
+
+
+def test_propagation_refuses_rather_than_partially_applying(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The rule the whole propagation surface rests on.
+
+    `transform references` may answer "here is what I found, and here is why I
+    might be missing something", because a person reads that and compensates. A
+    generated plan cannot, because it will be applied. So a reference dex could
+    not resolve refuses the plan outright, and nothing is stored.
+
+    Deliberately stricter than the delete guard, which warns on the same input:
+    a dangling dynamic ref left by a delete is unsatisfiable, and one in a
+    rename's path is fixable by hand.
+    """
+
+    from exmergo_dex_core.cli import main
+
+    (dbt_project_dir / "models" / "staging" / "stg_dynamic.sql").write_text(
+        "select * from {{ ref(var('which')) }}\n", encoding="utf-8"
+    )
+
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "rename",
+            "model",
+            "stg_customers",
+            "stg_people",
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+
+    assert rc != 0
+    assert envelope["status"] == "error"
+    assert "stg_dynamic.sql:1" in json.dumps(envelope["errors"])
+    assert FilesystemStore(tmp_path).list_plans() == []
+    assert (dbt_project_dir / "models" / "staging" / "stg_customers.sql").exists()
+
+
+def test_propagation_and_placement_open_no_connection(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Both verbs are repo-only, whatever the repo is configured to bill against.
+
+    They rewrite files and read a `ref()` graph, and neither needs a warehouse.
+    A connector opened here would price nothing and still authenticate, which is
+    the quiet version of the failure the cost handshake exists to make loud.
+    """
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import DexConfig, save_config
+    from exmergo_dex_core.engine import DexEngine
+
+    monkeypatch.setattr(
+        DexEngine,
+        "_adapter",
+        lambda *a, **k: pytest.fail("a propagation command opened a connection"),
+    )
+    for connector in ("bigquery", "snowflake", "databricks", "duckdb"):
+        save_config(DexConfig(connector=connector), tmp_path)
+        assert (
+            main(
+                [
+                    "--repo-root",
+                    str(tmp_path),
+                    "transform",
+                    "rename",
+                    "column",
+                    "stg_customers.id",
+                    f"id_{connector}",
+                ]
+            )
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+
+def test_the_reference_index_opens_no_connection_on_any_connector(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Repo-only means repo-only, whatever the repo is configured to bill against.
+
+    The command is advertised as free on every connector. A connector that got
+    opened here would price nothing and still authenticate, which is the quiet
+    version of the failure the cost handshake exists to make loud.
+    """
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import DexConfig, save_config
+    from exmergo_dex_core.engine import DexEngine
+
+    monkeypatch.setattr(
+        DexEngine,
+        "_adapter",
+        lambda *a, **k: pytest.fail("`transform references` opened a connection"),
+    )
+    for connector in ("bigquery", "snowflake", "databricks", "redshift", "duckdb"):
+        save_config(DexConfig(connector=connector), tmp_path)
+        assert (
+            main(["--repo-root", str(tmp_path), "transform", "references", "id"]) == 0
+        )
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == "ok"
+        assert envelope["cost"]["estimate"] is None
+
+
+def test_a_refused_seed_never_reaches_a_dbt_subprocess(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch, capsys
+):
+    """The PII gate runs before the parse, not after it.
+
+    `transform plan` hands snapshots, seeds and the config kinds to dbt's own
+    parser before it stores anything, and that parser reads a *copy of the
+    project with the edit written into it*. Parsing first would put a refused
+    seed's values on disk and through a subprocess before the gate ever fired,
+    which is the same failure the profiles secret-guard is ordered against.
+
+    Found by dogfooding, not by the suite: every unit test called the validator
+    directly and so could not see what the command layer did first.
+    """
+
+    import importlib
+    import json as _json
+
+    from exmergo_dex_core.cli import main
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def refuse_to_run(*args, **kwargs):
+        raise AssertionError("dbt was handed the seed before it was refused")
+
+    monkeypatch.setattr(build_mod, "shadow_parse", refuse_to_run)
+
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        _json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "seeds/contacts.csv",
+                        "kind": "seed_csv",
+                        "content": "id,email\n1,someone@example.com\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "a lookup built from customer data",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    envelope = _json.loads(capsys.readouterr().out)
+    assert rc != 0
+    assert "'email' looks like email" in envelope["errors"][0]
+    assert "someone@example.com" not in _json.dumps(envelope)
+
+
+def test_a_seed_over_the_size_cap_refuses_rather_than_writes(dbt_project_dir: Path):
+    # The other half of "a seed is data entering git": a multi-megabyte CSV is
+    # unreadable in review, which is the one thing a reviewable diff is for.
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.transform.validate import MAX_SEED_ROWS, EditValidationError
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    with pytest.raises(EditValidationError, match="row cap"):
+        transform.plan(
+            "far too much data",
+            [
+                transform.PlanEdit(
+                    path="seeds/big.csv",
+                    kind=transform.EditKind.SEED_CSV,
+                    new_content="code\n" + "x\n" * (MAX_SEED_ROWS + 1),
+                )
+            ],
+            dbt_project_dir,
+            repo_root=dbt_project_dir.parent,
+            store=store,
+        )
+    assert store.list_plans() == []
+    assert not (dbt_project_dir / "seeds" / "big.csv").exists()
+
+
 def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     # A hand-edit to the cache is overwritten by the next profile; only the
     # committed config entry durably clears a reviewed column, and the clear is
@@ -544,6 +1543,115 @@ def test_pii_override_is_config_only_and_survives_reprofiling(tmp_path: Path):
     assert without.columns[0].pii is not None, "no override: the flag stands"
     assert with_override.columns[0].pii is None
     assert with_override.columns[0].pii_overridden is not None, "the audit trail"
+
+
+def test_an_on_demand_profile_is_a_real_profile_not_a_shortcut(tmp_path: Path):
+    """Profiling on demand must not become a hole in the PII policy.
+
+    The firewall may proceed on an object nobody profiled only because dex
+    profiles it first, so the whole guarantee rests on that profile being the one
+    a deliberate `explore profile` would have written. Two things are asserted:
+    the flags block exactly as they do on a hand-profiled cache, and the cached
+    result is indistinguishable from the deliberate one for the columns and flags
+    the guard reads.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError
+    from exmergo_dex_core.storage import FilesystemStore
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE people (id INTEGER, email VARCHAR)")
+    conn.execute("INSERT INTO people VALUES (1, 'a@example.com')")
+    conn.close()
+
+    implicit_root = tmp_path / "implicit"
+    implicit_root.mkdir()
+    config = DexConfig(connector="duckdb")
+    with DexEngine(
+        connector="duckdb",
+        path=str(path),
+        config=config,
+        store=FilesystemStore(implicit_root),
+    ) as engine:
+        # Never mapped, never profiled: the object is reached for the first time
+        # by a query, and the flag it has never seen still blocks.
+        with pytest.raises(QueryRefusedError):
+            engine.query("SELECT email FROM people")
+        engine.query("SELECT COUNT(*) AS n FROM people")
+
+    deliberate_root = tmp_path / "deliberate"
+    deliberate_root.mkdir()
+    with DexEngine(
+        connector="duckdb",
+        path=str(path),
+        config=config,
+        store=FilesystemStore(deliberate_root),
+    ) as engine:
+        engine.profile("wh.main.people")
+
+    def flags(root: Path):
+        cache = FilesystemStore(root).load_cache()
+        (dataset,) = [d for d in cache.datasets if d.identifier == "wh.main.people"]
+        return [
+            (c.name, c.data_type, c.pii.category if c.pii else None)
+            for c in dataset.columns
+        ]
+
+    assert flags(implicit_root) == flags(deliberate_root)
+    assert any(category is not None for _n, _t, category in flags(implicit_root))
+
+
+def test_an_implicit_profile_cannot_be_reached_unconfirmed_or_over_ceiling(
+    fake_bq_client, monkeypatch, tmp_path: Path
+):
+    """The scan dex runs on the caller's behalf is still a scan, so the whole
+    cost lifecycle binds on it: an unconfirmed run executes nothing, an
+    over-ceiling estimate refuses and confirmation cannot override it, and the
+    quoted number covers the profile as well as the query rather than the query
+    alone."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.guards.cost_guard import (
+        ConfirmationRequiredError,
+        OverCeilingError,
+    )
+    from exmergo_dex_core.storage import FilesystemStore
+
+    sql = "SELECT COUNT(*) AS n FROM `test-proj`.`shop`.`customers`"
+
+    def run(*, ceiling, confirmed):
+        monkeypatch.setattr(
+            DexEngine,
+            "_adapter",
+            lambda self, command=None, **kw: _bq_adapter(
+                fake_bq_client, ceiling=ceiling, confirmed=confirmed
+            ),
+        )
+        engine = DexEngine(
+            connector="bigquery",
+            repo_root=str(tmp_path),
+            store=FilesystemStore(tmp_path),
+            config=DexConfig(connector="bigquery"),
+        )
+        return engine.query(sql)
+
+    # Nothing is cached, so answering this means profiling first. Unconfirmed,
+    # that ask is raised before anything executes, and the number it carries
+    # covers the profile as well as the query.
+    with pytest.raises(ConfirmationRequiredError) as caught:
+        run(ceiling=None, confirmed=False)
+    assert caught.value.cost.estimate > 10 * 1024 * 1024
+    assert all(call.dry_run for call in fake_bq_client.query_calls)
+
+    # And confirmation cannot buy through a ceiling the combined work exceeds.
+    with pytest.raises(OverCeilingError):
+        run(ceiling=1_000, confirmed=True)
+    assert all(call.dry_run for call in fake_bq_client.query_calls)
 
 
 def test_the_er_diagram_marks_pii_and_carries_no_column_value():
@@ -620,6 +1728,89 @@ def test_the_er_diagram_marks_pii_and_carries_no_column_value():
         assert "pii:government_id 0.90" in mermaid
 
 
+def test_the_map_payload_marks_pii_and_carries_no_column_value():
+    """`explore map` returns findings rather than a receipt (issue #202), which
+    puts profile content into the envelope for the first time. The rule the
+    diagram obeys has to hold here for the same reason and in the same strict
+    form: the cache retains min/max and a value domain for every column that
+    earned one, and this payload must never reach for them. The PII flag IS
+    reported, because flagged-not-hidden is the posture, and it is (category,
+    confidence) as it is everywhere.
+    """
+
+    import json as _json
+
+    from exmergo_dex_core.cache import (
+        Dataset,
+        DexCache,
+        PIICategory,
+        Relationship,
+        ValueCount,
+        ValueDomain,
+    )
+    from exmergo_dex_core.explore.summary import summarize_map
+
+    customers = Dataset(
+        identifier="shop.main.customers",
+        columns=[
+            ColumnProfile(
+                name="customer_id",
+                data_type="INTEGER",
+                is_unique=True,
+                min_value=1,
+                max_value=987654,
+            ),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                min_value="aaron@example.com",
+                max_value="zoe@example.com",
+                pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+            ),
+            ColumnProfile(
+                name="tier",
+                data_type="VARCHAR",
+                value_domain=ValueDomain(
+                    values=[ValueCount(value="platinum", count=3)]
+                ),
+            ),
+        ],
+        candidate_keys=[["customer_id"]],
+        grain=["customer_id"],
+    )
+    orders = Dataset(
+        identifier="shop.main.orders",
+        columns=[
+            ColumnProfile(name="order_id", data_type="INTEGER", is_unique=True),
+            ColumnProfile(name="customer_id", data_type="INTEGER"),
+        ],
+    )
+    cache = DexCache(
+        datasets=[customers, orders],
+        relationships=[
+            Relationship(
+                from_dataset="shop.main.orders",
+                from_columns=["customer_id"],
+                to_dataset="shop.main.customers",
+                to_columns=["customer_id"],
+            )
+        ],
+    )
+
+    for detail in (False, True):
+        view = summarize_map(cache, detail=detail)
+        blob = _json.dumps(
+            [o.model_dump(mode="json") for o in view.objects], sort_keys=True
+        )
+        for value in ("987654", "aaron@example.com", "zoe@example.com", "platinum"):
+            assert value not in blob, "a column value reached the map payload"
+        for key in ("min_value", "max_value", "value_domain"):
+            assert key not in blob
+        flagged = next(c for o in view.objects for c in o.columns if c.name == "email")
+        assert flagged.pii is not None
+        assert set(flagged.pii.model_dump()) == {"category", "confidence"}
+
+
 # --- Family 4: propose-don't-impose ------------------------------------------
 
 
@@ -644,6 +1835,190 @@ def test_changes_are_diffs_not_silent_writes(dbt_project_dir: Path):
     # Planning returns reviewable diffs and touches nothing in the project.
     assert diffs and diffs[0]["unified"]
     assert not new_model.exists()
+
+
+def test_a_house_convention_warns_and_never_imposes(dbt_project_dir: Path):
+    """The one plan-time check that judges style rather than fact.
+
+    Its whole design rests on staying advisory: it reads a convention nobody
+    declared, out of models the caller did not necessarily write, and a check
+    like that turning into a refusal would be dex imposing a house rule it
+    inferred. So it warns, the plan stores, the project is untouched, and it
+    opens no connection to reach any of that conclusion.
+    """
+
+    from exmergo_dex_core import transform
+
+    marts = dbt_project_dir / "models" / "marts"
+    marts.mkdir(parents=True)
+    for name, select in (
+        ("dim_products", "select product_id, brand_id, brand_name"),
+        ("dim_stores", "select store_id, region_id, region_name"),
+        ("dim_users", "select user_id, country_id, country_name"),
+        ("dim_suppliers", "select supplier_id, supplier_name"),
+    ):
+        (marts / f"{name}.sql").write_text(
+            f"{select} from {{{{ ref('stg_{name[4:]}') }}}}\n", encoding="utf-8"
+        )
+    authored = marts / "dim_orders.sql"
+
+    engine = DexEngine(
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector="duckdb"),
+    )
+    with engine:
+        result = engine.plan(
+            "add dim_orders",
+            edits=[
+                transform.PlanEdit(
+                    path="models/marts/dim_orders.sql",
+                    kind=transform.EditKind.MODEL_SQL,
+                    new_content=(
+                        "select order_id, supplier_id, status "
+                        "from {{ ref('stg_orders') }}\n"
+                    ),
+                )
+            ],
+        )
+        # No connection was opened to reach a judgment about naming.
+        assert engine._adapter_instance is None
+
+    assert result.plan_id
+    assert any("supplier_id" in w for w in result.warnings), result.warnings
+    assert not authored.exists()
+
+
+def _attribution_repo(dbt_project_dir: Path, duckdb_file: Path, model_sql: str) -> Path:
+    """A project whose one model reads a real warehouse table, cache and all.
+
+    Row-population attribution is the only plan-time check that reaches the
+    warehouse, so the spine exercises it against the real engine rather than a
+    stand-in: a real cache, the real firewall, the real adapter.
+    """
+
+    repo = dbt_project_dir.parent
+    (dbt_project_dir / "models" / "staging" / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    tables:\n"
+        "      - name: customers\n      - name: orders\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "stg_orders.sql").write_text(
+        model_sql, encoding="utf-8"
+    )
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        repo_root=str(repo),
+        store=FilesystemStore(repo),
+        config=DexConfig(connector="duckdb"),
+    ) as engine:
+        engine.map(full=True)
+    return repo
+
+
+_PRIOR_STG_ORDERS = "select * from {{ source('raw', 'customers') }}\nwhere id > 0\n"
+
+
+def _attribute(repo: Path, duckdb_file: Path, authored: str):
+    from exmergo_dex_core import transform
+
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        repo_root=str(repo),
+        store=FilesystemStore(repo),
+        config=DexConfig(connector="duckdb"),
+    ) as engine:
+        return engine.plan(
+            "edit the filter",
+            edits=[
+                transform.PlanEdit(
+                    path="models/staging/stg_orders.sql",
+                    kind=transform.EditKind.MODEL_SQL,
+                    new_content=authored,
+                )
+            ],
+        )
+
+
+def test_row_attribution_measures_and_still_writes_nothing(
+    dbt_project_dir: Path, duckdb_file: Path
+):
+    """Attribution runs statements against the warehouse. It must remain a
+    reader: the plan is still a proposal and the project is still untouched."""
+
+    repo = _attribution_repo(dbt_project_dir, duckdb_file, _PRIOR_STG_ORDERS)
+    model = dbt_project_dir / "models" / "staging" / "stg_orders.sql"
+    before = model.read_text()
+
+    result = _attribute(
+        repo,
+        duckdb_file,
+        "select * from {{ source('raw', 'customers') }}\nwhere id > 1\n",
+    )
+    measured = [c for c in result.row_attribution[0]["changes"] if c["attributed"]]
+    assert measured and all(c["delta"] is not None for c in measured)
+    # Propose-don't-impose survives a check that reaches the warehouse.
+    assert model.read_text() == before
+    assert result.diffs and result.diffs[0]["unified"]
+
+
+def test_row_attribution_over_a_pii_column_carries_no_value(
+    dbt_project_dir: Path, duckdb_file: Path
+):
+    """A filter on a PII-flagged column is still attributable, because the
+    statement projects COUNT(*) and nothing else. The count is a statistic; the
+    values it counts never leave the engine."""
+
+    repo = _attribution_repo(dbt_project_dir, duckdb_file, _PRIOR_STG_ORDERS)
+    result = _attribute(
+        repo,
+        duckdb_file,
+        "select * from {{ source('raw', 'customers') }}\nwhere email like 'a%'\n",
+    )
+    changes = result.row_attribution[0]["changes"]
+    assert any(c["attributed"] and c["delta"] is not None for c in changes)
+    # The PII column is named as SQL, never as data: no address appears anywhere.
+    payload = to_envelope(result).model_dump(mode="json")
+    assert "email" in str(payload), "the predicate itself is reported"
+    assert "@example.com" not in str(payload)
+
+
+def test_every_statement_row_attribution_issues_is_a_bare_count(
+    dbt_project_dir: Path, duckdb_file: Path, monkeypatch
+):
+    """The generated SQL is SELECT-only and projects one aggregate. This is the
+    property that lets attribution reach the warehouse at all."""
+
+    from exmergo_dex_core.adapters import duckdb as duckdb_adapter
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    issued: list[str] = []
+    original = duckdb_adapter.DuckDBAdapter.run_query
+
+    def recording(self, sql, **kwargs):
+        issued.append(sql)
+        return original(self, sql, **kwargs)
+
+    monkeypatch.setattr(duckdb_adapter.DuckDBAdapter, "run_query", recording)
+
+    repo = _attribution_repo(dbt_project_dir, duckdb_file, _PRIOR_STG_ORDERS)
+    issued.clear()
+    _attribute(
+        repo,
+        duckdb_file,
+        "select * from {{ source('raw', 'customers') }}\nwhere id > 1\n",
+    )
+
+    assert issued, "the attribution ran statements"
+    for sql in issued:
+        assert_select_only(sql, dialect="duckdb")
+        upper = sql.upper()
+        assert "COUNT(*)" in upper
+        assert not any(
+            forbidden in upper for forbidden in ("INSERT", "UPDATE", "DELETE", "CREATE")
+        )
 
 
 def _reconcile_fixtures(dbt_project_dir: Path) -> tuple[FilesystemStore, str]:
@@ -872,6 +2247,163 @@ def test_apply_refuses_to_overwrite_a_human_edit(dbt_project_dir: Path):
     assert model.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
 
 
+def test_one_conflict_refuses_the_whole_plan_not_the_conflicting_edit(
+    dbt_project_dir: Path,
+):
+    """An apply is all-or-nothing across the plan, and the edit set is the unit.
+
+    Landing the clean edits beside a refused one leaves the project matching
+    neither the proposal nor what the human had, while the apply reports itself
+    refused, so nothing records which half arrived. The single-file refusal above
+    cannot see that: with one edit in the plan there is no clean half to land.
+    """
+
+    from exmergo_dex_core import transform
+
+    touched = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    untouched = dbt_project_dir / "models" / "marts" / "fct_orders.sql"
+    edits = [
+        transform.PlanEdit(
+            path="models/marts/fct_orders.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as order_id\n",
+        ),
+        transform.PlanEdit(
+            path="models/staging/stg_customers.sql",
+            kind=transform.EditKind.MODEL_SQL,
+            new_content="select 1 as id\n",
+        ),
+    ]
+    planned, _diffs, _warnings = transform.plan(
+        "two edits, one of which a human will touch",
+        edits,
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+    model_existed = untouched.exists()
+    touched.write_text("select 99 as id -- hand-tuned\n", encoding="utf-8")
+
+    result = transform.apply(
+        planned.plan_id,
+        dbt_project_dir.parent,
+        store=FilesystemStore(dbt_project_dir.parent),
+    )
+
+    assert result.written == []
+    assert result.conflicts
+    assert touched.read_text(encoding="utf-8") == "select 99 as id -- hand-tuned\n"
+    assert untouched.exists() == model_existed, (
+        "the clean edit landed while the conflicting one beside it was refused"
+    )
+
+
+def test_a_stored_plan_cannot_escape_the_surface_its_format_declares(
+    dbt_project_dir: Path,
+):
+    """Containment is re-checked at apply, and confirmation does not override it.
+
+    A plan is a stored artifact that sits through a human review, so what it was
+    validated against at plan time is not what it is being written into. The
+    hashes are re-checked for that reason and the surface now is too: a path
+    outside what the format declares is refused before anything reaches the
+    writer, and unlike a conflict there is nobody who can accept it.
+    """
+
+    import json as _json
+
+    from exmergo_dex_core import transform
+    from exmergo_dex_core.adapters.project import DbtProject
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    planned, _diffs, _warnings = transform.plan(
+        "a plan to tamper with",
+        [
+            transform.PlanEdit(
+                path="models/staging/stg_customers.sql",
+                kind=transform.EditKind.MODEL_SQL,
+                new_content="select 1 as id\n",
+            )
+        ],
+        dbt_project_dir,
+        repo_root=dbt_project_dir.parent,
+        store=store,
+    )
+    # The plan is rewritten where it sits, which is the only way to reach apply
+    # with a path plan-time containment would have refused.
+    stored_path = dbt_project_dir.parent / ".dex" / "plans" / f"{planned.plan_id}.json"
+    stored = _json.loads(stored_path.read_text(encoding="utf-8"))
+    stored["edits"][0]["path"] = "models_backup/stg_customers.sql"
+    stored_path.write_text(_json.dumps(stored), encoding="utf-8")
+    escaped = dbt_project_dir / "models_backup" / "stg_customers.sql"
+
+    for confirmed in (False, True):
+        with pytest.raises(transform.PlanError, match="editing surface"):
+            transform.apply(
+                planned.plan_id,
+                dbt_project_dir.parent,
+                store=store,
+                confirmed=confirmed,
+                project_format=DbtProject(dbt_project_dir.parent, dbt_project_dir),
+            )
+    assert not escaped.exists()
+
+
+def test_an_authored_kind_cannot_land_outside_its_own_path_family(
+    dbt_project_dir: Path,
+):
+    """Writes are confined to the repo, and within the repo to the part of the
+    dbt surface the kind belongs to.
+
+    Containment alone is not enough once the surface has several families: a
+    snapshot written into ``models/`` is inside the surface and still wrong,
+    because dbt parses it as a model and the build fails. So the kind and its
+    location have to agree, in both directions, and neither confirmation nor a
+    re-plan can talk past it.
+    """
+
+    from exmergo_dex_core import transform
+
+    store = FilesystemStore(dbt_project_dir.parent)
+    misplaced = [
+        (
+            transform.EditKind.SNAPSHOT_SQL,
+            "models/staging/snap_customers.sql",
+            "snapshot paths",
+        ),
+        (transform.EditKind.SEED_CSV, "models/staging/lookup.csv", "seed paths"),
+        (transform.EditKind.SEED_CSV, "macros/lookup.csv", "seed paths"),
+        (transform.EditKind.SNAPSHOT_SQL, "seeds/snap.sql", "snapshot paths"),
+        # The two families that hold nothing but `.sql` and sit beside each
+        # other, which is where a misfiling is easiest to make and hardest to
+        # notice: dbt would build a misfiled test as a model, and would never
+        # look at a misfiled analysis at all.
+        (
+            transform.EditKind.TEST_SQL,
+            "models/staging/assert_ids.sql",
+            "test paths",
+        ),
+        (transform.EditKind.TEST_SQL, "analyses/assert_ids.sql", "test paths"),
+        (
+            transform.EditKind.ANALYSIS_SQL,
+            "models/staging/scratch.sql",
+            "analysis paths",
+        ),
+        (transform.EditKind.ANALYSIS_SQL, "tests/scratch.sql", "analysis paths"),
+    ]
+    for kind, path, named in misplaced:
+        with pytest.raises(transform.PlanError, match=named):
+            transform.plan(
+                "misfiled",
+                [transform.PlanEdit(path=path, kind=kind, new_content="id\n1\n")],
+                dbt_project_dir,
+                repo_root=dbt_project_dir.parent,
+                store=store,
+            )
+        assert not (dbt_project_dir / path).exists()
+    assert store.list_plans() == []
+
+
 def test_apply_refuses_to_delete_a_human_edited_file(dbt_project_dir: Path):
     # Propose-don't-impose extends to removal: a delete never silently drops a
     # file a human touched after the plan was made.
@@ -1043,6 +2575,69 @@ def test_init_refuses_where_a_project_already_exists(dbt_project_dir: Path):
         transform.init_project(
             "fresh", "duckdb", path=str(repo / "warehouse.duckdb"), repo_root=repo
         )
+
+
+def test_demo_refuses_to_overwrite_an_existing_warehouse(tmp_path: Path, capsys):
+    """`dex demo` is create-only, and deliberately not confirmable.
+
+    The sibling of the init refusal above, for the one verb that writes a data
+    file rather than a project file. It is stricter than init on purpose: a
+    `--confirm` that could talk past this would put a real warehouse one typo
+    away from being replaced, and the fix (name another path) costs nothing.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    existing = tmp_path / "production.duckdb"
+    existing.write_bytes(b"someone else's warehouse")
+
+    for argv in (["demo", str(existing)], ["demo", str(existing), "--confirm"]):
+        assert main(argv) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert payload["reason"] == "guard"
+        assert existing.read_bytes() == b"someone else's warehouse"
+
+
+def test_demo_creates_only_what_it_names_and_never_a_second_config(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """Two artifacts, both reported, and never one that shadows a real project.
+
+    A `.dex/config.yml` written into a subdirectory of someone's repo would
+    silently capture every command run there, which is the same class of harm as
+    overwriting a file: a change they did not ask for and would not see.
+    """
+
+    import json
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["demo"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    on_disk = sorted(
+        str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file()
+    )
+    assert on_disk == sorted(payload["data"]["created"])
+
+    # Now with a project config already above the target: the warehouse is still
+    # created, the config is not, and the envelope says which happened.
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "scratch").mkdir()
+    committed = tmp_path / ".dex" / "config.yml"
+    before = committed.read_text(encoding="utf-8")
+
+    assert main(["demo", "scratch/second.duckdb"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["created"] == ["scratch/second.duckdb"]
+    assert not (tmp_path / "scratch" / ".dex").exists()
+    assert committed.read_text(encoding="utf-8") == before
+    assert any("left untouched" in w for w in payload["warnings"])
 
 
 def test_init_never_falls_through_to_a_default_connector(tmp_path: Path, capsys):
@@ -1262,6 +2857,63 @@ def test_an_in_memory_store_writes_nothing_across_a_multi_step_flow(
     assert not (repo / ".dex").exists()
 
 
+def test_the_skill_wrapper_never_installs_into_the_repo_it_is_pointed_at(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Every uv invocation the wrapper makes is blind to the caller's own project.
+
+    The wrapper reaches the engine through uv, and uv is project-aware. Without
+    `--no-project` it discovers whatever Python project the caller is standing in,
+    builds it, and leaves a `.venv/` and a `uv.lock` behind: hundreds of megabytes
+    of artifact nobody asked for or reviewed, in a tree dex was asked only to read.
+    The same sync puts the caller's dependencies on the engine's import path, so
+    the engine stops running against the closure it pinned and starts running
+    against whatever the repo happened to have.
+
+    Asserted structurally, on the commands the wrapper builds, because the
+    alternative is provoking a real install into a scratch repo on every CI run.
+    Both paths are covered: the ordinary one that runs a command, and `--warm`,
+    which installs and nothing else.
+    """
+
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "skills"
+        / "explore"
+        / "scripts"
+        / "run.py"
+    )
+    spec = importlib.util.spec_from_file_location("_dex_spine_wrapper", path)
+    wrapper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wrapper)
+
+    monkeypatch.setattr(wrapper.shutil, "which", lambda _name: "/usr/local/bin/uv")
+    monkeypatch.setattr(wrapper.os, "name", "posix")
+    issued: list[list[str]] = []
+    monkeypatch.setattr(
+        wrapper.os, "execvp", lambda _file, cmd: issued.append(cmd) or None
+    )
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda cmd, **_kw: (
+            issued.append(cmd)
+            or wrapper.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        ),
+    )
+
+    monkeypatch.setattr(wrapper.sys, "argv", ["run.py", "explore", "inventory"])
+    wrapper.main()
+    monkeypatch.setattr(wrapper.sys, "argv", ["run.py", "--warm"])
+    wrapper.main()
+
+    assert len(issued) == 2, "both paths must reach uv"
+    for cmd in issued:
+        assert cmd[:3] == ["uv", "run", "--no-project"], cmd
+
+
 def test_an_in_memory_session_budget_still_binds(fake_bq_client):
     """A backend that forgets across processes must not forget within one.
 
@@ -1383,10 +3035,16 @@ def _bq_adapter(fake_bq_client, *, ceiling=500 * 1024 * 1024, confirmed=True):
 def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     # Family 1: every statement the adapter generates passes the SELECT-only
     # guard in the bigquery dialect (asserted at build time, no client needed).
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _bq_adapter(fake_bq_client)
     _meta, columns = adapter.table_metadata("test-proj.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -1394,11 +3052,36 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "test-proj.shop.customers", columns, {"id"}, shape
+        "test-proj.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    # Declared-type-vs-content statistics (#204) ride the same statement too.
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    # Heterogeneous-key-shape statistics (#205) ride the same statement too.
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too,
+    # using TIMESTAMP_TRUNC/TIMESTAMP_DIFF (BigQuery's reversed argument
+    # order and type-specific truncation family).
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "TIMESTAMP_TRUNC" in sql and "TIMESTAMP_DIFF" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
@@ -1464,6 +3147,85 @@ def test_bigquery_over_ceiling_cannot_be_confirmed_through(fake_bq_client):
             timeout_seconds=30,
         )
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+@pytest.mark.parametrize("table_type", ["VIEW", "EXTERNAL"])
+def test_bigquery_a_reserve_for_an_unknown_row_count_bounds_what_profiling_bills(
+    table_type,
+):
+    # Family 2: the estimate is a ceiling actual spend will not exceed (#107),
+    # and the reserve is what makes that true for probes the estimator cannot
+    # yet rule in or out (#299). An object BigQuery keeps no row count for is
+    # the sharpest case, and it used to be sharp in the other direction: the
+    # count never arrived, so the probes provably could not run and nothing was
+    # reserved. Now the aggregate's own COUNT(*) is captured, so all three can
+    # run, and the reserve has to cover them. This is where a reserve narrower
+    # than the probes it must pay for would show up as a bill above the quote.
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+
+    def rows(sql: str):
+        # The three escalation statements are distinguishable by shape, and each
+        # answers in its own: an array-valued domain sample, a
+        # distinct-combination count, an exact COUNT(DISTINCT) per column. The
+        # aggregate batch is everything else.
+        if "ARRAY_AGG" in sql:
+            return [
+                {
+                    "d_0": [{"v": 1, "c": 1}],
+                    "n_0": 100,
+                    "d_1": [{"v": "a", "c": 40}],
+                    "n_1": 3,
+                }
+            ]
+        if "SELECT DISTINCT" in sql or "COUNT(DISTINCT" in sql:
+            return [{"d_0": 100, "d_1": 3}]
+        return [
+            {
+                "n_total": 100,
+                "nn_0": 100,
+                "nd_0": 100,
+                "mn_0": 1,
+                "mx_0": 100,
+                "nn_1": 100,
+                "nd_1": 3,
+            }
+        ]
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="customers_x",
+                schema=[
+                    bigquery.SchemaField("id", "INTEGER"),
+                    bigquery.SchemaField("tier", "STRING"),
+                ],
+                # Whatever the metadata says is not a count for these kinds, and
+                # for an external table BigQuery really does report a zero here.
+                num_rows=0,
+                num_bytes=5_000,
+                table_type=table_type,
+            )
+        ],
+        row_resolver=rows,
+    )
+    adapter = _bq_adapter(client)
+    estimate, _per_table = adapter.profile_estimate(["test-proj.shop.customers_x"])
+    datasets = profile_mod.profile(adapter, ["test-proj.shop.customers_x"])
+    billed = adapter.cost_gate.spend_summary()["bytes_billed"]
+    assert billed <= estimate
+    # The escalation the reserve paid for is the escalation that ran, and the
+    # count it ran against came from the aggregate rather than the metadata.
+    executed = [c for c in client.query_calls if not c.dry_run]
+    assert len(executed) > 1
+    assert datasets[0].row_count == 100
+    assert "empty table (no rows)" not in datasets[0].data_quality
 
 
 def test_bigquery_every_executed_job_is_server_capped(fake_bq_client):
@@ -1730,10 +3492,16 @@ def test_an_unresolvable_scope_never_falls_back_on_any_connector(
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _sf_adapter(fake_sf_connection)
     _meta, columns = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
+    columns = [*columns, ColumnMeta("SIGNUP_TS", "TIMESTAMP_NTZ", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -1741,11 +3509,32 @@ def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"SIGNUP_TS"}
     sql, _plan = adapter._build_aggregate_sql(
-        "SHOP.PUBLIC.CUSTOMERS", columns, {"ID"}, shape
+        "SHOP.PUBLIC.CUSTOMERS",
+        columns,
+        {"ID"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
     assert assert_select_only(sql, dialect="snowflake") == sql
 
 
@@ -2000,10 +3789,16 @@ def _dbx_adapter(fake_databricks, *, ceiling=600.0, confirmed=True):
 def test_databricks_generated_sql_is_select_only(fake_databricks):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the databricks dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _dbx_adapter(fake_databricks)
     _meta, columns = adapter.table_metadata("shop.core.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2011,11 +3806,32 @@ def test_databricks_generated_sql_is_select_only(fake_databricks):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "shop.core.customers", columns, {"id"}, shape
+        "shop.core.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "date_trunc" in sql and "TIMESTAMPDIFF" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
 
 
@@ -2204,10 +4020,16 @@ def _pg_adapter(fake_pg_connection, *, ceiling=600.0, confirmed=True):
 def test_postgres_generated_sql_is_select_only(fake_pg_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the postgres dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _pg_adapter(fake_pg_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    columns = [*columns, ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns))]
     shape = {
         c.name
         for c in columns
@@ -2215,11 +4037,32 @@ def test_postgres_generated_sql_is_select_only(fake_pg_connection):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape
+        "dexdb.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "date_trunc" in sql and "EXTRACT(EPOCH" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
 
 
@@ -2438,10 +4281,23 @@ def _redshift_adapter(fake_redshift_connection, *, ceiling=600.0, confirmed=True
 def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the redshift dialect (asserted at build time).
+    from exmergo_dex_core.adapters.base import (
+        ColumnMeta,
+        is_integer_type,
+        is_string_type,
+    )
     from exmergo_dex_core.guards.sql_guard import assert_select_only
 
     adapter = _redshift_adapter(fake_redshift_connection)
     _meta, columns = adapter.table_metadata("dexdb.shop.customers")
+    columns = [
+        *columns,
+        ColumnMeta("signup_ts", "TIMESTAMP", True, len(columns)),
+        # The seeded timestamps are TIMESTAMPTZ, and that is not decoration:
+        # Redshift's DATEDIFF has no TIMESTAMPTZ overload, so a
+        # TIMESTAMP-only fixture asserts a statement the server would refuse.
+        ColumnMeta("created_at", "timestamp with time zone", True, len(columns) + 1),
+    ]
     shape = {
         c.name
         for c in columns
@@ -2449,11 +4305,44 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         or "STRING" in c.data_type.upper()
         or "TEXT" in c.data_type.upper()
     }
+    type_req = {
+        c.name
+        for c in columns
+        if is_string_type(c.data_type) or is_integer_type(c.data_type)
+    }
+    key_shape_req = {c.name for c in columns if is_string_type(c.data_type)}
+    temporal_req = {"signup_ts", "created_at"}
     sql, _plan = adapter._build_aggregate_sql(
-        "dexdb.shop.customers", columns, {"id"}, shape
+        "dexdb.shop.customers",
+        columns,
+        {"id"},
+        shape,
+        type_req,
+        key_shape_req,
+        temporal_req,
     )
     assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
+    assert "ts_ns_" in sql and "ts_ep_s_" in sql
+    # ...with every cast in them total, so no dialect can raise on a
+    # non-numeric string in a profiled column (#310).
+    assert_every_cast_is_total(sql)
+    assert "ks_uuid_" in sql and "ks_hex_" in sql
+    # Temporal-continuity statistics (#206) ride the same statement too.
+    assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
+    assert "DATE_TRUNC" in sql and "DATEDIFF" in sql
+    # ...with both DATEDIFF operands cast to TIMESTAMP, because Redshift
+    # resolves DATEDIFF to a pg_catalog.date_diff that is declared over
+    # DATE/TIME/TIMETZ/TIMESTAMP only: DATE_TRUNC over the TIMESTAMPTZ column
+    # yields TIMESTAMPTZ, and an uncast diff of two of those failed the whole
+    # profiling statement server-side.
+    assert "DATEDIFF(day, prev_period::TIMESTAMP, period::TIMESTAMP)" in sql
+    assert "DATEDIFF(month, prev_period::TIMESTAMP, period::TIMESTAMP)" in sql
+    assert "DATEDIFF(hour, prev_period::TIMESTAMP, period::TIMESTAMP)" in sql
+    # SUBSTR is the shared spelling, and Redshift refuses it by name ("SUBSTR()
+    # function is not supported (Hint: use SUBSTRING instead)") at execution
+    # over a real table, so this adapter must emit SUBSTRING and nothing else.
+    assert "SUBSTRING(" in sql and "SUBSTR(" not in sql.replace("SUBSTRING(", "")
     assert assert_select_only(sql, dialect="redshift") == sql
 
 
@@ -2687,6 +4576,329 @@ def test_redshift_spend_ledger_holds_no_sql_or_values(
     assert entry["statement_sha256"]
 
 
+# --- ClickHouse: the second db-load connector exercises every family ------------
+#
+# These run against the fake client (tests/fakes/clickhouse.py): deterministic,
+# offline, free. They importorskip on the [clickhouse] extra, which CI and the
+# release gate install, so trimming that extra from a workflow would silently
+# skip release-blocking families; keep `--extra clickhouse` in ci.yml and
+# release.yml.
+#
+# Two of these guard hazards that are specific to this engine and fail *silently*
+# rather than loudly, which is the failure mode a green suite is worst at
+# catching: ClickHouse fills an unmatched LEFT JOIN row with the column type's
+# default instead of NULL unless told otherwise, and it has no LAG at all.
+
+
+def _clickhouse_adapter(fake_clickhouse_connection, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.clickhouse import ClickHouseAdapter
+    from exmergo_dex_core.config import ClickHouseTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.DB_LOAD,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="clickhouse",
+    )
+    return ClickHouseAdapter(
+        connection=fake_clickhouse_connection,
+        cost_gate=gate,
+        target=ClickHouseTarget(),
+        auth_method="environment:password",
+    )
+
+
+def test_clickhouse_generated_sql_is_select_only(fake_clickhouse_connection):
+    # Family 1: every data statement the adapter generates passes the
+    # SELECT-only guard in its own dialect.
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    sql, _plan = adapter._build_aggregate_sql(
+        "shop.customers",
+        columns,
+        {"created_at"},
+        {"email"},
+        {"email"},
+        {"email"},
+        {"created_at"},
+    )
+    assert_select_only(sql, dialect="clickhouse")
+    for prefix in ("nn_", "d_", "su_", "sp_", "st_", "tp_d_", "tg_d_"):
+        assert prefix in sql
+
+
+def test_clickhouse_session_is_read_only_on_every_statement(
+    fake_clickhouse_connection,
+):
+    # Family 1: read-only is not a property of how the client was built. The
+    # settings ride each statement, so a host-supplied client cannot lose them.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    adapter.capabilities()
+    _meta, columns = adapter.table_metadata("shop.customers")
+    adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.queries
+    for query in fake_clickhouse_connection.queries:
+        assert query.settings["readonly"] == 2
+        assert query.settings["allow_ddl"] == 0
+
+
+def test_clickhouse_orphan_probes_can_actually_find_orphans(
+    fake_clickhouse_connection,
+):
+    # Family 1, and the sharpest ClickHouse-specific hazard in the connector.
+    #
+    # ClickHouse defaults join_use_nulls to 0, which fills an unmatched LEFT
+    # JOIN row with the column type's default (0, '') rather than NULL. The
+    # shared relationship overlap probe counts orphans with `IS NULL`, so with
+    # the default every inferred join reports perfectly clean and maintain
+    # grain's join-fanout half never fires. Measured live: 0 orphans under the
+    # default, 40 with the setting, against a table seeded with exactly 40.
+    #
+    # This is a control that looks active while doing nothing, so it gets a
+    # spine assertion rather than a unit test.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    adapter.capabilities()
+    _meta, columns = adapter.table_metadata("shop.customers")
+    adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.queries
+    for query in fake_clickhouse_connection.queries:
+        assert query.settings["join_use_nulls"] == 1, (
+            "without join_use_nulls=1 an unmatched LEFT JOIN row yields the "
+            "type default instead of NULL, and every orphan probe reports zero"
+        )
+
+
+def test_clickhouse_temporal_gaps_are_measurable_at_all(fake_clickhouse_connection):
+    # Family 1's honesty half: a detector that structurally cannot fire is
+    # worse than an absent one, because a clean result reads as a pass.
+    #
+    # ClickHouse has no LAG. lagInFrame returns the *type default* rather than
+    # NULL past the frame edge, so the naive rewrite makes the first row compare
+    # against the epoch and report a ~20,000 day gap on every column, and it
+    # respects the window frame, so it needs the explicit full frame. Measured
+    # live against a column with a known 3-day hole: 20590 without both
+    # corrections, 3 with them, which is what DuckDB reports for the same data.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    _meta, columns = adapter.table_metadata("shop.events")
+    occurred = next(c for c in columns if c.name == "occurred_at")
+    sql, _plan = adapter._build_aggregate_sql(
+        "shop.events", [occurred], set(), set(), set(), set(), {"occurred_at"}
+    )
+    assert "lagInFrame(toNullable(period), 1, NULL)" in sql
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" in sql
+
+
+def test_select_only_guard_rejects_clickhouse_writes_ddl_and_movement(
+    fake_clickhouse_connection,
+):
+    # Family 1: the guard refuses in this dialect, not merely in duckdb.
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    for sql in (
+        "INSERT INTO shop.customers VALUES (1)",
+        "ALTER TABLE shop.customers DROP COLUMN email",
+        "DROP TABLE shop.customers",
+        "TRUNCATE TABLE shop.customers",
+        "OPTIMIZE TABLE shop.customers FINAL",
+        "CREATE TABLE t (a UInt8) ENGINE = Memory",
+        "SELECT 1; DROP TABLE shop.customers",
+    ):
+        with pytest.raises(Exception):
+            assert_select_only(sql, dialect="clickhouse")
+
+
+def test_clickhouse_unconfirmed_scan_never_executes(fake_clickhouse_connection):
+    # Family 2: the gate binds before anything reaches the server.
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _clickhouse_adapter(fake_clickhouse_connection, confirmed=False)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_clickhouse_confirmed_run_without_a_ceiling_is_refused(
+    fake_clickhouse_connection,
+):
+    # Family 2: nothing executes unbudgeted.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _clickhouse_adapter(fake_clickhouse_connection, ceiling=None)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    with pytest.raises(CostGuardError):
+        adapter.column_aggregates("shop.customers", columns)
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_clickhouse_over_ceiling_cannot_be_confirmed_through(
+    fake_clickhouse_connection,
+):
+    # Family 2: an over-ceiling estimate refuses first, and confirmation
+    # cannot override it.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _clickhouse_adapter(
+        fake_clickhouse_connection, ceiling=0.001, confirmed=True
+    )
+    _meta, columns = adapter.table_metadata("shop.events")
+    with pytest.raises(OverCeilingError):
+        adapter.column_aggregates("shop.events", columns)
+    assert fake_clickhouse_connection.data_queries == []
+
+
+def test_clickhouse_every_executed_statement_is_server_capped(
+    fake_clickhouse_connection,
+):
+    # Family 2: the layer that binds when the estimate is wrong. Both caps are
+    # asserted because max_execution_time is checked at block boundaries and a
+    # single fast block can overshoot it; the byte cap is what binds on a scan.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection, ceiling=600.0)
+    _meta, columns = adapter.table_metadata("shop.customers")
+    adapter.column_aggregates("shop.customers", columns)
+    billed = fake_clickhouse_connection.data_queries
+    assert billed
+    for query in billed:
+        assert query.settings["max_execution_time"] > 0
+        assert query.settings["timeout_overflow_mode"] == "throw"
+        assert query.settings["max_bytes_to_read"] > 0
+        assert query.settings["read_overflow_mode"] == "throw"
+
+
+def test_query_firewall_blocks_clickhouse_value_carrying_shapes(
+    fake_clickhouse_connection,
+):
+    # Family 3: PII is flagged and never surfaced, in this dialect's idioms.
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError, inspect_query
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="shop.customers",
+                object_type="table",
+                row_count=100,
+                columns=[
+                    ColumnProfile(name="id", data_type="UInt64"),
+                    ColumnProfile(
+                        name="email",
+                        data_type="String",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+                    ),
+                    ColumnProfile(name="tags", data_type="Array(String)"),
+                ],
+            )
+        ]
+    )
+    limits = QueryLimits()
+
+    # Carrying shapes stay refused, including the ones ClickHouse spells its own
+    # way: an -If combinator over a value-returning aggregate is still value
+    # returning, and ARRAY JOIN reshapes but cannot launder.
+    for sql in (
+        "SELECT email FROM shop.customers",
+        "SELECT max(email) FROM shop.customers",
+        "SELECT anyIf(email, id > 1) FROM shop.customers",
+        "SELECT groupArray(email) FROM shop.customers",
+        "SELECT e FROM shop.customers ARRAY JOIN splitByChar(',', email) AS e",
+        "SELECT email LIKE 'a%' FROM shop.customers",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(sql, cache, limits, dialect="clickhouse")
+
+    # Measuring shapes still pass, so the gate is a taint rule rather than a
+    # column blocklist. Without this half the refusals above would also hold on
+    # a firewall that refused everything.
+    for sql in (
+        "SELECT count() FROM shop.customers",
+        "SELECT uniqExact(email) FROM shop.customers",
+        "SELECT countIf(id > 1) FROM shop.customers",
+        "SELECT id, count() FROM shop.customers FINAL GROUP BY id",
+        "SELECT tag, count() FROM shop.customers ARRAY JOIN tags AS tag GROUP BY tag",
+    ):
+        inspect_query(sql, cache, limits, dialect="clickhouse")
+
+
+def test_init_clickhouse_profile_is_dev_only_with_no_secrets(tmp_path, monkeypatch):
+    # Family 4 and 5: the rendered profile writes only to the dev database and
+    # carries no credential value.
+    import yaml as _yaml
+
+    from exmergo_dex_core.config import ClickHouseTarget, DexConfig
+    from exmergo_dex_core.transform.init import _clickhouse_profile
+
+    monkeypatch.setenv("CLICKHOUSE_HOST", "ch.internal")
+    monkeypatch.setenv("CLICKHOUSE_USER", "dbt_dev")
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "super-secret")
+    config = DexConfig(
+        connector="clickhouse",
+        clickhouse=ClickHouseTarget(databases=["app"], dev_database="dbt_dev"),
+    )
+    rendered = _clickhouse_profile("proj", None, config, tmp_path)
+
+    assert "super-secret" not in rendered
+    assert "env_var" in rendered
+    output = _yaml.safe_load(rendered)["proj"]["outputs"]["dev"]
+    assert output["type"] == "clickhouse"
+    # dbt-clickhouse has no `database` key: its `schema` is the ClickHouse
+    # database, and it must be the dev one, never a source.
+    assert output["schema"] == "dbt_dev"
+    assert "app" not in str(output["schema"])
+    assert output["password"].startswith("{{ env_var(")
+
+    # The cap references have to survive the yaml round trip intact. An f-string
+    # would silently collapse the closing `}}` to one brace, rendering a profile
+    # that parses, applies, and caps nothing.
+    settings = output["custom_settings"]
+    assert settings["max_execution_time"].endswith(") }}")
+    assert settings["max_bytes_to_read"].endswith(") }}")
+    assert settings["timeout_overflow_mode"] == "throw"
+
+
+def test_clickhouse_capabilities_pass_the_sanitizer(fake_clickhouse_connection):
+    # Family 5: nothing in the free probe trips the secret-key scan.
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    env.sanitize(env.ok(adapter.capabilities()))
+
+
+def test_clickhouse_spend_ledger_holds_no_sql_or_values(
+    tmp_path, fake_clickhouse_connection
+):
+    # Family 5: the ledger records a hash and a number, never statement text.
+    import json as _json
+
+    from fakes.clickhouse import FakeResult
+
+    from exmergo_dex_core.storage.filesystem import FilesystemStore
+
+    store = FilesystemStore(tmp_path)
+    fake_clickhouse_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=0.4
+    )
+    adapter = _clickhouse_adapter(fake_clickhouse_connection)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "shop"."customers"', max_rows=10, timeout_seconds=200
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = _json.loads(lines[-1])
+    assert "SELECT" not in _json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
+
+
 # --- Maintain: drift detection and reconcile exercise every family -------------
 #
 # Detection is read-only against data and writes only to `.dex/`; only reconcile
@@ -2783,8 +4995,17 @@ def test_maintain_grain_findings_carry_no_example_values(tmp_path: Path, capsys)
     dumped = __import__("json").dumps(payload)
     assert "@example.com" not in dumped  # no PII value ever
     grain = [f for f in payload["data"]["findings"] if f["axis"] == "grain"]
+    # `severity_floor_applied`/`grain_min_rows` (#280) are config-derived flags,
+    # not row-derived values, so they belong on this allowlist same as the rest.
     assert grain and all(
-        set(f["data"]) <= {"distinct_count", "row_count", "was_grain"}
+        set(f["data"])
+        <= {
+            "distinct_count",
+            "row_count",
+            "was_grain",
+            "severity_floor_applied",
+            "grain_min_rows",
+        }
         or f["code"] != "key_lost_uniqueness"
         for f in grain
     )
@@ -2974,9 +5195,135 @@ def test_local_semantic_pii_evidence_blocks_an_innocent_looking_dimension(
             )
         ]
     )
-    backend = LocalMetricFlowBackend(project, _memory_engine(), "duckdb", QueryLimits())
+    # The project format is injected, because the gate resolves a dimension to its
+    # physical column through the project seam now rather than by parsing the
+    # compiled artifact itself. The seam is what must keep the evidence flowing.
+    from exmergo_dex_core.adapters.project import DbtProject
+
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
     lookup = backend._cache_pii_lookup(cache)
     assert dict(screen_dimension_refs(["order__contact"], meta_lookup=lookup))
+
+
+def test_local_semantic_pii_evidence_follows_a_join_resolved_dimension(
+    tmp_path: Path,
+):
+    # Family 3, on the tokens the join resolution added. A metric can be grouped by
+    # a dimension declared in a model it joins to, and resolving those paths puts
+    # tokens in the catalog that a caller can now name. A token the gate cannot
+    # resolve to a physical column is screened on its name alone, which is the
+    # fail-closed floor rather than an equivalent, so every path the resolution
+    # adds has to reach the same evidence a declared token reaches.
+    import json as _json
+
+    from exmergo_dex_core import dbt_project
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import screen_dimension_refs
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "joined"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "users",
+                        "node_relation": {
+                            "alias": "dim_users",
+                            "relation_name": "wh.main.dim_users",
+                        },
+                        "entities": [{"name": "user", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [],
+                    },
+                    {
+                        "name": "sessions",
+                        "node_relation": {
+                            "alias": "fct_sessions",
+                            "relation_name": "wh.main.fct_sessions",
+                        },
+                        "entities": [
+                            {"name": "session", "type": "primary"},
+                            {"name": "user", "type": "foreign"},
+                        ],
+                        "dimensions": [],
+                        "measures": [{"name": "session_count", "agg": "count"}],
+                    },
+                ],
+                "metrics": [
+                    {
+                        "name": "sessions",
+                        "type": "simple",
+                        "type_params": {"input_measures": [{"name": "session_count"}]},
+                    }
+                ],
+            }
+        )
+    )
+
+    def resolve(_manifest_text):
+        # The resolver's answer, stated here rather than asked of MetricFlow: this
+        # suite installs no [semantic] extra, and the claim under test is what the
+        # gate does with a resolved path, not how the path was resolved.
+        return {
+            "sessions": [
+                dbt_project.ResolvedPath(
+                    "session__user__contact", "contact", "users", "categorical"
+                )
+            ]
+        }
+
+    class _Layer(DbtProject):
+        def semantic_catalog(self):
+            return dbt_project.semantic_catalog(self.project_dir, resolve_paths=resolve)
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.dim_users",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        _Layer(project.parent, project),
+    )
+    # The name says nothing: `session__user__contact` matches no PII pattern, so the
+    # column's own evidence is the only thing that refuses this query.
+    assert not screen_dimension_refs(["session__user__contact"])
+    lookup = backend._cache_pii_lookup(cache)
+    assert dict(screen_dimension_refs(["session__user__contact"], meta_lookup=lookup))
 
 
 def test_local_semantic_refuses_a_foreign_namespace_before_spending(tmp_path: Path):
@@ -3029,6 +5376,279 @@ def test_hosted_semantic_pii_dimension_refused_not_surfaced():
         backend.query(SemanticQuery(metrics=["sessions"], group_by=["user__email"]))
     # refused before the query was ever submitted for execution
     assert not any("createQuery" in posted for posted in backend.posted)
+
+
+def test_a_dimensions_values_are_refused_when_the_layer_flags_it():
+    # Family 3, at its sharpest. `explore semantic values` returns nothing but the
+    # values of one dimension, so there is no aggregate for a flagged dimension to
+    # hide behind and no reduced answer to fall back to: the command is refused.
+    # The gate that decides is the authoritative one, asked per metric and unioned,
+    # so a dimension whose NAME gives nothing away is still caught.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQueryRefusedError,
+        screen_dimension_refs,
+    )
+
+    flagged = {"name": "agent__operator_handle", "config": {"meta": {"pii": True}}}
+    backend = FakeHostedBackend(
+        metrics=[
+            {
+                "name": "agent_runs",
+                "dimensions": [{"name": "agent__operator_handle"}],
+            }
+        ],
+        dimensions_meta=[flagged],
+    )
+    assert not screen_dimension_refs(["agent__operator_handle"])
+
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.values("agent__operator_handle", [])
+    # Refused before the values query was ever submitted for execution, so the
+    # warehouse never read the column.
+    assert not any("createDimensionValuesQuery" in q for q in backend.posted)
+
+
+def test_a_local_dimensions_values_are_refused_on_the_columns_own_evidence(
+    tmp_path: Path,
+):
+    # The same refusal on the other backend, decided by the other authority: the
+    # .dex cache's value-evidence flag on the physical column the dimension
+    # resolves to, reached through the project seam. Refused before anything is
+    # rendered, so no statement exists that could reach a connection.
+    import json as _json
+
+    from exmergo_dex_core.adapters.project import DbtProject
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic import SemanticQueryRefusedError
+    from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend
+
+    project = tmp_path / "proj"
+    (project / "target").mkdir(parents=True)
+    (project / "target" / "semantic_manifest.json").write_text(
+        _json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "orders",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": "wh.main.orders",
+                        },
+                        "entities": [{"name": "order", "type": "primary"}],
+                        "dimensions": [
+                            {
+                                "name": "contact",
+                                "type": "categorical",
+                                "expr": "contact_col",
+                            }
+                        ],
+                        "measures": [{"name": "order_count", "agg": "count"}],
+                    }
+                ],
+                "metrics": [
+                    {
+                        "name": "orders",
+                        "type": "simple",
+                        "type_params": {"input_measures": [{"name": "order_count"}]},
+                    }
+                ],
+            }
+        )
+    )
+    backend = LocalMetricFlowBackend(
+        project,
+        _memory_engine(),
+        "duckdb",
+        QueryLimits(),
+        DbtProject(project.parent, project),
+    )
+    backend._load_cache = lambda: DexCache(
+        datasets=[
+            Dataset(
+                identifier="wh.main.orders",
+                columns=[
+                    ColumnProfile(
+                        name="contact_col",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.9),
+                    )
+                ],
+            )
+        ]
+    )
+
+    def _never(*_args, **_kwargs):
+        raise AssertionError("rendering was reached past the gate")
+
+    backend._metricflow_engine = _never
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.values("order__contact", [])
+
+
+def test_a_values_result_is_columnar_and_passes_the_sanitizer(capsys):
+    # Family 5. A values result is the one payload on this surface whose whole
+    # point is column values, so it is exactly the shape the sanitizer exists to
+    # judge: columnar, never row dicts, and never keyed by anything a caller named.
+    from fakes.semantic import SECRET_TOKEN, FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core import envelope as env
+    from exmergo_dex_core.results import to_envelope
+
+    backend = FakeHostedBackend(
+        metrics=[{"name": "sessions", "dimensions": [{"name": "user__pricing_tier"}]}],
+        result=table_json_result(
+            ["user__pricing_tier"], ["string"], [["free"], ["pro"]]
+        ),
+    )
+    env.emit(to_envelope(backend.values("user__pricing_tier", [])))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["data"]["cells"] == [["free"], ["pro"]]
+    assert SECRET_TOKEN not in json.dumps(payload)
+
+
+def test_hosted_values_is_warn_only_never_silently_priced():
+    # Family 4, on the second hosted command. dbt Cloud owns the warehouse
+    # connection here too, so there is no estimate dex could honestly report and
+    # no ceiling it could have enforced, and every result has to say so rather
+    # than report a zero that reads as free.
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core import envelope as env
+
+    backend = FakeHostedBackend(
+        metrics=[{"name": "sessions", "dimensions": [{"name": "user__pricing_tier"}]}],
+        result=table_json_result(["user__pricing_tier"], ["string"], [["free"]]),
+    )
+    record = backend.values("user__pricing_tier", [])
+    assert record.cost.paradigm == env.Paradigm.HOSTED
+    assert record.cost.estimate is None and record.cost.ceiling is None
+    assert any("cost guard unavailable" in w for w in record.warnings)
+
+
+def test_the_hosted_pii_map_covers_every_metric_in_a_multi_metric_query():
+    # Family 3, and the reason the gate asks one metric at a time. The API's
+    # `dimensions(metrics: [a, b])` returns the dimensions common to ALL the
+    # listed metrics, not their union, so asking once for a multi-metric query
+    # shrinks the authoritative map instead of growing it: everything outside the
+    # intersection falls through to the name heuristic. A dimension the dbt
+    # project marked `meta: {pii: true}` whose name carries no PII signal then
+    # passes the gate and is grouped and projected. "PII is flagged, never
+    # surfaced" does not survive that, and a note after the fact is not the same
+    # as a refusal.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+        screen_dimension_refs,
+    )
+
+    clean = {"name": "user__pricing_tier", "config": {"meta": {}}}
+    flagged = {"name": "agent__operator_handle", "config": {"meta": {"pii": True}}}
+    # Two metrics from two semantic models: the flagged dimension is reachable
+    # from one of them, so it is exactly what an intersection drops.
+    backend = FakeHostedBackend(
+        dimensions_meta={
+            "active_users": [clean],
+            "agent_runs": [clean, flagged],
+        }
+    )
+    # Nothing about the name gives it away, which is what makes the layer's own
+    # metadata the only thing standing between this dimension and stdout.
+    assert not screen_dimension_refs(["agent__operator_handle"])
+
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(
+            SemanticQuery(
+                metrics=["active_users", "agent_runs"],
+                group_by=["agent__operator_handle"],
+            )
+        )
+    assert not any("createQuery" in posted for posted in backend.posted)
+
+
+def test_the_hosted_pii_map_adjudicates_rather_than_disclosing_a_gap():
+    # The other half of the same invariant. Blocking is not enough: a dimension
+    # the layer documented must be *adjudicated*, not cleared by the heuristic and
+    # then disclosed as unscreened, because a note is the part of a payload a
+    # caller is least likely to act on. So a ref the layer speaks to leaves
+    # nothing unadjudicated, and a grain suffix (which no dimension name carries)
+    # is not enough on its own to drop a ref back to the floor.
+    from fakes.semantic import FakeHostedBackend, table_json_result
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery, unadjudicated_refs
+
+    dims = {
+        "active_users": [{"name": "user__pricing_tier", "config": {"meta": {}}}],
+        "agent_runs": [
+            {"name": "agent__mode", "config": {"meta": {"pii": False}}},
+            {"name": "user__created_at", "config": {"meta": {"pii": False}}},
+        ],
+    }
+    backend = FakeHostedBackend(
+        dimensions_meta=dims,
+        result=table_json_result(["active_users"], ["number"], [[5.0]]),
+    )
+    query = SemanticQuery(
+        metrics=["active_users", "agent_runs"],
+        group_by=["agent__mode", "user__created_at__month"],
+    )
+    meta, _ = backend._query_metadata(query.metrics)
+    lookup = backend._meta_lookup(meta)
+    assert unadjudicated_refs(query.group_by, meta_lookup=lookup) == []
+
+    result = backend.query(query)
+    assert not any("name heuristic alone" in note for note in result.notes)
+
+
+def test_a_filter_a_backend_cannot_read_is_refused_rather_than_half_screened():
+    # Family 3, and the gate's other structural fail-open. A metric query touches
+    # dimensions two ways: the group_by tokens and the dimensions its filter
+    # clauses name. The filter dialect belongs to the answering layer, so the
+    # backend reads it; a backend that cannot has to refuse the query, because the
+    # gate's disclosures can only report on refs the extraction found. An extractor
+    # that matches nothing produces a successful query, no blocks and no notes,
+    # with every filtered dimension grouped and projected and nothing saying it was
+    # never examined. Both shipped backends read MetricFlow's dialect, so this is
+    # the contract a third one inherits rather than a live path.
+    from fakes.semantic import FakeHostedBackend
+
+    from exmergo_dex_core.explore.semantic import (
+        SemanticQuery,
+        SemanticQueryRefusedError,
+    )
+
+    class _NoFilterDialect(FakeHostedBackend):
+        def filter_refs(self, clauses):
+            return None
+
+    backend = _NoFilterDialect(
+        dimensions_meta={"sessions": [{"name": "user__email", "config": None}]}
+    )
+    filtered = SemanticQuery(
+        metrics=["sessions"],
+        group_by=["session__mode"],
+        where=['{"member": "users.email", "operator": "set"}'],
+    )
+    with pytest.raises(SemanticQueryRefusedError, match="filter dialect"):
+        backend.query(filtered)
+    assert not any("createQuery" in posted for posted in backend.posted)
+
+    # The same backend still answers an unfiltered query: the refusal is scoped to
+    # the input it cannot screen, not to the backend.
+    unfiltered = SemanticQuery(metrics=["sessions"], group_by=["user__email"])
+    with pytest.raises(SemanticQueryRefusedError, match="PII"):
+        backend.query(unfiltered)
 
 
 def test_hosted_semantic_pii_gate_still_binds_on_an_injected_token(monkeypatch):
@@ -3485,3 +6105,124 @@ def test_duckdb_cannot_be_reached_through_an_injected_connection(duckdb_file: Pa
 
     with pytest.raises(ValueError, match="read-only"):
         DexEngine(config=config, connection=writable)._adapter("explore inventory")
+
+
+def test_the_semantic_layer_read_costs_the_warehouse_nothing(
+    tmp_path: Path, monkeypatch, capsys
+):
+    # Family 2: `--use-project` now folds a semantic layer into the map, and that
+    # read is a compiled-artifact parse and nothing else. A project read that
+    # quietly issued a statement would be spend the cost handshake never priced
+    # and the estimate never covered, which is the failure mode the guard exists
+    # for and the one a "free" read is most likely to introduce.
+    #
+    # Asserted as a delta rather than as an absolute: the map's own profiling
+    # statements are the subject of other tests, and what has to hold here is that
+    # adding the semantic read adds none of them.
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE customers (id INTEGER, region VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'eu')")
+    conn.execute("CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "target").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n', encoding="utf-8"
+    )
+    (repo / "target" / "semantic_manifest.json").write_text(
+        json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "customers_sm",
+                        "node_relation": {
+                            "alias": "customers",
+                            "relation_name": '"a"."main"."customers"',
+                        },
+                        "entities": [
+                            {"name": "customer", "type": "primary", "expr": "id"}
+                        ],
+                        "dimensions": [{"name": "region", "type": "categorical"}],
+                        "measures": [{"name": "n", "agg": "count", "expr": "id"}],
+                    },
+                    {
+                        "name": "orders_sm",
+                        "node_relation": {
+                            "alias": "orders",
+                            "relation_name": '"a"."main"."orders"',
+                        },
+                        "entities": [
+                            {"name": "order", "type": "primary", "expr": "order_id"},
+                            {
+                                "name": "customer",
+                                "type": "foreign",
+                                "expr": "buyer_id",
+                            },
+                        ],
+                        "dimensions": [],
+                        "measures": [{"name": "m", "agg": "count"}],
+                    },
+                ],
+                "metrics": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    statements: list[str] = []
+    original = DuckDBAdapter._run_select
+
+    def counting(self, sql, params=None):
+        statements.append(sql)
+        return original(self, sql, params)
+
+    monkeypatch.setattr(DuckDBAdapter, "_run_select", counting)
+
+    def run(*extra: str) -> int:
+        statements.clear()
+        cache = repo / ".dex"
+        if cache.is_dir():
+            shutil.rmtree(cache)
+        _run(
+            [
+                "explore",
+                "map",
+                "--path",
+                str(db),
+                "--repo-root",
+                str(repo),
+                *extra,
+            ],
+            capsys,
+        )
+        return len(statements)
+
+    bare = run()
+    with_layer = run("--use-project")
+
+    assert with_layer == bare, (
+        "folding the semantic layer into the map changed how many statements "
+        f"reached the warehouse ({bare} -> {with_layer}). The link is a read of a "
+        "compiled artifact; a version of it that scans is spend nothing priced"
+    )
+
+    # And the read did happen, so the equality above is not the trivial one.
+    payload = _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    edges = [e for e in payload["data"]["edges"] if e["declared_by"]]
+    assert edges and edges[0]["declared_by"] == "semantic entity 'customer'"

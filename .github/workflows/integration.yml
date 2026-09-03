@@ -1,13 +1,16 @@
 name: Integration
 
-# Live cloud connectors, authenticated via workload identity federation (OIDC,
-# no stored keys, matching the release workflow's Trusted Publishing stance).
+# Live cloud connectors use workload identity federation wherever the provider
+# offers it. ClickHouse Cloud has no suitable GitHub OIDC path, so its narrow
+# job is the documented exception: a service-scoped read-only API key and two
+# database credentials live only in a main-protected environment and rotate
+# through scripts/setup_clickhouse_cloud_ci.sh.
 # Deliberately NOT a merge or release gate: ci.yml stays deterministic and
 # fork-runnable; this workflow answers "does the connector still work against
 # the real service" on main and on a schedule. Each suite reads shared/public
 # sample data, writes only to its scratch scope, and caps every statement
 # (bytes on BigQuery, seconds on Snowflake, Databricks, Redshift, and
-# Postgres), so a worst-case run costs cents.
+# Postgres). ClickHouse additionally refuses at its 2 CHC UTC-day threshold.
 #
 # One-time setup (documented in CONTRIBUTING.md):
 #   BigQuery: scripts/setup_bigquery_ci.sh (Workload Identity Pool provider
@@ -37,11 +40,18 @@ name: Integration
 #   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
 #   fork-runnable by construction, kept here for pattern parity with the other
 #   connectors rather than as a cost decision.
+#   ClickHouse: the exhaustive suite remains a free, keyless, fork-runnable
+#   container started by scripts/setup_clickhouse_dev.sh. A separate narrow
+#   ClickHouse Cloud job uses the protected clickhouse-cloud-integration
+#   environment, refuses on the UTC-day CHC threshold before any SQL connection
+#   wakes the service, and shares the same parameterized data fixture.
 on:
   push:
     branches: [main]
     paths:
       - "packages/dex-core/**"
+      - "scripts/clickhouse*"
+      - "scripts/clickhouse_cloud/**"
       - ".github/workflows/integration.yml"
   schedule:
     - cron: "17 5 * * 1"
@@ -320,3 +330,90 @@ jobs:
         run: uv sync --extra postgres --extra duckdb --extra dev
       - name: Live Postgres integration suite
         run: uv run pytest tests/integration -q -m postgres
+
+  clickhouse:
+    # No repository gate and no environment: the target is a container this job
+    # starts, so there is nothing to authenticate against and nothing a fork
+    # could spend.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_CH_DSN: clickhouse://dex_ro:dex_ro@localhost:8124/app
+      DEX_TEST_CH_DEV_PASSWORD: dbt_dev
+    steps:
+      - uses: actions/checkout@v4
+      # Not a `services:` container. The seed is multi-statement and the HTTP
+      # interface refuses multi-statement bodies, so it has to go through
+      # clickhouse-client inside the container, which means the job needs a
+      # container it can `docker exec` by name. Calling the dogfood script gives
+      # exactly that and keeps the seeding path single-sourced.
+      - name: Start and seed ClickHouse
+        working-directory: .
+        run: scripts/setup_clickhouse_dev.sh
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (clickhouse + duckdb + dev extras)
+        run: uv sync --extra clickhouse --extra duckdb --extra dev
+      - name: Live ClickHouse integration suite
+        run: uv run pytest tests/integration -q -m clickhouse
+
+  clickhouse_cloud:
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: clickhouse-cloud-integration
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_CH_CLOUD_ORG_ID: ${{ vars.DEX_TEST_CH_CLOUD_ORG_ID }}
+      DEX_TEST_CH_CLOUD_SERVICE_ID: ${{ vars.DEX_TEST_CH_CLOUD_SERVICE_ID }}
+      DEX_TEST_CH_CLOUD_HOST: ${{ vars.DEX_TEST_CH_CLOUD_HOST }}
+      DEX_TEST_CH_CLOUD_PORT: ${{ vars.DEX_TEST_CH_CLOUD_PORT }}
+      DEX_TEST_CH_CLOUD_DATABASE: ${{ vars.DEX_TEST_CH_CLOUD_DATABASE }}
+      DEX_TEST_CH_CLOUD_DEV_DATABASE: ${{ vars.DEX_TEST_CH_CLOUD_DEV_DATABASE }}
+      DEX_TEST_CH_CLOUD_COMPUTE_UNIT_PRICE_USD: ${{ vars.DEX_TEST_CH_CLOUD_COMPUTE_UNIT_PRICE_USD }}
+      DEX_TEST_CH_CLOUD_MAX_SECONDS: ${{ vars.DEX_TEST_CH_CLOUD_MAX_SECONDS }}
+      DEX_TEST_CH_CLOUD_MAX_DAILY_CHC: ${{ vars.DEX_TEST_CH_CLOUD_MAX_DAILY_CHC }}
+      DEX_TEST_CH_CLOUD_DSN: ${{ secrets.DEX_TEST_CH_CLOUD_DSN }}
+      DEX_TEST_CH_CLOUD_DEV_PASSWORD: ${{ secrets.DEX_TEST_CH_CLOUD_DEV_PASSWORD }}
+      DEX_TEST_CH_CLOUD_API_KEY: ${{ secrets.DEX_TEST_CH_CLOUD_API_KEY }}
+      DEX_TEST_CH_CLOUD_API_SECRET: ${{ secrets.DEX_TEST_CH_CLOUD_API_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the protected Cloud configuration
+        run: |
+          for name in \
+            DEX_TEST_CH_CLOUD_ORG_ID DEX_TEST_CH_CLOUD_SERVICE_ID \
+            DEX_TEST_CH_CLOUD_HOST DEX_TEST_CH_CLOUD_PORT \
+            DEX_TEST_CH_CLOUD_DATABASE DEX_TEST_CH_CLOUD_DEV_DATABASE \
+            DEX_TEST_CH_CLOUD_COMPUTE_UNIT_PRICE_USD \
+            DEX_TEST_CH_CLOUD_MAX_SECONDS DEX_TEST_CH_CLOUD_MAX_DAILY_CHC \
+            DEX_TEST_CH_CLOUD_DSN DEX_TEST_CH_CLOUD_DEV_PASSWORD \
+            DEX_TEST_CH_CLOUD_API_KEY DEX_TEST_CH_CLOUD_API_SECRET; do
+            test -n "${!name}" || { echo "$name is missing" >&2; exit 1; }
+          done
+      - name: Install clickhousectl
+        working-directory: .
+        run: |
+          curl -fsSL https://clickhouse.com/cli | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Usage preflight before any SQL connection
+        id: preflight
+        working-directory: .
+        run: scripts/clickhouse_cloud/preflight.sh
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (clickhouse + duckdb + dev extras)
+        run: uv sync --extra clickhouse --extra duckdb --extra dev
+      - name: Narrow ClickHouse Cloud integration suite
+        run: uv run pytest tests/integration/test_clickhouse_cloud.py -q --tb=line -m clickhouse_cloud
+      - name: Provisional post-run usage report
+        if: always() && steps.preflight.outcome != 'skipped'
+        working-directory: .
+        run: scripts/clickhouse_cloud/preflight.sh --report-only

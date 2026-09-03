@@ -13,9 +13,19 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
-from ..adapters.base import Adapter, ColumnAggregate, is_blob_type, json_safe
+from ..adapters.base import (
+    VALUE_DOMAIN_CAP,
+    VALUE_DOMAIN_MAX_FRACTION,
+    Adapter,
+    ColumnAggregate,
+    is_blob_type,
+    is_integer_type,
+    is_temporal_type,
+    json_safe,
+)
+from ..adapters.base import is_string_type as _base_is_string_type
 from ..cache import (
     ColumnProfile,
     Dataset,
@@ -25,6 +35,7 @@ from ..cache import (
     ValueDomain,
 )
 from ..config import PIIOverrideMatcher
+from ..errors import WarehouseQueryError
 from ..progress import ProgressReporter
 
 # approx_count_distinct error observed in practice reaches ~14% in both
@@ -46,24 +57,16 @@ _EXACT_DISTINCT_CAP = 8
 # and the ranking puts a real grain in the first slots when one exists.
 _COMPOSITE_PAIR_CAP = 5
 
-# A later pair that shares a column with an already-kept pair is treated as
-# the same hypothesis tried with different filler ("does this dimension have
-# *a* partner?") when its product is within this multiple of the kept pair's
-# -- not a genuinely different candidate. Keeping the ratio bounded (rather
-# than 1:1) is what stops several near-identical junk pairs from each
-# consuming a cap slot; a pair whose product diverges meaningfully (a real
-# competing hypothesis, not filler) still gets its own slot even if it
-# reuses a column.
+# A later pair that shares a column with a better-ranked one is treated as the
+# same hypothesis tried with different filler ("does this dimension have *a*
+# partner?") when its product is within this multiple of the better-ranked
+# pair's -- not a genuinely different candidate. Keeping the ratio bounded
+# (rather than 1:1) is what sends several near-identical junk pairs to the back
+# together; a pair whose product diverges meaningfully (a real competing
+# hypothesis, not filler) keeps its place even if it reuses a column. This only
+# orders candidates. It decides nothing about which ones get probed while the
+# cap has room, because a discarded candidate cannot be the grain.
 _COMPOSITE_REDUNDANCY_RATIO = 3.0
-
-# A column's value domain is reported only when its distinct count clears
-# BOTH bars: small absolutely (this cap) and small relative to the table
-# (the fraction below), so a tiny table's near-key column does not qualify
-# on the absolute count alone. Deliberately conservative -- this codebase's
-# general posture is to under-report rather than over-report, and a false
-# negative here just costs one more `explore query`.
-_VALUE_DOMAIN_CAP = 25
-_VALUE_DOMAIN_MAX_FRACTION = 0.10
 
 # Name patterns mapped to a PII category and a base confidence. Matched on the
 # snake-normalized column name (camelCase is split first, so "firstName" matches
@@ -143,6 +146,13 @@ _FREE_TEXT = re.compile(
     r"(^|_)(comments?|notes?|message|body|feedback|review_text|bio|about)(_|$)"
 )
 
+# A column name that promises exactly two states (issue #218): the `is_`/`has_`
+# prefixes and `_flag`/`_yn`/`_ind` suffixes a data-quality check reads as
+# "boolean, by convention" even on a connector with no native BOOLEAN type.
+# Matched as a whole underscore-delimited token, same discipline as the PII
+# patterns above, so "is_active" matches but "history"/"island" do not.
+_BOOLEAN_NAME = re.compile(r"(^|_)(is|has|flag|yn|ind)(_|$)")
+
 # "FIXED" is Snowflake's SHOW COLUMNS token for every integer and NUMBER type
 # (surfaced by snowflake._render_type); without it no Snowflake integer column
 # reads as numeric, and the type-aware PII gates below would be inert there.
@@ -158,7 +168,6 @@ _NUMERIC_HINTS = (
 )
 _TEMPORAL_HINTS = ("DATE", "TIME", "TIMESTAMP", "INTERVAL")
 _BOOLEAN_HINTS = ("BOOL",)
-_STRING_HINTS = ("CHAR", "TEXT", "STRING", "VARCHAR")
 
 _MAX_CONFIDENCE = 0.95
 
@@ -206,8 +215,10 @@ def _normalize(column_name: str) -> str:
 
 
 def _is_string_type(data_type: str) -> bool:
-    upper = data_type.upper()
-    return any(h in upper for h in _STRING_HINTS)
+    # Delegates to adapters.base so profile.py's request-set construction and
+    # each adapter's SQL-branch decision (#204) classify a declared type the
+    # same way, single-sourced.
+    return _base_is_string_type(data_type)
 
 
 def is_numeric_type(data_type: str) -> bool:
@@ -282,15 +293,20 @@ def detect_pii(column_name: str, data_type: str) -> PIIFlag | None:
     patterns remain string-only.
     """
 
-    flag, _generic = _classify_pii(column_name, data_type)
+    flag, _generic = classify_pii(column_name, data_type)
     return flag
 
 
-def _classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool]:
+def classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool]:
     """The detector plus a marker for the generic `*_name` match.
 
-    The marker tells :func:`profile` which flags are eligible for value-shape
-    refinement. It is deliberately a return value and never persisted: keying
+    The marker says the flag is **provisional**: it is the one match
+    :func:`profile` refines against value shape, up to person-name confidence or
+    down to reference-vocabulary confidence. A caller that cannot run that
+    refinement (nothing that reads names without values can) needs to know it is
+    holding an unrefined guess rather than a verdict, which is why this is
+    public and :func:`detect_pii` is the front door for callers that do not
+    care. It is deliberately a return value and never persisted: keying
     eligibility on the flag itself (e.g. its confidence value) would couple the
     shape rules to the base-confidence table.
     """
@@ -337,6 +353,337 @@ def is_min_max_safe(data_type: str, pii: PIIFlag | None) -> bool:
     )
 
 
+# A detector reports only once it clears this fraction of non-null values,
+# matching the codebase's general under-report-over-over-report posture: a
+# false negative here just costs one more `explore query`.
+_TYPE_CONTRADICTION_MATCH_THRESHOLD = 0.95
+
+
+def _type_contradiction_notes(
+    col_name: str, data_type: str, agg: ColumnAggregate | None
+) -> list[str]:
+    """Data-quality notes for a declared type that contradicts its column's
+    content (#204): a string holding dates/timestamps, epoch-shaped numbers,
+    or numeric-only text. Fractions, pattern/format names, and (for epoch) a
+    translated calendar date only -- never a raw value. Fail closed: a
+    missing fraction (not requested, ineligible type, PII-flagged, or the
+    dialect could not) yields no note for that detector.
+    """
+
+    if agg is None:
+        return []
+    notes: list[str] = []
+
+    for fraction, fmt in (
+        (agg.iso_date_fraction, "%Y-%m-%d"),
+        (agg.iso_datetime_fraction, "%Y-%m-%d %H:%M:%S"),
+    ):
+        if fraction is not None and fraction >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+            notes.append(_temporal_note(col_name, data_type, fraction, fmt))
+
+    slash_note = _slash_date_note(col_name, data_type, agg)
+    if slash_note is not None:
+        notes.append(slash_note)
+
+    if (
+        agg.numeric_string_fraction is not None
+        and agg.numeric_string_fraction >= _TYPE_CONTRADICTION_MATCH_THRESHOLD
+    ):
+        notes.append(_numeric_string_note(col_name, data_type, agg))
+
+    epoch_note = _epoch_note(col_name, data_type, agg)
+    if epoch_note is not None:
+        notes.append(epoch_note)
+
+    return notes
+
+
+def _temporal_note(col_name: str, data_type: str, fraction: float, fmt: str) -> str:
+    return (
+        f"{col_name} is declared {data_type} but {fraction:.0%} of values match "
+        f"the {fmt} date format; consider casting with that format"
+    )
+
+
+def _slash_date_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | None:
+    """Disambiguate %m/%d/%Y from %d/%m/%Y, which share one regex shape.
+
+    A component that exceeds 12 anywhere in the data is a logical proof that
+    component cannot be a month -- not a confidence bar, a single
+    counterexample is conclusive -- so `> 0` decides this, never the 0.95
+    match threshold used everywhere else in this module.
+    """
+
+    date_frac = agg.slash_date_fraction or 0.0
+    datetime_frac = agg.slash_datetime_fraction or 0.0
+    total = date_frac + datetime_frac  # mutually exclusive shapes: sum is coverage
+    if total < _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return None
+    has_time = datetime_frac > date_frac
+
+    first_over = (agg.slash_first_component_over_12_fraction or 0.0) > 0
+    second_over = (agg.slash_second_component_over_12_fraction or 0.0) > 0
+    if first_over and second_over:
+        return None  # contradiction: no single format order fits every row
+
+    def fmt(day_first: bool) -> str:
+        base = "%d/%m/%Y" if day_first else "%m/%d/%Y"
+        return f"{base} %H:%M:%S" if has_time else base
+
+    if first_over:  # first component can't be a month (>12): must be the day
+        return _temporal_note(col_name, data_type, total, fmt(day_first=True))
+    if second_over:  # second component can't be a month: must be MDY
+        return _temporal_note(col_name, data_type, total, fmt(day_first=False))
+
+    # Neither component ever exceeds 12: the order cannot be told apart from
+    # the data alone -- say so rather than guessing.
+    return (
+        f"{col_name} is declared {data_type} and {total:.0%} of values match a "
+        f"slash-separated date shape, but the day/month order is ambiguous "
+        f"({fmt(day_first=True)} and {fmt(day_first=False)} both fit every "
+        "value); casting either way risks a silent swap"
+    )
+
+
+def _numeric_string_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str:
+    integer_fraction = agg.integer_string_fraction or 0.0
+    if integer_fraction >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        shape = "every value fits an integer"
+    else:
+        shape = (
+            f"only {integer_fraction:.0%} of values fit an integer "
+            "(the rest carry a decimal point)"
+        )
+    return (
+        f"{col_name} is declared {data_type} but {agg.numeric_string_fraction:.0%} "
+        f"of values are numeric-only strings; {shape}"
+    )
+
+
+def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | None:
+    seconds = agg.epoch_seconds_fraction or 0.0
+    millis = agg.epoch_millis_fraction or 0.0
+    if (
+        seconds < _TYPE_CONTRADICTION_MATCH_THRESHOLD
+        and millis < _TYPE_CONTRADICTION_MATCH_THRESHOLD
+    ):
+        return None
+    if seconds >= millis:
+        unit, fraction = "seconds", seconds
+        lo, hi = agg.epoch_seconds_min_value, agg.epoch_seconds_max_value
+    else:
+        unit, fraction = "milliseconds", millis
+        lo, hi = agg.epoch_millis_min_value, agg.epoch_millis_max_value
+    if lo is None or hi is None:
+        return None  # evidence incomplete: fail closed, no unverifiable claim
+
+    divisor = 1000 if unit == "milliseconds" else 1
+    lo_date = datetime.fromtimestamp(lo / divisor, tz=UTC).date().isoformat()
+    hi_date = datetime.fromtimestamp(hi / divisor, tz=UTC).date().isoformat()
+    return (
+        f"{col_name} is declared {data_type} but {fraction:.0%} of values fall "
+        f"in the plausible unix-epoch-{unit} range; implied date range "
+        f"{lo_date} to {hi_date}"
+    )
+
+
+# Below this, a second shape reads as a handful of typos/outliers, not a
+# second real population; the issue's own worked example floors here at 10%,
+# so 5% catches a genuine minority scheme with margin to spare while staying
+# on this codebase's side of under- rather over-reporting.
+_HETEROGENEOUS_KEY_MIN_SHARE = 0.05
+
+# Friendly names for the hash lengths this shape recurs as in practice;
+# anything else is reported by its bare length instead of guessing further.
+_HEX_LENGTH_NAMES = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def _is_candidate_key(
+    col_name: str, agg: ColumnAggregate | None, composite_members: set[str]
+) -> bool:
+    """A single-column proven key, or a member of a proven composite key --
+    the same predicate `relationships.candidate_keys` applies to
+    `ColumnProfile` after the fact, evaluated here instead against the live
+    aggregate because that's the only place `key_shape` fractions exist.
+    """
+
+    if col_name in composite_members:
+        return True
+    if agg is None:
+        return False
+    return bool(agg.is_unique) and agg.null_fraction in (0.0, None)
+
+
+def _hex_shape_label(agg: ColumnAggregate) -> str:
+    lo, hi = agg.hex_string_min_length, agg.hex_string_max_length
+    if lo is None or hi is None:
+        return "hexadecimal"
+    if lo == hi:
+        name = _HEX_LENGTH_NAMES.get(lo)
+        return (
+            f"{lo}-character hexadecimal ({name}-shaped)"
+            if name
+            else f"{lo}-character hexadecimal"
+        )
+    return f"hexadecimal ({lo}-{hi} characters, mixed length)"
+
+
+def _heterogeneous_key_note(col_name: str, agg: ColumnAggregate | None) -> str | None:
+    """A candidate-key column that mixes two or more value shapes (numeric,
+    UUID, fixed-length hex, or an unclassified remainder) in a meaningful
+    share each -- the shape that survives a partial migration or a merged
+    upstream, where a downstream cast or numeric comparison silently drops
+    the group it can't parse. Fractions and a length-derived shape label
+    only; never a value.
+    """
+
+    if agg is None:
+        return None
+    numeric = agg.numeric_string_fraction or 0.0
+    uuid = agg.uuid_string_fraction or 0.0
+    hexed = agg.hex_string_fraction or 0.0
+    other = max(0.0, 1.0 - numeric - uuid - hexed)
+    buckets = [
+        ("numeric", numeric),
+        ("uuid", uuid),
+        (_hex_shape_label(agg), hexed),
+        ("other", other),
+    ]
+    present = [
+        (name, frac) for name, frac in buckets if frac >= _HETEROGENEOUS_KEY_MIN_SHARE
+    ]
+    if len(present) < 2:
+        return None
+    parts = ", ".join(f"{frac:.0%} {name}" for name, frac in present)
+    return (
+        f"{col_name} is a candidate key but mixes value shapes: {parts}; "
+        "casting to a number or comparing numerically will silently drop "
+        "the non-numeric group(s)"
+    )
+
+
+def _boolean_shaped_flag_note(
+    col_name: str,
+    data_type: str,
+    agg: ColumnAggregate | None,
+    domain: ValueDomain | None,
+) -> str | None:
+    """A column named like a two-valued flag (``is_*``, ``has_*``, ``*_flag``,
+    ``*_yn``, ``*_ind``) whose non-null content holds more than two distinct
+    values -- a mixed-encoding defect invisible to anyone who does not ask for
+    the domain (issue #218). Firing does not require telling a data-quality
+    defect apart from a genuine third state; the tool cannot make that call,
+    and naming the count (and the values, when known) is what lets the caller
+    make it instead.
+
+    A genuinely ``BOOLEAN``-typed column can only ever hold two values (plus
+    null) by construction and is excluded outright, whatever its name.
+
+    Where the value domain (#203) is available, the note names the
+    encodings and their counts. Where it is not, because the column failed
+    one of that feature's own eligibility gates (PII-flagged, a candidate
+    key, or too many distinct values to report), the note still fires on the
+    count alone: the tool not being able to name the values is not evidence
+    there are only two of them.
+    """
+
+    if not _BOOLEAN_NAME.search(_normalize(col_name)):
+        return None
+    if any(hint in data_type.upper() for hint in _BOOLEAN_HINTS):
+        return None
+    if agg is None or agg.distinct_count is None or agg.distinct_count <= 2:
+        return None
+
+    if domain is not None and domain.values:
+        total = len(domain.values) + domain.elided
+        encodings = ", ".join(f"{v.value}={v.count}" for v in domain.values)
+        if domain.elided:
+            encodings += f", +{domain.elided} more"
+        return (
+            f"{col_name} looks boolean-shaped by name but holds {total} "
+            f"distinct non-null values: {encodings}; a two-valued read of "
+            "it will misclassify some rows"
+        )
+    marker = "" if agg.distinct_count_exact else "~"
+    return (
+        f"{col_name} looks boolean-shaped by name but holds "
+        f"{marker}{agg.distinct_count} distinct non-null values; a "
+        "two-valued read of it will misclassify some rows"
+    )
+
+
+def _parse_temporal(value: object) -> date | datetime:
+    """Normalize a temporal min/max back to a comparable object. Adapters
+    disagree about when they call ``json_safe`` on these two fields (see the
+    module docstring's note on #206): DuckDB/BigQuery hand back a native
+    ``date``/``datetime``, Snowflake/Databricks/Redshift/Postgres an ISO
+    8601 ``str``. Both must resolve to the same shape before date
+    arithmetic, since subtracting a ``date`` from a ``datetime`` raises."""
+
+    if isinstance(value, str):
+        return (
+            datetime.fromisoformat(value)
+            if ("T" in value or " " in value)
+            else date.fromisoformat(value)
+        )
+    return value  # already date or datetime
+
+
+def _temporal_granularity(agg: ColumnAggregate) -> str:
+    """Day is the default; month wins only when the data is clearly at that
+    grain (values sit on month boundaries), and hour is reported instead of
+    day when day-truncation would actually lose information (real
+    sub-day variation, so a bare DATE column -- always day-aligned by
+    construction -- never lands here)."""
+
+    day_aligned = agg.day_aligned_fraction or 0.0
+    month_aligned = agg.month_aligned_fraction or 0.0
+    if day_aligned < _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return "hour"
+    if month_aligned >= _TYPE_CONTRADICTION_MATCH_THRESHOLD:
+        return "month"
+    return "day"
+
+
+def _temporal_continuity(
+    agg: ColumnAggregate | None,
+) -> tuple[str, int, int, int, int] | None:
+    """Span, distinct periods, missing periods, and the largest gap, at the
+    detected granularity. Neutral by design: a genuinely sparse column (an
+    event timestamp on a rare event) reports large numbers here without
+    being characterized as broken -- interpretation belongs to the caller,
+    including a future drift-sweep detector this only lands the statistics
+    for (issue #226, not built here). ``None`` when there isn't enough
+    evidence (no aggregate, no min/max, or the adapter could not compute
+    the granularity-matched pair)."""
+
+    if agg is None or agg.min_value is None or agg.max_value is None:
+        return None
+    # Not a temporal-eligible column at all (no alignment evidence was ever
+    # requested for it): min/max exist but are not dates, so there is
+    # nothing to do date arithmetic on.
+    if agg.day_aligned_fraction is None and agg.month_aligned_fraction is None:
+        return None
+    granularity = _temporal_granularity(agg)
+    lo, hi = _parse_temporal(agg.min_value), _parse_temporal(agg.max_value)
+    if granularity == "month":
+        span = (hi.year - lo.year) * 12 + (hi.month - lo.month) + 1
+        distinct_periods = agg.month_distinct_periods
+        largest_gap = agg.month_largest_gap
+    elif granularity == "hour":
+        span = int((hi - lo).total_seconds() // 3600) + 1
+        distinct_periods = agg.hour_distinct_periods
+        largest_gap = agg.hour_largest_gap
+    else:
+        span = (hi - lo).days + 1
+        distinct_periods = agg.day_distinct_periods
+        largest_gap = agg.day_largest_gap
+    if distinct_periods is None:
+        return None
+    missing = max(0, span - distinct_periods)
+    return granularity, span, distinct_periods, missing, largest_gap or 0
+
+
 def profile(
     adapter: Adapter,
     identifiers: list[str],
@@ -380,7 +727,7 @@ def profile(
 
         # Decide min/max safety BEFORE querying, from name + type, so the adapter
         # never even computes a suppressed extreme.
-        classified = {c.name: _classify_pii(c.name, c.data_type) for c in columns}
+        classified = {c.name: classify_pii(c.name, c.data_type) for c in columns}
         prelim_pii = {name: flag for name, (flag, _g) in classified.items()}
         overridden: dict[str, PIICategory] = {}
         for c in columns:
@@ -399,6 +746,31 @@ def profile(
             for name, (flag, generic) in classified.items()
             if generic and prelim_pii[name] is not None
         }
+        # Declared-type-vs-content checks (#204) run only for non-PII
+        # string/integer columns: PII at any confidence is excluded, full
+        # stop, the same rule is_min_max_safe and value-domain eligibility
+        # already use.
+        type_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None
+            and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
+        }
+        # Heterogeneous-key-shape checks (#205) are string-only, unlike
+        # type_stats above: a UUID/hex check is meaningless on a column SQL
+        # already stores as a number.
+        key_shape_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None and _is_string_type(c.data_type)
+        }
+        # Temporal-continuity checks (#206): non-PII date/timestamp columns
+        # only, same eligibility rule as above.
+        temporal_stats = {
+            c.name
+            for c in columns
+            if prelim_pii[c.name] is None and is_temporal_type(c.data_type)
+        }
 
         # Blob-type columns can only ever yield a null fraction and a distinct
         # estimate, yet a columnar engine bills for the whole column once it is
@@ -412,27 +784,47 @@ def profile(
         ]
         scan_columns = [c for c in columns if c.name not in blob_excluded]
 
-        aggregates = {
-            a.name: a
-            for a in adapter.column_aggregates(
-                identifier, scan_columns, safe_min_max=safe, shape_stats=shape
+        # The adapter knows what the server said and this loop knows which
+        # object it said it about, so a server-side refusal picks up the
+        # identifier on its way past: an envelope reading "the warehouse
+        # refused a statement dex built" is only actionable when it names the
+        # object, and a map run has a dozen of them in flight.
+        try:
+            aggregates = {
+                a.name: a
+                for a in adapter.column_aggregates(
+                    identifier,
+                    scan_columns,
+                    safe_min_max=safe,
+                    shape_stats=shape,
+                    type_stats=type_stats,
+                    key_shape_stats=key_shape_stats,
+                    temporal_stats=temporal_stats,
+                )
+            }
+            # Re-read the metadata after the aggregate scan: adapters whose
+            # inventory row counts are planner estimates (Postgres reltuples)
+            # upgrade to the exact COUNT(*) the scan just paid for, so
+            # uniqueness proofs and the dataset row count are exact. Free
+            # everywhere (cached or trivially cheap on the other adapters).
+            meta, _ = adapter.table_metadata(identifier)
+            aggregates = _escalate_near_unique(
+                adapter, identifier, meta.row_count, aggregates
             )
-        }
-        # Re-read the metadata after the aggregate scan: adapters whose
-        # inventory row counts are planner estimates (Postgres reltuples)
-        # upgrade to the exact COUNT(*) the scan just paid for, so uniqueness
-        # proofs and the dataset row count are exact. Free everywhere (cached
-        # or trivially cheap on the other adapters).
-        meta, _ = adapter.table_metadata(identifier)
-        aggregates = _escalate_near_unique(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        composite_keys = _probe_composite_keys(
-            adapter, identifier, meta.row_count, aggregates
-        )
-        value_domains = _probe_value_domains(
-            adapter, identifier, meta.row_count, aggregates, prelim_pii, composite_keys
-        )
+            composite_keys = _probe_composite_keys(
+                adapter, identifier, meta.row_count, aggregates
+            )
+            value_domains = _probe_value_domains(
+                adapter,
+                identifier,
+                meta.row_count,
+                aggregates,
+                prelim_pii,
+                composite_keys,
+            )
+        except WarehouseQueryError as exc:
+            raise exc.naming(identifier) from exc
+        composite_members = {c for pair in composite_keys for c in pair}
 
         profiles: list[ColumnProfile] = []
         data_quality: list[str] = []
@@ -464,6 +856,22 @@ def profile(
                 generic=col.name in shape,
                 row_count=meta.row_count,
             )
+            if prelim_pii[col.name] is None:
+                data_quality.extend(
+                    _type_contradiction_notes(col.name, col.data_type, agg)
+                )
+                if _is_candidate_key(col.name, agg, composite_members):
+                    key_note = _heterogeneous_key_note(col.name, agg)
+                    if key_note is not None:
+                        data_quality.append(key_note)
+                flag_note = _boolean_shaped_flag_note(
+                    col.name, col.data_type, agg, value_domains.get(col.name)
+                )
+                if flag_note is not None:
+                    data_quality.append(flag_note)
+            continuity = (
+                _temporal_continuity(agg) if col.name in temporal_stats else None
+            )
             profiles.append(
                 ColumnProfile(
                     name=col.name,
@@ -478,6 +886,11 @@ def profile(
                     pii=pii,
                     pii_overridden=overridden.get(col.name),
                     value_domain=value_domains.get(col.name),
+                    temporal_granularity=continuity[0] if continuity else None,
+                    temporal_span=continuity[1] if continuity else None,
+                    temporal_distinct_periods=continuity[2] if continuity else None,
+                    temporal_missing_periods=continuity[3] if continuity else None,
+                    temporal_largest_gap=continuity[4] if continuity else None,
                 )
             )
 
@@ -569,14 +982,27 @@ def _probe_composite_keys(
     id-shaped members first (real grains are key-shaped), smallest product
     next (a minimal grain sits just above the row count; a pair of two
     near-unique columns lands near rows squared and is analytically useless
-    even when technically unique). Before the cut, pairs that share a column
-    with an already-kept pair and score within ``_COMPOSITE_REDUNDANCY_RATIO``
-    of it are dropped as the same hypothesis tried with different filler, so
-    the cap is spent on genuinely distinct candidates rather than several
-    near-identical pairs anchored on one popular column. Bounded to
-    ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a pair is
-    proven when its exact combination count equals the row count. Adapters
-    without ``distinct_combination_counts`` degrade to no composite keys.
+    even when technically unique).
+
+    A pair sharing a column with a better-ranked one at a product within
+    ``_COMPOSITE_REDUNDANCY_RATIO`` of it is the same hypothesis tried with
+    different filler, so it goes behind every pair that is not. **Behind, not
+    away.** That preference is only worth anything while the cap binds, and
+    discarding a ranked candidate with slots still free buys nothing and can
+    cost the grain outright: on a fact table the pair a two-id parent pair
+    blocks is exactly the parent-plus-line grain, which is the one shape this
+    probe exists to find. So the cap is filled from the preferred pairs first
+    and the demoted ones after, and the survivors go back into rank order.
+
+    Bounded to ``_COMPOSITE_PAIR_CAP`` pairs in one batched adapter call; a
+    pair is proven when its exact combination count equals the row count.
+    Proven pairs come back smallest product first, which is the minimal grain
+    among them: once a pair is proven, id-shapedness has nothing left to say,
+    and a superkey of two id columns that happen to be unique together must not
+    outrank the tighter key, because callers read the first entry as the grain.
+    Adapters without ``distinct_combination_counts`` degrade to no composite
+    keys, and one that narrows the probe to what its budget covers leaves the
+    pairs it dropped simply unproven.
     """
 
     if not row_count:
@@ -598,7 +1024,7 @@ def _probe_composite_keys(
 
     # Imported here: relationships imports NEAR_UNIQUE_RATIO from this module,
     # so a module-level import would be circular.
-    from .relationships import _is_id_shaped
+    from .relationships import is_id_shaped
 
     ranked: list[tuple[int, int, tuple[str, str]]] = []
     for i, a in enumerate(pool):
@@ -607,7 +1033,7 @@ def _probe_composite_keys(
             n_approx = sum(1 for m in (a, b) if not m.distinct_count_exact)
             if product < row_count * NEAR_UNIQUE_RATIO**n_approx:
                 continue
-            id_shaped = sum(1 for m in (a, b) if _is_id_shaped(m.name))
+            id_shaped = sum(1 for m in (a, b) if is_id_shaped(m.name))
             # Members ordered by descending cardinality so the key reads
             # parent-then-line, e.g. (L_ORDERKEY, L_LINENUMBER).
             members = sorted(
@@ -619,22 +1045,30 @@ def _probe_composite_keys(
         return []
 
     ranked.sort()
-    deduped: list[tuple[int, int, tuple[str, str]]] = []
+    preferred: list[tuple[int, int, tuple[str, str]]] = []
+    demoted: list[tuple[int, int, tuple[str, str]]] = []
     best_product_for: dict[str, int] = {}
-    for ids, product, pair in ranked:
+    for entry in ranked:
+        _ids, product, pair = entry
         if any(
             col in best_product_for
             and product <= best_product_for[col] * _COMPOSITE_REDUNDANCY_RATIO
             for col in pair
         ):
-            continue  # near-duplicate: same anchor, interchangeable filler
-        deduped.append((ids, product, pair))
+            demoted.append(entry)  # same anchor, interchangeable filler
+            continue
+        preferred.append(entry)
         for col in pair:
             best_product_for.setdefault(col, product)
 
-    chosen = [list(pair) for _ids, _product, pair in deduped[:_COMPOSITE_PAIR_CAP]]
-    exact = combo_counts(identifier, chosen)
-    return [combo for combo in chosen if exact.get(tuple(combo)) == row_count]
+    selected = sorted((preferred + demoted)[:_COMPOSITE_PAIR_CAP])
+    exact = combo_counts(identifier, [list(pair) for _ids, _product, pair in selected])
+    proven = sorted(
+        (product, pair)
+        for _ids, product, pair in selected
+        if exact.get(pair) == row_count
+    )
+    return [list(pair) for _product, pair in proven]
 
 
 def _probe_value_domains(
@@ -679,23 +1113,23 @@ def _probe_value_domains(
             continue
         if agg.is_unique and agg.null_fraction in (0.0, None):
             continue  # single-column key
-        if not agg.distinct_count or agg.distinct_count > _VALUE_DOMAIN_CAP:
+        if not agg.distinct_count or agg.distinct_count > VALUE_DOMAIN_CAP:
             continue
         non_null = row_count * (1 - (agg.null_fraction or 0.0))
-        if non_null <= 0 or agg.distinct_count > non_null * _VALUE_DOMAIN_MAX_FRACTION:
+        if non_null <= 0 or agg.distinct_count > non_null * VALUE_DOMAIN_MAX_FRACTION:
             continue
         eligible.append(name)
     if not eligible:
         return {}
 
-    samples = domain_fn(identifier, eligible, limit=_VALUE_DOMAIN_CAP)
+    samples = domain_fn(identifier, eligible, limit=VALUE_DOMAIN_CAP)
     domains: dict[str, ValueDomain] = {}
     for name, sample in samples.items():
         agg = aggregates[name]
         non_null = row_count * (1 - (agg.null_fraction or 0.0))
         if (
             non_null <= 0
-            or sample.total_distinct > non_null * _VALUE_DOMAIN_MAX_FRACTION
+            or sample.total_distinct > non_null * VALUE_DOMAIN_MAX_FRACTION
         ):
             # The approximate pre-check under-estimated the true fraction:
             # this is really a near-key column, so report no domain at all

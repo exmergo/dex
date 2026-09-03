@@ -13,11 +13,20 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core import envelope as env
-from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, Relationship
+from exmergo_dex_core.cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    Relationship,
+    ValueCount,
+    ValueDomain,
+)
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
 from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
+from exmergo_dex_core.explore import summary
 from exmergo_dex_core.explore.commands import _annotate_grain, _merged_hints
+from exmergo_dex_core.explore.results import ProfileResult
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -87,6 +96,73 @@ def test_inventory_rank_without_hints_orders_larger_table_first(
     assert scores["orders"] > scores["customers"]
 
 
+def test_inventory_rank_limit_caps_the_ranked_list(duckdb_file: Path, capsys):
+    payload = _run(
+        ["explore", "inventory", "--rank", "--limit", "1", "--path", str(duckdb_file)],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 1
+    assert data["elided_object_count"] == 1
+    assert any("capped at 1" in n for n in payload["data"]["notes"])
+
+
+def test_inventory_rank_all_lifts_the_cap_even_with_a_limit(duckdb_file: Path, capsys):
+    # --all wins over --limit: today's full-unbounded behavior, explicitly asked
+    # for, is not something a smaller --limit passed alongside it can narrow.
+    payload = _run(
+        [
+            "explore",
+            "inventory",
+            "--rank",
+            "--limit",
+            "1",
+            "--all",
+            "--path",
+            str(duckdb_file),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 2
+    assert data["elided_object_count"] == 0
+    assert not any("capped at" in n for n in payload["data"]["notes"])
+
+
+def test_inventory_rank_states_its_basis(duckdb_file: Path, capsys):
+    payload = _run(
+        ["explore", "inventory", "--rank", "--path", str(duckdb_file)], capsys
+    )
+    basis = " ".join(payload["data"]["notes"])
+    assert "naming convention" in basis
+    assert "connectivity" in basis
+
+
+def test_inventory_without_rank_reports_empty_notes(duckdb_file: Path, capsys):
+    # always_reports_notes: an empty list is itself the "nothing to say" signal,
+    # and it must still be present rather than omitted (map/diagram/query convention).
+    payload = _run(["explore", "inventory", "--path", str(duckdb_file)], capsys)
+    assert payload["data"]["notes"] == []
+
+
+def test_inventory_limit_and_all_are_no_ops_without_rank(duckdb_file: Path, capsys):
+    payload = _run(
+        [
+            "explore",
+            "inventory",
+            "--limit",
+            "1",
+            "--all",
+            "--path",
+            str(duckdb_file),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 2
+    assert data["elided_object_count"] == 0
+
+
 def test_inventory_rank_honors_configured_ranking_hints(
     duckdb_file: Path, tmp_path: Path, capsys
 ):
@@ -151,6 +227,244 @@ def test_pii_flag_structure_from_aggregates(duckdb_file: Path, capsys):
     assert 0 < pii["confidence"] <= 0.95
     assert set(pii) == {"category", "confidence"}  # never an example value
     assert cols["id"]["pii"] is None
+
+
+# --- profile payload order and column summary (#288) --------------------------
+
+
+def test_profile_leads_with_the_verdict_not_columns(duckdb_file: Path, capsys):
+    payload = _run(
+        ["explore", "profile", "customers", "--path", str(duckdb_file)], capsys
+    )
+    keys = list(payload["data"]["datasets"][0].keys())
+    assert keys.index("columns") == len(keys) - 2  # elided_column_count trails it
+    for verdict_field in ("grain", "candidate_keys", "data_quality", "row_count"):
+        assert keys.index(verdict_field) < keys.index("columns")
+
+
+def test_profile_columns_default_summarizes_to_findings(
+    profile_findings_duckdb: Path, capsys
+):
+    payload = _run(
+        ["explore", "profile", "wide_profile", "--path", str(profile_findings_duckdb)],
+        capsys,
+    )
+    dataset = payload["data"]["datasets"][0]
+    names = {c["name"] for c in dataset["columns"]}
+    assert names == {"id", "email"}  # key + PII survive; amount/notes don't
+    assert dataset["elided_column_count"] == 2
+
+
+def test_profile_columns_all_restores_every_column(
+    profile_findings_duckdb: Path, capsys
+):
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "wide_profile",
+            "--columns",
+            "all",
+            "--path",
+            str(profile_findings_duckdb),
+        ],
+        capsys,
+    )
+    dataset = payload["data"]["datasets"][0]
+    names = {c["name"] for c in dataset["columns"]}
+    assert names == {"id", "email", "amount", "tag"}
+    assert dataset["elided_column_count"] == 0
+
+
+# --- profile payload: all-null fields and the value-domain cap (#290) ----------
+
+
+def test_profile_suppresses_fields_that_are_null_on_every_column(
+    duckdb_file: Path, capsys
+):
+    payload = _run(
+        ["explore", "profile", "customers", "--path", str(duckdb_file)], capsys
+    )
+    dataset = payload["data"]["datasets"][0]
+    # No override applied, no value domain (id is the key, email is PII) and
+    # no temporal column: each of these was null on both columns, so each is
+    # dropped from both and named once, in the order the column shape has them.
+    assert dataset["suppressed_fields"] == [
+        "pii_overridden",
+        "value_domain",
+        "temporal_granularity",
+        "temporal_span",
+        "temporal_distinct_periods",
+        "temporal_missing_periods",
+        "temporal_largest_gap",
+    ]
+    for column in dataset["columns"]:
+        assert not set(dataset["suppressed_fields"]) & set(column)
+    cols = {c["name"]: c for c in dataset["columns"]}
+    # Null on some columns but not all stays on every column: email's
+    # suppressed extremes beside id's real ones are a finding, not padding.
+    assert cols["email"]["min_value"] is None
+    assert cols["id"]["min_value"] == 1
+    assert cols["id"]["pii"] is None
+    assert cols["email"]["pii"]["category"] == "email"
+    # The note sits ahead of `columns`, so a truncated read still explains
+    # the absence, and `columns` keeps its place as second to last.
+    keys = list(dataset)
+    assert keys.index("suppressed_fields") < keys.index("columns")
+    assert keys.index("columns") == len(keys) - 2
+
+
+def test_profile_suppression_is_judged_over_the_serialized_columns():
+    """The all-null test is over the columns the payload carries, not the
+    dataset's full set: a numeric extreme that lives only on a column the
+    default summary elides must not keep `min_value` on the shown columns
+    as a null, and `--columns all` brings the field back with the column.
+    The cached dataset is untouched either way."""
+
+    dataset = Dataset(
+        identifier="db.main.t",
+        row_count=100,
+        candidate_keys=[["ws_id"]],
+        columns=[
+            ColumnProfile(
+                name="ws_id", data_type="VARCHAR", null_fraction=0.0, is_unique=True
+            ),
+            ColumnProfile(
+                name="email",
+                data_type="VARCHAR",
+                null_fraction=0.0,
+                pii={"category": "email", "confidence": 0.9},
+            ),
+            ColumnProfile(
+                name="amount",
+                data_type="DOUBLE",
+                null_fraction=0.0,
+                is_unique=False,
+                min_value=1.5,
+                max_value=99.0,
+            ),
+        ],
+    )
+
+    summary_payload = ProfileResult(datasets=[dataset]).data()["datasets"][0]
+    assert {c["name"] for c in summary_payload["columns"]} == {"ws_id", "email"}
+    assert "min_value" in summary_payload["suppressed_fields"]
+    assert "max_value" in summary_payload["suppressed_fields"]
+    assert all("min_value" not in c for c in summary_payload["columns"])
+
+    full_payload = ProfileResult(datasets=[dataset], show_all_columns=True).data()[
+        "datasets"
+    ][0]
+    assert "min_value" not in full_payload["suppressed_fields"]
+    full = {c["name"]: c for c in full_payload["columns"]}
+    assert full["amount"]["min_value"] == 1.5
+    assert full["ws_id"]["min_value"] is None
+
+    assert dataset.columns[2].min_value == 1.5
+    empty = ProfileResult(datasets=[Dataset(identifier="db.main.empty")]).data()
+    assert empty["datasets"][0]["suppressed_fields"] == []
+
+
+def test_profile_payload_caps_value_domain_values_and_counts_the_rest():
+    domain = ValueDomain(
+        values=[ValueCount(value=f"v{i}", count=10 - i) for i in range(6)],
+        elided=4,
+    )
+    dataset = Dataset(
+        identifier="db.main.t",
+        row_count=100,
+        columns=[
+            ColumnProfile(
+                name="tier", data_type="VARCHAR", distinct_count=10, value_domain=domain
+            )
+        ],
+    )
+
+    def serialized(**kwargs) -> dict:
+        result = ProfileResult(datasets=[dataset], **kwargs).data()
+        return result["datasets"][0]["columns"][0]["value_domain"]
+
+    capped = serialized(value_domain_cap=4)
+    assert [v["value"] for v in capped["values"]] == ["v0", "v1", "v2", "v3"]
+    # The 4 the probe already left out, plus the 2 cut here: still 10 in total.
+    assert capped["elided"] == 6
+    # The default cap is the probe's own, so a domain within it is whole.
+    whole = serialized()
+    assert len(whole["values"]) == 6
+    assert whole["elided"] == 4
+    # A serialization choice only: the cached domain keeps every value.
+    assert len(dataset.columns[0].value_domain.values) == 6
+
+
+def test_profile_value_domain_cap_is_read_from_config(tmp_path: Path, capsys):
+    """`profile_value_domain_cap` in `.dex/config.yml` trims each serialized
+    domain to its most frequent values, with the rest counted in `elided`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "raw.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE raw_workspaces (ws_id VARCHAR, env_tier VARCHAR)")
+    tiers = ["prod"] * 40 + ["staging"] * 30 + ["dev"] * 20 + ["test"] * 10
+    conn.executemany(
+        "INSERT INTO raw_workspaces VALUES (?, ?)",
+        [(f"ws{i}", tiers[i]) for i in range(100)],
+    )
+    conn.close()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    save_config(DexConfig(profile_value_domain_cap=2), repo)
+
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "raw_workspaces",
+            "--path",
+            str(db_path),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+    cols = {c["name"]: c for c in payload["data"]["datasets"][0]["columns"]}
+    domain = cols["env_tier"]["value_domain"]
+    assert [v["value"] for v in domain["values"]] == ["prod", "staging"]
+    assert domain["elided"] == 2
+
+
+def test_columns_with_findings_word_boundary_and_value_domain():
+    """The two triggers a full profiling run can't isolate cleanly: a
+    data-quality mention has to match on a word boundary, not a substring
+    (`am` inside `amount` must not count), and a populated value_domain is a
+    finding on its own even with no PII, no nulls, and no key role."""
+
+    dataset = Dataset(
+        identifier="db.main.t",
+        columns=[
+            ColumnProfile(name="amount", data_type="DOUBLE"),
+            ColumnProfile(name="am", data_type="VARCHAR"),
+            ColumnProfile(
+                name="status",
+                data_type="VARCHAR",
+                value_domain=ValueDomain(values=[ValueCount(value="ok", count=1)]),
+            ),
+            ColumnProfile(name="boring", data_type="VARCHAR"),
+        ],
+        data_quality=["amount is declared DOUBLE but holds only integers"],
+    )
+
+    kept, dropped = dataset.columns_with_findings()
+    kept_names = {c.name for c in kept}
+
+    assert "amount" in kept_names  # named in the note
+    assert "am" not in kept_names  # substring of "amount", not a word match
+    assert "status" in kept_names  # value_domain alone is a finding
+    assert "boring" not in kept_names
+    assert dropped == 2
+
+    everything, dropped_everything = dataset.columns_with_findings(everything=True)
+    assert len(everything) == 4
+    assert dropped_everything == 0
 
 
 # --- relationships -----------------------------------------------------------
@@ -252,17 +566,200 @@ def test_map_writes_cache_and_preserves_created_at(
     assert second["data"]["relationship_count"] >= 1
 
 
-def test_map_summary_is_counts_not_a_schema_dump(
+def test_map_summary_is_a_budgeted_map_not_a_schema_dump(
     duckdb_file: Path, tmp_path: Path, capsys
 ):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+    # The summary answers the question it was asked (issue #202): findings, not a
+    # receipt. What it still never does is paste the cache, so the whole-dataset
+    # dump `explore profile` returns stays out of it.
+    assert "datasets" not in data
+    assert data["profiled_count"] <= data["object_count"]
+
+    assert data["objects"], "a map returns the objects it mapped"
+    first = data["objects"][0]
+    assert first["identifier"]
+    assert set(first["columns"][0]) == {"name", "data_type", "role", "pii"}
+    assert data["edges"], "a map returns the joins it inferred"
+    assert set(data["edges"][0]) == {
+        "from_dataset",
+        "from_columns",
+        "to_dataset",
+        "to_columns",
+        "kind",
+        "confidence",
+        "verified",
+        "orphan_fraction",
+        "declared_by",
+    }, "edges are shaped exactly like `explore relationships` returns them"
+
+
+def test_map_counts_reconcile_with_the_objects_beside_them(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """A count the payload contradicts is worse than a count with no payload.
+
+    Found by dogfooding: an eligibility rule borrowed from `explore diagram` drops
+    objects that carry no join, so a warehouse whose only PII sat on an unjoined
+    lookup table reported `pii_column_count: 6` beside objects accounting for 2.
+    """
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+
+    assert data["pii_column_count"] == sum(
+        o["pii_column_count"] for o in data["objects"]
+    )
+    assert data["data_quality_note_count"] == sum(
+        len(o["data_quality"]) + o["elided_data_quality_count"] for o in data["objects"]
+    )
+    assert data["relationship_count"] == len(data["edges"]) + data["elided_edge_count"]
+
+
+def test_map_reports_a_profiled_object_that_joins_to_nothing(tmp_path: Path, capsys):
+    """An isolated object is a finding, not noise. `explore diagram` drops it
+    because a box with no edge draws nothing; a findings payload must not."""
+
+    duckdb = pytest.importorskip("duckdb")
+    warehouse = tmp_path / "isolated.duckdb"
+    con = duckdb.connect(str(warehouse))
+    con.execute("create table lonely (site_name varchar, city varchar)")
+    con.execute("insert into lonely values ('a', 'Berlin'), ('b', 'Lisbon')")
+    con.execute("create table parent (id integer)")
+    con.execute("create table child (id integer, parent_id integer)")
+    con.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(warehouse), "--repo-root", str(repo)], capsys
+    )["data"]
+    reported = {o["identifier"].rsplit(".", 1)[-1] for o in data["objects"]}
+    assert "lonely" in reported
+    assert data["pii_column_count"] == sum(
+        o["pii_column_count"] for o in data["objects"]
+    )
+
+
+def test_map_payload_carries_no_column_value(duckdb_file: Path, tmp_path: Path, capsys):
+    """The cache holds min/max and value domains for the columns that earned them.
+    This command deliberately does not read them; `explore profile` is where a
+    caller asks for a value domain, one object at a time."""
+
     repo = tmp_path / "repo"
     repo.mkdir()
     payload = _run(
         ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
     )
-    # The printed summary carries counts and a small top list, never the columns.
-    assert "datasets" not in payload["data"]
-    assert payload["data"]["profiled_count"] <= payload["data"]["object_count"]
+    blob = json.dumps(payload["data"])
+    for banned in ("min_value", "max_value", "value_domain"):
+        assert banned not in blob
+    for obj in payload["data"]["objects"]:
+        for column in obj["columns"]:
+            assert column["pii"] is None or set(column["pii"]) == {
+                "category",
+                "confidence",
+            }
+
+
+def test_map_always_reports_notes_so_silence_is_a_positive_statement(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+    assert "notes" in data
+
+
+def test_map_caps_bind_and_every_elision_is_counted(
+    wide_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--path", str(wide_tables_duckdb), "--repo-root", str(repo)],
+        capsys,
+    )["data"]
+
+    assert data["object_count"] == 32
+    assert len(data["objects"]) == summary.MAX_OBJECTS
+    assert data["elided_object_count"] == 32 - summary.MAX_OBJECTS
+    note = next(n for n in data["notes"] if "capped at" in n and "object" in n)
+    assert str(summary.MAX_OBJECTS) in note
+    assert "explore profile" in note, "a note names the way to read what it cut"
+
+    assert data["elided_column_count"] > 0
+    assert any("column(s) are not described" in n for n in data["notes"])
+    assert all(
+        len(o["columns"]) <= summary.MAX_COLUMNS_PER_OBJECT for o in data["objects"]
+    )
+    assert len(data["edges"]) <= summary.MAX_EDGES
+
+
+def test_map_detail_widens_the_selection_but_never_the_caps(
+    wide_tables_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(wide_tables_duckdb),
+        "--repo-root",
+        str(repo),
+    ]
+    default = _run(argv, capsys)["data"]
+    detailed = _run([*argv, "--refresh", "--detail"], capsys)["data"]
+
+    def wide(data: dict) -> dict:
+        return next(o for o in data["objects"] if o["identifier"].endswith(".wide"))
+
+    assert len(wide(default)["columns"]) < len(wide(detailed)["columns"])
+    assert wide(detailed)["elided_column_count"] < wide(default)["elided_column_count"]
+    # `--detail` widens what is eligible. It lifts neither cap, so a table with
+    # twenty-two eligible columns still reports twelve, and still says so.
+    assert len(wide(detailed)["columns"]) == summary.MAX_COLUMNS_PER_OBJECT
+    assert wide(detailed)["elided_column_count"] > 0
+    assert len(detailed["objects"]) == summary.MAX_OBJECTS
+    assert detailed["elided_object_count"] == default["elided_object_count"]
+
+
+def test_map_and_diagram_agree_on_which_columns_are_notable(
+    duckdb_file: Path, tmp_path: Path, capsys
+):
+    """Both commands read one predicate (`Dataset.notable_columns`). A caller who
+    reads the map and then draws the diagram must not see two different answers."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    mapped = _run(
+        ["explore", "map", "--path", str(duckdb_file), "--repo-root", str(repo)], capsys
+    )["data"]
+    drawn = _run(["explore", "diagram", "--repo-root", str(repo)], capsys)["data"]
+
+    joined = {
+        o["identifier"]
+        for o in mapped["objects"]
+        if any(c["role"] == "join" for c in o["columns"])
+    }
+    for entity in drawn["entities"]:
+        if entity["identifier"] not in joined:
+            continue
+        obj = next(
+            o for o in mapped["objects"] if o["identifier"] == entity["identifier"]
+        )
+        for column in obj["columns"]:
+            assert column["name"] in drawn["mermaid"]
 
 
 def test_map_announces_profile_cutoff(many_tables_duckdb: Path, tmp_path: Path, capsys):
@@ -719,7 +1216,10 @@ def test_empty_table_and_view_profile_without_error(edge_duckdb: Path, capsys):
     ds = {d["identifier"].split(".")[-1]: d for d in payload["data"]["datasets"]}
     empty = ds["empty_t"]
     assert any("empty" in note for note in empty["data_quality"])
-    assert empty["columns"][0]["null_fraction"] is None  # no rows -> undefined
+    # No rows leaves every statistic undefined on every column, and a field
+    # that is null everywhere is dropped and named rather than repeated (#290).
+    assert "null_fraction" in empty["suppressed_fields"]
+    assert "null_fraction" not in empty["columns"][0]
     assert "people_v" in ds  # a view profiles fine
 
 
@@ -1141,3 +1641,191 @@ def test_merged_hints_appends_without_displacing():
         "customer",
         "orders",
     ]
+
+
+# --- the semantic layer, folded into the map (#360, #361) ---------------------
+
+
+def _semantic_layer_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A warehouse whose two tables join on differently named columns, plus a
+    project whose compiled semantic layer declares that join and sits one of its
+    models on a third table nothing exposes.
+
+    `buyer_id` against `id` is the join name-based inference cannot find, and
+    `audit_log` is the object the layer does not expose, so both halves of the
+    annotation have something to say.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    db = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(db))
+    conn.execute("CREATE TABLE customers (id INTEGER, region VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'eu'), (2, 'us')")
+    conn.execute("CREATE TABLE orders (order_id INTEGER, buyer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2)")
+    conn.execute("CREATE TABLE audit_log (event_id INTEGER)")
+    conn.execute("INSERT INTO audit_log VALUES (1), (2)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "target").mkdir(parents=True)
+    (repo / "dbt_project.yml").write_text(
+        'name: dex_test\nversion: "1.0.0"\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    manifest = {
+        "semantic_models": [
+            {
+                "name": "customers_sm",
+                # Quoted and with a database component that disagrees with the
+                # DuckDB file stem, which is the ordinary case: the suffix pins it.
+                "node_relation": {
+                    "alias": "customers",
+                    "relation_name": '"analytics"."main"."customers"',
+                },
+                "entities": [{"name": "customer", "type": "primary", "expr": "id"}],
+                "dimensions": [{"name": "region", "type": "categorical"}],
+                "measures": [{"name": "customer_count", "agg": "count", "expr": "id"}],
+            },
+            {
+                "name": "orders_sm",
+                "node_relation": {
+                    "alias": "orders",
+                    "relation_name": '"analytics"."main"."orders"',
+                },
+                "entities": [
+                    {"name": "order", "type": "primary", "expr": "order_id"},
+                    {"name": "customer", "type": "foreign", "expr": "buyer_id"},
+                ],
+                "dimensions": [],
+                "measures": [{"name": "order_count", "agg": "count"}],
+            },
+        ],
+        "metrics": [
+            {
+                "name": "orders",
+                "type": "simple",
+                "type_params": {"input_measures": [{"name": "order_count"}]},
+            }
+        ],
+    }
+    (repo / "target" / "semantic_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return db, repo
+
+
+def _map_with_project(db: Path, repo: Path, capsys) -> dict:
+    return _run(
+        [
+            "explore",
+            "map",
+            "--use-project",
+            "--path",
+            str(db),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+
+
+def test_map_says_which_objects_the_semantic_layer_exposes(tmp_path: Path, capsys):
+    """The physical half of the link, and what makes "is this table load-bearing"
+    answerable from the map: a relation several metrics are built on is a
+    different object from one nothing reads, and row count and PII flags cannot
+    tell them apart."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+
+    data = _map_with_project(db, repo, capsys)
+
+    exposure = {
+        o["identifier"].rsplit(".", 1)[-1]: o["semantic_models"]
+        for o in data["objects"]
+    }
+    assert exposure["customers"] == ["customers_sm"]
+    assert exposure["orders"] == ["orders_sm"]
+    # Exposed through nothing is an answer, not a gap.
+    assert exposure["audit_log"] == []
+    assert any(
+        "exposed through the project's semantic layer" in n for n in data["notes"]
+    )
+
+
+def test_map_draws_the_join_the_semantic_layer_declares(tmp_path: Path, capsys):
+    """`buyer_id` against `id` shares no name, so nothing dex infers would find
+    it. The layer states it outright, with the key named per model."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+
+    data = _map_with_project(db, repo, capsys)
+
+    declared = [e for e in data["edges"] if e["declared_by"]]
+    assert len(declared) == 1
+    edge = declared[0]
+    assert edge["from_dataset"].endswith(".orders")
+    assert edge["from_columns"] == ["buyer_id"]
+    assert edge["to_dataset"].endswith(".customers")
+    assert edge["to_columns"] == ["id"]
+    assert edge["kind"] == "declared" and edge["confidence"] == 1.0
+    assert edge["declared_by"] == "semantic entity 'customer'"
+    assert any("not found by name-based inference" in n for n in data["notes"])
+
+
+def test_exploration_still_starts_bare_without_use_project(tmp_path: Path, capsys):
+    """The default path is unchanged, which is what keeps this a minor release and
+    what keeps a warehouse observation independent of whichever repo dex runs
+    from."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+
+    data = _run(
+        ["explore", "map", "--path", str(db), "--repo-root", str(repo)], capsys
+    )["data"]
+
+    assert all(o["semantic_models"] == [] for o in data["objects"])
+    assert all(e["declared_by"] is None for e in data["edges"])
+
+
+def test_a_model_dropped_from_the_layer_clears_its_annotation(tmp_path: Path, capsys):
+    """A stale exposure claim is worse than none: it says a table backs a metric
+    that no longer reads it. Every dataset in view is rewritten whenever a
+    catalog was read, so the annotation cannot outlive the declaration."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+    _map_with_project(db, repo, capsys)
+
+    manifest = json.loads((repo / "target" / "semantic_manifest.json").read_text())
+    manifest["semantic_models"] = [
+        m for m in manifest["semantic_models"] if m["name"] != "orders_sm"
+    ]
+    (repo / "target" / "semantic_manifest.json").write_text(json.dumps(manifest))
+
+    data = _map_with_project(db, repo, capsys)
+
+    exposure = {
+        o["identifier"].rsplit(".", 1)[-1]: o["semantic_models"]
+        for o in data["objects"]
+    }
+    assert exposure["orders"] == []
+    assert exposure["customers"] == ["customers_sm"]
+    # The join went with it: the layer no longer declares that entity on orders.
+    assert not [e for e in data["edges"] if e["declared_by"]]
+
+
+def test_the_semantic_read_survives_a_project_with_no_compiled_layer(
+    tmp_path: Path, capsys
+):
+    """An uncompiled project is an ordinary state on the explore path, where the
+    warehouse is the subject and a project is a bonus. `explore semantic list` is
+    the command whose subject is the layer, and it is the one that refuses."""
+
+    db, repo = _semantic_layer_repo(tmp_path)
+    (repo / "target" / "semantic_manifest.json").unlink()
+
+    data = _map_with_project(db, repo, capsys)
+
+    assert data["objects"], "the map still describes the warehouse"
+    assert all(o["semantic_models"] == [] for o in data["objects"])

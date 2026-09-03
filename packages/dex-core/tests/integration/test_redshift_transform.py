@@ -15,7 +15,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import RS_MAX_SECONDS, assert_unpivot_build, unpivot_fixture_edits
+from .conftest import (
+    RS_MAX_SECONDS,
+    assert_ok,
+    assert_unpivot_build,
+    integration_budget,
+    unpivot_fixture_edits,
+)
 from .test_redshift_connect import run_cli
 
 pytestmark = [pytest.mark.integration, pytest.mark.redshift]
@@ -53,7 +59,7 @@ def seed_repo_password_path(
     config = {
         "connector": "redshift",
         "redshift": {"dev_schema": dev_schema, "schemas": schemas},
-        "budget": {"ceiling": budget},
+        "budget": integration_budget(budget),
     }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -73,7 +79,7 @@ def test_init_and_build_write_only_the_dev_schema(tmp_path: Path, capsys, dev_en
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     rendered = (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
     profile = yaml.safe_load(rendered)["analytics"]["outputs"]["dev"]
@@ -102,7 +108,7 @@ def test_init_and_build_write_only_the_dev_schema(tmp_path: Path, capsys, dev_en
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["success"] is True
     assert any(n["name"] == "stg_orders" for n in data["nodes"])
@@ -110,7 +116,7 @@ def test_init_and_build_write_only_the_dev_schema(tmp_path: Path, capsys, dev_en
     # surfaced before the run (the 5x budget covers it comfortably).
     assert envelope["cost"]["estimate"] is not None
     assert envelope["cost"]["estimate"] > 0
-    assert data["seconds_billed"] > 0
+    assert data["spend"]["seconds_billed"] > 0
     assert any("statement_timeout" in w for w in envelope["warnings"])
 
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text(encoding="utf-8")
@@ -139,13 +145,13 @@ def test_unpivot_json_object_macro_builds_live(tmp_path: Path, capsys, dev_env):
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     edits_file = tmp_path / "edits.json"
     edits_file.write_text(
@@ -218,7 +224,7 @@ def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "build", "--target", "dev"], capsys

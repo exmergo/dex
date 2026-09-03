@@ -335,6 +335,137 @@ def test_refusal_points_at_the_override_path(cache: DexCache):
     assert ".dex/config.yml" in message
 
 
+# --- issue #217: the refusal names the override that would clear it -----------
+
+
+def test_refusal_names_the_exact_override_entry(cache: DexCache):
+    """Acceptance: a PII refusal includes the exact override entry for the
+    named column, ready to paste under `pii_overrides:`."""
+
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", cache)
+    assert "- {column: db.main.RAW_HOSTS.NAME}" in message
+
+
+def test_refusal_omits_the_pattern_form_when_the_column_does_not_recur(
+    cache: DexCache,
+):
+    # NAME is flagged only on RAW_HOSTS in this cache; nothing here suggests a
+    # wider scope is safe, so no pattern form is offered.
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", cache)
+    assert "column_name:" not in message
+    assert "scope:" not in message
+
+
+@pytest.fixture
+def recurring_cache() -> DexCache:
+    """The same column name, flagged at the same category, on two tables in
+    one schema: the shape a pattern override actually fits."""
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.RAW_HOSTS",
+                columns=[
+                    ColumnProfile(
+                        name="NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                ],
+            ),
+            Dataset(
+                identifier="db.main.RAW_GUESTS",
+                columns=[
+                    ColumnProfile(
+                        name="NAME",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
+def test_refusal_includes_the_pattern_form_when_the_column_recurs(
+    recurring_cache: DexCache,
+):
+    """Acceptance: the pattern form is included when the column shape
+    suggests it recurs across tables."""
+
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", recurring_cache)
+    assert "- {column: db.main.RAW_HOSTS.NAME}" in message
+    assert "- {column_name: NAME, scope: db.main.*}" in message
+    assert "recurs across tables" in message
+
+
+def test_pattern_scope_is_never_wider_than_the_recurring_column_s_own_schema(
+    recurring_cache: DexCache,
+):
+    # The suggested scope is this column's own schema with the table wild-
+    # carded, not a blanket "*": dex never claims a wider blast radius than
+    # the evidence (another flagged dataset in the same schema) supports.
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", recurring_cache)
+    assert "scope: db.main.*" in message
+    assert "scope: *" not in message
+
+
+def test_recurrence_requires_the_same_category_not_just_the_same_name():
+    # Two columns sharing a name but flagged under different categories are
+    # not the same convention; suggesting a shared scope would be a guess.
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.RAW_HOSTS",
+                columns=[
+                    ColumnProfile(
+                        name="CODE",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="name", confidence=0.6),
+                    ),
+                ],
+            ),
+            Dataset(
+                identifier="db.main.RAW_ORDERS",
+                columns=[
+                    ColumnProfile(
+                        name="CODE",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="government_id", confidence=0.9),
+                    ),
+                ],
+            ),
+        ]
+    )
+    message = _refusal("SELECT CODE FROM RAW_HOSTS", cache)
+    assert "column_name:" not in message
+
+
+def test_refusal_suggests_one_entry_per_blocking_column(cache: DexCache):
+    """Two columns refused together each get their own named suggestion, not
+    one blended entry."""
+
+    extended = DexCache(
+        datasets=[
+            Dataset(
+                identifier=cache.datasets[0].identifier,
+                columns=[
+                    *cache.datasets[0].columns,
+                    ColumnProfile(
+                        name="EMAIL",
+                        data_type="VARCHAR",
+                        pii=PIIFlag(category="email", confidence=0.9),
+                    ),
+                ],
+            ),
+            *cache.datasets[1:],
+        ]
+    )
+    message = _refusal("SELECT NAME, EMAIL FROM RAW_HOSTS", extended)
+    assert "- {column: db.main.RAW_HOSTS.NAME}" in message
+    assert "- {column: db.main.RAW_HOSTS.EMAIL}" in message
+
+
 def test_stale_cache_refusal_hints_at_reprofiling():
     from exmergo_dex_core.cache import CACHE_SCHEMA_VERSION
 
@@ -608,3 +739,53 @@ def test_sub_threshold_flag_flows_through_the_unnest_as_a_warning(
         dialect="bigquery",
     )
     assert any("HINT" in warning for warning in inspected.warnings)
+
+
+# --- what a statement reads, ahead of the guard ----------------------------------
+
+
+def test_referenced_relations_names_what_the_statement_reads():
+    """The pre-pass the on-demand profiler resolves against.
+
+    It reports names, not verdicts, so it must agree with the firewall about what
+    counts as a relation and stay silent about everything else.
+    """
+
+    from exmergo_dex_core.guards.sql_guard import referenced_relations
+
+    assert referenced_relations("SELECT 1") == []
+    assert referenced_relations("SELECT * FROM orders") == ["orders"]
+    assert referenced_relations("SELECT * FROM db.main.orders") == ["db.main.orders"]
+    # Joins and subqueries are read too, and each name appears once.
+    assert referenced_relations(
+        "SELECT * FROM a JOIN b ON a.id = b.id "
+        "WHERE a.id IN (SELECT id FROM c) AND b.id IN (SELECT id FROM a)"
+    ) == ["a", "b", "c"]
+
+
+def test_referenced_relations_excludes_ctes_but_not_their_qualified_namesakes():
+    """A CTE is defined by the statement, so calling one a relation would invent a
+    missing table. Only an unqualified reference can be a CTE, so a qualified name
+    of the same spelling is still a relation."""
+
+    from exmergo_dex_core.guards.sql_guard import referenced_relations
+
+    assert referenced_relations(
+        "WITH orders AS (SELECT * FROM raw_orders) SELECT * FROM orders"
+    ) == ["raw_orders"]
+    assert referenced_relations(
+        "WITH orders AS (SELECT 1 AS n) SELECT * FROM orders, db.main.orders"
+    ) == ["db.main.orders"]
+
+
+def test_referenced_relations_is_silent_where_it_cannot_speak():
+    """Unparseable input belongs to the guards that parse for policy, and a
+    table-valued function is not an object anyone could profile."""
+
+    from exmergo_dex_core.guards.sql_guard import referenced_relations
+
+    assert referenced_relations("SELECT FROM WHERE ((") == []
+    assert (
+        referenced_relations("SELECT * FROM generate_series(1, 10)", dialect="postgres")
+        == []
+    )

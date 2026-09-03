@@ -28,52 +28,79 @@ single JSON envelope it prints to stdout, decide the next step. State persists i
 ```bash
 uv run python -m exmergo_dex_core <subcommand> [flags]
 # or, with the pinned wrapper a skill ships:
-uv run scripts/run.py <subcommand> [flags]
+uv run --no-project --script scripts/run.py <subcommand> [flags]
+# and once, ahead of the first command, to pay the engine's install out of band:
+uv run --no-project --script scripts/run.py --warm
 ```
+
+Both forms need [`uv`](https://docs.astral.sh/uv/) on `PATH`: it is what installs
+and runs the engine, and no agent host installs it for you. Without it the shell
+reports `uv: command not found`, and the shipped wrapper run directly refuses with
+an error envelope (`reason: prerequisite`) naming the fix. The install is one line
+(`curl -LsSf https://astral.sh/uv/install.sh | sh`, or `brew install uv`, or
+`pipx install uv`); relay it to the user rather than reaching for another way to do
+the work, since every guardrail below lives in the engine.
 
 Install the engine with the connector extra you use: `exmergo-dex-core[duckdb]`
 for the zero-credential on-ramp, or `[snowflake]`, `[bigquery]`, `[databricks]`,
-`[postgres]`, `[redshift]`, or `[all]` for every optional capability at once. The shipped wrapper pins
+`[postgres]`, `[redshift]`, `[clickhouse]`, or `[all]` for every optional capability at once. The shipped wrapper pins
 only the engine version and selects that extra for you at runtime from the active
 connector (an explicit `--connector`, then the `connector:` in the `.dex/config.yml`
 found by walking up from the run directory to the git root, then DuckDB), so a
-release is connector-neutral. The engine resolves the same way but does not default
-silently: with no `.dex/config.yml` anywhere up the tree and no explicit
-`--connector`/`--path`, it refuses and names the fix rather than reading a phantom
-DuckDB target, so a command run from a subdirectory of your project resolves the
-project's real config instead of a wrong default.
+release is connector-neutral. `--warm` resolves that extra the same way and
+installs it without running a command, so a container build, a CI setup step, or
+the first thing you do after installing can pay a cold install once instead of
+leaving it on an interactive caller's clock. `--warm --connector snowflake` warms a
+named warehouse before a project exists to name it, and `--warm explore cluster`
+warms what that command adds on top of the connector. The engine resolves the same
+way but does not default silently: with no `.dex/config.yml` anywhere up the tree
+and no explicit `--connector`/`--path`, it refuses and names the fix rather than
+reading a phantom DuckDB target, so a command run from a subdirectory of your
+project resolves the project's real config instead of a wrong default.
+
+With no warehouse to point at yet, `demo` generates one and writes the config for
+it, so `demo` then `explore map` is a working first run on a machine with no
+credentials and no network.
 
 | Subcommand | Returns |
 |---|---|
-| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate |
-| `explore inventory [--rank]` | ranked object summary (counts, sizes; no rows) |
-| `explore profile <objects>` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
-| `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe; `--use-project` folds in the dbt project's declared foreign keys at confidence 1.0 (a declared join wins over the same inferred edge) |
-| `explore map [--verify] [--use-project]` | writes/updates the `.dex/` map; prints a summary; `--use-project` additionally applies declared grain and ranks metric-backing models higher |
-| `explore diagram [--full]` | the `.dex/` map serialized as a Mermaid `erDiagram` under `data.mermaid`, plus an `entities` legend mapping each entity name back to its fully-qualified identifier. Free and connectionless: it reads the cache and never opens the warehouse, so it needs no credential and cannot spend. Declared joins are solid, inferred joins dotted, and a cardinality is drawn only where the cache proved it (an unverified inference never claims "exactly one"). The default draws profiled objects that participate in a join, with their grain, key, join, and PII-flagged columns; `--full` widens to every eligible object and column. An entity cap always binds and every elision is counted in `notes`. No column value ever appears; PII renders as category and confidence. dex writes no file: reproduce the string in a fenced ```mermaid block, or save it yourself |
-| `explore query "<SELECT ...>"` | runs one agent-authored SELECT through the query firewall: columnar, capped result; values only from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); the FROM clause may unnest JSON/array columns in the connector's native idiom (UNNEST, LATERAL FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL) when the unnested value derives from a queried table's column, with the outputs inheriting that column's flags; requires the `.dex/` cache (`explore map` first) |
-| `explore cluster <object> [--features a,b] [-k N]` | k-means over a bounded, column-pruned, dialect-sampled scan of numeric columns; returns cluster sizes + centroids (feature means) + silhouette, never rows; auto-selects non-PII, non-key numeric features (or takes `--features`; a named PII column is opt-in, mean only); requires the `.dex/` cache and the `[cluster]` extra; billed connectors take the cost handshake |
-| `explore semantic list [--local\|--api]` | discover the dbt semantic layer in one shape from either backend: metrics (name, type, label, description, queryable dimensions), dimensions, and entities. Local reads the compiled `target/semantic_manifest.json` (no extra); hosted introspects the dbt Cloud GraphQL API. Distinct from the top-level `semantic` group, which *authors* the layer; `explore semantic` *queries* it |
-| `explore semantic query --metric <m[,m]> [--group-by <entity__dim[,dim]>...] [--where "<jinja>"] [--order-by <c[,c]>] [--grain <g>] [--limit N] [--local\|--api]` | run a governed metric query. `--metric`, `--group-by`, and `--order-by` each take a comma-separated list or a repeated flag, interchangeably; `--where` never splits, because a filter clause carries its own commas. Local (`[semantic]` extra): MetricFlow `explain()` renders the SQL and dex executes it through its own connector, PII request-gate, SELECT-only assertion, relation pre-check against the connection's own inventory (a relation the connection does not have is refused before spend; a relation it has but has never profiled is queryable, with a note that PII screening fell back to the name heuristic), and cost handshake, so cost is surfaced before spend. Hosted (`[semantic-api]` extra): dbt Cloud executes server-side, so the cost guard cannot apply and every result warns so (see guardrail 4); PII is screened from the layer's metadata plus a name heuristic before the query is sent, and the service token never crosses the envelope. Either backend discloses on the result when only the name heuristic could screen a dimension, so weaker screening is never mistaken for evidence. Backend is ambient (`.dex/config.yml` `semantic.backend`), overridable with `--local` / `--api` |
+| `demo [path]` | generates a seeded local DuckDB warehouse (7 tables, 29,512 rows) plus a `.dex/config.yml` beside it, so a first run needs no warehouse, no credentials, and no network; both artifacts are listed in `data.created` and `data.next_steps` names the commands worth running next. The path is positional and resolves against the working directory, defaulting to `dex_demo.duckdb`; `--path` is refused here rather than honored, since everywhere else it names the warehouse dex *reads*. Create-only, with no `--confirm` that can talk past it: an existing file at the target is a refusal (`reason: guard`), a missing parent directory is a refusal (`reason: request`), no directories are ever created, and a `.dex/config.yml` at or above the target is left untouched with a warning rather than shadowed by a second one. The data is generated from a pinned seed, so the counts quoted in the docs are the counts a user sees, and it is deliberately flawed: a key that lost uniqueness to a double-loaded batch, a key mixing two id schemes, a join whose columns share a name and none of their values, an empty table, two columns whose declared type contradicts their content, and personal data alongside two designed false positives. Needs the `[duckdb]` extra and says so by name when it is absent (`reason: prerequisite`) |
+| `connect test` | capabilities, dialect, `read_only: true`; DuckDB takes `--path`, every warehouse connector takes repeatable `--scope` (a bare database on ClickHouse, whose identifiers are two-part `database.table`) (BigQuery also accepts its older `--project`/`--dataset`), never written to config; Snowflake and Databricks report the pinned warehouse and its credit or DBU rate; ClickHouse Cloud reports live replica memory and its derived compute-unit rate |
+| `explore inventory [--rank] [--limit N] [--all]` | ranked object summary (counts, sizes; no rows). `--rank` caps at 30 objects by default so the shortlist stays a shortlist on a large warehouse; `--limit` widens it, `--all` lifts the cap; both are no-ops without `--rank`, since the unranked list carries no order to cut from |
+| `explore profile <objects> [--columns all]` | column profiles + PII flags (column, category, confidence) + candidate keys, grain, data-quality warnings; the verdict fields (grain, keys, data quality, row count) lead the serialized payload and `columns` trails, so a truncating harness cuts schema rather than the answer. By default each dataset's `columns` is summarized to the ones carrying a finding (PII, a non-zero null fraction, key membership, a reported value domain, or a mention in a `data_quality` note), with the rest counted in `elided_column_count`; `--columns all` restores every column. A per-column field that is null on every column shown is dropped from each of them and named once in `suppressed_fields` (always present, so an empty list means the columns shown carry their full shape), and each `value_domain` carries its `profile_value_domain_cap` most frequent values (`.dex/config.yml`, default 25) with the rest counted in its `elided`; both reduce the payload only, never the cached profile. `--use-project` lets a semantic model's declared primary entity override the heuristic grain (disagreements noted) |
+| `explore relationships [--verify] [--use-project]` | inferred joins with confidences, plus notes on what inference examined; `--verify` measures each join with an aggregate overlap probe, declared and inferred alike (a composite-key join is not probed: the probe spans one column pair); `--use-project` folds in the dbt project's declared joins at confidence 1.0 from both channels that state one, its `relationships` tests and its semantic layer's shared entities (a declared join wins over the same inferred edge, and an edge both channels declare is counted once). `declared_by` names the semantic entity behind an edge that came from the layer, which is the part a reader can look up with `explore semantic list` and the only part the edge does not already carry; a `relationships` test leaves it unset, having declared exactly the two columns the edge names. `semantic_join_count` splits the two, and the notes say how many of the layer's joins name-based inference did not find, which is the set that matters: a semantic layer routinely joins columns that share no name. A measurement never revises a declared join's confidence, which stays at the 1.0 the project asserts; a declared join whose probe finds the parent largely missing is reported as a finding instead |
+| `explore map [--detail] [--verify] [--use-project]` | writes/updates the `.dex/` map and returns it: the counts as before, plus `data.objects` (per top-ranked object: row count, detected grain, candidate key, the notable columns with the role that earned each one a place, PII flags as category and confidence, and data-quality findings) and `data.edges` (the join edges, shaped exactly as `explore relationships` returns them). Budgeted like `explore diagram`: 25 objects by rank, 12 columns per object, 40 edges, 5 findings per object, every cap binding in every mode and every elision counted in `notes` and in an `elided_*` field, so a truncated answer never reads as a complete one. `--detail` widens the selection to every column and to objects that were inventoried but never profiled, and lifts no cap; it is not `--full`, which decides how much gets scanned and therefore what the run costs. No column value ever appears: the cache holds min/max and value domains and this command does not read them. `--use-project` additionally applies declared grain, ranks metric-backing models higher, folds the semantic layer's declared entity graph into `data.edges`, and marks each object with `semantic_models`, the semantic models that sit on that relation. Empty there is an answer: a relation nothing in the layer reads is a different object from one several metrics are built on, and row counts and PII flags cannot tell them apart. Every object in view is rewritten whenever the layer was read, so a model dropped from the layer clears rather than leaving a stale claim, and a project with no compiled semantic layer contributes nothing here rather than erroring |
+| `explore diagram [--full]` | the `.dex/` map serialized as a Mermaid `erDiagram` under `data.mermaid`, plus an `entities` legend mapping each entity name back to its fully-qualified identifier. Free and connectionless: it reads the cache and never opens the warehouse, so it needs no credential and cannot spend. Declared joins are solid, inferred joins dotted, and a cardinality is drawn only where the cache proved it (an unverified inference never claims "exactly one"). A solid edge whose label names a semantic entity is a join the semantic layer declares; the cardinality rule is unchanged for it, so a primary entity is the layer's claim and still buys no "exactly one" the cache has not proven. The default draws profiled objects that participate in a join, with their grain, key, join, and PII-flagged columns; `--full` widens to every eligible object and column. An entity cap always binds and every elision is counted in `notes`. No column value ever appears; PII renders as category and confidence. dex writes no file: reproduce the string in a fenced ```mermaid block, or save it yourself |
+| `explore query "<SELECT ...>" [more...]` | runs agent-authored SELECTs through the query firewall: columnar, capped results; `data.shape` is `columnar`, making the `columns`/`types`/`cells` layout discoverable from the envelope itself. Values only come from profiled columns whose PII flag is absent or below the 0.5 blocking threshold (sub-threshold projections warn in the envelope); the FROM clause may unnest JSON/array columns in the connector's native idiom (UNNEST, LATERAL FLATTEN, LATERAL VIEW EXPLODE, set-returning functions, PartiQL) when the unnested value derives from a queried table's column, with the outputs inheriting that column's flags. The positional is variadic, so a chain of questions is one call: each argument is one statement, adjudicated, executed, and ledgered on its own, and `--sql-file <path>` reads a larger batch from a file (one statement per line, or semicolon-separated). Several statements in one string is still refused, so batching never widens what a call may do. One statement returns the envelope described here; two or more return `data.results`, one entry per statement carrying its own `shape` discriminator and this same `columns`/`types`/`cells`/`row_count`/`truncated` layout plus its own `status` (`ok`, `refused`, `failed`, `skipped`) and `error`, so a refusal on the third does not discard the first two, and the envelope's own status is `error` whenever any statement failed. `query.max_payload_bytes` is the budget for the whole call rather than for one statement, and `query.max_statements` (default 10) refuses an oversized batch. An object a statement names that the connection has but the cache cannot adjudicate (never profiled, inventoried without column detail, or profiled against a column signature the warehouse has since changed) is profiled first and the statement then runs, with a warning naming what was profiled and `data.profiled_on_demand` listing it; that profile is a full one, so the flags governing the query are the flags a deliberate `explore profile` would have produced. On a metered connector it is priced, not implied: one handshake covers the profiles and every statement together, itemized per table and per statement, and the objects a whole batch needs are scanned once rather than once per statement. An object the connection does not have refuses only the statements that named it, naming the connection rather than the cache. `--no-auto-profile` (or `auto_profile: false` in `.dex/config.yml`) restores the strict prerequisite, and on that path nothing opens a connection before the firewall has spoken |
+| `explore cluster <object> [--features a,b] [-k N]` | k-means over a bounded, column-pruned, dialect-sampled scan of numeric columns; returns cluster sizes + centroids (feature means) + silhouette, never rows; auto-selects non-PII, non-key numeric features (or takes `--features`; a named PII column is opt-in, mean only); needs the `[cluster]` extra; profiles the named object on demand exactly as `explore query` does, including `--no-auto-profile`, and reports it under `data.profiled_on_demand`; billed connectors take the cost handshake, and where a profile was needed the sample scan is priced after it (the feature columns come out of that profile), so a budget too small for the sample comes back as `needs_confirmation` with the profile already saved rather than as a refusal |
+| `explore semantic list [--local\|--api] [--metric <m>] [--for-dimension <d>] [--search <t>] [--full]` | discover the semantic layer's objects in one shape from either backend: semantic models (the layer's organizing unit, with the transformation model each sits on and its default time dimension), metrics (type, the tokens each can be grouped by, the measures it reads, a ratio's two sides, any filter, the queryable grains, and `time_axis`: the physical time column(s) `metric_time` resolves to for that metric, where more than one means its measures aggregate over different timestamps and a time grouping buckets parts of the number differently), dimensions (the token a query groups by, plus the bare definition, owning model, and queryable grains behind it), entities (one declaration per semantic model, each with its own join key and caveats, and a derived `type` that is primary wherever any declaration is), and measures (the aggregation and expression the number is actually made of). Every label and description is the project's own words where it declared one, and an unset field is omitted rather than null. Costs no warehouse query: one GraphQL round trip hosted, one compiled-artifact read locally, through the project seam rather than a dbt-specific parser. `--metric` narrows the catalog to those metrics and what they reach, and names the scope in `scoped_to` so a subset is never mistaken for the layer. `--for-dimension` (repeatable, comma-separated) asks the reverse question, returning the metrics groupable by **all** the named tokens and narrowing the catalog to them, which is also the cheapest way to find the metrics that can go on one chart against one axis; it is an inversion of the `dimensions` list each metric already carries rather than a second call, so it costs nothing, answers for a metric's own time token, and refuses an unknown token by name instead of returning the empty list a caller would read as a fact about the layer. `--search` is for a caller who knows a word rather than a name: it matches case-insensitively against every element's name and against the project's own label and description, resolves to the metrics that word touches, and names a term that matched nothing in a note rather than refusing, since a substring matching nothing is an honest answer where a misspelled metric name is not. The three compose, applied in that order so `--metric x --search y` reads as "within x, the parts about y", and a named metric that cannot be grouped that way is dropped with a note naming it. Budgeted like `explore map`: 50 semantic models, 60 metrics, 150 dimension rows, 50 entities, 60 measures and 40 groupable tokens per metric, with every cut counted in `elided` and named in `notes`, `elided` present with its zeros so a complete catalog states that it is complete, and `--full` to lift the caps. The defaults leave a layer of a dozen models and a few dozen metrics uncut, so a cap only bites one that was already too large to read in one payload; the narrowing flags are the better answer either way, because they decide which part comes back rather than letting a cap decide. Two legitimate backend differences are declared in the payload rather than left to be inferred: `dimension_scope` says whether a dimension row is one declaration or one groupable path (which is why the two backends can report different dimension counts for one layer; `--local` resolves the join graph through MetricFlow where the `[semantic]` extra is installed, and says `declarations` plus a note where it could not), and `unavailable` names the fields a backend structurally cannot supply (the dbt Cloud API exposes no entity label, no semantic model metadata beyond a name, and no words on a measure). The catalog also resolves the layer onto the warehouse: a semantic model carries the `relation` it sits on, and each dimension, entity declaration and measure carries the `column` behind it, so "which table is behind this metric" is the metric's `semantic_models` followed to their relations and `explore profile` is the next call. The relation is carried once per model rather than once per element, and an element defined as a computed expression carries no column rather than a guessed one, because the PII gate resolves a dimension to a column and reads that column's evidence. `relation` is in `unavailable` on the hosted backend, which exposes columns but no relations at all. Distinct from the top-level `semantic` group, which *authors* the layer; `explore semantic` *queries* it. The catalog names which layer answered on four fields: `backend`, `vendor`, `deployment`, and `execution` |
+| `explore semantic values <dimension> [--metric <m>] [--local\|--api]` | one semantic dimension's value domain: what a filter on it may be filtered to, capped and columnar like `explore query`. The precondition for writing a filter, and on a hosted layer the only dex command that can reach it at all, since dbt Cloud is not a connector and `explore profile` cannot see a semantic dimension. Takes exactly one dimension and accepts a grain suffix (`user__created_at__month`), split against the grains the layer reports. The token is resolved against the catalog first, so a misspelling is refused by name. `scoped_to` says how the values were reached and changes what they mean: empty is the domain of the column behind the dimension, and a metric name means the values present for that metric. A dimension reached through a join has no other answer (neither layer will run a distinct-values query with no measure to join from), so dex renders the cheap form first, escalates once to a metric that reaches it, and names that metric and `--metric` in a note rather than narrowing silently. PII is screened harder than on a query: the whole output is values, so a flagged dimension refuses the command, and the refusal names the durable ways to clear one reviewed as not PII. dex reports the values that came back and never claims an exact cardinality, which would cost a second scan; a large domain comes back capped, `truncated`, and saying so. Local renders through MetricFlow and takes the full cost handshake (needs the `[semantic]` extra, unlike `list`); hosted is executed by dbt Cloud and carries the same cost-guard-unavailable warning as a hosted query |
+| `explore semantic query <m[,m]> [--metric <m[,m]>...] [--group-by <entity__dim[,dim]>...] [--where "<jinja>"] [--order-by <c[,c]>] [--grain <g>] [--limit N] [--local\|--api]` | run a governed metric query. Metrics are positional after the explicit `query` mode; the repeatable `--metric` spelling remains supported. Metric, `--group-by`, and `--order-by` values each accept comma-separated lists, and the flags may be repeated; `--where` never splits, because a filter clause carries its own commas. Local (`[semantic]` extra): MetricFlow `explain()` renders the SQL and dex executes it through its own connector, PII request-gate, SELECT-only assertion, relation pre-check against the connection's own inventory (a relation the connection does not have is refused before spend; a relation it has but has never profiled is queryable, with a note that PII screening fell back to the name heuristic), and cost handshake, so cost is surfaced before spend. Hosted (`[semantic-api]` extra): dbt Cloud executes server-side, so the cost guard cannot apply and every result warns so (see guardrail 4); PII is screened from the layer's metadata plus a name heuristic before the query is sent, and the service token never crosses the envelope. That metadata is fetched one metric at a time and unioned (in one request, one aliased field per metric), because the API's `dimensions(metrics:)` returns the intersection across the listed metrics and would otherwise leave a multi-metric query screening most of its dimensions on their names alone. Either backend discloses on the result when only the name heuristic could screen a dimension, so weaker screening is never mistaken for evidence. Reading which dimensions a `--where` clause names is the backend's own job, because the filter dialect belongs to the answering layer; a backend that cannot read its dialect refuses filtered queries rather than screening only the group-by half. `--grain` is validated against the grains the layer reports for the metrics being queried (hosted: in the same metadata request; local: from the compiled project), so a grain the layer accepts is not refused by dex and one it does not is refused by name. Backend is ambient (`.dex/config.yml` `semantic.vendor` and `semantic.deployment`, or the released `semantic.backend` spelling of the two), overridable with `--local` / `--api`, which name the **execution** axis: `dex` renders and runs the statement under the cost guard, `vendor` means the layer ran it and no guard could apply. Every result reports `execution` alongside `backend` |
 | `transform init "<name>" --connector <c>` | bootstrap a dbt project skeleton (`dbt_project.yml`, `models/staging/` + `models/marts/`, a dev-only `profiles.yml`), reported as create diffs; refuses if any dbt project exists; the connector never defaults, so bare init errors (an explicit flag or a committed `connector:` in `.dex/config.yml` is required); `--layered-schemas` additionally scaffolds `models/intermediate/`, a `generate_schema_name` override, and per-folder `+schema:` config so each layer builds into its own `<layer>_<target name>` schema; init also runs a free, metadata-only content check on every namespace the project would build into and warns (never refuses) when one already holds tables or views, degrading to a note when no connection opens |
-| `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache |
+| `transform plan "<intent>" --edits-file <f>` | proposed dbt edits as diffs (nothing applied); `--scaffold <table>` adds a staging skeleton from the cache; when an edited model already exists, every authored change that can move rows (a `WHERE`/`HAVING`/`QUALIFY` predicate, a join added, removed or retyped, a swapped driving relation, a `DISTINCT` or `GROUP BY` change) is named under `data.row_attribution`, and each is measured against the prior model as a common baseline alongside the whole-model net; column expressions, aliases and ordering report nothing; measuring runs unasked only on DuckDB (free) and needs `--attribute-rows` plus the usual `--confirm --budget` on a billed connector, where the ask rides back beside the already-stored plan; a change dex cannot isolate or measure (macro-generated SQL, a jinja conditional, a renamed CTE, an unprofiled parent) reports `attributed: false` with the reason, and nothing here ever refuses a plan. Two free static warnings ride in the same envelope: the authored SELECT list against the columns `schema.yml` declares (both directions, silent where the model declares none, explicit where a `select *` makes the comparison impossible), and a house convention read out of the project's own models, where an authored model exposes a raw foreign key and at least three siblings sharing its folder and layer prefix all resolve theirs to a descriptive attribute, none passes one through, and the project holds a parent to resolve against. The convention warning names its precedent and its parent, judges only models this plan authors, and is the one check a project can decline (`conventions.resolved_keys: false` in `.dex/config.yml`), because it is the one that judges style rather than fact |
 | `transform apply [plan-id]` | writes diffs into the dbt project (a reviewable git diff); a human edit since planning returns `needs_confirmation`, never an overwrite; no id applies the latest unapplied plan of any kind |
 | `transform plans` | list stored plans, pending and applied, newest first |
+| `transform references <name> [more...] [--kind <k>] [--full]` | where each name is used across the project: model SQL, `schema.yml`, `dbt_project.yml`, macros, semantic YAML, seed headers and installed packages. Repo-only and free on every connector, so it opens no connection and needs no extra. The positional is variadic. `--kind` narrows to one of `model`, `source`, `seed`, `snapshot`, `macro`, `var`, `column`, `metric`, `entity`, `dimension`, `measure`; omitting it reports every kind the name is used as, which is usually what a caller wants, since they know the name and not what the project calls it. Jinja-aware: a `var()` read inside a macro body counts, and a reference dex cannot resolve statically (`{{ ref(var('x')) }}`) is reported under `data.indeterminate` rather than dropped. `data.completeness` is `complete` only when every reason to doubt the answer has been ruled out, and `data.limits` names each remaining one (an unresolved reference, packages declared but not installed, `sqlglot` absent on a column query, a file that would not parse). A bare column name is matched project-wide and says so (`scope: name_matched`); a qualified `model.column` is resolved through the `ref()` graph, and occurrences outside that lineage are still listed, marked `same_name_elsewhere`. A seed contributes its header row and never a data row, and no occurrence ever carries source text. Capped at 200 occurrences across 50 files with every elision counted in `notes`; `--full` lifts both |
+| `transform rename <kind> <old> <new> [--edits-file <f>]` | every edit a rename needs, generated from the reference index and stored as one plan: the definition, every model that selects it, every `schema.yml` that documents or tests it, every semantic reference, and a seed header. `<kind>` is `column`, `var`, `model`, `seed`, `snapshot`, `macro` or `source`. A column must be named `model.column`; a bare name is refused, because a *report* may answer imprecisely across the project and a *rewrite* may not. Scoped to the defining node and its `ref()` descendants. Repo-only and free. SQL is rewritten by splicing the identifiers that named the column and nothing else, so comments, formatting and dialect spellings survive byte-identical and the diff shows only the rename. **It refuses rather than partially applying**: on a reference dex could not resolve statically, on a name an installed package also defines (renaming this project's copy stops it shadowing the package's, which would then resolve under the old name), on a column handed to a macro as a literal string (dex cannot tell a column argument from a label), and on a model whose SELECT list it cannot read. A bare `select *` is not a refusal: it provably carries the column through, needs no edit, and `notes` says so. `--edits-file` carries related hand-authored edits into the same atomic plan |
+| `transform remove <kind> <name> [--edits-file <f>]` | the definition removed, and every read verified gone. Same kinds and same refusals as `rename`. dex authors the removal of the **definition** and refuses while any read survives, naming each with a file and a line; it never rewrites a read, because `{% if var('flag') %}` can be dropped or unguarded and `{{ var('x') }}` in an expression has no value dex may invent, and only you know which. Author those read edits yourself and pass them with `--edits-file`: they are validated and stored in this same plan, so the removal stays atomic without dex guessing at semantics |
+| `transform place <column> --targets <m,m> --expr "<sql>" [--explain]` | where a derived column that several models need should be *defined*: the lowest model in the `ref()` graph that every target descends from and that already projects the inputs the expression reads. The inputs are parsed out of `--expr`, so they cannot disagree with the expression using them. Defines the column there and threads it down every chain, with a `schema.yml` entry at the ancestor and at each target and none at the hops in between. `data.reasoning` names the ancestor, why it is the lowest, which targets descend from it, and the chain, because a proposal you cannot argue with is an imposition. Where there is no common ancestor, where the lowest one lacks an input (dex will not hunt further upstream to pull one down, because that turns one placement into an unbounded rewrite of the graph above it), or where two candidates tie, `data.strategy` is `per_target` and the reason is stated rather than the worse thing being done quietly. `--explain` returns the reasoning and stores no plan. Repo-only and free |
+| `transform test --scaffold <model>` | plan a `unit_tests:` skeleton for the model: a `given` block per `ref()`/`source()` input carrying only the columns the model reads, typed from the exploration cache, and an `expect:` stub that fails until it is filled in (dbt-parse-checked; applied with `transform apply`) |
 | `transform macro [name]` | no name lists the shipped dbt macros; a name proposes scaffolding it into the project's macro directory as a plan (dbt-parse-checked, applied with `transform apply`); re-running diffs the project's copy against the shipped version |
 | `transform build --target dev` | prod-looking targets refused outright; then a free dev-target preflight (refuses when `.dex/config.yml` and the rendered `profiles.yml` disagree, or when the dev database does not exist, naming the fix); then the cost preflight, priced upfront by a free `dbt compile` dry-run of each node (a partial floor when a cold dev target has not built a node's inputs yet; degrades to no estimate when dex cannot open its own connection); runs only with `--confirm` and a budget; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
 | `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
 | `semantic define\|update\|plan ... --edits-file <f>\|--definitions-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies each name `defined`, `updated`, or `unchanged`; `--definitions-file` names one definition at a time instead of a whole file; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
 | `maintain snapshot` | capture/refresh the known-good baseline in `.dex/snapshot.json` (pins the `.dex/` map + per-layer definition fingerprints) |
 | `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors: the free axes complete and return `ok`, with one estimate for the scanning axes under `data.offer` |
-| `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources (free) |
-| `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata) |
-| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout (scans; gated on billed connectors) |
+| `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources; a model added, removed, or content-changed since the baseline (free) |
+| `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata). Free metadata carries no count for an object the warehouse does not maintain one for (a view anywhere, an external table on BigQuery), so those are named in `warnings` as not compared rather than returning no finding |
+| `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout, plus the grains the project itself declares (model-level `unique_combination_of_columns`) re-verified against the data (scans; gated on billed connectors). Two codes come out of the uniqueness checks and the difference is the baseline: `key_lost_uniqueness` is a key measurement proved unique and no longer is, `declared_grain_not_unique` is a declared combination that never held, which is a declaration to fix rather than drift to absorb. Below `maintain.grain_min_rows` rows (default 100, set in `.dex/config.yml`), a uniqueness-regression finding is damped to `low` rather than `high`: on a handful of rows, losing uniqueness means the least, and a 4-row table's boolean column "loses" a uniqueness it never meaningfully had. Damped, never dropped, and the damping is named in the finding's own `data` (`severity_floor_applied`, `grain_min_rows`) and prose |
 | `maintain semantic [<objects>]` | definition drift and dangling refs (free, and returned as `ok`) plus categorical dimension cardinality change (scans; offered under `data.offer` and gated on billed connectors) |
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
+| `maintain verify [<selector>]` | is the project correct *right now*, with no `.dex/snapshot.json` baseline required, unlike every other `maintain` subcommand above. The first finding class (#225): nodes that failed to build, nodes skipped because a parent failed (naming it, walking back through a chain of transitively-skipped parents when the immediate parent was itself only skipped), and models the project declares that have no relation in the warehouse; all free (reads the compiled manifest and the last run's `run_results.json`, plus cheap object-metadata listing for the relation check, never a scan). A project that fails to compile is reported first and suppresses every other check here, since a finding computed from a manifest a broken project could not have produced honestly is not a finding at all; `data.suppressed` names every finding class that did not run and why, so an empty `data.findings` from a run that skipped everything is never mistaken for a clean project |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
 
-Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
-fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
+Skill-to-subcommand mapping: `explore` fronts `demo`/`connect`/`explore`;
+`transform` fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole
 `maintain` group. Within `maintain`, detection (`check`, `schema`, `volume`,
 `grain`, `semantic`) is read-only; only `reconcile` emits diffs, and applying
 them is `transform apply`. Detection is read-only on every connector, but read-only
@@ -93,10 +120,26 @@ Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "op", "content"}, ...]}`
 with `kind` one of `model_sql`, `schema_yml`, `semantic_yml`, `packages_yml` (the
 guarded way to author the project-root `packages.yml`/`dependencies.yml`, so
-declaring a dbt package is a reviewable diff too), `macro_sql`, `project_yml`
-(the project-root `dbt_project.yml`), or `profiles_yml` (the project-root
-`profiles.yml`, secret-guarded so a credential never enters the diff: reference
-secrets via `{{ env_var('NAME') }}`). The semantic commands take a second,
+declaring a dbt package is a reviewable diff too), `macro_sql`, `snapshot_sql`
+(one `{% snapshot %}` block under the project's snapshot paths, its `config()`
+naming a `unique_key` and a strategy), `seed_csv` (a small reference CSV under
+the seed paths, capped at 5,000 rows and 1 MiB and refused when a column name
+looks like personal data, since a seed puts values into a diff and a diff goes
+into git), `test_sql` (a file under the test paths: a singular test, which is a
+SELECT that must return no rows, or a generic test definition, which is a
+`{% test %}` block checked like a macro), `analysis_sql` (SQL under the analysis
+paths that dbt compiles and never runs, held to the same read-only SELECT
+anyway), `project_yml` (the project-root `dbt_project.yml`), or `profiles_yml`
+(the project-root `profiles.yml`, secret-guarded so a credential never enters the
+diff: reference secrets via `{{ env_var('NAME') }}`). Each kind is confined to
+its own path family, and `schema_yml` is accepted beside a snapshot, a seed, a
+test or an analysis as well as beside a model. A singular test and an analysis
+build no relation and nothing can `ref()` either, so neither is a node: neither
+enters the drift baseline and neither raises a dangling-reference guard on
+delete. Note that three separate things are called a test: generic tests
+declared inside a `schema.yml`, unit tests scaffolded by
+`transform test --scaffold` into a `unit_tests:` block, and the files under
+`test-paths` that `test_sql` authors. The semantic commands take a second,
 narrower payload instead: `--definitions-file <path|->` with
 `{"definitions": [{"kind", "path", "content"}, ...]}`, where `kind` is
 `semantic_model` or `metric` and `content` is that one definition's YAML body.
@@ -104,11 +147,22 @@ The name is read from the content, and `path` may be omitted for a definition
 the project already declares, in which case it is rewritten where it lives. Use
 it whenever a change touches part of a shared file: the engine writes each
 definition in place and leaves every other byte, including comments, untouched,
-so the diff and the classification both describe only what changed. `op` is `upsert` (create or update, the
+so the diff and the classification both describe only what changed. 
+`op` is `upsert` (create or update, the
 default, carrying `content`) or `delete` (remove the file, no `content`); a
 delete is a reviewable diff too, guarded so the plan is refused if any surviving
 file still `ref()`s a deleted model, and a rename is one plan (delete old, create
-new, update the referrers). The engine validates, diffs, and stores the plan
+new, update the referrers). Reach for `transform rename` rather than assembling
+that by hand: it generates the same plan plus every column-level and YAML edit the
+rename needs. That guard reads the same reference index
+`transform references` returns, so it sees a `ref('package', 'model')` two-argument
+form, ignores a seed's data rows, and *warns* rather than refusing when a surviving
+reference is one dex could not resolve statically: such a reference may or may not
+name the deleted node, and refusing on it would be unsatisfiable. `transform
+rename` and `transform remove` **refuse** on that same input, and the difference is
+deliberate: a dangling dynamic ref left by a delete cannot be fixed by any edit the
+caller could make, while one in a rename's path can, so refusing there is a
+solvable problem rather than a permanent block. The engine validates, diffs, and stores the plan
 under `.dex/plans/`; nothing touches the dbt project until `transform apply`. See
 `references/command-contract.md`.
 
@@ -117,12 +171,19 @@ under `.dex/plans/`; nothing touches the dbt project until `transform apply`. Se
 Every command prints exactly one JSON object and nothing else:
 
 ```json
-{ "status", "data", "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
+{ "status", "data", "connection": { "connector", "target", "source" }, "cost": { "estimate", "ceiling", "paradigm" }, "warnings", "diffs", "errors" }
 ```
+
+On success, `connection` names the non-secret target dex resolved and whether it
+came from a flag, `.dex/config.yml`, an environment variable, a dbt profile, or
+directory-local inference. `DBT_PROFILES_DIR` only locates `profiles.yml` for dbt
+operations and last-resort credential discovery; it does not select dex's
+connector or override `--connector`/`--path` or `.dex/config.yml`.
 
 Cost is a preflight estimate surfaced **before** any spend. Any command that
 would spend requires an explicit `--confirm` and a session budget: on a
-metered connector (BigQuery, Snowflake, Databricks, Redshift, and Postgres)
+metered connector (BigQuery, Snowflake, Databricks, Redshift, Postgres, and
+ClickHouse)
 the first call returns `needs_confirmation` with a free estimate, and the
 same command is re-issued with `--confirm --budget <magnitude>` once the user
 has agreed to the spend.
@@ -135,6 +196,11 @@ runs until it arrives, and `cost.estimate` stays empty so an `ok` never reads as
 though it spent. Reserve `needs_confirmation` for reading "dex is waiting on
 me", and an offer for "there is more available if I want it".
 
+The first billed command in a project that has never
+decided whether the *day's* total is bounded also carries a
+`suggested_session_ceiling`, and adding `--session-ceiling <value>` (or
+`--no-session-ceiling`) to that same re-issue answers both asks at once and is
+recorded in `.dex/config.yml`; skip it and the confirmed run stops once to ask.
 The magnitude is paradigm-relative: **bytes** on
 BigQuery (an exact free dry-run figure), **warehouse-seconds** on Snowflake
 (a heuristic labeled `estimate_quality: "heuristic"`, with a credit
@@ -144,16 +210,38 @@ with a DBU translation alongside), **compute-seconds** on Redshift (a
 heuristic with an RPU-hour translation alongside; Serverless estimates carry
 the 60-second wake minimum once), **database-seconds** on Postgres (nothing
 is billed in dollars; the guarded quantity is load on the operational
-database, estimated free via EXPLAIN). On every time paradigm the budget
-still binds exactly via a server-side statement timeout. Actual spend comes
+database, estimated free via EXPLAIN) and on ClickHouse (database-seconds when
+self-hosted; compute-seconds in Cloud with live-capacity CU-hours and optional
+USD alongside; estimated free via the non-executing EXPLAIN ESTIMATE, which
+prices after primary-key pruning). On every time paradigm the budget
+still binds exactly via a server-side statement timeout, except on ClickHouse,
+where it binds via `max_execution_time` **and** `max_bytes_to_read`, because
+time alone is checked only at block boundaries there. Actual spend comes
 back under `data.spend` (`bytes_billed` or `seconds_billed`) and accumulates
-in the `.dex/spend.jsonl` ledger per connector. Credentials never appear in
+in the `.dex/spend.jsonl` ledger per connector. That is the only place spend is
+reported: every command that can bill carries the unit key whatever it settled
+at, zero included, and no command puts a billed magnitude anywhere else in
+`data`, because a key present on one command and absent on another reads as a
+spend of zero rather than as a key to look for elsewhere. That ledger gates billing and
+nothing else: it is read where work is admitted, not where a connection is
+assembled, so a command that cannot spend does not depend on it, and a ledger
+that cannot be read refuses billed work by name while reporting the day's total
+as `null` on the two surfaces that quote it. The ledger also records each
+command's estimate beside what it settled at, which is what lets a refusal over
+the ceiling end with this connector's own observed ratio ("the last 8 settled
+bigquery commands billed a median 69% of estimate, range 61%-88%") instead of
+leaving the next budget to a guess; with too little history it says so rather
+than quoting a ratio. The refusal itself is unchanged and still cannot be
+confirmed through, and the ceiling is checked against the estimate, so a budget
+set at that fraction of the estimate is refused again. Credentials never appear in
 `data` (BigQuery authenticates via discovered Application Default
 Credentials, Snowflake via a discovered `connections.toml` entry,
 environment, or dbt profile, Databricks via the SDK's unified chain, Redshift
 via the AWS credential chain (a pinned Serverless workgroup mints IAM
 temporary database credentials) or the `REDSHIFT_*` environment, Postgres via
-`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile, and
+`pg_service.conf`, `DATABASE_URL`, the `PG*` environment, or a dbt profile,
+ClickHouse via `CLICKHOUSE_URL`, the `CLICKHOUSE_*` environment, a committed
+non-secret target, or a dbt profile, and
 the hosted semantic layer via `DBT_SL_TOKEN` or `~/.dbt/dbt_cloud.yml`; never a
 pasted key or token), and result values appear only in
 `explore query`'s columnar payload after the query firewall has cleared
@@ -165,7 +253,14 @@ them.
 2. Profile, don't exfiltrate. Understanding is built from aggregates, not raw rows.
 3. Read-only against data; writes confined to the repo. DuckDB opens read-only;
    generated SQL is SELECT-only; agent-authored SQL runs only through the query
-   firewall; builds run against a dev target only, never prod.
+   firewall; builds run against a dev target only, never prod. `dex demo` is the
+   one verb that creates a data file, and the exception is narrower than the rule
+   it sits inside: it only ever creates, refusing rather than overwriting and with
+   no confirmation flag that can override that, so it cannot open, inspect, or
+   replace a warehouse it did not make. The generator sits on its own path and
+   never reaches a connector, which is why the read-only open above has no branch
+   it could take; the moment the file exists it is user data and is read like any
+   other warehouse.
 4. Cost-aware by connector. Nothing dex runs touches the warehouse without a
    ceiling. The source allowlist in `.dex/config.yml` is a committed cost
    boundary: `--scope` narrows it for one command and can never widen it, and a
@@ -182,7 +277,14 @@ them.
    one another: an admitted command books its estimate against the day's
    headroom before it runs, so issuing several billed commands at once cannot
    spend the same budget twice. If a cache backend cannot serialize that, every
-   billed command says so.
+   billed command says so, and if the ledger it binds against cannot be read,
+   billed admission refuses rather than deciding a ceiling from nothing. And a
+   project is asked for that daily cap once rather than warned about it forever:
+   the first billed command in a project that has never decided returns
+   `needs_confirmation` with a `suggested_session_ceiling`, answered by
+   `--session-ceiling <value>` or `--no-session-ceiling` and recorded in
+   `.dex/config.yml`, so an unbounded day is a decision somebody made rather
+   than the default nobody noticed.
 5. Nothing reaches agent context except through the sanitized envelope.
    Credentials never; data values only from profiled, PII-cleared columns,
    bounded and capped.

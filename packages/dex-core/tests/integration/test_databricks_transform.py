@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import DBX_MAX_SECONDS, assert_unpivot_build, unpivot_fixture_edits
+from .conftest import (
+    DBX_MAX_SECONDS,
+    assert_ok,
+    assert_unpivot_build,
+    unpivot_fixture_edits,
+)
 from .test_databricks_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.databricks]
@@ -71,7 +76,7 @@ def test_init_plan_apply_build_into_the_scratch_catalog(
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "init", "analytics"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     profiles = yaml.safe_load(
         (tmp_path / "analytics" / "profiles.yml").read_text(encoding="utf-8")
     )
@@ -133,7 +138,7 @@ def test_init_plan_apply_build_into_the_scratch_catalog(
     statuses = {n["name"]: n["status"] for n in built["data"]["nodes"]}
     assert statuses.get(MODEL_NAME) == "success"
     # Warehouse time is accounted: the compute-time build records seconds.
-    assert built["data"].get("seconds_billed", 0) >= 0
+    assert built["data"]["spend"]["seconds_billed"] >= 0
 
     # The relation exists exactly where the dev target points, then
     # best-effort cleanup through the same discovered connection.
@@ -182,7 +187,7 @@ def test_missing_dev_catalog_is_refused_before_the_cost_gate(
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "init", "analytics"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "build", "--target", "dev"], capsys
@@ -212,13 +217,13 @@ def test_unpivot_json_object_macro_builds_live(
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "init", "analytics"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(
         ["--repo-root", root, "transform", "macro", "unpivot_json_object"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     rc, envelope = run_cli(["--repo-root", root, "transform", "apply"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
 
     edits_file = tmp_path / "edits.json"
     edits_file.write_text(

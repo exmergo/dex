@@ -12,10 +12,16 @@ cache, the reconcile baseline, the last drift report, the append-only query and
 spend ledgers, and the stored transform plans. Delete all of it and nothing
 canonical is lost. That is what a `Store` holds.
 
-Two backends ship. `FilesystemStore` writes plain files under `.dex/` and is what
-the CLI uses, so persistence is git and a reviewer can read the state in a pull
-request. `MemoryStore` writes nothing and is the library default, which is why
-`import exmergo_dex_core` cannot leave a `.dex/` directory in a consumer's repo.
+Three backends ship. `FilesystemStore` writes plain files under `.dex/` and is
+what the CLI uses by default, so persistence is git and a reviewer can read the
+state in a pull request. `MemoryStore` writes nothing and is the library
+default, which is why `import exmergo_dex_core` cannot leave a `.dex/` directory
+in a consumer's repo. `SqliteStore` is opt-in: one `.dex/dex.db` file with real
+tables in place of loose JSON, for a host that wants durable local state without
+a directory of files to review, gitignore, or clean up. Select it with
+`cache.backend: sqlite` or `--cache-backend sqlite`; `filesystem` stays the
+default, and `.dex/dex.db` is not reviewable the way `.dex/cache.json` is, so add
+it to `.gitignore` the way you would any local database file.
 
 Secrets never live in any backend.
 
@@ -54,11 +60,13 @@ at runtime. Passing an explore-only store to a transform command refuses with a
 message naming the tier and the missing members, rather than failing on a missing
 attribute several frames down.
 
-Two capabilities sit alongside the tiers rather than inside them, and both are
+Three capabilities sit alongside the tiers rather than inside them, and all are
 optional: `SpendLock`, so the cumulative spend ceiling binds when two commands
-overlap, and the construction contract, so your backend can be named in
-configuration. A backend is a complete backend without either, and the first is
-one every concurrent host wants.
+overlap; `SpendHistory`, so an over-ceiling refusal can say how far this
+connector's past estimates ran from what they actually billed; and the
+construction contract, so your backend can be named in configuration. A backend
+is a complete backend without any of them, and the first is one every concurrent
+host wants.
 
 ## Writing one
 
@@ -154,6 +162,58 @@ skip the lock on anything serving concurrent requests.
 
 `SpendLockContract` in the conformance suite is the executable version of all of
 the above.
+
+## Reading the ledger back
+
+A second optional capability, and a gentler one: skipping it costs a sentence,
+not correctness.
+
+```python
+class MyStore:
+    def spend_entries(self, *, connector=None, limit=500):
+        entries = [e for e in self._entries("spend")
+                   if connector is None or e.get("connector") == connector]
+        return entries[-limit:]
+```
+
+**Why dex wants it.** `spend_since` answers the one question the cumulative
+ceiling asks, "how much today", and answers it as a single float, which is what
+keeps that hot path cheap. There is a second question worth asking of the same
+ledger. A dry-run estimate on a partitioned or clustered table is an upper bound
+by construction, so a build refused at an estimated 6.9 GB against a 5 GB ceiling
+may bill 4.75 GB when it is finally run, and "raise the budget or narrow the
+work" is then answered by a guess made under the impression that the estimate
+approximates the cost. dex records both halves already: every `settlement` entry
+carries an `estimate` beside the figure it settled at. This member is what reads
+them back, so the refusal can end with
+
+> The last 8 settled bigquery commands in this project's spend ledger billed a
+> median 69% of estimate (range 61%-88%) ...
+
+**Three properties.**
+
+- **Return the entries uninterpreted**, as dicts, exactly as they were appended.
+  The guard pairs `estimate` with the settled figure and groups by
+  `reservation_id`; a backend that drops keys it does not recognize breaks that.
+- **Append order, oldest first.** Not sorted by `at`: the ledger is append-only,
+  so insertion order is the true order and it stays right for entries whose stamp
+  is missing.
+- **Filter by connector, then cap.** `limit` takes the *most recent* matching
+  entries. Capping before filtering returns fewer than `limit` of the asked-for
+  connector whenever another connector shares the ledger.
+
+**Failing is allowed**, which is the opposite of `spend_since` and for the reason
+that separates them: nothing is admitted or refused on what this returns. It only
+decides whether an already-decided refusal carries one more sentence, so dex
+swallows an error here and drops the sentence. Raise or return `[]`; both read as
+"no history".
+
+**Without it your backend still works**, and nothing warns: no guard is narrower
+than it looks, so there is nothing to disclose. Over-ceiling refusals simply read
+as they always did.
+
+`SpendHistoryContract` in the conformance suite is the executable version of the
+above.
 
 ## Constructing one
 
@@ -274,10 +334,15 @@ deserializes its own rows: `maintain` catches a `ValueError` out of `load_snapsh
 and classifies it as a prerequisite failure, which is what tells a host to stop and
 rebuild the baseline rather than retry the command. Anything else reaches the
 engine's catch-all and is reported to the operator as a bad request they made, when
-the fix is a dex command they have not run. The other loads carry no such wrapper
-yet: a raise out of `load_cache` or `load_drift` reaches the catch-all whatever its
-type. Raise a `ValueError` there anyway, so those loads are classifiable when they
-get one, rather than because it is classified today.
+the fix is a dex command they have not run. The other two loads are wrapped the
+same way now, and they resolve to opposite answers on purpose. `load_cache` goes
+through `readable_cache`, which raises `CacheUnreadableError` naming `explore map`
+and saying that rebuilding bills. `load_drift` goes through `_stored_drift`, which
+treats an unparseable report as **absent**: a drift report is derived rather than
+vouched for, `maintain check` regenerates it from the baseline on demand, and both
+callers already had a path for a missing one. So raise a `ValueError` from any of
+the three and the engine classifies it; what it does next depends on whether the
+document can be rebuilt without asking anyone.
 
 **A stored `schema_version` is not the store's to police.** Documents carry one and
 the engine reads it: the query firewall degrades on an old cache, and `maintain`
@@ -307,6 +372,12 @@ admitted and has not finished paying. A release carries a **negative**
 magnitude, and that is the one thing to know here: a backend that clamps or
 filters on sign would leak held headroom for the rest of the UTC day. Sum what
 you are given.
+
+A `settlement` also carries `estimate`, the whole-command preflight figure the
+command was admitted on, so the ledger holds both halves of every "estimated
+this, billed that" pair rather than only the half a budget is measured against.
+It is a plain extra key that no backend has to know is there; `SpendHistory` is
+what reads it back.
 
 Two properties follow, and neither required a change to any backend written
 before reservations existed:
@@ -420,6 +491,12 @@ this contract cannot tell the difference. That gap is real, and it is why the tw
 shipped backends carry cross-process assertions of their own rather than treating
 a green contract as the whole answer.
 
+**If your backend implements `spend_entries`**, mix in `SpendHistoryContract` the
+same way. It checks the three properties from
+[Reading the ledger back](#reading-the-ledger-back): entries come back
+uninterpreted, oldest first, and `limit` caps the most recent entries *after* the
+connector filter rather than before it.
+
 ## Which calls need nothing on the filesystem
 
 A host with no project on disk can run the whole explore surface: `inventory`,
@@ -463,7 +540,7 @@ order:
 
 | Name | Example | For |
 |---|---|---|
-| shipped | `filesystem` | dex's own backends, and never shadowable by anything installed |
+| shipped | `filesystem`, `sqlite` | dex's own backends, and never shadowable by anything installed |
 | dotted path | `mypkg.stores:my_store` | a factory reachable by import, with no packaging work |
 | entry point | `acme` | a name an installed distribution registered under `exmergo_dex_core.stores` |
 
@@ -497,10 +574,10 @@ exists.
 
 Recorded so they are not re-argued.
 
-**Always pass `repo_root`.** It builds both shipped backends and would build an
-opt-in SQLite file, and it cannot build a tenant-keyed backend at all. That is the
-class of backend this seam was made public for, and widening a released config
-schema afterwards costs a deprecation.
+**Always pass `repo_root`.** It builds all three shipped backends, but it cannot
+build a tenant-keyed backend at all. That is the class of backend this seam was
+made public for, and widening a released config schema afterwards costs a
+deprecation.
 
 **Require a `from_config` classmethod on the store.** It puts an obligation on the
 structural protocol, which is what makes "no base class to inherit and no

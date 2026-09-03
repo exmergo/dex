@@ -13,6 +13,7 @@ keeps the seam load-bearing rather than merely defined.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -22,12 +23,17 @@ from exmergo_dex_core.adapters.conformance import (
     DeclaringProjectContract,
     EditableProjectContract,
     MaintainProjectContract,
+    PlacingProjectContract,
     ProjectFactoryContract,
+    SemanticCatalogContract,
+    SemanticProjectContract,
 )
 from exmergo_dex_core.adapters.project import (
     DbtProject,
     EditableProject,
     ProjectContext,
+    ProjectView,
+    SourceFileView,
     tier_of,
 )
 from exmergo_dex_core.config import DexConfig
@@ -42,6 +48,7 @@ from exmergo_dex_core.maintain.snapshot import (
     TransformLayer,
 )
 from exmergo_dex_core.storage import MemoryStore
+from exmergo_dex_core.transform.plans import PlanError, contained_key
 
 _PROJECT_YML = (
     'name: dex_test\nversion: "1.0.0"\nprofile: dex_test\nmodel-paths: ["models"]\n'
@@ -88,7 +95,34 @@ def _staged_conflict(root: Path):
     )
 
 
-class TestDbtProject(DeclaringProjectContract, EditableProjectContract):
+def _clean_edit(root: Path):
+    """An edit beside the staged conflict that is not itself in conflict.
+
+    Supplied so the all-or-nothing assertion asks what the project holds rather
+    than what the writer reported holding: a writer that lands this one while
+    refusing the conflict answers the result honestly and still leaves the tree
+    matching nothing anybody proposed.
+    """
+
+    target = root / "analytics" / "models" / "stg_orders.sql"
+    edit = dbt_project.Edit(
+        path="models/stg_orders.sql",
+        new_content="select 1 as order_id\n",
+        old_content_hash=None,
+    )
+    return (
+        edit,
+        lambda: target.read_text(encoding="utf-8") if target.is_file() else None,
+    )
+
+
+class TestDbtProject(
+    DeclaringProjectContract,
+    SemanticCatalogContract,
+    SemanticProjectContract,
+    PlacingProjectContract,
+    EditableProjectContract,
+):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
         # One root per assertion: a project is read from disk, so two assertions
@@ -101,6 +135,15 @@ class TestDbtProject(DeclaringProjectContract, EditableProjectContract):
 
     def an_edit_against_a_changed_target(self):
         return _staged_conflict(self.root)
+
+    def a_clean_edit(self, project):
+        return _clean_edit(self.root)
+
+    def placeable_model(self) -> str:
+        # The warehouse table, not `stg_orders`: dbt's scaffold prefix is applied
+        # by `edit_path` on the way out, and passing the prefixed name here would
+        # assert the convention twice and prove it once.
+        return "orders"
 
     def make_unreadable_project(self) -> DbtProject:
         # A dbt_project.yml that is not parseable YAML. dbt is a filesystem format,
@@ -144,6 +187,191 @@ class TestDbtProject(DeclaringProjectContract, EditableProjectContract):
             "id",
         )
 
+    def a_project_declaring_a_join_with_differently_named_sides(self):
+        # dbt's `relationships` test exists to express exactly this, and the
+        # fixture above already happens to use it: `customer_id` on one side, `id`
+        # on the other. Returned again through the widened hook rather than left to
+        # skip, so the assertion that the two stay apart actually runs.
+        return self.a_project_declaring_a_join()
+
+    def a_project_declaring_a_composite_key(self):
+        # Four columns, not two: a format special-casing the pair would pass a
+        # two-column fixture. dbt carries this as a model-level
+        # `unique_combination_of_columns`, which is a different construct from the
+        # column-level `unique` above and lands in a different field.
+        project = _project(
+            self.root,
+            "version: 2\n"
+            "models:\n"
+            "  - name: stg_customers\n"
+            "    tests:\n"
+            "      - unique_combination_of_columns:\n"
+            "          combination_of_columns:\n"
+            "            - tenant_id\n"
+            "            - id\n"
+            "            - valid_from\n"
+            "            - source_system\n",
+        )
+        return (
+            DbtProject(self.root, project),
+            "stg_customers",
+            ("tenant_id", "id", "valid_from", "source_system"),
+        )
+
+    def a_project_declaring_a_semantic_model(self):
+        """One semantic model covering all three ways a field resolves.
+
+        A bare `expr` is the column, an absent one means the field's own name is,
+        and a computed expression resolves to nothing. The third is the case worth
+        having: `markup` is `type: categorical` AND unresolved, so it must appear in
+        `dimensions` mapped to None and must NOT appear in `categorical_dimensions`,
+        whose values are required strings. A format that collapses those two
+        properties either drops the field or invents a column for it.
+        """
+
+        project = _project(self.root)
+        (project / "models" / "semantic.yml").write_text(
+            "semantic_models:\n"
+            "  - name: customers_sm\n"
+            "    model: ref('stg_customers')\n"
+            "    entities:\n"
+            "      - name: customer\n"
+            "        type: primary\n"
+            "        expr: id\n"
+            "    dimensions:\n"
+            "      - name: signed_up_at\n"
+            "        type: time\n"
+            "      - name: region\n"
+            "        type: categorical\n"
+            "        expr: region_code\n"
+            "      - name: markup\n"
+            "        type: categorical\n"
+            "        expr: base_rate * 1.2\n"
+            "    measures:\n"
+            "      - name: revenue\n"
+            "        agg: sum\n"
+            "        expr: revenue_net\n"
+            "      - name: blended\n"
+            "        agg: sum\n"
+            "        expr: revenue_net + adjustments\n"
+            "  - name: orders_sm\n"
+            "    model: ref('stg_orders')\n"
+            "    entities:\n"
+            "      - name: order\n"
+            "        type: primary\n"
+            "      - name: customer\n"
+            "        type: foreign\n"
+            "        expr: buyer_id\n"
+            "    dimensions:\n"
+            "      - name: status\n"
+            "        type: categorical\n"
+            "    measures:\n"
+            "      - name: order_count\n"
+            "        agg: count\n"
+            "        expr: order_id\n",
+            encoding="utf-8",
+        )
+        _write_compiled_semantics(project)
+        return (
+            DbtProject(self.root, project),
+            "customers_sm",
+            {"signed_up_at": "signed_up_at", "region": "region_code", "markup": None},
+            {"revenue": "revenue_net", "blended": None},
+        )
+
+
+def _write_compiled_semantics(project: Path) -> None:
+    """The compiled counterpart of the YAML above.
+
+    A real project holds both, and the two seam channels read the one each was
+    designed for: the fingerprint hashes what the author wrote, so it stays stable
+    across tool upgrades, and the catalog reads the compiled artifact, where the
+    metric inputs and the physical relations are already resolved. Writing only one
+    of them would leave whichever contract reads the other with nothing to check.
+    """
+
+    target = project / "target"
+    target.mkdir(exist_ok=True)
+    (target / "semantic_manifest.json").write_text(
+        json.dumps(
+            {
+                "semantic_models": [
+                    {
+                        "name": "customers_sm",
+                        "node_relation": {
+                            "alias": "stg_customers",
+                            "relation_name": "wh.main.stg_customers",
+                        },
+                        "defaults": {"agg_time_dimension": "signed_up_at"},
+                        "entities": [
+                            {"name": "customer", "type": "primary", "expr": "id"}
+                        ],
+                        "dimensions": [
+                            {"name": "signed_up_at", "type": "time"},
+                            {
+                                "name": "region",
+                                "type": "categorical",
+                                "expr": "region_code",
+                            },
+                            {
+                                "name": "markup",
+                                "type": "categorical",
+                                "expr": "base_rate * 1.2",
+                            },
+                        ],
+                        "measures": [
+                            {"name": "revenue", "agg": "sum", "expr": "revenue_net"},
+                            {
+                                "name": "blended",
+                                "agg": "sum",
+                                "expr": "revenue_net + adjustments",
+                            },
+                        ],
+                    },
+                    {
+                        "name": "orders_sm",
+                        "node_relation": {
+                            "alias": "stg_orders",
+                            "relation_name": "wh.main.stg_orders",
+                        },
+                        "defaults": {"agg_time_dimension": "signed_up_at"},
+                        "entities": [
+                            {"name": "order", "type": "primary"},
+                            {
+                                "name": "customer",
+                                "type": "foreign",
+                                "expr": "buyer_id",
+                            },
+                        ],
+                        "dimensions": [{"name": "status", "type": "categorical"}],
+                        "measures": [
+                            {"name": "order_count", "agg": "count", "expr": "order_id"}
+                        ],
+                    },
+                ],
+                "metrics": [
+                    {
+                        "name": "revenue",
+                        "type": "simple",
+                        "type_params": {
+                            "measure": {"name": "revenue"},
+                            "input_measures": [{"name": "revenue"}],
+                        },
+                    },
+                    {
+                        "name": "orders",
+                        "type": "simple",
+                        "type_params": {
+                            "measure": {"name": "order_count"},
+                            "input_measures": [{"name": "order_count"}],
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
 
 class TestDbtProjectFactory(ProjectFactoryContract, EditableProjectContract):
     """The shipped format, built the way configuration builds it.
@@ -173,6 +401,9 @@ class TestDbtProjectFactory(ProjectFactoryContract, EditableProjectContract):
 
     def an_edit_against_a_changed_target(self):
         return _staged_conflict(self.root)
+
+    def a_clean_edit(self, project):
+        return _clean_edit(self.root)
 
 
 class _PathlessProject:
@@ -211,6 +442,57 @@ class TestPathlessProject(MaintainProjectContract):
 
     def make_project(self) -> _PathlessProject:
         return _PathlessProject()
+
+
+def test_the_dbt_view_is_the_shipped_project_view(tmp_path: Path):
+    """`DbtProjectView` implements `ProjectView`, member for member.
+
+    The two protocols are not `runtime_checkable`, deliberately: an isinstance
+    check on a data protocol only asks whether the names exist, which reads as a
+    type check and is not one. Asserting against the declared members rather than
+    a hand-written list is what keeps this honest if a member is ever added, since
+    the shipped format has to grow it too or this fails.
+    """
+
+    view = DbtProject(tmp_path, _project(tmp_path)).load()
+
+    for member in ProjectView.__annotations__:
+        assert hasattr(view, member), f"DbtProjectView has no `{member}`"
+    entry = view.files["models/stg_customers.sql"]
+    for member in SourceFileView.__annotations__:
+        assert hasattr(entry, member), f"SourceFile has no `{member}`"
+
+
+def test_the_dbt_editing_surface_admits_everything_its_writer_accepts(tmp_path: Path):
+    """The declaration and the writer agree, which `transform apply` now needs.
+
+    Containment is re-checked against this list before a stored plan reaches the
+    writer, so a surface narrower than what the writer takes refuses the project
+    config, the profiles and the package manifests at apply. Every one of those is
+    a path dex authors through a plan.
+    """
+
+    project = _project(tmp_path)
+    surface = DbtProject(tmp_path, project).editing_surface()
+
+    for path in (
+        "models/stg_customers.sql",
+        "macros/m.sql",
+        # Every authored family, not only the two that predate them: a plan the
+        # writer accepts and this declaration refuses would be refused at apply
+        # after passing at plan.
+        "snapshots/snap_customers.sql",
+        "seeds/country_vat.csv",
+        "seeds/schema.yml",
+        "tests/assert_totals_reconcile.sql",
+        "tests/generic/not_negative.sql",
+        "analyses/email_skew.sql",
+        "analyses/schema.yml",
+        *dbt_project._ALLOWED_ROOT_FILES,
+    ):
+        contained_key(path, surface)
+    with pytest.raises(PlanError):
+        contained_key("models_backup/stg_customers.sql", surface)
 
 
 def test_a_pathless_format_declines_the_write_tier():

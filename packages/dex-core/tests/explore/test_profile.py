@@ -401,7 +401,15 @@ def test_shape_stats_requested_only_for_generic_name_string_columns():
             return meta, self.columns
 
         def column_aggregates(
-            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+            temporal_stats=None,
         ):
             self.shape_requests.append(set(shape_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -412,6 +420,763 @@ def test_shape_stats_requested_only_for_generic_name_string_columns():
     # (first_name), not the denylisted qualifier (product_name), not another
     # category (email), not a numeric column.
     assert adapter.shape_requests == [{"reviewer_name"}]
+
+
+def test_type_stats_requested_only_for_eligible_non_pii_columns():
+    """#204: only non-PII string/integer columns buy declared-type-vs-content
+    SQL -- not a float column (neither shape check applies), not a
+    PII-flagged column (any confidence, full stop, same rule as min/max
+    safety and value-domain eligibility)."""
+
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.type_requests: list[set[str]] = []
+            self.columns = [
+                ColumnMeta("id", "INTEGER", False, 0),
+                ColumnMeta("crt_ts_epoch", "VARCHAR", True, 1),
+                ColumnMeta("amount", "NUMERIC", True, 2),
+                ColumnMeta("email", "VARCHAR", True, 3),
+            ]
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=1,
+                byte_size=None,
+                column_count=len(self.columns),
+            )
+            return meta, self.columns
+
+        def column_aggregates(
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+            temporal_stats=None,
+        ):
+            self.type_requests.append(set(type_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.type_requests == [{"id", "crt_ts_epoch"}]
+
+
+# --- declared-type-vs-content notes (#204) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "expect_substring"),
+    [
+        # Clean numeric-only string, every value an integer.
+        (
+            {"numeric_string_fraction": 1.0, "integer_string_fraction": 1.0},
+            "numeric-only",
+        ),
+        # A decimal numeric string: not every value fits an integer.
+        (
+            {"numeric_string_fraction": 1.0, "integer_string_fraction": 0.0},
+            "the rest carry a decimal point",
+        ),
+        ({"iso_date_fraction": 1.0}, "%Y-%m-%d"),
+        ({"iso_datetime_fraction": 1.0}, "%Y-%m-%d %H:%M:%S"),
+        # %m/%d/%Y: the second component (day) is proven >12 somewhere, which
+        # rules out the second component being a month, so it must be MDY.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.0,
+                "slash_second_component_over_12_fraction": 0.1,
+            },
+            "%m/%d/%Y",
+        ),
+        # %d/%m/%Y: the first component is proven >12 somewhere.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.1,
+                "slash_second_component_over_12_fraction": 0.0,
+            },
+            "%d/%m/%Y",
+        ),
+        # Genuinely ambiguous: neither component ever exceeds 12, so the data
+        # cannot distinguish the two orderings.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.0,
+                "slash_second_component_over_12_fraction": 0.0,
+            },
+            "ambiguous",
+        ),
+        # Contradiction: both components are proven >12 at different rows, so
+        # no single format order fits every value -- no note, not a guess.
+        (
+            {
+                "slash_date_fraction": 1.0,
+                "slash_first_component_over_12_fraction": 0.1,
+                "slash_second_component_over_12_fraction": 0.1,
+            },
+            None,
+        ),
+        # Epoch seconds vs. milliseconds, distinguished by which fraction wins.
+        (
+            {
+                "epoch_seconds_fraction": 1.0,
+                "epoch_seconds_min_value": 1_600_000_000,
+                "epoch_seconds_max_value": 1_700_000_000,
+            },
+            "seconds",
+        ),
+        (
+            {
+                "epoch_millis_fraction": 1.0,
+                "epoch_millis_min_value": 1_600_000_000_000,
+                "epoch_millis_max_value": 1_700_000_000_000,
+            },
+            "milliseconds",
+        ),
+        # A genuine integer measure (an amount, a count): no plausible epoch
+        # fraction at all, so no note.
+        ({"epoch_seconds_fraction": 0.0, "epoch_millis_fraction": 0.0}, None),
+        # No evidence at all: fail closed.
+        ({}, None),
+    ],
+)
+def test_type_contradiction_note_decisions(agg_kwargs: dict, expect_substring):
+    from exmergo_dex_core.explore.profile import _type_contradiction_notes
+
+    notes = _type_contradiction_notes("crt_ts", "VARCHAR", _aggregate(**agg_kwargs))
+    if expect_substring is None:
+        assert notes == []
+    else:
+        assert any(expect_substring in n for n in notes), notes
+
+
+def test_type_contradiction_note_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _type_contradiction_notes
+
+    assert _type_contradiction_notes("crt_ts", "VARCHAR", None) == []
+
+
+def test_pii_flagged_column_gets_no_type_contradiction_note(tmp_path: Path):
+    """The integration-level gate: `prelim_pii[...] is None` at the `profile()`
+    call site, not just the pure decision function -- a PII-flagged column's
+    content is never even offered to `_type_contradiction_notes`, at any
+    confidence, even though the content itself matches a pattern cleanly."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "pii_epoch.duckdb"
+    conn = duckdb.connect(str(db_path))
+    # "ssn" is a GOVERNMENT_ID token, flagged regardless of type; its content
+    # is a clean numeric-only string, which would otherwise earn a note.
+    conn.execute("CREATE TABLE t (ssn VARCHAR)")
+    conn.executemany(
+        "INSERT INTO t VALUES (?)", [(str(100000000 + i),) for i in range(50)]
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["pii_epoch.main.t"])
+    finally:
+        adapter.close()
+
+    assert dataset.columns[0].pii is not None
+    assert dataset.data_quality == []
+
+
+# --- temporal continuity (#206) --------------------------------------------------
+
+
+def test_temporal_stats_requested_only_for_eligible_non_pii_date_columns():
+    """#206: date/timestamp columns only, and never a PII-flagged one (a DOB
+    column), at any confidence."""
+
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.temporal_requests: list[set[str]] = []
+            self.columns = [
+                ColumnMeta("id", "INTEGER", False, 0),
+                ColumnMeta("signup_date", "DATE", True, 1),
+                ColumnMeta("last_seen_ts", "TIMESTAMP", True, 2),
+                ColumnMeta("dob", "DATE", True, 3),  # PII: excluded at any confidence
+            ]
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=1,
+                byte_size=None,
+                column_count=len(self.columns),
+            )
+            return meta, self.columns
+
+        def column_aggregates(
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+            temporal_stats=None,
+        ):
+            self.temporal_requests.append(set(temporal_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.temporal_requests == [{"signup_date", "last_seen_ts"}]
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "expected"),
+    [
+        ({"day_aligned_fraction": 1.0, "month_aligned_fraction": 0.0}, "day"),
+        ({"day_aligned_fraction": 1.0, "month_aligned_fraction": 1.0}, "month"),
+        # Real sub-day variation: day-truncation would lose information.
+        ({"day_aligned_fraction": 0.3, "month_aligned_fraction": 0.0}, "hour"),
+        # Missing evidence reads as 0.0 for each fraction (fail toward the
+        # narrowest grain); the outer _temporal_continuity never reaches this
+        # case in practice since it returns None first when both are absent.
+        ({}, "hour"),
+    ],
+)
+def test_temporal_granularity_decisions(agg_kwargs: dict, expected: str):
+    from exmergo_dex_core.explore.profile import _temporal_granularity
+
+    assert _temporal_granularity(_aggregate(**agg_kwargs)) == expected
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "expected"),
+    [
+        # The issue's own acceptance example: a daily table missing 100 days.
+        (
+            {
+                "min_value": "2024-01-01",
+                "max_value": "2024-10-26",
+                "day_aligned_fraction": 1.0,
+                "month_aligned_fraction": 0.0,
+                "day_distinct_periods": 200,
+                "day_largest_gap": 100,
+            },
+            ("day", 300, 200, 100, 100),
+        ),
+        # A complete daily table: zero missing, zero gap.
+        (
+            {
+                "min_value": "2024-01-01",
+                "max_value": "2024-01-10",
+                "day_aligned_fraction": 1.0,
+                "month_aligned_fraction": 0.0,
+                "day_distinct_periods": 10,
+                "day_largest_gap": 0,
+            },
+            ("day", 10, 10, 0, 0),
+        ),
+        # Monthly-snapshot table: values sit on month boundaries.
+        (
+            {
+                "min_value": "2024-01-01",
+                "max_value": "2024-08-01",
+                "day_aligned_fraction": 1.0,
+                "month_aligned_fraction": 1.0,
+                "month_distinct_periods": 8,
+                "month_largest_gap": 0,
+            },
+            ("month", 8, 8, 0, 0),
+        ),
+        # Real sub-day variation: hour grain. 2024-01-01T00:00 to
+        # 2024-01-02T00:00 spans 25 hours (inclusive).
+        (
+            {
+                "min_value": "2024-01-01T00:00:00",
+                "max_value": "2024-01-02T00:00:00",
+                "day_aligned_fraction": 0.3,
+                "month_aligned_fraction": 0.0,
+                "hour_distinct_periods": 20,
+                "hour_largest_gap": 3,
+            },
+            ("hour", 25, 20, 5, 3),
+        ),
+        # Genuinely sparse by nature (a rare event's timestamp): the
+        # statistic is neutral, just numbers, not a "broken" verdict.
+        (
+            {
+                "min_value": "2024-01-01",
+                "max_value": "2024-12-31",
+                "day_aligned_fraction": 1.0,
+                "month_aligned_fraction": 0.0,
+                "day_distinct_periods": 5,
+                "day_largest_gap": 200,
+            },
+            ("day", 366, 5, 361, 200),
+        ),
+        # No min/max at all: fail closed.
+        ({"min_value": None, "max_value": None}, None),
+        # No alignment evidence: this column was never temporal-eligible in
+        # the first place (min/max happen to be non-None, e.g. an integer
+        # column), so there is nothing to do date arithmetic on.
+        (
+            {
+                "min_value": 1,
+                "max_value": 300,
+                "day_aligned_fraction": None,
+                "month_aligned_fraction": None,
+            },
+            None,
+        ),
+    ],
+)
+def test_temporal_continuity_decisions(agg_kwargs: dict, expected):
+    from exmergo_dex_core.explore.profile import _temporal_continuity
+
+    assert _temporal_continuity(_aggregate(**agg_kwargs)) == expected
+
+
+def test_temporal_continuity_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _temporal_continuity
+
+    assert _temporal_continuity(None) is None
+
+
+def test_temporal_continuity_end_to_end_real_duckdb(tmp_path: Path):
+    """A daily table missing a deliberate 100-day gap reports it precisely;
+    a sibling complete daily table reports zero; a non-temporal column
+    reports nothing at all."""
+
+    import datetime as dt
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "continuity.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE gappy (id INTEGER, d DATE)")
+    conn.execute("CREATE TABLE complete (d DATE)")
+    base = dt.date(2024, 1, 1)
+    gappy_rows = [
+        (i, base + dt.timedelta(days=i)) for i in range(300) if not (100 <= i < 200)
+    ]
+    complete_rows = [(base + dt.timedelta(days=i),) for i in range(10)]
+    conn.executemany("INSERT INTO gappy VALUES (?, ?)", gappy_rows)
+    conn.executemany("INSERT INTO complete VALUES (?)", complete_rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        datasets = profile_fn(
+            adapter, ["continuity.main.gappy", "continuity.main.complete"]
+        )
+    finally:
+        adapter.close()
+
+    by_name = {d.identifier.rsplit(".", 1)[-1]: d for d in datasets}
+    gappy_id = next(c for c in by_name["gappy"].columns if c.name == "id")
+    gappy_d = next(c for c in by_name["gappy"].columns if c.name == "d")
+    complete_d = by_name["complete"].columns[0]
+
+    assert gappy_id.temporal_granularity is None  # not a temporal column at all
+    assert gappy_d.temporal_granularity == "day"
+    assert gappy_d.temporal_span == 300
+    assert gappy_d.temporal_distinct_periods == 200
+    assert gappy_d.temporal_missing_periods == 100
+    assert gappy_d.temporal_largest_gap == 100
+
+    assert complete_d.temporal_granularity == "day"
+    assert complete_d.temporal_span == 10
+    assert complete_d.temporal_missing_periods == 0
+    assert complete_d.temporal_largest_gap == 0
+
+
+def test_temporal_continuity_never_reported_for_pii_flagged_column(tmp_path: Path):
+    """#206: a PII-flagged date column (dob) gets no continuity stats at
+    any confidence, the same rule #204's type-contradiction checks use."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "dob.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("CREATE TABLE t (dob DATE)")
+    conn.executemany(
+        "INSERT INTO t VALUES (?)",
+        [(f"19{80 + i % 20}-01-01",) for i in range(50)],
+    )
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["dob.main.t"])
+    finally:
+        adapter.close()
+
+    col = dataset.columns[0]
+    assert col.pii is not None
+    assert col.temporal_granularity is None
+    assert col.temporal_missing_periods is None
+
+
+# --- heterogeneous-key-shape notes (#205) ---------------------------------------
+
+
+def test_key_shape_stats_requested_only_for_eligible_non_pii_string_columns():
+    """#205: string-only, unlike #204's type_stats -- a UUID/hex check is
+    meaningless on a column SQL already stores as a number -- and never a
+    PII-flagged column, at any confidence."""
+
+    from exmergo_dex_core.adapters.base import ColumnAggregate, ColumnMeta, ObjectMeta
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    class _Recorder:
+        name = "stub"
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.key_shape_requests: list[set[str]] = []
+            self.columns = [
+                ColumnMeta("id", "VARCHAR", False, 0),
+                ColumnMeta("count", "INTEGER", True, 1),
+                ColumnMeta("email", "VARCHAR", True, 2),
+            ]
+
+        def table_metadata(self, identifier):
+            meta = ObjectMeta(
+                identifier=identifier,
+                object_type="table",
+                schema="s",
+                name="t",
+                row_count=1,
+                byte_size=None,
+                column_count=len(self.columns),
+            )
+            return meta, self.columns
+
+        def column_aggregates(
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+            temporal_stats=None,
+        ):
+            self.key_shape_requests.append(set(key_shape_stats or set()))
+            return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
+
+    adapter = _Recorder()
+    profile_mod.profile(adapter, ["db.s.t"])
+    assert adapter.key_shape_requests == [{"id"}]
+
+
+@pytest.mark.parametrize(
+    ("agg_kwargs", "expect_substring"),
+    [
+        # The issue's own worked example: 90% numeric, 10% md5-shaped hex.
+        (
+            {
+                "numeric_string_fraction": 0.9,
+                "hex_string_fraction": 0.1,
+                "hex_string_min_length": 32,
+                "hex_string_max_length": 32,
+            },
+            "md5-shaped",
+        ),
+        # Homogeneous numeric: only one bucket clears the floor, no note.
+        ({"numeric_string_fraction": 1.0}, None),
+        # Homogeneous UUID: same, no note.
+        ({"uuid_string_fraction": 1.0}, None),
+        # Below the minority-share floor (4% < 5%): reads as noise, not a
+        # second real population.
+        ({"numeric_string_fraction": 0.96, "hex_string_fraction": 0.04}, None),
+        # Mixed-length hex: reported as a range, not a false fixed length.
+        (
+            {
+                "numeric_string_fraction": 0.5,
+                "hex_string_fraction": 0.5,
+                "hex_string_min_length": 24,
+                "hex_string_max_length": 64,
+            },
+            "24-64 characters, mixed length",
+        ),
+        # Three-way mix: numeric, uuid, and hex all present in meaningful share.
+        (
+            {
+                "numeric_string_fraction": 0.4,
+                "uuid_string_fraction": 0.3,
+                "hex_string_fraction": 0.3,
+                "hex_string_min_length": 40,
+                "hex_string_max_length": 40,
+            },
+            "sha1-shaped",
+        ),
+        # No evidence at all: fail closed.
+        ({}, None),
+    ],
+)
+def test_heterogeneous_key_note_decisions(agg_kwargs: dict, expect_substring):
+    from exmergo_dex_core.explore.profile import _heterogeneous_key_note
+
+    note = _heterogeneous_key_note("id", _aggregate(**agg_kwargs))
+    if expect_substring is None:
+        assert note is None, note
+    else:
+        assert note is not None and expect_substring in note, note
+
+
+def test_heterogeneous_key_note_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _heterogeneous_key_note
+
+    assert _heterogeneous_key_note("id", None) is None
+
+
+@pytest.mark.parametrize(
+    ("col_name", "agg_kwargs", "composite_members", "expected"),
+    [
+        # Single-column, proven unique, non-null: a candidate key.
+        ("id", {"is_unique": True, "null_fraction": 0.0}, set(), True),
+        # A composite-key member, even though not itself unique alone.
+        ("order_id", {"is_unique": False}, {"order_id", "line_no"}, True),
+        # Unique-looking but nullable: not a proven key (the same rule
+        # relationships.candidate_keys applies).
+        ("maybe_unique", {"is_unique": True, "null_fraction": 0.1}, set(), False),
+        # Plain non-unique string column: never a key, straight from the
+        # issue's own acceptance criteria ("a free-text column is not
+        # treated as key-shaped").
+        ("comments", {"is_unique": False, "null_fraction": 0.0}, set(), False),
+    ],
+)
+def test_is_candidate_key_matches_relationships_candidate_keys_rule(
+    col_name, agg_kwargs, composite_members, expected
+):
+    from exmergo_dex_core.explore.profile import _is_candidate_key
+
+    agg = _aggregate(name=col_name, **agg_kwargs)
+    assert _is_candidate_key(col_name, agg, composite_members) is expected
+
+
+def test_heterogeneous_key_end_to_end_real_duckdb(tmp_path: Path):
+    """A unique string id column mixing 90 numeric-shaped and 10 md5-shaped
+    values names both shapes and the consequence; a sibling homogeneous-UUID
+    key and a non-key free-text column with the same mixed content produce
+    no note (the issue's own three acceptance scenarios, in one table)."""
+
+    import hashlib
+    import uuid as uuid_lib
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "heterogeneous_key.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE t (id VARCHAR PRIMARY KEY, uid VARCHAR, comments VARCHAR)"
+    )
+    rows = [
+        (str(1000 + i), str(uuid_lib.uuid4()), "a mixed comment") for i in range(90)
+    ]
+    for i in range(10):
+        # md5-shaped test fixture data only, not a security use.
+        h = hashlib.md5(str(i).encode(), usedforsecurity=False).hexdigest()
+        rows.append((h, str(uuid_lib.uuid4()), "a mixed comment"))
+    conn.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["heterogeneous_key.main.t"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "id is a candidate key but mixes value shapes" in notes
+    assert "90% numeric" in notes and "10% 32-character hexadecimal" in notes
+    assert "md5-shaped" in notes
+    assert "casting to a number or comparing numerically" in notes
+    # The homogeneous UUID key and the non-key free-text column (not unique:
+    # "a mixed comment" repeats) both stay silent.
+    assert "uid" not in notes
+    assert "comments" not in notes
+
+
+# --- boolean-shaped flag with more than two values (#218) ----------------------
+
+
+def test_boolean_shaped_flag_note_names_the_domain_when_known():
+    """The issue's own worked example: a *_yn column with five values, named
+    with counts once the domain (#203) is known."""
+
+    from exmergo_dex_core.cache import ValueCount, ValueDomain
+    from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
+
+    agg = _aggregate(name="primary_ws_yn", distinct_count=5, distinct_count_exact=True)
+    domain = ValueDomain(
+        values=[
+            ValueCount(value="Y", count=40),
+            ValueCount(value="N", count=38),
+            ValueCount(value="Yes", count=10),
+            ValueCount(value="No", count=8),
+            ValueCount(value="1", count=4),
+        ]
+    )
+    note = _boolean_shaped_flag_note("primary_ws_yn", "VARCHAR", agg, domain)
+    assert note is not None
+    assert "primary_ws_yn" in note and "5 distinct non-null values" in note
+    assert "Y=40" in note and "No=8" in note
+
+
+@pytest.mark.parametrize(
+    ("col_name", "data_type", "agg_kwargs", "expect_note"),
+    [
+        # A *_yn column with more than two values but no domain known (it
+        # failed one of #203's own eligibility gates) still fires, on the
+        # count alone: not being able to name the values is not evidence
+        # there are only two of them.
+        (
+            "primary_ws_yn",
+            "VARCHAR",
+            {"distinct_count": 5, "distinct_count_exact": True},
+            True,
+        ),
+        # A clean two-value flag: no note.
+        (
+            "has_discount",
+            "VARCHAR",
+            {"distinct_count": 2, "distinct_count_exact": True},
+            False,
+        ),
+        # A three-valued flag: still fires, even though a third value could
+        # be a genuine third state rather than a defect -- the tool cannot
+        # tell those apart, and the acceptance criteria says it should not
+        # try.
+        (
+            "is_active",
+            "VARCHAR",
+            {"distinct_count": 3, "distinct_count_exact": True},
+            True,
+        ),
+        # A genuinely BOOLEAN-typed column: excluded outright, whatever its
+        # distinct count claims (it cannot really exceed two).
+        (
+            "is_active",
+            "BOOLEAN",
+            {"distinct_count": 5},
+            False,
+        ),
+        # A column whose name does not match any boolean-ish pattern: no
+        # note, however many values it holds.
+        (
+            "ws_stat_cd",
+            "VARCHAR",
+            {"distinct_count": 6},
+            False,
+        ),
+        # An approximate (not yet escalated) distinct count still fires,
+        # marked accordingly by the caller-visible "~".
+        (
+            "has_flag",
+            "VARCHAR",
+            {"distinct_count": 4, "distinct_count_exact": False},
+            True,
+        ),
+    ],
+)
+def test_boolean_shaped_flag_note_decisions(
+    col_name, data_type, agg_kwargs, expect_note
+):
+    from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
+
+    agg = _aggregate(name=col_name, **agg_kwargs)
+    note = _boolean_shaped_flag_note(col_name, data_type, agg, None)
+    if expect_note:
+        assert note is not None and col_name in note
+    else:
+        assert note is None
+
+
+def test_boolean_shaped_flag_note_absent_without_aggregate():
+    from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
+
+    assert _boolean_shaped_flag_note("is_active", "VARCHAR", None, None) is None
+
+
+def test_boolean_shaped_flag_end_to_end_real_duckdb(tmp_path: Path):
+    """The issue's own four acceptance scenarios, in one table: a *_yn column
+    with five values names them; a clean two-value flag and a genuinely
+    BOOLEAN column stay silent; a three-valued flag still fires."""
+
+    import duckdb
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.profile import profile as profile_fn
+
+    db_path = tmp_path / "boolean_flag.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE raw_workspaces ("
+        "primary_ws_yn VARCHAR, has_discount VARCHAR, is_native_bool BOOLEAN, "
+        "onboarding_stage_flag VARCHAR)"
+    )
+    yn_values = ["Y", "N", "Yes", "No", "1"]
+    stage_values = ["new", "active", "churned"]
+    rows = [
+        (yn_values[i % 5], "Y" if i % 2 == 0 else "N", True, stage_values[i % 3])
+        for i in range(100)
+    ]
+    conn.executemany("INSERT INTO raw_workspaces VALUES (?, ?, ?, ?)", rows)
+    conn.close()
+
+    adapter = DuckDBAdapter(path=db_path)
+    try:
+        (dataset,) = profile_fn(adapter, ["boolean_flag.main.raw_workspaces"])
+    finally:
+        adapter.close()
+
+    notes = " ".join(dataset.data_quality)
+    assert "primary_ws_yn looks boolean-shaped by name" in notes
+    assert "5 distinct non-null values" in notes
+    assert "Y=" in notes and "Yes=" in notes
+    assert "onboarding_stage_flag looks boolean-shaped by name" in notes
+    assert "3 distinct non-null values" in notes
+    assert "has_discount" not in notes
+    assert "is_native_bool" not in notes
 
 
 # --- pii_overrides: the durable human decision ---------------------------------
@@ -435,7 +1200,10 @@ def test_pii_override_clears_flag_with_audit_and_survives_reprofile(
         )
         (dataset,) = payload["data"]["datasets"]
         person = {c["name"]: c for c in dataset["columns"]}["name"]
-        assert person["pii"] is None
+        # The override cleared the only flag, so `pii` is null on every column
+        # and is suppressed rather than repeated (#290): absent here, named there.
+        assert "pii" not in person
+        assert "pii" in dataset["suppressed_fields"]
         assert person["pii_overridden"] == "name", "the audit trail"
         assert any("pii_overrides" in n for n in payload["data"]["notes"])
 
@@ -469,7 +1237,8 @@ def test_pii_override_pattern_clears_flag_with_audit(tpch_names_duckdb: Path, ca
     )
     (dataset,) = payload["data"]["datasets"]
     person = {c["name"]: c for c in dataset["columns"]}["name"]
-    assert person["pii"] is None
+    assert "pii" not in person  # suppressed as null on every column (#290)
+    assert "pii" in dataset["suppressed_fields"]
     assert person["pii_overridden"] == "name", "the audit trail"
     assert any("pii_overrides" in n for n in payload["data"]["notes"])
 
@@ -536,7 +1305,15 @@ def test_pii_override_pattern_clears_across_multiple_tables():
             return meta, columns
 
         def column_aggregates(
-            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+            temporal_stats=None,
         ):
             self.shape_requests.append(set(shape_stats or set()))
             return [ColumnAggregate(c.name, 0.0, 1, False, None, None) for c in columns]
@@ -1104,7 +1881,15 @@ class _StubAdapter:
         return meta, columns
 
     def column_aggregates(
-        self, identifier, columns, *, safe_min_max=None, shape_stats=None
+        self,
+        identifier,
+        columns,
+        *,
+        safe_min_max=None,
+        shape_stats=None,
+        type_stats=None,
+        key_shape_stats=None,
+        temporal_stats=None,
     ):
         from exmergo_dex_core.adapters.base import ColumnAggregate
 
@@ -1223,10 +2008,9 @@ def test_composite_probe_caps_the_pair_count():
     from exmergo_dex_core.explore import profile as profile_mod
 
     # Twelve columns with geometrically spread cardinalities: every pair
-    # survives the product test, and their products are spread widely enough
-    # that redundancy dedup (#168) leaves dozens of genuinely distinct
-    # candidates -- so the cap, not the dedup, is what keeps the probe
-    # bounded here.
+    # survives the product test, so dozens of candidates reach the cut. The cap
+    # is the only thing bounding the probe, which is the point: the redundancy
+    # rule orders candidates and never removes one (#377).
     approx = {}
     for i in range(6):
         approx[f"a{i}_id"] = 32 * (2**i)
@@ -1237,7 +2021,7 @@ def test_composite_probe_caps_the_pair_count():
     assert len(adapter.combo_calls[0]) == 5  # _COMPOSITE_PAIR_CAP
 
 
-def test_composite_probe_dedups_same_anchor_pairs_so_the_true_grain_survives():
+def test_composite_probe_ranks_same_anchor_pairs_last_so_the_true_grain_survives():
     """#168: several pairs crossing one low-cardinality dimension with
     different, equally uninteresting partners must not consume the entire
     cap and crowd out the true grain, which can legitimately score worse on
@@ -1246,9 +2030,9 @@ def test_composite_probe_dedups_same_anchor_pairs_so_the_true_grain_survives():
     from exmergo_dex_core.explore import profile as profile_mod
 
     # dim's five (dim, j_i) pairings all score identically (product == row
-    # count) and are near-duplicates of each other -- only one should survive
-    # as dim's representative. (date, dim) scores 5x worse but is a
-    # genuinely different hypothesis and must still get a slot.
+    # count) and are near-duplicates of each other -- only one should reach the
+    # cap ahead of anything else as dim's representative. (date, dim) scores 5x
+    # worse but is a genuinely different hypothesis and must still get a slot.
     approx = {"dim": 10, "date": 500, **{f"j{i}": 100 for i in range(1, 6)}}
     adapter = _StubAdapter(rows=1000, approx=approx, combos={("date", "dim"): 1000})
     datasets = profile_mod.profile(adapter, ["db.s.t"])
@@ -1315,6 +2099,83 @@ def test_composite_grain_detected_end_to_end(composite_grain_duckdb: Path, capsy
     orders = ds["orders"]
     assert orders["grain"] == ["order_key"]
     assert orders["composite_keys"] == []
+
+
+def test_composite_probe_fills_the_cap_rather_than_discarding_the_grain():
+    """#377: the redundancy rule orders candidates, it does not delete them.
+
+    A parent-plus-line fact table, six rows. ``(customer_id, order_id)`` is two
+    id-shaped columns so it ranks first, claims both anchors, and every pair
+    reusing either scores within the redundancy ratio of it. Dropping those left
+    two pairs probed out of a cap of five, one of them a pair that cannot be a
+    key, and the grain never asked about at all.
+    """
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(
+        rows=6,
+        approx={"order_id": 4, "line_number": 2, "customer_id": 4, "amount": 4},
+        combos={("order_id", "line_number"): 6},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_items"])
+
+    probed = adapter.combo_calls[0]
+    assert ["order_id", "line_number"] in probed
+    # Six pairs clear the necessary condition and the cap is five, so five are
+    # asked: no slot goes unused while a ranked candidate sits dropped.
+    assert len(probed) == profile_mod._COMPOSITE_PAIR_CAP
+
+    ds = datasets[0]
+    assert ds.composite_keys == [["order_id", "line_number"]]
+    assert rel_mod.detect_grain(ds) == ["order_id", "line_number"]
+    assert not any("grain unknown" in n for n in rel_mod.data_quality_notes(ds))
+
+
+def test_composite_probe_reports_the_minimal_grain_when_two_pairs_prove():
+    """Filling the cap makes two proven composites reachable on one table, and
+    consumers read the first entry as the grain. ``(order_id, product_id)`` is
+    two id-shaped columns so it wins the probe ranking, but it is a superkey of
+    the parent-plus-line grain, so the tighter pair has to come back first."""
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    adapter = _StubAdapter(
+        rows=1000,
+        approx={"order_id": 250, "line_number": 4, "product_id": 900},
+        combos={("order_id", "line_number"): 1000, ("product_id", "order_id"): 1000},
+    )
+    datasets = profile_mod.profile(adapter, ["db.s.order_items"])
+
+    ds = datasets[0]
+    assert ds.composite_keys == [
+        ["order_id", "line_number"],
+        ["product_id", "order_id"],
+    ]
+    assert rel_mod.detect_grain(ds) == ["order_id", "line_number"]
+
+
+def test_parent_line_grain_detected_end_to_end(parent_line_grain_duckdb: Path, capsys):
+    """The same shape against a real warehouse: the decoy pair outranks the
+    grain, both survive the necessary condition, and the profile reports the
+    grain rather than no key at all."""
+
+    payload = _run(
+        [
+            "explore",
+            "profile",
+            "order_items",
+            "--path",
+            str(parent_line_grain_duckdb),
+        ],
+        capsys,
+    )
+    ds = payload["data"]["datasets"][0]
+    assert ds["composite_keys"] == [["order_id", "line_number"]]
+    assert ds["grain"] == ["order_id", "line_number"]
+    assert not any("grain unknown" in n for n in ds["data_quality"])
 
 
 # --- value-domain reporting (#203) -----------------------------------------------
@@ -1390,6 +2251,32 @@ def test_value_domain_excluded_when_fraction_exceeds_cutoff_on_small_table():
     datasets = profile_mod.profile(adapter, ["db.s.t"])
     assert adapter.domain_calls == []
     assert datasets[0].columns[0].value_domain is None
+
+
+def test_no_column_can_have_a_value_domain_below_the_minimum_row_count():
+    """The fraction implies a floor on rows, and a metered adapter reserves
+    budget against that floor rather than against the fraction it cannot
+    evaluate before the scan (issue #299). This pins the two together: below
+    VALUE_DOMAIN_MIN_ROWS not even the narrowest possible column qualifies, so
+    an estimator that skips the reserve there skips a query that cannot run."""
+
+    from exmergo_dex_core.adapters.base import (
+        VALUE_DOMAIN_MIN_ROWS,
+        ValueDomainSample,
+    )
+    from exmergo_dex_core.explore import profile as profile_mod
+
+    below = _StubAdapter(rows=VALUE_DOMAIN_MIN_ROWS - 1, approx={"code": 1})
+    profile_mod.profile(below, ["db.s.t"])
+    assert below.domain_calls == []
+
+    at_bar = _StubAdapter(
+        rows=VALUE_DOMAIN_MIN_ROWS,
+        approx={"code": 1},
+        domains={"code": ValueDomainSample(values=[("x", 10)], total_distinct=1)},
+    )
+    profile_mod.profile(at_bar, ["db.s.t"])
+    assert at_bar.domain_calls == [["code"]]
 
 
 def test_value_domain_excluded_for_composite_key_member():
@@ -1541,7 +2428,15 @@ def test_row_count_refreshes_after_the_aggregate_scan():
             ]
 
         def column_aggregates(
-            self, identifier, columns, *, safe_min_max=None, shape_stats=None
+            self,
+            identifier,
+            columns,
+            *,
+            safe_min_max=None,
+            shape_stats=None,
+            type_stats=None,
+            key_shape_stats=None,
+            temporal_stats=None,
         ):
             self.scanned = True
             return [

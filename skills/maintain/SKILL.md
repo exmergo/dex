@@ -1,6 +1,6 @@
 ---
 name: maintain
-description: 'Use this to keep a dbt project correct as the warehouse and the business change. It detects drift on four axes and proposes the fix: schema drift (source columns and tables added, dropped, retyped, or renamed), volume drift (a row count that collapsed, a table that emptied, a load that half-failed), grain drift (a key that lost uniqueness, a changed row-per-entity cardinality, an increased join fanout), and semantic drift (a metric, measure, dimension, or entity definition that no longer matches, new categorical values, dangling semantic references). Trigger it for requests like "what changed in the warehouse", "did anything drift", "is my dbt project still in sync", "my primary key has duplicates now", "the row count dropped", "did the load run", "the data stopped flowing", "the revenue metric definition changed", "reconcile my models with the source schema", or "which models are stale". It reads the .dex/ snapshot and proposes reviewable diffs; it never overwrites hand-written work. Do not use it to author new dbt models or metrics from scratch (use transform) or to explore an unfamiliar warehouse (use explore).'
+description: 'Use this to keep a dbt project correct as the warehouse and the business change. It detects drift on four axes and proposes the fix: schema drift (source columns and tables added, dropped, retyped, or renamed), volume drift (a row count that collapsed, a table that emptied, a load that half-failed), grain drift (a key that lost uniqueness, a changed row-per-entity cardinality, an increased join fanout), and semantic drift (a metric, measure, dimension, or entity definition that no longer matches, new categorical values, dangling semantic references). Reach for this when something that used to work has started failing or producing different numbers and the cause is more likely upstream than in the code you just wrote: a test that began failing with no code change, a dashboard whose numbers moved, a model that is suddenly empty or duplicated. Trigger it for requests like "what changed in the warehouse", "did anything drift", "is my dbt project still in sync", "my primary key has duplicates now", "the row count dropped", "did the load run", "the data stopped flowing", "the revenue metric definition changed", "reconcile my models with the source schema", or "which models are stale". It reads the .dex/ snapshot and proposes reviewable diffs; it never overwrites hand-written work. To author new models or metrics from scratch, use transform. To learn an unfamiliar warehouse for the first time, use explore.'
 ---
 
 # Maintain
@@ -37,8 +37,25 @@ mistaken for a clean bill.
 ## How to drive it
 
 ```bash
-uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
+
+dex runs its engine through `uv`, which is a prerequisite and is not installed by
+Claude Code. If the shell reports `uv: command not found`, stop and tell the user
+to install it (`curl -LsSf https://astral.sh/uv/install.sh | sh`, or
+`brew install uv`, or `pipx install uv`), then re-run. Never fall back to diffing
+the warehouse against the project by hand instead: the drift axes and the baseline
+comparison live in the engine, so any other path is guesswork.
+
+The first command in a fresh environment installs the engine, so it can take tens
+of seconds where later ones take well under a second. `--warm` pays that install up
+front and exits without running anything:
+
+```bash
+uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" --warm
+```
+
+Offer it once at setup. It is not something to run before an ordinary command.
 
 - `maintain snapshot` captures or refreshes the baseline. Run it after a clean
   explore or transform session so later runs have a known-good reference. It pins
@@ -56,9 +73,18 @@ uv run "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 - `maintain volume [<objects>]` detects **freshness drift**: row counts that
   collapsed, spiked, or went to zero. This is the "is the data still flowing
   correctly?" axis, distinct from "did the shape change?".
-- `maintain grain [<objects>]` detects **grain drift**: a declared primary or
-  unique key that now has duplicates, a changed row-per-entity cardinality, or an
-  increased join fanout. Uses aggregates, never raw rows.
+- `maintain grain [<objects>]` detects **grain drift**: a key that now has
+  duplicates, a changed row-per-entity cardinality, or an increased join fanout.
+  It also re-verifies the grains your project *declares* (a model-level
+  `unique_combination_of_columns`), which measurement on its own can miss. Uses
+  aggregates, never raw rows.
+
+  Two findings come out of the uniqueness checks and the difference is the
+  baseline. `key_lost_uniqueness` is a key that was proven unique and is not any
+  more: something changed in the data. `declared_grain_not_unique` is a declared
+  combination that does not hold, and nothing changed at all: the project asserts
+  a grain the data never had, so the fix is to the declaration (widen it, dedup
+  upstream, or drop the claim) rather than to the data.
 - `maintain semantic [<objects>]` detects **definition drift**: metric, measure,
   dimension, or entity definitions that changed against the baseline; semantic
   references that no longer resolve to a model or column; and categorical
@@ -73,7 +99,8 @@ depth, then `reconcile` to get the proposed fix.
 ## Per-axis cost: what is free and what scans
 
 Detection is read-only, but read-only is not the same as free on a metered
-connector (BigQuery, Snowflake, Databricks, Postgres, Redshift). The axes split:
+connector (BigQuery, Snowflake, Databricks, Postgres, Redshift, ClickHouse).
+The axes split:
 
 - **Schema, volume, and the reference/definition half of semantic are free**
   everywhere: they read metadata and the snapshot, and run immediately.
@@ -84,9 +111,15 @@ connector (BigQuery, Snowflake, Databricks, Postgres, Redshift). The axes split:
   units, get an explicit budget, and re-issue the same command with
   `--confirm --budget <magnitude>` in the paradigm's unit (bytes on BigQuery,
   warehouse-seconds on Snowflake and Databricks, compute-seconds on Redshift,
-  database-seconds on Postgres). Never invent a budget the user did not agree
+  database-seconds on Postgres and
+  ClickHouse). Never invent a budget the user did not agree
   to, and never retry with a raised budget on an over-ceiling refusal without
-  asking.
+  asking. An over-ceiling
+  refusal carries a calibration line from `.dex/spend.jsonl` (what this
+  connector's recent commands billed as a fraction of estimate, or a sentence
+  saying there is too little history to say): relay it, and note that the
+  ceiling binds on the estimate, so a budget set at that fraction of the
+  estimate is refused again.
 - **`check` and `semantic` answer first and offer second.** Their free axes
   complete on every call, so the envelope is `ok` and the findings in it are
   final. The price of the scanning axes sits in `data.offer`, with `axes` naming
@@ -102,6 +135,13 @@ connector (BigQuery, Snowflake, Databricks, Postgres, Redshift). The axes split:
 
 On DuckDB everything is free and local, so nothing prompts.
 
+A `needs_confirmation` envelope carrying `suggested_session_ceiling` is the
+project's one-time ask for a *cumulative* daily cap, separate from the
+per-command `--budget`. Surface it, get the user's answer, and add
+`--session-ceiling <value>` or `--no-session-ceiling` to the same re-issue; it is
+written to `.dex/config.yml` once and never asked again. Never answer it for
+them.
+
 ## Reconcile proposals are mechanical or advisory
 
 Reconcile tags every proposal by `kind`, because the fix differs sharply by axis:
@@ -112,7 +152,11 @@ Reconcile tags every proposal by `kind`, because the fix differs sharply by axis
 - **`advisory`**: grain, volume, and semantic drift are decisions, not auto-fixes
   (dex cannot dedup your warehouse or decide whether a new `'refunded'` status
   belongs in a metric). The proposal is the decision surfaced, at most backed by a
-  test edit that makes the break visible in builds.
+  test edit that makes the break visible in builds. It declines that test where
+  the test would be wrong: if your model declares a composite grain covering the
+  column, no column-level `unique` is proposed on it, and the warning names the
+  combination so you can tell "re-baseline, this is still the grain" from
+  "something relied on that column alone".
 
 When reconcile produces edits it stores them as a plan and prints a `plan_id`.
 Apply them with `transform apply <plan-id>` (the one apply door): a human edit made

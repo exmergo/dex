@@ -37,12 +37,19 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
-from ..errors import PrerequisiteError, ProjectError, RepoRootRequiredError
+from ..errors import DexError, PrerequisiteError, ProjectError, RepoRootRequiredError
 from ..results import ConfirmationRequest, to_envelope
-from ..storage import Document, FilesystemStore, MaintainStore
+from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
 from . import snapshot as snapshot_mod
-from .results import DriftResult, LayerFingerprint, ReconcileResult, SnapshotResult
+from . import verify as verify_mod
+from .results import (
+    DriftResult,
+    LayerFingerprint,
+    ReconcileResult,
+    SnapshotResult,
+    VerifyResult,
+)
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -234,6 +241,39 @@ def _require_baseline(store: MaintainStore) -> snapshot_mod.Snapshot:
     return snap
 
 
+def _stored_drift(store: MaintainStore) -> drift_mod.DriftReport | None:
+    """The stored drift report, treating one that will not parse as absent.
+
+    The opposite policy from :func:`_require_baseline`, and the reason is the one
+    already written down beside ``DRIFT_SCHEMA_VERSION`` in :mod:`.drift`: the
+    baseline is *vouched for* and nothing else reproduces it, while a drift
+    report is *derived* and `maintain check` regenerates it from the baseline on
+    demand. So a document this engine cannot read has a cheap correct answer here
+    that the baseline does not have, and that note pre-committed to this one:
+    "treat it as absent and rebuild, rather than refuse".
+
+    Both callers already have an absent path, so this widens a handled state
+    rather than adding one. ``_record_axes`` discards a report measured against a
+    different baseline wholesale, which is the same "throw it away and remeasure"
+    it now does for an unparseable one; ``reconcile`` raises
+    :class:`NoBaselineError` naming `maintain check`, which is the correct remedy
+    for a report that cannot be read as much as for one that was never written.
+
+    ⚠️ Deliberately silent about *which* of the two happened, unlike the cache and
+    the baseline. Rebuilding is free and automatic here, so an operator has
+    nothing to decide and a warning would be noise on a path that self-heals.
+    """
+
+    try:
+        return store.load_drift()
+    except ValueError:
+        # Same convention as `_require_baseline` and `readable_cache`: a backend
+        # signals "this document will not parse" with a ValueError, whatever its
+        # own deserializer raises. Swallowed rather than classified because the
+        # remedy runs itself on the very next line of both callers.
+        return None
+
+
 def snapshot(engine: DexEngine) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
@@ -247,7 +287,7 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
     config = engine.config
     warnings: list[str] = []
 
-    cache = store.load_cache()
+    cache = readable_cache(store)
     requested = engine.connector or config.connector
     usable = cache is not None and bool(cache.datasets)
     if usable and cache.provenance.connector not in (None, requested):
@@ -377,12 +417,15 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
     scope_names = list(objects or [])
     scope = _resolve_scope(scope_names, current, snap)
     findings = drift_mod.schema_drift(current, snap, scope, current_transform)
+    # Not scoped by `objects`: a model's identifier is its project name, not a
+    # warehouse identifier, and `scope` above is resolved against the latter.
+    findings.extend(drift_mod.transform_drift(current_transform, snap))
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
-    _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"schema": (ranked, scope_names)})
     result = _drift_result(
-        {"schema": ranked},
+        by_axis,
         snap,
         store,
         warnings=warnings
@@ -397,7 +440,13 @@ def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRe
 def volume_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """A row count that collapsed, a table that emptied, a load that half-failed."""
 
-    return _detect_free_axis(engine, "volume", drift_mod.volume_drift, objects)
+    return _detect_free_axis(
+        engine,
+        "volume",
+        drift_mod.volume_drift,
+        objects,
+        noter=drift_mod.uncomparable_volume,
+    )
 
 
 def cmd_schema(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -429,30 +478,45 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         if scope_names
         else None
     )
-    plan = drift_mod.grain_plan(adapter, snap, scope)
-    if plan.key_checks or plan.fanout_pairs or plan.composite_checks:
+    plan = drift_mod.grain_plan(
+        adapter, snap, scope, engine.project_format().definitions()
+    )
+    if (
+        plan.key_checks
+        or plan.fanout_pairs
+        or plan.composite_checks
+        or plan.declared_composite_checks
+    ):
         estimate, per_table = drift_mod.grain_estimate(adapter, plan)
         command_args.billed_handshake(
             "maintain grain", adapter, estimate, per_table=per_table
         )
     findings = drift_mod.grain_drift(
-        adapter, plan, timeout_seconds=engine.config.query.timeout_seconds
+        adapter,
+        plan,
+        timeout_seconds=engine.config.query.timeout_seconds,
+        min_rows=engine.config.maintain.grain_min_rows,
     )
     noted = {dataset.identifier for dataset, _keys, _rows in plan.key_checks} | {
-        dataset.identifier for dataset, _combos, _rows in plan.composite_checks
+        dataset.identifier
+        for dataset, _combos, _rows in plan.composite_checks
+        + plan.declared_composite_checks
     }
-    notes = _adapter_notes(adapter, sorted(noted))
+    notes_by_identifier = _adapter_notes_by_identifier(adapter, sorted(noted))
+    _qualify_uniqueness_findings(findings, notes_by_identifier)
+    notes = _flatten_adapter_notes(notes_by_identifier)
 
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
-    _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"grain": (ranked, scope_names)})
     result = _drift_result(
-        {"grain": ranked},
+        by_axis,
         snap,
         store,
         warnings=_grain_baseline_warnings(snap)
         + _column_detail_warnings(snap)
         + _baseline_warnings(store, snap, engine.config.profile_freshness_hours)
+        + plan.notes
         + notes,
     )
     return command_args.stamp_spend(result, adapter)
@@ -460,6 +524,104 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
 
 def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _drift_envelope(grain_drift(engine, getattr(args, "objects", None)))
+
+
+def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
+    """Is the project correct right now, with no baseline required (#224).
+
+    The first finding class (#225): build-status gaps read from the compiled
+    manifest and the last run's ``run_results.json`` (failed nodes, nodes
+    skipped by a failed parent), plus models the project declares that have
+    no relation in the warehouse. Entirely free: the manifest/run-results
+    read touches no connection, and the relation check reads only cheap
+    object metadata, never a scan.
+
+    A project that does not compile is reported first and suppresses every
+    other check here, since a finding computed from a manifest a broken
+    project could not have produced honestly is not a finding at all
+    (#172's inertness requirement, #225's third acceptance bullet).
+    """
+
+    from pathlib import Path
+
+    suppressed: dict[str, str] = {}
+    try:
+        project_dir = Path(engine.project_dir())
+    except (ProjectError, RepoRootRequiredError) as exc:
+        return VerifyResult(
+            suppressed={
+                "build_status": str(exc),
+                "no_relation": str(exc),
+                "compile": str(exc),
+            },
+            warnings=[f"maintain verify needs a dbt project: {exc}"],
+        )
+
+    findings: list = []
+    compile_finding, compile_notes = verify_mod.compile_check(project_dir)
+    if compile_finding is not None:
+        findings.append(compile_finding)
+        reason = "the project does not compile"
+        result = VerifyResult(
+            findings=drift_mod.rank_findings(findings),
+            suppressed={"build_status": reason, "no_relation": reason},
+            warnings=[
+                "build-status and no-relation findings suppressed: the project "
+                "does not compile, so its manifest cannot be trusted"
+            ],
+        )
+        return result
+
+    warnings = list(compile_notes)
+    build_findings, build_notes = verify_mod.build_status_findings(project_dir)
+    findings.extend(build_findings)
+    warnings.extend(build_notes)
+    if build_notes:
+        suppressed["build_status"] = build_notes[0]
+
+    definitions = engine.project_format().definitions()
+    cost = None
+    if not definitions.present:
+        suppressed["no_relation"] = "no dbt project found"
+    else:
+        model_relations = {
+            name: relation
+            for name, relation in definitions.model_relations.items()
+            if "." not in name
+        }
+        try:
+            adapter = engine._adapter("maintain verify")
+        except DexError as exc:
+            suppressed["no_relation"] = f"warehouse unreachable: {exc}"
+        else:
+            cost = command_args.preflight_cost(adapter)
+            live = [o.identifier for o in adapter.list_objects()]
+            already = {f.identifier for f in findings if f.identifier}
+            findings.extend(
+                verify_mod.missing_relation_findings(model_relations, live, already)
+            )
+
+    if objects:
+        wanted = {
+            name.strip().lower()
+            for raw in objects
+            for name in raw.split(",")
+            if name.strip()
+        }
+        findings = [f for f in findings if (f.identifier or "").lower() in wanted]
+
+    result = VerifyResult(
+        findings=drift_mod.rank_findings(findings),
+        suppressed=suppressed,
+        warnings=warnings,
+    )
+    if cost is not None:
+        result.cost = cost
+    return result
+
+
+def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(verify(engine, getattr(args, "objects", None)))
 
 
 def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
@@ -525,7 +687,7 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
         )
 
     ranked = drift_mod.rank_findings(free_findings + billed_findings)
-    _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
     # Identical warnings either way. Every reason this baseline may not describe
     # the warehouse bounds the free findings exactly as it bounds the settled
     # ones, and the unconfirmed call is the one a session makes first, so it is
@@ -536,10 +698,10 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     if offer is not None:
         # The free half is complete and real, so it returns as the answer it is,
         # with the scanning half offered on top rather than gating it.
-        result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
+        result = _drift_result(by_axis, snap, store, warnings=warnings)
         result.pending_offer = offer
         return result
-    result = _drift_result({"semantic": ranked}, snap, store, warnings=warnings)
+    result = _drift_result(by_axis, snap, store, warnings=warnings)
     return command_args.stamp_spend(result, adapter)
 
 
@@ -598,7 +760,11 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     schema_findings = drift_mod.schema_drift(
         current_datasets, snap, scope, current_transform
     )
+    # Not scoped by `objects`, same reason as in schema_drift(): a model's
+    # identifier is its project name, not a warehouse identifier.
+    schema_findings.extend(drift_mod.transform_drift(current_transform, snap))
     volume_findings = drift_mod.volume_drift(current_datasets, snap, scope)
+    warnings.extend(drift_mod.uncomparable_volume(current_datasets, snap, scope))
     semantic_findings = (
         _semantic_scope(
             drift_mod.semantic_free_drift(
@@ -610,10 +776,19 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         else []
     )
 
-    plan = drift_mod.grain_plan(adapter, snap, scope)
+    plan = drift_mod.grain_plan(
+        adapter, snap, scope, engine.project_format().definitions()
+    )
+    # Added before both returns, so a declared grain the survey could not reach
+    # is reported whether the scans run or stop at the handshake.
+    warnings.extend(plan.notes)
     checks = drift_mod.cardinality_plan(current_semantic, snap, names)
     scans_needed = bool(
-        plan.key_checks or plan.fanout_pairs or plan.composite_checks or checks
+        plan.key_checks
+        or plan.fanout_pairs
+        or plan.composite_checks
+        or plan.declared_composite_checks
+        or checks
     )
     offer: ConfirmationRequest | None = None
     if scans_needed and command_args.cost_gate(adapter) is not None:
@@ -662,15 +837,18 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         }
         if project_available:
             by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-        _record_axes(
+        axis_results = _record_axes(
             store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
         )
-        result = _drift_result(by_axis, snap, store, warnings=warnings)
+        result = _drift_result(axis_results, snap, store, warnings=warnings)
         result.pending_offer = offer
         return result
 
     grain_findings = drift_mod.grain_drift(
-        adapter, plan, timeout_seconds=config.query.timeout_seconds
+        adapter,
+        plan,
+        timeout_seconds=config.query.timeout_seconds,
+        min_rows=config.maintain.grain_min_rows,
     )
     semantic_findings = semantic_findings + _semantic_scope(
         drift_mod.cardinality_drift(adapter, checks, current_semantic), scope_names
@@ -684,10 +862,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     }
     if project_available:
         by_axis["semantic"] = drift_mod.rank_findings(semantic_findings)
-    _record_axes(
+    axis_results = _record_axes(
         store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
     )
-    result = _drift_result(by_axis, snap, store, warnings=warnings)
+    result = _drift_result(axis_results, snap, store, warnings=warnings)
     return command_args.stamp_spend(result, adapter)
 
 
@@ -715,13 +893,13 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import DbtProject
+    from ..adapters.project import PlacingProject, placement_gap
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
     store = engine.store
     snap = _require_baseline(store)
-    report = store.load_drift()
+    report = _stored_drift(store)
     if report is None:
         raise NoBaselineError(
             "no drift report yet; run `maintain check` (or a focused detector) "
@@ -758,12 +936,24 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             "Reconcile what these findings describe wherever your models are "
             "actually defined"
         )
-    elif not isinstance(editable, DbtProject):
+    elif not isinstance(editable, PlacingProject):
+        # A format holding some of `PlacingProject` and not the rest gets told
+        # which member is missing, because the general message below would send
+        # it to the ones it already wrote. That is the difference between the
+        # gap being reported here and it surfacing as `AttributeError` from
+        # inside the reconcile the tier check already let through.
         warnings.append(
-            f"the '{editable.name}' project format implements the write tier, but "
-            "reconcile's mechanical edits are dbt artifacts (a staging model and "
-            "its schema YAML) and dex cannot yet author them for another format, "
-            "so every proposal below is advisory"
+            placement_gap(editable)
+            or (
+                f"the '{editable.name}' project format implements the write tier, "
+                "but does not say where a proposed edit lands, so reconcile has no "
+                "path to plan an edit against and every proposal below is "
+                "advisory. A format reaches this path by implementing "
+                "`PlacingProject`: `load` returns the view an edit is pinned "
+                "against, `edit_path` answers where an edit of a given kind goes "
+                "and may decline a kind by answering None, and `editing_surface` "
+                "declares the region those paths must stay inside"
+            )
         )
     else:
         try:
@@ -771,14 +961,31 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         except (ProjectError, ValueError) as exc:
             raise ProjectError(f"reconcile edits a project: {exc}") from exc
 
+    # Hoisted rather than inlined into the call: this load can now refuse, and a
+    # refusal raised from inside an argument list reads as though `build` did it.
+    cache = readable_cache(store)
+
+    # What the project declares, which is a different question from what its
+    # files contain. `view` carries the bytes an edit is pinned against; this
+    # carries the grain, and an edit that contradicts a declared grain is one no
+    # format is obliged to keep. Tier 1, so it cannot raise.
+    definitions = engine.project_format().definitions()
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
-        store.load_cache(),
+        cache,
         view,
         pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        placement=editable if isinstance(editable, PlacingProject) else None,
+        definitions=definitions,
     )
     warnings.extend(build_warnings)
+    # Reconcile was the one project-reading command that dropped these, and the
+    # declarations channel is one no command read at all: a format that says it
+    # could not supply something says it here too, where an edit is at stake.
+    warnings.extend(
+        _layer_notes(definitions, snap.transform_layer, snap.semantic_layer)
+    )
 
     result = ReconcileResult(proposals=proposals, warnings=warnings)
     # A plan is pinned to the directory its edits were planned against, so there is
@@ -792,7 +999,17 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             f"maintain reconcile {drift_class}" if drift_class else "maintain reconcile"
         )
         plan, diffs, plan_warnings = plans_mod.plan(
-            intent, edits, project_dir=view.root, repo_root=repo_root, store=store
+            intent,
+            edits,
+            project_dir=view.root,
+            repo_root=repo_root,
+            store=store,
+            # The format that placed these edits also validates them. Passing it
+            # is what keeps the two halves of the check on the same project: the
+            # surface each path must land in, and the file each edit is pinned
+            # against. dbt reaches the identical checks through this argument as
+            # it did without it, and reuses the view it already loaded.
+            project_format=editable,
         )
         result.diffs = diffs
         result.warnings.extend(plan_warnings)
@@ -824,10 +1041,15 @@ def cmd_reconcile(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def _detect_free_axis(
-    engine: DexEngine, axis: str, detector, objects: list[str] | None
+    engine: DexEngine, axis: str, detector, objects: list[str] | None, noter=None
 ) -> DriftResult:
     """One metadata-only detector: free on every connector, so no handshake.
-    The cost stamp still reflects the connector's paradigm for the caller."""
+    The cost stamp still reflects the connector's paradigm for the caller.
+
+    ``noter`` reports what the detector could not examine, over the same inputs.
+    An axis that silently declines to check an object is indistinguishable from
+    one that checked and found nothing, and the two mean opposite things.
+    """
 
     store = engine.store
     snap = _require_baseline(store)
@@ -843,12 +1065,13 @@ def _detect_free_axis(
     drift_mod.annotate_impacts(findings, snap)
     ranked = drift_mod.rank_findings(findings)
 
-    _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
+    by_axis = _record_axes(store, snap, connector, {axis: (ranked, scope_names)})
     result = _drift_result(
-        {axis: ranked},
+        by_axis,
         snap,
         store,
-        warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours),
+        warnings=_baseline_warnings(store, snap, engine.config.profile_freshness_hours)
+        + (noter(current, snap, scope) if noter is not None else []),
     )
     result.cost = cost
     return result
@@ -890,26 +1113,29 @@ def _record_axes(
     snap: snapshot_mod.Snapshot,
     connector: str | None,
     results: dict[str, tuple[list[drift_mod.DriftFinding], list[str]]],
-) -> None:
+) -> dict[str, drift_mod.AxisResult]:
     """Merge this run's axes into the stored drift report. Axes merge across runs so
     a focused detector refreshes only itself, but never across baselines:
     findings measured against an older snapshot are dropped wholesale."""
 
-    report = store.load_drift()
+    report = _stored_drift(store)
     if report is None or report.snapshot_created_at != snap.created_at:
         report = drift_mod.DriftReport()
     report.connector = connector
     report.snapshot_created_at = snap.created_at
     run_at = datetime.now(UTC).isoformat()
+    current: dict[str, drift_mod.AxisResult] = {}
     for axis, (findings, scope_names) in results.items():
-        report.axes[axis] = drift_mod.AxisResult(
+        current[axis] = drift_mod.AxisResult(
             run_at=run_at, scope=scope_names or None, findings=findings
         )
+        report.axes[axis] = current[axis]
     store.save_drift(report)
+    return current
 
 
 def _drift_result(
-    by_axis: dict[str, list[drift_mod.DriftFinding]],
+    by_axis: dict[str, drift_mod.AxisResult],
     snap: snapshot_mod.Snapshot,
     store: MaintainStore,
     *,
@@ -917,9 +1143,9 @@ def _drift_result(
 ) -> DriftResult:
     return DriftResult(
         findings=drift_mod.rank_findings(
-            [finding for findings in by_axis.values() for finding in findings]
+            [finding for result in by_axis.values() for finding in result.findings]
         ),
-        by_axis={axis: len(findings) for axis, findings in by_axis.items()},
+        by_axis=by_axis,
         snapshot_created_at=snap.created_at,
         warehouse_from=snap.warehouse_from,
         drift_path=store.locator(Document.DRIFT),
@@ -1003,6 +1229,12 @@ def _layer_notes(*layers: object) -> list[str]:
     project. Surfacing one side would leave the other axis's limits unexplained.
     In practice both come from the same format and say the same thing, so the
     common case deduplicates to one line.
+
+    Anything carrying ``notes`` is accepted, not only the two snapshot layers.
+    ``ProjectDefinitions`` carries them on the declarations channel, which is
+    where a format explains an ambiguous or unreadable project, and reconcile
+    reads that one because a declaration it could not see is the difference
+    between declining an edit and proposing a wrong one.
     """
 
     seen: list[str] = []
@@ -1017,13 +1249,61 @@ def _adapter_notes(adapter, identifiers: list[str]) -> list[str]:
     """Surface the adapter's per-table notes (e.g. a skipped distinct-count
     escalation on a tight budget) so a silent skip never reads as a clean bill."""
 
+    return _flatten_adapter_notes(_adapter_notes_by_identifier(adapter, identifiers))
+
+
+def _adapter_notes_by_identifier(
+    adapter, identifiers: list[str]
+) -> dict[str, list[str]]:
+    """Collect adapter notes by table so command payloads can attach qualifying
+    facts to the findings they qualify, not only to envelope warnings."""
+
     hook = getattr(adapter, "table_notes", None)
     if hook is None:
-        return []
-    notes: list[str] = []
+        return {}
+    notes: dict[str, list[str]] = {}
     for identifier in identifiers:
-        notes.extend(f"{identifier}: {note}" for note in hook(identifier) or [])
+        table_notes = list(hook(identifier) or [])
+        if table_notes:
+            notes[identifier] = table_notes
     return notes
+
+
+def _flatten_adapter_notes(notes: dict[str, list[str]]) -> list[str]:
+    return [
+        f"{identifier}: {note}"
+        for identifier, table_notes in notes.items()
+        for note in table_notes
+    ]
+
+
+def _qualify_uniqueness_findings(
+    findings: list[drift_mod.DriftFinding], notes_by_identifier: dict[str, list[str]]
+) -> None:
+    for finding in findings:
+        if (
+            finding.code != "key_lost_uniqueness"
+            or finding.identifier not in notes_by_identifier
+        ):
+            continue
+        merge_notes = [
+            note
+            for note in notes_by_identifier[finding.identifier]
+            if _final_note(note)
+        ]
+        if not merge_notes:
+            continue
+        finding.severity = "medium"
+        finding.data["table_notes"] = merge_notes
+        finding.detail = (
+            f"{finding.detail}; this count is over stored parts before "
+            "ClickHouse FINAL, so the adapter note qualifies whether this is "
+            "merge timing or modeled-grain drift"
+        )
+
+
+def _final_note(note: str) -> bool:
+    return "FINAL" in note and "MergeTree" in note
 
 
 def _semantic_names(scope_names: list[str]) -> set[str]:
@@ -1084,7 +1364,7 @@ def _baseline_warnings(
     """
 
     warnings: list[str] = []
-    cache = store.load_cache()
+    cache = readable_cache(store)
     if (
         cache is not None
         and cache.provenance.updated_at

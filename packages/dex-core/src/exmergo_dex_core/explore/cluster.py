@@ -53,6 +53,14 @@ class ClusterDependencyError(ClusterError):
 # reason `references/redshift.md` refuses to ship a sampling threshold there.
 _SEEDABLE_DIALECTS = frozenset({"duckdb"})
 
+# `_sample_parts`'s fallthrough note for a dialect it has no case for (#313): a
+# connector added without a sampling entry here does not fail, it silently
+# scans the whole table, bounded only by the cost gate. Named so the caller can
+# escalate it to a warning rather than let it read as an ordinary informational
+# note; `test_cluster.py` also asserts every dialect in the adapter registry
+# gets a real sample clause and never reaches this branch.
+UNRECOGNIZED_DIALECT_NOTE = "no sample clause (unrecognized dialect)"
+
 
 def sample_is_repeatable(dialect: str, seed: int | None) -> bool:
     """Whether this dialect's sample clause draws the same rows twice."""
@@ -109,9 +117,17 @@ def _sample_parts(
         # No TABLESAMPLE on Redshift: a random-ordered top-N is the portable
         # sample. It is a full scan bounded by the budget, so the note says so.
         return "", f" ORDER BY RANDOM() LIMIT {n}", f"ORDER BY RANDOM() LIMIT {n}"
+    if dialect == "clickhouse":
+        # ClickHouse has SAMPLE, but only on a table that declared a sampling
+        # expression in its MergeTree key, which most do not. Emitting it
+        # unconditionally would fail on the common case, and falling through to
+        # the unknown-dialect branch would silently scan everything, so this
+        # takes Redshift's shape: a random-ordered top-N, a full scan bounded by
+        # the budget, described honestly in the note.
+        return "", f" ORDER BY rand() LIMIT {n}", f"ORDER BY rand() LIMIT {n}"
     # Unknown dialect: no sampling clause. The row-cap on the fetch and the cost
     # gate still bound the work; column pruning still limits the scan.
-    return "", "", "no sample clause (unrecognized dialect)"
+    return "", "", UNRECOGNIZED_DIALECT_NOTE
 
 
 def _table_ref(identifier: str, dialect: str) -> str:

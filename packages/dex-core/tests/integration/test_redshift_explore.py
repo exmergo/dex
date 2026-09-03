@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import RS_MAX_SECONDS
+from .conftest import RS_MAX_SECONDS, assert_ok
 from .test_redshift_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.redshift]
@@ -28,7 +28,7 @@ def test_inventory_is_ungated_and_scoped(tmp_path: Path, capsys):
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "inventory"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     identifiers = {o["identifier"] for o in envelope["data"]["objects"]}
     assert any(i.endswith("app.customers") for i in identifiers)
     assert all(".app." in i for i in identifiers)
@@ -81,7 +81,7 @@ def test_confirmed_map_profiles_flags_pii_and_records_spend(tmp_path: Path, caps
     rc, envelope = run_cli(
         ["--repo-root", str(tmp_path), "explore", "map", "--confirm"], capsys
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["profiled_count"] >= 4
     assert data["pii_column_count"] >= 1  # the seeded email at minimum
@@ -118,7 +118,7 @@ def test_query_firewall_allows_measuring_and_refuses_pii_values(tmp_path: Path, 
         ],
         capsys,
     )
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     assert envelope["data"]["row_count"] >= 1
 
     rc, envelope = run_cli(
@@ -160,7 +160,7 @@ def test_query_firewall_allows_measuring_and_refuses_pii_values(tmp_path: Path, 
 #         ],
 #         capsys,
 #     )
-#     assert rc == 0, envelope
+#     assert_ok(rc, envelope)
 #     assert envelope["data"]["row_count"] >= 1
 
 

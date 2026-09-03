@@ -4,7 +4,8 @@
     key. Nested objects never surface their own keys as top-level rows; the
     value of a key is the whole nested value, kept in the warehouse's native
     semi-structured type (BigQuery JSON, Snowflake VARIANT, Databricks VARIANT,
-    Postgres jsonb, Redshift SUPER, DuckDB JSON). The key is a plain string.
+    Postgres jsonb, Redshift SUPER, DuckDB JSON, ClickHouse String holding
+    raw JSON). The key is a plain string.
 
     Renders a complete SELECT:
 
@@ -19,10 +20,10 @@
     json_column may be a bare column name (qualified onto the relation
     automatically) or any expression over it. For a string-typed source pass
     the adapter's parse expression: parse_json(payload) on BigQuery, Snowflake,
-    and Databricks, json_parse(payload) on Redshift; Postgres and DuckDB accept
-    JSON-bearing text directly. A NULL object produces no rows. On Postgres a
-    non-object value errors loudly (jsonb_each is strict); the other adapters
-    yield no rows for it. Databricks needs VARIANT support (DBR 15.3+ or a
+    and Databricks, json_parse(payload) on Redshift; Postgres, DuckDB and
+    ClickHouse accept JSON-bearing text directly. A NULL object produces no
+    rows. On Postgres a non-object value errors loudly (jsonb_each is strict);
+    the other adapters yield no rows for it. Databricks needs VARIANT support (DBR 15.3+ or a
     current SQL warehouse).
 
     Edit freely: this file is yours. Re-running
@@ -97,6 +98,25 @@ select
     _dex_kv.value as {{ value_alias }}
 from {{ relation }} as base
 cross join lateral jsonb_each(({{ expr }})::jsonb) as _dex_kv(key, value)
+{% endmacro %}
+
+
+{% macro clickhouse__unpivot_json_object(relation, json_column, key_alias, value_alias, passthrough) %}
+{%- set expr = 'base.' ~ json_column if modules.re.match('^[A-Za-z_][A-Za-z0-9_]*$', json_column) else json_column %}
+{#- ClickHouse stores JSON as String and has no lateral join, so the expansion
+    is ARRAY JOIN over the key/value pairs. JSONExtractKeysAndValuesRaw returns
+    an Array(Tuple(String, String)) of *top-level* pairs only, which is exactly
+    the depth limit the other adapters have to ask for explicitly, and it keeps
+    each value as its raw JSON text rather than parsing it, so a nested object
+    survives whole. A NULL or non-object value yields an empty array, hence no
+    rows, matching every adapter here except Postgres. -#}
+select
+    {% for col in passthrough %}base.{{ col }},
+    {% endfor -%}
+    _dex_kv.1 as {{ key_alias }},
+    _dex_kv.2 as {{ value_alias }}
+from {{ relation }} as base
+array join JSONExtractKeysAndValuesRaw(toString({{ expr }})) as _dex_kv
 {% endmacro %}
 
 

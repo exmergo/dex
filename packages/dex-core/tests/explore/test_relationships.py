@@ -21,10 +21,13 @@ from exmergo_dex_core.cache import (
     RelationshipKind,
 )
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
+    _fold_semantic_edges,
     _merge_relationships,
+    _semantic_join_notes,
 )
 from exmergo_dex_core.explore.profile import profile
 from exmergo_dex_core.explore.relationships import (
@@ -35,9 +38,12 @@ from exmergo_dex_core.explore.relationships import (
     fk_candidate_count,
     fold_replica_relationships,
     infer_relationships,
+    probe_batches,
+    semantic_relationships,
     verify_relationships,
 )
 from exmergo_dex_core.progress import PROGRESS_FIRST_AFTER, ProgressReporter
+from exmergo_dex_core.semantic_catalog import EntityJoin
 from exmergo_dex_core.storage import FilesystemStore
 
 
@@ -329,6 +335,227 @@ def test_dealiased_match_skips_when_stripped_to_a_bare_suffix():
     a = _ds("db.main.alpha", [_col("a_key", distinct=2, unique=True)], rows=2)
     b = _ds("db.main.beta", [_col("b_key", distinct=2)], rows=2)
     assert infer_relationships([a, b]) == []
+
+
+# --- affix-stripped entity matching (issue #208) -------------------------------
+
+
+def test_history_data_suffixed_parent_is_not_matched_without_affixes_configured():
+    """The affix-stripping tier is opt-in per call: a caller that doesn't pass
+    `affixes` sees the exact pre-fix behavior, unchanged."""
+
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    assert infer_relationships([parent, child]) == []
+
+
+def test_history_data_suffix_is_stripped_when_affixes_are_configured():
+    """The exact scenario from issue #208: singularizing conversation_id yields
+    conversation, but the parent table carries both a CDC history suffix and a
+    landing-zone data suffix. Stripping both in sequence (`_data`, then
+    `_history`) recovers the match."""
+
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    rels = infer_relationships([parent, child], affixes=EntityAffixes())
+    assert len(rels) == 1
+    rel = rels[0]
+    assert rel.from_dataset == "db.main.conversation_part_history_data"
+    assert rel.from_columns == ["conversation_id"]
+    assert rel.to_dataset == "db.main.conversation_history_data"
+    assert rel.to_columns == ["id"]
+    assert rel.confidence < 0.85
+
+
+def test_affix_stripped_match_scores_below_an_exact_match_to_the_same_shape():
+    """A match that needed stripping must rank below an unambiguous exact
+    match, so ranking still prefers the case that needed no help."""
+
+    exact = infer_relationships(
+        [
+            _ds("db.main.products", [_col("id", distinct=5, unique=True)], rows=5),
+            _ds(
+                "db.main.inventory_transactions",
+                [_col("product_id", distinct=5)],
+                rows=20,
+            ),
+        ],
+        affixes=EntityAffixes(),
+    )
+    stripped = infer_relationships(
+        [
+            _ds(
+                "db.main.product_history_data",
+                [_col("id", distinct=5, unique=True)],
+                rows=5,
+            ),
+            _ds("db.main.inventory_events", [_col("product_id", distinct=5)], rows=20),
+        ],
+        affixes=EntityAffixes(),
+    )
+    assert len(exact) == 1
+    assert len(stripped) == 1
+    assert exact[0].confidence > stripped[0].confidence
+
+
+def test_versioned_parent_table_suffix_is_stripped():
+    """A versioned table (`_v2`) is a structural convention, always stripped,
+    not part of the configurable affix list."""
+
+    parent = _ds("db.main.products_v2", [_col("id", distinct=5, unique=True)], rows=5)
+    child = _ds("db.main.orders", [_col("product_id", distinct=5)], rows=20)
+    rels = infer_relationships([parent, child], affixes=EntityAffixes())
+    assert len(rels) == 1
+    assert rels[0].to_dataset == "db.main.products_v2"
+
+
+def test_layer_prefix_alone_needs_no_affix_config():
+    """A bare layer prefix (already handled by `_LAYER_PREFIX`) must still
+    match with `affixes=None`; the new tier only extends what the exact tier
+    can't already see."""
+
+    hosts = _ds("db.main.RAW_HOSTS", [_col("ID", distinct=2, unique=True)], rows=2)
+    listings = _ds("db.main.RAW_LISTINGS", [_col("HOST_ID", distinct=2)], rows=2)
+    rels = infer_relationships([hosts, listings])
+    assert len(rels) == 1
+    assert rels[0].confidence >= 0.85
+
+
+def test_ambiguous_affix_stripped_candidates_are_both_proposed():
+    """Where stripping produces two candidate parents, both must be proposed;
+    the matcher must not pick a winner (issue #208 acceptance criterion)."""
+
+    history = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    current = _ds(
+        "db.main.conversation_current_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    replies = _ds("db.main.replies", [_col("conversation_id", distinct=5)], rows=20)
+    rels = infer_relationships([history, current, replies], affixes=EntityAffixes())
+    targets = {r.to_dataset for r in rels}
+    assert targets == {
+        "db.main.conversation_history_data",
+        "db.main.conversation_current_data",
+    }
+
+
+def test_affix_stripped_match_is_recorded():
+    affix_matches: list = []
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    rels = infer_relationships(
+        [parent, child], affixes=EntityAffixes(), affix_matches=affix_matches
+    )
+    assert len(rels) == 1
+    assert len(affix_matches) == 1
+    assert affix_matches[0].child_column == "conversation_id"
+    assert affix_matches[0].parent == "db.main.conversation_history_data"
+    assert affix_matches[0].stripped_to == "conversation"
+
+
+def test_configured_affixes_can_be_narrowed_or_disabled():
+    """The affix list is configurable and small by default, not exhaustive: a
+    project can shrink or empty it, and a suffix outside the configured set
+    stays unmatched."""
+
+    parent = _ds(
+        "db.main.conversation_history_data",
+        [_col("id", distinct=5, unique=True)],
+        rows=5,
+    )
+    child = _ds(
+        "db.main.conversation_part_history_data",
+        [_col("conversation_id", distinct=5)],
+        rows=20,
+    )
+    assert (
+        infer_relationships([parent, child], affixes=EntityAffixes(suffixes=[])) == []
+    )
+
+
+def test_relationships_envelope_explains_affix_stripped_matches(tmp_path: Path, capsys):
+    """End-to-end: `explore relationships` wires the default configured
+    `entity_affixes` through by default, proposes the affix-stripped edge, and
+    explains it in `notes`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "intercom.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE conversation_history_data (id INTEGER)")
+    conn.execute("INSERT INTO conversation_history_data SELECT * FROM range(5)")
+    conn.execute(
+        "CREATE TABLE conversation_part_history_data (conversation_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_part_history_data SELECT i % 5 FROM range(20) t(i)"
+    )
+    conn.close()
+
+    payload = _run(["explore", "relationships", "--path", str(path)], capsys)
+    data = payload["data"]
+    by_fk = {tuple(r["from_columns"]): r for r in data["relationships"]}
+    rel = by_fk[("conversation_id",)]
+    assert rel["to_dataset"].endswith(".conversation_history_data")
+    assert rel["to_columns"] == ["id"]
+    assert any("stripping a configured prefix/suffix" in n for n in data["notes"])
+
+
+def test_affix_stripped_join_survives_verify(tmp_path: Path, capsys):
+    """The exact scenario from issue #208's acceptance criteria: the
+    affix-stripped join is proposed and survives `--verify` (zero orphans lift
+    its confidence rather than the probe demoting it away)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "intercom.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE conversation_history_data (id INTEGER)")
+    conn.execute("INSERT INTO conversation_history_data SELECT * FROM range(5)")
+    conn.execute(
+        "CREATE TABLE conversation_part_history_data (conversation_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_part_history_data SELECT i % 5 FROM range(20) t(i)"
+    )
+    conn.close()
+
+    payload = _run(
+        ["explore", "relationships", "--path", str(path), "--verify"], capsys
+    )
+    data = payload["data"]
+    by_fk = {tuple(r["from_columns"]): r for r in data["relationships"]}
+    rel = by_fk[("conversation_id",)]
+    assert rel["to_dataset"].endswith(".conversation_history_data")
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 0.0
 
 
 # --- same-lineage / replica folding --------------------------------------------
@@ -764,6 +991,295 @@ def test_verify_demotes_a_join_with_heavy_orphans(tmp_path: Path, capsys):
     assert rel["confidence"] < 0.5, "measured non-containment demotes the guess"
 
 
+# --- issue #163: a declared join is measurable too --------------------------
+
+
+def test_probe_statements_and_verify_cover_the_same_set():
+    """The estimate and the run must select identically.
+
+    `probe_statements` prices what `verify_relationships` will spend, so a
+    filter that admits a join to one and not the other under-reports cost
+    *before* it is incurred, which no later reconciliation can catch. Both go
+    through `probe_candidates`; this asserts the three stay one decision rather
+    than three that currently agree.
+    """
+
+    from exmergo_dex_core.explore.relationships import (
+        probe_batches,
+        probe_candidates,
+        probe_statements,
+    )
+
+    mixed = [
+        _rel(kind=RelationshipKind.INFERRED, verified=False),
+        _rel(kind=RelationshipKind.DECLARED, verified=False),
+        _rel(
+            kind=RelationshipKind.DECLARED,
+            from_columns=["order_id", "line_no"],
+            to_columns=["order_id", "line_no"],
+            verified=False,
+        ),
+    ]
+
+    candidates = probe_candidates(mixed)
+    # A statement now answers several joins at once, so "the same set" is about
+    # the joins the statements cover, not how many statements there are. Both
+    # sides flatten to `candidates`, in order.
+    batched = [rel for batch in probe_batches(candidates) for rel in batch]
+    assert batched == candidates
+    assert len(probe_statements(mixed, "duckdb")) == len(probe_batches(candidates))
+
+    # The composite is the one excluded, and deliberately: the probe SQL joins
+    # on a single column pair, so measuring it would answer about a different
+    # relationship than the one declared.
+    assert [len(r.from_columns) for r in candidates] == [1, 1]
+    assert {r.kind for r in candidates} == {
+        RelationshipKind.INFERRED,
+        RelationshipKind.DECLARED,
+    }
+
+
+def test_verify_measures_a_declared_join_without_touching_its_confidence(
+    tmp_path: Path,
+):
+    """The design split at the spine of #163.
+
+    Same warehouse and same 0.6 orphan rate as the inferred demotion test
+    above, but with the join declared by the project. The measurement lands;
+    the confidence does not move. A declared join is not a name-based guess
+    whose credibility is up for revision -- the project asserted it, and a
+    disagreement is a fact about the data, reported as a finding rather than
+    smuggled into the number that means "how sure is dex".
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "declared_orphans.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute(
+        "INSERT INTO orders VALUES (10, 1), (11, 2), (12, 7), (13, 8), (14, 9)"
+    )
+    conn.close()
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.relationships import verify_relationships
+
+    declared = _rel(
+        from_dataset="declared_orphans.main.orders",
+        to_dataset="declared_orphans.main.customers",
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    declared.confidence = 1.0
+
+    adapter = DuckDBAdapter(str(path))
+    try:
+        verify_relationships(adapter, [declared])
+    finally:
+        adapter.close()
+
+    assert declared.verified is True
+    assert declared.orphan_fraction == 0.6
+    assert declared.confidence == 1.0, "a declaration is not demoted by measurement"
+
+
+# --- orphan findings (#207): a complete orphan rate is a finding, not just a
+# demoted confidence -------------------------------------------------------
+
+
+def _rel(
+    *,
+    from_dataset: str = "db.s.orders",
+    from_columns: list[str] | None = None,
+    to_dataset: str = "db.s.customers",
+    to_columns: list[str] | None = None,
+    kind: RelationshipKind = RelationshipKind.INFERRED,
+    verified: bool = True,
+    orphan_fraction: float | None = None,
+) -> Relationship:
+    return Relationship(
+        from_dataset=from_dataset,
+        from_columns=from_columns or ["customer_id"],
+        to_dataset=to_dataset,
+        to_columns=to_columns or ["id"],
+        kind=kind,
+        verified=verified,
+        orphan_fraction=orphan_fraction,
+    )
+
+
+@pytest.mark.parametrize(
+    ("rel", "expect_finding"),
+    [
+        (_rel(orphan_fraction=1.0), True),
+        (_rel(orphan_fraction=0.9), True),  # exactly at the threshold
+        # The existing heavy-orphan demotion case: a real signal, but not
+        # catastrophic enough for this finding -- a different tier.
+        (_rel(orphan_fraction=0.6), False),
+        (_rel(orphan_fraction=0.0), False),
+        (_rel(orphan_fraction=None), False),  # verified but nothing measured
+        (_rel(verified=False, orphan_fraction=1.0), False),  # nothing measured
+        # Issue #163: a declared join is probed now, so it reaches this
+        # decision at all. It qualifies on the same measured threshold as an
+        # inferred one -- see the wording split below for why it is not the
+        # same finding.
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0), True),
+        (_rel(kind=RelationshipKind.DECLARED, orphan_fraction=0.6), False),
+        (
+            _rel(kind=RelationshipKind.DECLARED, verified=False, orphan_fraction=1.0),
+            False,
+        ),
+    ],
+)
+def test_orphan_findings_decisions(rel: Relationship, expect_finding: bool):
+    from exmergo_dex_core.explore.relationships import orphan_findings
+
+    findings = orphan_findings([rel])
+    if expect_finding:
+        assert len(findings) == 1
+        found_rel, text = findings[0]
+        assert found_rel is rel
+        assert "db.s.orders.customer_id" in text
+        assert "db.s.customers.id" in text
+    else:
+        assert findings == []
+
+
+def test_orphan_finding_text_differs_by_kind():
+    """The two kinds are different findings, not one finding on two inputs.
+
+    An inferred edge's suspect claim is dex's own name match, so the text
+    disclaims it. A declared edge has no name coincidence to disclaim: the
+    project asserted the key and the data contradicts it. Emitting the
+    inferred wording for a declared join would tell a reader their dbt
+    relationship test was a dex guess.
+    """
+
+    from exmergo_dex_core.explore.relationships import orphan_findings
+
+    ((_, inferred_text),) = orphan_findings([_rel(orphan_fraction=1.0)])
+    ((_, declared_text),) = orphan_findings(
+        [_rel(kind=RelationshipKind.DECLARED, orphan_fraction=1.0)]
+    )
+
+    assert "shares a column name" in inferred_text
+    assert "not evidence of a shared key" in inferred_text
+
+    assert "declared as a foreign key" in declared_text
+    assert "the project and the warehouse disagree" in declared_text
+    assert "shares a column name" not in declared_text
+
+
+def test_verify_reports_a_complete_orphan_edge_as_a_finding(tmp_path: Path, capsys):
+    """The issue's own scenario: two columns share a name and share no
+    values at all. The finding names both sides, and the same text survives
+    into the child dataset's persisted data_quality."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "no_overlap.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    # Every customer_id points at a customer that does not exist: orphan
+    # fraction 1.0, a shared name with zero shared data.
+    conn.execute("INSERT INTO orders VALUES (10, 7), (11, 8), (12, 9)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        [
+            "explore",
+            "relationships",
+            "--verify",
+            "--path",
+            str(path),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )["data"]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is True
+    assert rel["orphan_fraction"] == 1.0
+
+    notes = " ".join(data["notes"])
+    assert "orders.customer_id -> " in notes and "customers.id" in notes
+    assert "100%" in notes
+    assert "not evidence of a shared key" in notes
+
+    cache = FilesystemStore(repo).load_cache()
+    orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
+    assert any("not evidence of a shared key" in n for n in orders.data_quality)
+
+
+def test_verify_at_zero_orphans_produces_no_finding(tmp_path: Path, capsys):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "clean.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 1), (11, 2)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--verify", "--path", str(path)], capsys)[
+        "data"
+    ]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["orphan_fraction"] == 0.0
+    assert not any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_unverified_edge_produces_no_finding(tmp_path: Path, capsys):
+    """Nothing was measured without --verify, so nothing is reported, even
+    though the columns share a name."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "unverified.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2)")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 7), (11, 8)")
+    conn.close()
+
+    data = _run(["explore", "relationships", "--path", str(path)], capsys)["data"]
+    rel = next(r for r in data["relationships"] if r["from_columns"] == ["customer_id"])
+    assert rel["verified"] is False
+    assert not any("not evidence of a shared key" in n for n in data["notes"])
+
+
+def test_map_verify_also_reports_orphan_findings(tmp_path: Path, capsys):
+    """The second call site (`map --verify`) emits the identical finding
+    shape, since both commands share `orphan_findings`."""
+
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "map_no_overlap.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER, plan VARCHAR)")
+    conn.execute("INSERT INTO customers VALUES (1, 'a'), (2, 'b')")
+    conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    conn.execute("INSERT INTO orders VALUES (10, 7), (11, 8), (12, 9)")
+    conn.close()
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = _run(
+        ["explore", "map", "--verify", "--path", str(path), "--repo-root", str(repo)],
+        capsys,
+    )["data"]
+    notes = " ".join(data["notes"])
+    assert "not evidence of a shared key" in notes
+
+    cache = FilesystemStore(repo).load_cache()
+    orders = next(d for d in cache.datasets if d.identifier.endswith(".orders"))
+    assert any("not evidence of a shared key" in n for n in orders.data_quality)
+
+
 def test_relationships_persists_datasets_and_relationships(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
@@ -864,6 +1380,217 @@ def test_overlap_probe_transpiles_to_postgres_and_stays_select_only():
     # Portable shapes survive the rewrite; DuckDB-only FILTER syntax does not
     # appear (BigQuery lacks it and Postgres parses it differently).
     assert "order_items" in sql and "products" in sql
+
+
+# --- issue #398: overlap probes share their table references ----------------
+
+
+def _probe_rel(child: str, fk: str, parent: str, key: str) -> Relationship:
+    return Relationship(
+        from_dataset=f"wh.main.{child}",
+        from_columns=[fk],
+        to_dataset=f"wh.main.{parent}",
+        to_columns=[key],
+        kind=RelationshipKind.INFERRED,
+        confidence=0.7,
+    )
+
+
+def test_a_batch_costs_the_graph_s_tables_not_twice_its_edges():
+    """The invariant that produces the saving, counted the way the estimator
+    counts it.
+
+    A per-table minimum is charged on the distinct tables a statement reads, so
+    what matters is that one statement's table set is the graph's table set. Five
+    edges unbatched are five statements reading two tables each, ten table
+    references to bill; batched they are one statement reading five.
+    """
+
+    import sqlglot
+
+    from exmergo_dex_core.explore.relationships import probe_statements
+
+    edges = [
+        _probe_rel("order_items", "order_id", "orders", "id"),
+        _probe_rel("order_items", "user_id", "users", "id"),
+        _probe_rel("order_items", "product_id", "products", "id"),
+        _probe_rel("orders", "user_id", "users", "id"),
+        _probe_rel("events", "user_id", "users", "id"),
+    ]
+
+    [sql] = probe_statements(edges, "bigquery")  # five edges, inside the cap
+
+    parsed = sqlglot.parse_one(sql, read="bigquery")
+    referenced = {t.name for t in parsed.find_all(sqlglot.exp.Table)}
+    assert referenced == {"order_items", "orders", "users", "products", "events"}
+    # And the child side is read once per child, not once per edge, which is
+    # what the connectors billing scan time rather than bytes are paying for.
+    assert sql.count("`order_items` AS c") == 1
+
+
+def test_a_child_with_more_edges_than_the_cap_stays_one_statement(monkeypatch):
+    """Splitting a child across statements would read that child twice, which
+    is the thing batching exists to stop, so the cap yields to it."""
+
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    monkeypatch.setattr(rel_mod, "_PROBE_BATCH", 2)
+    edges = [_probe_rel("wide_fact", f"fk_{i}", f"dim_{i}", "id") for i in range(5)] + [
+        _probe_rel("other_fact", "fk_0", "dim_0", "id")
+    ]
+
+    batches = rel_mod.probe_batches(edges)
+
+    assert [len(b) for b in batches] == [5, 1]
+    assert {r.from_dataset for r in batches[0]} == {"wh.main.wide_fact"}
+
+
+def test_batching_never_reorders_or_drops_an_edge(monkeypatch):
+    """`probe_batches` is what keeps the priced statements and the run
+    statements the same statements, so it must be a regrouping of its input and
+    nothing else."""
+
+    from exmergo_dex_core.explore import relationships as rel_mod
+
+    monkeypatch.setattr(rel_mod, "_PROBE_BATCH", 3)
+    edges = [
+        _probe_rel("a", "x", "p", "id"),
+        _probe_rel("b", "x", "p", "id"),
+        _probe_rel("a", "y", "q", "id"),
+        _probe_rel("c", "x", "p", "id"),
+        _probe_rel("b", "y", "q", "id"),
+    ]
+
+    flattened = [rel for batch in rel_mod.probe_batches(edges) for rel in batch]
+
+    assert sorted(id(r) for r in flattened) == sorted(id(r) for r in edges)
+    # Edges sharing a child are adjacent, which is what lets one read answer
+    # all of them.
+    children = [r.from_dataset for r in flattened]
+    assert children == sorted(children, key=children.index)
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    ["bigquery", "snowflake", "postgres", "redshift", "databricks", "clickhouse"],
+)
+def test_a_cross_child_batch_transpiles_and_stays_select_only(dialect: str):
+    """The batched statement carries two shapes a single-edge probe never did
+    (several LEFT JOINs over one child, and a CROSS JOIN between children), so
+    every connector's dialect has to survive both."""
+
+    import sqlglot
+
+    from exmergo_dex_core.explore.relationships import probe_statements
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    [sql] = probe_statements(
+        [
+            _probe_rel("order_items", "order_id", "orders", "id"),
+            _probe_rel("order_items", "user_id", "users", "id"),
+            _probe_rel("orders", "user_id", "users", "id"),
+        ],
+        dialect,
+    )
+
+    assert_select_only(sql, dialect=dialect)
+    assert sqlglot.parse_one(sql, read=dialect) is not None
+    assert "FILTER" not in sql.upper()
+
+
+def test_batched_verification_matches_a_probe_per_join(tmp_path: Path):
+    """The acceptance criterion for #398: batching may change how many
+    statements run and nothing else.
+
+    The oracle is the pre-batching probe, written out here rather than reached
+    through a knob, so the comparison is against an independent statement per
+    join and not against the batcher configured small.
+
+    The warehouse carries every case that could plausibly diverge under a
+    batched read: several foreign keys on one child, a dimension shared by two
+    children, a non-unique parent key (which a bare join would fan out on), NULL
+    foreign keys, an entirely orphaned key, and a key with no non-null values at
+    all.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.explore.relationships import verify_relationships
+
+    path = tmp_path / "batched.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE customers (id INTEGER)")
+    conn.execute("INSERT INTO customers VALUES (1), (2), (2)")  # not unique
+    conn.execute("CREATE TABLE products (id INTEGER)")
+    conn.execute("INSERT INTO products VALUES (100), (101)")
+    conn.execute(
+        "CREATE TABLE orders (customer_id INTEGER, product_id INTEGER, "
+        "promo_id INTEGER, void_id INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO orders VALUES (1, 100, 900, NULL), (2, 101, 901, NULL), "
+        "(7, 100, 902, NULL), (NULL, 999, 903, NULL)"
+    )
+    conn.execute("CREATE TABLE returns (customer_id INTEGER)")
+    conn.execute("INSERT INTO returns VALUES (1), (55)")
+    conn.close()
+
+    def edges() -> list[Relationship]:
+        return [
+            _probe_rel("orders", "customer_id", "customers", "id"),
+            _probe_rel("orders", "product_id", "products", "id"),
+            _probe_rel("orders", "promo_id", "products", "id"),  # fully orphaned
+            _probe_rel("orders", "void_id", "products", "id"),  # no non-null values
+            _probe_rel("returns", "customer_id", "customers", "id"),
+        ]
+
+    def qualify(rels: list[Relationship]) -> list[Relationship]:
+        for rel in rels:
+            rel.from_dataset = rel.from_dataset.replace("wh.main.", "batched.main.")
+            rel.to_dataset = rel.to_dataset.replace("wh.main.", "batched.main.")
+        return rels
+
+    def one_probe_per_join(adapter, rels: list[Relationship]) -> list[tuple]:
+        """The statement `--verify` issued before #398, one join at a time."""
+
+        def quoted(identifier: str) -> str:
+            return ".".join(f'"{part}"' for part in identifier.split("."))
+
+        measured = []
+        for rel in rels:
+            child, parent = quoted(rel.from_dataset), quoted(rel.to_dataset)
+            fk, key = rel.from_columns[0], rel.to_columns[0]
+            result = adapter.run_query(
+                f'SELECT COUNT(c."{fk}") AS nonnull_fk, '  # noqa: S608
+                f'COUNT(CASE WHEN c."{fk}" IS NOT NULL AND d.pk IS NULL '
+                f"THEN 1 END) AS orphans "
+                f"FROM {child} c LEFT JOIN "
+                f'(SELECT DISTINCT "{key}" AS pk FROM {parent}) d '
+                f'ON d.pk = c."{fk}"',
+                max_rows=1,
+                timeout_seconds=30.0,
+            )
+            values = dict(zip(result.columns, result.cells[0], strict=True))
+            nonnull = int(values["nonnull_fk"] or 0)
+            orphans = int(values["orphans"] or 0)
+            fraction = None if nonnull == 0 else round(orphans / nonnull, 4)
+            measured.append((True, fraction))
+        return measured
+
+    adapter = DuckDBAdapter(str(path))
+    try:
+        expected = one_probe_per_join(adapter, qualify(edges()))
+        batched = qualify(edges())
+        verify_relationships(adapter, batched)
+    finally:
+        adapter.close()
+
+    assert [(r.verified, r.orphan_fraction) for r in batched] == expected
+    assert expected[2][1] == 1.0, "the fully orphaned edge is measured as such"
+    assert expected[3][1] is None, "no non-null values stays unmeasurable"
+    # Five joins, two children: one statement now, five before.
+    assert len(probe_batches(batched)) == 1
 
 
 # --- declared joins from the dbt project -----------------------------------------
@@ -1170,3 +1897,153 @@ def test_relationships_envelope_unresolved_declared_is_a_signal(tmp_path: Path, 
     notes = data["notes"]
     assert any("no declared relationships resolved" in n for n in notes)
     assert any("not in this connection's inventory" in n for n in notes)
+
+
+# ---- the semantic layer's declared entity graph (#361) -----------------------
+#
+# A shared entity is a join the layer states, with the key named per model. These
+# arrive at the declared tier beside the `relationships` tests, so the assertions
+# below are the ones that keep that tier honest: the same never-guess endpoint
+# resolution, one edge per join however many channels name it, and the entity
+# carried as the thing a reader can look up.
+
+
+def _join(
+    entity: str = "customer",
+    *,
+    parent_relation: str = "wh.main.customers",
+    parent_column: str = "id",
+    child_relation: str = "wh.main.orders",
+    child_column: str = "buyer_id",
+) -> EntityJoin:
+    return EntityJoin(
+        entity=entity,
+        parent_model="customers_sm",
+        parent_relation=parent_relation,
+        parent_column=parent_column,
+        child_model="orders_sm",
+        child_relation=child_relation,
+        child_column=child_column,
+    )
+
+
+def test_a_declared_entity_becomes_an_edge_naming_the_entity():
+    rels, notes = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    assert notes == []
+    (rel,) = rels
+    assert rel.from_dataset == "wh.main.orders" and rel.from_columns == ["buyer_id"]
+    assert rel.to_dataset == "wh.main.customers" and rel.to_columns == ["id"]
+    # Declared, not inferred: the layer states this join and names its key. A
+    # name-based rule would never have found `buyer_id` against `id`.
+    assert rel.kind is RelationshipKind.DECLARED
+    assert rel.confidence == 1.0
+    assert rel.declared_by == "semantic entity 'customer'"
+
+
+def test_a_semantic_endpoint_resolves_across_a_database_alias():
+    """Same rule the `relationships` tests go through, and the same reason: a
+    compiled manifest spells the database the way dbt was configured while the
+    adapter normalizes it per connector."""
+
+    rels, notes = semantic_relationships(
+        [
+            _join(
+                parent_relation="analytics.main.customers",
+                child_relation="analytics.main.orders",
+            )
+        ],
+        ["wh.main.orders", "wh.main.customers"],
+    )
+
+    assert notes == []
+    assert rels[0].from_dataset == "wh.main.orders"
+
+
+def test_a_semantic_endpoint_missing_here_is_a_note_not_an_edge():
+    rels, notes = semantic_relationships([_join()], ["wh.main.orders"])
+
+    assert rels == []
+    (note,) = notes
+    assert "semantic entity 'customer'" in note
+    assert "not in this connection's inventory" in note
+
+
+def test_an_ambiguous_semantic_endpoint_is_skipped_rather_than_guessed():
+    rels, notes = semantic_relationships(
+        [_join()], ["wh.a.orders", "wh.b.orders", "wh.main.customers"]
+    )
+
+    assert rels == []
+    assert any("more than one object" in note for note in notes)
+
+
+def test_duplicate_semantic_joins_are_deduped():
+    rels, _ = semantic_relationships(
+        [_join(), _join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    assert len(rels) == 1
+
+
+def test_a_semantic_edge_the_project_already_declares_is_counted_once():
+    """Both channels are declarations of the same tier, so an edge in both is one
+    edge. Which named it first is not a fact about the warehouse, and doubling it
+    would inflate the connectivity ranking."""
+
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["buyer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, already = _fold_semantic_edges([declared], semantic)
+
+    assert len(merged) == 1 and already == 1
+    # The relationships test's edge stands; the semantic channel adds nothing it
+    # did not already say.
+    assert merged[0].declared_by is None
+
+
+def test_the_notes_name_what_inference_would_have_missed():
+    """The count alone is not the interesting number. An edge the layer declares
+    and inference did not find is a join that would otherwise be absent from the
+    map, with a key no naming rule could have matched."""
+
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    notes = _semantic_join_notes(semantic, 0, [])
+
+    assert any("declared entity graph" in note for note in notes)
+    missed = next(note for note in notes if "not found by name-based" in note)
+    assert "semantic entity 'customer'" in missed
+
+
+def test_an_edge_inference_also_found_is_not_reported_as_rescued():
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+    inferred = [
+        Relationship(
+            from_dataset="wh.main.orders",
+            from_columns=["buyer_id"],
+            to_dataset="wh.main.customers",
+            to_columns=["id"],
+            kind=RelationshipKind.INFERRED,
+            confidence=0.7,
+        )
+    ]
+
+    notes = _semantic_join_notes(semantic, 0, inferred)
+
+    assert not any("not found by name-based" in note for note in notes)

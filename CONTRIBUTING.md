@@ -25,6 +25,17 @@ Everything is deterministic and free: no cloud account is needed. The live
 cloud integration tests under `tests/integration/` collect as skipped with
 the enabling variables named in the skip reason.
 
+To try a change by hand rather than through the suite, generate the demo
+warehouse in a scratch directory outside the checkout and drive the CLI against
+it. It is the same seeded fixture the documentation quotes, so what you see there
+is what a user sees:
+
+```
+mkdir /tmp/dex-scratch && cd /tmp/dex-scratch
+uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core demo
+uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core explore map
+```
+
 ## Live BigQuery integration tests
 
 `tests/integration/` runs the real loop against BigQuery: ADC discovery, the
@@ -202,6 +213,58 @@ fork-runnable, kept in the integration workflow for pattern parity with the
 cloud connectors rather than as a cost decision. There is no
 `setup_postgres_ci.sh`; there is nothing to provision.
 
+## Live ClickHouse integration tests
+
+The same `tests/integration/` directory carries the ClickHouse suite:
+connection discovery, the database-seconds handshake, the over-ceiling
+refusal, PII flag-not-surface, relationship inference on the seeded orphans,
+temporal continuity over a deliberate gap, a firewalled query using ClickHouse
+idioms (`countIf`, `FINAL`, `ARRAY JOIN`), the dev-target grant preflight, and
+a dbt build into the dedicated dev database. Like the Postgres suite it bills
+nothing and needs no account: the target is a local Docker container.
+
+Unlike Postgres it has only one seeding path, and CI uses it too. The seed is
+multi-statement and the ClickHouse HTTP interface refuses multi-statement
+bodies, so it has to go through `clickhouse-client` inside the container, which
+means the same script serves both places:
+
+```
+scripts/setup_clickhouse_dev.sh
+DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+    DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
+    uv run pytest tests/integration -q -m clickhouse
+scripts/setup_clickhouse_dev.sh --down
+```
+
+There is no setup script for the free container job; there is nothing to
+provision for that exhaustive path.
+
+### Narrow ClickHouse Cloud tests
+
+The repository also runs `tests/integration/test_clickhouse_cloud.py` under the
+protected `clickhouse-cloud-integration` environment. It is intentionally
+narrow: Cloud mode/capacity and control-plane agreement, confirmation and CU/USD
+translation, read-only enforcement, and one minimal dbt build. The container
+suite remains the exhaustive connector suite.
+
+One-time setup and subsequent atomic credential rotation use
+`scripts/setup_clickhouse_cloud_ci.sh`. The stable non-secret policy and all
+`dex_ci_*` names, dedicated account/service IDs, region, and real Scale-tier
+prices live in that script; flags are reserved for deliberate migration/testing.
+`scripts/clickhouse_cloud/preflight.sh` reads the exact
+service's UTC-day usage before any SQL connection can wake it and refuses at the
+protected 2-CHC limit. See `scripts/clickhouse_cloud/README.md` for setup, local
+execution, rotation, and bounded teardown.
+
+Two assertions in that suite are load-bearing and worth understanding before
+changing the seed. The seed puts exactly 40 of 5,000 `order_items` rows on
+products that do not exist, so an orphan probe reporting zero has lost the
+`join_use_nulls` session setting rather than found clean data. And
+`events.occurred_at` is missing exactly three consecutive days out of ninety,
+so a continuity check reporting no gap has the window function wrong. Both
+failures are silent by nature: they produce a clean result rather than an
+error.
+
 ## Agent evals (`evals/`)
 
 The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from
@@ -293,6 +356,20 @@ raises there turns an ordinary state into an outage. Override
 `make_unreadable_project()` to get those assertions running against your format
 instead of skipped.
 
+Mix in the contracts covering what your format *declares*, beside the one for your
+tier. `DeclaringProjectContract` checks that a declared key and a declared join
+arrive, and carries two further hooks worth supplying: a composite key of more than
+two columns (a format that special-cases the pair passes a two-column fixture), and
+a join whose two ends are spelled differently (if both ends of your fixture share a
+name, an implementation that mirrors one side onto the other satisfies it exactly).
+`SemanticProjectContract` checks that each semantic field keeps the warehouse column
+behind it, which is the one no tier assertion can see: the tier contract only looks
+at an *empty* semantic layer, and a format that reads every field name and drops the
+columns maps everything to `None`, which validates, serializes, and compares clean
+forever while the drift check silently never runs. It checks your format reaches
+tier 2 before any of that, so mixing it in beside the tier-1 contract fails with a
+sentence naming the tier rather than with a missing-attribute error.
+
 Mix `ProjectFactoryContract` in front of your tier contract if dex will build your
 format from a name rather than be handed an instance, which is what a host reaching
 dex as a subprocess needs. Naming one is the same shape as naming a storage backend:
@@ -308,15 +385,39 @@ A shipped name, a dotted path, or an entry point under `exmergo_dex_core.project
 with shipped names always winning so an install can never silently redirect which
 models a repo is reasoned about.
 
-Declining `EditableProject` is a supported answer, not a gap. A project reduced from
-a running graph cannot receive an edit, because its source of truth is the code that
-produced the graph, and `maintain reconcile` reads that declaration: your format
-gets advisory proposals and no stored plan, by contract rather than by luck.
+Declining `EditableProject` is a supported answer, not a gap. The clearest case is a
+project reduced from a running graph, where the reduction is not the source of truth:
+the code that produced the graph is, so an edit written into the reduction is
+overwritten on the next run. `maintain reconcile` reads that declaration, and your
+format gets advisory proposals and no stored plan, by contract rather than by luck.
+
+If you do serve it, `PlacingProject` is what carries a proposal to your write path,
+and it is three methods rather than two: `load()` reads the keyspace an edit is
+pinned against, `edit_path()` names a key in it, and `editing_surface()` declares the
+region those keys may fall in. They go together because none of them answers
+anything alone, and a format holding two of the three places nothing at all. Mix
+`PlacingProjectContract` in beside your tier-3 contract: it checks that the three
+agree, that the view carries the `root`, `content` and `sha256` a pinned edit needs,
+and that your own writer refuses a path outside the surface you declared, including
+the sibling case a string-prefix comparison lets through. Supplying its optional
+`a_clean_edit(project)` hook is what upgrades the all-or-nothing assertion from
+asking what your writer reported to reading what your project holds.
+
+Decide it by asking which artifact an edit would land in, not where your project came
+from. Those questions come apart more often than the graph example suggests: an asset
+graph carries neither column names nor join keys, so a format over one reads its
+declared keys, joins and semantics from somewhere else, and that somewhere is usually
+a hand-authored file that nothing regenerates. Such a file is a real source of truth
+and it is the shape `reconcile` already proposes edits to, so a format holding one may
+serve this tier for that channel while still refusing to author a model.
 `references/project.md` covers the tiers, the construction contract, and the rules
 that are not obvious from the signatures.
 
 Formats contributed here run the same suite: see
-`packages/dex-core/tests/adapters/test_project_parity.py`.
+`packages/dex-core/tests/adapters/test_project_parity.py` for the shipped format, and
+`packages/dex-core/tests/adapters/test_project_conformance.py` for a format that is
+neither dbt nor a directory, driven through the contract and then broken on purpose,
+one defect per assertion.
 
 ## Linting and formatting (Ruff)
 

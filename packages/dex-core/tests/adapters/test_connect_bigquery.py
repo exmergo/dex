@@ -4,18 +4,21 @@ client and the (simulated) server."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("google.cloud.bigquery")
 
+from google.auth.exceptions import RefreshError
 from google.cloud import bigquery
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter, BigQueryConnectionError
 from exmergo_dex_core.config import BigQueryTarget
-from exmergo_dex_core.envelope import Paradigm
+from exmergo_dex_core.envelope import Paradigm, Reason, reason_for
+from exmergo_dex_core.errors import PrerequisiteError
 from exmergo_dex_core.guards.cost_guard import (
     ConfirmationRequiredError,
     CostGate,
@@ -74,6 +77,23 @@ def test_capabilities_shape(fake_bq_client):
     assert fake_bq_client.query_calls == []
 
 
+def test_expired_credentials_are_a_prerequisite(fake_bq_client, monkeypatch):
+    message = (
+        "Reauthentication is needed. Please run `gcloud auth "
+        "application-default login` to reauthenticate."
+    )
+
+    def expired(*_args, **_kwargs):
+        yield from ()
+        raise RefreshError(message)
+
+    monkeypatch.setattr(fake_bq_client, "list_datasets", expired)
+    with pytest.raises(PrerequisiteError) as exc_info:
+        make_adapter(fake_bq_client).capabilities()
+    assert reason_for(exc_info.value) is Reason.PREREQUISITE
+    assert str(exc_info.value) == message
+
+
 def test_list_objects_uses_free_api_metadata_only(fake_bq_client):
     adapter = make_adapter(fake_bq_client)
     objects = adapter.list_objects()
@@ -129,6 +149,123 @@ def test_views_report_no_stored_row_count(fake_bq_client):
     meta = next(o for o in adapter.list_objects() if o.name == "recent_customers")
     assert meta.object_type == "view"
     assert meta.row_count is None
+
+
+@pytest.mark.parametrize(
+    ("table_type", "counted"),
+    [
+        # BigQuery maintains counts for a base table and for nothing else. An
+        # absent table_type is the client not having been told yet, which is a
+        # base table; a kind nobody anticipated is unknown, which is the only
+        # direction that cannot fabricate a number.
+        ("TABLE", True),
+        (None, True),
+        ("EXTERNAL", False),
+        ("SNAPSHOT", False),
+    ],
+)
+def test_only_a_base_table_reports_a_stored_row_count(
+    fake_bq_client, table_type, counted
+):
+    """Issue #375: an external table's `num_rows` is a real zero, not an absent
+    value, so storing it is a claim the table is empty. Verified live against
+    BigQuery: an external table over GCS parquet holding rows reports
+    `num_rows == 0` and `num_bytes == 0`, exactly as a genuinely empty table
+    does, while its profiling aggregate returns correct column statistics."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="lakehouse_orders",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=0,
+        table_type=table_type,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    adapter = make_adapter(fake_bq_client)
+    meta = next(o for o in adapter.list_objects() if o.name == "lakehouse_orders")
+    assert meta.row_count == (0 if counted else None)
+    assert meta.byte_size == (0 if counted else None)
+
+
+def test_the_aggregate_supplies_the_count_the_metadata_does_not_maintain(
+    fake_bq_client,
+):
+    """The donor pattern issue #375 cites did not exist: BigQuery read `n_total`
+    off every aggregate batch and discarded it, so a view's count never arrived
+    and the probes that need one could never run. Now it supersedes the metadata
+    for the rest of the command, as it does on Postgres."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_orders",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=5_000,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"n_total": 42, "nn_0": 42, "nd_0": 42}]
+    adapter = make_adapter(fake_bq_client)
+    meta, columns = adapter.table_metadata(table.identifier)
+    assert meta.row_count is None
+    adapter.column_aggregates(table.identifier, columns)
+    refreshed, _ = adapter.table_metadata(table.identifier)
+    assert refreshed.row_count == 42
+
+
+def test_a_sampled_aggregate_never_becomes_the_tables_row_count(fake_bq_client):
+    """The sample's count describes the sample. Writing it back would hand every
+    downstream uniqueness proof a denominator smaller than the table."""
+
+    from fakes.bigquery import FakeTable
+    from google.cloud import bigquery
+
+    huge = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_huge",
+        schema=[bigquery.SchemaField("id", "INTEGER")],
+        num_rows=0,
+        num_bytes=100 * MB,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[huge.identifier] = huge
+    fake_bq_client.row_resolver = lambda sql: [{"n_total": 7, "nn_0": 7, "nd_0": 7}]
+    adapter = make_adapter(
+        fake_bq_client,
+        ceiling=500 * MB,
+        target=BigQueryTarget(max_full_profile_bytes=10 * MB),
+    )
+    _meta, columns = adapter.table_metadata(huge.identifier)
+    assert adapter._sample_percent(huge.identifier) is not None, "sampling must engage"
+    adapter.column_aggregates(huge.identifier, columns)
+    refreshed, _ = adapter.table_metadata(huge.identifier)
+    assert refreshed.row_count is None
+
+
+def test_connect_test_reports_the_day_or_says_it_cannot(fake_bq_client):
+    """Issue #374: the capability report is the one free surface that still reads
+    the ledger, because saying what the budget looks like is its whole job. An
+    unreachable ledger makes that one field unavailable rather than failing the
+    command."""
+
+    adapter = make_adapter(fake_bq_client, session_spent=125.0)
+    assert adapter.capabilities()["budget"]["session_spent_today"] == 125.0
+
+    def unreachable() -> float:
+        raise ConnectionError("the ledger backend is unreachable")
+
+    adapter.cost_gate._read_session_spent = unreachable
+    assert adapter.capabilities()["budget"]["session_spent_today"] is None
 
 
 # --- the billed door --------------------------------------------------------------
@@ -196,14 +333,57 @@ def test_describe_estimate_names_the_per_query_floor(fake_bq_client):
     assert any("10,485,760" in note or "10 MB" in note for note in described["notes"])
 
 
+def test_profile_reserve_splits_the_escalation_reserve_from_the_scan(fake_bq_client):
+    """The reserve is most of a small-table estimate, so a caller sizing a
+    budget has to be able to tell it from measured scan (issue #299)."""
+
+    adapter = make_adapter(fake_bq_client)
+    # Nothing priced yet, so there is nothing to attribute and the adapter says
+    # so rather than reporting a zero split.
+    assert adapter.profile_reserve(40 * MB) is None
+
+    total, _per_table = adapter.profile_estimate(["test-proj.shop.customers"])
+    reserve = adapter.profile_reserve(total)
+    # customers: one floored batch plus three reserved floors.
+    assert reserve["reserved_queries"] == 3
+    assert reserve["reserved_bytes"] == 30 * MB
+    assert "3 queries" in reserve["note"]
+    # The remainder is the dry-run half, named as such.
+    assert "10,485,760 bytes is dry-run scan" in reserve["note"]
+
+
+def test_profile_reserve_is_silent_when_nothing_could_escalate(fake_bq_client):
+    """An estimate with no reserve in it has no split to report, and saying so
+    with a zero would read as a measurement rather than an absence."""
+
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    client = FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                table_id="empty_table",
+                schema=[bigquery.SchemaField("id", "INTEGER")],
+                num_rows=0,
+                num_bytes=0,
+            )
+        ],
+    )
+    adapter = make_adapter(client)
+    total, _per_table = adapter.profile_estimate(["test-proj.shop.empty_table"])
+    assert adapter.profile_reserve(total) is None
+
+
 def test_profile_estimate_floors_each_batch_at_the_billing_minimum(fake_bq_client):
     adapter = make_adapter(fake_bq_client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.customers"])
     # One batch over one table (the raw 5000-byte scan floors to the minimum)
-    # plus a floor reserved for each of the three possible escalation queries
-    # (customers has 2 non-blob columns and 100 rows, so all three are
-    # possible): 10 MB aggregate + 10 MB near-unique reserve + 10 MB
-    # value-domain reserve + 10 MB composite reserve.
+    # plus a floor reserved for each escalation query customers' metadata
+    # leaves possible (2 scalar columns, 100 rows, so all three are): 10 MB
+    # aggregate + 10 MB near-unique reserve + 10 MB value-domain reserve +
+    # 10 MB composite reserve.
     assert per_table["test-proj.shop.customers"] == 40 * MB
     assert total == 40 * MB
 
@@ -271,6 +451,81 @@ def test_server_side_cap_translates_when_the_estimate_drifts(fake_bq_client):
             timeout_seconds=30,
         )
     assert "budget" in str(exc_info.value)
+
+
+# --- issue #320: the server-side cap must not be pinned below the confirmed
+# budget by BigQuery's own execution-time billing rounding, which no dry run
+# predicts. The bug's actual trigger is a `session_ceiling`: without one,
+# `statement_cap()` already equals the confirmed ceiling directly
+# (see `test_every_executed_job_carries_maximum_bytes_billed` above); with
+# one, the per-statement cap is additionally bounded by this command's own
+# reservation (booked at confirm time, sized to the dry-run estimate), which
+# a dry run cannot widen for a gap execution alone reveals.
+
+
+def test_billing_rounding_retries_once_within_the_confirmed_budget(fake_bq_client):
+    # Dry run is accurate to within 1%: nothing was wrong with the estimate at
+    # dry-run time, but the real bill still exceeds the tight reservation a
+    # session_ceiling books it against, the way BigQuery's own execution-time
+    # rounding can regardless of how accurate the dry run was.
+    fake_bq_client.dry_run_underestimate = 0.99
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 160 * MB
+    adapter = make_adapter(
+        fake_bq_client,
+        ceiling=1_000 * MB,  # roughly 6x the estimate, like the reported budget
+        session_ceiling=10_000 * MB,
+    )
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    adapter.cost_gate.preflight_command(
+        adapter.query_estimate(sql)
+    )  # confirm handshake
+
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+
+    non_dry = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(non_dry) == 2  # the too-tight attempt, then the retry
+    first_cap = non_dry[0].job_config.maximum_bytes_billed
+    second_cap = non_dry[1].job_config.maximum_bytes_billed
+    assert first_cap < 160 * MB  # pinned to the reservation, not the ceiling
+    assert second_cap == 160 * MB  # widened to exactly what BigQuery required
+
+
+def test_billing_rounding_retry_still_refuses_past_the_confirmed_ceiling(
+    fake_bq_client,
+):
+    # The real bill (200 MB) exceeds not just the reservation but the
+    # confirmed per-command ceiling itself (120 MB): the retry's own widening
+    # must refuse here, on the real number, rather than silently granting more
+    # than the operator confirmed.
+    fake_bq_client.dry_run_underestimate = 0.5
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 200 * MB
+    adapter = make_adapter(fake_bq_client, ceiling=120 * MB, session_ceiling=1_000 * MB)
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    adapter.cost_gate.preflight_command(adapter.query_estimate(sql))
+
+    with pytest.raises(OverCeilingError) as exc_info:
+        adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    assert "budget" in str(exc_info.value)
+    # No second server-side attempt: the widening itself refused before a
+    # retry could even be issued.
+    non_dry = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(non_dry) == 1
+
+
+def test_parse_bytes_billed_required_reads_bigquerys_own_number():
+    from exmergo_dex_core.adapters.bigquery import _parse_bytes_billed_required
+
+    message = (
+        "Query exceeded limit for bytes billed: 163595928. "
+        "164626432 or higher required."
+    )
+    assert _parse_bytes_billed_required(message) == 164626432.0
+
+
+def test_parse_bytes_billed_required_degrades_to_none_on_an_unexpected_message():
+    from exmergo_dex_core.adapters.bigquery import _parse_bytes_billed_required
+
+    assert _parse_bytes_billed_required("bytesBilledLimitExceeded") is None
 
 
 def test_timeout_cancels_the_job(fake_bq_client):
@@ -439,12 +694,15 @@ def test_profile_estimate_sums_free_dry_runs(fake_bq_client):
         ["test-proj.shop.customers", "test-proj.shop.events", "test-proj.logs.requests"]
     )
     # Each queryable table is one below-floor batch (floors to the minimum)
-    # plus a floor reserved for each of its three possible escalation queries
-    # (both tables have >= 2 non-blob columns and > 0 rows): 40 MB apiece.
+    # plus a floor per escalation query its metadata leaves possible. customers
+    # has two scalar columns and 100 rows, so all three are: 40 MB. events has
+    # only one column BigQuery can count distinctly (payload is a STRUCT,
+    # labels is REPEATED, and neither gets an approximate distinct), so a
+    # composite pair cannot be formed and that reserve is dropped: 30 MB.
     assert per_table["test-proj.shop.customers"] == 40 * MB
-    assert per_table["test-proj.shop.events"] == 40 * MB
+    assert per_table["test-proj.shop.events"] == 30 * MB
     assert per_table["test-proj.logs.requests"] == 0.0  # unqueryable, skipped
-    assert total == 80 * MB
+    assert total == 70 * MB
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
@@ -508,12 +766,18 @@ def test_profile_estimate_skips_the_reserve_for_a_provably_empty_table(fake_bq_c
     assert total == 10 * MB
 
 
-def test_profile_estimate_still_reserves_for_a_view_with_unknown_row_count(
+def test_profile_estimate_reserves_for_an_unknown_row_count_but_not_an_empty_one(
     fake_bq_client,
 ):
-    """A view's row count is never known before the aggregate that reveals it
-    (BigQuery reports no stored row count for a view), so 'unknown' must still
-    reserve for escalation rather than being mistaken for 'empty' (issue #107).
+    """An unknown row count is not an empty one, and only the second rules out
+    escalation.
+
+    BigQuery maintains no row count for a view, and the aggregate's own COUNT(*)
+    is now captured off the batch, so the count exists by the time the probes are
+    asked and every one of them can run. There is no number at estimate time to
+    narrow the reserve with, so the maximum is the honest hold. This reverses the
+    view half of issue #299: the reserve was dropped for these objects on the
+    grounds that the probes provably could not run, which stopped being true.
     """
 
     from fakes.bigquery import FakeBigQueryClient, FakeTable
@@ -537,9 +801,84 @@ def test_profile_estimate_still_reserves_for_a_view_with_unknown_row_count(
     )
     adapter = make_adapter(client)
     total, per_table = adapter.profile_estimate(["test-proj.shop.a_view"])
-    # Full reserve still applies despite the unknown (None) row count.
+    # Aggregate batch floor plus all three escalation floors: exact distinct
+    # counts, the value domain, and the composite-key probe (two countable
+    # columns), none of which the unknown count can rule out.
     assert per_table["test-proj.shop.a_view"] == 40 * MB
     assert total == 40 * MB
+    reserve = adapter.profile_reserve(total)
+    assert reserve["reserved_queries"] == 3
+    assert reserve["reserved_bytes"] == 30 * MB
+
+
+def _sized_table_client(**table_kwargs):
+    from fakes.bigquery import FakeBigQueryClient, FakeTable
+
+    return FakeBigQueryClient(
+        project="test-proj",
+        tables=[
+            FakeTable(
+                project="test-proj",
+                dataset_id="shop",
+                num_bytes=5_000,
+                **table_kwargs,
+            )
+        ],
+    )
+
+
+def test_profile_estimate_skips_the_value_domain_reserve_on_a_tiny_table():
+    """A value domain needs at least one distinct value within a tenth of the
+    non-null rows, so no column of a table below VALUE_DOMAIN_MIN_ROWS can ever
+    qualify and the probe can never be issued. One row either side of the bar,
+    since the whole point is that the reserve tracks the probe's own rule."""
+
+    from exmergo_dex_core.adapters.base import VALUE_DOMAIN_MIN_ROWS
+
+    schema = [
+        bigquery.SchemaField("id", "INTEGER"),
+        bigquery.SchemaField("status", "STRING"),
+    ]
+    below = make_adapter(
+        _sized_table_client(
+            table_id="tiny", schema=schema, num_rows=VALUE_DOMAIN_MIN_ROWS - 1
+        )
+    )
+    # Batch floor plus the near-unique and composite reserves, not the domain.
+    assert below.profile_estimate(["test-proj.shop.tiny"])[0] == 30 * MB
+
+    at_bar = make_adapter(
+        _sized_table_client(
+            table_id="tiny", schema=schema, num_rows=VALUE_DOMAIN_MIN_ROWS
+        )
+    )
+    assert at_bar.profile_estimate(["test-proj.shop.tiny"])[0] == 40 * MB
+
+
+def test_profile_estimate_reserves_nothing_for_an_all_nested_table():
+    """Nested and repeated fields get no approximate distinct in the aggregate
+    batch, and every escalation's eligibility starts from one, so a table with
+    nothing else in it can no more escalate than a blob column already excluded
+    from the scan."""
+
+    adapter = make_adapter(
+        _sized_table_client(
+            table_id="nested_only",
+            schema=[
+                bigquery.SchemaField(
+                    "payload",
+                    "RECORD",
+                    fields=[bigquery.SchemaField("tag", "STRING")],
+                ),
+                bigquery.SchemaField("labels", "STRING", mode="REPEATED"),
+                bigquery.SchemaField("shape", "GEOGRAPHY"),
+            ],
+            num_rows=100_000,
+        )
+    )
+    total, per_table = adapter.profile_estimate(["test-proj.shop.nested_only"])
+    assert per_table["test-proj.shop.nested_only"] == 10 * MB
+    assert total == 10 * MB
 
 
 def _blob_fake_client():
@@ -623,6 +962,27 @@ def test_distinct_combination_counts_degrade_when_budget_cannot_cover(fake_bq_cl
         for note in adapter.table_notes("test-proj.shop.customers")
     )
     assert all(c.dry_run for c in fake_bq_client.query_calls)
+
+
+def test_distinct_combination_counts_stop_pricing_prefixes_at_the_billing_floor(
+    fake_bq_client,
+):
+    """Narrowing the probe only buys something when it drops a referenced
+    column, and nothing can price below the per-query minimum. A refusal
+    already at that floor is final, so the search stops there: one dry run for
+    five pairs, not one per prefix."""
+
+    adapter = make_adapter(fake_bq_client, ceiling=100 * MB)
+    adapter.cost_gate.charge(100 * MB - 1_000)
+    pairs = [["id", "email"], ["email", "id"], ["id", "plan"], ["email", "plan"]]
+
+    assert adapter.distinct_combination_counts("test-proj.shop.customers", pairs) == {}
+    assert any(
+        "composite-key probe skipped" in note
+        for note in adapter.table_notes("test-proj.shop.customers")
+    )
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    assert len(fake_bq_client.query_calls) == 1
 
 
 def test_value_domain_counts_batch_into_one_guarded_statement(fake_bq_client):
@@ -709,7 +1069,17 @@ def test_get_adapter_wires_bigquery(fake_bq_client):
 def test_get_dialect_resolves_without_clients():
     assert get_dialect("bigquery") == "bigquery"
     assert get_dialect("duckdb") == "duckdb"
-    assert get_dialect("nonsense") == "duckdb"
+
+
+def test_get_dialect_raises_on_an_unrecognized_connector():
+    """A silent fallback to DuckDB here would misparse every subsequent SQL
+    statement in the wrong dialect (issue #319: a hyphenated BigQuery project
+    id reads as subtraction under the DuckDB dialect) while reporting a
+    generic parse error that never names the real cause. Raising matches
+    `get_adapter`'s existing convention for the same condition."""
+
+    with pytest.raises(ValueError, match="unknown connector 'nonsense'"):
+        get_dialect("nonsense")
 
 
 # --- project resolution (connect.py) -----------------------------------------------
@@ -905,3 +1275,91 @@ def test_list_namespace_objects_lists_one_dataset_from_metadata(fake_bq_client):
     # Bare names qualify against the adapter's project; absence reads as empty.
     assert adapter.list_namespace_objects("not_there") == []
     assert fake_bq_client.query_calls == []
+
+
+def test_an_external_table_with_a_composite_grain_scaffolds_the_right_tests(
+    fake_bq_client,
+):
+    """Issue #375 named the wrong mechanism, and the real one is narrower.
+
+    Its claim was that a zero row count stops candidate-key detection so
+    `candidate_keys` comes back empty and the scaffold never emits a `unique`
+    test. Verified live on BigQuery, that is not what happens: `is_unique` comes
+    from the aggregate's own COUNT(*) rather than from the metadata, so
+    single-column keys are found and their `unique` test is emitted. What a zero
+    count really costs is the two probes that take the row count as an argument:
+    the exact-distinct escalation, so every uniqueness verdict stays an
+    approximation that nothing is allowed to draw a hard conclusion from, and the
+    composite-key probe, so a table whose grain is a pair reports no grain at all
+    and its staging model ships with no key test of any kind.
+    """
+
+    from fakes.bigquery import FakeTable
+
+    from exmergo_dex_core.explore import profile as profile_mod
+    from exmergo_dex_core.explore.relationships import candidate_keys
+    from exmergo_dex_core.transform.scaffold import _model_yaml
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="ext_order_items",
+        schema=[
+            bigquery.SchemaField("order_id", "INTEGER"),
+            bigquery.SchemaField("line_number", "INTEGER"),
+            bigquery.SchemaField("amount", "NUMERIC"),
+        ],
+        num_rows=0,
+        num_bytes=0,
+        table_type="EXTERNAL",
+    )
+    fake_bq_client.tables[table.identifier] = table
+
+    # Six rows over four orders: (order_id, line_number) is the only grain, and
+    # no single column comes close, which is the shape whose grain went missing.
+    def rows(sql: str) -> list[dict]:
+        if "ARRAY_AGG" in sql:  # the value-domain probe
+            row: dict = {}
+            for i in range(3):
+                row[f"d_{i}"] = []
+                row[f"n_{i}"] = 6
+            return [row]
+        if "SELECT DISTINCT" in sql:  # the composite-combination probe
+            # Answer every alias the statement actually asked for, keyed by the
+            # pair it names. Several candidate pairs ride in one call, and a
+            # resolver hard-coding `d_0` turns one more of them into a KeyError
+            # out of the profiler rather than a readable assertion.
+            counts = {}
+            for i, cols in enumerate(re.findall(r"SELECT DISTINCT (.+?) FROM", sql)):
+                pair = tuple(c.strip().strip("`") for c in cols.split(","))
+                # Only the parent-plus-line pair covers all six rows.
+                counts[f"d_{i}"] = 6 if pair == ("order_id", "line_number") else 5
+            return [counts]
+        if "COUNT(DISTINCT" in sql:  # the exact-distinct escalation
+            return [{"d_0": 6}]
+        aggregate = {"n_total": 6}
+        for i, distinct in enumerate((4, 2, 4)):
+            aggregate[f"nn_{i}"] = 6
+            aggregate[f"nd_{i}"] = distinct
+            aggregate[f"mn_{i}"] = 1
+            aggregate[f"mx_{i}"] = 100
+        return [aggregate]
+
+    fake_bq_client.row_resolver = rows
+    adapter = make_adapter(fake_bq_client, ceiling=500 * MB)
+    datasets = profile_mod.profile(adapter, [table.identifier])
+    dataset = datasets[0]
+
+    assert dataset.row_count == 6  # from the aggregate, not the metadata
+    assert "empty table (no rows)" not in dataset.data_quality
+    # The composite probe ran, so the pair is proven and reported as the grain.
+    assert [list(k) for k in dataset.composite_keys] == [["order_id", "line_number"]]
+    keys = candidate_keys(dataset)
+    assert keys[0] == ["order_id", "line_number"]
+
+    dataset.candidate_keys = keys
+    yaml_text = _model_yaml(dataset)
+    # A composite key means not_null on each member and no column-level unique,
+    # which is the test suite a lakehouse staging model should ship with.
+    assert "tests: [unique, not_null]" not in yaml_text
+    assert yaml_text.count("tests: [not_null]") == 3

@@ -9,14 +9,17 @@
       "The business changed the revenue metric definition; does my semantic model still match?",
       "Reconcile my models with the current source schema.",
       "Which of my models are stale after the upstream change?",
-      "The row count on orders dropped overnight; did a load half-fail?"
+      "The row count on orders dropped overnight; did a load half-fail?",
+      "The unique test on order_id started failing yesterday and nobody changed the model. Figure out what happened.",
+      "Our revenue dashboard dropped 40% overnight but the code has not changed. What is going on upstream?"
     ],
     "negative": [
       "What's in this warehouse and which tables matter?",
       "Profile the events table and flag PII.",
       "Set up a dbt project in this repo.",
       "Build a staging model for raw orders.",
-      "Define a revenue metric on top of fct_orders."
+      "Define a revenue metric on top of fct_orders.",
+      "I just rewrote stg_orders and now the not_null test fails. Fix my SQL."
     ]
   },
   "evals": [
@@ -41,8 +44,10 @@
       "assertions": [
         "Grain drift is established from SQL aggregates (uniqueness, cardinality), never raw rows",
         "The finding names the key that lost uniqueness or the changed row-per-entity cardinality",
+        "A key that was proven unique and lapsed is reported differently from a declared grain that never held",
         "On a billed connector, surfaces the dry-run cost estimate and re-issues with --confirm and a user-agreed budget rather than inventing one; on DuckDB it runs directly",
-        "Any proposed fix is a reviewable diff; nothing is applied silently"
+        "Any proposed fix is a reviewable diff; nothing is applied silently",
+        "No column-level unique test is proposed against a column covered by a declared composite grain"
       ]
     },
     {

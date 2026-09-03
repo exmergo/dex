@@ -40,6 +40,7 @@ from .adapters import get_adapter
 from .adapters.base import scope_within
 from .config import (
     BigQueryTarget,
+    ClickHouseTarget,
     DatabricksTarget,
     DexConfig,
     PostgresTarget,
@@ -65,12 +66,23 @@ _PARADIGMS = {
     "databricks": Paradigm.COMPUTE_TIME,
     "redshift": Paradigm.COMPUTE_TIME,
     "postgres": Paradigm.DB_LOAD,
+    "clickhouse": Paradigm.DB_LOAD,
 }
 
 
-def paradigm_for(connector: str | None) -> Paradigm:
-    """The cost paradigm a connector bills in, free/local when it bills nothing."""
+def paradigm_for(connector: str | None, config: DexConfig | None = None) -> Paradigm:
+    """The cost paradigm a connector bills in, free/local when it bills nothing.
 
+    ClickHouse is the one connector whose paradigm is deployment-dependent.
+    Config-free callers deliberately retain the historical self-hosted answer;
+    callers that resolved a project config must pass it so Cloud refusals and
+    error envelopes are denominated in compute-seconds before an adapter opens.
+    """
+
+    if connector == "clickhouse" and config is not None:
+        target = config.clickhouse or ClickHouseTarget()
+        if target.deployment == "cloud":
+            return Paradigm.COMPUTE_TIME
     return _PARADIGMS.get(connector or "", Paradigm.FREE_LOCAL)
 
 
@@ -154,7 +166,9 @@ class SemanticSource:
 # can be opened from a host-supplied one. DuckDB is deliberately absent: its target
 # is a local file dex opens read-only itself, and accepting an outside handle would
 # mean trusting that it is read-only.
-_INJECTABLE = frozenset({"bigquery", "snowflake", "databricks", "postgres", "redshift"})
+_INJECTABLE = frozenset(
+    {"bigquery", "snowflake", "databricks", "postgres", "redshift", "clickhouse"}
+)
 
 
 def assert_connection_source(
@@ -223,16 +237,37 @@ def new_cost_gate(
     Kept here, alongside credential discovery, on purpose: a host that supplies
     its own connection must never be the thing that supplies the guard.
 
-    The day's spend is passed as a reader rather than a number, so the gate
-    re-reads it when it admits work instead of deciding the whole command from
-    one reading taken here. The lock comes from the store when the store has
-    one; without it the gate still reserves and says on every billed result that
-    the cumulative ceiling is advisory.
+    The day's spend is passed as a reader rather than a number, and nothing
+    calls it here: the gate reads it when it admits work instead of deciding the
+    whole command from one reading taken at assembly. That is what keeps the
+    ledger out of the availability path of commands that cannot spend, since a
+    gate is built for every command on a billed connector and only the billed
+    ones have any stake in the day's total. A store whose ledger lives on a
+    network can therefore be unreachable without taking down a cache-served
+    answer, while billed admission still refuses.
+
+    The lock comes from the store when the store has one; without it the gate
+    still reserves and says on every billed result that the cumulative ceiling
+    is advisory.
+
+    The history reader is bound the same way and scoped to this connector at the
+    binding, so nothing downstream can widen it: the ratio an over-ceiling
+    refusal quotes has to be this connector's own, and a DuckDB history
+    calibrating a BigQuery refusal would be worse than no calibration at all.
+    Passed as a reader for the same reason the day's spend is, and more so:
+    nothing calls it unless a command is actually refused over its ceiling.
+
+    The one-time cumulative-ceiling ask (issue #283) is armed from
+    ``config.source_path``, so it fires only where dex itself loaded the config
+    from a file it can therefore amend: a config-free ad-hoc read and a
+    host-supplied config object are both never asked a question they have
+    nowhere to answer.
     """
 
-    paradigm = paradigm_for(connector)
+    paradigm = paradigm_for(connector, config)
     field = ledger_field(paradigm)
     lock = getattr(store, "spend_lock", None)
+    history = getattr(store, "spend_entries", None)
     return CostGate(
         paradigm=paradigm,
         ceiling=budget if budget is not None else config.budget.ceiling,
@@ -245,28 +280,59 @@ def new_cost_gate(
         command=command,
         record=store.append_spend_log,
         lock=lock if callable(lock) else None,
+        history=(lambda: history(connector=connector)) if callable(history) else None,
+        session_ceiling_declined=config.budget.session_ceiling_declined,
+        config_path=config.source_path,
     )
 
 
-def no_connector_selected(repo_root: str | Path | None) -> NoConnectorSelectedError:
+def duckdb_candidates(directory: str | Path) -> list[Path]:
+    """Every ``*.duckdb`` file directly in ``directory``, sorted for a stable
+    answer. No recursion and no walk up: this is the narrow, run-directory-only
+    substrate the single-unambiguous-file on-ramp (issue #199) and its
+    ambiguous-refusal both read; a config or an explicit ``--connector``/
+    ``--path`` is never overridden by what this finds.
+    """
+
+    return sorted(Path(directory).glob("*.duckdb"))
+
+
+def no_connector_selected(
+    repo_root: str | Path | None, *, ambiguous_duckdb: list[Path] | None = None
+) -> NoConnectorSelectedError:
     """The connector-selection half of "no silent connector default".
 
     Nothing resolved a connector and nothing explicit was passed, so there is no
     honest choice left: defaulting to duckdb here would connect a user to a
     target they never named. The two spellings address the two callers, a CLI run
     from a directory and a library caller holding no repo at all.
+
+    ``ambiguous_duckdb`` names the case a bare run directory almost resolves on
+    its own: more than one ``*.duckdb`` file sits there, so which one the caller
+    meant is exactly the thing dex must not guess at (issue #199). Naming both
+    is what turns the refusal into something the caller can act on instead of
+    rerunning the same command.
     """
 
     if repo_root is None:
         return NoConnectorSelectedError(
             "no connector selected: pass connector= (with path= for duckdb) or a "
             "config= that declares one, or build from a project on disk with "
-            "DexEngine.from_repo(repo_root)"
+            "DexEngine.from_repo(repo_root). DBT_PROFILES_DIR only locates dbt "
+            "profiles.yml; it does not select dex's connector"
+        )
+    if ambiguous_duckdb:
+        names = ", ".join(str(p) for p in ambiguous_duckdb)
+        return NoConnectorSelectedError(
+            f"no .dex/config.yml found searching from '{repo_root}' up to the "
+            f"git root, and more than one DuckDB file sits in this directory "
+            f"({names}); pass --path <file> to pick one, or --repo-root"
         )
     return NoConnectorSelectedError(
         f"no .dex/config.yml found searching from '{repo_root}' up to the git "
         "root: run inside your dex project, pass --repo-root, or pass "
-        "--connector/--path for an ad-hoc read"
+        "--connector/--path for an ad-hoc read. DBT_PROFILES_DIR only locates "
+        "dbt profiles.yml; it does not select dex's connector"
     )
 
 
@@ -290,6 +356,7 @@ _SCOPE_FIELDS = {
     "databricks": "catalogs",
     "postgres": "schemas",
     "redshift": "schemas",
+    "clickhouse": "databases",
 }
 _SCOPE_GRAMMAR = {
     "bigquery": "--scope <dataset> (or <project>.<dataset>)",
@@ -297,6 +364,7 @@ _SCOPE_GRAMMAR = {
     "databricks": "--scope <catalog> (or <catalog>.<schema>)",
     "postgres": "--scope <schema>",
     "redshift": "--scope <schema>",
+    "clickhouse": "--scope <database>",
 }
 
 
@@ -432,6 +500,18 @@ def open_adapter(
 
     if connector == "redshift":
         return _open_redshift(
+            config,
+            repo_root,
+            store=_require_store(store, connector),
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            scope_override=scopes,
+            connection=connection,
+        )
+
+    if connector == "clickhouse":
+        return _open_clickhouse(
             config,
             repo_root,
             store=_require_store(store, connector),
@@ -1290,6 +1370,185 @@ def _pg_service_params(service: str, env: dict | os._Environ) -> dict | None:
             continue
         if parser.has_section(service):
             return dict(parser.items(service))
+    return None
+
+
+def _open_clickhouse(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    store: ExploreStore,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+    scope_override: list[str] | None = None,
+    connection: ConnectionSource | None = None,
+):
+    target = config.clickhouse or ClickHouseTarget()
+    target = narrow_target(target, "clickhouse", scope_override)
+
+    if connection is not None:
+        # Session settings are the host's to set on a client it built; the
+        # read-only guard does not depend on them, because the adapter sends
+        # readonly=2 with every statement it issues.
+        client = connection.connect()
+        method = connection.auth_method
+    else:
+        params, method = resolve_clickhouse_connection(target, os.environ, repo_root)
+
+        try:
+            import clickhouse_connect
+        except ImportError as exc:
+            raise CredentialDiscoveryError(
+                "the ClickHouse client is not installed; install the connector "
+                "extra: exmergo-dex-core[clickhouse]"
+            ) from exc
+
+        client = clickhouse_connect.get_client(
+            **params,
+            # The attribution tag, the application_name analogue. Session
+            # settings ride each statement instead of the client, so a host
+            # reusing this client cannot lose them.
+            client_name="dex",
+        )
+
+    gate = new_cost_gate(
+        "clickhouse",
+        config,
+        store,
+        budget=budget,
+        confirmed=confirmed,
+        command=command,
+    )
+    return get_adapter(
+        "clickhouse",
+        connection=client,
+        owns_connection=connection is None,
+        cost_gate=gate,
+        target=target,
+        auth_method=method,
+        scope_origin=scope_origin("clickhouse", "--scope" if scope_override else None),
+    )
+
+
+def resolve_clickhouse_connection(
+    target: ClickHouseTarget,
+    env: dict | os._Environ,
+    repo_root: str | Path = ".",
+) -> tuple[dict, str]:
+    """Discover ClickHouse connection parameters, never prompting.
+
+    Returns ``(params, auth_method)`` where ``params`` feeds
+    ``clickhouse_connect.get_client`` and ``auth_method`` is a coarse class safe
+    to surface (environment / config_target / dbt_profile, suffixed with the
+    credential kind); parameter values, including any password, never leave the
+    engine process.
+
+    Order: ``CLICKHOUSE_URL`` (or ``CLICKHOUSE_DSN``), the ``CLICKHOUSE_*``
+    environment, the committed non-secret config target plus
+    ``CLICKHOUSE_PASSWORD``, then a dbt profile's clickhouse target. There is no
+    ``pg_service.conf`` analogue to pin, which is why this chain is one shorter
+    than Postgres's. Every failure names the fix.
+    """
+
+    dsn = env.get("CLICKHOUSE_URL") or env.get("CLICKHOUSE_DSN")
+    if dsn:
+        params: dict = {"dsn": dsn}
+        if target.database:
+            params["database"] = target.database
+        return params, "environment:dsn"
+
+    host = env.get("CLICKHOUSE_HOST")
+    if host:
+        params = {"host": host}
+        _put(params, "port", env.get("CLICKHOUSE_PORT"), int)
+        _put(params, "username", env.get("CLICKHOUSE_USER"))
+        _put(params, "password", env.get("CLICKHOUSE_PASSWORD"))
+        _put(params, "database", env.get("CLICKHOUSE_DATABASE") or target.database)
+        secure = env.get("CLICKHOUSE_SECURE")
+        if secure is not None:
+            params["secure"] = str(secure).lower() in ("1", "true", "yes", "on")
+        return params, _ch_credential_kind(params)
+
+    if target.host:
+        params = {"host": target.host}
+        _put(params, "port", target.port)
+        _put(params, "username", target.user)
+        _put(params, "password", env.get("CLICKHOUSE_PASSWORD"))
+        _put(params, "database", target.database)
+        if target.secure is not None:
+            params["secure"] = target.secure
+        return params, f"config_target:{_ch_credential_kind(params).split(':')[-1]}"
+
+    profile_params = _clickhouse_from_dbt_profiles(repo_root, env)
+    if profile_params:
+        kind = _ch_credential_kind(profile_params).split(":")[-1]
+        return profile_params, f"dbt_profile:{kind}"
+
+    raise CredentialDiscoveryError(
+        "no ClickHouse connection could be discovered. Set CLICKHOUSE_URL, or "
+        "CLICKHOUSE_HOST (with CLICKHOUSE_USER and CLICKHOUSE_PASSWORD), or "
+        "commit a clickhouse.host target in .dex/config.yml, or add a "
+        "clickhouse output to your dbt profiles.yml"
+    )
+
+
+def _put(params: dict, key: str, value, cast=None) -> None:
+    """Set an optional connection parameter only when it has a value, so the
+    client's own defaults (port by protocol, user 'default') still apply."""
+
+    if value in (None, ""):
+        return
+    params[key] = cast(value) if cast else value
+
+
+def _ch_credential_kind(params: dict) -> str:
+    """The coarse credential class, never the credential. Deliberately blunt:
+    the envelope needs to know whether a password was inlined, not what it was."""
+
+    if params.get("password"):
+        return "environment:password"
+    return "environment:external"
+
+
+def _clickhouse_from_dbt_profiles(
+    repo_root: str | Path, env: dict | os._Environ
+) -> dict | None:
+    """Last-resort fallback: a clickhouse output in the project's profiles.yml.
+
+    dbt-clickhouse names the ClickHouse database ``schema`` (it has no
+    ``database`` key), which is the same two-part-namespace fact the adapter
+    encodes, so the mapping here is not a special case so much as the same
+    truth spelled dbt's way. Any failure means not found.
+    """
+
+    profiles_path = Path(repo_root) / "profiles.yml"
+    if not profiles_path.is_file():
+        profiles_path = Path.home() / ".dbt" / "profiles.yml"
+    if not profiles_path.is_file():
+        return None
+    try:
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if not isinstance(output, dict) or output.get("type") != "clickhouse":
+                continue
+            host = _profile_scalar(output.get("host"), env)
+            if not host:
+                continue
+            params: dict = {"host": host}
+            _put(params, "port", _profile_scalar(output.get("port"), env), int)
+            _put(params, "username", _profile_scalar(output.get("user"), env))
+            _put(params, "password", _profile_scalar(output.get("password"), env))
+            _put(params, "database", _profile_scalar(output.get("schema"), env))
+            secure = _profile_scalar(output.get("secure"), env)
+            if secure is not None:
+                params["secure"] = str(secure).lower() in ("1", "true", "yes", "on")
+            return params
     return None
 
 

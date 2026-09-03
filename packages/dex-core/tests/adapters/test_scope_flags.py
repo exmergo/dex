@@ -13,6 +13,7 @@ import pytest
 
 from exmergo_dex_core.config import (
     BigQueryTarget,
+    ClickHouseTarget,
     DatabricksTarget,
     PostgresTarget,
     RedshiftTarget,
@@ -30,7 +31,7 @@ def _assert(connector, *, project=None, datasets=None, scopes=None):
 
 
 @pytest.mark.parametrize(
-    "connector", ["snowflake", "databricks", "postgres", "redshift"]
+    "connector", ["snowflake", "databricks", "postgres", "redshift", "clickhouse"]
 )
 @pytest.mark.parametrize(
     ("flag", "kwargs"),
@@ -61,7 +62,8 @@ def test_bigquery_accepts_its_own_flags():
 
 
 @pytest.mark.parametrize(
-    "connector", ["bigquery", "snowflake", "databricks", "postgres", "redshift"]
+    "connector",
+    ["bigquery", "snowflake", "databricks", "postgres", "redshift", "clickhouse"],
 )
 def test_scope_is_accepted_on_every_warehouse_connector(connector):
     _assert(connector, scopes=["analytics"])
@@ -81,6 +83,7 @@ def test_no_flags_is_always_fine():
         "databricks",
         "postgres",
         "redshift",
+        "clickhouse",
     ):
         _assert(connector)
 
@@ -137,3 +140,17 @@ def test_redshift_scope_narrows_and_never_widens():
 def test_no_override_leaves_the_target_untouched():
     committed = BigQueryTarget(datasets=["analytics"])
     assert narrow_target(committed, "bigquery", None) is committed
+
+
+def test_clickhouse_scope_narrows_and_never_widens():
+    """A ClickHouse scope is a bare database: there is no catalog above it to
+    qualify with, so the containment test is over one segment."""
+
+    committed = ClickHouseTarget(databases=["app", "raw"])
+    narrowed = narrow_target(committed, "clickhouse", ["app"])
+    assert narrowed.databases == ["app"]
+    # ...and the committed object is not mutated in place.
+    assert committed.databases == ["app", "raw"]
+
+    with pytest.raises(ScopeError, match="never widens"):
+        narrow_target(committed, "clickhouse", ["marketing"])

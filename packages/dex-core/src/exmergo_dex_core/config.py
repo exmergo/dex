@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from .diffs import file_diff
 from .envelope import Paradigm
+from .errors import ConfigurationError
 from .storage import DEX_DIR
 
 CONFIG_FILE = "config.yml"
@@ -30,11 +32,22 @@ class Budget(BaseModel):
     ``session_ceiling`` bounds cumulative spend across commands per UTC day,
     settled against the ``.dex/spend.jsonl`` ledger, so a long agent session
     (or a loop of confirmed commands) still has a hard stop.
+
+    ``session_ceiling_declined`` records that this project was asked for a
+    cumulative ceiling and chose to run without one (issue #283). It is the
+    record of a decision, not a permission: it loosens nothing, every billed
+    command still warns that the day's total is unbounded, and the only thing it
+    changes is that the one-time ask does not fire again. It lives in the
+    committed file rather than in the ``.dex/`` cache for two reasons: a
+    decision that a cleared cache re-asks is not a decision, and a project
+    running deliberately unbounded is exactly the kind of thing a reviewer
+    should see in a diff.
     """
 
     paradigm: Paradigm = Paradigm.FREE_LOCAL
     ceiling: float | None = None
     session_ceiling: float | None = None
+    session_ceiling_declined: bool = False
 
 
 class DuckDBTarget(BaseModel):
@@ -191,16 +204,83 @@ class RedshiftTarget(BaseModel):
     rpu_price_usd: float | None = None
 
 
+class ClickHouseTarget(BaseModel):
+    """Non-secret ClickHouse connection target. Credentials are never here:
+    auth is discovered at runtime by connect.py (CLICKHOUSE_URL, the
+    CLICKHOUSE_* environment, this committed target plus CLICKHOUSE_PASSWORD,
+    or a dbt profile), and passwords are never written or logged.
+
+    ClickHouse namespaces are two-part, ``database.table``: there is no
+    catalog level, and dbt-clickhouse's ``schema:`` *is* the ClickHouse
+    database. So ``databases`` is the source allowlist and ``dev_database``
+    is where dbt dev builds write, refused as a source so reads and writes
+    never share a database.
+
+    ``deployment`` declares which ClickHouse this is, and is a cost decision
+    rather than a connection one. Self-hosted bills no currency, so dex
+    guards it as database-seconds (``db_load``); ClickHouse Cloud is guarded
+    in compute-seconds, with live service capacity translating those seconds
+    to compute-unit-hours. ``compute_unit_price_usd`` adds the optional dollar
+    translation and is refused under ``self_hosted``, where it would otherwise
+    be accepted and ignored.
+
+    ``max_full_profile_bytes`` opts large tables into sampled profiling.
+    ClickHouse's ``SAMPLE`` clause only works where the table declared a
+    sampling expression in its MergeTree key, which is uncommon, so the
+    sampled path is ``ORDER BY rand() LIMIT n`` and is not repeatable.
+    """
+
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    user: str | None = None
+    secure: bool | None = None
+    databases: list[str] = Field(default_factory=list)
+    dev_database: str | None = None
+    deployment: str = "self_hosted"
+    compute_unit_price_usd: float | None = None
+    max_full_profile_bytes: int | None = None
+
+    @model_validator(mode="after")
+    def _check_deployment(self) -> ClickHouseTarget:
+        allowed = ("self_hosted", "cloud")
+        if self.deployment not in allowed:
+            raise ValueError(
+                f"clickhouse.deployment must be one of {', '.join(allowed)}, "
+                f"got '{self.deployment}'"
+            )
+        # Refused rather than ignored: a price per compute unit under a
+        # paradigm that counts seconds would read as a configured dollar
+        # translation and produce none, which is the accepted-and-ignored
+        # shape this codebase refuses everywhere else.
+        if self.deployment == "self_hosted" and self.compute_unit_price_usd is not None:
+            raise ValueError(
+                "clickhouse.compute_unit_price_usd applies to "
+                "deployment: cloud, which bills compute-unit-hours. A "
+                "self-hosted server bills no currency, so dex guards it in "
+                "database-seconds and would never spend this number. Remove "
+                "it, or set deployment: cloud"
+            )
+        return self
+
+
 class QueryLimits(BaseModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
     The caps protect agent context from token blowups: an oversized result is
     truncated with an explicit note rather than trusted to agent frugality.
+
+    ``max_rows`` and ``max_cell_chars`` bound one statement. ``max_payload_bytes``
+    bounds the whole call, because a call answering several statements can flood
+    context with results that are each individually small; the budget is spent in
+    statement order and what one statement leaves unspent the next may use.
+    ``max_statements`` bounds how many a single call may carry at all.
     """
 
     max_rows: int = 50
     max_cell_chars: int = 256
     max_payload_bytes: int = 16384
+    max_statements: int = 10
     timeout_seconds: float = 30.0
 
 
@@ -234,6 +314,22 @@ class ClusterLimits(BaseModel):
     random_state: int = 0
     sample_seed: int | None = 0
     timeout_seconds: float = 60.0
+
+
+class MaintainConfig(BaseModel):
+    """Tuning for `maintain`'s detectors.
+
+    ``grain_min_rows``: below this row count, a lost-uniqueness finding
+    (``key_lost_uniqueness`` / ``declared_grain_not_unique``) is damped to
+    ``low`` rather than reported at ``high`` (issue #280). A handful of rows
+    is exactly the shape where losing uniqueness means the least: a 4-row
+    table with a boolean column "loses" a uniqueness it never meaningfully
+    had once a fifth row repeats a value. The finding is never dropped, only
+    downgraded, and the damping is named in the finding's own `data` so
+    nothing about the run is silent.
+    """
+
+    grain_min_rows: int = 100
 
 
 class PIIOverride(BaseModel):
@@ -344,18 +440,103 @@ def blob_override_paths(overrides: list[BlobOverride]) -> set[str]:
     return {entry.column.strip().lower() for entry in overrides}
 
 
-class SemanticConfig(BaseModel):
-    """How ``explore semantic`` reaches the semantic layer.
+class EntityAffixes(BaseModel):
+    """Table-name prefixes and suffixes entity matching strips as a
+    lower-confidence fallback, tried only once an exact entity-name match
+    fails (see ``explore.relationships._match_parent``).
 
-    Two backends, selected by ``backend`` and overridable per command with
-    ``--local`` / ``--api``. ``local`` renders metric queries with MetricFlow and
-    executes them through dex's own connector and cost guard, so a dbt project
-    must be present (like DuckDB needs a local file). ``dbt_cloud`` sends the
-    query to a hosted dbt Cloud Semantic Layer over GraphQL and needs no local
-    project (like BigQuery needs no local DuckDB); dbt Cloud owns the warehouse
-    connection and executes server-side, so **dex's cost guard does not apply on
-    that path** (the dbt Cloud environment governs spend, and every hosted result
-    says so).
+    These are the default output of CDC history modes, landing-zone
+    conventions (``_data``/``_raw``/``_stg``), and layered-warehouse naming
+    (``stg_``/``dim_``/``fct_``), not exotic house choices, but house
+    conventions still vary enough that the list is overridable. Deliberately
+    small by default: an ordered set covers the common cases without turning
+    entity matching into a grab-bag of guesses. A trailing version marker
+    (``_v2``, ``_v3``, ...) is always stripped and is not part of this list,
+    since it is a structural convention rather than a house-specific word.
+    """
+
+    prefixes: list[str] = Field(
+        default_factory=lambda: [
+            "stg",
+            "src",
+            "raw",
+            "dim",
+            "fct",
+            "fact",
+            "int",
+            "base",
+        ]
+    )
+    suffixes: list[str] = Field(
+        default_factory=lambda: ["history", "data", "raw", "snapshot", "current"]
+    )
+
+
+# Which deployments each semantic-layer vendor ships, and the spellings that name
+# them. One vendor today; the table exists because `backend:` collapsed vendor and
+# deployment into one enum, which only extends while there is exactly one vendor.
+# `api` and `cloud` are released spellings of `dbt_cloud` and stay accepted.
+SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {"dbt": ("local", "dbt_cloud")}
+_SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
+    "local": "local",
+    "dbt_cloud": "dbt_cloud",
+    "api": "dbt_cloud",
+    "cloud": "dbt_cloud",
+}
+
+
+def canonical_semantic_deployment(value: str) -> str:
+    """One deployment spelling, canonicalized. Unknown values pass through so the
+    validator (or the backend resolver, for a duck-typed config) can refuse them
+    by name rather than silently mapping them onto something that exists."""
+
+    key = (value or "").strip().lower()
+    return _SEMANTIC_DEPLOYMENT_SPELLINGS.get(key, key)
+
+
+class ConventionWarnings(BaseModel):
+    """Which house conventions ``transform plan`` reads out of the project's own
+    models, and warns when an authored model breaks.
+
+    These are the only warnings dex raises on a style judgment rather than on a
+    fact, which is why they are the only ones a project can switch off. Each
+    fires only where the project's own precedent is unambiguous (see
+    ``transform.conventions``), so leaving them on costs a repo with no
+    consistent convention nothing; turning one off is for a house that has a
+    convention and has decided it is not this one.
+
+    ``resolved_keys``: an authored model exposes a raw foreign key where its
+    siblings all resolve the equivalent key to a descriptive attribute.
+    """
+
+    resolved_keys: bool = True
+
+
+class SemanticConfig(BaseModel):
+    """How ``explore semantic`` reaches the semantic layer, on two axes.
+
+    ``vendor`` is which semantic-layer format answers (``dbt``/MetricFlow today).
+    It is ambient per repo, chosen once, the same rule ``connector:`` follows: a
+    repo has one semantic layer, so there is no more reason to retype the vendor
+    per command than to retype the warehouse.
+
+    ``deployment`` is which endpoint or artifact of that vendor is read. For dbt:
+    ``local`` renders metric queries with MetricFlow and executes them through
+    dex's own connector and cost guard, so a dbt project must be present (like
+    DuckDB needs a local file); ``dbt_cloud`` sends the query to a hosted dbt Cloud
+    Semantic Layer over GraphQL and needs no local project (like BigQuery needs no
+    local DuckDB).
+
+    A third property, **who executes**, is derived from those two and never
+    configured, because it is what decides whether the cost guard can apply at
+    all. Each backend declares it (``execution``: ``dex`` or ``vendor``) and every
+    result carries it. ``--local`` / ``--api`` override that axis for one command.
+
+    ``backend`` is the released spelling of the two axes as one enum and is still
+    accepted: ``local`` reads as dbt plus the local deployment, ``dbt_cloud`` as
+    dbt plus the hosted one. Setting both is fine while they agree and refused
+    when they contradict, because a config dex accepts and then ignores is worse
+    than one it refuses.
 
     ``host`` and ``environment_id`` are the non-secret hosted coordinates, copied
     from the dbt Cloud Semantic Layer panel (or ``DBT_SL_HOST`` / ``DBT_SL_ENV_ID``
@@ -364,8 +545,58 @@ class SemanticConfig(BaseModel):
     """
 
     backend: str = "local"
+    vendor: str = "dbt"
+    deployment: str | None = None
     host: str | None = None
     environment_id: str | None = None
+
+    @model_validator(mode="after")
+    def _check_axes(self) -> SemanticConfig:
+        vendor = (self.vendor or "").strip().lower()
+        if vendor not in SEMANTIC_DEPLOYMENTS:
+            raise ValueError(
+                f"semantic.vendor must be one of "
+                f"{', '.join(sorted(SEMANTIC_DEPLOYMENTS))}, got '{self.vendor}'"
+            )
+        allowed = SEMANTIC_DEPLOYMENTS[vendor]
+
+        from_backend = canonical_semantic_deployment(self.backend)
+        explicit_backend = "backend" in self.model_fields_set
+        if explicit_backend and from_backend not in allowed:
+            raise ValueError(
+                f"semantic.backend '{self.backend}' names no deployment of vendor "
+                f"'{vendor}'; use one of {', '.join(allowed)}"
+            )
+
+        if self.deployment is None:
+            deployment = from_backend
+        else:
+            deployment = canonical_semantic_deployment(self.deployment)
+            if deployment not in allowed:
+                raise ValueError(
+                    f"semantic.deployment must be one of {', '.join(allowed)} for "
+                    f"vendor '{vendor}', got '{self.deployment}'"
+                )
+            # Refused rather than resolved by precedence: the two keys are two
+            # spellings of one choice, and picking a winner would leave the other
+            # accepted and ignored, which reads as a setting that took effect.
+            if explicit_backend and deployment != from_backend:
+                raise ValueError(
+                    f"semantic.backend '{self.backend}' and semantic.deployment "
+                    f"'{self.deployment}' name different deployments. They are two "
+                    "spellings of one choice; keep whichever you prefer and remove "
+                    "the other"
+                )
+
+        # Written through ``object.__setattr__`` so the derived values do not join
+        # ``model_fields_set``: ``save_config`` dumps with ``exclude_unset``, and a
+        # derived default written back into the committed file would read as a
+        # choice the author made. ``backend`` is kept consistent with the canonical
+        # deployment rather than left stale, so either spelling answers correctly.
+        object.__setattr__(self, "vendor", vendor)
+        object.__setattr__(self, "deployment", deployment)
+        object.__setattr__(self, "backend", deployment)
+        return self
 
 
 class CacheConfig(BaseModel):
@@ -378,7 +609,9 @@ class CacheConfig(BaseModel):
 
     ``backend`` is an open registry rather than a closed set. It accepts a name
     dex ships (``filesystem``, the default, which writes the loose JSON under
-    `.dex/` that a reviewer reads in a pull request), a dotted
+    `.dex/` that a reviewer reads in a pull request; or ``sqlite``, which writes
+    one `.dex/dex.db` file instead and is not git-reviewable, for a host that
+    wants durable state without scattering JSON files), a dotted
     ``mypkg.stores:my_store`` path, or a name an installed distribution registered
     under the ``exmergo_dex_core.stores`` entry-point group. A backend published
     as its own package is therefore selectable without a change to dex.
@@ -444,6 +677,24 @@ class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
 
+    # Where this config was read from, stamped by `load_config` and absent on one
+    # a host built itself. Private, so it never joins a dump and can never be
+    # written back into the file it names.
+    #
+    # It exists for the one-time cumulative-ceiling ask (issue #283), which needs
+    # to know not merely that a config file sits at the repo root but that *this*
+    # config is that file: a host holding its own object has already made the
+    # budget decisions the ask would go looking for, and amending a file whose
+    # settings are not the ones in play would record a decision about the wrong
+    # project's budget. See `session_ceiling_undecided`.
+    _source_path: Path | None = PrivateAttr(default=None)
+
+    @property
+    def source_path(self) -> Path | None:
+        """The file this config was loaded from, or None if it was not loaded."""
+
+        return self._source_path
+
     # The DuckDB on-ramp: a config that omits `connector:` (or a bare `--path`
     # read with no config) means the free local connector. This default only
     # applies to a config that actually exists or an explicit `--path`; it is NOT
@@ -457,6 +708,7 @@ class DexConfig(BaseModel):
     databricks: DatabricksTarget | None = None
     postgres: PostgresTarget | None = None
     redshift: RedshiftTarget | None = None
+    clickhouse: ClickHouseTarget | None = None
     dbt_target: str | None = None
     # Which format owns the source of truth. Defaults to dbt, so a repo that
     # selects nothing behaves exactly as it did before this setting existed.
@@ -478,14 +730,36 @@ class DexConfig(BaseModel):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     budget: Budget = Field(default_factory=Budget)
     ranking_hints: list[str] = Field(default_factory=list)
+    # Affixes entity matching strips as a lower-confidence fallback when an
+    # exact entity name misses (issue #208). The default list is small on
+    # purpose; house-specific conventions (a shop's own `_bak`/`ods_`) are the
+    # reason this is overridable rather than fixed.
+    entity_affixes: EntityAffixes = Field(default_factory=EntityAffixes)
+    # Which house-convention warnings `transform plan` raises (issue #223). All
+    # on by default: each stays silent unless the project's own models agree
+    # unanimously, so a repo with no convention never hears from them.
+    conventions: ConventionWarnings = Field(default_factory=ConventionWarnings)
     query: QueryLimits = Field(default_factory=QueryLimits)
     cluster: ClusterLimits = Field(default_factory=ClusterLimits)
+    maintain: MaintainConfig = Field(default_factory=MaintainConfig)
     # How many top-ranked objects `explore map` deep-profiles on a large
     # warehouse; the rest stay inventory-only. Selective by default, overridable.
     profile_top_n: int = 25
     # How fresh a cached profile must be to skip re-scanning it (`explore map` /
     # `explore relationships`); 0 disables reuse (always re-profile).
     profile_freshness_hours: float = 24.0
+    # How many values `explore profile` serializes for a column's value domain
+    # (issue #290): the most frequent ones, with the rest folded into that
+    # domain's `elided` count. The default equals the probe's own cap
+    # (`adapters.base.VALUE_DOMAIN_CAP`), so nothing is cut unless a repo asks;
+    # lowering it trims the payload and never what is probed or cached.
+    profile_value_domain_cap: int = 25
+    # Whether `explore query` and `explore cluster` may profile an object the
+    # connection has but the cache cannot speak for, instead of refusing. Priced
+    # and disclosed when it happens. Top-level rather than under `query:` because
+    # both commands honor it, and it governs profiling rather than result shape.
+    # Set false for the strict prerequisite (`--no-auto-profile` per command).
+    auto_profile: bool = True
     # Columns a human has reviewed and cleared as not PII. The only way to
     # durably clear a detector flag; hand-edits to the cache are overwritten by
     # the next profile, this list is re-applied on every profile.
@@ -496,12 +770,92 @@ class DexConfig(BaseModel):
     blob_overrides: list[BlobOverride] = Field(default_factory=list)
 
 
+def config_path(repo_root: Path | str = ".") -> Path | None:
+    """The committed config file at ``repo_root``, or None when there is none.
+
+    ``load_config`` answers the same question by returning None, but a caller
+    that means to *amend* the file needs the path without parsing it, and needs
+    to tell "no file" apart from "a file that parsed to nothing".
+    """
+
+    path = Path(repo_root) / DEX_DIR / CONFIG_FILE
+    return path if path.is_file() else None
+
+
+def record_session_ceiling_decision(
+    repo_root: Path | str,
+    *,
+    session_ceiling: float | None = None,
+    declined: bool = False,
+) -> tuple[DexConfig, dict[str, Any]]:
+    """Write the cumulative-ceiling decision into ``.dex/config.yml``.
+
+    Returns the amended config and the file diff, because a write dex performed
+    on the caller's behalf has to be visible: the envelope carries the diff the
+    way ``transform init`` carries the files it created, so the amendment is
+    reviewable rather than something a caller discovers in ``git status``.
+
+    Re-read from disk rather than amended in memory on purpose. The config the
+    engine is holding may have been overridden for this run (``--connector``, an
+    injected object), and writing that back would commit a one-run override as a
+    project setting. Only the budget field the decision names is touched.
+    """
+
+    if (session_ceiling is None) == (not declined):
+        raise ConfigurationError(
+            "a cumulative-ceiling decision is either a ceiling or a decline, "
+            "not both and not neither: pass --session-ceiling <value> or "
+            "--no-session-ceiling"
+        )
+    if session_ceiling is not None and session_ceiling <= 0:
+        raise ConfigurationError(
+            "--session-ceiling must be a positive magnitude, got "
+            f"{session_ceiling}; to run without a cumulative ceiling pass "
+            "--no-session-ceiling instead, which records that choice"
+        )
+
+    root = Path(repo_root)
+    path = config_path(root)
+    if path is None:
+        raise ConfigurationError(
+            f"no {DEX_DIR}/{CONFIG_FILE} at '{root}' to record a "
+            "cumulative-ceiling decision in; commit a config for this project "
+            "first (`dex transform init` writes one), or pass --budget alone "
+            "for an ad-hoc read"
+        )
+    old = path.read_text(encoding="utf-8")
+    config = DexConfig.model_validate(yaml.safe_load(old) or {})
+    if declined:
+        config.budget.session_ceiling = None
+        config.budget.session_ceiling_declined = True
+        config.budget.model_fields_set.discard("session_ceiling")
+    else:
+        config.budget.session_ceiling = session_ceiling
+        # A ceiling supersedes an earlier decline, and once it does, the flag is
+        # noise in a committed file: dropped rather than written as an explicit
+        # `false` that reads like a second setting.
+        config.budget.session_ceiling_declined = False
+        config.budget.model_fields_set.discard("session_ceiling_declined")
+    # `budget` itself has to join `model_fields_set`, or `save_config`'s
+    # `exclude_unset` dump drops the whole block a nested assignment landed in.
+    config.budget = config.budget
+    save_config(config, root)
+    return config, file_diff(
+        f"{DEX_DIR}/{CONFIG_FILE}", old, path.read_text(encoding="utf-8")
+    )
+
+
 def load_config(repo_root: Path | str = ".") -> DexConfig | None:
     path = Path(repo_root) / DEX_DIR / CONFIG_FILE
     if not path.is_file():
         return None
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return DexConfig.model_validate(raw)
+    config = DexConfig.model_validate(raw)
+    # Stamped here and nowhere else: this is the only function that turns a file
+    # into a config, so it is the only one that can honestly say a config came
+    # from one. See `DexConfig.source_path`.
+    config._source_path = path
+    return config
 
 
 def save_config(config: DexConfig, repo_root: Path | str = ".") -> Path:

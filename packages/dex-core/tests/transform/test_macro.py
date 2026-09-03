@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.dbt_project import DbtProjectError, contained_path
+from exmergo_dex_core.dbt_project import (
+    DbtProjectError,
+    DbtProjectView,
+    contained_path,
+)
 from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit, PlanError
 from exmergo_dex_core.transform.plans import plan as make_plan
@@ -25,6 +29,7 @@ ADAPTER_PREFIXES = (
     "databricks",
     "postgres",
     "redshift",
+    "clickhouse",
     "duckdb",
 )
 
@@ -120,6 +125,43 @@ def test_generate_schema_name_scaffolds_into_an_existing_project(
     assert (dbt_project_dir / "macros" / "generate_schema_name.sql").is_file()
 
 
+def test_drop_orphan_relations_asset_ships_and_is_balanced():
+    # importlib.resources is how the engine loads it at runtime, so this is the
+    # packaging regression guard: a wheel that drops the asset fails here.
+    asset = (
+        resources.files("exmergo_dex_core.transform")
+        / "assets"
+        / "macros"
+        / "drop_orphan_relations.sql"
+    )
+    content = asset.read_text(encoding="utf-8")
+    assert content.count("{% macro ") == content.count("{% endmacro %}")
+    assert "adapter.get_relation" in content
+    assert "adapter.drop_relation" in content
+
+
+def test_drop_orphan_relations_scaffolds_and_parses_into_an_existing_project(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # dbt's own parser sees the macro in a shadow copy of the project before
+    # the plan is even proposed (transform/commands.py::macro), so a green
+    # run here also proves the Jinja is syntactically valid, not just that the
+    # file scaffolds.
+    rc, envelope = _run(
+        ["--repo-root", str(tmp_path), "transform", "macro", "drop_orphan_relations"],
+        capsys,
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["macros/drop_orphan_relations.sql"]
+    unified = envelope["diffs"][0]["unified"]
+    assert "dry_run" in unified
+    assert "graph.nodes" in unified
+
+    rc, envelope = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, envelope
+    assert (dbt_project_dir / "macros" / "drop_orphan_relations.sql").is_file()
+
+
 def test_macro_refuses_an_unknown_name_naming_the_available(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
@@ -213,13 +255,16 @@ def test_plan_warns_when_a_model_calls_the_missing_macro(
 def test_contained_path_admits_macros_and_still_refuses_escapes(tmp_path: Path):
     root = tmp_path / "proj"
     root.mkdir()
-    assert contained_path(root, "macros/x.sql", ["models"], ["macros"])
+    view = DbtProjectView(
+        root=str(root), project_name="p", profile_name="p", model_paths=["models"]
+    )
+    assert contained_path(root, "macros/x.sql", view)
     with pytest.raises(DbtProjectError):
-        contained_path(root, "../macros/x.sql", ["models"], ["macros"])
+        contained_path(root, "../macros/x.sql", view)
     with pytest.raises(DbtProjectError):
-        contained_path(root, str(tmp_path / "macros" / "x.sql"), ["models"], ["macros"])
+        contained_path(root, str(tmp_path / "macros" / "x.sql"), view)
     with pytest.raises(DbtProjectError):
-        contained_path(root, "scripts/x.sql", ["models"], ["macros"])
+        contained_path(root, "scripts/x.sql", view)
 
 
 def test_custom_macro_paths_are_honored(dbt_project_dir: Path, tmp_path: Path, capsys):

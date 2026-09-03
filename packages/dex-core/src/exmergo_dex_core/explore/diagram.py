@@ -43,7 +43,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from ..cache import ColumnProfile, Dataset, DexCache, Relationship, RelationshipKind
+from ..cache import (
+    ColumnProfile,
+    Dataset,
+    DexCache,
+    Relationship,
+    RelationshipKind,
+    join_columns_by_dataset,
+)
 
 # Past roughly this many entities a Mermaid ER diagram stops being readable and
 # starts being a schema dump in agent context, which is the thing explore exists
@@ -100,7 +107,7 @@ def render_er_mermaid(
     column. It does not lift ``max_entities``, which always binds.
     """
 
-    ranked = _eligible_datasets(cache, full=full)
+    ranked = cache.ranked_datasets(profiled_only=not full, connected_only=not full)
     kept = ranked[:max_entities]
     kept_names = {d.identifier for d in kept}
     lowered = {d.identifier.lower() for d in kept}
@@ -113,7 +120,7 @@ def render_er_mermaid(
     edges.sort(key=lambda r: (r.to_dataset, r.from_dataset, tuple(r.from_columns)))
 
     ids = _entity_ids(kept)
-    join_columns = _join_columns(edges)
+    join_columns = join_columns_by_dataset(edges)
 
     lines = ["erDiagram"]
     lines.extend(_header_comments(cache, ids))
@@ -188,66 +195,21 @@ def render_er_mermaid(
 # --- selection ----------------------------------------------------------------
 
 
-def _eligible_datasets(cache: DexCache, *, full: bool) -> list[Dataset]:
-    """The datasets worth drawing, best first.
-
-    An empty ``columns`` list is the codebase's own test for "inventoried but
-    never profiled" (see ``_compose_datasets``), so the default set is the
-    intersection of profiled and connected: an unprofiled box carries no
-    attributes, and an isolated one carries no edge, so together they are the
-    two ways a box says nothing.
-
-    Order is rank first and identifier second, never cache order, so the same
-    cache renders byte-identically however its datasets happen to be stored.
-    """
-
-    connected = {r.from_dataset.lower() for r in cache.relationships}
-    connected |= {r.to_dataset.lower() for r in cache.relationships}
-    candidates = [
-        d
-        for d in cache.datasets
-        if full or (d.columns and d.identifier.lower() in connected)
-    ]
-    return sorted(candidates, key=lambda d: (-(d.rank_score or 0.0), d.identifier))
+# The Mermaid key glyph for each role the cache assigns a column. Selection is
+# `Dataset.notable_columns`, shared with `explore map` so the two commands can
+# never disagree about which columns matter; only the rendering is local.
+_ROLE_MARKS = {"grain": " PK", "join": " FK", "key": " UK"}
 
 
 def _attributes(
     dataset: Dataset, join_columns: set[str], *, full: bool
 ) -> tuple[list[str], int]:
-    """One Mermaid attribute line per column worth drawing, plus the drop count.
+    """One Mermaid attribute line per column worth drawing, plus the drop count."""
 
-    Warehouse column order is preserved rather than sorted: it is how the table
-    reads in every other tool, and it is already stable in the cache.
-    """
-
-    keyed = {c.lower() for group in dataset.candidate_keys for c in group}
-    keyed |= {c.lower() for group in dataset.composite_keys for c in group}
-    grain = {c.lower() for c in (dataset.grain or [])}
-
+    selected, dropped = dataset.notable_columns(join_columns, everything=full)
     lines: list[str] = []
-    dropped = 0
-    for column in dataset.columns:
-        lowered = column.name.lower()
-        wanted = (
-            full
-            or lowered in grain
-            or lowered in keyed
-            or lowered in join_columns
-            or column.pii is not None
-            or column.is_unique is True
-        )
-        if not wanted:
-            dropped += 1
-            continue
-
-        mark = ""
-        if lowered in grain:
-            mark = " PK"
-        elif lowered in join_columns:
-            mark = " FK"
-        elif lowered in keyed or column.is_unique is True:
-            mark = " UK"
-
+    for column, role in selected:
+        mark = _ROLE_MARKS.get(role or "", "")
         data_type = _safe(
             column.data_type or "unknown", fallback="unknown", strip_detail=True
         )
@@ -309,9 +271,19 @@ def _edge(rel: Relationship, kept: list[Dataset]) -> str:
 
 
 def _edge_label(rel: Relationship) -> str:
+    """The edge annotation: the key, the kind, and what earned the claim.
+
+    ``declared_by`` is drawn where the cache carries one, which is a semantic
+    layer's shared entity. A reader looking at a solid line otherwise has no way to
+    tell a foreign-key test from a declared join the semantic layer performs, and
+    the entity name is the handle for looking the second one up.
+    """
+
     parts = [", ".join(rel.from_columns) or "join", rel.kind.value]
     if rel.kind is not RelationshipKind.DECLARED and rel.confidence is not None:
         parts[-1] = f"{rel.kind.value} {rel.confidence:.2f}"
+    if rel.declared_by:
+        parts[-1] = f"{parts[-1]}: {rel.declared_by}"
     if rel.verified:
         if rel.orphan_fraction is None:
             parts.append("verified, no non-null keys")
@@ -342,20 +314,6 @@ def _is_proven_key(dataset: Dataset, columns: list[str]) -> bool:
             c.name.lower() == wanted[0] and c.is_unique is True for c in dataset.columns
         )
     return False
-
-
-def _join_columns(edges: list[Relationship]) -> dict[str, set[str]]:
-    """Columns that carry a drawn join, per dataset, for the FK mark."""
-
-    columns: dict[str, set[str]] = {}
-    for rel in edges:
-        columns.setdefault(rel.from_dataset.lower(), set()).update(
-            c.lower() for c in rel.from_columns
-        )
-        columns.setdefault(rel.to_dataset.lower(), set()).update(
-            c.lower() for c in rel.to_columns
-        )
-    return columns
 
 
 def _find(identifier: str, kept: list[Dataset]) -> Dataset | None:
@@ -443,8 +401,8 @@ def _header_comments(cache: DexCache, ids: dict[str, str]) -> list[str]:
     lines = [
         f"    %% dex exploration map, connector: {provenance.connector or 'unknown'}, "
         f"cached: {stamp}",
-        "    %% solid lines are relationships declared in the dbt project; "
-        "dotted lines are inferred",
+        "    %% solid lines are joins the project declares, by a relationships "
+        "test or a shared semantic-layer entity; dotted lines are inferred",
         "    %% a cardinality is drawn only where the cache proved it; "
         "}o..o{ means unproven",
     ]

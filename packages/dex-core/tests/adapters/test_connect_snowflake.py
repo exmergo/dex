@@ -544,6 +544,34 @@ def test_distinct_combination_counts_batch_into_one_guarded_statement(
     assert adapter.distinct_combination_counts("SHOP.PUBLIC.CUSTOMERS", []) == {}
 
 
+def test_distinct_combination_counts_narrow_to_what_the_budget_covers(
+    fake_sf_connection,
+):
+    """Every combination is another scan, so a budget can cover some of the
+    probe and not all of it. The pairs arrive best-ranked first, so spending on
+    the affordable prefix keeps the grain reachable where refusing the whole
+    probe would have thrown it away; the note names what went unasked."""
+
+    fake_sf_connection.row_resolver = lambda sql: [{"d_0": 97, "d_1": 100}]
+    adapter = make_adapter(fake_sf_connection, ceiling=100.0)
+    meta, _ = adapter.table_metadata("SHOP.PUBLIC.CUSTOMERS")
+    unit = adapter._scan_seconds(meta.byte_size)
+    # Room for two of the four scans asked for.
+    adapter.cost_gate.charge(100.0 - 2.5 * unit)
+
+    pairs = [["ID", "EMAIL"], ["EMAIL", "ID"], ["ID", "PLAN"], ["EMAIL", "PLAN"]]
+    counts = adapter.distinct_combination_counts("SHOP.PUBLIC.CUSTOMERS", pairs)
+
+    assert counts == {("ID", "EMAIL"): 97, ("EMAIL", "ID"): 100}
+    assert any(
+        "composite-key probe narrowed to 2 of 4 candidate pairs" in note
+        for note in adapter.table_notes("SHOP.PUBLIC.CUSTOMERS")
+    )
+    stmts = data_statements(fake_sf_connection)
+    assert len(stmts) == 1
+    assert stmts[0].sql.count("SELECT DISTINCT") == 2
+
+
 def test_distinct_combination_counts_degrade_when_budget_cannot_cover(
     fake_sf_connection,
 ):
@@ -1008,3 +1036,37 @@ def test_list_namespace_objects_reads_an_absent_schema_as_empty(multi_db_connect
     assert adapter.list_namespace_objects("RAW", "NOT_THERE") == []
     assert adapter.list_namespace_objects("NO_SUCH_DB", "STAGING_DEV") == []
     assert data_statements(multi_db_connection) == []
+
+
+def test_the_aggregate_supplies_the_count_show_tables_does_not_maintain(
+    fake_sf_connection,
+):
+    """The same gap as issue #375's, on the sibling connector nobody reported.
+
+    SHOW TABLES maintains no row count for a view, and the aggregate's own
+    COUNT(*) was read and discarded, so a view's count never arrived and the
+    exact-distinct escalation, the composite-key probe and the grain verdict
+    could never run against one. It now supersedes the SHOW figure the way it
+    already does on Postgres and Redshift.
+    """
+
+    from fakes.snowflake import FakeSnowflakeTable
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="PUBLIC",
+            name="V_CUSTOMERS",
+            columns=[("ID", "FIXED", False)],
+            kind="view",
+        )
+    )
+    fake_sf_connection.row_resolver = lambda sql: [
+        {"N_TOTAL": 42, "NN_0": 42, "ND_0": 42}
+    ]
+    adapter = make_adapter(fake_sf_connection)
+    meta, columns = adapter.table_metadata("SHOP.PUBLIC.V_CUSTOMERS")
+    assert meta.row_count is None
+    adapter.column_aggregates("SHOP.PUBLIC.V_CUSTOMERS", columns)
+    refreshed, _ = adapter.table_metadata("SHOP.PUBLIC.V_CUSTOMERS")
+    assert refreshed.row_count == 42

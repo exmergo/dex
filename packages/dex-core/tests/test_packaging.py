@@ -57,6 +57,7 @@ def _run_isolated(
     *,
     extras: list[str] | None = None,
     pins: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess:
     """Run ``code`` against the built wheel in a fresh environment.
 
@@ -88,7 +89,7 @@ def _run_isolated(
         ],
         capture_output=True,
         text=True,
-        cwd=PACKAGE_ROOT.parent,
+        cwd=str(cwd or PACKAGE_ROOT.parent),
     )
 
 
@@ -151,7 +152,7 @@ def test_importing_the_package_pulls_in_no_connector_client(wheel: str):
         "before={m.split('.')[0] for m in sys.modules};"
         "import exmergo_dex_core;"
         "clients={'google','snowflake','databricks','psycopg','redshift_connector',"
-        "'duckdb','sqlglot','sklearn','httpx','metricflow'};"
+        "'clickhouse_connect','duckdb','sqlglot','sklearn','httpx','metricflow'};"
         "print(sorted(({m.split('.')[0] for m in sys.modules} - before) & clients))",
     )
     assert done.returncode == 0, done.stderr
@@ -311,10 +312,10 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     dbt adapters and MetricFlow in one environment, it is also the only place a
     version conflict between them can surface at all.
 
-    `dev` and the two `*-conformance` extras are excluded deliberately: contributor
-    tooling, not capabilities. They carry a test runner for people implementing a
-    storage backend or a project format, and nobody installing "everything dex can
-    do" wants pytest.
+    `dev` and the three `*-conformance` extras are excluded deliberately:
+    contributor tooling, not capabilities. They carry a test runner for people
+    implementing a storage backend, a project format, or a semantic backend, and
+    nobody installing "everything dex can do" wants pytest.
     """
 
     extras = _project_metadata()["optional-dependencies"]
@@ -322,7 +323,13 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
     referenced = set(
         extras["all"][0].removeprefix("exmergo-dex-core[").removesuffix("]").split(",")
     )
-    tooling = {"all", "dev", "storage-conformance", "project-conformance"}
+    tooling = {
+        "all",
+        "dev",
+        "storage-conformance",
+        "project-conformance",
+        "semantic-conformance",
+    }
     assert referenced == set(extras) - tooling, (
         f"[all] does not cover {sorted(set(extras) - tooling - referenced)}"
     )
@@ -333,9 +340,11 @@ def test_the_all_extra_installs_every_optional_capability(wheel: str):
         wheel,
         "import duckdb, google.cloud.bigquery, snowflake.connector, psycopg;"
         "import redshift_connector, databricks.sql, sklearn, httpx, metricflow;"
+        "import clickhouse_connect;"
         "import sqlglot;"
         "import dbt.adapters.duckdb, dbt.adapters.bigquery, dbt.adapters.snowflake;"
         "import dbt.adapters.postgres, dbt.adapters.redshift, dbt.adapters.databricks;"
+        "import dbt.adapters.clickhouse;"
         "from exmergo_dex_core.explore.semantic.hosted import HostedDbtCloudBackend;"
         "from exmergo_dex_core.explore.semantic.local import LocalMetricFlowBackend;"
         "print('every capability imported')",
@@ -383,19 +392,59 @@ def test_the_quickstart_example_runs_against_the_installed_package(wheel: str):
     assert done.returncode == 0, done.stderr
 
     out = done.stdout
-    # The flow really ran: a map, the inferred join, the PII flag, a query.
-    assert "mapped 2 objects, 1 relationship(s)" in out
-    assert "join: shop.main.orders.customer_id -> shop.main.customers.id" in out
-    assert "PII: shop.main.customers.email is email" in out
+    # The flow really ran: the generator, a map, the findings, the PII flag, a
+    # query. The counts are the ones the READMEs quote, so a drift in the seeded
+    # data fails here too, against a real wheel rather than the source tree.
+    assert "generated 29512 rows across 7 tables" in out
+    assert "mapped 7 objects, 5 relationship(s)" in out
+    assert "order_item_id is not unique" in out
+    assert "PII: shop.main.customers.email is email (confidence 0.95)" in out
     # Exact cells, which is only stable because the example's query orders its
     # groups. A bare GROUP BY returns them in whatever order the hash aggregate
     # produced, so this assertion used to fail roughly one run in fifty.
-    assert "[['EU', 2], ['US', 1]]" in out
+    assert "[['cancelled', 996], ['delivered', 968], ['paid', 1044]" in out
     assert "refused, as designed" in out
     # PII stayed flagged and never surfaced, all the way out to stdout.
     assert "@example.com" not in out
     # And the default store wrote nothing beside the warehouse.
     assert "files in the workspace: ['shop.duckdb']" in out
+
+
+def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Path):
+    """The claim the README makes, made against a real wheel.
+
+    A stranger installs one extra, runs one command, and the next one works with
+    no flags, no credentials, and no network. Every part of that is a packaging
+    claim as much as an engine one, which is why it is asserted here: the demo
+    has to be inside the wheel, reachable from the console script, and satisfied
+    by `[duckdb]` alone.
+
+    Both commands run in one isolated interpreter rather than two. Building the
+    environment is what this file pays for, and doing it twice buys nothing here:
+    what is under test is that `[duckdb]` alone satisfies the on-ramp, not that
+    the two commands are separate processes, which every other suite already
+    covers by calling `main` repeatedly.
+    """
+
+    import json
+
+    done = _run_isolated(
+        wheel,
+        "import json;from exmergo_dex_core.cli import main;"
+        "main(['demo']);main(['explore', 'map'])",
+        extras=["duckdb"],
+        cwd=tmp_path,
+    )
+    assert done.returncode == 0, done.stderr
+
+    created, mapped = (json.loads(line) for line in done.stdout.splitlines())
+    assert created["status"] == "ok"
+    assert created["data"]["created"] == ["dex_demo.duckdb", ".dex/config.yml"]
+    assert created["data"]["row_count"] == 29512
+    # The second command found the config the first one wrote, with no flags.
+    assert mapped["status"] == "ok"
+    assert mapped["data"]["object_count"] == 7
+    assert mapped["data"]["pii_column_count"] == 6
 
 
 def test_the_installed_console_script_speaks_the_command_contract(wheel: str):
@@ -1036,6 +1085,53 @@ def test_the_project_contract_needs_only_a_test_runner(wheel: str, tmp_path: Pat
         encoding="utf-8",
     )
     spec = f"exmergo-dex-core[project-conformance] @ {wheel}"
+
+    done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [
+            _uv(),
+            "run",
+            "--isolated",
+            "--no-project",
+            "--with",
+            spec,
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(suite),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "passed" in done.stdout
+
+
+def test_the_semantic_contract_needs_only_a_test_runner(wheel: str, tmp_path: Path):
+    """`[semantic-conformance]` is pytest and nothing else, held by installing it.
+
+    The same floor the project contract has, checked the same way and for the same
+    reason: this repo's dev environment carries sqlglot, MetricFlow and httpx, so
+    an assertion that started reaching one of them would quietly make the extra
+    heavier for every implementer while staying green here. The reference layer
+    being data in the module is what keeps the floor this low, and it is also what
+    lets an implementer run the suite before their backend can reach anything.
+    """
+
+    suite = tmp_path / "test_light_floor.py"
+    suite.write_text(
+        "import sys\n\n"
+        "from exmergo_dex_core.explore.semantic import conformance\n\n\n"
+        "def test_the_contract_imports_nothing_heavy():\n"
+        "    assert 'sqlglot' not in sys.modules\n"
+        "    assert 'metricflow' not in sys.modules\n"
+        "    assert 'httpx' not in sys.modules\n"
+        "    assert conformance.SemanticBackendContract\n"
+        "    assert conformance.reference_dbt_manifest()['metrics']\n",
+        encoding="utf-8",
+    )
+    spec = f"exmergo-dex-core[semantic-conformance] @ {wheel}"
 
     done = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
         [

@@ -1269,3 +1269,190 @@ def test_duckdb_equivalent_path_spellings_are_accepted(
         config = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=declared))
         # should not raise
         dev_target.check(dbt_project_dir, "dev", config, dbt_project_dir)
+
+
+def _clickhouse(
+    dbt_project_dir: Path,
+    *,
+    grants=(),
+    dev: str = "dbt_dev",
+    profile_user: str = "dbt_dev",
+    role_grants_readable: bool = True,
+    grants_readable: bool = True,
+    custom_settings: bool = True,
+):
+    pytest.importorskip("clickhouse_connect")
+    from fakes.clickhouse import FakeClickHouseConnection, FakeClickHouseTable
+
+    from exmergo_dex_core.adapters.clickhouse import ClickHouseAdapter
+    from exmergo_dex_core.config import ClickHouseTarget
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.transform.init import clickhouse_custom_settings
+
+    connection = FakeClickHouseConnection(
+        tables=[
+            FakeClickHouseTable(
+                database="app", name="orders", columns=[("id", "UInt64", True)]
+            )
+        ],
+        grants=list(grants),
+        grants_readable=grants_readable,
+        role_grants_readable=role_grants_readable,
+    )
+    adapter = ClickHouseAdapter(
+        connection=connection,
+        cost_gate=CostGate(
+            paradigm=Paradigm.DB_LOAD,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="clickhouse",
+        ),
+        target=ClickHouseTarget(),
+    )
+    settings_block = ""
+    if custom_settings:
+        rendered = clickhouse_custom_settings()
+        # Inner single quotes are doubled, exactly as `transform init` renders
+        # them: unquoted Jinja is not valid YAML, and naively single-quoting a
+        # value that itself contains single quotes silently truncates it, which
+        # would make this helper write a profile dex cannot read at all.
+        settings_block = "      custom_settings:\n" + "".join(
+            "        {}: '{}'\n".format(key, str(value).replace("'", "''"))
+            for key, value in rendered.items()
+        )
+    _write_profile(
+        dbt_project_dir,
+        "      type: clickhouse\n"
+        f"      user: {profile_user}\n"
+        # dbt-clickhouse's `schema` is the ClickHouse database.
+        f"      schema: {dev}\n" + settings_block,
+    )
+    config = DexConfig(
+        connector="clickhouse", clickhouse=ClickHouseTarget(dev_database=dev)
+    )
+    return connection, adapter, config
+
+
+def test_a_writable_clickhouse_dev_database_passes(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    from fakes.clickhouse import FakeGrant
+
+    grants = [
+        FakeGrant(user_name="dbt_dev", access_type=access, database="dbt_dev")
+        for access in ("CREATE", "INSERT", "SELECT")
+    ]
+    connection, adapter, config = _clickhouse(dbt_project_dir, grants=grants)
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert connection.data_queries == []
+
+
+def test_an_unwritable_clickhouse_dev_database_refuses_with_the_grant(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """dbt-clickhouse creates the dev database itself, so its absence is not the
+    failure; the privilege to create it is. The first build otherwise dies on a
+    bare permission error naming neither the database nor the grant."""
+
+    from fakes.clickhouse import FakeGrant
+
+    grants = [FakeGrant(user_name="dex_ro", access_type="SELECT", database="app")]
+    connection, adapter, config = _clickhouse(
+        dbt_project_dir, grants=grants, profile_user="dex_ro"
+    )
+    _fake_open(monkeypatch, adapter)
+
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    message = str(exc.value)
+    assert 'on dev_database "dbt_dev"' in message
+    assert "GRANT CREATE DATABASE, CREATE TABLE, INSERT, SELECT ON dbt_dev.*" in message
+    assert connection.data_queries == []
+
+
+def test_an_unreadable_clickhouse_grant_table_warns_rather_than_refusing(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """ClickHouse shows another user's grants only to a caller holding SHOW
+    ACCESS, so 'no verdict' is a real state that Postgres does not have. A
+    preflight that guessed here would either refuse a build that works or pass
+    one that cannot."""
+
+    connection, adapter, config = _clickhouse(dbt_project_dir, grants_readable=False)
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert warnings and "could not be read" in warnings[0]
+    assert connection.data_queries == []
+
+
+def test_a_partial_clickhouse_grant_read_may_clear_but_never_refuses(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """Direct grants readable, role membership not. A privilege held through an
+    invisible role looks exactly like a missing one, so the partial read is only
+    ever allowed to clear a target."""
+
+    from fakes.clickhouse import FakeGrant
+
+    grants = [FakeGrant(user_name="dex_ro", access_type="SELECT", database="app")]
+    connection, adapter, config = _clickhouse(
+        dbt_project_dir,
+        grants=grants,
+        profile_user="dex_ro",
+        role_grants_readable=False,
+    )
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert warnings and "only be read in part" in warnings[0]
+    assert connection.data_queries == []
+
+
+def test_a_dex_rendered_clickhouse_profile_can_be_capped(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The non-degraded path, and the reason the degradation test below means
+    anything.
+
+    Without this half, renaming `custom_settings` in `transform init` would make
+    the warning fire forever and the pair would still look green. It also proves
+    the renderer and this reader agree on the key names, which is the only thing
+    that makes the cap reachable at all.
+    """
+
+    from fakes.clickhouse import FakeGrant
+
+    grants = [
+        FakeGrant(user_name="dbt_dev", access_type=access, database="dbt_dev")
+        for access in ("CREATE", "INSERT", "SELECT")
+    ]
+    _connection, adapter, config = _clickhouse(dbt_project_dir, grants=grants)
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+
+
+def test_a_hand_written_clickhouse_profile_warns_that_it_cannot_be_capped(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A profile without the env_var references builds fine and cannot be
+    capped, so the confirmed budget bounds the estimate and nothing bounds a
+    statement that outruns it. That has to be said out loud: the alternative is
+    a build that reports a cap it never had."""
+
+    from fakes.clickhouse import FakeGrant
+
+    grants = [
+        FakeGrant(user_name="dbt_dev", access_type=access, database="dbt_dev")
+        for access in ("CREATE", "INSERT", "SELECT")
+    ]
+    _connection, adapter, config = _clickhouse(
+        dbt_project_dir, grants=grants, custom_settings=False
+    )
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert warnings
+    assert "cannot wind the confirmed budget down" in warnings[0]
+    assert "DEX_CLICKHOUSE_MAX_EXECUTION_TIME" in warnings[0]

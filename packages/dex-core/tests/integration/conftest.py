@@ -54,6 +54,25 @@ use:
 
     DEX_TEST_REDSHIFT_WORKGROUP=dex-ci DEX_TEST_REDSHIFT_DATABASE=dev \
         uv run pytest tests/integration -q
+
+ClickHouse (bills nothing: a local container; db-load gating is exercised for
+real, server-side caps and all). The DSN should be the read-only user from
+scripts/clickhouse_local_users.sql; transform additionally needs the dbt_dev user's
+password in DEX_TEST_CH_DEV_PASSWORD. One script stands the whole thing up and
+is the same one CI runs, so the local target and the CI target cannot drift:
+
+    scripts/setup_clickhouse_dev.sh
+    DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+        DEX_TEST_CH_DEV_PASSWORD=dbt_dev \
+        uv run pytest tests/integration -q -m clickhouse
+
+ClickHouse Cloud (bills the dedicated Scale service in AWS us-east-1; the
+repository workflow performs the hard daily-usage preflight before any SQL).
+scripts/setup_clickhouse_cloud_ci.sh provisions the two isolated databases,
+least-privilege users, server-side limits, scoped usage reader, and protected
+GitHub environment used by this suite:
+
+    scripts/clickhouse_cloud/run_integration.sh
 """
 
 from __future__ import annotations
@@ -71,6 +90,42 @@ SF_MAX_SECONDS = float(os.environ.get("DEX_TEST_SNOWFLAKE_MAX_SECONDS", "60"))
 DBX_MAX_SECONDS = float(os.environ.get("DEX_TEST_DATABRICKS_MAX_SECONDS", "60"))
 
 RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
+
+CH_MAX_SECONDS = float(os.environ.get("DEX_TEST_CH_MAX_SECONDS", "60"))
+
+
+def integration_budget(ceiling: float | None = None) -> dict[str, float | bool]:
+    """Budget config for one ephemeral live-test project.
+
+    Every integration test gets a fresh ``tmp_path`` and already runs behind a
+    per-command ceiling plus the connector's external CI backstop. Record that
+    these disposable projects deliberately have no cross-command ceiling so the
+    one-time production prompt does not replace the behavior under test.
+    """
+
+    budget: dict[str, float | bool] = {"session_ceiling_declined": True}
+    if ceiling is not None:
+        budget["ceiling"] = ceiling
+    return budget
+
+
+def assert_ok(rc: int, envelope: dict) -> dict:
+    """Assert a live command succeeded, and say what the warehouse said if it
+    did not. Returns the envelope, so it reads inline.
+
+    The obvious spelling is ``assert rc == 0, envelope``, and it is why a live
+    Redshift failure cost sixteen CI runs to diagnose instead of five minutes
+    (#310): pytest elides the middle of a long assertion message, and the
+    middle of a profiling envelope is exactly where ``errors`` sits, so the
+    server's own message never once reached a CI log. Putting the errors
+    first, alone, makes the surviving line the one worth reading.
+    """
+
+    assert rc == 0, (
+        f"errors={envelope.get('errors')} reason={envelope.get('reason')} "
+        f"warnings={envelope.get('warnings')}"
+    )
+    return envelope
 
 
 def _snowflake_enabled() -> bool:
@@ -123,6 +178,37 @@ def _require_cloud_env(request):
                 "plus REDSHIFT_* credentials"
             )
         pytest.importorskip("redshift_connector")
+        return
+    if request.node.get_closest_marker("clickhouse_cloud"):
+        required = (
+            "DEX_TEST_CH_CLOUD_ORG_ID",
+            "DEX_TEST_CH_CLOUD_SERVICE_ID",
+            "DEX_TEST_CH_CLOUD_HOST",
+            "DEX_TEST_CH_CLOUD_PORT",
+            "DEX_TEST_CH_CLOUD_DATABASE",
+            "DEX_TEST_CH_CLOUD_DEV_DATABASE",
+            "DEX_TEST_CH_CLOUD_COMPUTE_UNIT_PRICE_USD",
+            "DEX_TEST_CH_CLOUD_MAX_SECONDS",
+            "DEX_TEST_CH_CLOUD_DSN",
+            "DEX_TEST_CH_CLOUD_DEV_PASSWORD",
+            "DEX_TEST_CH_CLOUD_API_KEY",
+            "DEX_TEST_CH_CLOUD_API_SECRET",
+        )
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            pytest.skip(
+                "ClickHouse Cloud integration disabled: required values are "
+                f"missing: {', '.join(missing)}"
+            )
+        pytest.importorskip("clickhouse_connect")
+        return
+    if request.node.get_closest_marker("clickhouse"):
+        if not os.environ.get("DEX_TEST_CH_DSN"):
+            pytest.skip(
+                "ClickHouse integration disabled: set DEX_TEST_CH_DSN (run "
+                "scripts/setup_clickhouse_dev.sh for a seeded local container)"
+            )
+        pytest.importorskip("clickhouse_connect")
         return
     missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
     if missing:
@@ -266,3 +352,13 @@ def assert_unpivot_build(built: dict) -> None:
     assert statuses.get("stg_entities") == "success"
     assert statuses.get("entity_relations") == "success"
     assert all(s in {"success", "pass"} for s in statuses.values()), statuses
+
+
+@pytest.fixture
+def ch_dsn() -> str:
+    return os.environ["DEX_TEST_CH_DSN"]
+
+
+@pytest.fixture
+def ch_dev_password() -> str:
+    return os.environ.get("DEX_TEST_CH_DEV_PASSWORD", "dbt_dev")

@@ -5,12 +5,14 @@
 only what its host uses; the sibling modules are the backends. Callers receive a
 store; only the entry point picks which one.
 
-It also holds two separate, optional contracts that sit alongside the tiers
+It also holds three separate, optional contracts that sit alongside the tiers
 rather than inside them: :class:`~.base.SpendLock`, which lets the cost gate make
-the spend admission atomic so the cumulative ceiling binds under concurrency, and
-the construction contract (:class:`~.base.StoreFactory` over a
-:class:`~.base.StoreContext`), for a backend that is named somewhere rather than
-handed to the engine as an instance.
+the spend admission atomic so the cumulative ceiling binds under concurrency;
+:class:`~.base.SpendHistory`, which hands the ledger's entries back so an
+over-ceiling refusal can say how far this connector's past estimates ran from
+what they billed; and the construction contract (:class:`~.base.StoreFactory`
+over a :class:`~.base.StoreContext`), for a backend that is named somewhere
+rather than handed to the engine as an instance.
 ``resolver`` is what turns such a name into a store, as an open registry: a
 shipped name, a dotted path, or an entry point an installed distribution
 registered.
@@ -21,31 +23,39 @@ this package. It is deliberately not imported here: it needs pytest, and a bare
 """
 
 from .base import (
+    CacheUnreadableError,
     Document,
     ExploreStore,
     MaintainStore,
+    SpendHistory,
     SpendLock,
     Store,
     StoreContext,
     StoreFactory,
+    readable_cache,
     spend_total,
 )
 from .filesystem import DEX_DIR, FilesystemStore
 from .memory import MemoryStore
 from .resolver import build_store, resolve_store_factory
+from .sqlite import SqliteStore
 
 __all__ = [
     "DEX_DIR",
+    "CacheUnreadableError",
     "Document",
     "ExploreStore",
     "FilesystemStore",
     "MaintainStore",
     "MemoryStore",
+    "SpendHistory",
     "SpendLock",
+    "SqliteStore",
     "Store",
     "StoreContext",
     "StoreFactory",
     "build_store",
+    "readable_cache",
     "resolve_store_factory",
     "spend_total",
 ]

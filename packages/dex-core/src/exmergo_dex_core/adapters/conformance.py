@@ -41,6 +41,12 @@ declared join actually reach the engine, which is the whole reason a project is
 read on the explore path: those two arrive through ``definitions()`` and through no
 other channel.
 
+**If you reach tier 3 you also want** :class:`PlacingProjectContract`, because
+placement is what carries a proposal from reconcile to your write path, and its two
+methods have to agree with each other: a format that places an edit outside the
+surface it declares builds a proposal the plan store then refuses, which reads as
+dex declining rather than as the format contradicting itself.
+
 **If dex is going to build your format rather than be handed one**, mix
 :class:`ProjectFactoryContract` in front. Construction is a separate contract from
 the tiers for the same reason it is separate in storage, and a format that passes
@@ -55,11 +61,13 @@ running the suite needs.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 import pytest
 
-from ..dbt_project import ProjectDefinitions
+from ..dbt_project import EditOp, ProjectDefinitions
 from ..maintain.snapshot import Snapshot
 from .project import ExploreProject, ProjectContext, tier_of
 
@@ -73,8 +81,43 @@ __all__ = [
     "EditableProjectContract",
     "ExploreProjectContract",
     "MaintainProjectContract",
+    "PlacingProjectContract",
     "ProjectFactoryContract",
+    "SemanticCatalogContract",
+    "SemanticProjectContract",
 ]
+
+
+def _probe_content(path: str) -> str:
+    """Content for an edit that must never land, commented for the file it names.
+
+    A refusal is what is being asserted, so nothing should ever read this. It is
+    still written as a comment in the target's own language, because a format
+    that parses what it is handed before refusing it should refuse it for the
+    reason under test rather than for being unparseable.
+    """
+
+    marker = "-- " if path.endswith(".sql") else "# "
+    return f"{marker}dex conformance probe: this must never be written\n"
+
+
+def _edit_like(template: Any, **changes: Any) -> Any:
+    """A copy of an edit the format was handed, with fields replaced.
+
+    The assertions below vary one field of a real edit (its path, or the hash it
+    is pinned to) rather than constructing one, so what reaches ``write_edits``
+    is the same shape dex passes it everywhere. Every caller in the engine passes
+    ``Edit`` or ``PlanEdit``, which is what makes this safe to assume.
+    """
+
+    copier = getattr(template, "model_copy", None)
+    assert copier is not None, (
+        "the edits returned by an_edit_against_a_changed_target() are not dex's "
+        f"`Edit`/`PlanEdit` models but {type(template).__name__}. write_edits() is "
+        "called with those models from every path in the engine, so the hook has "
+        "to stage what the format will really be handed"
+    )
+    return copier(update=changes)
 
 
 class ExploreProjectContract:
@@ -216,6 +259,55 @@ class DeclaringProjectContract:
 
         raise NotImplementedError
 
+    def a_project_declaring_a_composite_key(
+        self,
+    ) -> tuple[ExploreProject, str, tuple[str, ...]] | None:
+        """A project whose grain needs more than one column, or ``None``.
+
+        Returns ``(project, model, columns)`` with ``columns`` in declared order.
+
+        **Declare more than two columns.** A format that handles a composite key
+        by special-casing the pair satisfies a two-column fixture and fails a
+        four-column one, so a pair cannot tell you what you came to find out.
+
+        ``None`` skips, because a format may genuinely have no way to express a
+        multi-column grain: dbt's own ``unique`` test is column level, and a
+        format modelling grain one column at a time is not incomplete, it is
+        differently shaped. Override it if you can express one, because
+        ``declared_composite_keys`` is a separate field from ``declared_keys``
+        and nothing else in this suite reaches it.
+
+        **What getting this wrong costs, now that the field is read.** It is no
+        longer decoration on a diagram. The grain axis re-verifies the
+        combinations that arrive here, and reconcile checks them before proposing
+        a column-level ``unique``, so a format that leaves this empty loses grain
+        verification on exactly the tables whose grain is composite, and gets
+        offered ``unique`` tests on their member columns: assertions its own
+        parser is entitled to discard and dbt is entitled to fail every build on.
+        """
+
+        return None
+
+    def a_project_declaring_a_join_with_differently_named_sides(
+        self,
+    ) -> tuple[ExploreProject, str, str, str, str] | None:
+        """A join whose two ends are spelled differently, or ``None``.
+
+        Returns ``(project, model, column, to_model, to_column)``, and ``column``
+        must not equal ``to_column`` -- this contract checks that and refuses a
+        mirrored fixture, because a mirrored one cannot fail for the right reason.
+
+        **This is a distinct case from :meth:`a_project_declaring_a_join` and not
+        a redundant one.** If both ends of your fixture are named ``date``, an
+        implementation that reads the source column and copies it onto the target
+        satisfies the assertion exactly, and the defect ships. A foreign key whose
+        two ends are spelled differently is the ordinary case rather than the
+        exotic one, and a format that mirrors would join on a column the target may
+        not have, surfacing as a wrong answer rather than as a failure.
+        """
+
+        return None
+
     def test_a_declared_unique_key_reaches_the_engine(self) -> None:
         project, model, column = self.a_project_declaring_a_unique_key()
 
@@ -252,6 +344,415 @@ class DeclaringProjectContract:
             f"expected a declared join {model}.{column} -> {to_model}.{to_column}, "
             f"got {declared}"
         )
+
+    def test_a_composite_grain_keeps_every_column_and_their_order(self) -> None:
+        """A truncated composite key is silent, which is what makes it expensive.
+
+        It does not read as a missing declaration. It reads as a declared grain
+        that is simply narrower than the truth, so every check downstream runs
+        against a grain the author never claimed and the findings look like data
+        problems rather than a misread declaration.
+        """
+
+        supplied = self.a_project_declaring_a_composite_key()
+        if supplied is None:
+            pytest.skip(
+                "a_project_declaring_a_composite_key() returned None: this format "
+                "declares it cannot express a multi-column grain, so "
+                "declared_composite_keys goes unchecked"
+            )
+        project, model, columns = supplied
+
+        declared = project.definitions().declared_composite_keys
+        matching = [k for k in declared if k.model == model]
+
+        assert matching, (
+            f"expected a composite key on {model}, got {declared}. A multi-column "
+            "grain belongs in declared_composite_keys, not as several entries in "
+            "declared_keys: those say each column is unique on its own, which is a "
+            "different and much stronger claim"
+        )
+        assert tuple(matching[0].columns) == tuple(columns), (
+            f"expected columns {tuple(columns)} in order, got "
+            f"{tuple(matching[0].columns)}"
+        )
+        assert len(matching) == 1, (
+            f"expected one composite key on {model}, got {len(matching)}: "
+            f"{matching}. One declaration is one grain, and splitting it across "
+            "entries makes the grain axis verify combinations the project never "
+            "declared"
+        )
+        leaked = sorted(
+            key.column
+            for key in project.definitions().declared_keys
+            if key.model == model
+            and key.unique
+            and key.column.lower() in {c.lower() for c in columns}
+        )
+        assert not leaked, (
+            f"{model} reports {leaked} as unique on their own while also declaring "
+            f"the composite grain {tuple(columns)}. The fixture's grain needs every "
+            "one of those columns, so no single one of them is unique, and the "
+            "stronger claim is the one that gets acted on: reconcile reads it as a "
+            "grain the project already asserts and proposes edits against it"
+        )
+
+    def test_a_join_keeps_its_two_sides_apart_when_they_are_named_differently(
+        self,
+    ) -> None:
+        """The case :meth:`test_a_declared_join_carries_both_sides` cannot reach.
+
+        An implementation that mirrors the source column onto the target passes
+        that one whenever the fixture's two ends share a name, and this is the
+        assertion that separates them.
+        """
+
+        supplied = self.a_project_declaring_a_join_with_differently_named_sides()
+        if supplied is None:
+            pytest.skip(
+                "a_project_declaring_a_join_with_differently_named_sides() returned "
+                "None: a join whose ends are spelled differently goes unchecked, so "
+                "an implementation that mirrors one side onto the other would pass "
+                "this suite"
+            )
+        project, model, column, to_model, to_column = supplied
+
+        assert column != to_column, (
+            "this fixture has to name its two sides differently, or it cannot "
+            "detect the mirroring it exists to detect"
+        )
+
+        declared = project.definitions().foreign_keys
+        matching = [
+            fk
+            for fk in declared
+            if fk.model == model and fk.column == column and fk.to_model == to_model
+        ]
+
+        assert matching, (
+            f"expected a declared join from {model}.{column} to {to_model}, "
+            f"got {declared}"
+        )
+        assert matching[0].to_column == to_column, (
+            f"the join's target column arrived as {matching[0].to_column!r}, "
+            f"expected {to_column!r}. Reading it as {column!r} is the mirroring "
+            "failure: the far side is a column the target may not even have"
+        )
+
+
+class SemanticProjectContract:
+    """Opt-in, tier 2: a populated semantic layer keeps the column behind each field.
+
+    Mix in beside :class:`MaintainProjectContract` when your format declares
+    semantics at all::
+
+        class TestMyProject(SemanticProjectContract, MaintainProjectContract):
+            def make_project(self): ...
+            def a_project_declaring_a_semantic_model(self): ...
+
+    **Why this is separate from the tier contract, and worth the trouble.**
+    :class:`MaintainProjectContract` asserts that an *empty* project produces an
+    empty semantic layer. Nothing there looks at a populated one, so a format that
+    reads every dimension and measure name and drops the physical column behind
+    each passes the tier suite completely.
+
+    That is not a hypothetical shape. ``SemanticModelDef`` keys every field to a
+    warehouse column, and ``maintain``'s drift detector skips any field whose column
+    is ``None`` -- correctly, because it cannot resolve what it was not given. So a
+    layer mapped entirely to ``None`` validates, serializes, and compares clean
+    forever: the check does not fail, it never runs, and a dropped warehouse column
+    that should raise ``dangling_reference`` at high severity raises nothing. The
+    absence is indistinguishable from agreement, which is the worst property a
+    check can have.
+
+    A format that genuinely declares no semantics should not mix this in. Its empty
+    layer is correct and the tier contract already covers it.
+
+    **Semantics presuppose tier 2, and this checks that first.** ``semantic_layer``
+    is a tier-2 member, so every assertion below would otherwise fail with
+    ``AttributeError: 'MyProject' object has no attribute 'semantic_layer'`` for a
+    format that mixed this in beside :class:`ExploreProjectContract` -- an error
+    about a missing attribute, when the thing to say is that the format has not
+    reached the tier the attribute belongs to. The tier is asserted against the
+    project this contract is actually given rather than against ``make_project()``,
+    so the mixin keeps depending only on the one fixture it declares.
+    """
+
+    def test_declaring_semantics_presupposes_the_maintain_tier(self) -> None:
+        project, _, _, _ = self.a_project_declaring_a_semantic_model()
+
+        assert tier_of(project) >= 2, (
+            "a format declaring semantics has to reach tier 2, because "
+            "semantic_layer() is a MaintainProject member and every assertion in "
+            "this contract calls it. Implement transform_layer() and "
+            "semantic_layer(), or drop this mixin if the format declares no "
+            "semantics -- an empty layer is already correct under the tier contract"
+        )
+
+    def a_project_declaring_a_semantic_model(
+        self,
+    ) -> tuple[Any, str, Mapping[str, str | None], Mapping[str, str | None]]:
+        """A project declaring one semantic model.
+
+        Returns ``(project, name, dimensions, measures)``, where the two mappings
+        are ``field name -> the warehouse column behind it``, exactly as you expect
+        them to arrive on ``SemanticModelDef``.
+
+        **Map a field to ``None`` when your format has no bare column for it**, and
+        include at least one such field if your format can produce one: a computed
+        field, or one whose expression is not a plain column name. ``None`` is the
+        honest answer there and an invented column is not, because a consumer
+        resolving column names would treat a fabricated one as a reference that no
+        longer resolves.
+        """
+
+        raise NotImplementedError(
+            "a semantic conformance subclass must implement "
+            "a_project_declaring_a_semantic_model() -> (project, name, dimensions, "
+            "measures), mapping each field to the warehouse column behind it"
+        )
+
+    def test_a_semantic_field_carries_the_column_behind_it(self) -> None:
+        project, name, dimensions, measures = (
+            self.a_project_declaring_a_semantic_model()
+        )
+
+        layer = project.semantic_layer()
+        matching = [m for m in layer.semantic_models if m.name == name]
+
+        assert matching, (
+            f"expected a semantic model named {name!r}, got "
+            f"{[m.name for m in layer.semantic_models]}"
+        )
+        model = matching[0]
+        assert dict(model.dimensions) == dict(dimensions), (
+            "the dimension to column mapping did not survive. A layer whose columns "
+            "are all None still validates and still compares clean, so the drift "
+            "check simply never runs"
+        )
+        assert dict(model.measures) == dict(measures), (
+            "the measure to column mapping did not survive; see above"
+        )
+
+    def test_a_categorical_dimension_maps_only_to_a_real_column(self) -> None:
+        """``categorical_dimensions`` takes ``str``, not ``str | None``.
+
+        So a field that is categorical *and* unresolved cannot be represented
+        there, and the two properties have to stay independent: being categorical
+        says how the field behaves, having a column says whether it can be checked.
+        A format that collapses them either drops a categorical field that happens
+        to lack a column, or supplies an invented column to keep it. Both are worse
+        than leaving it out of this one mapping, which is what the typing asks for.
+        """
+
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+
+        model = next(
+            m for m in project.semantic_layer().semantic_models if m.name == name
+        )
+
+        columns = model.categorical_dimensions.values()
+        assert all(isinstance(c, str) and c for c in columns), (
+            "categorical_dimensions holds a null or empty column: its values are "
+            f"required strings, got {model.categorical_dimensions!r}. Leave an "
+            "unresolved categorical field out of this mapping rather than "
+            "inventing a column to keep it in"
+        )
+        assert set(model.categorical_dimensions) <= set(model.dimensions), (
+            "categorical_dimensions names a field that is not a dimension: "
+            f"{sorted(set(model.categorical_dimensions) - set(model.dimensions))}"
+        )
+
+
+class SemanticCatalogContract:
+    """Opt-in, beside tier 2: the read catalog keeps what the fingerprint drops.
+
+    Mix in when your format implements
+    :class:`~.project.SemanticCatalogProject`::
+
+        class TestMyProject(SemanticCatalogContract, MaintainProjectContract):
+            def make_project(self): ...
+            def a_project_declaring_a_semantic_model(self): ...
+
+    **Why a separate contract from** :class:`SemanticProjectContract`. That one
+    checks the drift fingerprint, whose whole job is to reduce a layer to what a
+    comparison needs: a hash, and the column behind each field. This one checks
+    the opposite reduction. ``explore semantic list`` reads the catalog to answer
+    "what can I query, how, and what will the number mean", and every field that
+    answers it is a field the fingerprint correctly throws away: the element
+    types, the project's own labels and descriptions, a measure's aggregation, a
+    metric's composition, and the token a query actually groups by.
+
+    A format can therefore pass the fingerprint contract in full and return a
+    catalog of bare names, which reads to a caller as a layer nobody documented
+    and reduces the discovery surface to the thing it exists to replace.
+
+    **The entity assertion is the load-bearing one.** An entity's type is a
+    property of the (entity, semantic model) declaration, not of the entity: it is
+    primary in the model that keys it and foreign in every model that joins to it.
+    A format that returns one record per entity has to pick, and whichever it
+    picks is iteration order rather than a fact. Both of dex's own backends got
+    this wrong, in opposite directions, on one identical layer, which is why it is
+    asserted here rather than left to a reviewer to notice.
+    """
+
+    def make_project(self):  # pragma: no cover - provided by the subclass
+        raise NotImplementedError
+
+    def a_project_declaring_a_semantic_model(self):
+        # pragma: no cover - provided by the subclass
+        raise NotImplementedError
+
+    def test_the_format_declares_the_catalog_channel(self) -> None:
+        from .project import SemanticCatalogProject
+
+        project = self.make_project()
+        assert isinstance(project, SemanticCatalogProject), (
+            "semantic_catalog() is what `explore semantic list --local` reads, and "
+            "it is checked structurally rather than declared, so a format missing "
+            "the member is refused by name at the command rather than here. Drop "
+            "this mixin if the format reads no semantic layer"
+        )
+
+    def test_the_catalog_keeps_what_the_fingerprint_reduces_away(self) -> None:
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        assert [m.name for m in catalog.semantic_models], (
+            "the catalog carries no semantic models. The layer's organizing unit "
+            "is the semantic model, and a caller with none of them holds one "
+            "undifferentiated list of dimension names"
+        )
+        assert any(m.name == name for m in catalog.semantic_models), (
+            f"expected a semantic model named {name!r}, got "
+            f"{[m.name for m in catalog.semantic_models]}"
+        )
+        assert all(d.type for d in catalog.dimensions), (
+            "a dimension arrived with no type. Whether a dimension is time or "
+            "categorical decides how it can be grouped by, so a caller that has "
+            "to guess cannot build a valid query from this catalog"
+        )
+        assert all(m.agg for m in catalog.measures), (
+            "a measure arrived with no aggregation. A measure without its "
+            "aggregation cannot say what the number counts, which is the question "
+            "the catalog exists to answer"
+        )
+
+    def test_an_entity_carries_a_declaration_per_semantic_model(self) -> None:
+        project, _, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        for entity in catalog.entities:
+            assert entity.roles, (
+                f"entity {entity.name!r} carries no declarations. Its `type` is "
+                "then a single value with nothing behind it, and a value chosen "
+                "per entity rather than per declaration is iteration order"
+            )
+            assert all(r.semantic_model for r in entity.roles), (
+                f"a declaration of entity {entity.name!r} names no semantic "
+                "model, so a caller cannot tell which model it is primary in"
+            )
+            declared = {r.type for r in entity.roles}
+            expected = "primary" if "primary" in declared else next(iter(declared))
+            assert entity.type == expected, (
+                f"entity {entity.name!r} reports type {entity.type!r} while its "
+                f"declarations say {sorted(declared)}. The single value is derived: "
+                "primary wherever any declaration is primary"
+            )
+
+    def test_the_catalog_resolves_a_semantic_model_to_its_relation(self) -> None:
+        """A semantic model that names no relation leaves the layer disconnected.
+
+        The catalog and the physical catalog are two views of one warehouse, and
+        the relation on a semantic model is the whole join between them: it is what
+        answers "which table is behind this metric", what lets ``explore map`` say
+        an object is exposed, and what an entity's declared join is drawn between.
+        A format that reads a layer but resolves none of it to a relation returns a
+        catalog that cannot be connected to anything the rest of ``explore``
+        describes.
+
+        Declining is still possible and is not this: a backend that structurally
+        cannot know the relation declares that gap, which is a different statement
+        from a format that could and did not.
+        """
+
+        project, name, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        model = next(m for m in catalog.semantic_models if m.name == name)
+        assert model.relation, (
+            f"semantic model {name!r} resolves to no physical relation, so nothing "
+            "connects this layer to the objects explore profiles and maps"
+        )
+
+    def test_an_element_carries_its_column_and_never_invents_one(self) -> None:
+        """The same rule the fingerprint follows, on the read catalog.
+
+        Two failures, opposite in direction and both live. A catalog whose columns
+        are all absent cannot reach a physical column at all, which is what the PII
+        gate needs to adjudicate a dimension from evidence rather than from the
+        shape of its name. A catalog that invents a column out of an expression is
+        worse: the gate then screens a column that is not the one behind the
+        element and reports the verdict as evidence-backed.
+
+        The fixture's own mapping is the oracle, including its ``None`` entries, so
+        a format is held to what it said its layer contains rather than to a shape.
+        """
+
+        project, name, dimensions, measures = (
+            self.a_project_declaring_a_semantic_model()
+        )
+        catalog = project.semantic_catalog()
+
+        for element, expected in (
+            (
+                {
+                    d.definition: d.column
+                    for d in catalog.dimensions
+                    if d.semantic_model == name
+                },
+                dimensions,
+            ),
+            (
+                {
+                    m.name: m.column
+                    for m in catalog.measures
+                    if m.semantic_model == name
+                },
+                measures,
+            ),
+        ):
+            for field, column in expected.items():
+                assert field in element, (
+                    f"the catalog carries no entry for {field!r} on {name!r}; the "
+                    "fixture declares it, so the read dropped it"
+                )
+                assert element[field] == column, (
+                    f"{field!r} on {name!r} carries column {element[field]!r} where "
+                    f"the fixture says {column!r}. None is the honest answer for an "
+                    "expression: a column guessed out of one makes the PII gate "
+                    "screen the wrong column and call it evidence"
+                )
+
+    def test_a_dimension_row_names_the_token_a_query_groups_by(self) -> None:
+        """The catalog's ``name`` is a query token, not a display name.
+
+        A caller builds a group-by out of it, so a format that returns the bare
+        declared name where the layer requires a qualified path hands back a
+        catalog whose every dimension fails at query time.
+        """
+
+        project, _, _, _ = self.a_project_declaring_a_semantic_model()
+        catalog = project.semantic_catalog()
+
+        listed = {d.name for d in catalog.dimensions}
+        for metric in catalog.metrics:
+            missing = sorted(set(metric.dimensions) - listed - {"metric_time"})
+            assert not missing, (
+                f"metric {metric.name!r} says it can be grouped by {missing}, and "
+                "no dimension row carries those names. The two must be the same "
+                "vocabulary or neither can be acted on"
+            )
 
 
 class MaintainProjectContract(ExploreProjectContract):
@@ -352,9 +853,20 @@ class EditableProjectContract(MaintainProjectContract):
     stage that scenario cannot detect it either, and a format that cannot detect it
     overwrites work silently, which is the one failure this seam exists to prevent.
 
-    **The two write assertions have to be read as a pair.** Refusing an unconfirmed
-    conflict is satisfied trivially by a ``write_edits`` that never writes anything,
-    so the confirmed case is what rules that out. Neither is worth much alone.
+    **The first two write assertions have to be read as a pair.** Refusing an
+    unconfirmed conflict is satisfied trivially by a ``write_edits`` that never
+    writes anything, so the confirmed case is what rules that out. Neither is worth
+    much alone.
+
+    **The pair rules out a writer that never writes. It does not rule out a writer
+    that writes too much**, which is the direction the rest of the assertions
+    cover: an apply that lands the clean half of a refused edit set, and a create
+    pinned to no prior content that overwrites a file which appeared during
+    review. Both leave the project holding something nobody proposed, both report
+    themselves as a clean refusal, and neither is visible to a contract that
+    stages one edit and asks only what came back. Supplying
+    :meth:`a_clean_edit` upgrades the first from checking what the writer said to
+    checking what the project holds.
 
     **Deliberately not asserted here: which directory the edits land in.**
     ``project_dir`` is a slot for the formats keyed by one, so an assertion about it
@@ -389,6 +901,33 @@ class EditableProjectContract(MaintainProjectContract):
             "read_target), staging the case the write tier exists to get right: a "
             "human edited the target after the plan pinned its content"
         )
+
+    def a_clean_edit(self, project: Any) -> tuple[Any, Any] | None:
+        """An edit that is *not* in conflict, and a callable reading its target.
+
+        Optional, and worth supplying. It is the oracle for
+        :meth:`test_a_refused_apply_leaves_every_target_alone`: without it that
+        assertion can only ask what ``write_edits`` *reported*, so a writer that
+        writes half an edit set and says it wrote nothing still passes. With it,
+        the target is read directly and the claim is checked against the project.
+
+        Return ``(edit, read_target)``, where ``edit`` is pinned truthfully
+        against current content (it must be clean, since the conflict under test
+        is the other one) and ``read_target`` is a zero-argument callable
+        returning what its target holds right now. Any value that compares equal
+        to itself will do.
+
+        ``project`` is the one :meth:`an_edit_against_a_changed_target` just
+        staged, and the edit has to be valid against *that* project rather than
+        against a fresh one: both edits are written through it in a single call,
+        and the reader has to be looking at the same place the write lands.
+
+        Returning ``None`` falls back to an edit derived from the staged
+        conflict's own path, which is inside your surface by construction (it is
+        a sibling of a path you already accept) and needs nothing from you.
+        """
+
+        return None
 
     def test_satisfies_the_editable_tier(self) -> None:
         assert tier_of(self.make_project()) >= 3
@@ -435,6 +974,402 @@ class EditableProjectContract(MaintainProjectContract):
             "override is what a human reaches for after reading the conflict "
             "diffs, so a format that refuses either way has no apply path"
         )
+
+    def test_a_refused_apply_leaves_every_target_alone(self) -> None:
+        """A conflict refuses the apply, not the conflicting edit within it.
+
+        ``write_edits`` is all-or-nothing, and the edit set is the unit. A writer
+        that lands the clean edits and holds back the conflicting one leaves the
+        project in a state neither the proposal nor the human intended, with no
+        record of which half arrived: the plan reads as refused, the tree does
+        not match it, and the diffs a reviewer was shown describe a change that
+        partly happened.
+
+        It is the failure worth catching most and the one a single-edit set
+        cannot see, which is why this stages two. The clean edit goes first, so a
+        writer working through the set in order reaches it before it discovers
+        the conflict.
+        """
+
+        project, project_dir, edits, read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+        staged = list(edits)
+        assert staged, (
+            "an_edit_against_a_changed_target() returned no edits, so there is no "
+            "conflict staged and nothing here can be asserted"
+        )
+        supplied = self.a_clean_edit(project)
+        if supplied is None:
+            template = staged[0]
+            sibling = PurePosixPath(template.path)
+            clean_path = str(sibling.with_name(f"dex_conformance_clean_{sibling.name}"))
+            clean = _edit_like(
+                template,
+                path=clean_path,
+                old_content_hash=None,
+                op=EditOp.UPSERT,
+                new_content=_probe_content(clean_path),
+            )
+            read_clean = None
+        else:
+            clean, read_clean = supplied
+
+        before = read_target()
+        before_clean = read_clean() if read_clean is not None else None
+
+        result = project.write_edits([clean, *staged], project_dir)
+
+        assert read_target() == before, (
+            "write_edits() overwrote the conflicting target inside a mixed edit "
+            "set, with confirmed left at its default"
+        )
+        assert not getattr(result, "written", []), (
+            "write_edits() refused an unconfirmed conflict and still reported "
+            f"{list(getattr(result, 'written', []))} as written. The apply is "
+            "all-or-nothing: one conflict refuses the whole set, so the clean "
+            "edits beside it do not land either"
+        )
+        if read_clean is not None:
+            assert read_clean() == before_clean, (
+                "write_edits() wrote the clean edit while refusing the "
+                "conflicting one beside it. That leaves the project matching "
+                "neither the proposal nor what the human had, and the apply "
+                "reports itself as refused, so nothing records which half landed"
+            )
+
+    def test_a_create_pinned_absent_refuses_a_target_that_now_exists(self) -> None:
+        """``old_content_hash=None`` is a claim about the target, and it is checked.
+
+        A create is pinned to nothing because there was nothing there when the
+        plan was made. If a file has appeared at that path since, the claim is
+        false and the write is exactly the overwrite this tier exists to refuse:
+        the human who created it during review loses the whole file rather than
+        the lines that diverged.
+
+        A writer that reads ``None`` as "nothing to compare, go ahead" passes
+        every other assertion here, because in the staged conflict the pinned
+        hash is a real one.
+        """
+
+        project, project_dir, edits, read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+        staged = list(edits)
+        assert staged, (
+            "an_edit_against_a_changed_target() returned no edits, so there is no "
+            "target to re-pin and nothing here can be asserted"
+        )
+        template = staged[0]
+        before = read_target()
+        create = _edit_like(
+            template,
+            old_content_hash=None,
+            op=EditOp.UPSERT,
+            new_content=_probe_content(template.path),
+        )
+
+        result = project.write_edits([create], project_dir)
+
+        assert read_target() == before, (
+            "write_edits() honored an edit pinned to no prior content over a "
+            "target that exists, overwriting it whole. A pin of None says the "
+            "file was absent at plan time; a file being there now is a conflict, "
+            "not a create. (If the target your hook stages does not exist, the "
+            "hook is not staging the case it documents.)"
+        )
+        assert not getattr(result, "written", []), (
+            "write_edits() reported the create as written over an existing "
+            "target, so the caller marks the plan applied and no one is asked "
+            "about the file that appeared"
+        )
+
+    def test_the_write_result_reports_what_happened(self) -> None:
+        """The caller has to be able to tell a refusal from an apply.
+
+        ``transform apply`` reads ``written`` to decide whether the plan is now
+        applied and ``conflicts`` to decide whether to surface the divergence for
+        a human to confirm. Both readings fail closed on a result that answers
+        neither, and they fail in opposite directions: a plan recorded as applied
+        that wrote nothing, or a conflict that never reaches the person it was
+        raised for.
+
+        Asserted on the refusing case because that is the one where the two
+        fields disagree, and so the one a result that reports nothing gets wrong.
+        """
+
+        project, project_dir, edits, _read_target = (
+            self.an_edit_against_a_changed_target()
+        )
+
+        result = project.write_edits(edits, project_dir)
+
+        assert hasattr(result, "written") and hasattr(result, "conflicts"), (
+            "write_edits() returned an object exposing no `written` and "
+            "`conflicts`, so the caller applying a plan cannot tell whether it "
+            "was written or refused. Return an ApplyResult, or something "
+            "answering both"
+        )
+        assert not result.written, (
+            "write_edits() reported paths in `written` while refusing an "
+            "unconfirmed conflict. The apply is what did not happen, so the "
+            "caller marks the plan applied and no one is asked about the "
+            "conflict"
+        )
+        assert result.conflicts, (
+            "write_edits() refused the write but reported no `conflicts`, so the "
+            "divergence it refused over never reaches a human and the apply "
+            "looks like a clean no-op"
+        )
+
+
+class PlacingProjectContract:
+    """Beside tier 3: where an edit lands, and the surface it must land in.
+
+    Mix it in beside :class:`EditableProjectContract`. Placement is what carries a
+    reconcile proposal to your write path, so a format that implements tier 3 and
+    not this one gets advisory proposals and no stored plan, which is the same
+    outcome as declining the tier.
+
+    **What this asserts is that your three answers agree.** Each is checkable
+    alone and none is interesting alone: ``load`` reads a keyspace, ``edit_path``
+    names a key in it, and ``editing_surface`` says which region those keys may
+    fall in. A format placing an edit outside its own declared surface builds a
+    proposal the plan store then refuses, and the refusal reads as dex declining
+    rather than as the format contradicting itself, which is a bad afternoon to
+    debug from the outside.
+
+    **Placement presupposes tier 3, and this checks that first**, the way
+    :class:`SemanticProjectContract` checks tier 2. Every assertion below needs
+    either the write path or the staged conflict that
+    :class:`EditableProjectContract` stages, so a format mixing this in alone
+    would meet an error about a missing attribute where the thing to say is that
+    the contract is missing its other half.
+    """
+
+    def _staged_conflict(self) -> tuple[Any, Any, Any, Any]:
+        """The tier-3 hook, with a message when this mixin is used on its own."""
+
+        hook = getattr(self, "an_edit_against_a_changed_target", None)
+        assert hook is not None, (
+            "the assertions here write through your format, so they need the "
+            "tier-3 hook an_edit_against_a_changed_target(). Mix "
+            "EditableProjectContract in beside this contract, which is how "
+            "placement is meant to be run: a format that places and cannot "
+            "receive an edit has nowhere for the placement to lead"
+        )
+        return hook()
+
+    def test_placement_presupposes_the_editable_tier(self) -> None:
+        assert tier_of(self.make_project()) >= 3, (
+            "a format that places an edit has to reach tier 3, because placement "
+            "is where a proposal is carried to `write_edits`. Implement the write "
+            "tier, or drop this mixin: placing an edit a format cannot receive "
+            "describes a path that stops halfway"
+        )
+
+    def test_the_view_pins_what_an_edit_is_written_against(self) -> None:
+        """``load()`` answers with the keyspace the other two members describe.
+
+        This is what ``transform plan`` pins each edit against and what
+        ``reconcile`` reads before it extends a declaration. Three things are
+        needed and each fails silently in its own way when it is absent:
+        ``root``, which the plan records as the directory it was pinned against;
+        ``content``, which the diff a human reviews is built from; and
+        ``sha256``, without which every existing file pins as a create, so a
+        one-line change is rendered as a whole-file overwrite and the apply that
+        follows conflicts on a file nobody touched.
+
+        The hash need only be consistent with what your own writer re-checks. It
+        is your keyspace, and dex compares your value against your value.
+        """
+
+        view = self.make_project().load()
+
+        root = getattr(view, "root", None)
+        assert isinstance(root, str) and root, (
+            "load() returned a view with no `root`. A plan records the directory "
+            "its edits were pinned against, and reads it from here"
+        )
+        files = getattr(view, "files", None)
+        assert isinstance(files, Mapping), (
+            "load() returned a view whose `files` is not a mapping. It has to be "
+            "keyed the way edit_path() keys, because that is how a placed edit is "
+            f"looked up: got {type(files).__name__}"
+        )
+
+        project, _project_dir, edits, _read_target = self._staged_conflict()
+        staged = list(edits)
+        assert staged, "an_edit_against_a_changed_target() returned no edits"
+        target = staged[0].path
+        entry = project.load().files.get(target)
+        assert entry is not None, (
+            f"load().files has no entry for '{target}', which is the path your own "
+            "hook staged an edit against. dex looks a placed path up in this "
+            "mapping: absent, it pins the edit as a create, renders a whole-file "
+            "diff, and conflicts at apply on a file nobody edited"
+        )
+        assert isinstance(getattr(entry, "content", None), str), (
+            f"the entry for '{target}' carries no `content` string, so no diff "
+            "can be built for a human to review"
+        )
+        sha = getattr(entry, "sha256", None)
+        assert isinstance(sha, str) and sha, (
+            f"the entry for '{target}' carries no `sha256`, so the edit pinned "
+            "against it pins nothing. A create is what a pin of None means, and "
+            "an existing file that pins as a create is one an apply overwrites "
+            "whole"
+        )
+
+    def test_write_edits_refuses_a_path_outside_the_declared_surface(self) -> None:
+        """Your writer honors the surface you declared, not just your placements.
+
+        Containment is checked at plan time and re-checked before dex hands a
+        stored plan to your writer, but ``write_edits`` is a public method of
+        your format and is reachable directly, so the surface has to hold there
+        too. What is asserted is the case a prefix comparison gets wrong: a
+        sibling that merely starts with the same characters. ``declarations``
+        admits ``declarations/orders.yml`` and does not admit
+        ``declarations_backup/orders.yml``, and a format matching by string
+        prefix accepts both while passing every other assertion here.
+
+        Refusing by raising and refusing by writing nothing are both refusals.
+        """
+
+        project, project_dir, edits, read_target = self._staged_conflict()
+        surface = [str(prefix) for prefix in project.editing_surface()]
+        if not surface:
+            pytest.skip(
+                "this format declares no editing surface, so it already refuses "
+                "every edit and there is no sibling prefix to probe"
+            )
+        staged = list(edits)
+        assert staged, "an_edit_against_a_changed_target() returned no edits"
+        outside = f"{surface[0]}_dex_conformance_outside/probe.yml"
+        before = read_target()
+        escaping = _edit_like(
+            staged[0],
+            path=outside,
+            old_content_hash=None,
+            op=EditOp.UPSERT,
+            new_content=_probe_content(outside),
+        )
+
+        try:
+            result = project.write_edits([escaping], project_dir)
+        except Exception:
+            return
+
+        assert not getattr(result, "written", []), (
+            f"write_edits() wrote '{outside}', which editing_surface() does not "
+            f"admit ({', '.join(surface)}). Prefixes match by path segment, so a "
+            "sibling that shares the first characters is outside the surface. A "
+            "format matching by string prefix admits the whole neighborhood of "
+            "every region it owns"
+        )
+        assert read_target() == before, (
+            f"write_edits() left '{outside}' unwritten but moved another target "
+            "while doing it"
+        )
+
+    def placeable_model(self) -> str:
+        """A warehouse table your format would place an edit for.
+
+        The table name as the warehouse spells it, not as your format names the
+        model derived from it. Reconcile passes what the finding is about, and the
+        distinction is the one ``edit_path`` is most often gotten wrong on.
+        """
+
+        raise NotImplementedError(
+            "a PlacingProjectContract subclass must implement placeable_model() "
+            "-> str, naming a warehouse table this format would place an edit "
+            "for. Reconcile's findings arrive keyed by table, and placement is "
+            "asked per table"
+        )
+
+    def test_satisfies_the_placing_protocol(self) -> None:
+        from .project import PlacingProject
+
+        project = self.make_project()
+        from .project import placement_gap
+
+        assert isinstance(project, PlacingProject), placement_gap(project) or (
+            "the format does not satisfy PlacingProject, so reconcile has no path "
+            "to plan an edit against and every proposal it makes stays advisory. "
+            "All three of `load`, `edit_path` and `editing_surface` are required"
+        )
+
+    def test_it_places_at_least_one_kind(self) -> None:
+        """A format that declines every kind has implemented nothing.
+
+        ``None`` per kind is a complete answer and the protocol exists to allow
+        it, but ``None`` for all of them is the format saying it has nowhere for
+        any edit to go, which is what declining tier 3 already says more directly.
+        """
+
+        from ..transform.plans import EditKind
+
+        project = self.make_project()
+        model = self.placeable_model()
+        placed = {
+            kind: project.edit_path(kind, model)
+            for kind in EditKind
+            if project.edit_path(kind, model) is not None
+        }
+
+        assert placed, (
+            f"edit_path() answered None for every kind on '{model}', so no "
+            "proposal can ever reach this format's write path. A format with "
+            "nowhere for any edit to land should decline tier 3 instead"
+        )
+
+    def test_every_placement_lands_inside_the_declared_surface(self) -> None:
+        """The two methods have to describe the same project.
+
+        Containment is checked against ``editing_surface`` at plan time, whatever
+        ``edit_path`` returned, so a placement outside it is an edit built and
+        then refused.
+        """
+
+        from ..transform.plans import EditKind, PlanError, contained_key
+
+        project = self.make_project()
+        model = self.placeable_model()
+        surface = list(project.editing_surface())
+
+        for kind in EditKind:
+            path = project.edit_path(kind, model)
+            if path is None:
+                continue
+            try:
+                contained_key(path, surface)
+            except PlanError as exc:
+                raise AssertionError(
+                    f"edit_path({kind.value}, {model!r}) placed the edit at "
+                    f"'{path}', which editing_surface() does not admit "
+                    f"({', '.join(surface) or 'nothing'}). The plan store checks "
+                    f"the path against the surface, so this proposal would be "
+                    f"built and then refused: {exc}"
+                ) from exc
+
+    def test_the_declared_surface_cannot_reach_outside_the_project(self) -> None:
+        """A surface is a region of the project, not a way out of it.
+
+        Escapes are refused ahead of the surface no matter what is declared, so
+        this cannot widen anything; declaring one means the format believes it
+        owns something it does not, and the belief is worth catching here rather
+        than as a refusal on the first edit that uses it.
+        """
+
+        from pathlib import PurePosixPath
+
+        for prefix in self.make_project().editing_surface():
+            candidate = PurePosixPath(str(prefix).replace("\\", "/"))
+            assert not candidate.is_absolute() and ".." not in candidate.parts, (
+                f"editing_surface() declares '{prefix}', which is absolute or "
+                "climbs out of the project. dex refuses those regardless, so "
+                "every edit placed under this prefix is refused"
+            )
 
 
 class ProjectFactoryContract:

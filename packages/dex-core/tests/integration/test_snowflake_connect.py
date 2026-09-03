@@ -13,6 +13,8 @@ import yaml
 
 from exmergo_dex_core.cli import main
 
+from .conftest import assert_ok, integration_budget
+
 pytestmark = [pytest.mark.integration, pytest.mark.snowflake]
 
 SAMPLE_SCOPE = "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1"
@@ -34,9 +36,11 @@ def seed_repo(
     }
     if connection_name:
         snowflake["connection_name"] = connection_name
-    config: dict = {"connector": "snowflake", "snowflake": snowflake}
-    if budget is not None:
-        config["budget"] = {"ceiling": budget}
+    config: dict = {
+        "connector": "snowflake",
+        "snowflake": snowflake,
+        "budget": integration_budget(budget),
+    }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
@@ -53,7 +57,7 @@ def test_connect_test_discovers_connection_and_reports_read_only(
 ):
     seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
     rc, envelope = run_cli(["--repo-root", str(tmp_path), "connect", "test"], capsys)
-    assert rc == 0, envelope
+    assert_ok(rc, envelope)
     data = envelope["data"]
     assert data["connector"] == "snowflake"
     assert data["dialect"] == "snowflake"

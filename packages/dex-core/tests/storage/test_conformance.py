@@ -562,18 +562,38 @@ def test_one_tenants_cache_is_invisible_to_another(duckdb_file: Path):
 
     other = DocumentStore("tenant-b")
     assert other.load_cache() is None
-    # And the firewall refuses for the other tenant, because cache membership is
-    # what decides that a query may name this table at all.
+
+    # What isolation means here is that no tenant ever adjudicates against
+    # another's state. It was never a read barrier on the warehouse: this
+    # stranger holds the same connection, so it could always have run `explore
+    # map` and queried. So the invariant to hold is that its query is decided by
+    # a profile written into *its own* store, and that tenant-a's cache neither
+    # supplies it nor is touched by it.
+    with DexEngine(
+        connector="duckdb",
+        path=str(duckdb_file),
+        config=config,
+        store=other,
+    ) as stranger:
+        result = stranger.query("select count(*) as n from customers")
+    assert result.profiled_on_demand, "the stranger had to profile for itself"
+    mine = other.load_cache()
+    assert mine is not None and [d.identifier for d in mine.datasets] == [
+        d.identifier for d in mine.datasets if d.columns
+    ]
+
+    # And the strict path still refuses on an empty store, so a deployment that
+    # wants cache membership to be the gate keeps exactly that.
     with (
         DexEngine(
             connector="duckdb",
             path=str(duckdb_file),
             config=config,
-            store=other,
-        ) as stranger,
+            store=DocumentStore("tenant-c"),
+        ) as strict,
         pytest.raises(Exception),
     ):
-        stranger.query("select count(*) as n from customers")
+        strict.query("select count(*) as n from customers", auto_profile=False)
 
 
 def test_a_backend_built_from_a_context_with_no_repo_root_drives_a_flow(

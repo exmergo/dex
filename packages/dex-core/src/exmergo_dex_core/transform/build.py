@@ -96,6 +96,7 @@ def build(
     ceiling: float | None = None,
     confirmed: bool = False,
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
+    connector: str | None = None,
     estimate: float | None = None,
     dev_target_check: Callable[[], list[str]] | None = None,
     runner: Runner | None = None,
@@ -182,7 +183,9 @@ def build(
     # cwd is pinned to the project dir so relative paths in profiles.yml (for
     # example a DuckDB `path: ./dev.duckdb`) resolve against the project, never
     # against whatever directory the caller happened to launch from.
-    run = runner or _default_runner(timeout, project, env=_build_env(paradigm, ceiling))
+    run = runner or _default_runner(
+        timeout, project, env=_build_env(connector, paradigm, ceiling)
+    )
     completed = run(argv)
 
     summary = _summarize(project, target, completed)
@@ -257,9 +260,7 @@ def shadow_parse(
             ),
         )
         for edit in edits:
-            edit_path = contained_path(
-                shadow, edit.path, view.model_paths, view.macro_paths
-            )
+            edit_path = contained_path(shadow, edit.path, view)
             if edit.op is EditOp.DELETE:
                 # Remove it from the copy so the parse runs against the true
                 # post-deletion tree: a surviving ref() to it fails dbt's parse.
@@ -387,6 +388,7 @@ def compile_estimate(
     target: str,
     select: str | None = None,
     runner: Runner | None = None,
+    env: dict[str, str] | None = None,
     timeout: float = _COMPILE_TIMEOUT_SECONDS,
 ) -> tuple[float, dict[str, float], list[str]]:
     """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
@@ -438,7 +440,7 @@ def compile_estimate(
     ]
     if select:
         argv += ["--select", select]
-    run = runner or _default_runner(timeout, project)
+    run = runner or _default_runner(timeout, project, env)
     completed = run(argv)
     if completed.returncode != 0:
         messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
@@ -523,21 +525,76 @@ def _dbt_executable() -> str:
     )
 
 
-def _build_env(paradigm: Paradigm, ceiling: float | None) -> dict[str, str] | None:
-    """Environment overrides for the dbt subprocess, or ``None`` to inherit.
+def _postgres_cap_env(ceiling: int) -> dict[str, str]:
+    """libpq honors PGOPTIONS, so the ceiling becomes a per-statement
+    server-side ``statement_timeout``."""
 
-    On db-load gating (Postgres) the profile has no statement-timeout key, but
-    libpq honors ``PGOPTIONS``, so the ceiling becomes a per-statement
-    server-side ``statement_timeout`` — the ``maximum_bytes_billed`` analogue:
-    a build statement cannot load the database past the budget even if the
-    upfront estimate under-priced it.
+    cap = f"-c statement_timeout={ceiling}s"
+    existing = os.environ.get("PGOPTIONS", "")
+    return {"PGOPTIONS": f"{existing} {cap}".strip()}
+
+
+# Kept in step with adapters.clickhouse._SCAN_BYTES_PER_SECOND: the cap and the
+# quote are two views of one number, so a byte cap derived from a different
+# rate than the estimate would bind somewhere the user was never shown.
+_CH_SCAN_BYTES_PER_SECOND = 200 * 1024 * 1024
+
+
+def _clickhouse_cap_env(ceiling: int) -> dict[str, str]:
+    """ClickHouse takes its caps as query settings, which dbt-clickhouse carries
+    in the profile's ``custom_settings``; a dex-rendered profile references
+    these two variables so the value can be tightened per invocation.
+
+    Both are set, not just time: ``max_execution_time`` is checked at block
+    boundaries and a single fast block can overshoot it, so the byte cap is the
+    one that actually binds on a scan.
     """
 
-    if paradigm is not Paradigm.DB_LOAD or ceiling is None:
+    from . import init
+
+    return {
+        init.CH_MAX_EXECUTION_TIME_ENV: str(ceiling),
+        init.CH_MAX_BYTES_TO_READ_ENV: str(ceiling * _CH_SCAN_BYTES_PER_SECOND),
+    }
+
+
+# Which environment variable carries the server-side cap into the dbt
+# subprocess, per connector. Keyed by connector rather than by paradigm because
+# there is more than one db-load connector and they cap by different mechanisms;
+# keying on the paradigm alone would hand ClickHouse a libpq variable it ignores
+# and then report that the build had been capped, which is a false safety claim
+# rather than a missing feature. An unlisted db-load connector returns None
+# rather than inheriting another connector's variable.
+_CAP_ENV_BUILDERS: dict[str, Callable[[int], dict[str, str]]] = {
+    "postgres": _postgres_cap_env,
+    "clickhouse": _clickhouse_cap_env,
+}
+
+
+def _build_env(
+    connector: str | None, paradigm: Paradigm, ceiling: float | None
+) -> dict[str, str] | None:
+    """Environment overrides for the dbt subprocess, or ``None`` to inherit.
+
+    On db-load gating the ceiling becomes a per-statement server-side cap: the
+    ``maximum_bytes_billed`` analogue, so a build statement cannot load the
+    database past the budget even if the upfront estimate under-priced it.
+    """
+
+    if ceiling is None:
         return None
-    cap = f"-c statement_timeout={max(int(ceiling), 1)}s"
-    existing = os.environ.get("PGOPTIONS", "")
-    return {**os.environ, "PGOPTIONS": f"{existing} {cap}".strip()}
+    # ClickHouse uses the same two server settings under both deployments; only
+    # the meaning of the seconds changes. Other compute-time connectors own
+    # their caps elsewhere, and other db-load connectors remain opt-in below.
+    supported = paradigm is Paradigm.DB_LOAD or (
+        connector == "clickhouse" and paradigm is Paradigm.COMPUTE_TIME
+    )
+    if not supported:
+        return None
+    builder = _CAP_ENV_BUILDERS.get(connector or "")
+    if builder is None:
+        return None
+    return {**os.environ, **builder(max(int(ceiling), 1))}
 
 
 def _default_runner(
@@ -730,6 +787,11 @@ def _summarize(
         "counts": counts,
         "messages": messages,
     }
+    # Internal hand-off, not envelope shape: `_shape_build_result` pops this to
+    # ledger the build and report it under `data.spend`, the one key every billed
+    # command reports spend under (issue #276). Present only when dbt actually
+    # reported a figure, so the shaper can tell "billed nothing" from "billed an
+    # amount dbt never told us".
     if saw_billing:
         summary["bytes_billed"] = bytes_billed
     return summary

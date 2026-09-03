@@ -54,17 +54,31 @@ from .base import (
     ObjectMeta,
     QueryResult,
     ValueDomainSample,
+    affordable_combinations,
     blame,
     distinct_combination_sql,
     is_blob_type,
+    is_integer_type,
+    is_string_type,
     json_safe,
+    key_shape_aggregate_kwargs,
+    key_shape_expressions,
     name_list,
     shape_stat_expressions,
     shape_stat_value,
+    temporal_alignment_expressions,
+    temporal_continuity_aggregate_kwargs,
+    temporal_continuity_sql,
+    temporal_units_for,
+    type_contradiction_aggregate_kwargs,
+    type_contradiction_expressions,
+    warehouse_refusal,
 )
 
 PARADIGM = "compute_time"
 DIALECT = "redshift"
+
+_BIGINT_TYPE = "BIGINT"
 
 # Columns are profiled in batches so one statement against a very wide table
 # does not balloon (up to 4 expressions per column).
@@ -146,6 +160,34 @@ _SIZE_FACTS_NOTE = (
 def _regexp_predicate(qcol: str, pattern: str) -> str:
     # ~ matches substrings; the shared patterns' anchors make it a full match.
     return f"{qcol} ~ '{pattern}'"
+
+
+def _date_trunc_expr(qcol: str, unit: str) -> str:
+    return f"DATE_TRUNC('{unit}', {qcol})"
+
+
+def _substring_expr(qcol: str, start: int, length: int) -> str:
+    # Redshift refuses SUBSTR by name -- "SUBSTR() function is not supported
+    # (Hint: use SUBSTRING instead)" -- and does so at execution, over a real
+    # table, not only in a leader-node-only query. SUBSTRING takes the same
+    # positional arguments and is what the hint asks for.
+    return f"SUBSTRING({qcol}, {start}, {length})"
+
+
+def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
+    # Both operands are cast, and the cast is not decorative: Redshift's
+    # DATEDIFF resolves to pg_catalog.date_diff, which is declared over
+    # DATE/TIME/TIMETZ/TIMESTAMP and has no TIMESTAMPTZ overload, while
+    # DATE_TRUNC over a TIMESTAMPTZ column returns TIMESTAMPTZ. The periods
+    # this diffs are therefore exactly the shape it refuses ("function
+    # pg_catalog.date_diff(\"unknown\", timestamp with time zone, timestamp
+    # with time zone) does not exist"), and a plain DATEDIFF failed the whole
+    # profiling statement for any table carrying a TIMESTAMPTZ column. The cast
+    # is total for every type that reaches here (DATE and TIMESTAMP widen
+    # unchanged; TIME is never temporal-profiled, see `is_temporal_type`), and
+    # it shifts nothing: both operands convert to the session timezone by the
+    # same rule, so their difference is what it was.
+    return f"DATEDIFF({unit}, {earlier}::TIMESTAMP, {later}::TIMESTAMP)"
 
 
 class RedshiftConnectionError(ConnectorError):
@@ -261,7 +303,7 @@ class RedshiftAdapter:
         }
         budget: dict[str, object] = {
             "ceiling_seconds": cost.ceiling,
-            "session_spent_today_seconds": self.cost_gate.session_spent,
+            "session_spent_today_seconds": self.cost_gate.session_spent_now(),
         }
         if cost.ceiling is not None:
             rpu_hours = self._to_rpu_hours(cost.ceiling)
@@ -752,14 +794,22 @@ class RedshiftAdapter:
         *,
         safe_min_max: set[str] | None = None,
         shape_stats: set[str] | None = None,
+        type_stats: set[str] | None = None,
+        key_shape_stats: set[str] | None = None,
+        temporal_stats: set[str] | None = None,
     ) -> list[ColumnAggregate]:
         safe = safe_min_max or set()
         shape = shape_stats or set()
+        type_req = type_stats or set()
+        key_shape_req = key_shape_stats or set()
+        temporal_req = temporal_stats or set()
         meta, _ = self.table_metadata(identifier)
         results: list[ColumnAggregate] = []
         for start in range(0, len(columns), _COLUMN_BATCH):
             batch = columns[start : start + _COLUMN_BATCH]
-            sql, plan = self._build_aggregate_sql(identifier, batch, safe, shape)
+            sql, plan = self._build_aggregate_sql(
+                identifier, batch, safe, shape, type_req, key_shape_req, temporal_req
+            )
             rows, labels = self._execute(
                 sql, estimate=self._scan_seconds(meta.byte_size)
             )
@@ -774,17 +824,22 @@ class RedshiftAdapter:
         columns: list[ColumnMeta],
         safe: set[str],
         shape: set[str],
-    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool]]]:
+        type_req: set[str],
+        key_shape_req: set[str],
+        temporal_req: set[str],
+    ) -> tuple[str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]]]:
         # One aggregate statement per batch, a single pass: COUNT(*) once,
         # then per column a non-null count, an approximate distinct (HLL),
-        # min/max only where allowed, and value-shape fractions only where
-        # requested. Pure (no connection), so the SELECT-only property is
-        # testable offline. Degraded types get the non-null count only: a
-        # distinct count over serialized SUPER or geometry values is not a
-        # meaningful cardinality even where the server accepts it (verified
-        # live: it does), and MIN/MAX would carry values.
+        # min/max only where allowed, and value-shape/type-contradiction/
+        # key-shape/temporal-continuity fractions only where requested. Pure
+        # (no connection), so the SELECT-only property is testable offline.
+        # Degraded types get the non-null count only: a distinct count over
+        # serialized SUPER or geometry values is not a meaningful
+        # cardinality even where the server accepts it (verified live: it
+        # does), and MIN/MAX would carry values.
+        table_sql = self._quote(identifier)
         select_parts = ["COUNT(*) AS n_total"]
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]] = []
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
             degraded = self._is_degraded(col.data_type)
@@ -803,10 +858,53 @@ class RedshiftAdapter:
             wants_shape = (col.name in shape) and not degraded
             if wants_shape:
                 select_parts.extend(shape_stat_expressions(qcol, i, _regexp_predicate))
-            plan.append((i, col, wants_distinct, wants_min_max, wants_shape))
+            wants_type = (col.name in type_req) and not degraded
+            if wants_type:
+                select_parts.extend(
+                    type_contradiction_expressions(
+                        qcol,
+                        i,
+                        is_string=is_string_type(col.data_type),
+                        is_integer=is_integer_type(col.data_type),
+                        regexp_predicate=_regexp_predicate,
+                        bigint_type=_BIGINT_TYPE,
+                        substring_expr=_substring_expr,
+                    )
+                )
+            wants_key_shape = (col.name in key_shape_req) and not degraded
+            if wants_key_shape:
+                select_parts.extend(key_shape_expressions(qcol, i, _regexp_predicate))
+            wants_temporal = (col.name in temporal_req) and not degraded
+            if wants_temporal:
+                select_parts.extend(
+                    temporal_alignment_expressions(qcol, i, _date_trunc_expr)
+                )
+                for unit in temporal_units_for(col.data_type):
+                    select_parts.extend(
+                        temporal_continuity_sql(
+                            qcol,
+                            i,
+                            unit,
+                            table_sql,
+                            _date_trunc_expr,
+                            _date_diff_expr,
+                        )
+                    )
+            plan.append(
+                (
+                    i,
+                    col,
+                    wants_distinct,
+                    wants_min_max,
+                    wants_shape,
+                    wants_type,
+                    wants_key_shape,
+                    wants_temporal,
+                )
+            )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
-        sql = f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}"  # noqa: S608
+        sql = f"SELECT {', '.join(select_parts)} FROM {table_sql}"  # noqa: S608
         return assert_select_only(sql, dialect=self.dialect), plan
 
     @staticmethod
@@ -816,11 +914,20 @@ class RedshiftAdapter:
     @staticmethod
     def _read_aggregates(
         values: dict,
-        plan: list[tuple[int, ColumnMeta, bool, bool, bool]],
+        plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]],
     ) -> list[ColumnAggregate]:
         n_total = int(values["n_total"])
         aggregates: list[ColumnAggregate] = []
-        for i, col, wants_distinct, wants_min_max, wants_shape in plan:
+        for (
+            i,
+            col,
+            wants_distinct,
+            wants_min_max,
+            wants_shape,
+            wants_type,
+            wants_key_shape,
+            wants_temporal,
+        ) in plan:
             nn = values.get(f"nn_{i}")
             null_fraction = (
                 (1 - int(nn) / n_total) if nn is not None and n_total > 0 else None
@@ -849,6 +956,9 @@ class RedshiftAdapter:
                         values, f"sp_{i}", wants_shape
                     ),
                     avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **type_contradiction_aggregate_kwargs(values, i, wants_type),
+                    **key_shape_aggregate_kwargs(values, i, wants_key_shape),
+                    **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
                 )
             )
         return aggregates
@@ -896,9 +1006,11 @@ class RedshiftAdapter:
         self, identifier: str, combinations: list[list[str]]
     ) -> dict[tuple[str, ...], int]:
         """Exact distinct count per column combination, spent only within the
-        already-confirmed budget: when the remaining budget cannot cover the
-        extra scans (one per combination), return nothing and let the grain
-        stay unknown. A metered adapter never self-escalates past its ceiling.
+        already-confirmed budget. Each combination is a further scan, so when
+        the budget cannot cover all of them the probe narrows to the pairs it
+        can afford (they arrive best-ranked first) and says so, rather than
+        giving up the grain wholesale. A metered adapter never self-escalates
+        past its ceiling.
         """
 
         if not combinations:
@@ -906,29 +1018,27 @@ class RedshiftAdapter:
         meta, _ = self.table_metadata(identifier)
         # Like the exact-distinct escalation, this can be a command's first
         # billed statement, so the pending Serverless wake minimum rides the
-        # charge; on refusal it stays pending.
-        estimate = (
-            self._scan_seconds(meta.byte_size) * len(combinations) + self._wake_floor()
+        # charge; it is flat across prefixes, and stays pending unless a prefix
+        # is actually charged.
+        unit = self._scan_seconds(meta.byte_size)
+        wake = self._wake_floor()
+        probed, note = affordable_combinations(
+            combinations,
+            lambda prefix: unit * len(prefix) + wake,
+            self.cost_gate.try_charge,
         )
-        if not self.cost_gate.try_charge(estimate):
-            self._note(
-                identifier,
-                "composite-key probe skipped: the remaining budget could not "
-                "cover the extra scan; grain stays unknown",
-            )
+        if note:
+            self._note(identifier, note)
+        if not probed:
             return {}
         self._consume_wake_floor()
         sql = assert_select_only(
-            distinct_combination_sql(
-                self._quote(identifier), combinations, _quote_ident
-            ),
+            distinct_combination_sql(self._quote(identifier), probed, _quote_ident),
             dialect=self.dialect,
         )
         rows, labels = self._run(sql)
         values = dict(zip(labels, rows[0], strict=True))
-        return {
-            tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(combinations)
-        }
+        return {tuple(combo): int(values[f"d_{i}"]) for i, combo in enumerate(probed)}
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1072,12 +1182,7 @@ class RedshiftAdapter:
         the cursor and whether the budget (not the wall clock) is the binding
         bound."""
 
-        remaining = self.cost_gate.remaining_for_statement()
-        if remaining is not None and remaining < 1:
-            raise OverCeilingError(
-                "the remaining budget is under one compute-second; raise "
-                "--budget or narrow the work"
-            )
+        remaining = self.cost_gate.statement_cap(unit="compute-second")
         self._ensure_session()
         cursor = self._conn.cursor()
         timeout_ms: int | None = None
@@ -1111,7 +1216,16 @@ class RedshiftAdapter:
         message = str(exc).lower()
         timed_out = payload.get("C") == "57014" or "statement timeout" in message
         if not timed_out:
-            return exc
+            # Everything else the server refused. Typed rather than handed
+            # back unchanged: a driver exception is not a DexError, so it used
+            # to fall through every reason override and land on `internal`,
+            # which reads as a dex crash and buries the server's own diagnosis
+            # in an envelope with no reason, no object, and no spend. The
+            # payload's M and C are the message and the SQLSTATE; str(exc) is
+            # the whole payload dict, which is not for reading.
+            return warehouse_refusal(
+                str(payload.get("M") or exc), code=payload.get("C")
+            )
         if budget_bound:
             return OverCeilingError(
                 "the statement hit the server-side statement_timeout derived "

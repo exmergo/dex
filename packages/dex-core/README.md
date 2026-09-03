@@ -16,7 +16,7 @@ every change is a reviewable diff.
 pip install "exmergo-dex-core"
 ```
 
-Connector client libraries live behind extras. DuckDB is an in-memory data warehouse,
+Connector client libraries live behind extras. DuckDB is an embedded data warehouse,
 so you can start from there if you want to test Dex locally. We aim to support all major
 data warehouses. Please suggest any missing connectors on [GitHub](https://github.com/exmergo/dex)!
 
@@ -27,6 +27,7 @@ exmergo-dex-core[bigquery]
 exmergo-dex-core[databricks]
 exmergo-dex-core[redshift]
 exmergo-dex-core[postgres]
+exmergo-dex-core[clickhouse]
 exmergo-dex-core[all]          # every optional capability at once
 ```
 
@@ -40,6 +41,36 @@ hosted semantic layer needs no connector, no dbt-core, and no SQL parser. Every
 other command validates SQL before running it, which is why the connector extras
 carry the dialect engine; run one without a connector installed and dex refuses
 with the install to use rather than guessing.
+
+## First run, with nothing to point it at
+
+`[duckdb]` is also what carries the on-ramp, so a fresh install has something to
+work against before you have wired up a warehouse:
+
+```
+pip install "exmergo-dex-core[duckdb]"
+dex demo
+dex explore map
+```
+
+`dex demo` generates a small e-commerce warehouse (7 tables, 29,512 rows) in the
+current directory and a `.dex/config.yml` beside it, so everything after it runs
+with no flags. No credentials, no cloud account, no network. The data comes from a
+pinned seed, so every run produces the same rows and the numbers quoted here are the
+numbers you get.
+
+It is seeded to be realistically broken rather than tidy: a key that lost its
+uniqueness to a double-loaded batch, a key mixing two id schemes from a merged
+catalogue, a join whose columns share a name and none of their values, a table an
+interrupted load left empty, two columns whose declared type contradicts their
+content, and personal data alongside two deliberate false positives. `explore map`
+finds 6 PII columns, 5 joins, and 5 data-quality findings; `explore query "select
+email from customers"` is refused, and the same count over the same column is not.
+
+The generation is create-only: it writes a new file and refuses rather than replace
+one, with no confirmation flag that can talk past that, and it will not write a
+`.dex/config.yml` where a project already has one. `generate_demo_warehouse` is
+public, so the Python API can build the same fixture.
 
 ## Two surfaces, one engine
 
@@ -69,9 +100,10 @@ instead, and a backend published as its own package is selectable by name from
 [`references/storage.md`](../../references/storage.md).
 
 [`examples/quickstart.py`](examples/quickstart.py) is the whole flow in one
-runnable file: map a warehouse, read the inferred joins, see PII flagged, ask a
-question, and watch the firewall refuse one it should. It builds its own
-throwaway DuckDB file, so it runs anywhere:
+runnable file: map a warehouse, read the inferred joins and the data-quality
+findings, see PII flagged, ask a question, and watch the firewall refuse one it
+should. It generates the same demo warehouse `dex demo` builds, into a throwaway
+directory, so it runs anywhere and reports the same findings:
 
 ```
 pip install "exmergo-dex-core[duckdb]"
@@ -158,6 +190,14 @@ subcommands are stateless and the agent orchestrates multi-step flows.
 dex connect test --path data.duckdb
 ```
 
+With nothing to point at yet, `dex demo` builds one and every command after it needs
+no flags:
+
+```
+dex demo
+dex connect test
+```
+
 The CLI is the API's first consumer rather than a parallel implementation: it
 parses arguments, builds an engine, and wraps the result it gets back. See
 [`references/command-contract.md`](../../references/command-contract.md) for the
@@ -167,27 +207,54 @@ full surface and the envelope spec.
 
 Early and under active development; open issues on [GitHub](https://github.com/exmergo/dex)! Today the engine
 runs Explore, Transform, and Maintain end to end on every connector: DuckDB,
-BigQuery, Snowflake, Databricks, Amazon Redshift, and Postgres, through either
-the command contract or the Python API.
+BigQuery, Snowflake, Databricks, Amazon Redshift, Postgres, and ClickHouse
+(self-hosted), through either the command contract or the Python API. One
+exception, stated so it is never overclaimed: `explore semantic query --local`
+renders through MetricFlow, which ships no ClickHouse renderer, so that one
+capability refuses on ClickHouse by name rather than running.
 
 ### Commands
+
+`demo`: generates a seeded local DuckDB warehouse and wires it up, so a first run
+needs no warehouse and no credentials. One command, no network, and deterministic:
+the row counts and column names the documentation quotes are the ones you get. It is
+the only verb that creates a data file, and it is create-only by construction, so it
+never opens, inspects, or replaces a warehouse you already have. The generator lives
+on its own path, never through a connector, which is what keeps the read-only rule
+true everywhere else.
 
 `explore`: ranks what matters in an unfamiliar warehouse, profiles columns
 selectively, flags PII, surfaces grain and data-quality warnings, infers joins
 and verifies them with overlap probes (`--verify`), and executes agent-authored
-ad-hoc SELECTs behind a PII-aware query firewall (`explore query`), all
-read-only. `explore diagram` serializes the map it built as a Mermaid
+ad-hoc SELECTs behind a PII-aware query firewall (`explore query`, which takes
+several statements per call, or a `--sql-file`, and adjudicates each on its own),
+all read-only. `explore diagram` serializes the map it built as a Mermaid
 `erDiagram`, free and without opening a connection, drawing declared joins solid
 and inferred joins dotted and claiming a cardinality only where the cache proved
 one. It starts bare by default; with `--use-project` it reads an existing
 dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
-writing back to `.dex/config.yml`. It also queries the dbt semantic layer
-(`explore semantic list` / `query`): metric queries run either locally through
-MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt Cloud
-deployment (`--api`), where dbt Cloud executes server-side and every result warns
-that dex's cost guard does not apply there.
+writing back to `.dex/config.yml`. It also reads and queries the dbt semantic layer
+(`explore semantic list` / `values` / `query`). `list` returns the layer's objects,
+semantic models and metrics and their composition and measures and dimensions and
+the declared entity graph, in one shape from either backend, scopeable to the
+metrics a caller came for (or, with `--for-dimension`, to the metrics a given slice
+is available on, or, with `--search`, to the metrics a word matches in a name or in
+the project's own prose) and costing no warehouse query. The catalog is budgeted
+like the map, with every cut counted in the payload and `--full` to lift the caps,
+so a complete answer says that it is complete. Each semantic model carries the
+relation it sits on and each element the column behind it, which is what connects a
+metric to the objects `explore map` and `explore profile` describe; the hosted
+backend exposes columns but no relations, and declares that gap rather than leaving
+it to be inferred. That link runs both ways: with `--use-project`, `explore map`
+marks each object with the semantic models that expose it and draws the joins the
+layer declares, at the declared tier and with the entity named. `values` returns one dimension's
+value domain, which is what you need before writing a filter and the only way to
+reach it at all on a hosted layer. Metric queries run either locally
+through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt
+Cloud deployment (`--api`), where dbt Cloud executes server-side and every result
+warns that dex's cost guard does not apply there.
 
 `transform`: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and
@@ -196,6 +263,15 @@ deterministic staging scaffolds into reviewable, conflict-checked diffs
 gated dev-target-only builds with cost surfaced before any spend
 (`transform build`), and authors the semantic layer as MetricFlow-validated dbt
 semantic models (`semantic define|update|plan`, applied with `transform apply`).
+It also answers, and then acts on, "where is this used": `transform references`
+reports every use of a name across model SQL, `schema.yml`, `dbt_project.yml`,
+macros, semantic YAML, seed headers and installed packages, jinja-aware and honest
+about what it could not resolve; `transform rename` and `transform remove` turn
+that report into every edit the change needs as one plan, refusing rather than
+propagating a change to most of a project; and `transform place` decides where a
+derived column that several models need should be defined, proposing the lowest
+common ancestor in the `ref()` graph along with the reasoning behind the choice.
+All four are repo-only and free on every connector.
 
 `maintain`: detects drift against the `.dex/` snapshot on four axes and proposes
 the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
@@ -282,6 +358,28 @@ planner's own statistics instead of scanning distincts, and dbt builds go to
 a dedicated dev schema via dbt-postgres, which the `[postgres]` extra
 carries, with the ceiling injected as a statement timeout through
 `PGOPTIONS`. See [`references/postgres.md`](../../references/postgres.md).
+
+ClickHouse: the self-hosted analytical connector and ClickHouse Cloud warehouse.
+Connects through discovered
+credentials (`CLICKHOUSE_URL`, the `CLICKHOUSE_*` environment, a committed
+non-secret target, or a dbt profile). Identifiers are two-part
+`database.table`, because ClickHouse has no catalog level and dbt-clickhouse's
+`schema:` is the ClickHouse database. Self-hosted budgets are
+**database-seconds**; Cloud budgets are **compute-seconds**, with live
+per-replica memory translating them to approximate compute-unit-hours and
+optional USD. Estimates come from
+the free, non-executing `EXPLAIN ESTIMATE`, which prices a statement after
+primary-key pruning, with a `system.tables` fallback for the relations it does
+not cover; the budget is hard-enforced anyway by a per-statement
+`max_execution_time` **and** `max_bytes_to_read`, since time alone is checked
+only at block boundaries. Settlement is free and exact: every response carries
+the server's own elapsed time, so the ledger records what the server spent
+rather than what the client waited. The session sends `readonly = 2` and
+`allow_ddl = 0` on every statement, and dbt builds go to a dedicated dev
+database via dbt-clickhouse, which the `[clickhouse]` extra carries, with the
+ceiling injected through the profile's `custom_settings`. Cloud corroborates
+`cloud_mode` and fails closed unless every replica reports its capacity. See
+[`references/clickhouse.md`](../../references/clickhouse.md).
 
 ## License
 
