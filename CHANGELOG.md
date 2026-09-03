@@ -112,6 +112,57 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   each degrading on its own rather than one absence hiding the other's
   presence.
 
+- **A semantic layer's own declared dataset keys now reach grain detection**
+  ([#408]). Ossie is never the transformation project `engine.project_format()`
+  resolves, so its `primary_key`/`unique_keys` declarations had no route to
+  `explore profile --use-project`'s grain channel at all: only a dbt project's
+  own tier-1 `definitions()` fed it. `SemanticLayer` gains a `declared_keys()`
+  capability, the same shape `declared_relationships()` already established;
+  every backend but Ossie's returns nothing, because a dbt-backed layer's keys
+  already reach grain through the project route and stating them twice would
+  only ever double-count. `explore commands.py` calls this capability
+  unconditionally rather than branching on which vendor is configured, honoring
+  the same architectural rule `test_no_command_carries_a_vendor_branch` already
+  enforces elsewhere. A repository with both dbt and Ossie gets both sets of
+  keys, additively, not a choice between them.
+
+- **Declared relationships that disagree about which columns join the same two
+  datasets are now flagged rather than silently doubled** ([#408]). Two
+  declarations naming the same dataset pair with different column pairs used
+  to fold into two separate, unlabeled edges with nothing to say they
+  contradict each other. `explore map` and `explore relationships` now surface
+  every such pair as a `DeclaredRelationshipConflict` in the new `conflicts`
+  field, naming every disagreeing declaration and its columns and source, with
+  a note pointing at the structured field. Every declaration is still kept as
+  its own edge: dex reports the disagreement rather than picking a winner.
+
+- **`--use-project` and `--use-hosted-semantic-layer` now compose instead of
+  one silently winning** ([#408]). Passing both used to read only the local
+  project's semantic layer; the hosted read, and its "cannot add map exposure
+  annotations" note, never ran. Both are now read and unioned: semantic
+  models, metrics, dimensions and measures merge by name (the local entry
+  wins a name both declare, since it is the side with physical relations),
+  and an entity declared on both sides merges its per-model roles and
+  re-derives its summary `type` from the wider set rather than one side's
+  declaration overwriting the other's. Relationship-edge extraction reads
+  both sources the same way, though no shipped hosted backend returns
+  physical relations there today, so every edge still comes from the local
+  read in practice. A hosted vendor with no local counterpart (or the
+  reverse, such as Ossie's own vendor having no hosted deployment) degrades
+  to whichever side actually answered instead of losing a read that already
+  succeeded.
+
+### Fixed
+
+- **A composite relationship's Mermaid label named only the child-side columns,
+  silently dropping the parent side.** ([#408]) `explore diagram`'s edge label
+  joined `from_columns` alone, so `(product_id, variant_id)` rendered as
+  `"product_id, variant_id, declared"` with no way to tell which child column
+  paired with which parent column, or that a parent side existed at all. The
+  label now pairs every column (`"product_id = id, variant_id = variant_id"`);
+  a single pair sharing one name on both sides, the common case, still renders
+  as that bare name unchanged.
+
 ## [1.9.2] - 2026-09-02
 
 ### Added

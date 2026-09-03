@@ -175,6 +175,12 @@ class LocalMetricFlowBackend:
 
         return []
 
+    def declared_keys(self) -> tuple[list[Any], list[Any]]:
+        """dbt's own declared keys already reach grain through its project
+        format's ``definitions()``; stating them here too would double them."""
+
+        return [], []
+
     def _semantic_view(self):
         """The project's semantic catalog, read once per command.
 

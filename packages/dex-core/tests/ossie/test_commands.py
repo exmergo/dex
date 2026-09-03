@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import DexConfig, save_config
@@ -222,6 +223,97 @@ def test_an_unreadable_document_degrades_rather_than_failing_a_map(
     (configured / "commerce.ossie.yaml").write_text("a: [1,\n", encoding="utf-8")
 
     assert _semantic_catalog(DexEngine.from_repo(str(configured)), True) is None
+
+
+def test_use_hosted_semantic_layer_degrades_to_the_local_ossie_view(
+    configured: Path,
+):
+    """Ossie has no hosted deployment (#408): asking for both `--use-project`
+    and `--use-hosted-semantic-layer` reads what each side can actually answer
+    rather than the hosted side's refusal discarding the local read that
+    already succeeded."""
+
+    from exmergo_dex_core.explore.commands import _semantic_catalog
+
+    view = _semantic_catalog(
+        DexEngine.from_repo(str(configured)),
+        True,
+        use_hosted_semantic_layer=True,
+    )
+
+    assert view is not None
+    assert "commerce.orders" in [m.name for m in view.semantic_models]
+
+
+def test_declared_keys_reach_the_grain_channel_without_a_vendor_branch(
+    configured: Path,
+):
+    """Ossie's dataset keys have no route to grain detection except this one
+    (#408): unlike dbt, Ossie is never the transformation project `engine.
+    project_format()` resolves, so `explore profile --use-project` would see
+    no declared grain at all without it. Reached through the semantic layer's
+    own `declared_keys()` capability, the same shape `declared_relationships`
+    already uses, never a name check on which vendor is configured."""
+
+    from exmergo_dex_core.explore.commands import _project_definitions
+
+    defs = _project_definitions(DexEngine.from_repo(str(configured)), True)
+
+    assert defs.present is True
+    single = {k.model: k.column for k in defs.declared_keys}
+    assert single["commerce.orders"] == "order_id"
+    assert single["commerce.customers"] == "customer_id"
+    composite = {c.model: c.columns for c in defs.declared_composite_keys}
+    assert composite["commerce.order_items"] == ["order_id", "line_no"]
+
+
+def test_no_declared_keys_is_silent_rather_than_a_forced_presence(
+    configured: Path,
+):
+    """A document that declares no keys at all must not flip `present` on the
+    strength of nothing: an empty capability result changes nothing about the
+    definitions dbt's own tier-1 read already produced."""
+
+    from exmergo_dex_core.explore.commands import _project_definitions
+
+    (configured / "commerce.ossie.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.2.0.dev0",
+                "semantic_model": [
+                    {
+                        "name": "bare",
+                        "datasets": [
+                            {
+                                "name": "events",
+                                "source": "demo.main.events",
+                                "fields": [
+                                    {
+                                        "name": "id",
+                                        "expression": {
+                                            "dialects": [
+                                                {
+                                                    "dialect": "ANSI_SQL",
+                                                    "expression": "id",
+                                                }
+                                            ]
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    defs = _project_definitions(DexEngine.from_repo(str(configured)), True)
+
+    assert defs.present is False
+    assert defs.declared_keys == []
+    assert defs.declared_composite_keys == []
 
 
 def test_no_command_carries_a_vendor_branch():

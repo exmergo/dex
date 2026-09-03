@@ -179,6 +179,38 @@ class ProfileResult(Result):
         }
 
 
+class ConflictingRelationshipDeclaration(BaseModel):
+    """One of two or more declarations that disagree about the same join.
+
+    ``column_pairs`` is ordered ``[from_column, to_column]`` entries, exactly
+    the shape a composite join needs; ``source`` names where this particular
+    declaration came from (a ``relationships`` test, a semantic layer's shared
+    entity, or a native declaration), the same provenance a non-conflicting
+    edge already carries in ``declaration_sources``.
+    """
+
+    column_pairs: list[list[str]] = Field(default_factory=list)
+    source: str = ""
+
+
+class DeclaredRelationshipConflict(BaseModel):
+    """Two or more declarations state a join between the same two datasets
+    with different column pairs (#408).
+
+    Both edges still appear in ``relationships``/``edges``; this is the one
+    place that says they disagree, since which columns actually join is a
+    fact about the warehouse only one declaration can be right about, and dex
+    never guesses which by silently picking a winner or merging one column
+    set into the other.
+    """
+
+    from_dataset: str
+    to_dataset: str
+    declarations: list[ConflictingRelationshipDeclaration] = Field(
+        default_factory=list
+    )
+
+
 class RelationshipsResult(Result):
     """Joins across the objects in scope, with what earned each one.
 
@@ -188,6 +220,11 @@ class RelationshipsResult(Result):
     which is worth its own number because it is the one that appears only under
     ``--use-project`` on a project with a semantic layer, and a reader comparing
     two runs otherwise sees `declared_count` move with no field explaining it.
+
+    ``conflicts`` names every pair of datasets more than one declaration joins
+    with different columns; see :class:`DeclaredRelationshipConflict`. Empty is
+    the positive statement that every declaration touching the same two
+    datasets agreed.
     """
 
     relationships: list[Relationship] = Field(default_factory=list)
@@ -196,6 +233,7 @@ class RelationshipsResult(Result):
     profiled_count: int = 0
     cache_hit_count: int = 0
     carried_relationship_count: int = 0
+    conflicts: list[DeclaredRelationshipConflict] = Field(default_factory=list)
     cache_path: str = ""
     updated_at: str = ""
 
@@ -208,6 +246,7 @@ class RelationshipsResult(Result):
             "profiled_count": self.profiled_count,
             "cache_hit_count": self.cache_hit_count,
             "carried_relationship_count": self.carried_relationship_count,
+            "conflicts": [c.model_dump(mode="json") for c in self.conflicts],
             "cache_path": self.cache_path,
             "updated_at": self.updated_at,
         }
@@ -255,6 +294,7 @@ class MapResult(Result):
     top_objects: list[RankedObject] = Field(default_factory=list)
     objects: list[MapObject] = Field(default_factory=list)
     edges: list[Relationship] = Field(default_factory=list)
+    conflicts: list[DeclaredRelationshipConflict] = Field(default_factory=list)
     elided_object_count: int = 0
     elided_column_count: int = 0
     elided_edge_count: int = 0
@@ -283,6 +323,7 @@ class MapResult(Result):
             "top_objects": [o.model_dump(mode="json") for o in self.top_objects],
             "objects": [o.model_dump(mode="json") for o in self.objects],
             "edges": [e.model_dump(mode="json") for e in self.edges],
+            "conflicts": [c.model_dump(mode="json") for c in self.conflicts],
             "elided_object_count": self.elided_object_count,
             "elided_column_count": self.elided_column_count,
             "elided_edge_count": self.elided_edge_count,
