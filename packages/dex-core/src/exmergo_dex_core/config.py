@@ -9,7 +9,7 @@ Secrets (passwords, keys, tokens) are read at runtime from their own stores by
 from __future__ import annotations
 
 import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -457,15 +457,35 @@ class EntityAffixes(BaseModel):
 
 
 # Which deployments each semantic-layer vendor ships, and the spellings that name
-# them. One vendor today; the table exists because `backend:` collapsed vendor and
-# deployment into one enum, which only extends while there is exactly one vendor.
-# `api` and `cloud` are released spellings of `dbt_cloud` and stay accepted.
+# them. The table exists because `backend:` collapsed vendor and deployment into
+# one enum, which only extends while there is exactly one vendor, and there is
+# now more than one. `api` and `cloud` are released spellings of `dbt_cloud` and
+# stay accepted.
 SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     "dbt": ("local", "dbt_cloud"),
-    # Ossie is an interchange format, not a query service.  Its local deployment
-    # means "read the native documents in this repository".
+    # Ossie is an interchange format, not a query service. Its local deployment
+    # means "read the native documents in this repository", and there is no
+    # hosted one to add later: a hosted Ossie would be some vendor's service
+    # speaking its own protocol, which is a different vendor rather than a second
+    # deployment of this one.
     "ossie": ("local",),
 }
+
+#: The project format that answers a vendor's semantic catalog, where the vendor
+#: is not the project itself. A table rather than a branch, and this is the
+#: mechanism that lets `semantic.vendor: ossie` sit beside `project.format: dbt`
+#: without any command learning a vendor name: the engine builds the named format
+#: and injects it, and the backend reads a catalog through the same seam it
+#: always did. `dbt` is absent because the configured project format already
+#: answers for it.
+#:
+#: A vendor listed here reads its format's coordinates from the `SemanticConfig`
+#: field named after the vendor (`semantic.ossie` for `ossie`), which is passed
+#: through to the format as its options verbatim. That convention is what keeps
+#: the engine from growing a per-vendor coordinate reader.
+SEMANTIC_PROJECT_FORMATS: dict[str, str] = {"ossie": "ossie"}
+#: Compatibility spelling accepted only while migrating old configuration.
+LEGACY_OSSIE_PROJECT_FORMAT = "ossie"
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",
@@ -484,25 +504,66 @@ def canonical_semantic_deployment(value: str) -> str:
 
 
 class OssieSemanticConfig(BaseModel):
-    """The repository-confined native documents behind ``vendor: ossie``."""
+    """The repository-confined native documents behind ``vendor: ossie``.
+
+    The same coordinates ``project.options.files`` carries for an Ossie-only
+    repository, and validated the same way here, because a bad path should be
+    refused where it is written rather than several frames into a command. Both
+    routes build one class, so what is checked here is checked once more by the
+    format itself: this one can name the config line, that one holds for a
+    caller who built the coordinates some other way.
+    """
 
     files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_files(self) -> OssieSemanticConfig:
+        from .ossie.loader import DOCUMENT_SUFFIXES
+
+        listed = ", ".join(DOCUMENT_SUFFIXES)
+        for name in self.files:
+            if not name.endswith(DOCUMENT_SUFFIXES):
+                raise ValueError(
+                    f"semantic.ossie.files: '{name}' is not a native Ossie "
+                    f"document; they are named {listed}"
+                )
+            path = PurePosixPath(name)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(
+                    f"semantic.ossie.files: '{name}' has to name a file inside "
+                    "the repository, written relative to its root"
+                )
+        if duplicated := sorted({n for n in self.files if self.files.count(n) > 1}):
+            raise ValueError(
+                "semantic.ossie.files names the same document twice: "
+                f"{', '.join(duplicated)}"
+            )
+        return self
 
 
 class SemanticConfig(BaseModel):
     """How ``explore semantic`` reaches the semantic layer, on two axes.
 
-    ``vendor`` is which semantic-layer format answers (``dbt``/MetricFlow today).
-    It is ambient per repo, chosen once, the same rule ``connector:`` follows: a
-    repo has one semantic layer, so there is no more reason to retype the vendor
-    per command than to retype the warehouse.
+    ``vendor`` is which semantic-layer format answers: ``dbt``/MetricFlow, or
+    ``ossie`` for native Apache Ossie documents in the repository. It is
+    ambient per repo, chosen once, the same rule ``connector:`` follows: a repo
+    has one semantic layer, so there is no more reason to retype the vendor per
+    command than to retype the warehouse.
 
     ``deployment`` is which endpoint or artifact of that vendor is read. For dbt:
     ``local`` renders metric queries with MetricFlow and executes them through
     dex's own connector and cost guard, so a dbt project must be present (like
     DuckDB needs a local file); ``dbt_cloud`` sends the query to a hosted dbt Cloud
     Semantic Layer over GraphQL and needs no local project (like BigQuery needs no
-    local DuckDB).
+    local DuckDB). For Ossie there is one deployment, ``local``, because Ossie
+    specifies an interchange document rather than a service to reach.
+
+    ``ossie.files`` names those documents, relative to the repository root, and
+    is required with ``vendor: ossie`` and refused without it. It is the
+    beside-dbt route: `project.format` keeps naming dbt and the semantic
+    catalog comes from Ossie. An Ossie-only repository names
+    `project.format: ossie` instead and puts the same list in
+    `project.options.files`, which builds the same reader.
 
     A third property, **who executes**, is derived from those two and never
     configured, because it is what decides whether the cost guard can apply at
@@ -574,21 +635,48 @@ class SemanticConfig(BaseModel):
         object.__setattr__(self, "vendor", vendor)
         object.__setattr__(self, "deployment", deployment)
         object.__setattr__(self, "backend", deployment)
-        if vendor != "ossie" and self.ossie.files:
+        # A vendor whose catalog comes from a project format carries its
+        # coordinates in the section named after it, and those coordinates mean
+        # nothing under any other vendor. Driven off the table rather than
+        # written per vendor, so the next one is a row rather than three more
+        # conditions here.
+        for named, section in _vendor_sections(self):
+            if named == vendor and not section.files:
+                raise ValueError(
+                    f"semantic.vendor: {named} needs semantic.{named}.files: "
+                    "the native documents to read, named relative to the "
+                    "repository root"
+                )
+            if named != vendor and section.files:
+                raise ValueError(
+                    f"semantic.{named}.files is only valid for semantic.vendor: {named}"
+                )
+        # `host` and `environment_id` reach a hosted service, so they are
+        # meaningless for a vendor with no hosted deployment. Read off the
+        # deployment table rather than named, for the same reason.
+        if "dbt_cloud" not in allowed and (self.host or self.environment_id):
             raise ValueError(
-                "semantic.ossie.files is only valid for semantic.vendor: ossie"
-            )
-        if vendor == "ossie" and not self.ossie.files:
-            raise ValueError(
-                "semantic.vendor: ossie needs semantic.ossie.files: a list of "
-                "native .ossie.yaml/.ossie.json files relative to the repository"
-            )
-        if vendor == "ossie" and (self.host or self.environment_id):
-            raise ValueError(
-                "semantic.host and semantic.environment_id belong to the hosted "
-                "dbt semantic layer and are not valid for semantic.vendor: ossie"
+                "semantic.host and semantic.environment_id are the hosted dbt "
+                f"Cloud coordinates, and semantic.vendor: {vendor} has no "
+                f"hosted deployment (it offers {', '.join(allowed)})"
             )
         return self
+
+
+def _vendor_sections(semantic: SemanticConfig) -> list[tuple[str, Any]]:
+    """Every ``(vendor, its config section)`` pair a project format reads.
+
+    The section is the `SemanticConfig` field named after the vendor, which is
+    the convention `SEMANTIC_PROJECT_FORMATS` documents and the engine relies on
+    when it passes a section through as a format's options.
+    """
+
+    pairs = []
+    for named in SEMANTIC_PROJECT_FORMATS:
+        section = getattr(semantic, named, None)
+        if section is not None:
+            pairs.append((named, section))
+    return pairs
 
 
 class CacheConfig(BaseModel):
