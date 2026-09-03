@@ -214,7 +214,11 @@ dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: 
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
-dex maintain snapshot             -> capture/refresh the known-good baseline in .dex/snapshot.json
+dex maintain snapshot [--project-only]
+                                  -> capture/refresh the known-good baseline in .dex/snapshot.json;
+                                     --project-only re-fingerprints only project layers and carries the
+                                     existing warehouse baseline and its timestamps forward without opening
+                                     a warehouse connection
 dex maintain check                -> sweep every drift axis vs the snapshot; ranked report (read-only;
                                      two-phase on billed connectors: free axes now, one estimate for scans)
 dex maintain schema [<objects>]   -> structural drift: columns/tables added, dropped, retyped, renamed;

@@ -65,6 +65,11 @@ Offer it once at setup. It is not something to run before an ordinary command.
   also warns when the cache it pinned is thin (objects without column detail) or
   older than the profile freshness window, because either makes an "accept
   current state" only partly true.
+- `maintain snapshot --project-only` is for a project-only refactor, such as
+  moved model files or a dbt project rename. It refreshes transform and semantic
+  fingerprints without opening the warehouse, carrying the previous warehouse
+  evidence and original capture time forward instead. It requires an existing
+  snapshot and refuses connection-target flags.
 - `maintain check` is the everyday entry point: it sweeps every axis and returns
   a report ranked by blast radius. Read-only.
 - `maintain schema [<objects>]` detects **structural drift**: source columns and
