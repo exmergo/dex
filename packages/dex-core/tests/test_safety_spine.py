@@ -5649,6 +5649,162 @@ def test_a_host_supplied_semantic_token_never_crosses_the_boundary(monkeypatch):
     assert injected not in json.dumps(envelope.model_dump(mode="json"))
 
 
+# --- Native Apache Ossie is bound by the same spine as every other reader ------
+#
+# Ossie adds a second semantic-layer format and a second project format, and both
+# are new surfaces the spine had no entry for. Three families reach it. Family 3:
+# a document is authored by a human and its dataset sources are strings, so PII
+# linkage has to come from evidence rather than from a string that looks like a
+# relation. Family 5: the catalog is read from files in the repository and must
+# carry no row values. Family 3 again, in the other direction: reads are confined
+# to the repository the way writes are, or a committed config line could name any
+# file on the machine and have dex parse it into an envelope.
+
+
+def _ossie_repo(root, document_text: str) -> None:
+    from exmergo_dex_core.config import DexConfig, save_config
+
+    (root / "layer.ossie.yaml").write_text(document_text, encoding="utf-8")
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            duckdb={"path": "demo.duckdb"},
+            semantic={"vendor": "ossie", "ossie": {"files": ["layer.ossie.yaml"]}},
+        ),
+        root,
+    )
+
+
+_OSSIE_DOCUMENT = """
+version: "0.2.0.dev0"
+semantic_model:
+  - name: people
+    datasets:
+      - name: customers
+        source: demo.main.customers
+        fields:
+          - name: email
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: email
+          - name: masked_email
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: "LOWER(email)"
+      - name: leaked
+        source: "SELECT email FROM demo.main.customers"
+        fields:
+          - name: email
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: email
+"""
+
+
+def test_ossie_pii_linkage_exists_only_for_a_direct_column_on_a_real_relation(
+    tmp_path,
+):
+    """The PII gate resolves a token to a profiled column and reads that
+    column's evidence, so a wrong link is worse than no link: it screens the
+    wrong column and reports the verdict as evidence-backed.
+
+    Two ways an Ossie document can produce one. A computed expression has no
+    single column behind it, and a query-valued source is a SQL string that
+    would otherwise reach the gate as a relation that does not exist.
+    """
+
+    from exmergo_dex_core.engine import DexEngine
+
+    _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
+    view = (
+        DexEngine.from_repo(str(tmp_path)).semantic_catalog_format().semantic_catalog()
+    )
+
+    assert view.physical_columns == {
+        "customers__email": ("demo.main.customers", "email")
+    }, view.physical_columns
+
+
+def test_the_ossie_catalog_carries_no_row_values_and_no_credentials(tmp_path):
+    from exmergo_dex_core.engine import DexEngine
+
+    _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
+    engine = DexEngine.from_repo(str(tmp_path))
+
+    envelope = to_envelope(engine.semantic_list())
+    env.sanitize(envelope)  # a secret-like key would hard-fail here
+    payload = envelope.model_dump(mode="json")
+
+    assert payload["status"] == "ok"
+    assert payload["data"]["vendor"] == "ossie"
+    assert "physical_columns" not in json.dumps(payload), (
+        "the PII gate's lookup table maps a token to a relation and column; it "
+        "is not the caller's to read and putting it in the payload would ship "
+        "the layer's whole physical addressing to agent context"
+    )
+
+
+def test_ossie_reads_are_confined_to_the_repository(tmp_path):
+    """Reads are confined the way writes are. Without it a committed config
+    line naming `../../secrets.ossie.yaml` would have dex parse it, and what it
+    parsed would reach an envelope.
+    """
+
+    from pydantic import ValidationError
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.ossie import OssieProject
+
+    outside = tmp_path.parent / "escape.ossie.yaml"
+    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Refused where it is written, so a bad config line never becomes a read.
+    with pytest.raises(ValidationError, match="inside the repository"):
+        DexConfig(
+            semantic={
+                "vendor": "ossie",
+                "ossie": {"files": ["../escape.ossie.yaml"]},
+            }
+        )
+
+    # And refused again at the read, because the format is also reachable from a
+    # caller that built its coordinates without going through config at all.
+    # Confinement is a safety property, so it is checked where the file is
+    # opened rather than only where the path is written.
+    escaping = OssieProject(repo, ["../escape.ossie.yaml"], connector="duckdb")
+    definitions = escaping.definitions()
+
+    assert definitions.model_relations == {}
+    assert any("outside the repository" in note for note in definitions.notes)
+
+
+def test_ossie_never_executes_a_metric_query_it_cannot_price(tmp_path):
+    """Guardrail 4 in its strongest form: there is no runtime to price.
+
+    Ossie specifies no filter grammar, no join planning, and no execution
+    semantics, so a rendered statement would be dex inventing them and
+    attributing them to the document's author. The refusal is the guard.
+    """
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.explore.semantic import (
+        SemanticBackendError,
+        SemanticQuery,
+        resolve_backend,
+    )
+
+    _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
+    backend = resolve_backend(DexEngine.from_repo(str(tmp_path)))
+
+    with pytest.raises(SemanticBackendError, match="not a portable query runtime"):
+        backend.query(SemanticQuery(metrics=["anything"]))
+
+
 # --- The programmatic API is bound by the same spine as the CLI ----------------
 #
 # Every guard above was written when the only way in was a subcommand. The engine
