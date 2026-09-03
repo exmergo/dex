@@ -9,7 +9,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
-## [1.9.2] - 2026-09-02
+### Added
 
 - **Native Apache Ossie semantic models are readable, as a project format rather
   than a set of vendor branches** ([#405], [#406], [#407]). `semantic.vendor:
@@ -68,6 +68,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   hatch `MetricInfo` already had, so a format's dialect spellings and authored AI
   context have a declared home instead of being dropped or smuggled into a
   neighbouring field.
+
+## [1.9.2] - 2026-09-02
 
 ### Added
 
