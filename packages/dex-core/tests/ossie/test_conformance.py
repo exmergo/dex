@@ -7,9 +7,11 @@ also means a later change to the contract reaches this format automatically,
 which is exactly what a format built as the second implementation of a seam
 needs.
 
-The tier contracts stop at tier 1 on purpose. Subclassing a wider contract than
-the format implements is how you find out you have not finished, so the narrow
-class is a feature.
+The tier contracts stop where the format's own implementation does. Subclassing
+a wider contract than the format implements is how you find out you have not
+finished, so a narrow class is a feature: `TestOssieProject` now reaches tier 2
+(#409), and stops there rather than also mixing in the tier-3 write contract,
+which Ossie does not implement.
 """
 
 from __future__ import annotations
@@ -20,9 +22,10 @@ import pytest
 
 from exmergo_dex_core.adapters.conformance import (
     DeclaringProjectContract,
-    ExploreProjectContract,
+    MaintainProjectContract,
     ProjectFactoryContract,
     SemanticCatalogContract,
+    SemanticProjectContract,
 )
 from exmergo_dex_core.adapters.project import ExploreProject, ProjectContext
 from exmergo_dex_core.explore.semantic.conformance import SemanticBackendContract
@@ -46,9 +49,12 @@ def _declaring(root: Path, name: str, doc) -> OssieProject:
 
 
 class TestOssieProject(
-    ProjectFactoryContract, DeclaringProjectContract, ExploreProjectContract
+    ProjectFactoryContract,
+    DeclaringProjectContract,
+    MaintainProjectContract,
+    SemanticProjectContract,
 ):
-    """Tier 1, the factory, and the declarations dex reads a project *for*."""
+    """Tier 1 and 2, the factory, and the declarations dex reads a project *for*."""
 
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path) -> None:
@@ -188,6 +194,34 @@ class TestOssieProject(
             "buyer_ref",
             "s.customers",
             "customer_id",
+        )
+
+    def a_project_declaring_a_semantic_model(self):
+        """One direct field and one computed, so the snapshot's column mapping
+        is asserted in both directions, the same reason the catalog hook one
+        section over uses the same shape."""
+
+        project = _declaring(
+            self.root,
+            "snapshot.ossie.yaml",
+            document(
+                model(
+                    "snap",
+                    dataset(
+                        "orders",
+                        "demo.main.orders",
+                        field("order_id"),
+                        field("net_total", "order_total - discount"),
+                        primary_key=["order_id"],
+                    ),
+                )
+            ),
+        )
+        return (
+            project,
+            "snap.orders",
+            {"order_id": "order_id", "net_total": None},
+            {},
         )
 
     def a_project_declaring_a_composite_key(self):

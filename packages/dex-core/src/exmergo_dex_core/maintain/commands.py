@@ -52,6 +52,7 @@ from .results import (
 )
 
 if TYPE_CHECKING:
+    from ..adapters.project import MaintainProject
     from ..engine import DexEngine
     from .snapshot import SemanticLayer, TransformLayer
 
@@ -76,10 +77,14 @@ def _read_layers(
 ) -> tuple[TransformLayer | None, SemanticLayer | None, str | None]:
     """The current project's snapshot layers, or why there are none.
 
-    Returns ``(transform, semantic, reason)``. ``reason`` is ``None`` on success
-    and otherwise a clause each command folds into its own warning, so the four
-    detection commands share one definition of "read the project" while keeping
-    the sentence that says what *this* command loses without it.
+    Returns ``(transform, semantic, reason)``. ``reason`` describes why the
+    layer ``semantic`` actually asked for is unavailable (the transform half
+    when ``semantic=False``, otherwise the semantic half), which is what each
+    command's warning names and what ``check`` gates its semantic axis on. It
+    is ``None`` whenever that layer is present, even if the *other* one is
+    not: the two are read independently (#409), so a repository whose
+    semantic vendor answers on its own is not blocked by a transformation
+    project neither it nor that vendor needs.
 
     ``semantic=False`` skips the second layer rather than reading and discarding
     it. `maintain schema` needs only the transform half, and on the dbt format
@@ -95,15 +100,68 @@ def _read_layers(
     same reason ``definitions()`` may not raise.
     """
 
+    project: MaintainProject | None = None
+    transform: TransformLayer | None = None
+    transform_reason: str | None = None
     try:
         project = engine.maintain_project()
         if project is None:
-            return None, None, engine.project_tier_note()
-        transform = project.transform_layer()
-        current = project.semantic_layer() if semantic else None
+            transform_reason = engine.project_tier_note()
+        else:
+            transform = project.transform_layer()
     except (ProjectError, RepoRootRequiredError, ValidationError) as exc:
-        return None, None, str(exc)
-    return transform, current, None
+        transform_reason = str(exc)
+
+    if not semantic:
+        return transform, None, transform_reason
+
+    current: SemanticLayer | None = None
+    semantic_reason: str | None = None
+    try:
+        current = _semantic_layer(engine, project)
+    except (ProjectError, RepoRootRequiredError, ValidationError) as exc:
+        semantic_reason = str(exc)
+
+    # `semantic_reason` names why the semantic-vendor substitute (#409) came
+    # back empty; when there was none to try, `transform_reason` is the only
+    # explanation on hand (the same project answered, or failed to build,
+    # for both), and a caller must still see *some* reason rather than a
+    # blank one that reads as success.
+    reason = (semantic_reason or transform_reason) if current is None else None
+    return transform, current, reason
+
+
+def _semantic_layer(
+    engine: DexEngine, project: MaintainProject | None
+) -> SemanticLayer | None:
+    """The semantic-axis snapshot, from whichever format answers it (#409).
+
+    Usually ``project`` itself: the semantic vendor defaults to dbt, the same
+    format ``transform_layer()`` just came from. A repository that configures
+    a different semantic vendor beside it (``semantic.vendor: ossie``) gets
+    that format's own fingerprint instead, through the identical seam
+    ``_semantic_catalog`` already reads on the explore side for #408, rather
+    than a second, vendor-specific snapshot section: a table lookup against
+    ``SEMANTIC_PROJECT_FORMATS``, not a name check on which vendor is
+    configured.
+
+    Read independently of ``project``, which may be ``None`` or may have
+    failed to build its own transform layer: a repository with no dbt project
+    at all and ``semantic.vendor: ossie`` still gets a semantic baseline, even
+    though the transform half has nothing to answer with.
+    """
+
+    from ..adapters.project import MaintainProject as _MaintainProject
+    from ..config import SEMANTIC_PROJECT_FORMATS
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor in SEMANTIC_PROJECT_FORMATS:
+        semantic_format = engine.semantic_catalog_format()
+        if isinstance(semantic_format, _MaintainProject):
+            return semantic_format.semantic_layer()
+    if project is None:
+        return None
+    return project.semantic_layer()
 
 
 class NoBaselineError(PrerequisiteError):

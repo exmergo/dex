@@ -172,16 +172,29 @@ class SemanticModelDef(BaseModel):
     dangling-ref finding. ``path`` is ``None`` on the same principle: it is
     provenance carried on the ``definition_changed`` finding, absent for a format
     whose definitions are objects rather than files, and never opened.
+
+    ``relation`` and ``keys`` are additive, #409 fields (empty/``None`` for
+    every baseline pinned before this field existed, and for dbt, which has no
+    populated analogue for either): a format whose semantic model *is* a
+    direct relation reference, rather than a name a transformation project
+    later builds, records that relation here so drift can match it straight
+    against the warehouse without a ``model_ref``. ``keys`` is every column
+    combination the format declares independently unique, one list per
+    declaration regardless of arity, so a single-column and a composite key
+    are recorded the same way instead of one being disguised as several
+    single ones.
     """
 
     name: str
     path: str | None = None
     content_sha256: str
     model_ref: str | None = None
+    relation: str | None = None
     entities: dict[str, str | None] = Field(default_factory=dict)
     dimensions: dict[str, str | None] = Field(default_factory=dict)
     categorical_dimensions: dict[str, str] = Field(default_factory=dict)
     measures: dict[str, str | None] = Field(default_factory=dict)
+    keys: list[list[str]] = Field(default_factory=list)
 
     def referenced_columns(self) -> set[str]:
         return {
@@ -189,19 +202,19 @@ class SemanticModelDef(BaseModel):
             for mapping in (self.entities, self.dimensions, self.measures)
             for column in mapping.values()
             if column is not None
-        }
+        } | {column for combo in self.keys for column in combo}
 
     def structural_columns(self) -> set[str]:
-        """Columns whose loss breaks the model as a whole (entities and
-        dimensions), as opposed to a measure column that breaks only the
-        measures on it."""
+        """Columns whose loss breaks the model as a whole (entities,
+        dimensions, and declared keys), as opposed to a measure column that
+        breaks only the measures on it."""
 
         return {
             column
             for mapping in (self.entities, self.dimensions)
             for column in mapping.values()
             if column is not None
-        }
+        } | {column for combo in self.keys for column in combo}
 
 
 class MetricDef(BaseModel):
@@ -220,6 +233,31 @@ class MetricDef(BaseModel):
     input_metrics: list[str] = Field(default_factory=list)
 
 
+class RelationshipDef(BaseModel):
+    """One declared join between two semantic models, with its full ordered
+    column pairs (#409).
+
+    Composite and single-column joins are recorded the same way: dropping a
+    pair's second column here would be the exact partial-edge risk #408
+    refused at the read-catalog layer, one level down. It sits beside
+    :class:`SemanticModelDef` rather than on it because a join names two
+    models, not one.
+
+    ``name`` is never ``None``: a format whose declarations are themselves
+    unnamed (Ossie's relationships are optional to name) synthesizes a stable
+    one from the endpoints and columns, because this is the identity
+    ``semantic_free_drift`` diffs added/removed/changed by, and an identity
+    that is absent for some rows would silently exclude them from that diff.
+    """
+
+    name: str
+    path: str | None = None
+    content_sha256: str
+    model: str
+    to_model: str
+    column_pairs: list[tuple[str, str]] = Field(default_factory=list)
+
+
 class SemanticLayerSnapshot(BaseModel):
     """The semantic layer's fingerprint: every named definition the project holds.
 
@@ -227,10 +265,26 @@ class SemanticLayerSnapshot(BaseModel):
     same reason: this is a return type a non-dbt project format fills in, and a
     layer that is narrower than a dbt one needs somewhere to say so that travels
     with the value rather than sitting beside it.
+
+    ``relationships_and_keys_captured`` is #409's answer to the hazard its own
+    fields create: ``relationships`` and every ``SemanticModelDef.keys`` entry
+    are additive fields a baseline pinned before they existed carries empty,
+    and empty there is indistinguishable from "this layer declares no
+    relationships or keys" -- which would read as a clean bill rather than as
+    "not checked". This flag is what ``semantic_free_drift`` reads instead of
+    trusting the emptiness: ``False`` (the default, so an old baseline and a
+    format that has never populated these -- dbt included, which has no
+    composite-relationship or multi-column-key concept at the semantic-model
+    level -- both land here) skips every relationship/key finding rather than
+    reporting false drift or a false clean bill; only a layer that set it
+    ``True`` on both sides of a comparison is one the two new checks run
+    against.
     """
 
     semantic_models: list[SemanticModelDef] = Field(default_factory=list)
     metrics: list[MetricDef] = Field(default_factory=list)
+    relationships: list[RelationshipDef] = Field(default_factory=list)
+    relationships_and_keys_captured: bool = False
     notes: list[str] = Field(default_factory=list)
 
 
