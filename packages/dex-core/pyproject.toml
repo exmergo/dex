@@ -121,6 +121,16 @@ semantic = ["metricflow>=0.211,<0.212", "exmergo-dex-core[sql]"]
 # dbt Cloud owns the warehouse connection and executes server-side, so a
 # pure-remote user (no local dbt project) installs only this.
 semantic-api = ["httpx>=0.27"]
+# Native Apache Ossie documents (`semantic.vendor: ossie`, `project.format:
+# ossie`). One dependency: a Draft 2020-12 JSON Schema validator, used against
+# the Ossie schema dex vendors and pins by content hash. Deliberately does NOT
+# self-reference [sql]: structure and integrity validation are the layers that
+# decide whether a document is readable at all, and they are pure. Expression
+# syntax checking is the third layer and rides on [sql], which every connector
+# extra already brings; absent, it degrades to a named skipped-validation note
+# and never to a silent pass. 4.26 is upstream Ossie's own declared floor for
+# its validator, so dex validates against what upstream validates against.
+ossie = ["jsonschema>=4.26"]
 # k-means clustering (`explore cluster`). scikit-learn pulls numpy and scipy, so
 # it is deliberately NOT a base dependency: the light default and the [duckdb]
 # on-ramp stay lean, and this extra is installed only when clustering is actually
@@ -175,13 +185,13 @@ semantic-conformance = ["pytest>=8"]
 # This is the heaviest install there is (seven dbt adapters, MetricFlow, and
 # scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
 all = [
-  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,postgres,redshift,semantic,semantic-api,snowflake,sql]",
+  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,ossie,postgres,redshift,semantic,semantic-api,snowflake,sql]",
 ]
 # Contributor tooling, plus the optional libraries the suite exercises directly
 # (the clustering tests need scikit-learn, the firewall tests need the dialect
-# engine), so `uv sync --extra dev` runs the whole suite without also picking a
-# connector.
-dev = ["ruff==0.15.19", "scikit-learn>=1.4", "exmergo-dex-core[sql,storage-conformance]"]
+# engine, the Ossie tests need the schema validator), so `uv sync --extra dev`
+# runs the whole suite without also picking a connector.
+dev = ["ruff==0.15.19", "scikit-learn>=1.4", "exmergo-dex-core[ossie,sql,storage-conformance]"]
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"
