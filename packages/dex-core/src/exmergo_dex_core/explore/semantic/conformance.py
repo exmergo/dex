@@ -360,6 +360,10 @@ _DECLARED_FIELDS: dict[str, tuple[str, ...]] = {
         "queryable_granularities",
         "column",
     ),
+    # `vendor_params` is deliberately absent from every kind above. It is the
+    # declared escape hatch for what one format states and the portable model has
+    # no field for, so the reference layer cannot declare it and a backend that
+    # does not fill it is not leaving a portable field unanswered.
     "entities": ("name", "type", "label", "description", "roles"),
     "measures": (
         "name",
