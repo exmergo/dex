@@ -220,7 +220,7 @@ class MetricDef(BaseModel):
     input_metrics: list[str] = Field(default_factory=list)
 
 
-class SemanticLayer(BaseModel):
+class SemanticLayerSnapshot(BaseModel):
     """The semantic layer's fingerprint: every named definition the project holds.
 
     ``notes`` carries the same meaning as on :class:`TransformLayer`, and for the
@@ -250,7 +250,7 @@ class Snapshot(BaseModel):
     warehouse_from: str = "cache"
     cache_updated_at: str | None = None
     transform_layer: TransformLayer | None = None
-    semantic_layer: SemanticLayer | None = None
+    semantic_layer: SemanticLayerSnapshot | None = None
 
 
 def warehouse_from_cache(cache: DexCache) -> WarehouseBaseline:
@@ -356,7 +356,7 @@ def transform_layer(view: DbtProjectView) -> TransformLayer:
     )
 
 
-def semantic_layer(view: DbtProjectView) -> SemanticLayer:
+def semantic_layer_snapshot(view: DbtProjectView) -> SemanticLayerSnapshot:
     """Fingerprint the semantic layer from the project's YAML files."""
 
     semantic_models: list[SemanticModelDef] = []
@@ -366,7 +366,12 @@ def semantic_layer(view: DbtProjectView) -> SemanticLayer:
             semantic_models.append(_semantic_model_def(entry, path))
         else:
             metrics.append(_metric_def(entry, path))
-    return SemanticLayer(semantic_models=semantic_models, metrics=metrics)
+    return SemanticLayerSnapshot(semantic_models=semantic_models, metrics=metrics)
+
+
+# RETRO: Compatibility names: the JSON field is intentionally still `semantic_layer`.
+SemanticLayer = SemanticLayerSnapshot
+semantic_layer = semantic_layer_snapshot
 
 
 # --- helpers -----------------------------------------------------------------
