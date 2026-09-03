@@ -102,6 +102,7 @@ _EXPORTS = {
     "Result": "results",
     "ScopeError": "connect",
     "SemanticBackendError": "explore.semantic",
+    "SemanticLayerError": "explore.semantic",
     "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
     "SessionCeilingDecisionRequiredError": "guards.cost_guard",
@@ -155,6 +156,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .explore.diagram import MermaidDiagram, render_er_mermaid
     from .explore.semantic import (
         SemanticBackendError,
+        SemanticLayerError,
         SemanticQueryRefusedError,
     )
     from .guards.cost_guard import (
@@ -252,6 +254,7 @@ __all__ = [
     "Result",
     "ScopeError",
     "SemanticBackendError",
+    "SemanticLayerError",
     "SemanticQueryRefusedError",
     "SemanticSource",
     "SessionCeilingDecisionRequiredError",

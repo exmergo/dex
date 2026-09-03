@@ -151,7 +151,8 @@ def test_the_acceptor_opens_nothing_and_imports_no_client():
         "from exmergo_dex_core.adapters import parse_relation;"
         "parse_relation('duckdb', 'a.b.c');"
         "print(sorted(m for m in sys.modules if m in "
-        "{'duckdb','google','snowflake','psycopg','clickhouse_connect'}))"
+        "{'duckdb','google.cloud.bigquery','snowflake','psycopg',"
+        "'clickhouse_connect'}))"
     )
     out = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True

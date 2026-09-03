@@ -1032,8 +1032,8 @@ def test_probe_statements_and_verify_cover_the_same_set():
     # A composite is probed as the full ordered tuple, never as its first pair.
     assert [len(r.from_columns) for r in candidates] == [1, 1, 2]
     composite_sql = probe_statements(mixed, "duckdb")[-1]
-    assert 'd.pk0 = c."order_id"' in composite_sql
-    assert 'd.pk1 = c."line_no"' in composite_sql
+    assert 'd2.pk0 = c."order_id"' in composite_sql
+    assert 'd2.pk1 = c."line_no"' in composite_sql
     assert {r.kind for r in candidates} == {
         RelationshipKind.INFERRED,
         RelationshipKind.DECLARED,

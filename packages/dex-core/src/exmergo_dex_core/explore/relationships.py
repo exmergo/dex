@@ -538,14 +538,10 @@ def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
     the measurement is *allowed to change* still depends on the kind: see
     :func:`verify_relationships` on confidence.
 
-    A composite join is excluded, and the exclusion is load-bearing rather than
-    an oversight. :func:`_batched_probe_sql` joins on ``from_columns[0]``
-    and ``to_columns[0]`` only, which was total coverage while inference was the
-    sole source (it emits single-column edges by construction) and stops being
-    so now that declared edges qualify. Probing the first column of a composite
-    key measures a different relationship than the one declared and would
-    report its orphan count as though it were the join's: silently wrong beats
-    unmeasured, so these stay unverified until the probe itself spans a key.
+    Composite joins are included only when they carry equal, non-empty column
+    lists. :func:`_batched_probe_sql` joins every ordered pair as one tuple;
+    probing only the first pair would measure a different relationship and is
+    never an allowed fallback.
     """
 
     return [
@@ -717,17 +713,24 @@ def _batched_probe_sql(batch: list[Relationship]) -> str:
     for child, edges in by_child.items():
         counts, joins = [], []
         for index, rel in edges:
-            fk = _quote_part(rel.from_columns[0])
-            key = _quote_part(rel.to_columns[0])
+            fks = [_quote_part(column) for column in rel.from_columns]
+            keys = [_quote_part(column) for column in rel.to_columns]
             parent = _quote_identifier(rel.to_dataset)
+            nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
+            parent_keys = ", ".join(
+                f"{key} AS pk{pair_index}" for pair_index, key in enumerate(keys)
+            )
+            predicate = " AND ".join(
+                f"d{index}.pk{pair_index} = c.{fk}" for pair_index, fk in enumerate(fks)
+            )
             counts.append(
-                f"COUNT(c.{fk}) AS nonnull_fk_{index}, "
-                f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d{index}.pk IS NULL "
+                f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS nonnull_fk_{index}, "
+                f"COUNT(CASE WHEN {nonnull} AND d{index}.pk0 IS NULL "
                 f"THEN 1 END) AS orphans_{index}"
             )
             joins.append(
-                f"LEFT JOIN (SELECT DISTINCT {key} AS pk FROM {parent}) "  # noqa: S608
-                f"d{index} ON d{index}.pk = c.{fk}"
+                f"LEFT JOIN (SELECT DISTINCT {parent_keys} FROM {parent}) "  # noqa: S608
+                f"d{index} ON {predicate}"
             )
         aggregates.append(
             f"SELECT {', '.join(counts)} "  # noqa: S608

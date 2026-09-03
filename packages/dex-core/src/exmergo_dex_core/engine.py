@@ -923,6 +923,7 @@ class DexEngine:
         infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
+        use_hosted_semantic_layer: bool = False,
     ) -> RelationshipsResult:
         from .explore import commands as explore
 
@@ -932,6 +933,7 @@ class DexEngine:
             infer_by_overlap=infer_by_overlap,
             refresh=refresh,
             use_project=use_project,
+            use_hosted_semantic_layer=use_hosted_semantic_layer,
         )
 
     def map(
@@ -943,6 +945,7 @@ class DexEngine:
         infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
+        use_hosted_semantic_layer: bool = False,
     ) -> MapResult:
         from .explore import commands as explore
 
@@ -954,6 +957,7 @@ class DexEngine:
             verify=verify,
             refresh=refresh,
             use_project=use_project,
+            use_hosted_semantic_layer=use_hosted_semantic_layer,
         )
 
     def query(self, sql: str, *, auto_profile: bool | None = None) -> QueryResult:
