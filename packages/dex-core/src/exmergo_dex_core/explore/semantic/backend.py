@@ -68,6 +68,19 @@ class SemanticLayer(Protocol):
         """Native full-pair declarations, or an empty list when unavailable."""
         ...
 
+    def declared_keys(self) -> tuple[list[Any], list[Any]]:
+        """Dataset keys this layer declares itself, as ``(keys, composite_keys)``.
+
+        Empty for a layer whose declared keys already reach the grain channel
+        through the transformation project's own tier-1 ``definitions()`` (dbt):
+        stating them here too would risk a caller double-counting rather than
+        ever adding information. Non-empty only for a layer that is itself the
+        sole declaration channel for its repository, such as native Ossie
+        documents, which are never a transformation project and so have no
+        other route to grain detection.
+        """
+        ...
+
 
 def descriptor_from_backend(backend: Any) -> BackendDescriptor:
     """Read a descriptor, including compatibility for narrow test doubles."""

@@ -277,9 +277,19 @@ def _edge_label(rel: Relationship) -> str:
     layer's shared entity. A reader looking at a solid line otherwise has no way to
     tell a foreign-key test from a declared join the semantic layer performs, and
     the entity name is the handle for looking the second one up.
+
+    The key names every pair when there is more than one (a composite join) or
+    when the two sides are spelled differently, so a reader is never left
+    matching two unpaired lists by position; a single pair sharing one name on
+    both sides (the common case) still reads as that bare name.
     """
 
-    parts = [", ".join(rel.from_columns) or "join", rel.kind.value]
+    pairs = list(zip(rel.from_columns, rel.to_columns, strict=False))
+    if len(pairs) == 1 and pairs[0][0] == pairs[0][1]:
+        key = pairs[0][0] or "join"
+    else:
+        key = ", ".join(f"{frm} = {to}" for frm, to in pairs) or "join"
+    parts = [key, rel.kind.value]
     if rel.kind is not RelationshipKind.DECLARED and rel.confidence is not None:
         parts[-1] = f"{rel.kind.value} {rel.confidence:.2f}"
     if rel.declared_by:

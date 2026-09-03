@@ -25,8 +25,10 @@ from exmergo_dex_core.config import EntityAffixes
 from exmergo_dex_core.dbt_project import DeclaredForeignKey, ProjectDefinitions
 from exmergo_dex_core.explore.commands import (
     _carry_forward_relationships,
+    _declared_relationship_conflicts,
     _fold_semantic_edges,
     _merge_relationships,
+    _relationship_conflict_notes,
     _semantic_join_notes,
 )
 from exmergo_dex_core.explore.profile import profile
@@ -2012,6 +2014,120 @@ def test_a_semantic_edge_the_project_already_declares_is_counted_once():
     # The relationships test's edge stands; the semantic channel adds nothing it
     # did not already say.
     assert merged[0].declared_by is None
+
+
+# --- declared relationship conflicts (#408) -------------------------------------
+
+
+def test_conflicting_declarations_over_the_same_endpoints_are_both_kept_and_flagged():
+    """A relationships test and the semantic layer's shared entity name the same
+    two datasets but disagree on which column joins them: dex never picks a
+    winner, so both edges survive and the disagreement is named rather than
+    one silently overwriting or merging with the other."""
+
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["customer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declaration_sources=["relationships test orders.customer_id"],
+    )
+    semantic, _ = semantic_relationships(
+        [_join(child_column="buyer_id")], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, already = _fold_semantic_edges([declared], semantic)
+    conflicts = _declared_relationship_conflicts(merged)
+
+    assert already == 0
+    assert len(merged) == 2, "neither declaration wins; both edges survive"
+    assert len(conflicts) == 1
+    conflict = conflicts[0]
+    assert conflict.from_dataset == "wh.main.orders"
+    assert conflict.to_dataset == "wh.main.customers"
+    pairs = {tuple(tuple(p) for p in d.column_pairs) for d in conflict.declarations}
+    assert pairs == {(("customer_id", "id"),), (("buyer_id", "id"),)}
+    sources = {d.source for d in conflict.declarations}
+    assert "relationships test orders.customer_id" in sources
+    assert any("customer" in s for s in sources)  # the semantic entity's name
+
+
+def test_agreeing_declarations_over_the_same_endpoints_are_not_a_conflict():
+    declared = Relationship(
+        from_dataset="wh.main.orders",
+        from_columns=["buyer_id"],
+        to_dataset="wh.main.customers",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    merged, _already = _fold_semantic_edges([declared], semantic)
+
+    assert _declared_relationship_conflicts(merged) == []
+
+
+def test_a_composite_conflict_carries_every_column_pair():
+    declared = Relationship(
+        from_dataset="wh.main.order_lines",
+        from_columns=["product_id"],
+        to_dataset="wh.main.products",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declaration_sources=["relationships test order_lines.product_id"],
+    )
+    composite = Relationship(
+        from_dataset="wh.main.order_lines",
+        from_columns=["product_id", "variant_id"],
+        to_dataset="wh.main.products",
+        to_columns=["id", "variant_id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+        declaration_sources=["native relationship 'order_lines_to_products'"],
+    )
+
+    (conflict,) = _declared_relationship_conflicts([declared, composite])
+
+    by_pairs = {tuple(tuple(p) for p in d.column_pairs): d for d in conflict.declarations}
+    assert (("product_id", "id"),) in by_pairs
+    assert (("product_id", "id"), ("variant_id", "variant_id")) in by_pairs
+
+
+def test_conflict_notes_name_the_endpoints_and_point_at_the_structured_field():
+    conflicts = _declared_relationship_conflicts(
+        [
+            Relationship(
+                from_dataset="wh.main.orders",
+                from_columns=["customer_id"],
+                to_dataset="wh.main.customers",
+                to_columns=["id"],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+            ),
+            Relationship(
+                from_dataset="wh.main.orders",
+                from_columns=["buyer_id"],
+                to_dataset="wh.main.customers",
+                to_columns=["id"],
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+            ),
+        ]
+    )
+
+    (note,) = _relationship_conflict_notes(conflicts)
+    assert "wh.main.orders -> wh.main.customers" in note
+    assert "data.conflicts" in note
+
+
+def test_no_conflict_notes_when_nothing_disagrees():
+    assert _relationship_conflict_notes([]) == []
 
 
 def test_the_notes_name_what_inference_would_have_missed():

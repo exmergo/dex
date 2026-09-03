@@ -218,6 +218,50 @@ def test_the_edge_label_states_the_kind_the_confidence_and_the_verification():
     )
 
 
+def test_a_composite_edge_label_pairs_every_column_rather_than_two_lists():
+    """A composite join's label used to join only `from_columns`, dropping the
+    parent side entirely: `product_id, variant_id` with no way to tell which
+    parent column each one pairs with. It now names every pair (#408)."""
+
+    products = _ds(
+        "shop.main.products",
+        [_col("id", is_unique=True), _col("variant_id")],
+        candidate_keys=[["id", "variant_id"]],
+        grain=["id", "variant_id"],
+    )
+    order_lines = _ds(
+        "shop.main.order_lines",
+        [_col("product_id"), _col("variant_id")],
+    )
+    rel = _rel(
+        "shop.main.order_lines",
+        ["product_id", "variant_id"],
+        "shop.main.products",
+        ["id", "variant_id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    rendered = render_er_mermaid(_cache([products, order_lines], [rel]))
+    assert _edge_line(rendered.mermaid).endswith(
+        ': "product_id = id, variant_id = variant_id, declared"'
+    )
+
+
+def test_a_single_pair_with_differing_names_is_also_paired():
+    rel = _rel(
+        "shop.main.orders",
+        ["cust_id"],
+        "shop.main.customers",
+        ["id"],
+        kind=RelationshipKind.DECLARED,
+        confidence=1.0,
+    )
+    customers = _ds("shop.main.customers", [_col("id", is_unique=True)])
+    orders = _ds("shop.main.orders", [_col("cust_id")])
+    rendered = render_er_mermaid(_cache([customers, orders], [rel]))
+    assert _edge_line(rendered.mermaid).endswith(': "cust_id = id, declared"')
+
+
 # --- what never crosses into the diagram --------------------------------------
 
 
