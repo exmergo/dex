@@ -504,6 +504,9 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "semantic":
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
+                    # The per-definition payload: name only what changes, and the
+                    # engine writes it into the file that holds it.
+                    sp.add_argument("--definitions-file", default=None)
                     sp.add_argument("--no-parse", action="store_true", default=False)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.

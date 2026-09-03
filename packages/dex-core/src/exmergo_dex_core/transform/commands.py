@@ -51,6 +51,7 @@ from .results import (
     PropagationResult,
     TestScaffoldResult,
 )
+from .validate import EditValidationError
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -1003,7 +1004,12 @@ def cmd_deps(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def semantic_define(
-    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+    engine: DexEngine,
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    definitions: list[semantic_mod.DefinitionEdit] | None = None,
+    no_parse: bool = False,
 ) -> PlanResult:
     """Author new semantic definitions (entities, dimensions, measures, metrics).
 
@@ -1011,11 +1017,18 @@ def semantic_define(
     caught rather than applied; use :func:`semantic_update` to evolve one.
     """
 
-    return _semantic_plan(engine, intent, edits, mode="define", no_parse=no_parse)
+    return _semantic_plan(
+        engine, intent, edits, mode="define", definitions=definitions, no_parse=no_parse
+    )
 
 
 def semantic_update(
-    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+    engine: DexEngine,
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    definitions: list[semantic_mod.DefinitionEdit] | None = None,
+    no_parse: bool = False,
 ) -> PlanResult:
     """Evolve existing semantic definitions.
 
@@ -1023,17 +1036,27 @@ def semantic_update(
     already have, so a typo does not silently create a second definition.
     """
 
-    return _semantic_plan(engine, intent, edits, mode="update", no_parse=no_parse)
+    return _semantic_plan(
+        engine, intent, edits, mode="update", definitions=definitions, no_parse=no_parse
+    )
 
 
 def semantic_plan(
-    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+    engine: DexEngine,
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    definitions: list[semantic_mod.DefinitionEdit] | None = None,
+    no_parse: bool = False,
 ) -> PlanResult:
     """Mixed-intent semantic authoring: one payload may evolve existing
     definitions and add the new ones they depend on; each name is classified
-    as defined or updated instead of the whole payload being refused."""
+    as defined, updated, or unchanged instead of the whole payload being
+    refused."""
 
-    return _semantic_plan(engine, intent, edits, mode="plan", no_parse=no_parse)
+    return _semantic_plan(
+        engine, intent, edits, mode="plan", definitions=definitions, no_parse=no_parse
+    )
 
 
 # Mode to the public function that owns it. The shims dispatch through this
@@ -1068,8 +1091,13 @@ def _semantic_envelope(
             _edits_from_payload(
                 getattr(args, "edits_file", None), default_kind=EditKind.SEMANTIC_YML
             ),
+            definitions=_definitions_from_payload(
+                getattr(args, "definitions_file", None)
+            ),
             no_parse=bool(getattr(args, "no_parse", False)),
         )
+    except EditValidationError as exc:
+        return env.error_for(exc)
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
@@ -1469,12 +1497,38 @@ def _semantic_plan(
     edits: list[PlanEdit],
     *,
     mode: str,
+    definitions: list[semantic_mod.DefinitionEdit] | None = None,
     no_parse: bool = False,
 ) -> PlanResult:
+    from ..dbt_project import load as load_project
+
+    project = engine.project_dir()
+    view = load_project(project)
+
+    if definitions and edits:
+        raise ValueError(
+            f"semantic {mode} takes one payload: whole files (--edits-file) or "
+            "definitions (--definitions-file), not both"
+        )
+    # What the caller named, when they named definitions rather than files. The
+    # classification is narrowed to it: a spliced file carries every definition
+    # it already held, and those were not part of this change.
+    scope: set[semantic_mod.DefinitionKey] | None = None
+    if definitions:
+        # Lowered to the whole-file unit before anything else looks at them, so
+        # the validation, classification, parse gate, and plan store below stay
+        # on one code path regardless of how the caller expressed the change.
+        edits = [
+            PlanEdit(path=path, kind=EditKind.SEMANTIC_YML, new_content=content)
+            for path, content in semantic_mod.splice_definitions(definitions, view)
+        ]
+        scope = {(d.kind, d.name) for d in definitions}
+
     if not edits:
         raise ValueError(
-            f"semantic {mode} needs content: pass --edits-file <path|-> with the "
-            "authored dbt semantic YAML"
+            f"semantic {mode} needs content: pass --edits-file <path|-> with whole "
+            "semantic YAML files, or --definitions-file <path|-> with the "
+            "individual definitions to write"
         )
     non_semantic = [e.path for e in edits if e.kind is not EditKind.SEMANTIC_YML]
     if non_semantic:
@@ -1489,12 +1543,9 @@ def _semantic_plan(
             "semantic YAML with `transform plan` instead, for: " + ", ".join(deletions)
         )
 
-    from ..dbt_project import load as load_project
-
-    project = engine.project_dir()
-    view = load_project(project)
-    parsed_edits = [yaml.safe_load(e.new_content) for e in edits]
-    classification = semantic_mod.check_mode(mode, parsed_edits, view)
+    parsed_by_path = [(e.path, yaml.safe_load(e.new_content)) for e in edits]
+    parsed_edits = [parsed for _path, parsed in parsed_by_path]
+    classification = semantic_mod.check_mode(mode, parsed_by_path, view, scope=scope)
     semantic_mod.check_references(parsed_edits, view)
     spine_warning = semantic_mod.time_spine_warning(view, parsed_edits)
 
@@ -1529,6 +1580,16 @@ def _semantic_plan(
     result = _make_plan(engine, intent, edits)
     result.defined = classification["defined"]
     result.updated = classification["updated"]
+    result.unchanged = classification["unchanged"]
+    # `plans.plan` emits one diff per edit whether or not the content moved, so
+    # a no-op is an all-empty diff set rather than an absent one.
+    if result.unchanged and all(
+        d["additions"] == 0 and d["deletions"] == 0 for d in result.diffs
+    ):
+        result.warnings.append(
+            "every definition in this payload is identical to the project's "
+            "current content, so this plan changes nothing"
+        )
     if spine_warning:
         result.warnings.append(spine_warning)
     if parse_warning:
@@ -1545,6 +1606,30 @@ def _has_seed(edits: list[PlanEdit]) -> bool:
     """
 
     return any(e.kind is EditKind.SEED_CSV and e.op is EditOp.UPSERT for e in edits)
+
+
+def _definitions_from_payload(
+    definitions_file: str | None,
+) -> list[semantic_mod.DefinitionEdit]:
+    """Read the per-definition payload (a file path, or ``-`` for stdin).
+
+    Shape: ``{"definitions": [{"kind": ..., "path": ..., "content": ...}, ...]}``.
+    ``kind`` is ``semantic_model`` or ``metric``; ``content`` is that one
+    definition's YAML body; ``path`` may be omitted for a definition the project
+    already declares, which is then rewritten where it already lives.
+    """
+
+    if definitions_file is None:
+        return []
+    raw = sys.stdin.read() if definitions_file == "-" else _read_file(definitions_file)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"definitions payload is not valid JSON: {exc}") from exc
+    entries = payload.get("definitions") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError('definitions payload must be {"definitions": [...]}')
+    return semantic_mod.parse_definition_payload(entries)
 
 
 def _edits_from_payload(

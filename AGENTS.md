@@ -88,13 +88,13 @@ credentials and no network.
 | `transform macro [name]` | no name lists the shipped dbt macros; a name proposes scaffolding it into the project's macro directory as a plan (dbt-parse-checked, applied with `transform apply`); re-running diffs the project's copy against the shipped version |
 | `transform build --target dev` | prod-looking targets refused outright; then a free dev-target preflight (refuses when `.dex/config.yml` and the rendered `profiles.yml` disagree, or when the dev database does not exist, naming the fix); then the cost preflight, priced upfront by a free `dbt compile` dry-run of each node (a partial floor when a cold dev target has not built a node's inputs yet; degrades to no estimate when dex cannot open its own connection); runs only with `--confirm` and a budget; cwd pinned to the project dir; auto-runs `dbt deps` when packages are declared but not installed |
 | `transform deps` | install/refresh dbt packages (repo-confined; no warehouse spend) |
-| `semantic define\|update\|plan ... --edits-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies per name; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
+| `semantic define\|update\|plan ... --edits-file <f>\|--definitions-file <f>` | dbt semantic model edits as diffs; validated up to and including dbt's own parser (a throwaway project copy) before the plan is stored; `plan` accepts a mix and classifies each name `defined`, `updated`, or `unchanged`; `--definitions-file` names one definition at a time instead of a whole file; degrades to a warning when dbt is absent, `--no-parse` skips; applied with `transform apply` like any other plan |
 | `maintain snapshot [--project-only]` | capture/refresh the known-good baseline in `.dex/snapshot.json` (pins the `.dex/` map + per-layer definition fingerprints). `--project-only` re-fingerprints only the transform and semantic project layers, carries the existing `warehouse` block, `warehouse_from`, and `cache_updated_at` forward unchanged, opens no warehouse connection, and reports that carried-forward state explicitly. It requires an existing snapshot and refuses connection-target flags (`--connector`, `--path`, `--scope`, `--project`, `--dataset`). Use it after a file-path/project-name-only refactor; it deliberately preserves warehouse staleness rather than laundering it into a fresh measurement. |
-| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors (free axes now, one estimate for the scanning axes) |
+| `maintain check` | sweep every drift axis vs the snapshot; ranked drift report (read-only); two-phase on billed connectors: the free axes complete and return `ok`, with one estimate for the scanning axes under `data.offer` |
 | `maintain schema [<objects>]` | structural drift: columns/tables added, dropped, retyped, renamed; nullability; dangling sources; a model added, removed, or content-changed since the baseline (free) |
 | `maintain volume [<objects>]` | freshness drift: row counts that collapsed, emptied, or spiked (free metadata). Free metadata carries no count for an object the warehouse does not maintain one for (a view anywhere, an external table on BigQuery), so those are named in `warnings` as not compared rather than returning no finding |
 | `maintain grain [<objects>]` | cardinality/identity drift: lost key uniqueness, changed grain, join fanout, plus the grains the project itself declares (model-level `unique_combination_of_columns`) re-verified against the data (scans; gated on billed connectors). Two codes come out of the uniqueness checks and the difference is the baseline: `key_lost_uniqueness` is a key measurement proved unique and no longer is, `declared_grain_not_unique` is a declared combination that never held, which is a declaration to fix rather than drift to absorb. Below `maintain.grain_min_rows` rows (default 100, set in `.dex/config.yml`), a uniqueness-regression finding is damped to `low` rather than `high`: on a handful of rows, losing uniqueness means the least, and a 4-row table's boolean column "loses" a uniqueness it never meaningfully had. Damped, never dropped, and the damping is named in the finding's own `data` (`severity_floor_applied`, `grain_min_rows`) and prose |
-| `maintain semantic [<objects>]` | definition drift and dangling refs (free) plus categorical dimension cardinality change (scans; gated on billed connectors) |
+| `maintain semantic [<objects>]` | definition drift and dangling refs (free, and returned as `ok`) plus categorical dimension cardinality change (scans; offered under `data.offer` and gated on billed connectors) |
 | `maintain reconcile [<class>]` | propose the dbt edits that reconcile detected drift, as a stored plan of diffs tagged mechanical or advisory (never applied; apply with `transform apply <plan-id>`) |
 | `maintain verify [<selector>]` | is the project correct *right now*, with no `.dex/snapshot.json` baseline required, unlike every other `maintain` subcommand above. The first finding class (#225): nodes that failed to build, nodes skipped because a parent failed (naming it, walking back through a chain of transitively-skipped parents when the immediate parent was itself only skipped), and models the project declares that have no relation in the warehouse; all free (reads the compiled manifest and the last run's `run_results.json`, plus cheap object-metadata listing for the relation check, never a scan). A project that fails to compile is reported first and suppresses every other check here, since a finding computed from a manifest a broken project could not have produced honestly is not a finding at all; `data.suppressed` names every finding class that did not run and why, so an empty `data.findings` from a run that skipped everything is never mistaken for a clean project |
 | `viz preview` | emit the dbt semantic model to the Viz preview (not yet implemented) |
@@ -108,6 +108,13 @@ is not free: `schema`, `volume`, and the reference half of `semantic` are metada
 (free everywhere), while `grain` and the dimension-cardinality half of `semantic`
 scan and go through the `--confirm --budget` handshake on billed connectors. The
 engine does not care which skill fronts a subcommand.
+
+A command whose free half completed reports `ok` and puts the price of the
+scanning half in `data.offer`, rather than gating the whole answer behind a
+confirmation. `needs_confirmation` means dex is waiting on you for work you asked
+for; an offer is work you did not ask for, and ignoring it is a valid choice.
+Read `data.axes_run` for what completed and `data.offer.axes` for what the
+estimate would add, since with an `ok` status those are no longer implied.
 
 Authored content reaches the engine through `--edits-file <path>` (or `-` for
 stdin): a JSON payload of `{"edits": [{"path", "kind", "op", "content"}, ...]}`
@@ -132,7 +139,16 @@ enters the drift baseline and neither raises a dangling-reference guard on
 delete. Note that three separate things are called a test: generic tests
 declared inside a `schema.yml`, unit tests scaffolded by
 `transform test --scaffold` into a `unit_tests:` block, and the files under
-`test-paths` that `test_sql` authors. `op` is `upsert` (create or update, the
+`test-paths` that `test_sql` authors. The semantic commands take a second,
+narrower payload instead: `--definitions-file <path|->` with
+`{"definitions": [{"kind", "path", "content"}, ...]}`, where `kind` is
+`semantic_model` or `metric` and `content` is that one definition's YAML body.
+The name is read from the content, and `path` may be omitted for a definition
+the project already declares, in which case it is rewritten where it lives. Use
+it whenever a change touches part of a shared file: the engine writes each
+definition in place and leaves every other byte, including comments, untouched,
+so the diff and the classification both describe only what changed. 
+`op` is `upsert` (create or update, the
 default, carrying `content`) or `delete` (remove the file, no `content`); a
 delete is a reviewable diff too, guarded so the plan is refused if any surviving
 file still `ref()`s a deleted model, and a rename is one plan (delete old, create
@@ -170,7 +186,17 @@ metered connector (BigQuery, Snowflake, Databricks, Redshift, Postgres, and
 ClickHouse)
 the first call returns `needs_confirmation` with a free estimate, and the
 same command is re-issued with `--confirm --budget <magnitude>` once the user
-has agreed to the spend. The first billed command in a project that has never
+has agreed to the spend.
+
+One exception to the status, not to the rule: a command that finished free work
+the caller did want, and can offer paid work they did not ask for, returns `ok`
+with the estimate under `data.offer` instead. That is `maintain check` and
+`maintain semantic`. The re-issue is identical (`--confirm --budget`), nothing
+runs until it arrives, and `cost.estimate` stays empty so an `ok` never reads as
+though it spent. Reserve `needs_confirmation` for reading "dex is waiting on
+me", and an offer for "there is more available if I want it".
+
+The first billed command in a project that has never
 decided whether the *day's* total is bounded also carries a
 `suggested_session_ceiling`, and adding `--session-ceiling <value>` (or
 `--no-session-ceiling`) to that same re-issue answers both asks at once and is

@@ -406,13 +406,31 @@ database, which is fine for model-only builds.
 
 ### The semantic layer
 
-- `semantic define ... --edits-file <path|->` and `semantic update ...` author
-  and evolve the dbt semantic models (entities, dimensions, measures, metrics)
-  as plans. `define` refuses names that already exist (use `update`); `update`
-  refuses names that do not (use `define`). For one logical change that mixes
-  both (evolve existing metrics and add the helpers they depend on), use
-  `semantic plan ...`: it accepts mixed intent and classifies each name, and the
-  envelope reports the split as `defined` and `updated`.
+- `semantic define ...` and `semantic update ...` author and evolve the dbt
+  semantic models (entities, dimensions, measures, metrics) as plans. `define`
+  refuses names that already exist (use `update`); `update` refuses names that
+  do not (use `define`). For one logical change that mixes both (evolve existing
+  metrics and add the helpers they depend on), use `semantic plan ...`: it
+  accepts mixed intent and classifies each name, and the envelope reports the
+  split as `defined`, `updated`, and `unchanged`.
+- **Prefer `--definitions-file` over `--edits-file` for the semantic layer.** A
+  real project keeps its metrics in one shared file, so a whole-file payload
+  means retyping every definition you are not touching: the diff and the
+  `updated` list then describe the whole file instead of your change, and every
+  restated line is a chance to corrupt a definition by hand. Send only what
+  changes instead:
+  `{"definitions": [{"kind": "metric", "content": "name: ...\n..."}]}`, where
+  `kind` is `semantic_model` or `metric` and `content` is that definition's YAML
+  body with no leading `- `. The name comes from the content, and `path` can be
+  omitted for anything the project already declares (the engine rewrites it
+  where it lives). Everything else in the file, comments included, is preserved
+  byte for byte. Reach for `--edits-file` when you are creating a file, removing
+  a definition, or moving one between files, and when the engine refuses a
+  layout it will not splice into.
+- `unchanged` means you re-stated a definition exactly as the project already
+  has it. It is not an error, but if a plan is entirely `unchanged` it changes
+  nothing, and the envelope warns as much: check whether you meant to edit
+  something.
 - Plan-time validation is layered so a plan that validates will build:
   MetricFlow's schemas check the shape; the engine resolves every metric input
   (ratio and derived metrics reference **metrics**, not measures; a measure only

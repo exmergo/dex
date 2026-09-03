@@ -110,23 +110,33 @@ The axes split:
 - **Schema, volume, and the reference/definition half of semantic are free**
   everywhere: they read metadata and the snapshot, and run immediately.
 - **Grain and the dimension-cardinality half of semantic scan the warehouse**, so
-  on a metered connector they run the two-step handshake. The first call returns
-  `needs_confirmation` with an estimate in `cost.estimate` (and a per-table
-  breakdown). Surface it to the user in human units, get an explicit budget, and
-  re-issue the same command with `--confirm --budget <magnitude>` in the
-  paradigm's unit (bytes on BigQuery, warehouse-seconds on Snowflake and
-  Databricks, compute-seconds on Redshift, database-seconds on Postgres and
-  ClickHouse).
-  Never invent a budget the user did not agree to, and never retry with a
-  raised budget on an over-ceiling refusal without asking. An over-ceiling
+  on a metered connector they run the two-step handshake. Asked for directly,
+  `maintain grain` returns `needs_confirmation` with an estimate in
+  `cost.estimate` (and a per-table breakdown). Surface it to the user in human
+  units, get an explicit budget, and re-issue the same command with
+  `--confirm --budget <magnitude>` in the paradigm's unit (bytes on BigQuery,
+  warehouse-seconds on Snowflake and Databricks, compute-seconds on Redshift,
+  database-seconds on Postgres and
+  ClickHouse). Never invent a budget the user did not agree
+  to, and never retry with a raised budget on an over-ceiling refusal without
+  asking. An over-ceiling
   refusal carries a calibration line from `.dex/spend.jsonl` (what this
   connector's recent commands billed as a fraction of estimate, or a sentence
   saying there is too little history to say): relay it, and note that the
   ceiling binds on the estimate, so a budget set at that fraction of the
   estimate is refused again.
-- **`check` is two-phase on a metered connector**: the free axes complete
-  immediately and their findings ride along in the `needs_confirmation` envelope,
-  with one combined estimate for the scanning axes. Confirm to complete the sweep.
+- **`check` and `semantic` answer first and offer second.** Their free axes
+  complete on every call, so the envelope is `ok` and the findings in it are
+  final. The price of the scanning axes sits in `data.offer`, with `axes` naming
+  what it would add; `data.axes_run` names what already ran. Confirming is a
+  choice, not a required next step: quote the estimate, say which axes are still
+  dark, and let the user decide. A triage pass that stops at the free axes is a
+  complete piece of work, not an abandoned one.
+- **Read `warnings` on these responses, always.** They carry the reasons the
+  baseline may no longer describe the warehouse (a cache newer than the
+  snapshot, a baseline pinned from a stale cache), which bound every finding
+  above them. A stale baseline is often the most important line in the response
+  and it is never in `findings`.
 
 On DuckDB everything is free and local, so nothing prompts.
 

@@ -5,7 +5,7 @@ free phase of a two-phase command completes before any confirmation."""
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("google.cloud.bigquery")
 
 from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
-from exmergo_dex_core.cache import ColumnProfile, Dataset
+from exmergo_dex_core.cache import CacheProvenance, ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.cli import dispatch
 from exmergo_dex_core.config import BigQueryTarget, DexConfig
 from exmergo_dex_core.engine import DexEngine
@@ -229,18 +229,32 @@ def test_over_ceiling_grain_cannot_be_confirmed_through(
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
 
-def test_unconfirmed_check_is_two_phase(fake_bq_client, route_adapter, tmp_path):
+def test_unconfirmed_check_answers_and_offers(fake_bq_client, route_adapter, tmp_path):
+    """The free axes are the answer, not a pending charge.
+
+    An unconfirmed `check` completed three of four axes and spent nothing, so it
+    reports `ok`. The scanning axes are work the caller never asked for, and they
+    come back as an offer: gating the whole response behind confirming them would
+    train a caller to confirm what costs nothing.
+    """
+
     _seed_snapshot(tmp_path, extra_baseline_column=True)
     route_adapter(fake_bq_client)
 
     envelope = _dispatch(tmp_path, "check")
-    assert envelope.status.value == "needs_confirmation"
-    # Phase one is complete and returned: the free axes' findings ride along
-    # with the estimate for the scanning axes.
+    assert envelope.status.value == "ok"
     codes = {f["code"] for f in envelope.data["findings"]}
     assert "column_dropped" in codes
-    assert envelope.data["estimated_bytes"] == 10 * MB
-    assert any("free" in note for note in envelope.data["notes"])
+
+    offer = envelope.data["offer"]
+    assert offer["estimated_bytes"] == 10 * MB
+    # What did not run has to be nameable, now that the status no longer says so.
+    assert offer["axes"] == ["grain"]
+    assert envelope.data["axes_run"] == ["schema", "volume"]
+    assert any("final" in note for note in offer["notes"])
+    # An `ok` must never carry the estimate where a reader looks for what a run
+    # cost; the offer is the only place that number lives.
+    assert envelope.cost.estimate is None
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
     # The free axes are already persisted for reconcile; grain waits.
@@ -313,8 +327,8 @@ def test_check_fanout_estimate_reflects_per_query_floor(
     route_adapter(fake_bq_client)
 
     unconfirmed = _dispatch(tmp_path, "check")
-    assert unconfirmed.status.value == "needs_confirmation"
-    assert unconfirmed.data["estimated_bytes"] == 2 * 10 * MB
+    assert unconfirmed.status.value == "ok"
+    assert unconfirmed.data["offer"]["estimated_bytes"] == 2 * 10 * MB
 
     fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
     route_adapter(fake_bq_client)
@@ -322,9 +336,57 @@ def test_check_fanout_estimate_reflects_per_query_floor(
         tmp_path,
         "check",
         confirm=True,
-        budget=float(unconfirmed.data["estimated_bytes"]),
+        budget=float(unconfirmed.data["offer"]["estimated_bytes"]),
     )
     assert confirmed.status.value == "ok"
+    # The completed sweep has nothing left to offer, so the key is absent
+    # entirely rather than present and empty.
+    assert "offer" not in confirmed.data
+
+
+def test_the_offer_carries_the_same_caveats_as_the_settled_answer(
+    fake_bq_client, route_adapter, tmp_path
+):
+    """A baseline that may be wrong bounds the free findings too.
+
+    The unconfirmed call is the one a maintenance session opens with, so it is
+    the last place a caveat about the baseline should go missing. It used to:
+    the confirmation branch built its result without the baseline warnings the
+    settled branch adds, which silently dropped the "your baseline is stale"
+    line from the only response most sessions ever read.
+    """
+
+    _seed_snapshot(tmp_path, extra_baseline_column=True)
+    store = FilesystemStore(tmp_path)
+    snap = store.load_snapshot()
+    later = datetime.fromisoformat(snap.created_at) + timedelta(hours=1)
+    store.save_cache(
+        DexCache(
+            datasets=[],
+            provenance=CacheProvenance(
+                connector="bigquery", updated_at=later.isoformat()
+            ),
+        )
+    )
+    route_adapter(fake_bq_client)
+
+    unconfirmed = _dispatch(tmp_path, "check")
+    assert unconfirmed.status.value == "ok"
+    assert "offer" in unconfirmed.data
+    assert [w for w in unconfirmed.warnings if "newer than the drift baseline" in w]
+
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    route_adapter(fake_bq_client)
+    confirmed = _dispatch(
+        tmp_path,
+        "check",
+        confirm=True,
+        budget=float(unconfirmed.data["offer"]["estimated_bytes"]),
+    )
+    stale = "newer than the drift baseline"
+    assert [w for w in confirmed.warnings if stale in w] == [
+        w for w in unconfirmed.warnings if stale in w
+    ]
 
 
 def test_volume_names_an_external_table_it_could_not_compare(

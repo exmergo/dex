@@ -508,8 +508,32 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   with a pointer to the full log when anything was trimmed.
 - `semantic define` refuses names that already exist in the project (use
   `update`); `update` refuses names that do not (use `define`); `semantic plan`
-  accepts a mix and classifies per name, reporting `defined` and `updated` in
-  the envelope. Names implicitly created by `create_metric: true` measures count
+  accepts a mix and classifies per name, reporting `defined`, `updated`, and
+  `unchanged` in the envelope. `updated` means the definition's parsed content
+  actually differs from the project's; a definition re-stated identically in the
+  file that already holds it is `unchanged`. The distinction matters because a
+  whole-file payload restates every definition in the file, so without it a
+  two-metric change reports thirty objects as updated and the real blast radius
+  is invisible in the one place a reviewer checks it. Key order and formatting
+  are not changes; list order is, and identical content written to a different
+  file is a move, so both read as `updated`.
+- **Two payload units.** `--edits-file` carries whole files. `--definitions-file`
+  carries individual definitions:
+  `{"definitions": [{"kind", "path", "content"}, ...]}`, `kind` being
+  `semantic_model` or `metric`, `content` that definition's YAML body (a mapping,
+  written without the leading `- `). The name is read from the content, so the
+  two cannot disagree. `path` is required for a name the project does not have
+  and optional for one it does, defaulting to the file that declares it; an
+  explicit path that would relocate an existing definition is refused, because
+  writing it to a second file duplicates the name. The engine writes each
+  definition in place and preserves every other byte, comments included, then
+  re-parses the result and compares it against what was sent. A file whose
+  layout it cannot span safely (a flow-style sequence, anchors or aliases,
+  multiple documents, tab indentation) is refused with `--edits-file` named as
+  the way to edit it. Classification is scoped to the definitions named, so a
+  spliced file's other definitions are reported in no class at all. Removing a
+  definition is still a whole-file edit; the semantic verbs author and do not
+  delete. Names implicitly created by `create_metric: true` measures count
   as existing metrics everywhere. Beyond MetricFlow's schemas, the engine
   resolves every metric input (ratio and derived inputs must reference metrics,
   not measures) and then runs the emitted YAML through dbt's own parser against
@@ -530,6 +554,19 @@ immediately, while `grain` and the dimension-cardinality half of `semantic` scan
 the warehouse and take the `--confirm --budget` handshake on billed connectors;
 `check` runs the free axes first and returns one combined estimate for the
 scanning axes.
+
+That estimate arrives as an **offer on a complete answer**, not as a pending
+charge. `check` and `semantic` finish their free axes on every call and return
+`ok`, with the price of the scanning axes under `data.offer` (`estimated_bytes`
+or the connector's own estimate shape, `per_table_bytes`, `axes` naming what the
+estimate would add, and the `--confirm --budget` hint). `data.axes_run` names
+what completed, and reading both is how a caller tells "grain found nothing"
+from "grain did not run", which the status used to imply. Nothing scans until
+the confirmed re-issue arrives, and `cost.estimate` stays unset on the offer so
+an `ok` never carries a number that reads as spend. The reason for the split is
+that `needs_confirmation` is a request for a decision dex is blocked on, and
+spending it on work the caller never asked for teaches them to confirm
+reflexively, which is the one habit the handshake cannot survive.
 
 **A baseline reports its own coverage, and the axes only compare what it
 covers.** `maintain snapshot` pins the exploration cache, and a cache is thin
@@ -832,7 +869,18 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   spend returns `needs_confirmation` unless given `--confirm` (and a `--budget`
   on billed connectors; DuckDB is free, so the confirm handshake alone gates it).
   An estimate over the ceiling is refused outright; confirmation cannot override
-  it. On billed connectors the estimate comes from free dry-runs, the confirmed
+  it.
+- **A priced phase the caller did not request is an offer, not a refusal.** When
+  a command's free half is a complete answer in its own right, the envelope is
+  `ok` and the price of the optional half sits in `data.offer`, carrying the
+  same estimate, breakdown, and `--confirm --budget` hint a refusal would.
+  `maintain check` and `maintain semantic` are the two. The spend gate is
+  unchanged (nothing runs without the confirmed re-issue) and `cost.estimate`
+  stays unset, so a reader can keep treating a populated `cost.estimate` on an
+  `ok` as settled preflight for work that ran. `needs_confirmation` stays
+  reserved for work the caller asked for and has not authorized, which is the
+  only case where dex is genuinely blocked.
+  On billed connectors the estimate comes from free dry-runs, the confirmed
   run re-checks every statement against the budget with a server-side cap as
   backstop, actual spend is reported under `data.spend`, and every billed byte
   is appended to the `.dex/spend.jsonl` ledger, against which the optional
