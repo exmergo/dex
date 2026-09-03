@@ -648,7 +648,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "no_parse": "no_parse",
         },
     },
-    ("maintain", "snapshot"): {"method": "snapshot", "args": {}},
+    ("maintain", "snapshot"): {
+        "method": "snapshot",
+        "args": {"project_only": "project_only"},
+    },
     ("maintain", "check"): {"method": "check", "args": {"objects": "objects"}},
     ("maintain", "schema"): {"method": "schema_drift", "args": {"objects": "objects"}},
     ("maintain", "volume"): {"method": "volume_drift", "args": {"objects": "objects"}},

@@ -1021,10 +1021,10 @@ class DexEngine:
 
     # --- maintain -------------------------------------------------------------
 
-    def snapshot(self) -> SnapshotResult:
+    def snapshot(self, *, project_only: bool = False) -> SnapshotResult:
         from .maintain import commands as maintain
 
-        return maintain.snapshot(self)
+        return maintain.snapshot(self, project_only=project_only)
 
     def check(self, objects: list[str] | None = None) -> DriftResult:
         from .maintain import commands as maintain
