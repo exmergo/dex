@@ -9,6 +9,45 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain snapshot --project-only` re-pins the project layers without
+  re-measuring the warehouse** ([#281]). A repo-wide move of every model file
+  and a dbt project rename changes no warehouse object, but the documented way
+  to re-pin the baseline afterwards was `explore map --full` and a fresh
+  snapshot, which the issue priced at 8.69 GB on its own project. A discipline
+  that costs that much to follow after a routine refactor gets skipped, and the
+  session that reported this ended green against a baseline 363 hours old.
+
+  The flag reads the transform and semantic layers from the project files as
+  usual, and carries the warehouse half of the previous baseline forward as a
+  unit: the `warehouse` block itself, the `connector` it was measured on,
+  `warehouse_from`, and `cache_updated_at`. It consults neither a connector nor
+  the exploration cache, because a cache that has moved on since the baseline
+  would silently upgrade the warehouse side of a command whose whole point is
+  not to touch it. Preserving the original `cache_updated_at` is what keeps the
+  staleness honest rather than laundered: the thin-column-detail and cache-age
+  warnings still run against the baseline just written, so an aging warehouse
+  side is restated on every project-only refresh instead of being reset to look
+  freshly measured.
+
+  Nothing about the run reaches a warehouse. The dialect availability check is
+  skipped for this path, so it also runs where no warehouse driver is installed;
+  the cost stays `free_local` with no estimate; and the envelope says so in both
+  a `warnings` line naming the carry-forward and zero billed bytes, and
+  `data.warehouse.carried_forward`, which a host automating the accept can gate
+  on. A `maintain check` straight afterwards, against an unchanged warehouse,
+  reports no schema, volume, or grain drift.
+
+  Two refusals keep the mode unambiguous. It requires an existing readable
+  baseline, since there is no warehouse evidence to carry forward without one,
+  and says which command produces one rather than quietly capturing a fresh
+  baseline the caller did not ask for. And it cannot be combined with a
+  warehouse target (`--connector`, `--path`, `--scope`, `--project`,
+  `--dataset`), which is a request error: naming a target for a command that
+  opens no connection can only mean the caller expected something else to
+  happen. Library callers reach it as `DexEngine.snapshot(project_only=True)`.
+
 ## [1.9.2] - 2026-09-02
 
 ### Added

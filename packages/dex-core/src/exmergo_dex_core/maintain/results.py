@@ -67,6 +67,9 @@ class SnapshotResult(Result):
     #: automating the accept needs to gate on it.
     column_detail_count: int = 0
     cache_updated_at: str | None = None
+    #: ``True`` only when `--project-only` retained the previously measured
+    #: warehouse side instead of opening a warehouse connection.
+    warehouse_carried_forward: bool = False
     transform_layer: LayerFingerprint | None = None
     semantic_layer: LayerFingerprint | None = None
 
@@ -80,6 +83,7 @@ class SnapshotResult(Result):
                 "grain_baseline_count": self.grain_baseline_count,
                 "column_detail_count": self.column_detail_count,
                 "cache_updated_at": self.cache_updated_at,
+                "carried_forward": self.warehouse_carried_forward,
             },
             "transform_layer": (
                 self.transform_layer.transform_data()

@@ -37,7 +37,13 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
-from ..errors import DexError, PrerequisiteError, ProjectError, RepoRootRequiredError
+from ..errors import (
+    DexError,
+    PrerequisiteError,
+    ProjectError,
+    RepoRootRequiredError,
+    RequestError,
+)
 from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
@@ -274,7 +280,7 @@ def _stored_drift(store: MaintainStore) -> drift_mod.DriftReport | None:
         return None
 
 
-def snapshot(engine: DexEngine) -> SnapshotResult:
+def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
     Prefers the exploration cache, which carries the grain and cardinality
@@ -287,36 +293,52 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
     config = engine.config
     warnings: list[str] = []
 
-    cache = readable_cache(store)
-    requested = engine.connector or config.connector
-    usable = cache is not None and bool(cache.datasets)
-    if usable and cache.provenance.connector not in (None, requested):
+    if project_only:
+        previous = _require_baseline(store)
+        # Copy the old warehouse block as a unit.  Project-only mode must not
+        # consult a cache (which may be newer) or a connector: the old evidence
+        # and the timestamp that tells a future check how old it is travel
+        # together.
+        warehouse = previous.warehouse.model_copy(deep=True)
+        connector = previous.connector
+        warehouse_from = previous.warehouse_from
+        cache_updated_at = previous.cache_updated_at
         warnings.append(
-            f"the exploration cache was mapped on '{cache.provenance.connector}' but "
-            f"the active connector is '{requested}'; capturing a fresh "
-            "metadata-only baseline instead"
+            "warehouse baseline was carried forward without re-measuring it; no "
+            "warehouse connection was opened and zero warehouse bytes were billed"
         )
-        usable = False
-
-    if usable:
-        warehouse = snapshot_mod.warehouse_from_cache(cache)
-        connector = cache.provenance.connector or requested
-        warehouse_from = "cache"
-        cache_updated_at = cache.provenance.updated_at
     else:
-        # No cache to pin: capture directly. Metadata is free on every
-        # connector, so this path needs no confirm handshake.
-        adapter = engine._adapter("maintain snapshot")
-        warehouse = snapshot_mod.warehouse_from_metadata(adapter)
-        connector = adapter.name
-        warehouse_from = "metadata"
-        cache_updated_at = None
-        if cache is None or not cache.datasets:
+        cache = readable_cache(store)
+        requested = engine.connector or config.connector
+        usable = cache is not None and bool(cache.datasets)
+        if usable and cache.provenance.connector not in (None, requested):
             warnings.append(
-                "no exploration cache to pin, so this baseline is metadata-only "
-                "(schema and volume axes); run `explore map` and re-snapshot "
-                "to give the grain and cardinality axes a baseline"
+                "the exploration cache was mapped on "
+                f"'{cache.provenance.connector}' but "
+                f"the active connector is '{requested}'; capturing a fresh "
+                "metadata-only baseline instead"
             )
+            usable = False
+
+        if usable:
+            warehouse = snapshot_mod.warehouse_from_cache(cache)
+            connector = cache.provenance.connector or requested
+            warehouse_from = "cache"
+            cache_updated_at = cache.provenance.updated_at
+        else:
+            # No cache to pin: capture directly. Metadata is free on every
+            # connector, so this path needs no confirm handshake.
+            adapter = engine._adapter("maintain snapshot")
+            warehouse = snapshot_mod.warehouse_from_metadata(adapter)
+            connector = adapter.name
+            warehouse_from = "metadata"
+            cache_updated_at = None
+            if cache is None or not cache.datasets:
+                warnings.append(
+                    "no exploration cache to pin, so this baseline is metadata-only "
+                    "(schema and volume axes); run `explore map` and re-snapshot "
+                    "to give the grain and cardinality axes a baseline"
+                )
 
     transform_layer, semantic_layer, no_project = _read_layers(engine)
     if no_project is not None:
@@ -332,6 +354,7 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
         warehouse=warehouse,
         warehouse_from=warehouse_from,
         cache_updated_at=cache_updated_at,
+        warehouse_carried_forward=project_only,
         transform_layer=transform_layer,
         semantic_layer=semantic_layer,
     )
@@ -378,6 +401,21 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
 
 
 def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    project_only = getattr(args, "project_only", False)
+    if project_only:
+        warehouse_options = {
+            "--connector": getattr(args, "connector", None),
+            "--path": getattr(args, "path", None),
+            "--scope": getattr(args, "scope", None),
+            "--project": getattr(args, "project", None),
+            "--dataset": getattr(args, "dataset", None),
+        }
+        supplied = [name for name, value in warehouse_options.items() if value]
+        if supplied:
+            raise RequestError(
+                "`maintain snapshot --project-only` cannot be combined with "
+                "warehouse target options: " + ", ".join(supplied)
+            )
     # Which advice is true depends on where the baseline landed, so the hint is
     # built from the store rather than fixed. The shipped filesystem backend is
     # the only one dex knows puts a reviewable file in the repo; a backend it
@@ -386,7 +424,9 @@ def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # real location either way.
     reviewable = isinstance(engine.store, FilesystemStore)
     hint = (_REVIEWABLE_SNAPSHOT_HINT if reviewable else "") + _SNAPSHOT_HINT
-    return to_envelope(snapshot(engine), hints={"hint": hint})
+    return to_envelope(
+        snapshot(engine, project_only=project_only), hints={"hint": hint}
+    )
 
 
 def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:

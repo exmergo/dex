@@ -254,6 +254,10 @@ def _build_parser() -> argparse.ArgumentParser:
             sub = gp.add_subparsers(dest="subcommand", required=True)
             for name in subcommands:
                 sp = sub.add_parser(name, parents=[common])
+                if group == "maintain" and name == "snapshot":
+                    sp.add_argument(
+                        "--project-only", action="store_true", default=False
+                    )
                 if group == "explore" and name == "inventory":
                     sp.add_argument(
                         "--rank", action="store_true", default=argparse.SUPPRESS
@@ -604,7 +608,11 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return handlers[args.subcommand](args, engine)
 
     if args.group == "maintain":
-        ensure_dialect_available()
+        # Project-only snapshot refreshes use only the store and project seam;
+        # requiring a warehouse dialect here would make a zero-connection path
+        # depend on the very connector it deliberately does not touch.
+        if not (args.subcommand == "snapshot" and getattr(args, "project_only", False)):
+            ensure_dialect_available()
         from .maintain import commands as maintain_cmds
 
         handlers = {
