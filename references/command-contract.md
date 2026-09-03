@@ -496,8 +496,8 @@ warn when the baseline was pinned from a cache older than
 rather than on which file was written last, so re-pinning cannot silence it.
 
 **`explore semantic` queries the semantic layer; `transform` and the `semantic`
-group author it, and `maintain semantic` detects drift in it.** Two backends answer
-the same three subcommands through one abstraction, chosen ambiently by
+group author it, and `maintain semantic` detects drift in it.** Three backends
+answer the same three subcommands through one abstraction, chosen ambiently by
 `semantic.vendor` and `semantic.deployment` in `.dex/config.yml` (the released
 `semantic.backend` spelling of the two is still accepted) and overridable per
 command with `--local` / `--api`. Those two flags name **who executes**, not which
@@ -505,6 +505,22 @@ vendor: every catalog and every result reports it as `execution` (`dex` or
 `vendor`), and that is the axis the guards read. A vendor-executed backend owns the
 warehouse connection, so dex never holds a statement it could price or cap, and
 every hosted result carries a warning saying exactly that.
+
+**`vendor: ossie` reads native Apache Ossie documents from the repository**, with
+no dbt project and no MetricFlow in the path. It is catalog-first because the
+format is: Ossie specifies interchange metadata and not a portable query runtime,
+so `list` answers and `query` and `values` refuse by name rather than inventing
+filter grammar, join planning, and execution semantics the document's author never
+stated. `--for-dimension` refuses too, off the backend's own declared
+`unavailable` block rather than off a vendor name: Ossie states no
+metric-to-dimension relationship, and answering "no metric can be grouped that
+way" would be a claim about the layer where the truth is that this backend was
+never told. The documents are named in `semantic.ossie.files` (beside a dbt
+project) or in `project.options.files` with `project.format: ossie` (an Ossie-only
+repository); both build the same reader, both are confined to the repository, and
+selecting either without the `[ossie]` extra refuses and names it. dex pins the
+Ossie schema by content hash rather than by the version string the document
+carries. See `references/semantic-layer.md`.
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than
@@ -536,6 +552,11 @@ models reachable from metric definitions rank higher alongside the configured
 `ranking_hints`. The compiled manifest resolves names exactly when present;
 an uncompiled project falls back to name-based resolution and says so. A
 stale manifest (older than the model sources) is noted, not trusted silently.
+
+`explore relationships` and `explore map` also accept the independent
+`--use-hosted-semantic-layer` opt-in. It permits a configured hosted layer read;
+when that layer cannot expose physical relations (as dbt Cloud currently cannot),
+dex reports the partial linkage and does not invent warehouse edges or exposure.
 
 **The project's semantic layer folds in on the same flag**, in both directions,
 and neither direction costs a warehouse query.

@@ -393,8 +393,8 @@ Two configured axes, and one that is derived:
 
 | axis | values | what it decides | set how |
 |---|---|---|---|
-| `vendor` | `dbt` | which semantic-layer format answers | configured, ambient per repo |
-| `deployment` | `local`, `dbt_cloud` | which endpoint or artifact is read | configured |
+| `vendor` | `dbt`, `ossie` | which semantic-layer format answers | configured, ambient per repo |
+| `deployment` | `local`, `dbt_cloud` (`local` only for `ossie`) | which endpoint or artifact is read | configured |
 | `execution` | `dex`, `vendor` | **whether dex's cost guard applies** | derived, never configured |
 
 `execution` is the one the guards read, so it is reported on every result rather
@@ -572,6 +572,181 @@ because their fixes differ: a layer that answered and carries no PII metadata fo
 dimension wants `meta: {pii: true}` on it in the dbt project, while a
 dimension-metadata call that never answered (which degrades every ref to the
 heuristic at once) wants retrying.
+
+## Native Apache Ossie (`vendor: ossie`)
+
+[Apache Ossie](https://github.com/apache/ossie) (incubating) is a portable
+interchange format for semantic models: datasets over physical relations, fields
+with multi-dialect expressions, explicit relationships, and expression metrics.
+dex reads native `.ossie.yaml`, `.ossie.yml` and `.ossie.json` documents from the
+repository, with no dbt project and no MetricFlow anywhere in the path.
+
+It is **catalog-first**, and that is a statement about the format rather than
+about how far the implementation got. Ossie specifies interchange metadata and
+not a portable query runtime: no filter grammar, no join planning, no execution
+semantics. So `list` answers and `query` and `values` refuse, and the refusal is
+the honest answer rather than a gap. Upstream has an active working group on a
+query language and a reference engine; when that lands it becomes a declared
+runtime adapter with its own governed contract, not a loosening of these
+commands.
+
+### Configuring it as a semantic layer
+
+Ossie is never a transformation project. dbt remains the project when present;
+Ossie is selected only on the semantic axis, including in an Ossie-only
+repository:
+
+```yaml
+semantic:
+  vendor: ossie
+  ossie:
+    files:
+      - semantics/commerce.ossie.yaml
+```
+
+`project.format: ossie` is accepted temporarily as a deprecated compatibility
+spelling. Migrate its `project.options.files` list to `semantic.ossie.files`;
+it no longer makes semantic documents answer transformation-project commands.
+
+Paths are relative to the repository root and confined to it: an absolute path, a
+`..` that walks out, and a symlink that resolves out are each refused. Reads are
+confined the way writes are, because a committed config file naming a path
+outside the repository would otherwise have dex parse it, and what it parsed
+would reach an envelope.
+
+### Two extras, three validation layers
+
+Selecting Ossie without the `[ossie]` extra refuses by name and names the extra.
+The layers sit on different tiers deliberately:
+
+| layer | what it checks | needs |
+|---|---|---|
+| structure | the bundled Ossie JSON Schema: shape, types, the pinned `version`, and unknown structural keys | `[ossie]` (`jsonschema`) |
+| integrity | name uniqueness at four scopes, relationship endpoints, equal key-array arity, target-key coverage | nothing |
+| expression syntax | each SQL expression parses in its declared dialect | `[sql]`, which every connector extra already brings |
+
+With `[sql]` absent the third layer degrades to a **named skipped-validation
+note**, never to a silent pass. With `[ossie]` absent there is nothing to degrade
+to, so the catalog refuses; the tier-1 declarations channel returns the empty view
+with a note instead, because `explore` runs against raw warehouses where a
+semantic layer is simply absent.
+
+The integrity layer ports the judgment in upstream's own `validation/validate.py`
+rather than reimplementing it, so dex and upstream agree about what a valid
+document is. Two rules are dex's own and are marked as such in the source:
+**equal `from_columns`/`to_columns` arity** (a join pairs them positionally, so
+unequal lengths describe a join no consumer can resolve) and **one semantic-model
+name across the whole configured set** (dex reads a set of documents together and
+namespaces catalog entries `<semantic model>.<dataset>`, so two models sharing a
+name would collapse onto the same entries). Both are carried upstream as consumer
+findings.
+
+### The schema is pinned by content, not by version
+
+Upstream declares `version` as a constant that does not move when the schema
+does, and the specification says the schema may change before release, so a
+version check is worthless as a drift signal. dex vendors the schema verbatim and
+asserts its sha256 against a recorded constant, which makes a regeneration a
+reviewed diff in a commit rather than a quiet update. The document's own `version`
+is still required and still checked, because upstream requires it and the schema
+itself is what checks it.
+
+The upstream commit, the hash, and the upgrade procedure are recorded beside the
+schema in the installed package, at
+`exmergo_dex_core/ossie/schema/PROVENANCE.md`.
+
+**State the assurance boundary plainly.** There is no external validator here the
+way `dbt parse` is for dbt: neither `apache-ossie` nor `apache-ossie-dbt` is
+published, and there is no Ossie runtime to load a document into. What this proves
+is that a document is schema-valid and internally consistent. It does not prove
+that any consumer can execute it.
+
+### Which expression dex reads
+
+An Ossie field or metric may declare an expression per dialect, and the enum mixes
+SQL with languages that are not SQL. dex partitions it once: `ANSI_SQL`,
+`SNOWFLAKE`, `DATABRICKS` and `BIGQUERY` are read; `MDX`, `TABLEAU` and `MAQL` are
+preserved verbatim, never parsed, and never a source of a physical column claim.
+Upstream's own validator maintains the same partition.
+
+Selection is deterministic given a document and a connector:
+
+1. the active connector's own Ossie dialect, where it has one;
+2. the portable dialect, `ANSI_SQL`;
+3. the first declared SQL dialect, in the document's own order.
+
+It never falls through to a non-SQL language. DuckDB, Postgres, Redshift and
+ClickHouse have no token in Ossie's enum, so they fall to the portable dialect,
+which is correct and is stated here rather than left to be inferred. Every
+declared dialect is preserved on the element's `vendor_params`, along with the
+datatype, the AI context, and any custom extensions, so nothing the document says
+is dropped and nothing is smuggled into an unrelated field.
+
+### The physical link needs both conditions
+
+A field resolves to a physical column only when **the whole dataset source is
+accepted as one relation identifier by the active connector** and **the selected
+expression is an unquoted bare identifier**. Four cases therefore carry no column,
+each documented and tested rather than emergent, and each named in a note that
+says which of them applies:
+
+| case | why not |
+|---|---|
+| a computed expression | a column guessed out of an expression makes the PII gate screen the wrong column and report it as evidence |
+| a quoted identifier | an unquoted identifier is folded the way the warehouse folds it while a quoted one is exact, so the two need not name the same column and dex cannot tell which was meant |
+| a query-backed source | Ossie documents a source as `database.schema.table` **or a query** with no portable discriminator, and a query read as a relation would reach the PII gate as physical evidence that does not exist |
+| a field declaring only non-SQL dialects | dex does not read MDX, Tableau or MAQL, so it has nothing to resolve |
+
+The relation rule is the connector's own, so the same document links on DuckDB and
+does not on ClickHouse, whose relations are two parts rather than three.
+
+### What Ossie does not carry, declared rather than absent
+
+The catalog names its gaps per element kind, so a caller can tell a structural
+absence from a field the author left blank:
+
+- **no measures and no entities.** Ossie metrics are expressions and its joins are
+  explicit relationships, so every declared field of both kinds is unavailable
+  rather than the kinds being quietly empty.
+- **no metric groupability.** `metrics[].dimensions` is empty and declared
+  unavailable, and `--for-dimension` refuses because of that declaration rather
+  than because of a vendor name. Lineage says an expression mentions a dataset; it
+  does not say a field can group the metric or that a relationship path is
+  executable.
+- **no metric-to-dataset reference.** Lineage comes only from qualified
+  `dataset.field` references that resolve, and **when nothing resolves it is
+  empty**: naming every dataset in the semantic model would be the maximal claim
+  dressed as a conservative one.
+- **no grain vocabulary.** A categorical dimension states `queryable_granularities:
+  []`, which is a fact. A time dimension leaves it unset, because Ossie was never
+  asked and an empty list there would positively state that no grain is queryable.
+- **no metric composition.** A possible metric-to-metric reference stays opaque
+  expression text: Ossie has not defined its grammar or scope, and promoting one
+  would turn an interpretation into a fact.
+
+### Reaching tier 1
+
+An Ossie-only repository contributes its declarations to `explore`:
+
+- a single-column `primary_key` or `unique_keys` entry becomes a declared unique
+  key;
+- a multi-column one becomes a declared composite grain, kept whole and **never**
+  also split into single keys, which would be a much stronger claim;
+- a single-column relationship becomes a declared join at confidence 1.0;
+- a **composite** relationship remains one declaration with its ordered column
+  pairs intact. Map, relationships, diagram, and `--verify` consume the full
+  tuple; no first-column proxy is emitted or measured.
+
+`explore map --use-project` marks each source relation with the Ossie semantic
+models sitting on it, on either configuration route.
+
+### Upgrading the pinned schema
+
+1. Copy the new `core-spec/ossie-schema.json` in verbatim.
+2. Update the commit, hash, and declared version in `PROVENANCE.md`.
+3. Update `SCHEMA_SHA256` in `exmergo_dex_core/ossie/loader.py`.
+4. Run the Ossie fixture suite and read the diffs. A fixture that changes verdict
+   is the upgrade telling you what moved.
 
 ## Internal architecture
 
