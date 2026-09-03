@@ -219,6 +219,12 @@ class HostedDbtCloudBackend:
 
         return []
 
+    def declared_keys(self) -> tuple[list[Any], list[Any]]:
+        """dbt's own declared keys already reach grain through its project
+        format's ``definitions()``; stating them here too would double them."""
+
+        return [], []
+
     # ---- query -------------------------------------------------------------
 
     def filter_refs(self, clauses: list[str]) -> list[str] | None:

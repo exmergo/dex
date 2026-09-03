@@ -120,6 +120,14 @@ class LocalOssieLayer:
 
         return self._project.declared_definitions().declared_relationships
 
+    def declared_keys(self) -> tuple[list[Any], list[Any]]:
+        """Ossie's own declared dataset keys (#408): unlike dbt, Ossie is never
+        the transformation project `engine.project_format()` resolves, so this
+        is the only route its keys have to grain detection at all."""
+
+        defs = self._project.declared_definitions()
+        return defs.declared_keys, defs.declared_composite_keys
+
     def query(self, _q: Any) -> Any:
         raise SemanticBackendError(
             f"{_NO_RUNTIME}. Read the layer with `explore semantic list`, then "
