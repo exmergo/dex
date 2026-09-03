@@ -801,9 +801,6 @@ def relationships(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
-    # The catalog currently annotates exposure only for Ossie beside dbt. #408
-    # owns folding Ossie relationships into declared edges, including agreement
-    # and conflicts with dbt declarations.
     catalog = _semantic_catalog(
         engine, use_project, use_hosted_semantic_layer=use_hosted_semantic_layer
     )
@@ -1932,9 +1929,6 @@ def map(
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
-    # The catalog currently annotates exposure only for Ossie beside dbt. #408
-    # owns folding Ossie relationships into declared edges, including agreement
-    # and conflicts with dbt declarations.
     catalog = _semantic_catalog(
         engine, use_project, use_hosted_semantic_layer=use_hosted_semantic_layer
     )
