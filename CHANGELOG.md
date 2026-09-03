@@ -104,6 +104,58 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   `AGENTS.md`, `references/command-contract.md`, and both the `transform` and
   `maintain` skills document the new payload, the third class, and the offer.
 
+- **A column that is wholly or almost wholly NULL is now a grain finding, and a
+  fully NULL column names the join that could explain it** ([#227]). A column
+  that is 100% NULL in a relation that has rows is the visible symptom of a join
+  that matched nothing, a rename that missed, a `CASE` whose branches never
+  fire, or a source column that stopped arriving. Nothing in the sweep was
+  looking at it, so the caller had to notice it in output they were not reading.
+
+  `maintain grain`, and `maintain check` which sweeps every axis, now survey the
+  null fraction of every column of every in-scope relation and emit three new
+  codes on the grain axis. `fully_null_column` is `high` and fires at exactly
+  1.0. `mostly_null_column` is `low` and covers the near-miss band from 0.95 up
+  to but not including 1.0, because a legitimately optional column is often
+  sparse and is not the same event. Below 0.95 the survey says nothing. An empty
+  relation reports `no_rows` once, at `low`, with no column attached and no
+  per-column finding at all: with no rows there is no null fraction to report,
+  and a column-by-column sweep of an empty table would bury the one fact that
+  matters.
+
+  Where a fully NULL column sits on a relation that joins outward, the finding
+  carries every join whose left side is that relation in `data.joins`, with the
+  columns on both sides, and the detail adds that the joined relation may have
+  matched nothing. Every such join stays in the payload rather than dex guessing
+  which one supplied the column. The joins come from the relationships already
+  in the snapshot and already priced for the fanout check, so naming them costs
+  no extra query. A fully NULL column on a relation with no known join is still
+  reported at `high`, without the clause it cannot support.
+
+  The survey needs no baseline: a wholly NULL column in a non-empty relation is
+  a defect in the shape the table has now, not a before-and-after drift claim.
+  So it speaks on the first snapshot, and on tables the other grain checks skip
+  for having neither a measured nor a declared key, which is why a
+  metadata-only baseline that previously produced no findings now reports its
+  empty tables.
+
+  It is priced inside the gated half rather than added on top of it. The null
+  scan goes through the adapter's `profile_estimate` and lands in the same
+  per-table estimate as the distinct-count and join-overlap probes, so an
+  unconfirmed `maintain grain` or `maintain check` on a metered warehouse quotes
+  it up front and a confirmed run spends it against the declared budget. Binary
+  and blob columns, which an explore value profile leaves out, are opted back
+  into this survey, because a null fraction is meaningful for a blob even where
+  a value domain is not, and the estimate then covers exactly the columns the
+  executed aggregates do. Only `null_fraction` is read: the aggregates are
+  requested without the min/max, shape, and type extras, so no value crosses the
+  envelope. An adapter that does not implement `column_aggregates` skips the
+  survey rather than failing.
+
+  Not where the issue put it: #227 proposed this under `maintain verify`, the
+  free, baseline-free correctness command from #224. It landed on the grain axis
+  instead, because the survey is a real scan and a scan belongs behind the
+  confirmation gate and the budget. `verify` stays free.
+
 - **`maintain snapshot --project-only` re-pins the project layers without
   re-measuring the warehouse** ([#281]). A repo-wide move of every model file
   and a dbt project rename changes no warehouse object, but the documented way

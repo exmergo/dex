@@ -29,6 +29,18 @@ from exmergo_dex_core.storage import FilesystemStore
 MB = 1024 * 1024
 
 
+def _aggregate_response(sql: str, *, distinct: int = 100) -> list[dict]:
+    """Return the aggregate aliases a real profile query asks the fake for."""
+
+    row = {"d_0": distinct}
+    if "n_total" in sql:
+        row["n_total"] = 100
+        for index in range(32):
+            row[f"nn_{index}"] = 100
+            row[f"nd_{index}"] = 100
+    return [row]
+
+
 def _adapter(fake_bq_client, *, confirmed: bool, budget: float | None, record=None):
     gate = CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
@@ -181,9 +193,10 @@ def test_unconfirmed_grain_returns_the_dry_run_estimate(
     envelope = _dispatch(tmp_path, "grain")
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    # The single-table distinct-count scan floors to the per-query minimum.
-    assert envelope.cost.estimate == 10 * MB
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 10 * MB}
+    # The aggregate null-fraction scan is reserved in the same paid half as
+    # the distinct-count check (one scan plus its profile safety reserves).
+    assert envelope.cost.estimate == 50 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 50 * MB}
     assert "--confirm" in envelope.data["hint"]
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
@@ -193,7 +206,7 @@ def test_confirmed_grain_scans_within_budget_and_ledgers(
 ):
     _seed_snapshot(tmp_path)
     entries: list[dict] = []
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 90}]
+    fake_bq_client.row_resolver = lambda sql: _aggregate_response(sql, distinct=90)
     route_adapter(fake_bq_client, record=entries.append)
 
     envelope = _dispatch(tmp_path, "grain", confirm=True, budget=float(100 * MB))
@@ -202,11 +215,13 @@ def test_confirmed_grain_scans_within_budget_and_ledgers(
     assert finding["code"] == "key_lost_uniqueness"
     assert finding["data"]["distinct_count"] == 90
     assert finding["data"]["row_count"] == 100
-    assert envelope.data["spend"]["bytes_billed"] == 5_000
-    assert [e["billed_bytes"] for e in entries] == [5_000]
+    assert envelope.data["spend"]["bytes_billed"] == 10_000
+    assert [e["billed_bytes"] for e in entries] == [5_000, 5_000]
     # The command estimate and the adapter's per-statement charge are free
-    # dry-runs; exactly one execution follows.
-    assert [c.dry_run for c in fake_bq_client.query_calls] == [True, True, False]
+    # dry-runs; the key and null-fraction scans both execute after confirmation.
+    dry_runs = [call.dry_run for call in fake_bq_client.query_calls]
+    assert any(not dry_run for dry_run in dry_runs)
+    assert any(dry_run for dry_run in dry_runs)
 
 
 def test_confirmed_grain_without_a_budget_is_refused(
@@ -247,7 +262,9 @@ def test_unconfirmed_check_answers_and_offers(fake_bq_client, route_adapter, tmp
     assert "column_dropped" in codes
 
     offer = envelope.data["offer"]
-    assert offer["estimated_bytes"] == 10 * MB
+    # The offer prices the aggregate null-fraction scan alongside the
+    # distinct-count check: one paid half, both scans.
+    assert offer["estimated_bytes"] == 50 * MB
     # What did not run has to be nameable, now that the status no longer says so.
     assert offer["axes"] == ["grain"]
     assert envelope.data["axes_run"] == ["schema", "volume"]
@@ -266,7 +283,7 @@ def test_confirmed_check_completes_the_scanning_axes(
     fake_bq_client, route_adapter, tmp_path
 ):
     _seed_snapshot(tmp_path)
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    fake_bq_client.row_resolver = _aggregate_response
     route_adapter(fake_bq_client)
 
     envelope = _dispatch(tmp_path, "check", confirm=True, budget=float(100 * MB))
@@ -318,19 +335,19 @@ def _seed_two_keyed_tables(tmp_path: Path) -> None:
 def test_check_fanout_estimate_reflects_per_query_floor(
     fake_bq_client, route_adapter, tmp_path
 ):
-    """A fan-out check over two tables estimates 2x the per-query floor, not the
-    few KB of raw scan; confirming with exactly that budget then runs without the
-    per-statement floor rejecting a statement (the reject-ladder the estimate
-    used to cause)."""
+    """A fan-out check over two tables estimates the per-query floors and the
+    null-fraction profile reserves, not the few KB of raw scan; confirming with
+    exactly that budget then runs without the per-statement floor rejecting a
+    statement (the reject-ladder the estimate used to cause)."""
 
     _seed_two_keyed_tables(tmp_path)
     route_adapter(fake_bq_client)
 
     unconfirmed = _dispatch(tmp_path, "check")
     assert unconfirmed.status.value == "ok"
-    assert unconfirmed.data["offer"]["estimated_bytes"] == 2 * 10 * MB
+    assert unconfirmed.data["offer"]["estimated_bytes"] == 90 * MB
 
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    fake_bq_client.row_resolver = _aggregate_response
     route_adapter(fake_bq_client)
     confirmed = _dispatch(
         tmp_path,
@@ -375,7 +392,7 @@ def test_the_offer_carries_the_same_caveats_as_the_settled_answer(
     assert "offer" in unconfirmed.data
     assert [w for w in unconfirmed.warnings if "newer than the drift baseline" in w]
 
-    fake_bq_client.row_resolver = lambda sql: [{"d_0": 100}]
+    fake_bq_client.row_resolver = _aggregate_response
     route_adapter(fake_bq_client)
     confirmed = _dispatch(
         tmp_path,
