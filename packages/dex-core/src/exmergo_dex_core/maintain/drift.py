@@ -29,7 +29,7 @@ from ..adapters.base import Adapter, distinct_combination_sql
 from ..cache import Dataset, Relationship, match_identifier
 from ..dbt_project import ProjectDefinitions
 from ..explore import relationships as rel_mod
-from .snapshot import SemanticLayer, Snapshot, TransformLayer
+from .snapshot import SemanticLayer, SemanticModelDef, Snapshot, TransformLayer
 
 #: Deliberately without the supported-set gate `SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS`
 #: gives the baseline, and this is where that decision is recorded rather than
@@ -967,6 +967,17 @@ def grain_drift(
     return findings
 
 
+def _matched_identifier(sm: SemanticModelDef, dataset_ids: list[str]) -> list[str]:
+    """The live warehouse identifier(s) this semantic model resolves to, by
+    whichever of ``model_ref``/``relation`` it states (#409): the same
+    fallback :func:`semantic_free_drift` applies inline for its own column
+    check, shared here so the relationship check resolves each endpoint the
+    same way rather than by a second rule."""
+
+    target = sm.model_ref or sm.relation
+    return match_identifier(target, dataset_ids) if target else []
+
+
 def semantic_free_drift(
     current_transform: TransformLayer | None,
     current_semantic: SemanticLayer | None,
@@ -985,6 +996,18 @@ def semantic_free_drift(
     base_defs.update({("metric", m.name): m for m in baseline.metrics})
     cur_defs = {("semantic_model", d.name): d for d in current.semantic_models}
     cur_defs.update({("metric", m.name): m for m in current.metrics})
+    # Relationships join the same generic added/removed/changed diff below,
+    # but only when both sides actually captured them (#409): a baseline
+    # pinned before this field existed has none, and comparing that against a
+    # populated current layer would report every real relationship as
+    # freshly added rather than as a baseline gap.
+    relationships_comparable = (
+        baseline.relationships_and_keys_captured
+        and current.relationships_and_keys_captured
+    )
+    if relationships_comparable:
+        base_defs.update({("relationship", r.name): r for r in baseline.relationships})
+        cur_defs.update({("relationship", r.name): r for r in current.relationships})
 
     for kind, name in sorted(cur_defs.keys() - base_defs.keys()):
         findings.append(
@@ -1054,7 +1077,14 @@ def semantic_free_drift(
                 )
             )
             continue
-        matches = match_identifier(sm.model_ref, dataset_ids) if sm.model_ref else []
+        # A model whose semantic layer states its own physical relation
+        # directly (#409: `relation`, populated by a format with no build
+        # step between a semantic model and a warehouse relation) is matched
+        # against the warehouse the same way `model_ref` is, once a model_ref
+        # is absent to try first: the two name the same kind of thing to this
+        # comparison, a physical relation this semantic model sits on.
+        match_target = sm.model_ref or sm.relation
+        matches = match_identifier(match_target, dataset_ids) if match_target else []
         if len(matches) != 1:
             continue  # not built (or ambiguous): nothing to check columns against
         available = columns_by_id[matches[0]]
@@ -1084,8 +1114,76 @@ def semantic_free_drift(
                             f"{matches[0]}"
                         ),
                         data={"semantic_model": sm.name, "role": role, "name": name},
-                        impacted_models=[sm.model_ref],
+                        impacted_models=[sm.model_ref] if sm.model_ref else [],
                         impacted_metrics=_metrics_from_measures(current, impacted),
+                    )
+                )
+        if not current.relationships_and_keys_captured:
+            continue
+        for columns in sm.keys:
+            missing = [c for c in columns if c not in available]
+            if not missing:
+                continue
+            findings.append(
+                DriftFinding(
+                    axis="semantic",
+                    code="dangling_reference",
+                    identifier=matches[0],
+                    severity="high",
+                    detail=(
+                        f"a declared key on semantic model '{sm.name}' names "
+                        f"column(s) {', '.join(missing)}, which "
+                        f"{'is' if len(missing) == 1 else 'are'} gone from "
+                        f"{matches[0]}"
+                    ),
+                    data={"semantic_model": sm.name, "role": "key", "columns": columns},
+                )
+            )
+
+    if current.relationships_and_keys_captured:
+        models_by_name = {sm.name: sm for sm in current.semantic_models}
+        for rel in current.relationships:
+            left = models_by_name.get(rel.model)
+            right = models_by_name.get(rel.to_model)
+            if left is None or right is None:
+                missing_side = rel.model if left is None else rel.to_model
+                findings.append(
+                    DriftFinding(
+                        axis="semantic",
+                        code="broken_relationship",
+                        severity="high",
+                        detail=(
+                            f"relationship '{rel.name}' names '{missing_side}', "
+                            "which is no longer a semantic model"
+                        ),
+                        data={"relationship": rel.name, "missing_model": missing_side},
+                    )
+                )
+                continue
+            left_matches = _matched_identifier(left, dataset_ids)
+            right_matches = _matched_identifier(right, dataset_ids)
+            if len(left_matches) != 1 or len(right_matches) != 1:
+                continue  # not built (or ambiguous): nothing to check columns against
+            left_available = columns_by_id[left_matches[0]]
+            right_available = columns_by_id[right_matches[0]]
+            broken = [
+                [frm, to]
+                for frm, to in rel.column_pairs
+                if frm not in left_available or to not in right_available
+            ]
+            if broken:
+                findings.append(
+                    DriftFinding(
+                        axis="semantic",
+                        code="broken_relationship",
+                        identifier=left_matches[0],
+                        severity="high",
+                        detail=(
+                            f"relationship '{rel.name}' from '{rel.model}' to "
+                            f"'{rel.to_model}' names column pair(s) that no "
+                            f"longer resolve: {broken}"
+                        ),
+                        data={"relationship": rel.name, "missing_pairs": broken},
                     )
                 )
 

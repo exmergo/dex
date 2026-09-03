@@ -69,6 +69,49 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   context have a declared home instead of being dropped or smuggled into a
   neighbouring field.
 
+- **Native Ossie documents reach maintain's tier 2, so `maintain snapshot` and
+  `maintain check` get a real drift baseline for a semantic vendor that is not
+  dbt** ([#409]). `OssieSemanticLayer` now answers `transform_layer()` (file
+  hashes only; Ossie declares no build step) and `semantic_layer()` (named
+  definitions, each with a content hash and the physical column behind it),
+  the same two methods `DbtProject` already implements.
+
+  The snapshot shape gained two things it could not hold before, both additive
+  and both defaulted so a committed `.dex/snapshot.json` from before this
+  change still loads: `SemanticModelDef.relation` (the semantic model's own
+  physical relation, for a format with no build step to name a `model_ref`
+  through) and `.keys` (every declared unique key, one list of columns per
+  declaration regardless of arity), plus a new `SemanticLayerSnapshot.
+  relationships` list carrying full composite ordered column pairs. None of
+  it bumps `SNAPSHOT_SCHEMA_VERSION`.
+
+  The hazard the issue named directly: an old baseline's empty `relationships`
+  and `keys` is indistinguishable from "this layer declares none", which would
+  make relationship and key drift report a false clean bill instead of "not
+  checked". `SemanticLayerSnapshot.relationships_and_keys_captured` (default
+  `False`) is the guard, the same role `warehouse_from` already plays for the
+  warehouse side: `semantic_free_drift`'s two new finding classes,
+  `broken_relationship` (a relationship whose model or column pair no longer
+  resolves) and the key-column analogue of `dangling_reference`, run only when
+  the *current* read set it; relationship added/removed/changed detection
+  (folded into the existing generic diff) runs only when *both* the baseline
+  and the current read did, so a baseline that never captured relationships
+  never reads every current one as freshly added. dbt's own snapshots leave
+  the flag `False`: it has no composite-relationship or multi-column-key
+  concept at the semantic-model level to capture, and that is an honest
+  narrower answer, not a regression.
+
+  The two layers are read independently now (`maintain/commands.py`'s
+  `_read_layers`), through the same seam #408 added on the explore side: the
+  semantic half comes from whichever format answers `semantic.vendor`
+  (`SEMANTIC_PROJECT_FORMATS`, a table lookup rather than a name check), not
+  always from the configured `project.format`. A repository with no dbt
+  project at all and `semantic.vendor: ossie` gets a semantic baseline even
+  though the transform half has nothing to answer with, and a repository that
+  keeps dbt for its models with Ossie's semantics declared beside it gets both,
+  each degrading on its own rather than one absence hiding the other's
+  presence.
+
 - **A semantic layer's own declared dataset keys now reach grain detection**
   ([#408]). Ossie is never the transformation project `engine.project_format()`
   resolves, so its `primary_key`/`unique_keys` declarations had no route to

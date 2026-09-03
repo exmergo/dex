@@ -9,11 +9,13 @@ Ossie is configured through ``semantic.vendor: ossie`` and
 The semantic backend builds this reader from those coordinates; dbt, when
 present, remains responsible for the transformation-project tiers.
 
-**The tier reached today is tier 1 plus the catalog channel**, and no more.
-Tier 2 needs a snapshot shape that can hold composite relationships and dataset
-keys, and tier 3 needs a preservation contract for writing documents back. Both
-are their own work, and claiming them here structurally, by growing the methods,
-would be claiming them to `maintain reconcile` as well.
+**The tier reached today is tier 2 plus the catalog channel** (#409): this
+class also answers ``transform_layer()``/``semantic_layer()``, the snapshot
+fingerprints ``maintain snapshot``/``maintain check`` diff against a baseline,
+so a repository whose semantic vendor is Ossie gets a real drift baseline for
+its declared keys and relationships. Tier 3 (a preservation contract for
+writing documents back) is not claimed here: growing the write methods would
+claim them to ``maintain reconcile`` as well, and that is its own work.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from .loader import DOCUMENT_SUFFIXES, LoadResult, OssieDependencyError, load_do
 
 if TYPE_CHECKING:
     from ..adapters.project import ProjectContext
+    from ..maintain.snapshot import SemanticLayer, TransformLayer
     from ..project_definitions import ProjectDefinitions
     from ..semantic_catalog import SemanticCatalogView
 
@@ -158,6 +161,48 @@ class OssieSemanticLayer:
         return catalog_mod.semantic_catalog(
             loaded.documents, connector=self.connector, notes=loaded.notes()
         )
+
+    # --- tier 2 -----------------------------------------------------------
+
+    def transform_layer(self) -> TransformLayer:
+        """The document set's own fingerprint (#409): file hashes and nothing
+        else, since Ossie declares no build step. See
+        :func:`.snapshot.transform_layer` for what that means for the rest of
+        the shape.
+
+        **This must not raise**, matching tier 1's promise rather than
+        dbt's tier-2 contract of raising when there is no project: an unreadable
+        document is exactly the ordinary condition tier 1 already degrades
+        around, and a repository whose semantic vendor is Ossie should not
+        lose its whole drift baseline because one file could not be hashed.
+        """
+
+        from . import snapshot as snapshot_mod
+
+        return snapshot_mod.transform_layer(self.repo_root, self.files)
+
+    def semantic_layer(self) -> SemanticLayer:
+        """The documents' own fingerprint (#409): named definitions, declared
+        keys, and composite relationships, each with a content hash.
+
+        Degrades the same way :meth:`declared_definitions` does, for the same
+        reason: every failure this format has is a state a user reaches by an
+        ordinary typo or a missing extra, not a wiring mistake that should
+        propagate.
+        """
+
+        from ..maintain.snapshot import SemanticLayer as _SemanticLayerSnapshot
+        from . import snapshot as snapshot_mod
+
+        try:
+            loaded = self._load()
+        except OssieDependencyError as exc:
+            return _SemanticLayerSnapshot(notes=[str(exc)])
+        except (OSError, ValueError) as exc:
+            return _SemanticLayerSnapshot(
+                notes=[f"native Ossie documents could not be read: {exc}"]
+            )
+        return snapshot_mod.semantic_layer(loaded, connector=self.connector)
 
     def _load(self) -> LoadResult:
         if self._loaded is None:
