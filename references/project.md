@@ -608,7 +608,7 @@ project:
 
 | Name | Example | For |
 |---|---|---|
-| shipped | `dbt` | dex's own formats, and never shadowable by anything installed |
+| shipped | `dbt`, `ossie` | dex's own formats, and never shadowable by anything installed |
 | dotted path | `mypkg.projects:my_project` | a factory reachable by import, with no packaging work |
 | entry point | `acme` | a name an installed distribution registered under `exmergo_dex_core.projects` |
 
@@ -633,13 +633,20 @@ format and one format's coordinates are not another's.
 Anything callable that takes a `ProjectContext` and returns a project: a function, a
 class whose `__init__` takes one, or a classmethod like `DbtProject.from_context`.
 
-`ProjectContext` has three fields, and the point of the shape is that a format
-ignores the ones it does not have.
+`ProjectContext` is a set of nullable slots, and the point of the shape is that a
+format ignores the ones it does not have.
 
 - **`repo_root`**, the directory dex was pointed at, or `None` when there is no
   repository in the picture.
 - **`project_dir`**, where within that repository the project was pinned, relative
   to `repo_root`. `None` when nothing pinned one.
+- **`connector`**, the name of the warehouse dex resolved for this run, or `None`
+  when nothing named one. A **name**, never a live adapter and never a credential,
+  so reading it opens no connection and costs nothing. It is here because a format
+  may have to read an authored expression or relation name the way the active
+  warehouse would, and identifier arity, quoting, and unquoted-case folding are
+  the connector's rules: a format that guesses them links a declaration to the
+  wrong column or to none. dbt reads its own target and ignores this.
 - **`options`**, your format's own coordinates, passed through verbatim. dex does
   not interpret them, so the keys are yours to define and yours to validate.
 

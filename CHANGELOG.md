@@ -9,6 +9,66 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **Native Apache Ossie semantic models are readable, as a project format rather
+  than a set of vendor branches** ([#405], [#406], [#407]). `semantic.vendor:
+  ossie` beside a dbt project, or `project.format: ossie` for a repository with
+  no dbt project at all, reads native `.ossie.yaml` / `.ossie.yml` /
+  `.ossie.json` documents into the same catalog `explore semantic list` has
+  always returned. Neither arrangement involves MetricFlow, and neither format
+  imports the other's reader.
+
+  Ossie is [entering ASF maturity](https://github.com/apache/ossie) and every one
+  of its upstream converters converts *into* it from a vendor format, so this is
+  the first independent consumer implementation rather than a late follow. The
+  cost of being early is that the schema moves underneath the implementation,
+  which is why pinning is a first-class mechanism here with its own test: dex
+  vendors the upstream JSON Schema verbatim and asserts its sha256 against a
+  recorded constant. Upstream declares the document version as a constant that
+  does not move when the schema does, and says plainly that the schema may change
+  before release, so a version check would have been worthless as a drift signal.
+  Content hashing makes a regeneration a reviewed diff in a commit instead.
+
+  Three validation layers on three install tiers. Structure is the bundled schema
+  and needs the new `[ossie]` extra, which is one JSON Schema validator and
+  nothing else. Integrity is pure Python. Expression syntax rides on the existing
+  `[sql]` extra and, absent it, degrades to a **named skipped-validation note**
+  rather than a silent pass, following the refusal posture `guards/dialect.py`
+  already sets. The integrity layer ports the judgment in upstream's own
+  `validation/validate.py` so dex and upstream agree about what a valid document
+  is; two rules are dex's own and are carried back upstream as consumer findings.
+
+  **The read is deliberately conservative, and every place it declines says so.**
+  A field resolves to a physical column only when the whole dataset source is
+  accepted as one relation by the active connector *and* the selected expression
+  is an unquoted bare identifier. Ossie documents a source as
+  `database.schema.table` **or a query** with no portable discriminator, so a
+  source dex cannot address produces no column, no exposure annotation, and no
+  PII linkage: a query read as a relation would reach the PII gate as physical
+  evidence that does not exist. Metric lineage comes only from qualified
+  `dataset.field` references that resolve, and is **empty** when none do, because
+  Ossie states no metric-to-dataset reference and naming every dataset would be
+  the maximal claim dressed as a conservative one.
+
+  What Ossie structurally cannot carry is declared rather than left absent, since
+  an absent field and an undeclared one read identically to a caller. There are
+  no measures and no entities, so every field of both kinds is named in
+  `unavailable`; `metrics[].dimensions` is empty and declared, which is why
+  `--for-dimension` refuses off that declaration rather than off a vendor name.
+  `explore semantic query` and `values` refuse too: Ossie specifies interchange
+  metadata and not a portable query runtime, so rendering a statement would mean
+  inventing filter grammar and join planning the document's author never stated.
+
+  Two supporting changes fall out of this and are useful on their own.
+  `ProjectContext` gains a `connector` slot, because identifier arity, quoting
+  and case folding are the connector's rules and a format that guesses them links
+  a declaration to the wrong column or to none; it is a name, never an adapter
+  and never a credential. And `DimensionInfo` gains the `vendor_params` escape
+  hatch `MetricInfo` already had, so a format's dialect spellings and authored AI
+  context have a declared home instead of being dropped or smuggled into a
+  neighbouring field.
+
 ## [1.9.2] - 2026-09-02
 
 ### Added

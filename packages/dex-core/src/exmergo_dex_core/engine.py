@@ -707,7 +707,58 @@ class DexEngine:
             ProjectContext(
                 repo_root=self.repo_root,
                 project_dir=self.config.dbt_project_dir,
+                connector=self.connector or self.config.connector,
                 options=self._project_options,
+            ),
+        )
+
+    def semantic_catalog_format(self) -> ExploreProject:
+        """The project format that answers the semantic catalog.
+
+        #408 infrastructure: this is the shared catalog route for the backend
+        and ``--use-project``. When it differs from ``project.format``, #408
+        must compose native tier-1 declarations with dbt rather than replacing it.
+
+        Usually :meth:`project_format`, and the reason this method exists is the
+        case where it is not. The semantic layer and the transformation project
+        are two axes: a repository can keep dbt for its models and author its
+        semantics as native Apache Ossie documents beside them, and in that
+        arrangement dbt keeps serving tier 1 while a second format answers the
+        catalog.
+
+        **A table lookup rather than a vendor branch, and that is the whole
+        point.** The alternative shape, an `if vendor == ...` at each call site,
+        was what this replaced: it put a vendor name inside two commands and the
+        backend resolver, and the next format would have added three more. Here
+        the vendor names a *format*, the format is built through the same
+        resolver and the same context as any other, and every caller downstream
+        keeps asking a project for a catalog without knowing who answered.
+
+        The format is built per call for the same reason :meth:`project_format`
+        builds per command: its source is a file a later command may rewrite.
+        """
+
+        from .adapters.project import ProjectContext
+        from .adapters.project_resolver import build_project
+        from .config import SEMANTIC_PROJECT_FORMATS
+
+        vendor = (getattr(self.config.semantic, "vendor", None) or "dbt").lower()
+        named = SEMANTIC_PROJECT_FORMATS.get(vendor)
+        if named is None:
+            return self.project_format()
+        # The vendor's own coordinates, read from the config section named after
+        # it (`semantic.ossie` for `vendor: ossie`) and passed through as the
+        # format's options. They live on the semantic axis because that is the
+        # axis the user is configuring; the format sees the same options from
+        # either route, which is what makes the two one implementation.
+        section = getattr(self.config.semantic, vendor, None)
+        options = section.model_dump() if section is not None else {}
+        return build_project(
+            named,
+            ProjectContext(
+                repo_root=self.repo_root,
+                connector=self.connector or self.config.connector,
+                options=options,
             ),
         )
 
@@ -872,6 +923,7 @@ class DexEngine:
         infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
+        use_hosted_semantic_layer: bool = False,
     ) -> RelationshipsResult:
         from .explore import commands as explore
 
@@ -881,6 +933,7 @@ class DexEngine:
             infer_by_overlap=infer_by_overlap,
             refresh=refresh,
             use_project=use_project,
+            use_hosted_semantic_layer=use_hosted_semantic_layer,
         )
 
     def map(
@@ -892,6 +945,7 @@ class DexEngine:
         infer_by_overlap: bool = False,
         refresh: bool = False,
         use_project: bool = False,
+        use_hosted_semantic_layer: bool = False,
     ) -> MapResult:
         from .explore import commands as explore
 
@@ -903,6 +957,7 @@ class DexEngine:
             verify=verify,
             refresh=refresh,
             use_project=use_project,
+            use_hosted_semantic_layer=use_hosted_semantic_layer,
         )
 
     def query(self, sql: str, *, auto_profile: bool | None = None) -> QueryResult:

@@ -454,12 +454,13 @@ class ProjectAdapter(Protocol):
 class ProjectContext:
     """Everything a format gets to build itself from when dex constructs it.
 
-    Three fields, because the formats disagree about what keys them and the
-    disagreement is not resolvable by picking a winner. A dbt project is keyed by
-    a directory. A project reduced from a graph already in memory has neither a
-    directory nor a repository. A hosted format has service coordinates and
-    neither. A contract shaped around the directory-shaped one would leave the
-    other two unbuildable, which is the group this seam exists for.
+    Nullable slots rather than one required coordinate, because the formats
+    disagree about what keys them and the disagreement is not resolvable by
+    picking a winner. A dbt project is keyed by a directory. A project reduced
+    from a graph already in memory has neither a directory nor a repository. A
+    hosted format has service coordinates and neither. A contract shaped around
+    the directory-shaped one would leave the other two unbuildable, which is the
+    group this seam exists for.
 
     ``repo_root`` is the directory dex was pointed at, or ``None`` when there is
     no repository in the picture.
@@ -470,6 +471,17 @@ class ProjectContext:
     A format not keyed by a directory ignores this exactly as a format with no
     repository ignores ``repo_root``: both are slots for the formats that have
     them, not an assumption that every format does.
+
+    ``connector`` is the name of the warehouse dex resolved for this run, or
+    ``None`` when nothing named one. A slot for the formats that have one,
+    exactly as the two above are: dbt reads its own target and ignores this, and
+    a format keyed by a graph has no use for it. It is here because a format may
+    have to read an authored expression or an authored relation name the way the
+    active warehouse would, and the answer differs per connector: identifier
+    arity, quoting, and unquoted-case folding are the connector's rules, and a
+    format that guesses them links a declaration to the wrong column or to none.
+    It is a **name**, never a live adapter and never a credential, so reading it
+    opens no connection and costs nothing.
 
     ``options`` is the format's own non-secret coordinates, passed through
     verbatim from wherever the format was named. dex does not interpret it, so
@@ -495,6 +507,7 @@ class ProjectContext:
 
     repo_root: str | None = None
     project_dir: str | None = None
+    connector: str | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
 
 

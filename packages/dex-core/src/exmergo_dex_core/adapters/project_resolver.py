@@ -4,9 +4,9 @@ A name reaches here from `.dex/config.yml` (`project.format`) or from
 ``--project-format``, and leaves as a constructed project. Three kinds of name
 resolve, in this order:
 
-- a **shipped name** (``dbt``), which can never be shadowed by anything
-  installed, so a config that says ``dbt`` means dex's own reader on every
-  machine that reads it;
+- a **shipped name** (``dbt``), which can never be shadowed by
+  anything installed, so a config that says ``dbt`` means dex's own reader on
+  every machine that reads it;
 - a **dotted path**, ``mypkg.projects:my_project``, which needs no packaging work
   at all and is what a host reaches for first;
 - an **entry-point name**, registered by an installed distribution under
@@ -34,6 +34,7 @@ from ..errors import ConfigurationError
 from .project import DbtProject, ExploreProject, ProjectContext, ProjectFactory
 
 ENTRY_POINT_GROUP = "exmergo_dex_core.projects"
+
 
 #: The formats dex ships and will construct by name. Checked before anything
 #: installed, so no third-party registration can take over a shipped name.

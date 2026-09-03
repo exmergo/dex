@@ -538,20 +538,16 @@ def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
     the measurement is *allowed to change* still depends on the kind: see
     :func:`verify_relationships` on confidence.
 
-    A composite join is excluded, and the exclusion is load-bearing rather than
-    an oversight. :func:`_batched_probe_sql` joins on ``from_columns[0]``
-    and ``to_columns[0]`` only, which was total coverage while inference was the
-    sole source (it emits single-column edges by construction) and stops being
-    so now that declared edges qualify. Probing the first column of a composite
-    key measures a different relationship than the one declared and would
-    report its orphan count as though it were the join's: silently wrong beats
-    unmeasured, so these stay unverified until the probe itself spans a key.
+    Composite joins are included only when they carry equal, non-empty column
+    lists. :func:`_batched_probe_sql` joins every ordered pair as one tuple;
+    probing only the first pair would measure a different relationship and is
+    never an allowed fallback.
     """
 
     return [
         rel
         for rel in relationships
-        if len(rel.from_columns) == 1 and len(rel.to_columns) == 1
+        if rel.from_columns and len(rel.from_columns) == len(rel.to_columns)
     ]
 
 
@@ -717,17 +713,24 @@ def _batched_probe_sql(batch: list[Relationship]) -> str:
     for child, edges in by_child.items():
         counts, joins = [], []
         for index, rel in edges:
-            fk = _quote_part(rel.from_columns[0])
-            key = _quote_part(rel.to_columns[0])
+            fks = [_quote_part(column) for column in rel.from_columns]
+            keys = [_quote_part(column) for column in rel.to_columns]
             parent = _quote_identifier(rel.to_dataset)
+            nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
+            parent_keys = ", ".join(
+                f"{key} AS pk{pair_index}" for pair_index, key in enumerate(keys)
+            )
+            predicate = " AND ".join(
+                f"d{index}.pk{pair_index} = c.{fk}" for pair_index, fk in enumerate(fks)
+            )
             counts.append(
-                f"COUNT(c.{fk}) AS nonnull_fk_{index}, "
-                f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d{index}.pk IS NULL "
+                f"COUNT(CASE WHEN {nonnull} THEN 1 END) AS nonnull_fk_{index}, "
+                f"COUNT(CASE WHEN {nonnull} AND d{index}.pk0 IS NULL "
                 f"THEN 1 END) AS orphans_{index}"
             )
             joins.append(
-                f"LEFT JOIN (SELECT DISTINCT {key} AS pk FROM {parent}) "  # noqa: S608
-                f"d{index} ON d{index}.pk = c.{fk}"
+                f"LEFT JOIN (SELECT DISTINCT {parent_keys} FROM {parent}) "  # noqa: S608
+                f"d{index} ON {predicate}"
             )
         aggregates.append(
             f"SELECT {', '.join(counts)} "  # noqa: S608
@@ -1076,7 +1079,12 @@ def declared_relationships(
                     f"{label} references a relation not in this connection's inventory"
                 )
             continue
-        key = (child.lower(), fk.column.lower(), parent.lower(), fk.to_column.lower())
+        key = (
+            child.lower(),
+            (fk.column.lower(),),
+            parent.lower(),
+            (fk.to_column.lower(),),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -1088,6 +1096,51 @@ def declared_relationships(
                 to_columns=[fk.to_column],
                 kind=RelationshipKind.DECLARED,
                 confidence=1.0,
+                declaration_sources=[fk.source],
+            )
+        )
+    for declaration in defs.declared_relationships:
+        child, child_ambiguous = resolve_declared(
+            declaration.relation, declaration.model, known_identifiers
+        )
+        parent, parent_ambiguous = resolve_declared(
+            declaration.to_relation, declaration.to_model, known_identifiers
+        )
+        label = declaration.name or (
+            f"declared relationship {declaration.model} -> {declaration.to_model}"
+        )
+        if child is None or parent is None:
+            reason = (
+                "matches more than one object here"
+                if (child_ambiguous or parent_ambiguous)
+                else "references a relation not in this connection's inventory"
+            )
+            notes.append(f"{label} {reason}; skipped rather than guessed")
+            continue
+        from_columns = [pair[0] for pair in declaration.column_pairs]
+        to_columns = [pair[1] for pair in declaration.column_pairs]
+        key = (
+            child.lower(),
+            tuple(c.lower() for c in from_columns),
+            parent.lower(),
+            tuple(c.lower() for c in to_columns),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        source = declaration.source + (
+            f" relationship '{declaration.name}'" if declaration.name else ""
+        )
+        relationships.append(
+            Relationship(
+                from_dataset=child,
+                from_columns=from_columns,
+                to_dataset=parent,
+                to_columns=to_columns,
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+                declared_by=source,
+                declaration_sources=[source],
             )
         )
     return relationships, notes

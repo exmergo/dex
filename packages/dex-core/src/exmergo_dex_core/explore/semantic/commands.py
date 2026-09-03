@@ -76,6 +76,21 @@ def semantic_list(
     notes: list[str] = []
 
     if slicing:
+        # A backend that declares it cannot say which dimensions group a metric
+        # has to refuse rather than answer, and the refusal is read off that
+        # declaration rather than off a vendor name. Otherwise the inversion
+        # below runs over empty groupable lists and reports "the layer declares
+        # the dimension and no metric reaches it", which is a statement about
+        # the layer where the truth is that this backend was never told.
+        if "dimensions" in catalog.unavailable.get("metrics", ()):
+            raise SemanticBackendError(
+                f"the '{catalog.backend}' semantic backend ({catalog.vendor}) "
+                "cannot say which dimensions a metric can be grouped by, so "
+                "--for-dimension has nothing to invert. Its `unavailable` block "
+                "says so on every catalog it returns. List without "
+                "--for-dimension to see what the layer declares, and read a "
+                "dimension's own `semantic_model` to find the relation behind it"
+            )
         groupable, unknown = catalog.metrics_for_dimensions(slicing)
         if unknown:
             raise SemanticBackendError(

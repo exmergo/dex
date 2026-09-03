@@ -47,6 +47,12 @@ from .dbt_semantic import (
 from .diffs import file_diff
 from .errors import ProjectError
 from .metricflow_dialect import METRIC_TIME
+from .project_definitions import (
+    DeclaredCompositeKey,
+    DeclaredForeignKey,
+    DeclaredKey,
+    ProjectDefinitions,
+)
 from .semantic_catalog import (
     DIMENSIONS_PER_DECLARATION,
     DIMENSIONS_PER_QUERYABLE_PATH,
@@ -1111,87 +1117,6 @@ def metric_inputs(entry: dict[str, Any]) -> tuple[list[str], list[str]]:
             add(measures, conversion.get("base_measure"))
             add(measures, conversion.get("conversion_measure"))
     return measures, metrics
-
-
-class DeclaredForeignKey(BaseModel):
-    """One ``relationships`` test: child column to parent column.
-
-    ``relation`` / ``to_relation`` carry quote-stripped physical names when the
-    manifest resolves them; the YAML fallback leaves them None, and downstream
-    resolution is name-based.
-    """
-
-    model: str
-    relation: str | None = None
-    column: str
-    to_model: str
-    to_relation: str | None = None
-    to_column: str
-    source: str
-
-
-class DeclaredKey(BaseModel):
-    """A column carrying ``unique`` and/or ``not_null`` tests on one model."""
-
-    model: str
-    relation: str | None = None
-    column: str
-    unique: bool = False
-    not_null: bool = False
-    source: str
-
-
-class DeclaredCompositeKey(BaseModel):
-    """A model-level ``unique_combination_of_columns`` test: the columns whose
-    COMBINATION is unique, never any one of them alone.
-
-    A distinct model from ``DeclaredKey`` rather than a widened ``column``:
-    this test has no ``not_null`` variant and a different multiplicity (it is
-    the model's own claim about several columns together, not one column's own
-    test), so overloading ``column`` to sometimes hold a list would blur two
-    different concepts into one field.
-    """
-
-    model: str
-    relation: str | None = None
-    columns: list[str]
-    source: str
-
-
-class ProjectDefinitions(BaseModel):
-    """What the dbt project declares, loaded once for consumers that must keep
-    working without one.
-
-    ``present`` False means no readable project: every collection is empty and
-    consumers degrade instead of erroring. ``relationship_source`` and
-    ``semantic_source`` record where each half came from (``"manifest"`` is
-    exact, ``"yaml"`` resolves by name). ``model_relations`` maps referable
-    names (model names and ``source.table``) to quote-stripped physical
-    relations. ``primary_entities`` maps model names to their declared grain
-    column; ``metric_models`` lists models reachable from any metric.
-    ``declared_composite_keys`` carries model-level ``unique_combination_of_
-    columns`` tests -- a grain declaration a column-level test structurally
-    cannot express. ``built_relation_names`` is bare table names (lowered) the
-    project builds or sources, from files/YAML alone (populated even with no
-    compiled manifest, unlike ``model_relations``) -- explore's orphan-relation
-    down-ranking reads this. ``notes`` are analyst-readable caveats for the
-    caller's envelope.
-    """
-
-    present: bool = False
-    project_dir: str | None = None
-    manifest_loaded: bool = False
-    manifest_stale: bool = False
-    relationship_source: str | None = None
-    semantic_source: str | None = None
-    foreign_keys: list[DeclaredForeignKey] = Field(default_factory=list)
-    declared_keys: list[DeclaredKey] = Field(default_factory=list)
-    declared_composite_keys: list[DeclaredCompositeKey] = Field(default_factory=list)
-    model_relations: dict[str, str] = Field(default_factory=dict)
-    primary_entities: dict[str, str] = Field(default_factory=dict)
-    metric_models: list[str] = Field(default_factory=list)
-    built_relation_names: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
 
 
 def definitions(

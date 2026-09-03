@@ -595,6 +595,7 @@ def test_map_summary_is_a_budgeted_map_not_a_schema_dump(
         "verified",
         "orphan_fraction",
         "declared_by",
+        "declaration_sources",
     }, "edges are shaped exactly like `explore relationships` returns them"
 
 

@@ -514,6 +514,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "infer_by_overlap": "infer_by_overlap",
             "refresh": "refresh",
             "use_project": "use_project",
+            "use_hosted_semantic_layer": "use_hosted_semantic_layer",
         },
     },
     ("explore", "map"): {
@@ -525,6 +526,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "infer_by_overlap": "infer_by_overlap",
             "refresh": "refresh",
             "use_project": "use_project",
+            "use_hosted_semantic_layer": "use_hosted_semantic_layer",
         },
     },
     ("explore", "diagram"): {"method": "diagram", "args": {"full": "full"}},

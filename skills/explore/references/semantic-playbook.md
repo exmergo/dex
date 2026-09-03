@@ -125,6 +125,38 @@ often does not.
 - **An unknown metric or dimension name is refused by name.** A search term that
   matched nothing is not: it comes back as a note, because a substring matching
   nothing is an honest answer about the layer's words.
+- **A backend that declares a field unavailable refuses the command that needs
+  it**, rather than answering from the empty value. `--for-dimension` on a layer
+  whose backend lists `dimensions` under `unavailable.metrics` is the standing
+  example. Read `unavailable` before concluding anything from an empty list.
+
+## When the layer is native Apache Ossie
+
+`vendor: ossie` means the layer is native Ossie documents in the repository rather
+than a dbt project. `list` works and reads the same shape as anywhere else, and
+the payload says so on `vendor`. Three things differ, and each is a property of the
+format rather than a missing feature:
+
+- **`query` and `values` refuse.** Ossie specifies interchange metadata and not a
+  portable query runtime, so there is no filter grammar and no join planning to
+  render a governed statement from. Take the physical route instead: a dimension
+  names its `semantic_model`, that model names its `relation`, and `explore
+  profile` then `explore query` reach the values under the firewall and the cost
+  guard. Do not present the refusal as dex being unable to reach the layer.
+- **`--for-dimension` refuses**, because Ossie states no metric-to-dimension
+  relationship at all. `metrics[].dimensions` is empty and `unavailable.metrics`
+  says why. An empty groupable list here is not "this metric can be grouped by
+  nothing".
+- **A metric with no `semantic_models` is a metric whose lineage did not resolve**,
+  not one that reads nothing. Ossie carries no metric-to-dataset reference, so dex
+  reports only what a qualified reference in the expression proved, and reports
+  nothing when none did.
+
+An element with no `column` is also normal here and the notes say which of four
+reasons applies: a computed expression, a quoted identifier, a query-backed
+dataset source, or a field written only in a non-SQL dialect. In every one of them
+dex declined to guess a column rather than failed to find one, so do not go looking
+for the column yourself and do not treat the absence as a data problem.
 
 ## Cost, and which backend answered
 

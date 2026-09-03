@@ -8,6 +8,7 @@ that descriptor instead of reaching through a growing set of class attributes.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -36,16 +37,22 @@ class BackendDescriptor:
     cost_guard_warning: str | None = None
 
 
-class SemanticBackendError(DexError):
-    """A semantic backend could not be constructed, reached, or queried."""
+class SemanticLayerError(DexError):
+    """A semantic layer could not be constructed, reached, or queried."""
 
 
-class SemanticQueryRefusedError(SemanticBackendError):
+class SemanticQueryRefusedError(SemanticLayerError):
     """A semantic request was understood and deliberately not executed."""
 
 
-class SemanticBackend(Protocol):
-    """The behavior required from a semantic backend."""
+class SemanticLayer(Protocol):
+    """The behavior required from a semantic layer and its runtime.
+
+    A layer is the semantic system of record, whether it is a local dbt
+    artifact, dbt Cloud, or native Ossie documents.  ``backend`` was the old
+    name for this seam; it hid that all three implementations own discovery as
+    well as execution.
+    """
 
     descriptor: BackendDescriptor
 
@@ -56,6 +63,10 @@ class SemanticBackend(Protocol):
     def values(self, dimension: str, metrics: list[str]) -> Any: ...
 
     def filter_refs(self, clauses: list[str]) -> list[str] | None: ...
+
+    def declared_relationships(self) -> list[Any]:
+        """Native full-pair declarations, or an empty list when unavailable."""
+        ...
 
 
 def descriptor_from_backend(backend: Any) -> BackendDescriptor:
@@ -122,14 +133,70 @@ def values_gap(backend: Any) -> str:
 
 
 _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
-    "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"}
+    "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"},
+    "ossie": {EXECUTION_DEX: "local"},
 }
 
 
-def resolve_backend(
+def _local_metricflow(engine: Any) -> SemanticLayer:
+    from .local import LocalMetricFlowBackend
+
+    return LocalMetricFlowBackend.from_engine(engine)
+
+
+def _hosted_dbt_cloud(engine: Any) -> SemanticLayer:
+    from .hosted import HostedDbtCloudBackend
+
+    return HostedDbtCloudBackend.from_config(
+        engine.config, getattr(engine, "semantic_source", None)
+    )
+
+
+def _local_ossie(engine: Any) -> SemanticLayer:
+    from .ossie import LocalOssieLayer
+
+    return LocalOssieLayer.from_engine(engine)
+
+
+# Which backend answers for a resolved (vendor, deployment) pair. A table rather
+# than a chain of conditions, so a vendor is a row here and nowhere else, and so
+# a deployment that resolved is a deployment that gets used: the previous shape
+# computed one and then short-circuited past it for a vendor, which happened to
+# be harmless only because that vendor has exactly one deployment.
+#
+# Each entry is a loader rather than a class, because the backends sit behind
+# different extras and importing all three to select one would make every
+# install pay for the other two.
+_BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
+    ("dbt", "local"): _local_metricflow,
+    ("dbt", "dbt_cloud"): _hosted_dbt_cloud,
+    ("ossie", "local"): _local_ossie,
+}
+
+# Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
+# token) has no meaning for them and is refused rather than ignored. Keyed by
+# the pair for the same reason the table above is.
+_SOURCE_REFUSALS: dict[tuple[str, str], str] = {
+    ("dbt", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for the local backend, which renders metric SQL and runs it "
+        "through this engine's own connector. Select the hosted backend "
+        "(semantic.deployment: dbt_cloud, or --api), or drop the source and "
+        "let the connector's credential govern"
+    ),
+    ("ossie", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for native Apache Ossie documents, which are files in this "
+        "repository. Drop the source, or select a hosted dbt semantic layer "
+        "with semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+}
+
+
+def resolve_semantic_layer(
     engine: Any, *, api: bool = False, local: bool = False
-) -> SemanticBackend:
-    """Resolve the configured semantic deployment or an execution override."""
+) -> SemanticLayer:
+    """Resolve the configured semantic layer or an execution override."""
 
     from ...config import SEMANTIC_DEPLOYMENTS, canonical_semantic_deployment
 
@@ -146,31 +213,41 @@ def resolve_backend(
 
     if api or local:
         execution = EXECUTION_VENDOR if api else EXECUTION_DEX
-        deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
+        try:
+            deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
+        except KeyError as exc:
+            raise SemanticBackendError(
+                f"semantic vendor '{vendor}' has no "
+                f"{'hosted' if api else 'local'} execution override"
+            ) from exc
     else:
         configured = getattr(semantic, "deployment", None) or getattr(
             semantic, "backend", None
         )
         deployment = canonical_semantic_deployment(configured or "local")
 
-    source = getattr(engine, "semantic_source", None)
-    if deployment == "dbt_cloud":
-        from .hosted import HostedDbtCloudBackend
+    build = _BACKENDS.get((vendor, deployment))
+    if build is None:
+        raise SemanticBackendError(
+            f"vendor '{vendor}' has no deployment '{deployment}'; use one of "
+            f"{', '.join(SEMANTIC_DEPLOYMENTS[vendor])} (or pass --local / --api)"
+        )
+    if getattr(engine, "semantic_source", None) is not None:
+        refusal = _SOURCE_REFUSALS.get((vendor, deployment))
+        if refusal is not None:
+            raise SemanticBackendError(refusal)
+    return build(engine)
 
-        return HostedDbtCloudBackend.from_config(engine.config, source)
-    if deployment == "local":
-        if source is not None:
-            raise SemanticBackendError(
-                "a semantic source supplies a hosted dbt Cloud token and has no "
-                "meaning for the local backend, which renders metric SQL and runs "
-                "it through this engine's own connector. Select the hosted backend "
-                "(semantic.deployment: dbt_cloud, or --api), or drop the source "
-                "and let the connector's credential govern"
-            )
-        from .local import LocalMetricFlowBackend
 
-        return LocalMetricFlowBackend.from_engine(engine)
-    raise SemanticBackendError(
-        f"vendor '{vendor}' has no deployment '{deployment}'; use one of "
-        f"{', '.join(SEMANTIC_DEPLOYMENTS[vendor])} (or pass --local / --api)"
-    )
+# RETRO: Compatibility names retained for callers that imported the first version of
+# this seam. New code must use SemanticLayer / resolve_semantic_layer.
+SemanticBackend = SemanticLayer
+SemanticBackendError = SemanticLayerError
+
+
+def resolve_backend(
+    engine: Any, *, api: bool = False, local: bool = False
+) -> SemanticLayer:
+    """Deprecated compatibility alias for :func:`resolve_semantic_layer`."""
+
+    return resolve_semantic_layer(engine, api=api, local=local)

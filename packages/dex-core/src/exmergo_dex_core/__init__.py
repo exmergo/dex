@@ -88,6 +88,7 @@ _EXPORTS = {
     "MermaidDiagram": "explore.diagram",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
+    "OssieDependencyError": "ossie.loader",
     "OverCeilingError": "guards.cost_guard",
     "Paradigm": "envelope",
     "PlanError": "transform.plans",
@@ -101,6 +102,7 @@ _EXPORTS = {
     "Result": "results",
     "ScopeError": "connect",
     "SemanticBackendError": "explore.semantic",
+    "SemanticLayerError": "explore.semantic",
     "SemanticQueryRefusedError": "explore.semantic",
     "SemanticSource": "connect",
     "SessionCeilingDecisionRequiredError": "guards.cost_guard",
@@ -154,6 +156,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .explore.diagram import MermaidDiagram, render_er_mermaid
     from .explore.semantic import (
         SemanticBackendError,
+        SemanticLayerError,
         SemanticQueryRefusedError,
     )
     from .guards.cost_guard import (
@@ -169,6 +172,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
+    from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
         ConfirmationRequest,
@@ -236,6 +240,7 @@ __all__ = [
     "MermaidDiagram",
     "NoBaselineError",
     "NoConnectorSelectedError",
+    "OssieDependencyError",
     "OverCeilingError",
     "Paradigm",
     "PlanError",
@@ -249,6 +254,7 @@ __all__ = [
     "Result",
     "ScopeError",
     "SemanticBackendError",
+    "SemanticLayerError",
     "SemanticQueryRefusedError",
     "SemanticSource",
     "SessionCeilingDecisionRequiredError",

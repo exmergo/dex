@@ -145,6 +145,16 @@ class DimensionInfo:
     than one declaring model has no single column to name and a synthesized token
     has no declaration at all. Absent is the honest answer in both cases; guessing
     a column out of an expression is what makes a reader over-claim.
+
+    ``vendor_params`` is the same escape hatch :class:`MetricInfo` carries, and
+    it is here for the same reason: a format states things about a dimension that
+    no portable field means anything for. A format holding several dialect
+    spellings of one expression, or authored guidance for an AI reader, has
+    nowhere else to put them, and the alternatives are both worse than a declared
+    slot. Dropping them loses what the author wrote. Smuggling them into a
+    neighbouring field is worse still: setting ``queryable_granularities`` to an
+    empty list to signal "there is other metadata here" would positively state
+    that no grain is queryable, which is a different claim and a false one.
     """
 
     name: str
@@ -155,6 +165,7 @@ class DimensionInfo:
     semantic_model: str | None = None
     queryable_granularities: list[str] | None = None
     column: str | None = None
+    vendor_params: dict[str, Any] | None = None
 
 
 @dataclass
