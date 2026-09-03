@@ -88,6 +88,7 @@ _EXPORTS = {
     "MermaidDiagram": "explore.diagram",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
+    "OssieDependencyError": "ossie.loader",
     "OverCeilingError": "guards.cost_guard",
     "Paradigm": "envelope",
     "PlanError": "transform.plans",
@@ -168,6 +169,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
+    from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
         ConfirmationRequest,
@@ -234,6 +236,7 @@ __all__ = [
     "MermaidDiagram",
     "NoBaselineError",
     "NoConnectorSelectedError",
+    "OssieDependencyError",
     "OverCeilingError",
     "Paradigm",
     "PlanError",

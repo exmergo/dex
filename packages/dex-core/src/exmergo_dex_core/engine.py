@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
 from .config import (
+    LEGACY_OSSIE_PROJECT_FORMAT,
     CacheConfig,
     DexConfig,
     ProjectConfig,
@@ -281,6 +282,26 @@ class DexEngine:
 
             declared = getattr(overrides["config"], "project", None) or ProjectConfig()
             chosen = project_format_name or declared.format
+            if chosen == LEGACY_OSSIE_PROJECT_FORMAT:
+                # Ossie was briefly exposed as a project format. Keep the
+                # spelling as a config migration shim, but never let semantic
+                # documents impersonate a transformation project.
+                semantic = overrides["config"].semantic
+                if semantic.vendor == "dbt" and not semantic.ossie.files:
+                    files = list(declared.options.get("files") or [])
+                    semantic.vendor = "ossie"
+                    semantic.deployment = "local"
+                    semantic.backend = "local"
+                    semantic.ossie.files = files
+                engine.config_diffs.append(
+                    {
+                        "path": "project.format",
+                        "op": "deprecation",
+                        "message": "project.format: ossie is deprecated; move "
+                        "project.options.files to semantic.ossie.files",
+                    }
+                )
+                chosen = "dbt"
             engine._project_name = chosen
             engine._project_factory = resolve_project_factory(chosen)
             engine._project_options = (
@@ -702,7 +723,68 @@ class DexEngine:
             ProjectContext(
                 repo_root=self.repo_root,
                 project_dir=self.config.dbt_project_dir,
+                connector=self.connector or self.config.connector,
                 options=self._project_options,
+            ),
+        )
+
+    def semantic_catalog_format(self) -> ExploreProject:
+        """The project format that answers the semantic catalog.
+
+        #408 infrastructure: this is the shared catalog route for the backend
+        and ``--use-project``. When it differs from ``project.format``, #408
+        must compose native tier-1 declarations with dbt rather than replacing it.
+
+        Usually :meth:`project_format`, and the reason this method exists is the
+        case where it is not. The semantic layer and the transformation project
+        are two axes: a repository can keep dbt for its models and author its
+        semantics as native Apache Ossie documents beside them, and in that
+        arrangement dbt keeps serving tier 1 while a second format answers the
+        catalog.
+
+        **A table lookup rather than a vendor branch, and that is the whole
+        point.** The alternative shape, an `if vendor == ...` at each call site,
+        was what this replaced: it put a vendor name inside two commands and the
+        backend resolver, and the next format would have added three more. Here
+        the vendor names a *format*, the format is built through the same
+        resolver and the same context as any other, and every caller downstream
+        keeps asking a project for a catalog without knowing who answered.
+
+        The format is built per call for the same reason :meth:`project_format`
+        builds per command: its source is a file a later command may rewrite.
+        """
+
+        from .adapters.project import ProjectContext
+        from .adapters.project_resolver import build_project
+        from .config import SEMANTIC_PROJECT_FORMATS
+
+        vendor = (getattr(self.config.semantic, "vendor", None) or "dbt").lower()
+        if vendor == LEGACY_OSSIE_PROJECT_FORMAT:
+            # Deprecated compatibility accessor. It returns the semantic layer
+            # directly; Ossie is deliberately no longer built as a Project.
+            from .ossie import OssieSemanticLayer
+
+            return OssieSemanticLayer(
+                self.repo_root or ".",
+                self.config.semantic.ossie.files,
+                self.connector or self.config.connector,
+            )
+        named = SEMANTIC_PROJECT_FORMATS.get(vendor)
+        if named is None:
+            return self.project_format()
+        # The vendor's own coordinates, read from the config section named after
+        # it (`semantic.ossie` for `vendor: ossie`) and passed through as the
+        # format's options. They live on the semantic axis because that is the
+        # axis the user is configuring; the format sees the same options from
+        # either route, which is what makes the two one implementation.
+        section = getattr(self.config.semantic, vendor, None)
+        options = section.model_dump() if section is not None else {}
+        return build_project(
+            named,
+            ProjectContext(
+                repo_root=self.repo_root,
+                connector=self.connector or self.config.connector,
+                options=options,
             ),
         )
 

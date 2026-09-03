@@ -402,6 +402,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_true",
                         default=argparse.SUPPRESS,
                     )
+                if group == "explore" and name in {"relationships", "map"}:
+                    sp.add_argument(
+                        "--use-hosted-semantic-layer",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                    )
                 # transform init takes the project name; plan the intent; apply
                 # the plan id; macro the shipped-macro name (none lists them).
                 if group == "transform" and name in {"init", "plan", "apply", "macro"}:
