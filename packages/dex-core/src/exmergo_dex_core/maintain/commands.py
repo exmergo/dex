@@ -52,6 +52,7 @@ from .results import (
 )
 
 if TYPE_CHECKING:
+    from ..adapters.project import ExploreProject
     from ..engine import DexEngine
     from .snapshot import SemanticLayer, TransformLayer
 
@@ -69,6 +70,33 @@ _NO_SNAPSHOT_ERROR = (
     "no drift baseline yet; run `maintain snapshot` first (ideally right after "
     "a known-good build)"
 )
+
+
+def _read_project(engine: DexEngine) -> tuple[ExploreProject | None, str | None]:
+    """The constructed project format, or why there is none.
+
+    The counterpart to :func:`_read_layers` for the commands that want the
+    format itself: its tier-1 declarations, or the instance to ask about the
+    write tier. Same shape and same reason, so there is one place deciding which
+    project failures degrade rather than one per call site.
+
+    ``definitions()`` never raises by contract, but the format holding it still
+    has to be built, and construction refuses coordinates it cannot honor: the
+    shipped dbt format has no project to read without a repo root. A host
+    pointed at a warehouse and a baseline with no repository is an ordinary
+    state, and nothing here needs a project to answer at all, so a format that
+    cannot be built costs the declarations and the write tier and nothing else.
+
+    Call it once per command and reuse the instance. A project is deliberately
+    not held across commands, because a previous command may have rewritten it,
+    but the expensive part is memoized inside the instance, so building it twice
+    in one command loads it twice.
+    """
+
+    try:
+        return engine.project_format(), None
+    except (ProjectError, RepoRootRequiredError, ValidationError) as exc:
+        return None, str(exc)
 
 
 def _read_layers(
@@ -478,8 +506,9 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         if scope_names
         else None
     )
+    project, _ = _read_project(engine)
     plan = drift_mod.grain_plan(
-        adapter, snap, scope, engine.project_format().definitions()
+        adapter, snap, scope, project.definitions() if project is not None else None
     )
     if (
         plan.key_checks
@@ -776,8 +805,12 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         else []
     )
 
+    # Rebuilt rather than carried over from `_read_layers`: that one asks for the
+    # baseline tier, and a format narrower than it still declares a grain worth
+    # re-verifying here.
+    project, _ = _read_project(engine)
     plan = drift_mod.grain_plan(
-        adapter, snap, scope, engine.project_format().definitions()
+        adapter, snap, scope, project.definitions() if project is not None else None
     )
     # Added before both returns, so a declared grain the survey could not reach
     # is reported whether the scans run or stop at the handshake.
@@ -893,7 +926,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import PlacingProject, placement_gap
+    from ..adapters.project import EditableProject, PlacingProject, placement_gap
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
@@ -925,10 +958,24 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     if not findings:
         return ReconcileResult(warnings=warnings)
 
-    editable = engine.editable_project()
+    # One construction for the whole command, reused for the write tier and the
+    # declarations below. Three separate reads is three loads of the same
+    # project, and only the first of them was guarded against a format that
+    # cannot be built at all.
+    project, no_project = _read_project(engine)
+    editable = project if isinstance(project, EditableProject) else None
     view = None
-    if editable is None:
-        named = getattr(engine.project_format(), "name", "this")
+    if no_project is not None:
+        # Its own sentence rather than the write-tier one below: a format that
+        # could not be built declined nothing, and telling someone their format
+        # refuses edits sends them to implement a tier they already have.
+        warnings.append(
+            "no project format could be built, so every proposal below is "
+            f"advisory and no plan is stored: {no_project}. Reconcile what these "
+            "findings describe wherever your models are actually defined"
+        )
+    elif editable is None:
+        named = getattr(project, "name", "this")
         warnings.append(
             f"the '{named}' project format does not implement the write tier, so "
             "every proposal below is advisory and no plan is stored: dex will not "
@@ -968,8 +1015,9 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # What the project declares, which is a different question from what its
     # files contain. `view` carries the bytes an edit is pinned against; this
     # carries the grain, and an edit that contradicts a declared grain is one no
-    # format is obliged to keep. Tier 1, so it cannot raise.
-    definitions = engine.project_format().definitions()
+    # format is obliged to keep. Tier 1, so the read cannot raise; `None` is the
+    # answer when there was no format to read it from.
+    definitions = project.definitions() if project is not None else None
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,

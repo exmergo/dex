@@ -629,6 +629,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "args": {
             "argument": _TRANSLATED,
             "edits_file": _TRANSLATED,
+            # Named rather than `_TRANSLATED`: the payload is parsed on the way
+            # in, but it lands on a parameter that is literally `definitions`,
+            # so the map can assert the engine forwards it.
+            "definitions_file": "definitions",
             "no_parse": "no_parse",
         },
     },
@@ -637,6 +641,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "args": {
             "argument": _TRANSLATED,
             "edits_file": _TRANSLATED,
+            # Named rather than `_TRANSLATED`: the payload is parsed on the way
+            # in, but it lands on a parameter that is literally `definitions`,
+            # so the map can assert the engine forwards it.
+            "definitions_file": "definitions",
             "no_parse": "no_parse",
         },
     },
@@ -645,6 +653,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "args": {
             "argument": _TRANSLATED,
             "edits_file": _TRANSLATED,
+            # Named rather than `_TRANSLATED`: the payload is parsed on the way
+            # in, but it lands on a parameter that is literally `definitions`,
+            # so the map can assert the engine forwards it.
+            "definitions_file": "definitions",
             "no_parse": "no_parse",
         },
     },

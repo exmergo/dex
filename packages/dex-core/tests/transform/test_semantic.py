@@ -994,6 +994,48 @@ def test_definition_payload_reads_the_name_from_the_content(
     assert "name" in envelope["errors"][0]
 
 
+def test_the_definition_unit_reaches_the_engine_surface_too(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The per-definition payload is not a CLI feature.
+
+    `DexEngine` is the surface a host drives dex through, and a flag the CLI
+    parses into a keyword the engine cannot pass is a capability only one of the
+    two has. Same payload, same classification, same one-definition diff as
+    `test_definition_edit_touches_only_its_own_definition` reaches through
+    argparse.
+    """
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.transform.semantic import parse_definition_payload
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+
+    definitions = parse_definition_payload(
+        [
+            {
+                "kind": "metric",
+                "content": (
+                    "name: customer_count\n"
+                    "label: Count of customers\n"
+                    "type: simple\n"
+                    "type_params:\n"
+                    "  measure: customer_count\n"
+                ),
+            }
+        ]
+    )
+    with DexEngine.from_repo(tmp_path, connector="duckdb") as engine:
+        result = engine.semantic_plan(
+            "one definition", [], definitions=definitions, no_parse=True
+        )
+
+    assert result.updated == ["customer_count"]
+    assert result.unchanged == []
+    assert result.defined == []
+    assert len(result.diffs) == 1
+
+
 def test_the_two_payload_units_are_mutually_exclusive(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

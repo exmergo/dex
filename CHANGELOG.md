@@ -35,9 +35,10 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   separates "grain found nothing" from "grain did not run" since the status no
   longer implies it. `cost.estimate` stays unset, so an `ok` never carries a
   number that reads as spend. Nothing about the spend gate moved: the confirmed
-  re-issue is identical and no scan runs without it. `explore relationships
-  --verify` and `explore map --verify` keep `needs_confirmation`, correctly, since
-  there the caller did ask for the probes and the budget ran out mid-command.
+  re-issue is identical and no scan runs without it.
+  `explore relationships --verify` and `explore map --verify` keep
+  `needs_confirmation`, correctly, since there the caller did ask for the probes
+  and the budget ran out mid-command.
 
   A host reading `data["estimated_bytes"]` on these two commands reads
   `data["offer"]["estimated_bytes"]`.
@@ -94,8 +95,41 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   format, the diffs, the conflict hashing, and `transform apply` are unchanged.
   Deleting a definition remains a whole-file edit.
 
+  The unit is not a CLI feature. `DexEngine.semantic_define`, `semantic_update`,
+  and `semantic_plan` take the parsed payload as `definitions=`, so a host
+  driving dex programmatically writes one definition where the flag writes one
+  definition. A flag the CLI parses into a keyword the engine cannot pass would
+  be a capability only one of the two surfaces has.
+
   `AGENTS.md`, `references/command-contract.md`, and both the `transform` and
   `maintain` skills document the new payload, the third class, and the offer.
+
+### Fixed
+
+- **`maintain` stops refusing an engine that was never given a repo root.**
+  `check`, `grain`, and `reconcile` each read the project format without
+  guarding the construction, and the shipped dbt format correctly refuses to
+  build without a repo root, because a dbt project is a filesystem artifact. So
+  a host pointed at a warehouse and a baseline with no repository in the picture
+  got a refusal from all three, including for the answers that need no project
+  at all. Both commands already intended otherwise and said so in their own
+  code: `check` builds the warning naming the missing project, runs schema and
+  volume, and then died reading the project a second time for the declared
+  grain, and `reconcile` notes that only the plan store needs a repo root "so
+  the advisory-only path stays reachable for an engine that has none", which it
+  was not.
+
+  A project that cannot be built now costs the declarations and the write tier
+  and nothing else. `check` returns its free axes, `grain` surveys the measured
+  half, and `reconcile` proposes advisory fixes with no stored plan and a
+  warning naming the real reason rather than claiming the format declined a
+  tier. Nothing changes for an engine that has a repo root.
+
+  `reconcile` also built the project format three times per call, and only the
+  first of those was reachable, so it now builds it once and reuses it. A
+  project is deliberately not held across commands, but the expensive load is
+  memoized inside the instance, so reading it three times in one command loaded
+  it three times.
 
 ## [1.9.2] - 2026-09-02
 
