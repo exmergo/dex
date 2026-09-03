@@ -4,13 +4,10 @@ Ossie is a **semantic layer**, not a transformation project. Its documents own
 semantic metadata and declared relationships; they do not own dbt models,
 snapshots, or writeback.
 
-**One class, two ways to reach it.** An Ossie-only repository names
-`project.format: ossie` and puts its documents in `project.options`, and every
-command that reads a project reads Ossie. A repository that keeps dbt for its
-models and Ossie for its semantics sets `semantic.vendor: ossie` beside
-`project.format: dbt`, and the same class is built and injected into the
-semantic backend, which already accepts an injected project format for exactly
-this reason. dbt keeps serving tier 1 there; Ossie serves the semantic catalog.
+Ossie is configured through ``semantic.vendor: ossie`` and
+``semantic.ossie.files``, whether or not the repository also has a dbt project.
+The semantic backend builds this reader from those coordinates; dbt, when
+present, remains responsible for the transformation-project tiers.
 
 **The tier reached today is tier 1 plus the catalog channel**, and no more.
 Tier 2 needs a snapshot shape that can hold composite relationships and dataset
@@ -34,7 +31,12 @@ if TYPE_CHECKING:
     from ..project_definitions import ProjectDefinitions
     from ..semantic_catalog import SemanticCatalogView
 
-__all__ = ["FORMAT_NAME", "OssieProject", "OssieSemanticLayer"]
+__all__ = [
+    "FORMAT_NAME",
+    "OssieProject",
+    "OssieSemanticLayer",
+    "build_semantic_layer",
+]
 
 FORMAT_NAME = "ossie"
 
@@ -53,8 +55,8 @@ class OssieSemanticLayer:
     documents as they were before the write.
     """
 
-    # Deprecated identity retained for direct-reader integrations. It is not
-    # registered as a Project format and is never selected by project.format.
+    # This identifies the semantic format; it is not a transformation project
+    # format and is never selected by project.format.
     name = FORMAT_NAME
 
     def __init__(
@@ -165,8 +167,14 @@ class OssieSemanticLayer:
         return self._loaded
 
 
-# Compatibility import for integrations that adopted the temporary project name.
+# Historical public name for integrations that construct the reader directly.
 OssieProject = OssieSemanticLayer
+
+
+def build_semantic_layer(context: ProjectContext) -> OssieSemanticLayer:
+    """Build the native reader from the semantic configuration coordinates."""
+
+    return OssieSemanticLayer.from_context(context)
 
 
 def _files(value: Any) -> list[str]:
@@ -180,10 +188,9 @@ def _files(value: Any) -> list[str]:
 
     if value is None:
         raise ConfigurationError(
-            "the ossie project format needs `files`: the native Ossie documents "
-            "to read, named relative to the repository root. Write them under "
-            "`project.options.files` in .dex/config.yml, or use "
-            "`semantic.ossie.files` to read Ossie beside a dbt project"
+            "the Ossie semantic reader needs `files`: native documents named "
+            "relative to the repository root. Configure them under "
+            "`semantic.ossie.files` in .dex/config.yml"
         )
     if isinstance(value, str) or not isinstance(value, Sequence | Mapping):
         raise ConfigurationError(

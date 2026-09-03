@@ -604,10 +604,6 @@ semantic:
       - semantics/commerce.ossie.yaml
 ```
 
-`project.format: ossie` is accepted temporarily as a deprecated compatibility
-spelling. Migrate its `project.options.files` list to `semantic.ossie.files`;
-it no longer makes semantic documents answer transformation-project commands.
-
 Paths are relative to the repository root and confined to it: an absolute path, a
 `..` that walks out, and a symlink that resolves out are each refused. Reads are
 confined the way writes are, because a committed config file naming a path
@@ -738,7 +734,7 @@ An Ossie-only repository contributes its declarations to `explore`:
   tuple; no first-column proxy is emitted or measured.
 
 `explore map --use-project` marks each source relation with the Ossie semantic
-models sitting on it, on either configuration route.
+models sitting on it.
 
 ### Upgrading the pinned schema
 

@@ -561,12 +561,11 @@ stated. `--for-dimension` refuses too, off the backend's own declared
 `unavailable` block rather than off a vendor name: Ossie states no
 metric-to-dimension relationship, and answering "no metric can be grouped that
 way" would be a claim about the layer where the truth is that this backend was
-never told. The documents are named in `semantic.ossie.files` (beside a dbt
-project) or in `project.options.files` with `project.format: ossie` (an Ossie-only
-repository); both build the same reader, both are confined to the repository, and
-selecting either without the `[ossie]` extra refuses and names it. dex pins the
-Ossie schema by content hash rather than by the version string the document
-carries. See `references/semantic-layer.md`.
+never told. The documents are named in `semantic.ossie.files`, including for an
+Ossie-only repository. They are confined to the repository, and selecting Ossie
+without the `[ossie]` extra refuses and names it. dex pins the Ossie schema by
+content hash rather than by the version string the document carries. See
+`references/semantic-layer.md`.
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than

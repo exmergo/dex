@@ -517,9 +517,9 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
 #: field named after the vendor (`semantic.ossie` for `ossie`), which is passed
 #: through to the format as its options verbatim. That convention is what keeps
 #: the engine from growing a per-vendor coordinate reader.
-SEMANTIC_PROJECT_FORMATS: dict[str, str] = {"ossie": "ossie"}
-#: Compatibility spelling accepted only while migrating old configuration.
-LEGACY_OSSIE_PROJECT_FORMAT = "ossie"
+SEMANTIC_PROJECT_FORMATS: dict[str, str] = {
+    "ossie": "exmergo_dex_core.ossie.project:build_semantic_layer"
+}
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",
@@ -540,12 +540,9 @@ def canonical_semantic_deployment(value: str) -> str:
 class OssieSemanticConfig(BaseModel):
     """The repository-confined native documents behind ``vendor: ossie``.
 
-    The same coordinates ``project.options.files`` carries for an Ossie-only
-    repository, and validated the same way here, because a bad path should be
-    refused where it is written rather than several frames into a command. Both
-    routes build one class, so what is checked here is checked once more by the
-    format itself: this one can name the config line, that one holds for a
-    caller who built the coordinates some other way.
+    The coordinates are validated here so a bad path is refused where it is
+    written rather than several frames into a command. They are checked once
+    more by the reader itself for callers that construct it directly.
     """
 
     files: list[str] = Field(default_factory=list)
@@ -594,10 +591,8 @@ class SemanticConfig(BaseModel):
 
     ``ossie.files`` names those documents, relative to the repository root, and
     is required with ``vendor: ossie`` and refused without it. It is the
-    beside-dbt route: `project.format` keeps naming dbt and the semantic
-    catalog comes from Ossie. An Ossie-only repository names
-    `project.format: ossie` instead and puts the same list in
-    `project.options.files`, which builds the same reader.
+    This remains true for a repository with no dbt project: Ossie is configured
+    on the semantic axis and supplies the semantic catalog only.
 
     A third property, **who executes**, is derived from those two and never
     configured, because it is what decides whether the cost guard can apply at

@@ -42,7 +42,6 @@ from typing import TYPE_CHECKING, Any
 
 from . import command_args, connect
 from .config import (
-    LEGACY_OSSIE_PROJECT_FORMAT,
     CacheConfig,
     DexConfig,
     ProjectConfig,
@@ -287,26 +286,6 @@ class DexEngine:
 
             declared = getattr(overrides["config"], "project", None) or ProjectConfig()
             chosen = project_format_name or declared.format
-            if chosen == LEGACY_OSSIE_PROJECT_FORMAT:
-                # Ossie was briefly exposed as a project format. Keep the
-                # spelling as a config migration shim, but never let semantic
-                # documents impersonate a transformation project.
-                semantic = overrides["config"].semantic
-                if semantic.vendor == "dbt" and not semantic.ossie.files:
-                    files = list(declared.options.get("files") or [])
-                    semantic.vendor = "ossie"
-                    semantic.deployment = "local"
-                    semantic.backend = "local"
-                    semantic.ossie.files = files
-                engine.config_diffs.append(
-                    {
-                        "path": "project.format",
-                        "op": "deprecation",
-                        "message": "project.format: ossie is deprecated; move "
-                        "project.options.files to semantic.ossie.files",
-                    }
-                )
-                chosen = "dbt"
             engine._project_name = chosen
             engine._project_factory = resolve_project_factory(chosen)
             engine._project_options = (
@@ -764,16 +743,6 @@ class DexEngine:
         from .config import SEMANTIC_PROJECT_FORMATS
 
         vendor = (getattr(self.config.semantic, "vendor", None) or "dbt").lower()
-        if vendor == LEGACY_OSSIE_PROJECT_FORMAT:
-            # Deprecated compatibility accessor. It returns the semantic layer
-            # directly; Ossie is deliberately no longer built as a Project.
-            from .ossie import OssieSemanticLayer
-
-            return OssieSemanticLayer(
-                self.repo_root or ".",
-                self.config.semantic.ossie.files,
-                self.connector or self.config.connector,
-            )
         named = SEMANTIC_PROJECT_FORMATS.get(vendor)
         if named is None:
             return self.project_format()

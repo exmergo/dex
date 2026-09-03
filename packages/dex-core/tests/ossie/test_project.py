@@ -1,4 +1,4 @@
-"""Native Ossie semantic-layer construction and legacy migration coverage."""
+"""Native Ossie semantic-layer construction coverage."""
 
 from __future__ import annotations
 
@@ -229,13 +229,11 @@ def test_the_name_identifies_the_format_and_not_the_instance(repo: Path, tmp_pat
     assert one.name == two.name == "ossie"
 
 
-# --- the two construction routes -------------------------------------------
+# --- semantic configuration -------------------------------------------------
 
 
-def test_both_configuration_routes_build_the_same_catalog(repo: Path):
-    """One class, two ways to reach it. An Ossie-only repository names
-    `project.format: ossie`; a dbt repository sets `semantic.vendor: ossie`
-    beside it, and dbt keeps serving tier 1 while Ossie serves the catalog."""
+def test_semantic_configuration_builds_the_catalog(repo: Path):
+    """Ossie is configured on the semantic axis and supplies the catalog."""
 
     from exmergo_dex_core.config import DexConfig, save_config
     from exmergo_dex_core.engine import DexEngine
@@ -255,26 +253,11 @@ def test_both_configuration_routes_build_the_same_catalog(repo: Path):
             },
         }
     )
-    ossie_only = catalog_of(
-        {
-            "connector": "duckdb",
-            "project": {
-                "format": "ossie",
-                "options": {"files": ["commerce.ossie.yaml"]},
-            },
-            "semantic": {
-                "vendor": "ossie",
-                "ossie": {"files": ["commerce.ossie.yaml"]},
-            },
-        }
-    )
-
-    assert beside_dbt == ossie_only
     assert "commerce.orders" in beside_dbt
 
 
-def test_legacy_ossie_project_config_migrates_to_the_semantic_layer(repo: Path):
-    """The compatibility spelling never replaces the dbt project route."""
+def test_project_format_ossie_is_not_migrated(repo: Path):
+    """Ossie has no project-format compatibility route."""
 
     from exmergo_dex_core.config import DexConfig, save_config
     from exmergo_dex_core.engine import DexEngine
@@ -289,13 +272,9 @@ def test_legacy_ossie_project_config_migrates_to_the_semantic_layer(repo: Path):
         ),
         repo,
     )
-    engine = DexEngine.from_repo(str(repo))
 
-    from exmergo_dex_core.explore.semantic import resolve_semantic_layer
-
-    assert engine.project_format().name == "dbt"
-    assert resolve_semantic_layer(engine).list_definitions().view.semantic_models
-    assert any(diff["op"] == "deprecation" for diff in engine.config_diffs)
+    with pytest.raises(ConfigurationError, match="unknown project format 'ossie'"):
+        DexEngine.from_repo(str(repo))
 
 
 def test_the_connector_reaches_the_semantic_layer(repo: Path):
@@ -309,9 +288,9 @@ def test_the_connector_reaches_the_semantic_layer(repo: Path):
     save_config(
         DexConfig(
             connector="clickhouse",
-            project={
-                "format": "ossie",
-                "options": {"files": ["commerce.ossie.yaml"]},
+            semantic={
+                "vendor": "ossie",
+                "ossie": {"files": ["commerce.ossie.yaml"]},
             },
         ),
         repo,
