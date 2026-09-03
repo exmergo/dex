@@ -1259,3 +1259,86 @@ def test_an_entry_point_registration_selects_a_format_dex_does_not_ship(
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "resolved acme 2 ['orders']" in done.stdout
+
+
+def test_the_wheel_ships_every_non_python_asset_the_engine_reads(wheel: str):
+    """A vendored asset absent from the wheel fails only on an installed copy.
+
+    Two of them now, and they fail differently. A missing macro breaks
+    `transform macro`; a missing Ossie schema breaks every read of a native
+    document, and it breaks it *after* the format resolved and the command
+    started, which reads as a bug in the document rather than in the install.
+
+    Asserted against the source tree rather than a hard-coded list, so an asset
+    added later is covered without anyone remembering to add it here.
+    """
+
+    import zipfile
+
+    source = Path(__file__).resolve().parents[1] / "src" / "exmergo_dex_core"
+    expected = {
+        f"exmergo_dex_core/{path.relative_to(source).as_posix()}"
+        for path in source.rglob("*")
+        if path.is_file()
+        and path.suffix in {".sql", ".json", ".md"}
+        and "__pycache__" not in path.parts
+    }
+    assert expected, "the probe found no assets, so it is asserting nothing"
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+
+    assert expected <= names, sorted(expected - names)
+
+
+def test_the_ossie_extra_carries_the_schema_validator_and_not_the_dialect_engine(
+    wheel: str,
+):
+    """The three validation layers sit on three install tiers deliberately.
+
+    Structure and integrity decide whether a document is readable at all and are
+    pure plus one validator. Expression syntax is the third layer and rides on
+    `[sql]`, which every connector extra already brings. Bundling them would make
+    the lightest Ossie install pull the dialect engine to check something the
+    other two layers never need.
+    """
+
+    done = _run_isolated(
+        wheel,
+        "import jsonschema, sys\n"
+        "from exmergo_dex_core.ossie.loader import schema_sha256, SCHEMA_SHA256\n"
+        "assert schema_sha256() == SCHEMA_SHA256, 'bundled schema hash moved'\n"
+        "print('sqlglot' in sys.modules)\n",
+        extras=["ossie"],
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
+
+
+def test_selecting_ossie_without_its_extra_refuses_by_name(wheel: str):
+    """Never a fallback to a weaker check: structure validation is what stands
+    between an authored file and dex treating it as a semantic layer, and there
+    is no second validator to fall back to.
+    """
+
+    done = _run_isolated(
+        wheel,
+        "from exmergo_dex_core.ossie import OssieProject, OssieDependencyError\n"
+        "from exmergo_dex_core.adapters.project import ProjectContext\n"
+        "p = OssieProject.from_context(ProjectContext(\n"
+        "    repo_root='.', connector='duckdb',\n"
+        "    options={'files': ['a.ossie.yaml']}))\n"
+        "try:\n"
+        "    p.semantic_catalog()\n"
+        "except OssieDependencyError as exc:\n"
+        "    assert 'exmergo-dex-core[ossie]' in str(exc), exc\n"
+        "    print('refused')\n"
+        "else:\n"
+        "    raise AssertionError('read a document with no validator installed')\n"
+        "# Tier 1 degrades instead, because explore runs on raw warehouses.\n"
+        "assert p.definitions().notes\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "refused"
