@@ -549,7 +549,7 @@ def probe_candidates(relationships: list[Relationship]) -> list[Relationship]:
     return [
         rel
         for rel in relationships
-        if len(rel.from_columns) == 1 and len(rel.to_columns) == 1
+        if rel.from_columns and len(rel.from_columns) == len(rel.to_columns)
     ]
 
 
@@ -628,8 +628,11 @@ def probe_statements(relationships: list[Relationship], dialect: str) -> list[st
 def _overlap_probe_sql(rel: Relationship) -> str:
     child = _quote_identifier(rel.from_dataset)
     parent = _quote_identifier(rel.to_dataset)
-    fk = _quote_part(rel.from_columns[0])
-    key = _quote_part(rel.to_columns[0])
+    fks = [_quote_part(column) for column in rel.from_columns]
+    keys = [_quote_part(column) for column in rel.to_columns]
+    nonnull = " AND ".join(f"c.{column} IS NOT NULL" for column in fks)
+    select_keys = ", ".join(f"{column} AS pk{i}" for i, column in enumerate(keys))
+    joins = " AND ".join(f"d.pk{i} = c.{column}" for i, column in enumerate(fks))
     # Aggregate-only by construction: two counts, no value in the projection.
     # A LEFT JOIN against the DISTINCT parent keys keeps the orphan count
     # correct even when the parent key is not unique (a bare join would fan
@@ -638,11 +641,11 @@ def _overlap_probe_sql(rel: Relationship) -> str:
     # and a join rather than a projected NOT EXISTS, which Redshift refuses
     # outright (XX000: correlated subquery pattern not supported).
     return (
-        f"SELECT COUNT(c.{fk}) AS nonnull_fk, "  # noqa: S608
-        f"COUNT(CASE WHEN c.{fk} IS NOT NULL AND d.pk IS NULL THEN 1 END) "
+        f"SELECT COUNT(CASE WHEN {nonnull} THEN 1 END) AS nonnull_fk, "  # noqa: S608
+        f"COUNT(CASE WHEN {nonnull} AND d.pk0 IS NULL THEN 1 END) "
         f"AS orphans "
         f"FROM {child} c LEFT JOIN ("
-        f"SELECT DISTINCT {key} AS pk FROM {parent}) d ON d.pk = c.{fk}"
+        f"SELECT DISTINCT {select_keys} FROM {parent}) d ON {joins}"
     )
 
 
@@ -948,7 +951,12 @@ def declared_relationships(
                     f"{label} references a relation not in this connection's inventory"
                 )
             continue
-        key = (child.lower(), fk.column.lower(), parent.lower(), fk.to_column.lower())
+        key = (
+            child.lower(),
+            (fk.column.lower(),),
+            parent.lower(),
+            (fk.to_column.lower(),),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -960,6 +968,51 @@ def declared_relationships(
                 to_columns=[fk.to_column],
                 kind=RelationshipKind.DECLARED,
                 confidence=1.0,
+                declaration_sources=[fk.source],
+            )
+        )
+    for declaration in defs.declared_relationships:
+        child, child_ambiguous = resolve_declared(
+            declaration.relation, declaration.model, known_identifiers
+        )
+        parent, parent_ambiguous = resolve_declared(
+            declaration.to_relation, declaration.to_model, known_identifiers
+        )
+        label = declaration.name or (
+            f"declared relationship {declaration.model} -> {declaration.to_model}"
+        )
+        if child is None or parent is None:
+            reason = (
+                "matches more than one object here"
+                if (child_ambiguous or parent_ambiguous)
+                else "references a relation not in this connection's inventory"
+            )
+            notes.append(f"{label} {reason}; skipped rather than guessed")
+            continue
+        from_columns = [pair[0] for pair in declaration.column_pairs]
+        to_columns = [pair[1] for pair in declaration.column_pairs]
+        key = (
+            child.lower(),
+            tuple(c.lower() for c in from_columns),
+            parent.lower(),
+            tuple(c.lower() for c in to_columns),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        source = declaration.source + (
+            f" relationship '{declaration.name}'" if declaration.name else ""
+        )
+        relationships.append(
+            Relationship(
+                from_dataset=child,
+                from_columns=from_columns,
+                to_dataset=parent,
+                to_columns=to_columns,
+                kind=RelationshipKind.DECLARED,
+                confidence=1.0,
+                declared_by=source,
+                declaration_sources=[source],
             )
         )
     return relationships, notes
