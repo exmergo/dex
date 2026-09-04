@@ -20,6 +20,7 @@ from ..errors import ProjectError
 from .loader import ERROR, LoadedDocument, validate_document_contents
 
 if TYPE_CHECKING:
+    from ..cache import DexCache
     from ..transform.plans import PlanEdit
     from .project import OssieSemanticLayer
 
@@ -61,8 +62,12 @@ def load_edit_view(layer: OssieSemanticLayer) -> SemanticDocumentView:
 
 
 def validate_plan(
-    layer: OssieSemanticLayer, edits: list[PlanEdit], mode: str
-) -> tuple[dict[str, list[str]], list[str]]:
+    layer: OssieSemanticLayer,
+    edits: list[PlanEdit],
+    mode: str,
+    *,
+    cache: DexCache | None = None,
+) -> tuple[dict[str, list[str]], list[str], list[str]]:
     """Validate the prospective configured set and classify model names."""
 
     configured = set(layer.files)
@@ -133,11 +138,26 @@ def validate_plan(
         )
 
     warnings = [d.render() for d in validated.diagnostics if d.severity != ERROR]
+    from .cache_validation import validate_cached_references
+
+    cache_validation = validate_cached_references(
+        validated.documents, cache, connector=layer.connector
+    )
+    if cache_validation.errors:
+        raise ValueError(
+            "the prospective Ossie semantic layer has references contradicted "
+            "by the exploration cache, so no plan was stored: "
+            + "; ".join(cache_validation.errors)
+        )
     warnings.append(
         "Ossie edits are whole-document replacements written byte-for-byte; dex "
         "does not reformat YAML/JSON or modify unedited configured documents"
     )
-    return {"defined": defined, "updated": updated}, warnings
+    return (
+        {"defined": defined, "updated": updated},
+        cache_validation.notes,
+        warnings,
+    )
 
 
 def write_edits(
