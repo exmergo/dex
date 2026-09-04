@@ -112,6 +112,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   each degrading on its own rather than one absence hiding the other's
   presence.
 
+- **`maintain grain`/`maintain check` verify Ossie's declared primary and
+  unique keys, composite ones included** ([#410]). `grain_plan` read declared
+  composite keys exclusively from `engine.project_format().definitions()`,
+  which is never Ossie, so its `primary_key`/`unique_keys` declarations never
+  reached the one code path that actually probes a declared grain against the
+  live warehouse (`declared_grain_not_unique`), no matter how the connector
+  was configured. A new `_composed_definitions` folds in a differing semantic
+  vendor's own keys additively, the same seam #408's `_fold_semantic_layer_keys`
+  and #409's `_semantic_layer` already use, so a repository with no dbt
+  project at all and `semantic.vendor: ossie` now gets its declared grain
+  checked as the never-measured declaration it is (`declared_grain_not_unique`,
+  never the demoted "was unique, no longer is" `key_lost_uniqueness` a
+  measurement it never earned would read as), and priced and
+  confirmation-gated through the identical billed handshake every other
+  connector already goes through. Relationship
+  verification needed no change: #408 already routed Ossie's composite
+  declarations through the same neutral `Relationship`/`--verify` path any
+  other format's do. Nothing here proposes an edit; a failed declaration
+  surfaces only as a finding, the existing behavior for every format and,
+  for Ossie specifically, also true because it has no write tier to edit at
+  all.
+
 - **A semantic layer's own declared dataset keys now reach grain detection**
   ([#408]). Ossie is never the transformation project `engine.project_format()`
   resolves, so its `primary_key`/`unique_keys` declarations had no route to
