@@ -28,9 +28,12 @@ from exmergo_dex_core.adapters.conformance import (
     SemanticProjectContract,
 )
 from exmergo_dex_core.adapters.project import ExploreProject, ProjectContext
+from exmergo_dex_core.edits import EditOp, content_hash
+from exmergo_dex_core.edits_conformance import SemanticEditTargetContract
 from exmergo_dex_core.explore.semantic.conformance import SemanticBackendContract
 from exmergo_dex_core.explore.semantic.ossie import LocalOssieBackend
 from exmergo_dex_core.ossie import OssieProject
+from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 
 from .conftest import dataset, document, expression, field, model, write
 
@@ -338,3 +341,58 @@ class TestLocalOssieBackend(SemanticBackendContract):
             ),
         )
         return LocalOssieBackend(_project(self.root, "backend.ossie.yaml"))
+
+
+class TestOssieSemanticEditing(SemanticEditTargetContract):
+    """The write guarantees, without claiming a transformation-project tier."""
+
+    @pytest.fixture(autouse=True)
+    def _root(self, tmp_path: Path) -> None:
+        self.root = tmp_path
+
+    def _documents(self):
+        first = "first.ossie.yaml"
+        second = "second.ossie.yaml"
+        write(
+            self.root,
+            first,
+            document(model("first", dataset("things", "demo.main.things"))),
+        )
+        write(
+            self.root,
+            second,
+            document(model("second", dataset("things", "demo.main.things"))),
+        )
+        return _project(self.root, first, second), first, second
+
+    def make_semantic_edit_target(self):
+        target, _first, _second = self._documents()
+        return target
+
+    def an_edit_against_a_changed_semantic_target(self):
+        target, first, _second = self._documents()
+        view = target.semantic_edit_view()
+        original = view.files[first].content
+        edit = PlanEdit(
+            path=first,
+            kind=EditKind.SEMANTIC_DOCUMENT,
+            op=EditOp.UPSERT,
+            old_content_hash=view.files[first].sha256,
+            new_content="# proposed\n" + original,
+        )
+        (self.root / first).write_text(
+            "# human edit\n" + original, encoding="utf-8"
+        )
+        return target, [edit], lambda: (self.root / first).read_text("utf-8")
+
+    def a_clean_semantic_edit(self, target):
+        second = "second.ossie.yaml"
+        current = (self.root / second).read_text("utf-8")
+        edit = PlanEdit(
+            path=second,
+            kind=EditKind.SEMANTIC_DOCUMENT,
+            op=EditOp.UPSERT,
+            old_content_hash=content_hash(current),
+            new_content="# proposed clean\n" + current,
+        )
+        return edit, lambda: (self.root / second).read_text("utf-8")

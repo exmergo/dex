@@ -117,6 +117,7 @@ _NOT_ENGINE_METHODS = {
 _METHOD_NAMES = {
     ("connect", "test"): "connect_test",
     ("explore", "semantic"): "semantic_list",
+    ("semantic", "ossie"): "semantic_ossie",
     ("maintain", "schema"): "schema_drift",
     ("maintain", "volume"): "volume_drift",
     ("maintain", "grain"): "grain_drift",

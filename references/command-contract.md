@@ -214,6 +214,10 @@ dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: 
 dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted by transform);
                                      validated up to and including dbt's own parser; applied with
                                      transform apply like any other plan
+dex semantic ossie define|update|plan
+                                  -> native Ossie whole-document edits as diffs; limited to the exact
+                                     files in semantic.ossie.files, validated as one prospective
+                                     layer, and applied atomically with transform apply
 dex maintain snapshot             -> capture/refresh the known-good baseline in .dex/snapshot.json
 dex maintain check                -> sweep every drift axis vs the snapshot; ranked report (read-only;
                                      two-phase on billed connectors: free axes now, one estimate for scans)
@@ -260,7 +264,8 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
 `macro_sql`, `snapshot_sql`, `seed_csv`, `test_sql`, `analysis_sql`,
-`project_yml`, or `profiles_yml`. Each edit also has an `op`:
+`project_yml`, `profiles_yml`, or `semantic_document` (optional on `semantic
+ossie define|update|plan`). Each edit also has an `op`:
 `upsert` (create or update, the default, carrying `content`) or `delete` (remove
 the file, no `content`). A delete is a reviewable diff pinned to the file's hash
 like any other edit, and it is guarded: the plan is refused if any surviving file
@@ -514,6 +519,15 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   degrades to a warning; `--no-parse` skips it. A stored semantic plan is applied
   with `transform apply` like any other plan (no id applies the latest unapplied
   one).
+- `semantic ossie define|update|plan` is the corresponding native-file route.
+  Its namespace guard is the semantic-model namespace across every configured
+  document: `define` rejects existing names, `update` rejects missing names,
+  and `plan` reports a mixed change under `defined` and `updated`. Each edit is
+  a complete configured `.ossie.yaml`, `.ossie.yml`, or `.ossie.json` document;
+  Dex overlays all edits in memory and validates the prospective configured set
+  before storing anything. It writes the accepted content byte-for-byte, with
+  no YAML/JSON reformatting, and never changes a configured document absent from
+  the payload. File removal is not part of this command.
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
 fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole

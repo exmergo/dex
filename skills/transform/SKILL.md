@@ -423,6 +423,12 @@ database, which is fine for model-only builds.
   explicitly.
 - A semantic plan is applied like any other: `transform apply [plan-id]` writes
   its YAML into the dbt project (no id applies the latest unapplied plan).
+- For native Ossie use `semantic ossie define|update|plan ... --edits-file
+  <path|->`. Supply whole documents whose paths are listed in
+  `semantic.ossie.files`; the command implies the `semantic_document` kind,
+  validates the complete prospective configured layer, and writes the accepted
+  bytes exactly when the plan is later applied. This is a semantic-layer write
+  surface and does not make Ossie the transformation project.
 - dbt cannot parse semantic models in a project without a MetricFlow **time
   spine**; the engine warns when one is missing and defers the parse gate until
   one exists. Author it like any other model (a day-grain date model plus YAML

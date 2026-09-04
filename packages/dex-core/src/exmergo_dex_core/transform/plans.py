@@ -1,11 +1,11 @@
-"""Transform plans: the propose half of propose-don't-impose.
+"""Repository edit plans: the propose half of propose-don't-impose.
 
-The agent authors dbt file content; the engine validates it, pins it to the
-current project state, and hands it to the store as a plan. Nothing touches the
-dbt project until ``apply``, and apply re-checks the pinned hashes so a human edit
-made after planning surfaces as a conflict instead of being overwritten. Plans are
-cache, not truth: the dbt project stays canonical, and a deleted plan loses
-nothing but a proposal.
+The agent authors file content; the engine validates it, pins it to the current
+source state, and hands it to the store as a plan. Nothing touches the source of
+truth until ``apply``, and apply re-checks the pinned hashes so a human edit made
+after planning surfaces as a conflict instead of being overwritten. Plans are
+cache, not truth: the transformation project or semantic layer stays canonical,
+and a deleted plan loses nothing but a proposal.
 
 Plan ids are content-addressed (a hash of the intent plus the edits), so
 re-planning the same change is idempotent and yields the same id.
@@ -19,35 +19,18 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
-import sqlglot
 import yaml
 from pydantic import BaseModel
-from sqlglot import expressions as exp
 
-from ..dbt_project import (
-    ApplyResult,
-    DbtProjectView,
-    Edit,
-    EditOp,
-    SourceFile,
-    contained_path,
-    content_hash,
-    find_project,
-    node_files,
-    node_name,
-    path_family,
-    write_edits,
-)
-from ..dbt_project import (
-    load as load_project,
-)
 from ..diffs import file_diff
+from ..edits import ApplyResult, Edit, EditOp, content_hash
 from ..errors import DexError
-from .validate import _PLACEHOLDER, find_inlined_secret, strip_jinja, validate_edit
 
 if TYPE_CHECKING:
     from ..adapters.project import EditableProject
     from ..config import ConventionWarnings
+    from ..dbt_project import DbtProjectView
+    from ..edits import SemanticEditTarget
     from ..storage import Store
 
 
@@ -63,6 +46,10 @@ class EditKind(str, Enum):
     MODEL_SQL = "model_sql"
     SCHEMA_YML = "schema_yml"
     SEMANTIC_YML = "semantic_yml"
+    # A semantic-layer document, independent of any transformation project.
+    # Native Ossie is the first consumer; the kind intentionally names the
+    # artifact rather than its vendor so another file-backed layer can reuse it.
+    SEMANTIC_DOCUMENT = "semantic_document"
     # A dbt project-root manifest, not a model-path file: authoring it brings
     # dependency declaration inside the plan/apply guardrail like every other edit.
     PACKAGES_YML = "packages_yml"
@@ -107,6 +94,9 @@ class TransformPlan(BaseModel):
     intent: str
     # Relative to the repo root, so a plan stays valid when the repo moves.
     project_dir: str
+    # Which independent repository axis owns the edits. Old stored plans omit
+    # this and remain transformation-project plans by default.
+    edit_target: str = "project"
     edits: list[PlanEdit]
     applied_at: str | None = None
 
@@ -306,6 +296,8 @@ def admit_edit(
     refuses on its own terms first; dbt's parser is the backstop behind it.
     """
 
+    from ..dbt_project import contained_path, path_family
+
     resolved = contained_path(project, edit.path, view).resolve()
     assert_kind_placement(edit, path_family(project, edit.path, view), view)
 
@@ -333,6 +325,8 @@ def admit_edit(
     # verifies the post-deletion project instead.
     if edit.op is not EditOp.UPSERT:
         return []
+    from .validate import validate_edit
+
     return validate_edit(edit, cache=cache, pii_overrides=pii_overrides)
 
 
@@ -344,17 +338,24 @@ def plan(
     *,
     store: Store,
     project_format: EditableProject | None = None,
+    semantic_layer: SemanticEditTarget | None = None,
+    edit_target: str = "project",
     pii_overrides: Any = None,
     conventions: ConventionWarnings | None = None,
 ) -> tuple[TransformPlan, list[dict[str, Any]], list[str]]:
-    """Validate agent-authored edits and store them as a plan. Writes no project file.
+    """Validate agent-authored edits and store them as a plan. Writes no source file.
 
     Returns the plan, the reviewable diffs against the current project, and any
     validation warnings. Each edit is pinned to the sha256 of the file it would
     change (``None`` for a create), which is what apply later re-checks.
 
-    ``repo_root`` locates the dbt project (the source of truth, always a
-    filesystem artifact); ``store`` is where the proposal itself lands.
+    ``repo_root`` locates the repository source of truth; ``store`` is where the
+    proposal itself lands.
+
+    ``semantic_layer`` is the independent semantic-document edit target. It is
+    deliberately separate from ``project_format``: accepting semantic edits
+    does not make a layer a transformation project. The two routes share only
+    hash pinning, containment, plan storage, diffs, and atomic apply.
 
     ``project_format`` is the format the edits were built against. Omitting it
     loads the dbt project and validates against dbt's own surface, which is what
@@ -381,6 +382,13 @@ def plan(
 
     if not edits:
         raise PlanError("a plan needs at least one edit")
+    if edit_target not in {"project", "semantic"}:
+        raise PlanError(f"unknown edit target '{edit_target}'")
+    if (edit_target == "semantic") != (semantic_layer is not None):
+        raise PlanError(
+            "semantic plans need a semantic-layer edit target, and project "
+            "plans may not carry one"
+        )
 
     # A format that does not place is not routed through this seam at all: it goes
     # down the path it went down before the seam existed, loading the dbt project
@@ -394,14 +402,24 @@ def plan(
     # is the object that says all three are there; `placement_gap` is what tells an
     # implementer which one is not.
     #
-    # Late import: `adapters.project` reads this module's `EditKind`.
-    from ..adapters.project import PlacingProject
+    if semantic_layer is not None:
+        view = semantic_layer.semantic_edit_view()
+        project = Path(getattr(view, "root", "."))
+        places = True
+        semantic_surface = list(semantic_layer.semantic_editing_surface())
+        dbt_shaped = False
+    else:
+        # Late import: `adapters.project` reads this module's `EditKind`.
+        from ..adapters.project import PlacingProject
+        from ..dbt_project import DbtProjectView, find_project
+        from ..dbt_project import load as load_project
 
-    places = isinstance(project_format, PlacingProject)
-    if places:
+        places = isinstance(project_format, PlacingProject)
+        semantic_surface = []
+    if semantic_layer is None and places:
         view = project_format.load()
         project = Path(project_dir) if project_dir else Path(getattr(view, "root", "."))
-    else:
+    elif semantic_layer is None:
         project = Path(project_dir) if project_dir else find_project(repo_root)
         view = load_project(project)
 
@@ -410,8 +428,15 @@ def plan(
     # offering dbt's surface and gets dbt's checks, and asking the view keeps
     # this from becoming the `isinstance(project, DbtProject)` gate the seam
     # exists to remove.
-    dbt_shaped = isinstance(view, DbtProjectView)
-    surface = [] if dbt_shaped or not places else list(project_format.editing_surface())
+    if semantic_layer is None:
+        dbt_shaped = isinstance(view, DbtProjectView)
+    surface = (
+        []
+        if dbt_shaped or not places
+        else semantic_surface
+        if semantic_layer is not None
+        else list(project_format.editing_surface())
+    )
 
     warnings: list[str] = []
     pinned: list[PlanEdit] = []
@@ -461,7 +486,12 @@ def plan(
             # allow. Agreement there is the format's own, expressed through what
             # `edit_path` places and what `write_edits` accepts.
             contained_key(edit.path, surface)
-            if edit.op is EditOp.UPSERT:
+            if (
+                edit.op is EditOp.UPSERT
+                and edit.kind is not EditKind.SEMANTIC_DOCUMENT
+            ):
+                from .validate import validate_edit
+
                 warnings.extend(validate_edit(edit))
         current = view.files.get(edit.path)
         if edit.op is EditOp.DELETE and current is None:
@@ -475,6 +505,8 @@ def plan(
         # diff is built, never reaching agent context. A delete surfaces the same
         # removed content, so it is guarded too.
         if edit.kind is EditKind.PROFILES_YML and current is not None:
+            from .validate import find_inlined_secret
+
             secret_key = find_inlined_secret(current.content)
             if secret_key is not None:
                 raise PlanError(
@@ -553,10 +585,11 @@ def plan(
     except ValueError:
         rel_project = str(project)
     new_plan = TransformPlan(
-        plan_id=_plan_id(intent, pinned),
+        plan_id=_plan_id(intent, pinned, edit_target=edit_target),
         created_at=created_at,
         intent=intent,
         project_dir=rel_project,
+        edit_target=edit_target,
         edits=pinned,
     )
     store.save_plan(new_plan)
@@ -570,8 +603,9 @@ def apply(
     store: Store,
     confirmed: bool = False,
     project_format: EditableProject | None = None,
+    semantic_layer: SemanticEditTarget | None = None,
 ) -> ApplyResult:
-    """Write a stored plan's edits into the project, hash-checked and
+    """Write a stored plan's edits into its source, hash-checked and
     all-or-nothing.
 
     ``project_format`` is the tier-3 format the plan should be written through.
@@ -593,7 +627,21 @@ def apply(
 
     stored = store.load_plan(plan_id)
     project = Path(repo_root) / stored.project_dir
-    if project_format is None:
+    if stored.edit_target == "semantic":
+        if semantic_layer is None:
+            raise PlanError(
+                "this plan targets a semantic layer, but the configured layer "
+                "does not provide a semantic-document write surface"
+            )
+        surface = list(semantic_layer.semantic_editing_surface())
+        for edit in stored.edits:
+            contained_key(edit.path, surface)
+        result = semantic_layer.write_semantic_edits(
+            list(stored.edits), confirmed=confirmed
+        )
+    elif project_format is None:
+        from ..dbt_project import write_edits
+
         result = write_edits(list(stored.edits), project, confirmed=confirmed)
     else:
         # Containment is re-checked here, against the surface the format declares
@@ -660,6 +708,8 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     Packages are not scanned. The question is whether *this project* still points
     at what it is deleting, and a package cannot be edited to fix it anyway.
     """
+
+    from ..dbt_project import SourceFile, node_files, node_name
 
     delete_paths = {e.path for e in edits if e.op is EditOp.DELETE}
     if not delete_paths:
@@ -861,6 +911,11 @@ def select_columns(sql: str) -> set[str] | None:
     output name regardless of what expression computed it.
     """
 
+    import sqlglot
+    from sqlglot import expressions as exp
+
+    from .validate import _PLACEHOLDER, strip_jinja
+
     stripped = strip_jinja(sql)
     if not stripped:
         return None
@@ -888,12 +943,17 @@ def select_columns(sql: str) -> set[str] | None:
     return columns or None
 
 
-def _plan_id(intent: str, edits: list[PlanEdit]) -> str:
-    canonical = json.dumps(
-        {
-            "intent": intent,
-            "edits": [e.model_dump(mode="json") for e in edits],
-        },
-        sort_keys=True,
-    )
+def _plan_id(
+    intent: str, edits: list[PlanEdit], *, edit_target: str = "project"
+) -> str:
+    payload: dict[str, Any] = {
+        "intent": intent,
+        "edits": [e.model_dump(mode="json") for e in edits],
+    }
+    # Preserve every existing project plan id. The discriminator is needed only
+    # for the new axis, where an identical path/content must not collide with a
+    # transformation-project proposal.
+    if edit_target != "project":
+        payload["edit_target"] = edit_target
+    canonical = json.dumps(payload, sort_keys=True)
     return "p" + content_hash(canonical)[:10]

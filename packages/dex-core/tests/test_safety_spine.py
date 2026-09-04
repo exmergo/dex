@@ -5712,8 +5712,8 @@ def test_a_host_supplied_semantic_token_never_crosses_the_boundary(monkeypatch):
 
 # --- Native Apache Ossie is bound by the same spine as every other reader ------
 #
-# Ossie adds a second semantic-layer format and a second project format, and both
-# are new surfaces the spine had no entry for. Three families reach it. Family 3:
+# Ossie adds a second semantic-layer format and a native semantic edit target;
+# both are new surfaces the spine had no entry for. Three families reach it. Family 3:
 # a document is authored by a human and its dataset sources are strings, so PII
 # linkage has to come from evidence rather than from a string that looks like a
 # relation. Family 5: the catalog is read from files in the repository and must
@@ -5763,6 +5763,152 @@ semantic_model:
                 - dialect: ANSI_SQL
                   expression: email
 """
+
+
+def test_invalid_ossie_authoring_stores_no_plan_and_writes_nothing(
+    tmp_path, capsys
+):
+    """Family 4: validation precedes both plan storage and source writes."""
+
+    _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
+    original = (tmp_path / "layer.ossie.yaml").read_bytes()
+    edits = tmp_path / "invalid-ossie-edits.json"
+    edits.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {"path": "layer.ossie.yaml", "content": "version: wrong\n"}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "ossie",
+            "update",
+            "invalid document",
+            "--edits-file",
+            str(edits),
+        ],
+        capsys,
+    )
+
+    assert payload["status"] == "error"
+    assert "no plan was stored" in payload["errors"][0]
+    assert (tmp_path / "layer.ossie.yaml").read_bytes() == original
+    assert not list((tmp_path / ".dex" / "plans").glob("*.json"))
+
+
+def test_ossie_authoring_cannot_write_an_unconfigured_document(tmp_path, capsys):
+    """Family 4: the committed Ossie file list is the write boundary."""
+
+    _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
+    edits = tmp_path / "unconfigured-ossie-edits.json"
+    edits.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "unconfigured.ossie.yaml",
+                        "content": _OSSIE_DOCUMENT.replace(
+                            "name: people", "name: other", 1
+                        ),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "ossie",
+            "define",
+            "outside configured surface",
+            "--edits-file",
+            str(edits),
+        ],
+        capsys,
+    )
+
+    assert payload["status"] == "error"
+    assert "not configured" in payload["errors"][0]
+    assert not (tmp_path / "unconfigured.ossie.yaml").exists()
+    assert not list((tmp_path / ".dex" / "plans").glob("*.json"))
+
+
+def test_stale_ossie_authoring_refuses_the_whole_apply(tmp_path, capsys):
+    """Family 4: a stale pin makes a multi-document apply atomic."""
+
+    from exmergo_dex_core.config import DexConfig, save_config
+
+    first = tmp_path / "first.ossie.yaml"
+    second = tmp_path / "second.ossie.yaml"
+    first.write_text(_OSSIE_DOCUMENT, encoding="utf-8")
+    second_text = _OSSIE_DOCUMENT.replace("name: people", "name: other", 1)
+    second.write_text(second_text, encoding="utf-8")
+    save_config(
+        DexConfig(
+            connector="duckdb",
+            duckdb={"path": "demo.duckdb"},
+            semantic={
+                "vendor": "ossie",
+                "ossie": {
+                    "files": ["first.ossie.yaml", "second.ossie.yaml"]
+                },
+            },
+        ),
+        tmp_path,
+    )
+    edits = tmp_path / "stale-ossie-edits.json"
+    edits.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "first.ossie.yaml",
+                        "content": "# planned first\n" + _OSSIE_DOCUMENT,
+                    },
+                    {
+                        "path": "second.ossie.yaml",
+                        "content": "# planned second\n" + second_text,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    planned = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "ossie",
+            "update",
+            "two documents",
+            "--edits-file",
+            str(edits),
+        ],
+        capsys,
+    )
+    assert planned["status"] == "ok", planned
+
+    first.write_text("# human edit\n" + _OSSIE_DOCUMENT, encoding="utf-8")
+    before_second = second.read_bytes()
+    applied = _run(
+        ["--repo-root", str(tmp_path), "transform", "apply"], capsys
+    )
+
+    assert applied["status"] == "needs_confirmation"
+    assert second.read_bytes() == before_second
 
 
 def test_ossie_pii_linkage_exists_only_for_a_direct_column_on_a_real_relation(
