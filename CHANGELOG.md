@@ -11,6 +11,27 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **Native Ossie authoring plans are validated against cached exploration
+  evidence before they are stored, with no warehouse connection opened**
+  ([#412]). `semantic ossie define|update|plan` now checks each dataset's
+  source relation, direct field columns, declared keys, and relationship
+  endpoint columns against `.dex/cache.json`, reusing the exact same
+  `normalize_relation`/`match_identifier`/`column_reference` primitives the
+  read catalog already uses, so a reference dex would call invalid while
+  reading is checked by the identical rule at plan time.
+
+  The distinction the issue asks for is structural, not a judgment call: a
+  relation is refused only when it is absent from a namespace the cache
+  completely inventoried (a new `CacheProvenance.inventory_namespaces`,
+  populated from the same observed-namespace bookkeeping issue #149 already
+  established for carry-forward, not a new concept); a column is refused only
+  when it is missing from a relation the cache actually profiled. Everything
+  else, an unprofiled relation, a namespace never inventoried, a query-backed
+  or quoted source, a computed field expression, is a note, never a refusal:
+  absence of evidence is not evidence of absence. A refused reference stores
+  no plan, exactly like every other validation failure this command already
+  has.
+
 - **Native Ossie semantic documents can now be authored as reviewable plans**
   with `semantic ossie define|update|plan` and applied through the existing
   `transform apply` command ([#411]). The new `semantic_document` edit kind is
