@@ -53,6 +53,7 @@ from .results import (
 
 if TYPE_CHECKING:
     from ..adapters.project import MaintainProject
+    from ..dbt_project import ProjectDefinitions
     from ..engine import DexEngine
     from .snapshot import SemanticLayer, TransformLayer
 
@@ -162,6 +163,48 @@ def _semantic_layer(
     if project is None:
         return None
     return project.semantic_layer()
+
+
+def _composed_definitions(engine: DexEngine) -> ProjectDefinitions:
+    """Declared keys and joins, with a differing semantic vendor's own keys
+    folded in additively (#410).
+
+    Grain verification (`maintain grain`/`maintain check`) reads declared
+    composite keys off ``ProjectDefinitions.declared_composite_keys``, which
+    ``engine.project_format().definitions()`` alone never carries for Ossie:
+    Ossie is never the transformation project that method resolves (the same
+    fact #408 already worked around for the explore-side grain channel, in
+    `explore.commands._fold_semantic_layer_keys`). Mirrored here rather than
+    imported from there, the way #409's `_semantic_layer` is its own
+    implementation beside `explore.commands._semantic_catalog`: each module
+    composes through the same neutral `SemanticLayer.declared_keys()` seam
+    rather than one reaching into the other's private helper.
+
+    Additive and silent on every declinable condition, matching
+    ``declared_keys()``'s own contract: a format with nothing to add (dbt,
+    whose keys already reach here through this same call) returns empty and
+    changes nothing.
+    """
+
+    defs = engine.project_format().definitions()
+    if engine.repo_root is None:
+        return defs
+    try:
+        from ..explore.semantic import resolve_semantic_layer
+
+        layer = resolve_semantic_layer(engine, local=True)
+        keys, composite_keys = layer.declared_keys()
+    except (DexError, ValueError, OSError):
+        return defs
+    if not keys and not composite_keys:
+        return defs
+    return defs.model_copy(
+        update={
+            "present": True,
+            "declared_keys": [*defs.declared_keys, *keys],
+            "declared_composite_keys": [*defs.declared_composite_keys, *composite_keys],
+        }
+    )
 
 
 class NoBaselineError(PrerequisiteError):
@@ -536,9 +579,7 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         if scope_names
         else None
     )
-    plan = drift_mod.grain_plan(
-        adapter, snap, scope, engine.project_format().definitions()
-    )
+    plan = drift_mod.grain_plan(adapter, snap, scope, _composed_definitions(engine))
     if (
         plan.key_checks
         or plan.fanout_pairs
@@ -828,9 +869,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         else []
     )
 
-    plan = drift_mod.grain_plan(
-        adapter, snap, scope, engine.project_format().definitions()
-    )
+    plan = drift_mod.grain_plan(adapter, snap, scope, _composed_definitions(engine))
     # Added before both returns, so a declared grain the survey could not reach
     # is reported whether the scans run or stop at the handshake.
     warnings.extend(plan.notes)
@@ -1007,8 +1046,11 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # What the project declares, which is a different question from what its
     # files contain. `view` carries the bytes an edit is pinned against; this
     # carries the grain, and an edit that contradicts a declared grain is one no
-    # format is obliged to keep. Tier 1, so it cannot raise.
-    definitions = engine.project_format().definitions()
+    # format is obliged to keep. Tier 1, so it cannot raise. Composed with a
+    # differing semantic vendor's own keys (#410), so a proposal for a column
+    # Ossie already covers via a declared composite is not suggested as if
+    # nothing declared it.
+    definitions = _composed_definitions(engine)
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,
