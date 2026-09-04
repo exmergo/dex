@@ -20,19 +20,17 @@ but transform and maintain require one, since dbt is what they edit and diff.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from .dbt_semantic import (
     ResolvedPath,
@@ -45,6 +43,7 @@ from .dbt_semantic import (
     read_semantic_manifest as _read_semantic_manifest_file,
 )
 from .diffs import file_diff
+from .edits import ApplyResult, Conflict, Edit, EditOp, content_hash
 from .errors import ProjectError
 from .metricflow_dialect import METRIC_TIME
 from .project_definitions import (
@@ -183,62 +182,6 @@ class TargetInfo(BaseModel):
     name: str
     type: str
     is_default: bool
-
-
-class EditOp(str, Enum):
-    """The operation an edit performs, orthogonal to the file's ``kind``.
-
-    ``UPSERT`` writes ``new_content`` (create or update, decided by whether the
-    file already exists), the only behavior before deletes existed. ``DELETE``
-    removes the file. The default is ``UPSERT`` so every stored plan written
-    before this field existed deserializes unchanged.
-    """
-
-    UPSERT = "upsert"
-    DELETE = "delete"
-
-
-class Edit(BaseModel):
-    """One proposed file change, pinned to the content it was planned against.
-
-    ``old_content_hash`` is the sha256 of the file at plan time; ``None`` means
-    the file did not exist (a create). ``write_edits`` re-checks it so a human
-    edit after planning is detected as a conflict, never silently overwritten.
-
-    ``op`` distinguishes writing content from removing the file. A delete carries
-    no ``new_content`` (there is nothing to write) but still pins
-    ``old_content_hash``, so removing a file a human edited after planning is a
-    conflict, not a silent deletion.
-    """
-
-    path: str
-    new_content: str | None = None
-    old_content_hash: str | None = None
-    op: EditOp = EditOp.UPSERT
-
-    @model_validator(mode="after")
-    def _content_matches_op(self) -> Edit:
-        if self.op is EditOp.UPSERT and self.new_content is None:
-            raise ValueError(f"an upsert edit needs new_content: '{self.path}'")
-        if self.op is EditOp.DELETE and self.new_content is not None:
-            raise ValueError(f"a delete edit carries no new_content: '{self.path}'")
-        return self
-
-
-class Conflict(BaseModel):
-    path: str
-    expected_sha256: str | None
-    found_sha256: str | None
-
-
-class ApplyResult(BaseModel):
-    written: list[str] = Field(default_factory=list)
-    diffs: list[dict[str, Any]] = Field(default_factory=list)
-    conflicts: list[Conflict] = Field(default_factory=list)
-
-
-def content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def discover_projects(repo_root: Path | str = ".") -> list[Path]:

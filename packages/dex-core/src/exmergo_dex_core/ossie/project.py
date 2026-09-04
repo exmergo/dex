@@ -9,13 +9,11 @@ Ossie is configured through ``semantic.vendor: ossie`` and
 The semantic backend builds this reader from those coordinates; dbt, when
 present, remains responsible for the transformation-project tiers.
 
-**The tier reached today is tier 2 plus the catalog channel** (#409): this
-class also answers ``transform_layer()``/``semantic_layer()``, the snapshot
-fingerprints ``maintain snapshot``/``maintain check`` diff against a baseline,
-so a repository whose semantic vendor is Ossie gets a real drift baseline for
-its declared keys and relationships. Tier 3 (a preservation contract for
-writing documents back) is not claimed here: growing the write methods would
-claim them to ``maintain reconcile`` as well, and that is its own work.
+The class also answers ``transform_layer()``/``semantic_layer()``, the snapshot
+fingerprints ``maintain snapshot``/``maintain check`` diff against a baseline.
+Its authoring methods deliberately use semantic-document names rather than the
+``Project`` tier protocols: Ossie can receive semantic edits without becoming a
+transformation project or claiming dbt model writeback.
 """
 
 from __future__ import annotations
@@ -72,6 +70,7 @@ class OssieSemanticLayer:
         self.files = list(files)
         self.connector = connector
         self._loaded: LoadResult | None = None
+        self._semantic_edit_view: Any = None
 
     @classmethod
     def from_context(cls, context: ProjectContext) -> OssieSemanticLayer:
@@ -203,6 +202,31 @@ class OssieSemanticLayer:
                 notes=[f"native Ossie documents could not be read: {exc}"]
             )
         return snapshot_mod.semantic_layer(loaded, connector=self.connector)
+
+    # --- native semantic-document authoring ---------------------------------
+
+    def semantic_edit_view(self):
+        """Configured document bytes and hashes for format-neutral planning."""
+
+        from .authoring import load_edit_view
+
+        if self._semantic_edit_view is None:
+            self._semantic_edit_view = load_edit_view(self)
+        return self._semantic_edit_view
+
+    def semantic_editing_surface(self) -> list[str]:
+        """The exact configured documents; no directory-wide write authority."""
+
+        return list(self.files)
+
+    def write_semantic_edits(
+        self, edits: Any, *, confirmed: bool = False
+    ) -> Any:
+        """Write exact authored bytes with atomic stale-edit protection."""
+
+        from .authoring import write_edits
+
+        return write_edits(self, edits, confirmed=confirmed)
 
     def _load(self) -> LoadResult:
         if self._loaded is None:

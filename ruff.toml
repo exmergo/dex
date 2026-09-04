@@ -38,6 +38,9 @@ ignore = ["UP042"]
 # The project conformance contract ships for the same reason and in the same
 # idiom (S101).
 "packages/dex-core/src/exmergo_dex_core/adapters/conformance.py" = ["S101"]
+# The semantic edit-target conformance contract also ships for reuse and uses
+# pytest assertions for the same reason (S101).
+"packages/dex-core/src/exmergo_dex_core/edits_conformance.py" = ["S101"]
 # The semantic-backend conformance contract, third of the three, same reason and
 # same idiom (S101).
 "packages/dex-core/src/exmergo_dex_core/explore/semantic/conformance.py" = ["S101"]

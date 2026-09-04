@@ -11,6 +11,23 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **Native Ossie semantic documents can now be authored as reviewable plans**
+  with `semantic ossie define|update|plan` and applied through the existing
+  `transform apply` command ([#411]). The new `semantic_document` edit kind is
+  format-neutral and stored on the semantic-layer axis, so dbt remains the
+  transformation project and its semantic authoring behavior is unchanged.
+  Writes are limited to the exact paths configured in `semantic.ossie.files`;
+  the prospective full document set must pass the bundled Ossie schema,
+  integrity, expression, and cross-document namespace checks before a plan is
+  stored. Apply re-checks source hashes atomically, so one stale file refuses
+  every edit in the plan. Edits are whole-document replacements written
+  byte-for-byte: dex does not reformat YAML/JSON or touch unedited documents.
+  Ossie passes the shipped `SemanticEditTargetContract`, which exercises the
+  editable-tier and placement safety guarantees at the semantic-source seam.
+  It deliberately does not implement `EditableProject` or `PlacingProject`:
+  those protocols identify transformation projects, and the semantic-layer
+  architecture requires Ossie to remain independent of that axis.
+
 - **Native Apache Ossie semantic models are readable, as a project format rather
   than a set of vendor branches** ([#405], [#406], [#407]). `semantic.vendor:
   ossie` beside a dbt project, or `project.format: ossie` for a repository with

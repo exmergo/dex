@@ -52,6 +52,8 @@ def _all_commands() -> list[list[str]]:
                         "--expr",
                         "upper(x)",
                     ]
+                if group == "semantic" and sub == "ossie":
+                    argv.append("define")
                 argvs.append(argv)
         elif group == "demo":
             # The one verb that creates a file. Pointed at a directory that does
@@ -648,6 +650,14 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "argument": _TRANSLATED,
             "edits_file": _TRANSLATED,
             "no_parse": "no_parse",
+        },
+    },
+    ("semantic", "ossie"): {
+        "method": "semantic_ossie",
+        "args": {
+            "mode": "mode",
+            "argument": _TRANSLATED,
+            "edits_file": _TRANSLATED,
         },
     },
     ("maintain", "snapshot"): {"method": "snapshot", "args": {}},
