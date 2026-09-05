@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.9.3] - 2026-09-05
+
 ### Changed
 
 - **Reconcile edits a `schema.yml` by splicing it, not by reprinting it.** The
