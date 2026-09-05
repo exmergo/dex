@@ -11,6 +11,24 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Changed
 
+- **Reconcile edits a `schema.yml` by splicing it, not by reprinting it.** The
+  `unique` test edit parsed the file, mutated the tree and dumped it back, which
+  reflows every line and drops every comment, so the diff a reviewer read to approve
+  a one-word change described the whole document. It now changes the bytes that
+  declare the test and leaves the rest alone, which is the rule every other rewrite
+  in the engine already followed. A one-word change renders as one line added and
+  one removed.
+
+  This matters most for the formats above, whose declarations are hand-written, but
+  it applies to dbt too and the output shape moves for both. A new column entry takes
+  its indent from the entries already in the file, a flow test list stays flow, the
+  file's own choice between `tests` and `data_tests` is kept, removing the last test
+  removes the key rather than leaving an empty list, and a configured test written as
+  a mapping is never rewritten. A file dex cannot span safely, indented with tabs,
+  holding several YAML documents, or using anchors and aliases, is declined by name
+  rather than spliced at a guessed offset, and every result is re-parsed and checked
+  against what the edit intended before it can reach the plan store.
+
 - **A free answer stops arriving shaped like a bill** ([#136]). `maintain check`
   and `maintain semantic` complete their free axes on every call: schema, volume,
   and the reference and definition half of semantic are metadata reads that finish
@@ -194,6 +212,55 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   happen. Library callers reach it as `DexEngine.snapshot(project_only=True)`.
 
 ### Fixed
+
+- **A project format that declines the staging model still gets its declaration
+  reconciled** ([#429], reported by @catincloudlabs). `PlacingProject` was built so
+  a format could answer a path for one edit kind and `None` for another, and the
+  documented case is a project reduced from a running graph: no authored staging
+  model, but hand-written declarations that nothing regenerates. Reconcile asked
+  for the `MODEL_SQL` path first and treated `None` as a refusal for the whole
+  table, so every schema finding came back advisory with "this project format has
+  nowhere for a staging model to land", including the ones that were never about
+  dbt SQL. The one mechanical edit such a format could reach was the `unique` test
+  on a single-column key, so a tree whose keys were already declared unique could
+  not receive an edit at all, and the write tier it implemented was exercised by no
+  natural event.
+
+  Schema drift now lands in the declaration the format placed. `column_added` and
+  `column_dropped` add and remove the column entry, `nullability_changed` adds or
+  removes `not_null`, and the proposal says in its own words that dex authored
+  nothing for the model, because a consumer has to be able to tell a half the
+  format declined from a half dex dropped. Nothing changes for dbt, which places
+  both kinds and takes the re-scaffold as before.
+
+- **A type change no longer reconciles to a plan that changes nothing.** Neither
+  the model SQL nor the `schema.yml` dex writes carries a type, so re-scaffolding
+  from a retyped profile reproduced both files byte for byte: `column_retyped`
+  returned `mechanical`, stored a plan, and rendered two diffs whose every hunk was
+  empty. A retype is now advisory on every format, and the proposal names both
+  spellings.
+
+  It is not a gap waiting to be filled. `data_type` in the snapshot is the
+  connector's own spelling and is never canonicalized, so Snowflake reports
+  `NUMBER(38,0)` and `NUMBER(10,2)` both as `FIXED`, BigQuery reports a repeated
+  record as `ARRAY<STRUCT>`, and ClickHouse carries `Nullable(Int64)` verbatim. A
+  type written from that would be one warehouse's word for the column rather than
+  the column's. Two consequences are now stated in the connector references: on
+  ClickHouse nullability is part of the type, so a nullability change is reported
+  as a retype and gets advice where other connectors get an edit; on Snowflake a
+  precision or scale change produces no schema finding at all.
+
+- **A table that drifted on two axes stopped losing one of them.** Schema drift and
+  a lost unique key both reconcile into the same `schema.yml`, and reconcile emitted
+  two edits on that one path, each pinned to the same content hash. `transform apply`
+  wrote them in order and reported `ok`, listing the path twice as written, so the
+  second silently replaced the first: the applied project selected the added column
+  in its model SQL and did not declare it in its `schema.yml`. Reachable on a plain
+  dbt project with `maintain check` followed by `maintain reconcile`, with no second
+  format involved, and it is a propose-don't-impose failure, since the edit a human
+  reviewed in the diff is not the edit that landed. Everything now folds into one
+  edit per path, and an edit that would reproduce the file already there is dropped
+  rather than offered.
 
 - **`maintain` stops refusing an engine that was never given a repo root.**
   `check`, `grain`, and `reconcile` each read the project format without
