@@ -13,6 +13,7 @@ import json
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2161,6 +2162,87 @@ def test_a_format_that_declines_the_write_tier_gets_no_mechanical_edit(
         editable.plan_id
     ), "a format that declines the write tier stored a plan"
     assert any("does not implement the write tier" in w for w in declined.warnings)
+
+
+class _DeclaringProject(_NotEditableProject):
+    """Tier 3 for one channel: it places a declaration and no staging model.
+
+    The shape the placement seam exists for. It can receive an edit to the file a
+    person wrote, and it cannot receive a model, because its models are nodes in a
+    graph that regenerates.
+    """
+
+    name = "declaring"
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def load(self):
+        from exmergo_dex_core.dbt_project import SourceFile, content_hash
+
+        files = {}
+        for path in sorted((self._root / "declarations").glob("*.yml")):
+            content = path.read_text(encoding="utf-8")
+            key = f"declarations/{path.name}"
+            files[key] = SourceFile(
+                path=key, content=content, sha256=content_hash(content)
+            )
+        return SimpleNamespace(root=str(self._root), files=files)
+
+    def edit_path(self, kind, model):
+        from exmergo_dex_core.transform.plans import EditKind
+
+        return f"declarations/{model}.yml" if kind is EditKind.SCHEMA_YML else None
+
+    def editing_surface(self):
+        return ["declarations"]
+
+    def write_edits(self, edits, project_dir=None, *, confirmed: bool = False):
+        from exmergo_dex_core.dbt_project import ApplyResult
+
+        return ApplyResult(written=[], diffs=[], conflicts=[])
+
+
+def test_a_format_that_places_only_declarations_never_receives_dbt_sql(
+    dbt_project_dir: Path,
+):
+    """Widening the write path opened no channel for dbt SQL into a foreign tree.
+
+    A format that answers `None` for the staging model now receives a mechanical
+    edit rather than advice, which is the point of asking placement per kind. What
+    must not follow is dex authoring the half the format declined: the scaffold
+    generates dbt SQL alongside its path, and a tree whose models are graph nodes
+    has nowhere to put it and nothing that would read it.
+
+    Paired with the tier-2 assertion above rather than replacing it. That one pins
+    that declining the write tier declines everything; this one pins that
+    declining one kind declines only that kind.
+    """
+
+    store, _ = _reconcile_fixtures(dbt_project_dir)
+    root = dbt_project_dir.parent
+    declarations = root / "declarations"
+    declarations.mkdir()
+    (declarations / "orders.yml").write_text(
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n      - name: id\n",
+        encoding="utf-8",
+    )
+
+    result = DexEngine(
+        config=DexConfig(dbt_project_dir="analytics"),
+        store=store,
+        repo_root=str(root),
+        project_format=_DeclaringProject(root),
+    ).reconcile()
+
+    assert [p.kind for p in result.proposals] == ["mechanical"], result.proposals
+    assert result.plan_id is not None
+    stored = store.latest_plan()
+    assert [edit.path for edit in stored.edits] == ["declarations/orders.yml"]
+    for edit in stored.edits:
+        assert edit.kind.value != "model_sql"
+        assert "{{ source(" not in (edit.new_content or "")
+        assert "{{ ref(" not in (edit.new_content or "")
 
 
 def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: Path):
