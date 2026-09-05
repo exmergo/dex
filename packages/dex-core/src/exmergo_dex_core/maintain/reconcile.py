@@ -19,9 +19,6 @@ writes to the project and human edits stay authoritative at apply time.
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
-
-import yaml
 from pydantic import BaseModel, Field
 
 from ..adapters.project import PlacingProject
@@ -30,7 +27,9 @@ from ..config import PIIOverrideMatcher
 from ..dbt_project import DbtProjectView, ProjectDefinitions
 from ..explore.profile import detect_pii
 from ..transform.plans import EditKind, PlanEdit
+from ..transform.rewrite import column_tests
 from ..transform.scaffold import model_edits
+from .declare import DeclarationEdits, Declined, Placed
 from .drift import DriftFinding
 from .snapshot import Snapshot
 
@@ -52,8 +51,15 @@ class Proposal(BaseModel):
     paths: list[str] = Field(default_factory=list)
 
 
-# Schema findings that patch a column list; the rest of the axis is advisory.
+# Schema findings `_patched_dataset` knows how to apply to a profile.
 _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_changed"}
+
+#: The subset that has a written form. A retype has none: `data_type` carries the
+#: connector's own spelling rather than a canonical one (Snowflake renders
+#: NUMBER(38,0) and NUMBER(10,2) both as FIXED, BigQuery renders a repeated record
+#: as ARRAY<STRUCT>), so a type dex wrote into a declaration would not be the
+#: warehouse's. It is surfaced as a decision instead.
+_MECHANICAL = {"column_added", "column_dropped", "nullability_changed"}
 
 
 def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
@@ -131,38 +137,54 @@ def build(
                 orphan_identifiers.append(finding.identifier)
             proposals.append(_advisory(finding))
 
+    declarations = DeclarationEdits(view, placement)
     for identifier, table_findings in sorted(schema_patches.items()):
         table = identifier.rsplit(".", 1)[-1]
+        # A retype is always its own decision, and never a reason on its own to
+        # rebuild anything: nothing dex writes carries a type, so a plan built for
+        # one would propose the file it already has.
+        proposals.extend(
+            _retype_advisory(finding)
+            for finding in table_findings
+            if finding.code not in _MECHANICAL
+        )
+        written = [f for f in table_findings if f.code in _MECHANICAL]
+        if not written:
+            continue
         base = _base_dataset(identifier, cache, snap)
         model_path = _placed(placement, EditKind.MODEL_SQL, table)
-        if (
-            view is None
-            or base is None
-            or model_path is None
-            or (model_path not in view.files)
-        ):
+        if view is not None and model_path is None:
+            # The format authors no staging model, and this drift was never about
+            # one. The declaration it does place is a file the drift describes, and
+            # patching it needs no profile to rebuild from: the finding carries
+            # every fact a column entry states.
+            placed = declarations.resolve(table)
+            if isinstance(placed, Placed):
+                _declare(
+                    declarations,
+                    placed,
+                    identifier,
+                    table,
+                    written,
+                    proposals,
+                    pii_overrides,
+                )
+            else:
+                proposals.extend(
+                    _schema_advisory(identifier, finding, placed.reason)
+                    for finding in written
+                )
+            continue
+        if view is None or base is None or model_path not in view.files:
             reason = (
                 "this project format cannot receive edits"
                 if view is None
                 else "no profiled baseline to rebuild from"
                 if base is None
-                else "this project format has nowhere for a staging model to land"
-                if model_path is None
                 else f"no dex-scaffolded staging model at {model_path}"
             )
             proposals.extend(
-                Proposal(
-                    axis="schema",
-                    kind="advisory",
-                    finding_code=finding.code,
-                    identifier=identifier,
-                    column=finding.column,
-                    action=(
-                        f"{reason}; adjust the referencing models by hand "
-                        "or with `transform plan`"
-                    ),
-                )
-                for finding in table_findings
+                _schema_advisory(identifier, finding, reason) for finding in written
             )
             continue
         patched = _patched_dataset(base, table_findings, pii_overrides or set())
@@ -193,10 +215,9 @@ def build(
                 for finding in table_findings
             )
             continue
-        edits.extend(table_edits)
-        changes = ", ".join(
-            f"{f.code.replace('_', ' ')} ({f.column})" for f in table_findings
-        )
+        for edit in table_edits:
+            declarations.stage_whole(edit.path, edit.kind, edit.new_content or "")
+        changes = ", ".join(f"{f.code.replace('_', ' ')} ({f.column})" for f in written)
         proposals.append(
             Proposal(
                 axis="schema",
@@ -212,11 +233,10 @@ def build(
             )
         )
 
-    grain_edits, grain_warnings = _grain_test_edits(
-        proposals, view, placement, definitions
-    )
-    edits.extend(grain_edits)
-    warnings.extend(grain_warnings)
+    warnings.extend(_grain_test_edits(proposals, declarations, definitions))
+    edits.extend(declarations.edits())
+    warnings.extend(declarations.warnings)
+    _drop_empty_proposals(proposals, {edit.path for edit in edits})
 
     if definition_churn:
         warnings.append(
@@ -323,6 +343,157 @@ def _advisory(finding: DriftFinding) -> Proposal:
     )
 
 
+def _schema_advisory(identifier: str, finding: DriftFinding, reason: str) -> Proposal:
+    return Proposal(
+        axis="schema",
+        kind="advisory",
+        finding_code=finding.code,
+        identifier=identifier,
+        column=finding.column,
+        action=(
+            f"{reason}; adjust the referencing models by hand or with `transform plan`"
+        ),
+    )
+
+
+def _retype_advisory(finding: DriftFinding) -> Proposal:
+    """A type change, surfaced rather than written.
+
+    Nothing dex authors carries a type, and there is no type it could carry: the
+    snapshot records the connector's own spelling rather than a canonical one, so
+    a written type would be one warehouse's word for the column rather than the
+    column's. Naming both spellings is what lets a reader decide whether the
+    change is a widening they can absorb or one that breaks a downstream cast.
+    """
+
+    if finding.code != "column_retyped":
+        return _advisory(finding)
+    before = finding.data.get("type_before", "?")
+    after = finding.data.get("type_after", "?")
+    return Proposal(
+        axis=finding.axis,
+        kind="advisory",
+        finding_code=finding.code,
+        identifier=finding.identifier,
+        column=finding.column,
+        action=(
+            f"the column changed type ({before} -> {after}); dex proposes no edit, "
+            "because nothing it writes declares a type and the type it holds is "
+            "the connector's spelling rather than a canonical one. Update the "
+            "declared type and the models reading this column by hand"
+        ),
+    )
+
+
+def _declare(
+    declarations: DeclarationEdits,
+    placed: Placed,
+    identifier: str,
+    table: str,
+    written: list[DriftFinding],
+    proposals: list[Proposal],
+    pii_overrides: PIIOverrideMatcher | None,
+) -> None:
+    """Stage the schema drift onto the declaration the format placed.
+
+    Every finding that could not be staged becomes its own advisory carrying the
+    reason, so a reader never has to infer from a shorter list that dex declined
+    something. The rest fold into one proposal, which says in words that the model
+    itself was not authored: this format declined that kind, and a declined half
+    a consumer cannot see is indistinguishable from one dex dropped.
+    """
+
+    staged: list[DriftFinding] = []
+    for finding in written:
+        if finding.code == "column_added":
+            refusal = declarations.add_column(
+                placed, _added_column(identifier, finding, pii_overrides)
+            )
+        elif finding.code == "column_dropped":
+            refusal = declarations.drop_column(placed, finding.column or "")
+        else:
+            nullable = bool(finding.data.get("nullable_after", True))
+            refusal = declarations.want_tests(
+                placed,
+                finding.column or "",
+                add=() if nullable else ("not_null",),
+                remove=("not_null",) if nullable else (),
+            )
+        if refusal is None:
+            staged.append(finding)
+        else:
+            proposals.append(_schema_advisory(identifier, finding, refusal))
+    if not staged:
+        return
+    changes = ", ".join(f"{f.code.replace('_', ' ')} ({f.column})" for f in staged)
+    proposals.append(
+        Proposal(
+            axis="schema",
+            kind="mechanical",
+            finding_code="schema_drift",
+            identifier=identifier,
+            action=(
+                f"update '{placed.model}' in {placed.path} to match the drifted "
+                f"source ({changes}); this project format places no staging model "
+                f"for {table}, so dex authored nothing for the model itself: make "
+                "the matching change wherever that model is defined"
+            ),
+            paths=[placed.path],
+        )
+    )
+
+
+def _added_column(
+    identifier: str,
+    finding: DriftFinding,
+    pii_overrides: PIIOverrideMatcher | None,
+) -> ColumnProfile:
+    """The profile behind one added column, flagged the way the scaffold flags it.
+
+    Name-based only, at base confidence: no aggregates exist for a column that
+    appeared since the last profile, so there is no shape evidence to refine it
+    with and the flag blocks until the next one. A column a human already cleared
+    is cleared here too, with the audit kept.
+    """
+
+    data_type = str(finding.data.get("data_type", ""))
+    column = finding.column or ""
+    flag = detect_pii(column, data_type)
+    overridden = f"{identifier}.{column}".lower() in (pii_overrides or set())
+    return ColumnProfile(
+        name=column,
+        data_type=data_type,
+        pii=None if overridden else flag,
+        pii_overridden=flag.category if overridden and flag else None,
+    )
+
+
+def _drop_empty_proposals(proposals: list[Proposal], written: set[str]) -> None:
+    """Demote a mechanical proposal whose paths produced no edit.
+
+    The fold drops an edit that reproduced the file it already had, and a splice
+    that did not verify is dropped too. Either leaves a proposal claiming a plan
+    behind it that is not there, which tells a reader an edit landed when none
+    did: the same failure the unique test's clause exists to prevent, one axis
+    over.
+    """
+
+    for index, proposal in enumerate(proposals):
+        if proposal.kind != "mechanical" or set(proposal.paths) & written:
+            continue
+        proposals[index] = proposal.model_copy(
+            update={
+                "kind": "advisory",
+                "action": (
+                    f"{proposal.action}. dex proposed no edit in the end: what it "
+                    "would have written is what the project already holds, so the "
+                    "drift is real and does not show up in anything dex authors"
+                ),
+                "paths": [],
+            }
+        )
+
+
 def _base_dataset(
     identifier: str, cache: DexCache | None, snap: Snapshot
 ) -> Dataset | None:
@@ -388,101 +559,65 @@ _TEST_EDIT_CLAUSE = "; the unique test keeps the break visible in builds"
 
 def _grain_test_edits(
     proposals: list[Proposal],
-    view: DbtProjectView | None,
-    placement: PlacingProject | None = None,
+    declarations: DeclarationEdits,
     definitions: ProjectDefinitions | None = None,
-) -> tuple[list[PlanEdit], list[str]]:
-    """Back key_lost_uniqueness proposals with a `unique` test edit when the
-    scaffolded YAML exists, does not already alert, and the project does not
-    declare a composite grain over that column. The duplicates themselves stay a
-    human decision; the edit only makes the break visible.
+) -> list[str]:
+    """Back key_lost_uniqueness proposals with a `unique` test where one belongs.
 
-    Every path out of this that produces no edit says so in ``warnings``, and the
-    action string gains its "the unique test keeps the break visible" clause only
-    where an edit was produced. The proposal itself survives either way, so a
-    silent skip would leave a reader looking at a `key_lost_uniqueness` proposal
-    with no test edit and no way to tell whether dex declined or failed, and an
-    unconditional promise would tell them an edit landed when none did."""
+    The duplicates themselves stay a human decision; the test only makes the break
+    visible in builds. It goes through the same accumulator the schema axis uses,
+    so a table that drifted both ways arrives as one edit for its declaration
+    rather than two edits pinned to the same content, the second of which would
+    silently replace the first.
 
-    if view is None:
-        return [], []
+    Every path out of this that produces no edit says so in the returned warnings,
+    and the action string gains its "the unique test keeps the break visible"
+    clause only where an edit was produced. The proposal itself survives either
+    way, so a silent skip would leave a reader looking at a `key_lost_uniqueness`
+    proposal with no test edit and no way to tell whether dex declined or failed,
+    and an unconditional promise would tell them an edit landed when none did.
+    """
 
-    edits: list[PlanEdit] = []
     warnings: list[str] = []
     for proposal in proposals:
         if proposal.finding_code != "key_lost_uniqueness" or proposal.column is None:
             continue
         table = (proposal.identifier or "").rsplit(".", 1)[-1]
-        path = _placed(placement, EditKind.SCHEMA_YML, table)
-        if path is None:
+        placed = declarations.resolve(table)
+        if isinstance(placed, Declined):
             warnings.append(
-                f"this project format has nowhere for a test on {proposal.identifier} "
-                "to land, so the lost unique key has no test edit; add a `unique` "
-                "test wherever that model is defined"
+                f"{placed.reason}, so the lost unique key on {proposal.identifier} "
+                "has no test edit; add a `unique` test wherever that model is "
+                "defined"
             )
             continue
-        source = view.files.get(path)
-        if source is None:
-            warnings.append(
-                f"no dex-scaffolded {path} to extend, so the lost unique key on "
-                f"{proposal.identifier} has no test edit; add a `unique` test "
-                "wherever that model is defined"
-            )
-            continue
-        try:
-            parsed = yaml.safe_load(source.content)
-        except yaml.YAMLError:
-            warnings.append(f"{path} did not parse; add the unique test by hand")
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        # The convention leaks through content as well as through paths, and
-        # placement only closes the path half. This matched `stg_{table}` inside
-        # the YAML, so a format that placed the file correctly and names its
-        # model `orders` was still missed, silently, one line before the edit.
-        #
-        # The model is named after the file the format chose. For dbt that is the
-        # same string it always matched, because the scaffold path is
-        # `models/staging/stg_{table}.yml` and its stem is `stg_{table}`; for a
-        # format placing `declarations/orders.yml` it is `orders`. The format
-        # already answered "where does this table's declaration live", and this
-        # reads the answer instead of asserting dbt's spelling over it. A format
-        # that packs many models into one file finds no entry and is warned
-        # below, which is a refusal to guess rather than a wrong write.
-        declared = PurePosixPath(path).stem
-        entry = next(
-            (
-                column
-                for model in parsed.get("models") or []
-                if isinstance(model, dict) and model.get("name") == declared
-                for column in model.get("columns") or []
-                if isinstance(column, dict) and column.get("name") == proposal.column
-            ),
-            None,
+        content = declarations.content_for(placed.path)
+        current = (
+            column_tests(content, placed.model, proposal.column)
+            if content is not None
+            else None
         )
-        if entry is None:
-            # Split from the "already alerting" skip below, which is silent
-            # because it is correct. This one is a miss: the file resolved and
-            # the column entry did not, and a reader looking at the proposal
-            # would otherwise have no way to tell that from dex declining.
+        if current is None:
             warnings.append(
-                f"{path} declares no column '{proposal.column}' under a model "
-                f"named '{declared}', so the lost unique key on "
+                f"{placed.path} declares no column '{proposal.column}' under a "
+                f"model named '{placed.model}', so the lost unique key on "
                 f"{proposal.identifier} has no test edit; add a `unique` test "
                 "there by hand"
             )
             continue
-        if "unique" in (entry.get("tests") or []):
+        if "unique" in current.values:
             continue  # already alerting
-        composite, unresolved = _declared_grain(definitions, declared, proposal.column)
+        composite, unresolved = _declared_grain(
+            definitions, placed.model, proposal.column
+        )
         if unresolved:
             # Not a decline: nothing established that a composite covers this
             # column, so the edit stands. What is missing is the confidence, and
             # a reader deciding whether to apply the diff should know the check
             # could not run rather than read silence as a clean answer.
             warnings.append(
-                f"the project's declarations for '{declared}' could not be read "
-                f"({unresolved}), so the `unique` test proposed on "
+                f"the project's declarations for '{placed.model}' could not be "
+                f"read ({unresolved}), so the `unique` test proposed on "
                 f"{proposal.identifier}.{proposal.column} was not checked against "
                 "a declared composite grain; confirm the model's grain before "
                 "applying"
@@ -496,7 +631,7 @@ def _grain_test_edits(
             # letting the format sort it out is how a plan comes back
             # `conflicts=0` having changed nothing.
             warnings.append(
-                f"'{declared}' declares a composite grain "
+                f"'{placed.model}' declares a composite grain "
                 f"({', '.join(composite)}), so no column-level `unique` is "
                 f"proposed on {proposal.column}: the project never claimed that "
                 "column is unique on its own. Either the composite is still the "
@@ -505,17 +640,16 @@ def _grain_test_edits(
                 f"{proposal.column} alone and that assumption is now false"
             )
             continue
-        entry.setdefault("tests", []).append("unique")
-        edits.append(
-            PlanEdit(
-                path=path,
-                kind=EditKind.SCHEMA_YML,
-                new_content=yaml.safe_dump(parsed, sort_keys=False),
+        refusal = declarations.want_tests(placed, proposal.column, add=("unique",))
+        if refusal is not None:
+            warnings.append(
+                f"{refusal}, so the lost unique key on {proposal.identifier} has "
+                "no test edit; act on the drift that removed the column instead"
             )
-        )
-        proposal.paths.append(path)
+            continue
+        proposal.paths.append(placed.path)
         proposal.action += _TEST_EDIT_CLAUSE
-    return edits, warnings
+    return warnings
 
 
 def _declared_grain(
