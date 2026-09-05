@@ -412,7 +412,7 @@ database, which is fine for model-only builds.
   do not (use `define`). For one logical change that mixes both (evolve existing
   metrics and add the helpers they depend on), use `semantic plan ...`: it
   accepts mixed intent and classifies each name, and the envelope reports the
-  split as `defined`, `updated`, and `unchanged`.
+  split as `defined`, `updated`, `unchanged`, and `removed`.
 - **Prefer `--definitions-file` over `--edits-file` for the semantic layer.** A
   real project keeps its metrics in one shared file, so a whole-file payload
   means retyping every definition you are not touching: the diff and the
@@ -424,9 +424,23 @@ database, which is fine for model-only builds.
   body with no leading `- `. The name comes from the content, and `path` can be
   omitted for anything the project already declares (the engine rewrites it
   where it lives). Everything else in the file, comments included, is preserved
-  byte for byte. Reach for `--edits-file` when you are creating a file, removing
-  a definition, or moving one between files, and when the engine refuses a
-  layout it will not splice into.
+  byte for byte. Reach for `--edits-file` when you are creating a file, moving a
+  definition between files, or emptying one, and when the engine refuses a layout
+  it will not splice into.
+- **Removing one definition is the same payload with `"op": "delete"`**:
+  `{"definitions": [{"kind": "metric", "name": "doubled", "op": "delete"}]}`, the
+  name declared (there is no content to read it from) and no `content` beside it.
+  Nothing is removed for going unmentioned, so you can send a removal and an
+  edit in one payload and everything you did not name stays as it is. Use
+  `semantic update` or `semantic plan`, not `define`. The envelope reports it
+  under `removed`.
+- If a metric still reads what you are removing (its input is that metric, or a
+  measure of the semantic model you are removing), the plan is refused and the
+  reader is named: add that reader's own delete or update to the same payload,
+  in any order, and it goes through. A removal that would leave a file with no
+  semantic model or metric in it is refused too, because deleting or emptying a
+  file is a whole-file edit: do that with `transform plan --edits-file` and
+  `"op": "delete"`.
 - `unchanged` means you re-stated a definition exactly as the project already
   has it. It is not an error, but if a plan is entirely `unchanged` it changes
   nothing, and the envelope warns as much: check whether you meant to edit
