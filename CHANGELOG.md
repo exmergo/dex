@@ -245,6 +245,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Fixed
 
+- **BigQuery `explore map` profiles a table with a `TIMESTAMP` column again**
+  ([#430]). Temporal continuity asked for a month-grain gap on every non-PII
+  `TIMESTAMP` column as `TIMESTAMP_DIFF(period, prev_period, MONTH)`, and
+  BigQuery's `TIMESTAMP_DIFF` stops at `DAY`, so the statement was refused at
+  job insert. The continuity subqueries ride the same flat `SELECT` as the
+  batch's other aggregates, and the `BadRequest` fallback in `column_aggregates`
+  degrades the whole batch, so one optional fraction took every column's null
+  fraction, distinct count, min and max, key detection and grain with it, and
+  recorded `aggregate profiling failed and was skipped` in `data_quality`. The
+  run still returned `ok`. Present since 1.6.6 shipped the feature ([#206]);
+  `DATETIME` and `DATE` columns were never affected because their diff
+  families accept `MONTH`.
+
+  The month gap on a `TIMESTAMP` column is now
+  `DATE_DIFF(DATE(period), DATE(prev_period), MONTH)`. Both operands are
+  already `TIMESTAMP_TRUNC(..., MONTH)` periods, so their UTC dates are month
+  boundaries and the diff is exact; day and hour keep `TIMESTAMP_DIFF`, and
+  the other two temporal types render as before. Whether the batch should
+  retry without the optional temporal expressions before degrading to
+  metadata-only is left open on the issue: it is a change to the fallback
+  contract, not to the expression that broke it.
+
 - **`maintain` stops refusing an engine that was never given a repo root.**
   `check`, `grain`, and `reconcile` each read the project format without
   guarding the construction, and the shipped dbt format correctly refuses to
