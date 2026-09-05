@@ -176,6 +176,13 @@ judged. Exact distinct-count escalation spends only inside the confirmed
 budget and degrades to approximate verdicts with a note when the remainder
 cannot cover it.
 
+`SHOW COLUMNS` reports a type token rather than a full type. `NUMBER(38,0)` and
+`NUMBER(10,2)` both arrive as `FIXED`, and `VARCHAR(50)` as `TEXT`, so precision,
+scale and length are not recorded anywhere dex can compare. Two things follow:
+`maintain schema` reports no `column_retyped` for a precision, scale or length
+change, and `is_integer_type` treats `FIXED` as a known, accepted false negative
+rather than guessing at the scale behind it.
+
 ## Testing
 
 Offline: a stateful fake connection (`tests/fakes/snowflake.py`) that records

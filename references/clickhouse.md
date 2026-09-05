@@ -234,6 +234,13 @@ setting rather than assuming it.
 - Nullability comes from the **type**, not a column flag: ClickHouse has no
   `is_nullable`, so `Nullable(...)` and `LowCardinality(...)` are unwrapped in
   either nesting order before any type reasoning happens.
+- **That has a consequence for drift.** Because nullability is part of the type
+  string, a column that starts or stops accepting nulls is reported by
+  `maintain schema` as `column_retyped` rather than `nullability_changed`, and
+  `maintain reconcile` answers a retype with advice rather than an edit on every
+  connector. So a nullability change here is surfaced with both type spellings
+  named and the declaration is yours to update, where the same warehouse change on
+  BigQuery or Snowflake would arrive as a proposed edit.
 - Distinct counts come from `uniq` (a HyperLogLog sketch) in the same pass as the
   null counts, and are never a uniqueness verdict on their own. Near-unique
   columns escalate to an exact `uniqExact` inside the confirmed budget.

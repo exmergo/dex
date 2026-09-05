@@ -151,9 +151,12 @@ them.
 
 Reconcile tags every proposal by `kind`, because the fix differs sharply by axis:
 
-- **`mechanical`**: schema drift on a dex-scaffolded staging model re-scaffolds
-  the model from the drifted source. High-confidence, but still a reviewable diff:
-  read it for hand-written logic the scaffold cannot know about.
+- **`mechanical`**: schema drift reconciles in one of two shapes. On a
+  dex-scaffolded staging model it re-scaffolds the model from the drifted source;
+  on a project format that places a declaration but authors no staging model, it
+  edits the drifted columns into that declaration and says so. High-confidence, but
+  still a reviewable diff: read it for hand-written logic the scaffold cannot know
+  about.
 - **`advisory`**: grain, volume, and semantic drift are decisions, not auto-fixes
   (dex cannot dedup your warehouse or decide whether a new `'refunded'` status
   belongs in a metric). The proposal is the decision surfaced, at most backed by a
@@ -162,6 +165,13 @@ Reconcile tags every proposal by `kind`, because the fix differs sharply by axis
   column, no column-level `unique` is proposed on it, and the warning names the
   combination so you can tell "re-baseline, this is still the grain" from
   "something relied on that column alone".
+
+**A type change is advisory on every format.** Nothing dex writes declares a type,
+and the type it holds is the connector's own spelling rather than a canonical one
+(Snowflake reports `NUMBER(38,0)` and `NUMBER(10,2)` both as `FIXED`), so the
+proposal names both spellings and the edit is yours. One consequence to know: on
+ClickHouse nullability is part of the type, so a column that starts accepting nulls
+is reported as a retype and gets advice where other connectors get an edit.
 
 When reconcile produces edits it stores them as a plan and prints a `plan_id`.
 Apply them with `transform apply <plan-id>` (the one apply door): a human edit made
