@@ -142,6 +142,13 @@ def _date_trunc_expr(qcol: str, unit: str, data_type: str) -> str:
 
 
 def _date_diff_expr(unit: str, later: str, earlier: str, data_type: str) -> str:
+    # TIMESTAMP_DIFF stops at DAY: BigQuery refuses MONTH (and every coarser
+    # part) for TIMESTAMP arguments, at job insert, so the whole aggregate
+    # statement failed and the table degraded to metadata-only (issue #430).
+    # Both operands here are TIMESTAMP_TRUNC(..., MONTH) periods, so their UTC
+    # dates are month boundaries and DATE_DIFF at MONTH is exact.
+    if unit == "month" and "TIMESTAMP" in data_type.upper():
+        return f"DATE_DIFF(DATE({later}), DATE({earlier}), MONTH)"
     return f"{_diff_family(data_type)}({later}, {earlier}, {unit.upper()})"
 
 
