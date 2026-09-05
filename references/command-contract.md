@@ -230,7 +230,7 @@ dex maintain grain [<objects>]    -> cardinality/identity drift: lost key unique
                                      (aggregates; gated by --confirm --budget on billed connectors)
 dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + categorical dimension
                                      cardinality change (a scan; gated on billed connectors)
-dex maintain reconcile [<class>]  -> propose the dbt edits that reconcile detected drift, as a stored plan
+dex maintain reconcile [<class>]  -> propose the edits that reconcile detected drift, as a stored plan
                                      of diffs tagged mechanical/advisory (applied with transform apply)
 dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
                                      required (unlike every subcommand above): failed/skipped build
