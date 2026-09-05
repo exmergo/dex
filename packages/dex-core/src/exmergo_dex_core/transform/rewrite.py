@@ -886,6 +886,240 @@ def _column_blocks(
     return blocks
 
 
+def column_anchor(content: str, model: str) -> tuple[int, str] | None:
+    """Where a new column entry goes under ``model``, and the indent to write it at.
+
+    The indent is read from the entries already there rather than assumed, because
+    this runs against files dex did not write. A model declaring no columns has no
+    precedent to read and no contract to keep current, so it answers ``None``
+    rather than inventing one.
+
+    The offset is backed up over trailing blank lines: :func:`_block_end` walks
+    past them to find the next line with content, so the raw span end sits *after*
+    the separator a human put before the next key, and an insertion there lands the
+    new column on the far side of the gap.
+    """
+
+    blocks = [
+        block
+        for block in yaml_blocks(content)
+        if block.form == "yaml_column" and block.owner == model
+    ]
+    if not blocks:
+        return None
+    last = max(blocks, key=lambda block: block.span[1])
+    line_start = content.rfind("\n", 0, last.span[0]) + 1
+    indent = content[line_start:][
+        : len(content[line_start:]) - len(content[line_start:].lstrip(" "))
+    ]
+    return (before_trailing_blanks(content, last.span[1]), indent)
+
+
+@dataclass
+class ColumnTests:
+    """One column's declared tests, and the spans needed to change the list.
+
+    ``spans`` carries only the *scalar* items. A test written as a mapping
+    (``- accepted_values: {...}``) is counted in ``values`` under its single key
+    and carries no span, so it is never rewritten and never removed: dex changes
+    the tests it can name and leaves configured ones alone.
+    """
+
+    key: str | None
+    values: list[str]
+    spans: dict[str, tuple[int, int]]
+    key_span: tuple[int, int] | None
+    value_span: tuple[int, int] | None
+    items: list[tuple[int, int]]
+    entry_span: tuple[int, int]
+    bullet_indent: str
+    flow: bool
+
+
+def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
+    """One column's test list, resolved inside that column's own bytes.
+
+    Scoped through :func:`yaml_blocks` first, which bounds the entry by
+    indentation. That is what keeps two columns of the same model that both carry
+    ``not_null`` from being confused for each other: the search never leaves the
+    one column's span, so the ambiguity cannot arise rather than being resolved.
+    """
+
+    try:
+        root = yaml.compose(content)
+    except yaml.YAMLError:
+        return None
+    entry_span = next(
+        (
+            block.span
+            for block in yaml_blocks(content)
+            if block.form == "yaml_column"
+            and block.owner == model
+            and block.name == column
+        ),
+        None,
+    )
+    if entry_span is None:
+        return None
+    line = content[entry_span[0] :]
+    bullet_indent = line[: len(line) - len(line.lstrip(" "))]
+
+    node = _column_node(root, model, column)
+    for key in ("tests", "data_tests"):
+        listed = dict(_mapping(node, spans=True)) if node is not None else {}
+        found = next((v for k, v in listed.items() if k[0] == key), None)
+        if found is None:
+            continue
+        key_span = next(k[1] for k in listed if k[0] == key)
+        values: list[str] = []
+        spans: dict[str, tuple[int, int]] = {}
+        items: list[tuple[int, int]] = []
+        for item in _sequence(found):
+            if isinstance(item, yaml.ScalarNode):
+                values.append(item.value)
+                spans[item.value] = _span(item)
+                items.append(_span(item))
+            else:
+                named = [name for name, _body in _mapping(item)]
+                values.append(named[0] if named else "")
+                items.append((item.start_mark.index, item.end_mark.index))
+        return ColumnTests(
+            key=key,
+            values=values,
+            spans=spans,
+            key_span=key_span,
+            value_span=(found.start_mark.index, found.end_mark.index),
+            items=items,
+            entry_span=entry_span,
+            bullet_indent=bullet_indent,
+            flow=bool(getattr(found, "flow_style", False)),
+        )
+    return ColumnTests(
+        key=None,
+        values=[],
+        spans={},
+        key_span=None,
+        value_span=None,
+        items=[],
+        entry_span=entry_span,
+        bullet_indent=bullet_indent,
+        flow=False,
+    )
+
+
+def prevailing_test_key(content: str) -> str:
+    """Whether this file spells its tests ``tests`` or ``data_tests``.
+
+    dbt accepts both and a file that already chose one should not gain the other.
+    Decided by which spelling more column entries use; with no precedent, ``tests``,
+    which is what dex's own scaffold writes.
+    """
+
+    counts = {
+        "tests": content.count("tests:"),
+        "data_tests": content.count("data_tests:"),
+    }
+    counts["tests"] -= counts["data_tests"]
+    return "data_tests" if counts["data_tests"] > counts["tests"] else "tests"
+
+
+def column_tests_span(
+    content: str, current: ColumnTests, wanted: list[str], *, key: str
+) -> tuple[int, int, str] | None:
+    """One replacement span that makes ``current`` say ``wanted``.
+
+    Surgical rather than a re-render, so a mapping test sitting in the same list
+    survives untouched and a flow list stays on its line. ``None`` when the file
+    already says ``wanted``, which is what keeps a no-op out of the plan.
+    """
+
+    if current.values == wanted:
+        return None
+    added = [name for name in wanted if name not in current.values]
+    removed = [name for name in current.values if name not in wanted]
+    if len(added) + len(removed) != 1:
+        raise RewriteError(
+            "a test list changes one name at a time; dex would have produced a "
+            "file it could not predict, so nothing was changed"
+        )
+
+    if removed:
+        name = removed[0]
+        span = current.spans.get(name)
+        if span is None or current.key_span is None or current.value_span is None:
+            return None
+        if len(current.values) == 1:
+            # The whole key goes rather than being left as an empty list, which
+            # declares nothing and reads as a test someone deleted the body of.
+            start, end = _pair_span(content, current.key_span, None)
+            return (start, before_trailing_blanks(content, end), "")
+        if current.flow:
+            index = current.items.index(span)
+            if index > 0:
+                return (current.items[index - 1][1], span[1], "")
+            return (span[0], current.items[index + 1][0], "")
+        start = content.rfind("\n", 0, span[0]) + 1
+        return (start, _block_end(content, start, _indent_of(content, start)), "")
+
+    name = added[0]
+    if current.key is None:
+        field_indent = current.bullet_indent + "  "
+        at = before_trailing_blanks(content, current.entry_span[1])
+        return (at, at, f"{field_indent}{key}: [{name}]\n")
+    if current.value_span is None:
+        return None
+    if current.flow:
+        end = current.value_span[1]
+        if content[end - 1] != "]":
+            raise RewriteError(
+                f"the test list for a column is not closed at {end}; dex would "
+                "have produced a file it could not predict, so nothing was changed"
+            )
+        return (end - 1, end - 1, f", {name}" if current.values else name)
+    last = max(current.items, key=lambda span: span[1])
+    start = content.rfind("\n", 0, last[0]) + 1
+    item_indent = content[start : start + _indent_of(content, start)]
+    at = _block_end(content, start, _indent_of(content, start))
+    return (at, at, f"{item_indent}- {name}\n")
+
+
+def _column_node(root: Any, model: str, column: str) -> Any:
+    for key, node in _mapping(root):
+        if key not in ("models", "seeds", "snapshots"):
+            continue
+        for entry in _sequence(node):
+            fields = dict(_mapping(entry))
+            if _scalar_value(fields.get("name")) != model:
+                continue
+            for candidate in _sequence(fields.get("columns")):
+                candidate_fields = dict(_mapping(candidate))
+                if _scalar_value(candidate_fields.get("name")) == column:
+                    return candidate
+    return None
+
+
+def _indent_of(content: str, line_start: int) -> int:
+    rest = content[line_start:]
+    return len(rest) - len(rest.lstrip(" "))
+
+
+def before_trailing_blanks(content: str, end: int) -> int:
+    """``end`` backed up over the blank lines a block span swept up.
+
+    :func:`_block_end` walks past blank lines looking for the next line with
+    content, so an entry's span reaches past the separator a human wrote after it.
+    An insertion at the raw end lands on the far side of that gap, and a removal
+    eats it.
+    """
+
+    while end > 0 and content[end - 1] == "\n":
+        line_start = content.rfind("\n", 0, end - 1) + 1
+        if content[line_start : end - 1].strip():
+            break
+        end = line_start
+    return end
+
+
 def _entry_span(content: str, node: Any) -> tuple[int, int]:
     """A block entry's span: its own lines, and none of its sibling's.
 
