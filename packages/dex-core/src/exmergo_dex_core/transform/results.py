@@ -53,6 +53,9 @@ class PlanResult(Result):
     defined: list[str] | None = None
     updated: list[str] | None = None
     unchanged: list[str] | None = None
+    # A fourth class rather than an empty diff: a removal states no content, so
+    # it is the one change a reviewer cannot read off the other three.
+    removed: list[str] | None = None
     # Per edited model, which authored changes can move rows and what each one
     # moved. Absent (not empty) when the edit cannot change a row population at
     # all, which is the common case and deserves no key.
@@ -72,6 +75,8 @@ class PlanResult(Result):
             payload["updated"] = self.updated
         if self.unchanged is not None:
             payload["unchanged"] = self.unchanged
+        if self.removed is not None:
+            payload["removed"] = self.removed
         if self.row_attribution is not None:
             payload["row_attribution"] = self.row_attribution
         return payload

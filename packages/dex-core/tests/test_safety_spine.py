@@ -3167,6 +3167,42 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     assert assert_select_only(sql, dialect="bigquery") == sql
 
 
+def test_bigquery_month_gap_on_a_timestamp_column_never_asks_timestamp_diff():
+    # TIMESTAMP_DIFF supports MICROSECOND through DAY only, so a MONTH part on
+    # a TIMESTAMP column is refused at job insert, and because the continuity
+    # subqueries ride the same flat SELECT as every other aggregate, that one
+    # expression degraded the entire table to metadata-only (#430). The
+    # expected form diffs the periods' UTC dates instead; day and hour keep
+    # TIMESTAMP_DIFF, and DATETIME and DATE columns are untouched.
+    from exmergo_dex_core.adapters import bigquery as bq
+    from exmergo_dex_core.adapters.base import ColumnMeta
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = bq.BigQueryAdapter.__new__(bq.BigQueryAdapter)
+
+    def build(data_type: str) -> str:
+        col = ColumnMeta(name="t", data_type=data_type, nullable=True, ordinal=1)
+        sql, _plan = bq.BigQueryAdapter._build_aggregate_sql(
+            adapter, "p.d.t", [col], set(), set(), set(), set(), {"t"}
+        )
+        assert assert_select_only(sql, dialect="bigquery") == sql
+        return sql
+
+    ts = build("TIMESTAMP")
+    assert "TIMESTAMP_DIFF(period, prev_period, MONTH)" not in ts
+    assert "DATE_DIFF(DATE(period), DATE(prev_period), MONTH)" in ts
+    assert "TIMESTAMP_DIFF(period, prev_period, DAY)" in ts
+    assert "TIMESTAMP_DIFF(period, prev_period, HOUR)" in ts
+
+    dt = build("DATETIME")
+    assert "DATETIME_DIFF(period, prev_period, MONTH)" in dt
+    assert "DATE_DIFF(DATE(" not in dt
+
+    d = build("DATE")
+    assert "DATE_DIFF(period, prev_period, MONTH)" in d
+    assert "DATE_DIFF(DATE(" not in d
+
+
 def test_select_only_guard_rejects_bigquery_writes_and_scripts():
     # Family 1: BigQuery scripting, DML/DDL, and multi-statement forms are all
     # refused when parsed in the bigquery dialect.

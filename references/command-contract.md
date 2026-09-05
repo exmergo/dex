@@ -508,9 +508,9 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   with a pointer to the full log when anything was trimmed.
 - `semantic define` refuses names that already exist in the project (use
   `update`); `update` refuses names that do not (use `define`); `semantic plan`
-  accepts a mix and classifies per name, reporting `defined`, `updated`, and
-  `unchanged` in the envelope. `updated` means the definition's parsed content
-  actually differs from the project's; a definition re-stated identically in the
+  accepts a mix and classifies per name, reporting `defined`, `updated`,
+  `unchanged`, and `removed` in the envelope. `updated` means the definition's
+  parsed content actually differs from the project's; a definition re-stated identically in the
   file that already holds it is `unchanged`. The distinction matters because a
   whole-file payload restates every definition in the file, so without it a
   two-metric change reports thirty objects as updated and the real blast radius
@@ -531,10 +531,9 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   layout it cannot span safely (a flow-style sequence, anchors or aliases,
   multiple documents, tab indentation) is refused with `--edits-file` named as
   the way to edit it. Classification is scoped to the definitions named, so a
-  spliced file's other definitions are reported in no class at all. Removing a
-  definition is still a whole-file edit; the semantic verbs author and do not
-  delete. Names implicitly created by `create_metric: true` measures count
-  as existing metrics everywhere. Beyond MetricFlow's schemas, the engine
+  spliced file's other definitions are reported in no class at all. Names
+  implicitly created by `create_metric: true` measures count as existing metrics
+  everywhere. Beyond MetricFlow's schemas, the engine
   resolves every metric input (ratio and derived inputs must reference metrics,
   not measures) and then runs the emitted YAML through dbt's own parser against
   a throwaway copy of the project; a plan that fails parse is never stored.
@@ -542,6 +541,25 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   degrades to a warning; `--no-parse` skips it. A stored semantic plan is applied
   with `transform apply` like any other plan (no id applies the latest unapplied
   one).
+- **Removing a definition** is an entry with `"op": "delete"`, which carries the
+  `name` (there is no body to read one from) and no `content`. It is always
+  declared: a definitions payload never removes a definition for having gone
+  unmentioned, because an unmentioned definition is what the unit promises to
+  leave alone. `semantic define` refuses a removal; `update` and `plan` accept
+  one, and it is reported as a fourth class, `removed`. One payload names each
+  definition once, so what it asks for cannot depend on the order it is read in.
+  A removal the surviving project still reads is refused, naming the reader and
+  its file: a metric whose input is a removed metric, or a measure of a removed
+  semantic model (`create_metric` names included). The check is over the state
+  the payload leaves behind, so adding those readers' own removals or updates to
+  the same payload satisfies it, in any order; what a reference index cannot
+  resolve statically (a `Metric()` call inside a filter string) is left to dbt's
+  parser. A removal that would leave a file declaring no semantic model or metric
+  is refused as well, pointing at `transform plan --edits-file`: emptying or
+  deleting a file is a file-level act, and the semantic verbs delete no files.
+  The file comes back without that one definition, as an ordinary content edit,
+  so the plan store, the diffs, and `transform apply` see the unit they always
+  have.
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
 fronts `transform`, `semantic`, and `viz`; `maintain` fronts the whole

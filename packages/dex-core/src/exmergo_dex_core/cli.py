@@ -505,7 +505,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
                     # The per-definition payload: name only what changes, and the
-                    # engine writes it into the file that holds it.
+                    # engine writes it into the file that holds it. An entry's `op`
+                    # removes one instead, which is the only way a definition goes
+                    # away: never by going unmentioned.
                     sp.add_argument("--definitions-file", default=None)
                     sp.add_argument("--no-parse", action="store_true", default=False)
                 # maintain detectors take an optional object scope (default: whole

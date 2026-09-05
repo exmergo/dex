@@ -1095,3 +1095,328 @@ def test_definition_mode_guards_still_apply(
     )
     assert rc == 1
     assert "already defined" in envelope["errors"][0]
+
+
+# --- removing a definition (#254) ---------------------------------------------
+
+
+def _apply_definitions(
+    tmp_path: Path, capsys, definitions: list[dict], name: str, mode: str = "plan"
+) -> tuple[dict, str]:
+    """Plan a definitions payload, apply it, and read the file back.
+
+    The file is the assertion worth making about a removal: a diff can look right
+    while the surrounding bytes have moved, and the comments a hand-written
+    semantic layer carries are exactly what a removal must not disturb.
+    """
+
+    rc, envelope = _plan_definitions(tmp_path, capsys, definitions, name, mode)
+    assert rc == 0, envelope
+    rc, applied = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, applied
+    landed = tmp_path / "analytics" / "models" / "semantic" / "customers.yml"
+    return envelope, landed.read_text(encoding="utf-8")
+
+
+def test_a_definitions_payload_removes_the_definition_it_names(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The other half of the unit: name one metric, remove one metric.
+
+    Deleting used to mean sending the whole file back without it, which is the
+    ergonomic cost the per-definition unit exists to remove: the diff describes
+    the whole file, and every restated line is a chance to corrupt a definition
+    nobody meant to touch.
+    """
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    envelope, landed = _apply_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "name": "doubled", "op": "delete"}],
+        "remove.json",
+    )
+
+    assert envelope["data"]["removed"] == ["doubled"]
+    assert envelope["data"]["defined"] == []
+    assert envelope["data"]["updated"] == []
+    assert envelope["data"]["unchanged"] == []
+
+    diff = envelope["diffs"][0]
+    assert diff["additions"] == 0
+    assert "-  - name: doubled" in diff["unified"]
+
+    # The neighbouring metric and the semantic model are untouched, and so is
+    # every comment: the note inside the metric that stayed, and both section
+    # banners, including the one that headed the metric now gone. A banner can
+    # head several definitions, so removing one definition is no licence to take
+    # it away; a reviewer reads it in the diff's context and decides.
+    assert "name: doubled" not in landed
+    assert "- name: customer_count" in landed
+    assert "- name: customers" in landed
+    assert "# ---- volume" in landed
+    assert "# ---- ratios" in landed
+    assert "# counts rows, not distinct ids" in landed
+
+
+def test_an_unmentioned_definition_is_never_removed(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The property the whole unit rests on, stated as a test.
+
+    Removal is declared or it does not happen. A payload that rewrites one
+    metric and says nothing about the other leaves the other alone, and reports
+    an empty ``removed`` rather than leaving the caller to infer it.
+    """
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    envelope, landed = _apply_definitions(
+        tmp_path,
+        capsys,
+        [
+            {
+                "kind": "metric",
+                "content": (
+                    "name: customer_count\n"
+                    "label: Count of customers\n"
+                    "type: simple\n"
+                    "type_params:\n"
+                    "  measure: customer_count\n"
+                ),
+            }
+        ],
+        "unmentioned.json",
+    )
+
+    assert envelope["data"]["removed"] == []
+    assert envelope["data"]["updated"] == ["customer_count"]
+    assert "- name: doubled" in landed
+
+
+def test_removing_a_metric_the_project_still_reads_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The guard the whole-plan delete guard cannot supply.
+
+    That one reasons about deleted *files* and `ref()`; a definition removal
+    deletes no file, and the name it takes away is a name in YAML inside a file
+    that survives. dbt refuses to parse the result either way, so this refuses
+    too, and names the reader so the fix is one entry away.
+    """
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "name": "customer_count", "op": "delete"}],
+        "orphan.json",
+    )
+
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert "doubled" in envelope["errors"][0]
+    assert "still reads metric 'customer_count'" in envelope["errors"][0]
+
+
+def test_removing_a_metric_with_its_readers_is_accepted(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The guard is over the payload's end state, not its entries in order.
+
+    Which is what makes the refusal above actionable: the caller adds the
+    reader's own removal to the same payload and the plan goes through, the way
+    a `ref()` delete is satisfied by putting the referrer's edit in one plan.
+    """
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    envelope, landed = _apply_definitions(
+        tmp_path,
+        capsys,
+        [
+            {"kind": "metric", "name": "customer_count", "op": "delete"},
+            {"kind": "metric", "name": "doubled", "op": "delete"},
+        ],
+        "both-gone.json",
+    )
+
+    assert envelope["data"]["removed"] == ["customer_count", "doubled"]
+    assert "metrics:" not in landed  # the emptied block goes with its last item
+    assert "- name: customers" in landed  # the semantic model is untouched
+
+
+def test_removing_a_semantic_model_takes_its_measures_with_it(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """A measure is addressed inside its model, so removing the model removes
+    every measure in it, and a metric grounded in one of those is orphaned."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "semantic_model", "name": "customers", "op": "delete"}],
+        "model-gone.json",
+    )
+
+    assert rc == 1
+    assert "still reads measure 'customer_count'" in envelope["errors"][0]
+
+
+def test_removing_the_last_definition_in_a_file_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Emptying a file is a file-level act and stays a whole-file edit.
+
+    Whether what is left should remain as plain model documentation or go away
+    entirely is the caller's call, and the semantic verbs do not delete files at
+    all, so guessing either way here would be this unit deciding something it
+    was never given.
+    """
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    extra = [
+        {
+            "kind": "metric",
+            "path": "models/semantic/extra.yml",
+            "content": (
+                "name: tripled\n"
+                "type: derived\n"
+                "type_params:\n"
+                "  expr: customer_count * 3\n"
+                "  metrics:\n"
+                "    - name: customer_count\n"
+            ),
+        }
+    ]
+    rc, envelope = _plan_definitions(tmp_path, capsys, extra, "extra.json")
+    assert rc == 0, envelope
+    rc, applied = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "name": "tripled", "op": "delete"}],
+        "empty.json",
+    )
+    assert rc == 1
+    assert "models/semantic/extra.yml" in envelope["errors"][0]
+    assert "transform plan" in envelope["errors"][0]
+
+
+def test_semantic_define_will_not_remove(dbt_project_dir: Path, tmp_path: Path, capsys):
+    """A verb whose job is to add a name cannot take one away in the same call."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "name": "doubled", "op": "delete"}],
+        "define-delete.json",
+        mode="define",
+    )
+    assert rc == 1
+    assert "semantic define adds definitions" in envelope["errors"][0]
+    assert "semantic update" in envelope["errors"][0]
+
+
+def test_removing_a_definition_the_project_does_not_declare_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "name": "never_existed", "op": "delete"}],
+        "absent.json",
+    )
+    assert rc == 1
+    assert "nothing to remove" in envelope["errors"][0]
+
+
+def test_a_delete_entry_is_a_name_and_no_content(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """There is no body to write, so the name is declared rather than read out
+    of one, and content beside it would mean two different things at once."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [{"kind": "metric", "op": "delete"}],
+        "nameless-delete.json",
+    )
+    assert rc == 1
+    assert "needs the name" in envelope["errors"][0]
+
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [
+            {
+                "kind": "metric",
+                "name": "doubled",
+                "op": "delete",
+                "content": "name: doubled\n",
+            }
+        ],
+        "content-delete.json",
+    )
+    assert rc == 1
+    assert "carries no content" in envelope["errors"][0]
+
+
+def test_one_payload_names_each_definition_once(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Otherwise what the payload asks for depends on the order it is read in,
+    and a delete paired with an upsert of the same name has no answer at all."""
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+    rc, envelope = _plan_definitions(
+        tmp_path,
+        capsys,
+        [
+            {"kind": "metric", "name": "doubled", "op": "delete"},
+            {
+                "kind": "metric",
+                "content": (
+                    "name: doubled\n"
+                    "type: derived\n"
+                    "type_params:\n"
+                    "  expr: customer_count * 2\n"
+                    "  metrics:\n"
+                    "    - name: customer_count\n"
+                ),
+            },
+        ],
+        "twice.json",
+    )
+    assert rc == 1
+    assert "already definitions[0]" in envelope["errors"][0]
+
+
+def test_the_removal_unit_reaches_the_engine_surface_too(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """A flag the CLI parses into a keyword the engine cannot pass would be a
+    capability only one of the two surfaces has, and `semantic update` is where
+    a removal belongs beside the evolutions it usually travels with."""
+
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.transform.semantic import parse_definition_payload
+
+    _land_baseline(tmp_path, capsys, _COMMENTED_YAML)
+
+    definitions = parse_definition_payload(
+        [{"kind": "metric", "name": "doubled", "op": "delete"}]
+    )
+    with DexEngine.from_repo(tmp_path, connector="duckdb") as engine:
+        result = engine.semantic_update(
+            "drop the derived metric", [], definitions=definitions, no_parse=True
+        )
+
+    assert result.removed == ["doubled"]
+    assert result.updated == []
+    assert len(result.diffs) == 1

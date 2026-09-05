@@ -87,6 +87,56 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **A definition can now be removed through `--definitions-file`** ([#254]). An
+  entry carrying `"op": "delete"` names one semantic model or metric and takes it
+  out of the file that declares it. `name` is declared beside `kind`, there being
+  no body to read it from, and no `content` rides along. Deleting used to mean
+  sending the whole file back without the definition, which is the exact cost the
+  per-definition unit exists to remove: the diff then describes the file rather
+  than the change, and every restated line is a chance to corrupt a definition
+  nobody meant to touch.
+
+  Removal is declared, never inferred. A definitions payload does not remove a
+  definition for having gone unmentioned, in any circumstance: an unmentioned
+  definition is untouched, and that is the property the unit is for. `op` is
+  dbt's own edit vocabulary rather than a second spelling of it, and one payload
+  names each definition exactly once, so what it asks for cannot depend on the
+  order it is read in. `semantic define` refuses a removal, a verb that adds a
+  name being unable to take one away in the same call; `update` and `plan` accept
+  one. The envelope reports a fourth class, `removed`, beside `defined`,
+  `updated`, and `unchanged`, because a removal states no content and is the one
+  change a reviewer cannot read off the other three.
+
+  **A removal the surviving project still reads is refused**, which is the
+  decision this turned on. The whole-plan delete guard asks that question about
+  files and `ref()`, and it cannot answer it here: a definition removal deletes no
+  file, and the name it takes away is a name in YAML inside a file that survives.
+  So the same guard is repeated one namespace over. The project the payload leaves
+  behind is computed in memory and every surviving metric re-resolved against it;
+  a metric still reading a removed metric, or a measure of a removed semantic
+  model (`create_metric` included), refuses the plan and names the reader and its
+  file. Adding those definitions' own removals to the same payload satisfies it,
+  in any order, since the guard reads the end state rather than the sequence.
+  Warning instead, and leaving it to `maintain semantic`, was the alternative: a
+  dangling metric input fails `dbt parse`, the gate every semantic plan already
+  passes, so warning would differ only where that gate is off (`--no-parse`, or no
+  dbt installed) and there it would store a plan dex knows cannot be applied.
+  Detection after the fact is the tool for drift that arrived from the warehouse
+  on its own, not for a break the command is in the middle of authoring. What a
+  reference index cannot see statically, a `Metric()` call inside a filter string,
+  stays dbt's parser's to catch.
+
+  Removing the last definition in a file is refused as well, pointing at
+  `transform plan --edits-file`: emptying or deleting a file is a file-level act,
+  the semantic verbs delete no files, and whether what is left should remain as
+  plain model documentation is the caller's call rather than this unit's. The
+  removal itself lowers to the same whole-file `PlanEdit` an authored definition
+  does, so the plan format, the diffs, the conflict hashing, and `transform apply`
+  are unchanged, and every byte outside the definition removed is preserved,
+  comments included: a block's `key:` line goes only with its last item.
+  `DexEngine.semantic_update` and `semantic_plan` take the same payload through
+  `definitions=`, so removal is not a CLI feature either.
+
 - **A per-definition edit unit for the semantic layer** ([#109]).
   `semantic define|update|plan` take `--definitions-file <path|->` beside
   `--edits-file`: `{"definitions": [{"kind", "path", "content"}, ...]}`, where
@@ -111,7 +161,7 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
   It lowers to the whole-file `PlanEdit` the engine already stores, so the plan
   format, the diffs, the conflict hashing, and `transform apply` are unchanged.
-  Deleting a definition remains a whole-file edit.
+  Removing a definition came later, as a declared `op` ([#254]).
 
   The unit is not a CLI feature. `DexEngine.semantic_define`, `semantic_update`,
   and `semantic_plan` take the parsed payload as `definitions=`, so a host
@@ -261,6 +311,28 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   reviewed in the diff is not the edit that landed. Everything now folds into one
   edit per path, and an edit that would reproduce the file already there is dropped
   rather than offered.
+
+- **BigQuery `explore map` profiles a table with a `TIMESTAMP` column again**
+  ([#430]). Temporal continuity asked for a month-grain gap on every non-PII
+  `TIMESTAMP` column as `TIMESTAMP_DIFF(period, prev_period, MONTH)`, and
+  BigQuery's `TIMESTAMP_DIFF` stops at `DAY`, so the statement was refused at
+  job insert. The continuity subqueries ride the same flat `SELECT` as the
+  batch's other aggregates, and the `BadRequest` fallback in `column_aggregates`
+  degrades the whole batch, so one optional fraction took every column's null
+  fraction, distinct count, min and max, key detection and grain with it, and
+  recorded `aggregate profiling failed and was skipped` in `data_quality`. The
+  run still returned `ok`. Present since 1.6.6 shipped the feature ([#206]);
+  `DATETIME` and `DATE` columns were never affected because their diff
+  families accept `MONTH`.
+
+  The month gap on a `TIMESTAMP` column is now
+  `DATE_DIFF(DATE(period), DATE(prev_period), MONTH)`. Both operands are
+  already `TIMESTAMP_TRUNC(..., MONTH)` periods, so their UTC dates are month
+  boundaries and the diff is exact; day and hour keep `TIMESTAMP_DIFF`, and
+  the other two temporal types render as before. Whether the batch should
+  retry without the optional temporal expressions before degrading to
+  metadata-only is left open on the issue: it is a change to the fallback
+  contract, not to the expression that broke it.
 
 - **`maintain` stops refusing an engine that was never given a repo root.**
   `check`, `grain`, and `reconcile` each read the project format without
