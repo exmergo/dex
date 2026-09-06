@@ -581,6 +581,11 @@ with multi-dialect expressions, explicit relationships, and expression metrics.
 dex reads native `.ossie.yaml`, `.ossie.yml` and `.ossie.json` documents from the
 repository, with no dbt project and no MetricFlow anywhere in the path.
 
+What dex accepts, checks, links, and declines to claim is written out row by row
+in [Apache Ossie compatibility](ossie-compatibility.md), with the pinned schema
+hash and a named corpus case behind each claim. This section is how to use the
+layer; that one is what it promises.
+
 It is **catalog-first**, and that is a statement about the format rather than
 about how far the implementation got. Ossie specifies interchange metadata and
 not a portable query runtime: no filter grammar, no join planning, no execution
@@ -681,7 +686,9 @@ itself is what checks it.
 
 The upstream commit, the hash, and the upgrade procedure are recorded beside the
 schema in the installed package, at
-`exmergo_dex_core/ossie/schema/PROVENANCE.md`.
+`exmergo_dex_core/ossie/schema/PROVENANCE.md`, and the deltas between the pin and
+upstream's current schema are listed in
+[Apache Ossie compatibility](ossie-compatibility.md).
 
 **State the assurance boundary plainly.** There is no external validator here the
 way `dbt parse` is for dbt: neither `apache-ossie` nor `apache-ossie-dbt` is
@@ -876,7 +883,55 @@ carries the PII gate's own column lookup; caps that count what they cut and leav
 the catalog they were given alone; `filter_refs` answering or declining without
 raising; and a values request for a PII-flagged dimension refused.
 
-dex binds its own two backends to it in
+### The source, as distinct from the backend
+
+A backend answers a catalog at runtime. A **semantic source** is what supplies
+the layer it answers from, and for a file-backed one that is a different set of
+promises: what the documents declare, what a drift baseline reduces them to, and
+what construction may and may not do. Those live in
+`exmergo_dex_core.semantic_source_conformance`, under the same
+`[semantic-conformance]` extra:
+
+```python
+from exmergo_dex_core.semantic_source_conformance import (
+    SemanticCatalogSourceContract,
+    SemanticDeclarationContract,
+    SemanticFingerprintContract,
+    SemanticSourceFactoryContract,
+)
+
+
+class TestMySource(
+    SemanticSourceFactoryContract,
+    SemanticDeclarationContract,
+    SemanticFingerprintContract,
+    SemanticCatalogSourceContract,
+):
+    def build_source(self, context): ...
+    def empty_source_context(self): ...
+    def a_source_declaring_a_unique_key(self): ...
+```
+
+Four contracts because a source may legitimately answer only some of them, and
+declining one is an answer rather than a shortfall: a source with no drift
+fingerprint is complete, and `maintain` reports the absence itself.
+
+The assertions are the same ones the project contracts in
+`exmergo_dex_core.adapters.conformance` run, extracted rather than copied, and
+those contracts compose these. A project format and a semantic source make the
+same promises about a layer through differently named methods, and one behaviour
+asserted in two places is one behaviour that can disagree with itself. dex binds
+Ossie to all four in `tests/ossie/test_conformance.py` and dbt reaches the same
+assertions through its project binding.
+
+**A semantic source is never a project**, and the contracts are structured so
+that satisfying these buys none of the project tiers. A transformation project
+owns a model graph, compilation, targets, and a write surface;
+`SemanticCatalogSource` and `SemanticSnapshotSource` in
+`exmergo_dex_core.semantic_source` are one method each and inherit nothing from
+`ExploreProject`.
+
+dex binds its own two backends to the runtime contract in
 `tests/explore/test_semantic_conformance.py`, three times: `--local` with
 MetricFlow resolving the join graph, `--local` with no resolver (the declared
 single-hop read), and `--api` against a transport reproducing the dbt Cloud API's

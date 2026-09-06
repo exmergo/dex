@@ -51,6 +51,17 @@ as well as tier 3. Its three methods are `load()`, `edit_path()` and
 what `explore semantic list --local` reads. It is described under
 [Reading the semantic layer twice](#reading-the-semantic-layer-twice-for-two-different-questions).
 
+It is here because a *dbt project* happens to hold a semantic layer, not because
+a semantic layer is a project. A repository can have a layer and no
+transformation project at all, and one that does is configured on the semantic
+axis (`semantic.vendor`) and built through
+`exmergo_dex_core.semantic_source`, which checks that what it built can answer a
+catalog and checks nothing else. Nothing on this page applies to it: it owns no
+model graph, no compilation, no targets, and no write surface into dbt's files,
+and it satisfies none of the tiers below. See
+[the semantic layer reference](semantic-layer.md) for that axis and its own
+conformance contracts.
+
 Both are beside rather than on a tier because these protocols are
 `runtime_checkable`: a method added to a tier would demote every format that has not
 implemented it yet, so `tier_of` would start answering 2 where it answered 3 and the
@@ -672,7 +683,7 @@ project:
 
 | Name | Example | For |
 |---|---|---|
-| shipped | `dbt`, `ossie` | dex's own formats, and never shadowable by anything installed |
+| shipped | `dbt` | dex's own formats, and never shadowable by anything installed |
 | dotted path | `mypkg.projects:my_project` | a factory reachable by import, with no packaging work |
 | entry point | `acme` | a name an installed distribution registered under `exmergo_dex_core.projects` |
 
