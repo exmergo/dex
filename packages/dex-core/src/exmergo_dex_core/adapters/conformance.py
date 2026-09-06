@@ -53,6 +53,15 @@ the tiers for the same reason it is separate in storage, and a format that passe
 the behavioral suite can still be unreachable from configuration, so "the suite is
 green" should mean correct *and* constructable.
 
+**Some assertions here are shared with the semantic axis and live there.** A
+project format and a semantic source make the same promises about the layer they
+hold, through differently named methods, so the declaration, fingerprint and
+catalog assertions live once in
+:mod:`exmergo_dex_core.semantic_source_conformance` and the contracts below
+compose them. Nothing changes for an implementer: the hooks keep their names and
+the tests keep running. It is worth knowing where to read an assertion's own
+reasoning, and worth knowing that changing one changes it for both.
+
 This module imports pytest, so it is deliberately not imported by
 :mod:`exmergo_dex_core.adapters`: a bare ``import exmergo_dex_core`` must not
 require a test framework. Install the ``[project-conformance]`` extra to get what
@@ -69,6 +78,11 @@ import pytest
 
 from ..dbt_project import EditOp, ProjectDefinitions
 from ..maintain.snapshot import Snapshot
+from ..semantic_source_conformance import (
+    SemanticCatalogSourceContract,
+    SemanticDeclarationContract,
+    SemanticFingerprintContract,
+)
 from .project import ExploreProject, ProjectContext, tier_of
 
 if TYPE_CHECKING:
@@ -223,7 +237,7 @@ class ExploreProjectContract:
         assert project.definitions().notes
 
 
-class DeclaringProjectContract:
+class DeclaringProjectContract(SemanticDeclarationContract):
     """Opt-in: the declarations dex reads a project *for* actually arrive.
 
     Mix in beside the contract for your tier::
@@ -236,7 +250,41 @@ class DeclaringProjectContract:
     Separate from the tier contract because the two answer different questions. The
     tier contract asks whether dex can safely call your format at all; this asks
     whether reading it was worth doing.
+
+    The assertions live in
+    :class:`~..semantic_source_conformance.SemanticDeclarationContract`, because
+    a semantic source contributes the same declarations through a differently
+    named method and the two would otherwise be one behaviour asserted twice.
+    The hooks stay spelled the way they always were: a project format implements
+    ``a_project_declaring_*`` and reads through ``definitions()``, which is its
+    tier-1 contract and has been public since v1.
     """
+
+    def make_semantic_source(self):
+        """The tier contract's own fixture: a project with nothing declared."""
+
+        return self.make_project()
+
+    def declarations_of(self, source: Any) -> ProjectDefinitions:
+        """Tier 1's own method, which is how a project states what it declares."""
+
+        return source.definitions()
+
+    def a_source_declaring_a_unique_key(self) -> tuple[ExploreProject, str, str]:
+        return self.a_project_declaring_a_unique_key()
+
+    def a_source_declaring_a_join(self) -> tuple[ExploreProject, str, str, str, str]:
+        return self.a_project_declaring_a_join()
+
+    def a_source_declaring_a_composite_key(
+        self,
+    ) -> tuple[ExploreProject, str, tuple[str, ...]] | None:
+        return self.a_project_declaring_a_composite_key()
+
+    def a_source_declaring_a_join_with_differently_named_sides(
+        self,
+    ) -> tuple[ExploreProject, str, str, str, str] | None:
+        return self.a_project_declaring_a_join_with_differently_named_sides()
 
     def a_project_declaring_a_unique_key(self) -> tuple[ExploreProject, str, str]:
         """A project declaring one single-column unique key.
@@ -308,139 +356,8 @@ class DeclaringProjectContract:
 
         return None
 
-    def test_a_declared_unique_key_reaches_the_engine(self) -> None:
-        project, model, column = self.a_project_declaring_a_unique_key()
 
-        declared = project.definitions().declared_keys
-        matching = [k for k in declared if k.model == model and k.column == column]
-
-        assert matching, f"expected a declared key on {model}.{column}, got {declared}"
-        assert matching[0].unique, (
-            "a key declared unique must arrive with unique=True; a grain that "
-            "arrives without it is read as an ordinary column"
-        )
-
-    def test_a_declared_join_carries_both_sides(self) -> None:
-        """Both ends, because a half-read join is worse than an unread one.
-
-        A join naming the wrong side sends the relationship detector looking for a
-        key that is not there, and the finding it produces reads like a data
-        problem rather than a misread declaration.
-        """
-
-        project, model, column, to_model, to_column = self.a_project_declaring_a_join()
-
-        declared = project.definitions().foreign_keys
-        matching = [
-            fk
-            for fk in declared
-            if fk.model == model
-            and fk.column == column
-            and fk.to_model == to_model
-            and fk.to_column == to_column
-        ]
-
-        assert matching, (
-            f"expected a declared join {model}.{column} -> {to_model}.{to_column}, "
-            f"got {declared}"
-        )
-
-    def test_a_composite_grain_keeps_every_column_and_their_order(self) -> None:
-        """A truncated composite key is silent, which is what makes it expensive.
-
-        It does not read as a missing declaration. It reads as a declared grain
-        that is simply narrower than the truth, so every check downstream runs
-        against a grain the author never claimed and the findings look like data
-        problems rather than a misread declaration.
-        """
-
-        supplied = self.a_project_declaring_a_composite_key()
-        if supplied is None:
-            pytest.skip(
-                "a_project_declaring_a_composite_key() returned None: this format "
-                "declares it cannot express a multi-column grain, so "
-                "declared_composite_keys goes unchecked"
-            )
-        project, model, columns = supplied
-
-        declared = project.definitions().declared_composite_keys
-        matching = [k for k in declared if k.model == model]
-
-        assert matching, (
-            f"expected a composite key on {model}, got {declared}. A multi-column "
-            "grain belongs in declared_composite_keys, not as several entries in "
-            "declared_keys: those say each column is unique on its own, which is a "
-            "different and much stronger claim"
-        )
-        assert tuple(matching[0].columns) == tuple(columns), (
-            f"expected columns {tuple(columns)} in order, got "
-            f"{tuple(matching[0].columns)}"
-        )
-        assert len(matching) == 1, (
-            f"expected one composite key on {model}, got {len(matching)}: "
-            f"{matching}. One declaration is one grain, and splitting it across "
-            "entries makes the grain axis verify combinations the project never "
-            "declared"
-        )
-        leaked = sorted(
-            key.column
-            for key in project.definitions().declared_keys
-            if key.model == model
-            and key.unique
-            and key.column.lower() in {c.lower() for c in columns}
-        )
-        assert not leaked, (
-            f"{model} reports {leaked} as unique on their own while also declaring "
-            f"the composite grain {tuple(columns)}. The fixture's grain needs every "
-            "one of those columns, so no single one of them is unique, and the "
-            "stronger claim is the one that gets acted on: reconcile reads it as a "
-            "grain the project already asserts and proposes edits against it"
-        )
-
-    def test_a_join_keeps_its_two_sides_apart_when_they_are_named_differently(
-        self,
-    ) -> None:
-        """The case :meth:`test_a_declared_join_carries_both_sides` cannot reach.
-
-        An implementation that mirrors the source column onto the target passes
-        that one whenever the fixture's two ends share a name, and this is the
-        assertion that separates them.
-        """
-
-        supplied = self.a_project_declaring_a_join_with_differently_named_sides()
-        if supplied is None:
-            pytest.skip(
-                "a_project_declaring_a_join_with_differently_named_sides() returned "
-                "None: a join whose ends are spelled differently goes unchecked, so "
-                "an implementation that mirrors one side onto the other would pass "
-                "this suite"
-            )
-        project, model, column, to_model, to_column = supplied
-
-        assert column != to_column, (
-            "this fixture has to name its two sides differently, or it cannot "
-            "detect the mirroring it exists to detect"
-        )
-
-        declared = project.definitions().foreign_keys
-        matching = [
-            fk
-            for fk in declared
-            if fk.model == model and fk.column == column and fk.to_model == to_model
-        ]
-
-        assert matching, (
-            f"expected a declared join from {model}.{column} to {to_model}, "
-            f"got {declared}"
-        )
-        assert matching[0].to_column == to_column, (
-            f"the join's target column arrived as {matching[0].to_column!r}, "
-            f"expected {to_column!r}. Reading it as {column!r} is the mirroring "
-            "failure: the far side is a column the target may not even have"
-        )
-
-
-class SemanticProjectContract:
+class SemanticProjectContract(SemanticFingerprintContract):
     """Opt-in, tier 2: a populated semantic layer keeps the column behind each field.
 
     Mix in beside :class:`MaintainProjectContract` when your format declares
@@ -476,7 +393,23 @@ class SemanticProjectContract:
     reached the tier the attribute belongs to. The tier is asserted against the
     project this contract is actually given rather than against ``make_project()``,
     so the mixin keeps depending only on the one fixture it declares.
+
+    The content assertions live in
+    :class:`~..semantic_source_conformance.SemanticFingerprintContract`: a
+    semantic source produces the identical fingerprint through the identical
+    method, and one behaviour asserted in two places is one behaviour that can
+    disagree with itself. The hook keeps its published spelling here.
     """
+
+    def make_semantic_source(self):
+        """The tier contract's own fixture: a project with nothing declared."""
+
+        return self.make_project()
+
+    def a_source_declaring_a_semantic_model(
+        self,
+    ) -> tuple[Any, Mapping[str, str | None], Mapping[str, str | None]] | Any:
+        return self.a_project_declaring_a_semantic_model()
 
     def test_declaring_semantics_presupposes_the_maintain_tier(self) -> None:
         project, _, _, _ = self.a_project_declaring_a_semantic_model()
@@ -512,59 +445,8 @@ class SemanticProjectContract:
             "measures), mapping each field to the warehouse column behind it"
         )
 
-    def test_a_semantic_field_carries_the_column_behind_it(self) -> None:
-        project, name, dimensions, measures = (
-            self.a_project_declaring_a_semantic_model()
-        )
 
-        layer = project.semantic_layer()
-        matching = [m for m in layer.semantic_models if m.name == name]
-
-        assert matching, (
-            f"expected a semantic model named {name!r}, got "
-            f"{[m.name for m in layer.semantic_models]}"
-        )
-        model = matching[0]
-        assert dict(model.dimensions) == dict(dimensions), (
-            "the dimension to column mapping did not survive. A layer whose columns "
-            "are all None still validates and still compares clean, so the drift "
-            "check simply never runs"
-        )
-        assert dict(model.measures) == dict(measures), (
-            "the measure to column mapping did not survive; see above"
-        )
-
-    def test_a_categorical_dimension_maps_only_to_a_real_column(self) -> None:
-        """``categorical_dimensions`` takes ``str``, not ``str | None``.
-
-        So a field that is categorical *and* unresolved cannot be represented
-        there, and the two properties have to stay independent: being categorical
-        says how the field behaves, having a column says whether it can be checked.
-        A format that collapses them either drops a categorical field that happens
-        to lack a column, or supplies an invented column to keep it. Both are worse
-        than leaving it out of this one mapping, which is what the typing asks for.
-        """
-
-        project, name, _, _ = self.a_project_declaring_a_semantic_model()
-
-        model = next(
-            m for m in project.semantic_layer().semantic_models if m.name == name
-        )
-
-        columns = model.categorical_dimensions.values()
-        assert all(isinstance(c, str) and c for c in columns), (
-            "categorical_dimensions holds a null or empty column: its values are "
-            f"required strings, got {model.categorical_dimensions!r}. Leave an "
-            "unresolved categorical field out of this mapping rather than "
-            "inventing a column to keep it in"
-        )
-        assert set(model.categorical_dimensions) <= set(model.dimensions), (
-            "categorical_dimensions names a field that is not a dimension: "
-            f"{sorted(set(model.categorical_dimensions) - set(model.dimensions))}"
-        )
-
-
-class SemanticCatalogContract:
+class SemanticCatalogContract(SemanticCatalogSourceContract):
     """Opt-in, beside tier 2: the read catalog keeps what the fingerprint drops.
 
     Mix in when your format implements
@@ -594,6 +476,12 @@ class SemanticCatalogContract:
     picks is iteration order rather than a fact. Both of dex's own backends got
     this wrong, in opposite directions, on one identical layer, which is why it is
     asserted here rather than left to a reviewer to notice.
+
+    The catalog assertions themselves live in
+    :class:`~..semantic_source_conformance.SemanticCatalogSourceContract`, since
+    a semantic source answers the same read view and the assertions are about the
+    view rather than about who holds it. What stays here is the one thing that is
+    genuinely about a project: that the format declares the optional channel.
     """
 
     def make_project(self):  # pragma: no cover - provided by the subclass
@@ -602,6 +490,12 @@ class SemanticCatalogContract:
     def a_project_declaring_a_semantic_model(self):
         # pragma: no cover - provided by the subclass
         raise NotImplementedError
+
+    def make_semantic_source(self):
+        return self.make_project()
+
+    def a_source_declaring_a_semantic_model(self):
+        return self.a_project_declaring_a_semantic_model()
 
     def test_the_format_declares_the_catalog_channel(self) -> None:
         from .project import SemanticCatalogProject
@@ -613,146 +507,6 @@ class SemanticCatalogContract:
             "the member is refused by name at the command rather than here. Drop "
             "this mixin if the format reads no semantic layer"
         )
-
-    def test_the_catalog_keeps_what_the_fingerprint_reduces_away(self) -> None:
-        project, name, _, _ = self.a_project_declaring_a_semantic_model()
-        catalog = project.semantic_catalog()
-
-        assert [m.name for m in catalog.semantic_models], (
-            "the catalog carries no semantic models. The layer's organizing unit "
-            "is the semantic model, and a caller with none of them holds one "
-            "undifferentiated list of dimension names"
-        )
-        assert any(m.name == name for m in catalog.semantic_models), (
-            f"expected a semantic model named {name!r}, got "
-            f"{[m.name for m in catalog.semantic_models]}"
-        )
-        assert all(d.type for d in catalog.dimensions), (
-            "a dimension arrived with no type. Whether a dimension is time or "
-            "categorical decides how it can be grouped by, so a caller that has "
-            "to guess cannot build a valid query from this catalog"
-        )
-        assert all(m.agg for m in catalog.measures), (
-            "a measure arrived with no aggregation. A measure without its "
-            "aggregation cannot say what the number counts, which is the question "
-            "the catalog exists to answer"
-        )
-
-    def test_an_entity_carries_a_declaration_per_semantic_model(self) -> None:
-        project, _, _, _ = self.a_project_declaring_a_semantic_model()
-        catalog = project.semantic_catalog()
-
-        for entity in catalog.entities:
-            assert entity.roles, (
-                f"entity {entity.name!r} carries no declarations. Its `type` is "
-                "then a single value with nothing behind it, and a value chosen "
-                "per entity rather than per declaration is iteration order"
-            )
-            assert all(r.semantic_model for r in entity.roles), (
-                f"a declaration of entity {entity.name!r} names no semantic "
-                "model, so a caller cannot tell which model it is primary in"
-            )
-            declared = {r.type for r in entity.roles}
-            expected = "primary" if "primary" in declared else next(iter(declared))
-            assert entity.type == expected, (
-                f"entity {entity.name!r} reports type {entity.type!r} while its "
-                f"declarations say {sorted(declared)}. The single value is derived: "
-                "primary wherever any declaration is primary"
-            )
-
-    def test_the_catalog_resolves_a_semantic_model_to_its_relation(self) -> None:
-        """A semantic model that names no relation leaves the layer disconnected.
-
-        The catalog and the physical catalog are two views of one warehouse, and
-        the relation on a semantic model is the whole join between them: it is what
-        answers "which table is behind this metric", what lets ``explore map`` say
-        an object is exposed, and what an entity's declared join is drawn between.
-        A format that reads a layer but resolves none of it to a relation returns a
-        catalog that cannot be connected to anything the rest of ``explore``
-        describes.
-
-        Declining is still possible and is not this: a backend that structurally
-        cannot know the relation declares that gap, which is a different statement
-        from a format that could and did not.
-        """
-
-        project, name, _, _ = self.a_project_declaring_a_semantic_model()
-        catalog = project.semantic_catalog()
-
-        model = next(m for m in catalog.semantic_models if m.name == name)
-        assert model.relation, (
-            f"semantic model {name!r} resolves to no physical relation, so nothing "
-            "connects this layer to the objects explore profiles and maps"
-        )
-
-    def test_an_element_carries_its_column_and_never_invents_one(self) -> None:
-        """The same rule the fingerprint follows, on the read catalog.
-
-        Two failures, opposite in direction and both live. A catalog whose columns
-        are all absent cannot reach a physical column at all, which is what the PII
-        gate needs to adjudicate a dimension from evidence rather than from the
-        shape of its name. A catalog that invents a column out of an expression is
-        worse: the gate then screens a column that is not the one behind the
-        element and reports the verdict as evidence-backed.
-
-        The fixture's own mapping is the oracle, including its ``None`` entries, so
-        a format is held to what it said its layer contains rather than to a shape.
-        """
-
-        project, name, dimensions, measures = (
-            self.a_project_declaring_a_semantic_model()
-        )
-        catalog = project.semantic_catalog()
-
-        for element, expected in (
-            (
-                {
-                    d.definition: d.column
-                    for d in catalog.dimensions
-                    if d.semantic_model == name
-                },
-                dimensions,
-            ),
-            (
-                {
-                    m.name: m.column
-                    for m in catalog.measures
-                    if m.semantic_model == name
-                },
-                measures,
-            ),
-        ):
-            for field, column in expected.items():
-                assert field in element, (
-                    f"the catalog carries no entry for {field!r} on {name!r}; the "
-                    "fixture declares it, so the read dropped it"
-                )
-                assert element[field] == column, (
-                    f"{field!r} on {name!r} carries column {element[field]!r} where "
-                    f"the fixture says {column!r}. None is the honest answer for an "
-                    "expression: a column guessed out of one makes the PII gate "
-                    "screen the wrong column and call it evidence"
-                )
-
-    def test_a_dimension_row_names_the_token_a_query_groups_by(self) -> None:
-        """The catalog's ``name`` is a query token, not a display name.
-
-        A caller builds a group-by out of it, so a format that returns the bare
-        declared name where the layer requires a qualified path hands back a
-        catalog whose every dimension fails at query time.
-        """
-
-        project, _, _, _ = self.a_project_declaring_a_semantic_model()
-        catalog = project.semantic_catalog()
-
-        listed = {d.name for d in catalog.dimensions}
-        for metric in catalog.metrics:
-            missing = sorted(set(metric.dimensions) - listed - {"metric_time"})
-            assert not missing, (
-                f"metric {metric.name!r} says it can be grouped by {missing}, and "
-                "no dimension row carries those names. The two must be the same "
-                "vocabulary or neither can be acted on"
-            )
 
 
 class MaintainProjectContract(ExploreProjectContract):
