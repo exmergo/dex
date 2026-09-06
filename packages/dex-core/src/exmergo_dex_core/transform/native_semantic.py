@@ -1,12 +1,12 @@
 """Native semantic-document authoring: whole documents in, a reviewable plan out.
 
 Its own module rather than a branch inside :mod:`.commands`, for the reason
-``transform references`` is one: a vendor whose semantic layer is its own
-project format (:data:`..config.SEMANTIC_PROJECT_FORMATS`) authors documents,
-not SQL, so this route owes nothing to the dialect engine or to dbt. Importing
-`.commands` would pull the whole dbt authoring surface and sqlglot with it,
-which an install carrying only the vendor's own reader does not have, and the
-one command that install exists to run would be unreachable.
+``transform references`` is one: a vendor whose semantic layer is its own source
+(:data:`..config.SEMANTIC_SOURCE_FACTORIES`) authors documents, not SQL, so this
+route owes nothing to the dialect engine or to dbt. Importing `.commands` would
+pull the whole dbt authoring surface and sqlglot with it, which an install
+carrying only the vendor's own reader does not have, and the one command that
+install exists to run would be unreachable.
 
 The edits payload reader lives here for the same reason and is imported back by
 `.commands`: turning ``{"edits": [...]}`` into plan edits parses nothing.
@@ -63,9 +63,12 @@ def semantic_ossie(
             + ", ".join(deleted)
         )
 
-    layer = engine.semantic_catalog_format()
+    layer = engine.semantic_catalog_source()
     if not isinstance(layer, SemanticEditTarget):
-        named = getattr(layer, "name", type(layer).__name__)
+        # The vendor, not the class: the caller configured a vendor name and that
+        # is the line they would edit. A class name would send someone reading
+        # this into the engine looking for a setting that is not there.
+        named = getattr(engine.config.semantic, "vendor", None) or "dbt"
         raise ValueError(
             f"the configured '{named}' semantic layer does not support native "
             "semantic-document authoring; configure `semantic.vendor: ossie`"
