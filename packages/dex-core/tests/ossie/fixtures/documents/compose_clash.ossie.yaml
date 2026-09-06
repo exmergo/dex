@@ -1,0 +1,15 @@
+# Declares `shop` a second time. Two files each valid on their own, and a layer
+# that is not: a name resolved to two definitions has no answer.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: returns
+        source: demo.main.returns
+        primary_key: [return_id]
+        fields:
+          - name: return_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: return_id

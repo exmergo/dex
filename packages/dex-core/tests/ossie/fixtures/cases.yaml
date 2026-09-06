@@ -1,0 +1,236 @@
+# The reviewed Ossie corpus: one entry per case, each naming the documents it
+# reads and what dex is expected to make of them.
+#
+# The expectations here are authored from the documented rules, not captured
+# from a run. A golden file recorded from the implementation asserts that the
+# implementation still does what it did, which is a different and much weaker
+# statement than that it does what it is supposed to. That is also why there are
+# no full-envelope goldens: an envelope carries plan ids, absolute paths and
+# timestamps, and a corpus that has to be regenerated whenever one of those
+# moves stops being read.
+#
+# `origin` says where a rule comes from, which decides what an upgrade means:
+#
+#   schema     the pinned Apache Ossie JSON Schema decides it. A schema upgrade
+#              may legitimately change the verdict.
+#   integrity  upstream's own validation judgment, ported rather than reinvented.
+#   dex        dex's own restriction, and a candidate to carry upstream.
+#
+# `severity` is one of three, and they are not three strengths of one verdict:
+#
+#   error      dex could not read the document. It is absent from the layer.
+#   warning    dex read it and has something to say about what it found.
+#   note       dex read it and is saying what it did not check, which is the
+#              honest answer where a silent pass would be a false one.
+#
+# Every path is relative to this file's `documents/` directory. The offline
+# consistency test refuses a case naming a document that does not exist, and
+# refuses a document no case names.
+
+schema:
+  # Pinned here as well as in the loader and PROVENANCE.md, so a hash bumped in
+  # one place and not the others fails rather than drifting quietly.
+  sha256: 27aab111647b1e8d2229a2413e4682e459f43edc62e0eaadd497317754089e42
+  upstream_commit: b5da5d66f0da4a0cd3388d52201dbf5523221a77
+  declared_version: 0.2.0.dev0
+
+cases:
+  - id: minimal_yaml
+    documents: [minimal.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    semantic_models: [shop.orders]
+    physical_columns:
+      orders__order_id: [demo.main.orders, order_id]
+    composite_keys: []
+    single_keys:
+      - {model: shop.orders, column: order_id}
+
+  - id: minimal_yml
+    documents: [minimal.ossie.yml]
+    connector: duckdb
+    diagnostics: []
+    semantic_models: [shop.orders]
+    physical_columns:
+      orders__order_id: [demo.main.orders, order_id]
+
+  - id: minimal_json
+    documents: [minimal.ossie.json]
+    connector: duckdb
+    diagnostics: []
+    semantic_models: [shop.orders]
+    physical_columns:
+      orders__order_id: [demo.main.orders, order_id]
+
+  - id: compose_two_documents
+    documents: [compose_a.ossie.yaml, compose_b.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    semantic_models: [shop.orders, logistics.shipments]
+
+  - id: duplicate_model_across_files
+    documents: [compose_a.ossie.yaml, compose_clash.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: duplicate_semantic_model_across_files, severity: error, origin: dex}
+
+  - id: yaml_stream_in_one_file
+    documents: [stream.ossie.yaml]
+    connector: duckdb
+    # One configured file is one document, and a `---` stream inside one is
+    # refused rather than read as several. Configuring a file is what puts its
+    # content in the layer and what makes it writable by `semantic ossie`, so a
+    # stream would put documents in the layer that no config line names and that
+    # the authoring surface has no way to address.
+    diagnostics:
+      - {rule: malformed, severity: error, origin: dex}
+    semantic_models: []
+
+  - id: unparseable
+    documents: [unparseable.ossie.yaml]
+    connector: duckdb
+    # `malformed`, not `unreadable`: the file opened and its bytes are not YAML.
+    # `unreadable` is the separate rule for a file dex could not open at all,
+    # and keeping them apart is what lets a caller tell a missing document from
+    # a broken one.
+    diagnostics:
+      - {rule: malformed, severity: error, origin: dex}
+    semantic_models: []
+
+  - id: wrong_version
+    documents: [wrong_version.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: version, severity: error, origin: schema}
+    semantic_models: []
+
+  - id: unknown_structural_key
+    documents: [unknown_key.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: unknown_key, severity: error, origin: schema}
+    semantic_models: []
+
+  - id: duplicate_names_within_a_document
+    documents: [duplicate_names.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: duplicate_dataset, severity: error, origin: integrity}
+      - {rule: duplicate_field, severity: error, origin: integrity}
+      - {rule: duplicate_metric, severity: error, origin: integrity}
+
+  - id: relationship_endpoint_missing
+    documents: [missing_endpoint.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: unknown_dataset, severity: error, origin: integrity}
+
+  - id: relationship_arity_unequal
+    documents: [unequal_arity.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: key_arity, severity: error, origin: dex}
+
+  - id: target_key_coverage_warns
+    documents: [weak_target_key.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: key_coverage, severity: warning, origin: integrity}
+    # A warning retains the document: it is readable, and the fanout may be what
+    # the author meant.
+    semantic_models: [shop.orders, shop.customers]
+
+  - id: dialect_selection
+    documents: [dialects.ossie.yaml]
+    connector: bigquery
+    diagnostics: []
+    physical_columns:
+      orders__connector_wins: [demo.main.orders, bigquery_column]
+      orders__ansi_next: [demo.main.orders, ansi_column]
+      orders__first_supported: [demo.main.orders, databricks_column]
+
+  - id: dialect_selection_falls_back_to_portable
+    documents: [dialects.ossie.yaml]
+    # DuckDB has no token in Ossie's enum, so it falls to the portable dialect
+    # rather than to something close. A wrong dialect is a worse answer.
+    connector: duckdb
+    diagnostics: []
+    physical_columns:
+      orders__connector_wins: [demo.main.orders, ansi_column]
+      orders__ansi_next: [demo.main.orders, ansi_column]
+      orders__first_supported: [demo.main.orders, databricks_column]
+
+  - id: non_sql_dialects_are_metadata
+    documents: [non_sql.ossie.yaml]
+    connector: duckdb
+    # A note rather than a warning: nothing is wrong with the document. dex is
+    # saying which expressions it did not check, so a caller never reads
+    # "skipped" as "validated".
+    diagnostics:
+      - {rule: non_sql_dialect, severity: note, origin: dex}
+    # Only the field that also declares SQL resolves to a column. The three
+    # non-SQL-only fields are preserved and carry none.
+    physical_columns:
+      orders__mixed: [demo.main.orders, order_id]
+
+  - id: post_pin_thoughtspot_is_refused
+    documents: [post_pin_dialect.ossie.yaml]
+    connector: duckdb
+    diagnostics:
+      - {rule: enum, severity: error, origin: schema}
+    semantic_models: []
+
+  - id: physical_linkage_is_direct_only
+    documents: [linkage.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    # The only entry: a bare identifier on a three-part relation. Everything
+    # else in the document is a shape dex refuses to read a column out of.
+    physical_columns:
+      direct__bare: [demo.main.orders, order_total]
+
+  - id: keys_and_relationships
+    documents: [keys.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    composite_keys:
+      - {model: grain.allocations, columns: [order_id, line_no, warehouse_id]}
+      - {model: grain.customers, columns: [tenant_id, external_ref]}
+    single_keys:
+      - {model: grain.customers, column: customer_id}
+      - {model: grain.customers, column: email}
+      - {model: grain.orders, column: order_id}
+    relationships:
+      - model: grain.orders
+        to_model: grain.customers
+        pairs: [[buyer_tenant, tenant_id], [buyer_ref, external_ref]]
+      - model: grain.allocations
+        to_model: grain.orders
+        pairs: [[order_id, order_id]]
+
+  - id: adversarial_composite
+    documents: [adversarial_composite.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    relationships:
+      - model: adversarial.child
+        to_model: adversarial.parent
+        pairs: [[c_one, p_one], [c_two, p_two], [c_three, p_three]]
+
+  - id: drift_baseline
+    documents: [drift_before.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    semantic_models: [drift.orders, drift.customers]
+    composite_keys:
+      - {model: drift.orders, columns: [order_id, tenant_id]}
+
+  - id: drift_changed
+    documents: [drift_after.ossie.yaml]
+    connector: duckdb
+    diagnostics: []
+    semantic_models: [drift.orders, drift.customers]
+    composite_keys: []
+    single_keys:
+      - {model: drift.orders, column: order_id}
+      - {model: drift.customers, column: customer_id}
