@@ -116,7 +116,7 @@ def _read_layers(
     when ``semantic=False``, otherwise the semantic half), which is what each
     command's warning names and what ``check`` gates its semantic axis on. It
     is ``None`` whenever that layer is present, even if the *other* one is
-    not: the two are read independently (#409), so a repository whose
+    not: the two are read independently, so a repository whose
     semantic vendor answers on its own is not blocked by a transformation
     project neither it nor that vendor needs.
 
@@ -156,7 +156,7 @@ def _read_layers(
     except (ProjectError, RepoRootRequiredError, ValidationError) as exc:
         semantic_reason = str(exc)
 
-    # `semantic_reason` names why the semantic-vendor substitute (#409) came
+    # `semantic_reason` names why the semantic-vendor substitute came
     # back empty; when there was none to try, `transform_reason` is the only
     # explanation on hand (the same project answered, or failed to build,
     # for both), and a caller must still see *some* reason rather than a
@@ -168,31 +168,38 @@ def _read_layers(
 def _semantic_layer(
     engine: DexEngine, project: MaintainProject | None
 ) -> SemanticLayer | None:
-    """The semantic-axis snapshot, from whichever format answers it (#409).
+    """The semantic-axis snapshot, from whichever source answers it.
 
     Usually ``project`` itself: the semantic vendor defaults to dbt, the same
-    format ``transform_layer()`` just came from. A repository that configures
-    a different semantic vendor beside it (``semantic.vendor: ossie``) gets
-    that format's own fingerprint instead, through the identical seam
-    ``_semantic_catalog`` already reads on the explore side for #408, rather
-    than a second, vendor-specific snapshot section: a table lookup against
-    ``SEMANTIC_PROJECT_FORMATS``, not a name check on which vendor is
+    format ``transform_layer()`` just came from. A repository that configures a
+    different semantic vendor beside it (``semantic.vendor: ossie``) gets that
+    source's own fingerprint instead, through the identical seam
+    ``_semantic_catalog`` reads on the explore side, rather than a second,
+    vendor-specific snapshot section: a table lookup against
+    ``SEMANTIC_SOURCE_FACTORIES``, not a name check on which vendor is
     configured.
 
-    Read independently of ``project``, which may be ``None`` or may have
-    failed to build its own transform layer: a repository with no dbt project
-    at all and ``semantic.vendor: ossie`` still gets a semantic baseline, even
-    though the transform half has nothing to answer with.
+    Read independently of ``project``, which may be ``None`` or may have failed
+    to build its own transform layer: a repository with no dbt project at all and
+    ``semantic.vendor: ossie`` still gets a semantic baseline, even though the
+    transform half has nothing to answer with.
+
+    The capability is asked for rather than the type: a source that can produce a
+    fingerprint satisfies ``SemanticSnapshotSource``, and one that answers only a
+    read catalog declines here and is reported as absent by the caller. Asking
+    for a *project* tier instead would be asking a semantic source to claim a
+    model graph it does not own, and would silently drop the baseline for the
+    vendors that correctly refuse to.
     """
 
-    from ..adapters.project import MaintainProject as _MaintainProject
-    from ..config import SEMANTIC_PROJECT_FORMATS
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+    from ..semantic_source import SemanticSnapshotSource
 
     vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
-    if vendor in SEMANTIC_PROJECT_FORMATS:
-        semantic_format = engine.semantic_catalog_format()
-        if isinstance(semantic_format, _MaintainProject):
-            return semantic_format.semantic_layer()
+    if vendor in SEMANTIC_SOURCE_FACTORIES:
+        source = engine.semantic_catalog_source()
+        if isinstance(source, SemanticSnapshotSource):
+            return source.semantic_layer()
     if project is None:
         return None
     return project.semantic_layer()
@@ -202,7 +209,7 @@ def _composed_definitions(
     engine: DexEngine, project: ExploreProject | None
 ) -> ProjectDefinitions | None:
     """Declared keys and joins, with a differing semantic vendor's own keys
-    folded in additively (#410).
+    folded in additively.
 
     Takes the project the caller already read rather than resolving one of its
     own: the format is built once per command, and a repo-less host has no
@@ -211,11 +218,11 @@ def _composed_definitions(
 
     Grain verification (`maintain grain`/`maintain check`) reads declared
     composite keys off ``ProjectDefinitions.declared_composite_keys``, which
-    the project's own ``definitions()`` alone never carries for Ossie:
-    Ossie is never the transformation project that method resolves (the same
-    fact #408 already worked around for the explore-side grain channel, in
-    `explore.commands._fold_semantic_layer_keys`). Mirrored here rather than
-    imported from there, the way #409's `_semantic_layer` is its own
+    the project's own ``definitions()`` alone never carries for a semantic
+    vendor that is not the project: it is never the transformation project that
+    method resolves, which is the same fact the explore-side grain channel works
+    around in `explore.commands._fold_semantic_layer_keys`. Mirrored here rather
+    than imported from there, the way `_semantic_layer` above is its own
     implementation beside `explore.commands._semantic_catalog`: each module
     composes through the same neutral `SemanticLayer.declared_keys()` seam
     rather than one reaching into the other's private helper.
@@ -1164,7 +1171,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # carries the grain, and an edit that contradicts a declared grain is one no
     # format is obliged to keep. Tier 1, so the read cannot raise; `None` is the
     # answer when there was no format to read it from. Composed with a
-    # differing semantic vendor's own keys (#410), so a proposal for a column
+    # differing semantic vendor's own keys, so a proposal for a column
     # Ossie already covers via a declared composite is not suggested as if
     # nothing declared it.
     definitions = _composed_definitions(engine, project)

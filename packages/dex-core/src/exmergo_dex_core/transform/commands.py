@@ -22,7 +22,7 @@ import argparse
 import contextlib
 import json
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -35,7 +35,6 @@ from ..errors import DexError
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
-from . import semantic as semantic_mod
 from .native_semantic import edits_from_payload, plan_hint, read_payload_file
 from .plans import EditKind, PlanEdit, PlanError
 from .results import (
@@ -51,10 +50,25 @@ from .results import (
     PropagationResult,
     TestScaffoldResult,
 )
-from .validate import EditValidationError
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
+    from . import semantic as semantic_mod
+
+# Two of this module's neighbours reach the dialect engine at import (`.semantic`
+# for MetricFlow-shaped YAML, `.validate` for SQL), and importing either here
+# would put sqlglot behind every verb this module serves. Most of them need it;
+# `apply` does not, and `transform apply` is how a native semantic plan is
+# written. An install carrying only a semantic reader has no sqlglot, so an
+# eager import here would let that install author a plan it could never apply.
+# Reached at the point of use instead, which is where the dependency is real.
+
+
+def _semantic() -> Any:
+    from . import semantic
+
+    return semantic
+
 
 # What actually caps a dbt statement server-side, per compute-time connector:
 # a per-connector fact, kept out of the shared build arm so the next connector
@@ -731,7 +745,7 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
     stored = store.load_plan(plan_id)
     semantic_layer = None
     if stored.edit_target == "semantic":
-        candidate = engine.semantic_catalog_format()
+        candidate = engine.semantic_catalog_source()
         if isinstance(candidate, SemanticEditTarget):
             semantic_layer = candidate
     outcome: PlanApplyResult = plans_mod.apply(
@@ -1090,6 +1104,14 @@ def cmd_semantic_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
     return _semantic_envelope(args, engine, "plan")
 
 
+def _validation_error() -> type[Exception]:
+    """`.validate`'s error, reached lazily for the reason above it."""
+
+    from .validate import EditValidationError
+
+    return EditValidationError
+
+
 def _semantic_envelope(
     args: argparse.Namespace, engine: DexEngine, mode: str
 ) -> env.Envelope:
@@ -1105,7 +1127,7 @@ def _semantic_envelope(
             ),
             no_parse=bool(getattr(args, "no_parse", False)),
         )
-    except EditValidationError as exc:
+    except _validation_error() as exc:
         return env.error_for(exc)
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
@@ -1531,7 +1553,7 @@ def _semantic_plan(
         # on one code path regardless of how the caller expressed the change.
         edits = [
             PlanEdit(path=path, kind=EditKind.SEMANTIC_YML, new_content=content)
-            for path, content in semantic_mod.splice_definitions(definitions, view)
+            for path, content in _semantic().splice_definitions(definitions, view)
         ]
         scope = {(d.kind, d.name) for d in definitions}
         removed = [d for d in definitions if d.op is EditOp.DELETE]
@@ -1557,7 +1579,7 @@ def _semantic_plan(
 
     parsed_by_path = [(e.path, yaml.safe_load(e.new_content)) for e in edits]
     parsed_edits = [parsed for _path, parsed in parsed_by_path]
-    classification = semantic_mod.check_mode(
+    classification = _semantic().check_mode(
         mode,
         parsed_by_path,
         view,
@@ -1566,11 +1588,11 @@ def _semantic_plan(
     )
     # The two reference directions: what this payload's own definitions read,
     # then what the surviving project reads out of what it removes.
-    semantic_mod.check_references(parsed_edits, view)
-    semantic_mod.check_removals(
+    _semantic().check_references(parsed_edits, view)
+    _semantic().check_removals(
         removed, [(e.path, e.new_content or "") for e in edits], view
     )
-    spine_warning = semantic_mod.time_spine_warning(view, parsed_edits)
+    spine_warning = _semantic().time_spine_warning(view, parsed_edits)
 
     # The authoritative gate: a plan that dbt cannot parse is never stored.
     # Skipped when the time-spine warning fires (dbt would refuse to parse for
@@ -1662,4 +1684,4 @@ def _definitions_from_payload(
     entries = payload.get("definitions") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
         raise ValueError('definitions payload must be {"definitions": [...]}')
-    return semantic_mod.parse_definition_payload(entries)
+    return _semantic().parse_definition_payload(entries)
