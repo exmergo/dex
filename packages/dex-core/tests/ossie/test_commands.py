@@ -56,15 +56,26 @@ def test_the_vendor_resolves_to_the_ossie_backend(configured: Path):
     assert backend.descriptor.execution == "dex"
 
 
-def test_the_backend_reads_its_catalog_through_the_injected_format(
+def test_the_layer_reads_its_catalog_through_the_injected_source(
     configured: Path,
 ):
-    """The backend never constructs a reader, which is what lets one class serve
-    both configuration routes without this class knowing which it is in."""
+    """The runtime layer never constructs a reader, which is what lets one class
+    serve both configuration routes without knowing which it is in.
+
+    It holds a semantic *source*, not a project: the object it was handed
+    answers a catalog and declines every project tier, which is what stops the
+    explore surface reasoning about a document set as a model graph.
+    """
+
+    from exmergo_dex_core.adapters.project import ExploreProject
+    from exmergo_dex_core.ossie import OssieSemanticLayer
+    from exmergo_dex_core.semantic_source import SemanticCatalogSource
 
     backend = resolve_backend(DexEngine.from_repo(str(configured)))
 
-    assert backend._project.name == "ossie"
+    assert isinstance(backend._source, OssieSemanticLayer)
+    assert isinstance(backend._source, SemanticCatalogSource)
+    assert not isinstance(backend._source, ExploreProject)
 
 
 def test_a_hosted_source_is_refused_for_a_local_only_vendor(configured: Path):

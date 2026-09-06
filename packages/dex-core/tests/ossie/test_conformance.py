@@ -1,17 +1,28 @@
 """The shipped contracts, subclassed for Ossie.
 
-Five bindings rather than hand-written parallel assertions. The contracts are
-the standard the other formats and backends are already held to, they are
-already written, and each one is a fixture hook or two away. Subclassing them
-also means a later change to the contract reaches this format automatically,
-which is exactly what a format built as the second implementation of a seam
-needs.
+Bindings rather than hand-written parallel assertions. The contracts are the
+standard the other sources and layers are already held to, they are already
+written, and each one is a hook or two away. Subclassing them also means a later
+change to a contract reaches this implementation automatically, which is what a
+second implementation of a seam needs.
 
-The tier contracts stop where the format's own implementation does. Subclassing
-a wider contract than the format implements is how you find out you have not
-finished, so a narrow class is a feature: `TestOssieProject` now reaches tier 2
-(#409), and stops there rather than also mixing in the tier-3 write contract,
-which Ossie does not implement.
+**Semantic-source contracts, not project ones.** Ossie is a semantic layer: it
+owns no model graph, no compilation, no targets, and no dbt write surface, so
+the project tiers are the wrong standard for it and satisfying them would be
+claiming capabilities it does not have. What it does own is a set of
+declarations, a read catalog, a drift fingerprint, and a write surface over its
+own configured documents, and there is a contract for each. The assertions are
+the same ones the project contracts run, extracted rather than copied, so dbt and
+Ossie cannot drift apart on behaviour they share.
+
+Which contracts are absent is the other half of the statement.
+`SemanticCatalogContract` from `explore.semantic.conformance` is not here: it
+asserts the content of a dbt-shaped reference layer, and Ossie has no entities,
+no measures, and no metric groupability to answer it with. Manufacturing them to
+pass would be inventing a layer the document's author never wrote. The catalog
+*shape* rules that do apply reach Ossie through `SemanticBackendContract` and the
+source contracts below, and the applicability boundary is written down in
+`references/ossie-compatibility.md` rather than left as a gap someone rediscovers.
 """
 
 from __future__ import annotations
@@ -20,44 +31,43 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.adapters.conformance import (
-    DeclaringProjectContract,
-    MaintainProjectContract,
-    ProjectFactoryContract,
-    SemanticCatalogContract,
-    SemanticProjectContract,
-)
-from exmergo_dex_core.adapters.project import ExploreProject, ProjectContext
 from exmergo_dex_core.edits import EditOp, content_hash
 from exmergo_dex_core.edits_conformance import SemanticEditTargetContract
 from exmergo_dex_core.explore.semantic.conformance import SemanticBackendContract
 from exmergo_dex_core.explore.semantic.ossie import LocalOssieBackend
-from exmergo_dex_core.ossie import OssieProject
+from exmergo_dex_core.ossie import OssieSemanticLayer
+from exmergo_dex_core.semantic_source import SemanticSourceContext
+from exmergo_dex_core.semantic_source_conformance import (
+    SemanticCatalogSourceContract,
+    SemanticDeclarationContract,
+    SemanticFingerprintContract,
+    SemanticSourceFactoryContract,
+)
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 
 from .conftest import dataset, document, expression, field, model, write
 
 
-def _project(root: Path, *names: str) -> OssieProject:
-    return OssieProject.from_context(
-        ProjectContext(
+def _source(root: Path, *names: str) -> OssieSemanticLayer:
+    return OssieSemanticLayer.from_context(
+        SemanticSourceContext(
             repo_root=str(root), connector="duckdb", options={"files": list(names)}
         )
     )
 
 
-def _declaring(root: Path, name: str, doc) -> OssieProject:
+def _declaring(root: Path, name: str, doc) -> OssieSemanticLayer:
     write(root, name, doc)
-    return _project(root, name)
+    return _source(root, name)
 
 
-class TestOssieProject(
-    ProjectFactoryContract,
-    DeclaringProjectContract,
-    MaintainProjectContract,
-    SemanticProjectContract,
+class TestOssieSemanticSource(
+    SemanticSourceFactoryContract,
+    SemanticDeclarationContract,
+    SemanticFingerprintContract,
+    SemanticCatalogSourceContract,
 ):
-    """Tier 1 and 2, the factory, and the declarations dex reads a project *for*."""
+    """Construction, declarations, the fingerprint, and the read catalog."""
 
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path) -> None:
@@ -65,14 +75,14 @@ class TestOssieProject(
         # fixtures, so the root is stashed on the instance for them to reach.
         self.root = tmp_path
 
-    def build(self, context: ProjectContext):
-        return OssieProject.from_context(context)
+    def build_source(self, context: SemanticSourceContext):
+        return OssieSemanticLayer.from_context(context)
 
-    def empty_context(self) -> ProjectContext:
-        """A project with nothing declared in it.
+    def empty_source_context(self) -> SemanticSourceContext:
+        """A layer with nothing declared in it.
 
         A document declaring one dataset and nothing about it, which is what
-        "nothing declared" means for a format whose documents *are* the
+        "nothing declared" means for a source whose documents *are* the
         declarations: an empty file is not a valid Ossie document at all, since
         the schema requires at least one dataset per semantic model.
         """
@@ -82,17 +92,34 @@ class TestOssieProject(
             "empty.ossie.yaml",
             document(model("empty", dataset("thing", "demo.main.thing"))),
         )
-        return ProjectContext(
+        return SemanticSourceContext(
             repo_root=str(self.root),
             connector="duckdb",
             options={"files": ["empty.ossie.yaml"]},
         )
 
-    def make_unreadable_project(self) -> ExploreProject:
-        """A document the format genuinely cannot parse.
+    def absent_document_context(self) -> SemanticSourceContext:
+        """A configured document that is not on disk.
 
-        Overridden rather than left to skip, because this is the hook behind the
-        contract's most valuable assertion and Ossie has a real unparseable
+        Overridden rather than left to skip: this is the ordinary state between
+        committing a path to config and authoring the file, and refusing it at
+        construction would make `explore map` on a raw warehouse fail over a typo
+        in a semantic-layer path.
+        """
+
+        return SemanticSourceContext(
+            repo_root=str(self.root),
+            connector="duckdb",
+            options={"files": ["absent.ossie.yaml"]},
+        )
+
+    def make_semantic_source(self):
+        return self.build_source(self.empty_source_context())
+
+    def an_unreadable_semantic_source(self) -> OssieSemanticLayer:
+        """A document the source genuinely cannot parse.
+
+        Overridden rather than left to skip, because Ossie has a real unparseable
         state: a YAML file is a file, and files get truncated, merged badly, and
         hand-edited.
         """
@@ -100,9 +127,30 @@ class TestOssieProject(
         (self.root / "unreadable.ossie.yaml").write_text(
             "version: '0.2.0.dev0'\nsemantic_model: [ {name: x,\n", encoding="utf-8"
         )
-        return _project(self.root, "unreadable.ossie.yaml")
+        return _source(self.root, "unreadable.ossie.yaml")
 
-    def a_project_declaring_a_unique_key(self):
+    def test_the_declaration_channel_never_raises_on_an_unreadable_document(
+        self,
+    ) -> None:
+        """The asymmetry the catalog contract's own assertion implies, asserted
+        from the other side.
+
+        A caller reading the catalog asked what the layer contains, so refusing
+        is the answer to their question. A caller on the declaration channel
+        asked about a *warehouse* and happens to have a layer beside it, and
+        exploration runs against raw warehouses where a semantic layer is absent
+        or broken. Raising there turns an ordinary condition into an outage.
+        """
+
+        definitions = self.an_unreadable_semantic_source().declared_definitions()
+
+        assert definitions.declared_keys == []
+        assert definitions.notes, (
+            "an empty result with no note is indistinguishable from a layer that "
+            "genuinely declares nothing"
+        )
+
+    def a_source_declaring_a_unique_key(self):
         return (
             _declaring(
                 self.root,
@@ -123,7 +171,7 @@ class TestOssieProject(
             "order_id",
         )
 
-    def a_project_declaring_a_join(self):
+    def a_source_declaring_a_join(self):
         return (
             _declaring(
                 self.root,
@@ -160,7 +208,7 @@ class TestOssieProject(
             "customer_id",
         )
 
-    def a_project_declaring_a_join_with_differently_named_sides(self):
+    def a_source_declaring_a_join_with_differently_named_sides(self):
         """The ordinary case, not the exotic one.
 
         A mirrored fixture cannot fail for the right reason: an implementation
@@ -199,12 +247,12 @@ class TestOssieProject(
             "customer_id",
         )
 
-    def a_project_declaring_a_semantic_model(self):
+    def a_source_declaring_a_semantic_model(self):
         """One direct field and one computed, so the snapshot's column mapping
         is asserted in both directions, the same reason the catalog hook one
         section over uses the same shape."""
 
-        project = _declaring(
+        source = _declaring(
             self.root,
             "snapshot.ossie.yaml",
             document(
@@ -221,13 +269,13 @@ class TestOssieProject(
             ),
         )
         return (
-            project,
+            source,
             "snap.orders",
             {"order_id": "order_id", "net_total": None},
             {},
         )
 
-    def a_project_declaring_a_composite_key(self):
+    def a_source_declaring_a_composite_key(self):
         """Three columns, because a pair cannot tell you what you came to find
         out: an implementation that special-cases the pair passes a two-column
         fixture and fails a four-column one."""
@@ -255,57 +303,7 @@ class TestOssieProject(
         )
 
 
-class TestOssieSemanticCatalog(SemanticCatalogContract):
-    """The read catalog keeps what a drift fingerprint would reduce away."""
-
-    @pytest.fixture(autouse=True)
-    def _root(self, tmp_path: Path) -> None:
-        self.root = tmp_path
-
-    def make_project(self):
-        write(
-            self.root,
-            "catalog.ossie.yaml",
-            document(model("c", dataset("thing", "demo.main.thing", field("a")))),
-        )
-        return _project(self.root, "catalog.ossie.yaml")
-
-    def a_project_declaring_a_semantic_model(self):
-        """One direct field and one computed, so the column assertion runs in
-        both directions: `None` is the honest answer for an expression, and an
-        invented column is what makes the PII gate screen the wrong one."""
-
-        project = _declaring(
-            self.root,
-            "semantics.ossie.yaml",
-            document(
-                model(
-                    "shop",
-                    dataset(
-                        "orders",
-                        "demo.main.orders",
-                        field("order_id"),
-                        field("net_total", "order_total - discount"),
-                        primary_key=["order_id"],
-                    ),
-                    metrics=[
-                        {
-                            "name": "revenue",
-                            "expression": expression(ANSI_SQL="SUM(orders.net_total)"),
-                        }
-                    ],
-                )
-            ),
-        )
-        return (
-            project,
-            "shop.orders",
-            {"order_id": "order_id", "net_total": None},
-            {},
-        )
-
-
-class TestLocalOssieBackend(SemanticBackendContract):
+class TestLocalOssieLayer(SemanticBackendContract):
     """Provenance, idempotency, declared scope, and the payload rules."""
 
     @pytest.fixture(autouse=True)
@@ -340,7 +338,7 @@ class TestLocalOssieBackend(SemanticBackendContract):
                 )
             ),
         )
-        return LocalOssieBackend(_project(self.root, "backend.ossie.yaml"))
+        return LocalOssieBackend(_source(self.root, "backend.ossie.yaml"))
 
 
 class TestOssieSemanticEditing(SemanticEditTargetContract):
@@ -363,7 +361,7 @@ class TestOssieSemanticEditing(SemanticEditTargetContract):
             second,
             document(model("second", dataset("things", "demo.main.things"))),
         )
-        return _project(self.root, first, second), first, second
+        return _source(self.root, first, second), first, second
 
     def make_semantic_edit_target(self):
         target, _first, _second = self._documents()

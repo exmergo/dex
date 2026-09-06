@@ -154,6 +154,19 @@ class TestDbtProject(
         (project / "dbt_project.yml").write_text("name: [unclosed\n", encoding="utf-8")
         return DbtProject(self.root, project)
 
+    def an_unreadable_semantic_source(self) -> DbtProject:
+        # An uncompiled project rather than a broken one: this is the state a dbt
+        # user reaches every time, and it is the one where "no metrics" and "not
+        # compiled yet" are easiest to confuse. Only one of them is fixed by
+        # running `dbt parse`.
+        project = self.root / "uncompiled"
+        project.mkdir()
+        (project / "dbt_project.yml").write_text(
+            "name: uncompiled\nprofile: uncompiled\nversion: '1.0'\n",
+            encoding="utf-8",
+        )
+        return DbtProject(self.root, project)
+
     def a_project_declaring_a_unique_key(self) -> tuple[DbtProject, str, str]:
         project = _project(
             self.root,
