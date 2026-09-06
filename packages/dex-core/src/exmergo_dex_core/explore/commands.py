@@ -1136,7 +1136,14 @@ def relationships(
     # set is authoritative for every identifier it examined; anything with an
     # endpoint outside that (a narrower --scope/--dataset than a prior run) is
     # carried forward above rather than dropped, same as the profiles are.
-    cache, stats = _merge_profiles(prior, datasets, connector, now, relationships=rels)
+    cache, stats = _merge_profiles(
+        prior,
+        datasets,
+        connector,
+        now,
+        relationships=rels,
+        observed_namespaces=observed_namespaces,
+    )
     if catalog is not None:
         _annotate_semantic_exposure(cache.datasets, catalog)
     locator = store.save_cache(cache, now=now)
@@ -2215,6 +2222,12 @@ def map(
 
     cache = DexCache(datasets=datasets, relationships=relationship_set)
     cache.provenance.connector = adapter.name
+    cache.provenance.inventory_namespaces = sorted(
+        {
+            *(reusable.provenance.inventory_namespaces if reusable else []),
+            *observed_namespaces,
+        }
+    )
     cache.provenance.created_at = (
         prior.provenance.created_at
         if prior and prior.provenance.created_at
@@ -4363,6 +4376,7 @@ def _merge_profiles(
     now: datetime,
     *,
     relationships=_KEEP_RELATIONSHIPS,
+    observed_namespaces: set[str] | None = None,
 ) -> tuple[DexCache, dict]:
     """Fold freshly profiled datasets into a prior cache, keyed by identifier.
 
@@ -4401,6 +4415,12 @@ def _merge_profiles(
         rels = relationships
     cache = DexCache(datasets=datasets, relationships=rels)
     cache.provenance.connector = connector
+    cache.provenance.inventory_namespaces = sorted(
+        {
+            *(reusable.provenance.inventory_namespaces if reusable else []),
+            *(observed_namespaces or set()),
+        }
+    )
     cache.provenance.created_at = (
         reusable.provenance.created_at
         if reusable and reusable.provenance.created_at

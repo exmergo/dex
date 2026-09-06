@@ -1099,8 +1099,11 @@ def semantic_ossie(
         )
 
     from ..ossie.authoring import validate_plan
+    from ..storage import readable_cache
 
-    classification, validation_warnings = validate_plan(layer, edits, mode)
+    classification, validation_notes, validation_warnings = validate_plan(
+        layer, edits, mode, cache=readable_cache(engine.store)
+    )
     repo_root = engine.require_repo_root("storing a native semantic plan")
     stored, diffs, plan_warnings = plans_mod.plan(
         intent,
@@ -1118,6 +1121,7 @@ def semantic_ossie(
             stored.plan_id
         ),
         diffs=diffs,
+        notes=validation_notes,
         warnings=[*plan_warnings, *validation_warnings],
         defined=classification["defined"],
         updated=classification["updated"],
