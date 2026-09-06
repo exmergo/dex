@@ -2094,7 +2094,9 @@ def test_a_composite_conflict_carries_every_column_pair():
 
     (conflict,) = _declared_relationship_conflicts([declared, composite])
 
-    by_pairs = {tuple(tuple(p) for p in d.column_pairs): d for d in conflict.declarations}
+    by_pairs = {
+        tuple(tuple(p) for p in d.column_pairs): d for d in conflict.declarations
+    }
     assert (("product_id", "id"),) in by_pairs
     assert (("product_id", "id"), ("variant_id", "variant_id")) in by_pairs
 
