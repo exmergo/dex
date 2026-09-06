@@ -215,34 +215,23 @@ it is better than the one a point below it.
 
 ## Connectors
 
-- Cloud warehouse: **Snowflake**, **BigQuery**, **Databricks**, **Amazon Redshift** (Serverless-first), **ClickHouse Cloud**.
-- Self-hosted analytical: **ClickHouse**.
-- Embedded analytical: **DuckDB**.
-- Operational database: **Postgres**.
+| Connector | Type | Self-hostable | Extra / `--connector` | Cost surfaced as | Credentials discovered from |
+| --- | --- | :---: | --- | --- | --- |
+| <img src="https://www.exmergo.com/connectors/snowflake.png" width="20" height="20" alt=""> **Snowflake** | Cloud warehouse | ❌ | `snowflake` | Warehouse-seconds, credits alongside | `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile |
+| <img src="https://www.exmergo.com/connectors/bigquery.png" width="20" height="20" alt=""> **BigQuery** | Cloud warehouse | ❌ | `bigquery` | Bytes scanned | Application Default Credentials (`gcloud auth application-default login`) |
+| <img src="https://www.exmergo.com/connectors/databricks.png" width="20" height="20" alt=""> **Databricks** | Cloud warehouse | ❌ | `databricks` | Warehouse-seconds, DBUs alongside | The SDK's unified chain: `databricks auth login`, `DATABRICKS_*` env, or a dbt profile |
+| <img src="https://www.exmergo.com/connectors/redshift.png" width="20" height="20" alt=""> **Amazon Redshift** | Cloud warehouse, Serverless-first | ❌ | `redshift` | Compute-seconds, RPU-hours alongside | The AWS credential chain (a pinned Serverless workgroup mints IAM temporary database credentials) or `REDSHIFT_*` env |
+| <img src="https://www.exmergo.com/connectors/clickhouse.png" width="20" height="20" alt=""> **ClickHouse** | Analytical database | ✅ | `clickhouse` | Compute-seconds on Cloud, with live allocated memory translating to approximate compute-unit-hours and optional USD; database-seconds self-hosted | `CLICKHOUSE_URL`, the `CLICKHOUSE_*` env, or a dbt profile |
+| <img src="https://www.exmergo.com/connectors/duckdb.png" width="20" height="20" alt=""> **DuckDB** | Embedded analytical | ✅ | `duckdb` | Free and local, nothing to confirm | None, just a file path |
+| <img src="https://www.exmergo.com/connectors/postgresql.png" width="20" height="20" alt=""> **Postgres** | Operational database | ✅ | `postgres` | Database-seconds, no invoice | `pg_service.conf`, `DATABASE_URL`, the `PG*` env, or a dbt profile |
 
-<img width="1093" height="189" alt="Screenshot 2026-08-31 at 14 01 15" src="https://github.com/user-attachments/assets/ea738a4c-f6f6-4061-9bc6-d9743c2dc7a7" />
+Credentials are discovered, never asked for. Every scan is estimated and
+confirmed before it spends, and capped server-side: `maximum_bytes_billed` on
+BigQuery, a per-statement statement timeout on Snowflake, Databricks, Redshift,
+and Postgres, and `max_execution_time` plus `max_bytes_to_read` on ClickHouse.
+All settled spend is recorded in a local ledger.
 
-
-Credentials are discovered, never asked for: BigQuery through Application
-Default Credentials (`gcloud auth application-default login`), Snowflake
-through `connections.toml`, `SNOWFLAKE_*` env, or a dbt profile, Databricks
-through the SDK's unified chain (`databricks auth login`, `DATABRICKS_*` env,
-or a dbt profile), Redshift through the AWS credential chain (a pinned
-Serverless workgroup mints IAM temporary database credentials) or `REDSHIFT_*`
-env, Postgres through `pg_service.conf`, `DATABASE_URL`, the `PG*`
-environment, or a dbt profile, ClickHouse through `CLICKHOUSE_URL`, the
-`CLICKHOUSE_*` environment, or a dbt profile. Every scan is estimated and
-confirmed before it spends, capped server-side (`maximum_bytes_billed` on
-BigQuery; a per-statement statement timeout on Snowflake, Databricks, Redshift,
-and Postgres; `max_execution_time` plus `max_bytes_to_read` on ClickHouse).
-Budgets are bytes on BigQuery, warehouse-seconds with credits or DBUs alongside
-on Snowflake and Databricks, compute-seconds with RPU-hours alongside on
-Redshift, and database-seconds on Postgres and self-hosted ClickHouse.
-ClickHouse Cloud uses compute-seconds with live allocated memory translating to
-approximate compute-unit-hours and optional USD. All settled spend is recorded
-in a local ledger.
-
-The two self-hosted connectors bill no dollars, and dex still gates them: an
+Self-hosted Postgres and ClickHouse bill no dollars, and dex still gates them: an
 unbounded scan on a production Postgres primary or a shared ClickHouse cluster
 is a real cost even when nothing appears on an invoice.
 
@@ -253,11 +242,13 @@ is a real cost even when nothing appears on an invoice.
 ## Semantic layers
 
 The semantic layer is a separate axis from the transformation project, chosen
-once per repository in `.dex/config.yml`. dex reads three today: **dbt's own
-semantic models** through MetricFlow locally, the **hosted dbt Cloud Semantic
-Layer** over its API, and **native [Apache Ossie](https://github.com/apache/ossie)
-(incubating) documents** read straight out of the repository, with no dbt project
-and no MetricFlow anywhere in the path.
+once per repository in `.dex/config.yml`. dex reads two vendors across three
+deployments today:
+
+| Semantic layer | Hosted | Queryable | `vendor` / `deployment` | Read through |
+| --- | :---: | :---: | --- | --- |
+| <img src="https://www.exmergo.com/connectors/dbt.png" width="20" height="20" alt=""> **dbt** | ✅ | ✅ | `dbt` / `local` or `dbt_cloud` | MetricFlow locally, with the rendered SQL run through the dex connector and its cost guard, or the hosted dbt Cloud Semantic Layer over its API |
+| <img src="https://www.exmergo.com/connectors/ossie.png" width="20" height="20" alt=""> **[Apache Ossie](https://github.com/apache/ossie)** (incubating) | ❌ | ❌ | `ossie` / `local` | Native documents read straight out of the repository, with no dbt project and no MetricFlow anywhere in the path |
 
 Ossie is catalog-first, and that is a statement about the format rather than
 about how far we got: Ossie specifies interchange metadata and no portable query
