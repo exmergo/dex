@@ -91,9 +91,7 @@ class SemanticEditTargetContract:
         target, edits, read_target = self.an_edit_against_a_changed_semantic_target()
         assert edits
         before = read_target()
-        create = _copy_edit(
-            edits[0], old_content_hash=None, op=EditOp.UPSERT
-        )
+        create = _copy_edit(edits[0], old_content_hash=None, op=EditOp.UPSERT)
 
         result = target.write_semantic_edits([create])
 

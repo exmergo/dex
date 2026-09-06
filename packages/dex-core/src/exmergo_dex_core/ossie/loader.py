@@ -342,9 +342,7 @@ def _parse(path: Path, name: str) -> tuple[dict[str, Any] | None, list[Diagnosti
     return _parse_text(text, name)
 
 
-def _parse_text(
-    text: str, name: str
-) -> tuple[dict[str, Any] | None, list[Diagnostic]]:
+def _parse_text(text: str, name: str) -> tuple[dict[str, Any] | None, list[Diagnostic]]:
     """Parse supplied document text with the same diagnostics as a file read."""
 
     def refusal(rule: str, message: str) -> tuple[None, list[Diagnostic]]:

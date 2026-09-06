@@ -206,9 +206,7 @@ class DeclaredRelationshipConflict(BaseModel):
 
     from_dataset: str
     to_dataset: str
-    declarations: list[ConflictingRelationshipDeclaration] = Field(
-        default_factory=list
-    )
+    declarations: list[ConflictingRelationshipDeclaration] = Field(default_factory=list)
 
 
 class RelationshipsResult(Result):

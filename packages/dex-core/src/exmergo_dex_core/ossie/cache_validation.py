@@ -181,13 +181,10 @@ def _column_references(
         else:
             references.append((column, f"field '{field_.get('name')}'"))
     references.extend(
-        (str(column), "primary_key")
-        for column in dataset.get("primary_key") or []
+        (str(column), "primary_key") for column in dataset.get("primary_key") or []
     )
     for key_index, key in enumerate(dataset.get("unique_keys") or []):
-        references.extend(
-            (str(column), f"unique_keys[{key_index}]") for column in key
-        )
+        references.extend((str(column), f"unique_keys[{key_index}]") for column in key)
     # The same physical column may be a field, key, and endpoint.  Each role is
     # useful in a refusal, but duplicate declarations of one role are only noise.
     return list(dict.fromkeys(references)), skipped

@@ -486,10 +486,7 @@ def plan(
             # allow. Agreement there is the format's own, expressed through what
             # `edit_path` places and what `write_edits` accepts.
             contained_key(edit.path, surface)
-            if (
-                edit.op is EditOp.UPSERT
-                and edit.kind is not EditKind.SEMANTIC_DOCUMENT
-            ):
+            if edit.op is EditOp.UPSERT and edit.kind is not EditKind.SEMANTIC_DOCUMENT:
                 from .validate import validate_edit
 
                 warnings.extend(validate_edit(edit))

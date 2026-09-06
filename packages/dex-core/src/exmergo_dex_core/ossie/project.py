@@ -219,9 +219,7 @@ class OssieSemanticLayer:
 
         return list(self.files)
 
-    def write_semantic_edits(
-        self, edits: Any, *, confirmed: bool = False
-    ) -> Any:
+    def write_semantic_edits(self, edits: Any, *, confirmed: bool = False) -> Any:
         """Write exact authored bytes with atomic stale-edit protection."""
 
         from .authoring import write_edits

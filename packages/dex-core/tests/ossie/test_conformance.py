@@ -380,9 +380,7 @@ class TestOssieSemanticEditing(SemanticEditTargetContract):
             old_content_hash=view.files[first].sha256,
             new_content="# proposed\n" + original,
         )
-        (self.root / first).write_text(
-            "# human edit\n" + original, encoding="utf-8"
-        )
+        (self.root / first).write_text("# human edit\n" + original, encoding="utf-8")
         return target, [edit], lambda: (self.root / first).read_text("utf-8")
 
     def a_clean_semantic_edit(self, target):
