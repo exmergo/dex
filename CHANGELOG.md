@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-06
+
 ### Added
 
 - **Native Apache Ossie workflows are documented end to end, and the pages that
