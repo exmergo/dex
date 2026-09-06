@@ -1,0 +1,14 @@
+# The pin is on content, but the document's own version is still required and
+# still checked, because upstream requires it and the schema is what checks it.
+version: "0.1.0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id

@@ -121,9 +121,9 @@ semantic = ["metricflow>=0.211,<0.212", "exmergo-dex-core[sql]"]
 # dbt Cloud owns the warehouse connection and executes server-side, so a
 # pure-remote user (no local dbt project) installs only this.
 semantic-api = ["httpx>=0.27"]
-# Native Apache Ossie documents (`semantic.vendor: ossie`, `project.format:
-# ossie`). One dependency: a Draft 2020-12 JSON Schema validator, used against
-# the Ossie schema dex vendors and pins by content hash. Deliberately does NOT
+# Native Apache Ossie documents (`semantic.vendor: ossie`). One dependency: a
+# Draft 2020-12 JSON Schema validator, used against the Ossie schema dex vendors
+# and pins by content hash. Deliberately does NOT
 # self-reference [sql]: structure and integrity validation are the layers that
 # decide whether a document is readable at all, and they are pure. Expression
 # syntax checking is the third layer and rides on [sql], which every connector
@@ -164,17 +164,20 @@ storage-conformance = ["pytest>=8", "exmergo-dex-core[sql]"]
 # holds it true, because the cheapest way for this to acquire a heavier floor is for
 # an assertion to start building something that parses SQL.
 project-conformance = ["pytest>=8"]
-# The semantic-backend conformance contract
-# (`exmergo_dex_core.explore.semantic.conformance`), for anyone implementing a
-# semantic-layer backend outside this distribution. Named on the same rule as the
-# two above: an install line answers "conformance to what?" alone.
+# The two semantic conformance contracts
+# (`exmergo_dex_core.explore.semantic.conformance` for a runtime backend and
+# `exmergo_dex_core.semantic_source_conformance` for the source that supplies the
+# layer), for anyone implementing either outside this distribution. Named on the
+# same rule as the two above: an install line answers "conformance to what?"
+# alone, and both answer "the semantic layer", so they share one extra rather
+# than splitting a hair an install line cannot express.
 #
 # Pytest and nothing else, and that floor is the point rather than a coincidence.
-# The contract reads a catalog and asserts on its shape, so it reaches neither the
-# dialect engine nor a warehouse client, and it does not need either semantic
-# extra: the reference layer is data in the module, so an implementer runs the
-# suite against their own backend without installing MetricFlow or httpx to do it.
-# A packaging test holds that true.
+# They read a catalog, a declaration set and a fingerprint and assert on their
+# shape, so they reach neither the dialect engine nor a warehouse client, and
+# they need neither semantic extra: the reference layer is data in the module, so
+# an implementer runs the suite against their own backend without installing
+# MetricFlow or httpx to do it. Packaging tests hold that true for both.
 semantic-conformance = ["pytest>=8"]
 # One command for users who want every optional capability at once: every
 # connector, both semantic-layer backends, and clustering. Self-references the

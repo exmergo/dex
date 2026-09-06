@@ -1,0 +1,20 @@
+# A relationship naming a dataset the model does not declare. The endpoint is
+# unresolvable, so the join cannot be drawn and cannot be probed.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+    relationships:
+      - name: orders_to_absent
+        from: orders
+        to: customers
+        from_columns: [customer_id]
+        to_columns: [customer_id]

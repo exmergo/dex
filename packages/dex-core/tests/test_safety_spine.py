@@ -6035,7 +6035,7 @@ def test_ossie_pii_linkage_exists_only_for_a_direct_column_on_a_real_relation(
 
     _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
     view = (
-        DexEngine.from_repo(str(tmp_path)).semantic_catalog_format().semantic_catalog()
+        DexEngine.from_repo(str(tmp_path)).semantic_catalog_source().semantic_catalog()
     )
 
     assert view.physical_columns == {
@@ -6071,7 +6071,7 @@ def test_ossie_reads_are_confined_to_the_repository(tmp_path):
     from pydantic import ValidationError
 
     from exmergo_dex_core.config import DexConfig
-    from exmergo_dex_core.ossie import OssieProject
+    from exmergo_dex_core.ossie import OssieSemanticLayer
 
     outside = tmp_path.parent / "escape.ossie.yaml"
     outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
@@ -6091,8 +6091,8 @@ def test_ossie_reads_are_confined_to_the_repository(tmp_path):
     # caller that built its coordinates without going through config at all.
     # Confinement is a safety property, so it is checked where the file is
     # opened rather than only where the path is written.
-    escaping = OssieProject(repo, ["../escape.ossie.yaml"], connector="duckdb")
-    definitions = escaping.definitions()
+    escaping = OssieSemanticLayer(repo, ["../escape.ossie.yaml"], connector="duckdb")
+    definitions = escaping.declared_definitions()
 
     assert definitions.model_relations == {}
     assert any("outside the repository" in note for note in definitions.notes)
@@ -6118,6 +6118,262 @@ def test_ossie_never_executes_a_metric_query_it_cannot_price(tmp_path):
 
     with pytest.raises(SemanticBackendError, match="not a portable query runtime"):
         backend.query(SemanticQuery(metrics=["anything"]))
+
+
+def _ossie_billed_repo(root, *, session_ceiling: float | None = None) -> None:
+    """An Ossie layer over the BigQuery fake's own tables.
+
+    The relations are the fixture's, so a declared join is one the fake can
+    actually be asked about. Both edges point at one shared parent, which is what
+    makes the batched probe a single statement rather than one per edge.
+    """
+
+    from exmergo_dex_core.config import DexConfig, save_config
+
+    (root / "billed.ossie.yaml").write_text(
+        """
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: test-proj.shop.customers
+        primary_key: [id]
+        fields:
+          - name: id
+            expression:
+              dialects: [{dialect: BIGQUERY, expression: id}]
+      - name: events
+        source: test-proj.shop.events
+        primary_key: [id]
+        fields:
+          - name: id
+            expression:
+              dialects: [{dialect: BIGQUERY, expression: id}]
+    relationships:
+      - name: events_to_orders
+        from: events
+        to: orders
+        from_columns: [id]
+        to_columns: [id]
+      - name: orders_to_orders
+        from: orders
+        to: orders
+        from_columns: [id]
+        to_columns: [id]
+""",
+        encoding="utf-8",
+    )
+    save_config(
+        DexConfig(
+            connector="bigquery",
+            bigquery={"project": "p"},
+            semantic={"vendor": "ossie", "ossie": {"files": ["billed.ossie.yaml"]}},
+            budget=(
+                {} if session_ceiling is None else {"session_ceiling": session_ceiling}
+            ),
+        ),
+        root,
+    )
+
+
+def _ossie_billed_engine(fake_bq_client, root, monkeypatch, **kwargs):
+    """The Ossie repo, opened through the gate the engine really builds.
+
+    ``connect.new_cost_gate`` rather than a hand-rolled ``CostGate``: a
+    vendor-shaped second route to the warehouse is exactly the shape a guard gets
+    bypassed by, so what is under test has to be the wiring, not a stand-in.
+    """
+
+    import exmergo_dex_core.connect as connect_mod
+    from exmergo_dex_core.adapters.bigquery import BigQueryAdapter
+    from exmergo_dex_core.config import BigQueryTarget, load_config
+    from exmergo_dex_core.connect import new_cost_gate
+
+    config = load_config(root)
+    store = FilesystemStore(root)
+
+    def opener(**opened):
+        return BigQueryAdapter(
+            project="test-proj",
+            cost_gate=new_cost_gate(
+                "bigquery",
+                config,
+                store,
+                budget=opened.get("budget"),
+                confirmed=opened.get("confirmed", False),
+                command=opened.get("command"),
+            ),
+            target=BigQueryTarget(),
+            client=fake_bq_client,
+            principal_type="user",
+        )
+
+    monkeypatch.setattr(connect_mod, "open_adapter", opener)
+    return DexEngine(config=config, store=store, repo_root=str(root), **kwargs)
+
+
+def _billed_rows(sql: str) -> list[dict]:
+    values: dict[str, object] = {"n_total": 100}
+    for i in range(10):
+        values[f"nn_{i}"] = 100
+        values[f"nd_{i}"] = 100 if i == 0 else 40
+        values[f"mn_{i}"] = 1
+        values[f"mx_{i}"] = 100
+        values[f"d_{i}"] = 100
+        values[f"nonnull_fk_{i}"] = 100
+        values[f"orphans_{i}"] = 0
+    return [values]
+
+
+def test_unconfirmed_ossie_verification_executes_no_billed_statement(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Family 2: a declaration is not an authorization to scan.
+
+    Ossie contributes declared joins at confidence 1.0, and measuring one is a
+    warehouse scan like any other. Free metadata and the dry run that produces
+    the estimate are allowed; nothing billed runs before the caller says so.
+    """
+
+    from exmergo_dex_core import ConfirmationRequiredError
+
+    _ossie_billed_repo(tmp_path)
+    fake_bq_client.row_resolver = _billed_rows
+    engine = _ossie_billed_engine(fake_bq_client, tmp_path, monkeypatch)
+
+    with engine, pytest.raises(ConfirmationRequiredError) as caught:
+        engine.relationships(verify=True, use_project=True)
+
+    assert caught.value.request.cost.estimate > 0
+    assert fake_bq_client.query_calls
+    assert all(call.dry_run for call in fake_bq_client.query_calls)
+
+
+def test_a_confirmed_ossie_scan_is_server_capped_and_reaches_the_ledger(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Family 2, the other half: the ceiling binds at the server and the spend
+    is recorded, so the next command's headroom is computed from what this one
+    actually billed rather than from what it estimated."""
+
+    _ossie_billed_repo(tmp_path, session_ceiling=float(1024 * 1024 * 1024))
+    fake_bq_client.row_resolver = _billed_rows
+    engine = _ossie_billed_engine(
+        fake_bq_client,
+        tmp_path,
+        monkeypatch,
+        confirmed=True,
+        budget=float(500 * 1024 * 1024),
+    )
+
+    with engine:
+        engine.relationships(verify=True, use_project=True)
+
+    executed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert executed
+    assert all(c.job_config.maximum_bytes_billed for c in executed)
+
+    ledger = (tmp_path / ".dex" / "spend.jsonl").read_text(encoding="utf-8")
+    assert any(
+        json.loads(line).get("entry") == "settlement"
+        for line in ledger.splitlines()
+        if line.strip()
+    ), ledger
+
+
+def test_reading_an_ossie_layer_opens_no_warehouse_connection(
+    fake_bq_client, tmp_path, monkeypatch
+):
+    """Family 2: the layer is files in the repository, so reading it costs
+    nothing and must not put a cost handshake in front of a free question.
+
+    Three reads that must all stay free: the catalog, plan-time validation
+    (which adjudicates against the exploration cache), and a project-only
+    snapshot, which re-fingerprints the repository and deliberately carries
+    warehouse staleness forward rather than laundering it into a measurement.
+    """
+
+    from exmergo_dex_core.transform.native_semantic import semantic_ossie
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+
+    _ossie_billed_repo(tmp_path, session_ceiling=float(1024 * 1024 * 1024))
+    fake_bq_client.row_resolver = _billed_rows
+    engine = _ossie_billed_engine(fake_bq_client, tmp_path, monkeypatch)
+    content = (tmp_path / "billed.ossie.yaml").read_text(encoding="utf-8")
+
+    with engine:
+        assert engine.semantic_list().catalog.view.semantic_models
+        semantic_ossie(
+            engine,
+            "revise the layer",
+            [
+                PlanEdit(
+                    path="billed.ossie.yaml",
+                    kind=EditKind.SEMANTIC_DOCUMENT,
+                    new_content=content + "\n# reviewed\n",
+                )
+            ],
+            mode="plan",
+        )
+
+    assert fake_bq_client.query_calls == []
+
+
+def test_a_post_plan_symlink_cannot_move_an_ossie_write_out_of_the_repository(
+    tmp_path, capsys
+):
+    """Family 4 + 3: the write surface is decided at apply time, not at plan time.
+
+    A plan names a configured document, and between planning and applying that
+    document becomes a symlink pointing somewhere else. Checking containment
+    only when the plan was stored would write the authored bytes through the
+    link, and the file that changed would be one no diff ever showed.
+    """
+
+    _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
+    outside = tmp_path.parent / "escaped.ossie.yaml"
+    outside.write_text("version: '0.2.0.dev0'\nsemantic_model: []\n", encoding="utf-8")
+    before = outside.read_bytes()
+
+    edits = tmp_path / "symlink-edits.json"
+    edits.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "layer.ossie.yaml",
+                        "content": _OSSIE_DOCUMENT + "\n# reviewed\n",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    planned = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "ossie",
+            "plan",
+            "revise the layer",
+            "--edits-file",
+            str(edits),
+        ],
+        capsys,
+    )
+    assert planned["status"] == "ok", planned
+
+    target = tmp_path / "layer.ossie.yaml"
+    target.unlink()
+    target.symlink_to(outside)
+
+    applied = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+
+    assert applied["status"] == "error", applied
+    assert "outside the repository" in " ".join(applied["errors"]), applied
+    assert outside.read_bytes() == before
 
 
 # --- The programmatic API is bound by the same spine as the CLI ----------------

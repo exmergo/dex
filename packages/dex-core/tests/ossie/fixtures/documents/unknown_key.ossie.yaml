@@ -1,0 +1,17 @@
+# A structural key the pinned schema does not define. Refused rather than
+# ignored: a key dex accepted and dropped is indistinguishable from one it
+# honored, and the next schema may give it a meaning.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+    unexpected_section:
+      - anything

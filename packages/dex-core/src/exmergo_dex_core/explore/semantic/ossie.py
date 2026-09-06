@@ -1,8 +1,8 @@
-"""The catalog-only semantic backend for native Apache Ossie documents.
+"""The catalog-only semantic layer for native Apache Ossie documents.
 
-Thin on purpose. The reading is the project format's job and reaches this
-backend through the same injected-format seam `LocalMetricFlowBackend` uses, so
-what is left here is provenance, the capability declarations, and two refusals.
+Thin on purpose. The reading is the semantic source's job and reaches this layer
+through the same injected-source seam `LocalMetricFlowBackend` uses, so what is
+left here is provenance, the capability declarations, and two refusals.
 
 **The refusals are the honest answer, not a gap to be closed later by this
 class.** Ossie specifies interchange metadata and not a portable query runtime:
@@ -83,34 +83,34 @@ class LocalOssieLayer:
         catalog_gaps=OSSIE_CATALOG_GAPS,
     )
 
-    def __init__(self, project: Any) -> None:
-        self._project = project
+    def __init__(self, source: Any) -> None:
+        self._source = source
 
     @classmethod
     def from_engine(cls, engine: Any) -> LocalOssieLayer:
-        """Build directly from semantic configuration, never a project format."""
+        """Build through the engine's semantic-source seam, never a project.
+
+        One construction path rather than two. This used to call the reader's
+        constructor directly, which meant the coordinates were validated on the
+        maintain and authoring routes and not on this one, so a configuration
+        dex would refuse elsewhere read fine here.
+        """
 
         if engine.repo_root is None:
+            # Caught here rather than left to the source, because this is the
+            # surface the message is for: a caller who built the engine without a
+            # repository gets told which constructor to use.
             raise SemanticBackendError(
                 "reading native Apache Ossie documents needs a repository to "
                 "read them from: they are git-reviewable files, so build the "
                 "engine with DexEngine.from_repo(repo_root)"
             )
-        from ...ossie import OssieSemanticLayer
-
-        semantic = engine.config.semantic
-        return cls(
-            OssieSemanticLayer(
-                engine.repo_root,
-                semantic.ossie.files,
-                engine.connector or engine.config.connector,
-            )
-        )
+        return cls(engine.semantic_catalog_source())
 
     def list_definitions(self) -> SemanticCatalog:
-        project = self._project
+        source = self._source
         try:
-            view = project.semantic_catalog()
+            view = source.semantic_catalog()
         except ProjectError as exc:
             raise SemanticBackendError(str(exc)) from exc
         return SemanticCatalog.from_view(view, self)
@@ -118,14 +118,14 @@ class LocalOssieLayer:
     def declared_relationships(self) -> list[Any]:
         """The native declaration channel, including composite ordered pairs."""
 
-        return self._project.declared_definitions().declared_relationships
+        return self._source.declared_definitions().declared_relationships
 
     def declared_keys(self) -> tuple[list[Any], list[Any]]:
-        """Ossie's own declared dataset keys (#408): unlike dbt, Ossie is never
-        the transformation project `engine.project_format()` resolves, so this
-        is the only route its keys have to grain detection at all."""
+        """Ossie's own declared dataset keys. Unlike dbt, Ossie is never the
+        transformation project `engine.project_format()` resolves, so this is the
+        only route its keys have to grain detection at all."""
 
-        defs = self._project.declared_definitions()
+        defs = self._source.declared_definitions()
         return defs.declared_keys, defs.declared_composite_keys
 
     def query(self, _q: Any) -> Any:

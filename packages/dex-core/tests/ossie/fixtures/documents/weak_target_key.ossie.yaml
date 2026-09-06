@@ -1,0 +1,36 @@
+# Upstream integrity, at warning severity: the target's declared key does not
+# cover the columns the relationship joins on, so the join may fan out. A
+# warning rather than a refusal, because the document is still readable and the
+# fanout may be what the author meant.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: shop
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+      - name: customers
+        source: demo.main.customers
+        primary_key: [tenant_id]
+        fields:
+          - name: customer_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer_id
+          - name: tenant_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: tenant_id
+    relationships:
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [customer_id]
+        to_columns: [customer_id]

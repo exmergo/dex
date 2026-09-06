@@ -11,6 +11,61 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **Native Apache Ossie is constructed as a semantic source rather than through
+  the transformation-project factory, and can no longer be used as a project at
+  all** ([#413]). Ossie was already absent from the shipped project registry and
+  `project.format: ossie` was already refused, but every consumer except the
+  explore route still built the reader through `build_project()`, which enforces
+  `ExploreProject`. That is why the reader carried a `name` attribute and a
+  `definitions()` alias: two vestigial members whose only job was getting past a
+  check meant for formats that own a model graph.
+
+  A new `exmergo_dex_core.semantic_source` module is the seam instead:
+  `SemanticSourceContext` (repository, connector, and the vendor's own
+  coordinates, with no transformation-project directory) plus two
+  runtime-checkable capabilities, `SemanticCatalogSource` for the read catalog
+  and `SemanticSnapshotSource` for the drift fingerprint. `DexEngine.
+  semantic_catalog_source()` is the canonical accessor and
+  `semantic_catalog_format()` forwards to it. `maintain` now asks for the
+  snapshot *capability* rather than the project tier, so an Ossie-only
+  repository keeps its semantic baseline, and the reader satisfies none of
+  `ExploreProject`, `MaintainProject`, `EditableProject` or `PlacingProject`,
+  which is asserted rather than documented. `SEMANTIC_PROJECT_FORMATS` is
+  renamed `SEMANTIC_SOURCE_FACTORIES`; configuration keys, CLI commands,
+  envelope fields, and the stored snapshot schema are unchanged.
+
+- **A reviewed Ossie fixture corpus and a compatibility matrix, gated on the
+  pinned schema** ([#413]). `packages/dex-core/tests/ossie/fixtures/` holds
+  native documents a person can read plus a case manifest saying what each one
+  means: expected diagnostic rules and severities, whether each rule comes from
+  the pinned schema, upstream's integrity judgment or a dex restriction, and the
+  expected physical links, key tuples and relationship pairs. The expectations
+  are authored rather than captured, because a golden recorded from a run
+  asserts only that the implementation still does what it did.
+
+  `references/ossie-compatibility.md` states the same ground for a reader: what
+  is accepted, what is checked and at what severity, which expression dialect
+  dex reads, what links to a warehouse column and what deliberately does not,
+  and what dex does not claim (no converter interoperability, no execution
+  assurance, and a missing SQL check disclosed rather than passed). It names the
+  pin and the known deltas from upstream's current schema, including the
+  post-pin `THOUGHTSPOT` dialect, which is refused under this pin. An offline
+  test asserts that the loader constant, `PROVENANCE.md`, the corpus manifest
+  and the matrix carry the same hash, and that every claim in the matrix names a
+  case that exists.
+
+- **Shipped conformance contracts for a semantic source**
+  (`exmergo_dex_core.semantic_source_conformance`, under the existing
+  `[semantic-conformance]` extra) ([#413]). Four contracts covering
+  construction, declarations, the drift fingerprint, and the read catalog. The
+  assertions are extracted from the project contracts rather than copied, and
+  those contracts now compose them, so a project format and a semantic source
+  are held to one implementation of each shared rule. The runtime
+  `SemanticBackendContract` also gained descriptor-to-payload agreement, gap
+  declarations that name real fields and are not contradicted by the payload
+  they ship in, and shape checks on the declared-key and declared-relationship
+  channels.
+
 - **Native Ossie authoring plans are validated against cached exploration
   evidence before they are stored, with no warehouse connection opened**
   ([#412]). `semantic ossie define|update|plan` now checks each dataset's
@@ -49,13 +104,13 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   those protocols identify transformation projects, and the semantic-layer
   architecture requires Ossie to remain independent of that axis.
 
-- **Native Apache Ossie semantic models are readable, as a project format rather
-  than a set of vendor branches** ([#405], [#406], [#407]). `semantic.vendor:
-  ossie` beside a dbt project, or `project.format: ossie` for a repository with
-  no dbt project at all, reads native `.ossie.yaml` / `.ossie.yml` /
+- **Native Apache Ossie semantic models are readable, through the semantic axis
+  rather than a set of vendor branches** ([#405], [#406], [#407]).
+  `semantic.vendor: ossie` reads native `.ossie.yaml` / `.ossie.yml` /
   `.ossie.json` documents into the same catalog `explore semantic list` has
-  always returned. Neither arrangement involves MetricFlow, and neither format
-  imports the other's reader.
+  always returned, beside a dbt project or in a repository that has none.
+  Neither arrangement involves MetricFlow, and neither reader imports the
+  other's.
 
   Ossie is [entering ASF maturity](https://github.com/apache/ossie) and every one
   of its upstream converters converts *into* it from a vendor format, so this is
@@ -213,6 +268,17 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   succeeded.
 
 ### Fixed
+
+- **`transform apply` refused a native semantic plan on an install carrying only
+  `[ossie]`** ([#413]). The command router asserted the dialect engine before
+  dispatching every authoring verb, and `transform.commands` imported it
+  eagerly, so an install with a semantic reader and no connector extra could
+  author a plan it could never apply, which is the one command that install
+  exists to run. The two dialect-engine imports in `transform.commands` are now
+  reached at the point of use, and the router reads the stored plan's edit
+  target and asserts the dialect engine only for the plans that author SQL. It
+  fails toward asserting it, so an apply that cannot resolve a plan still
+  refuses with the message it always did.
 
 - **A composite relationship's Mermaid label named only the child-side columns,
   silently dropping the parent side.** ([#408]) `explore diagram`'s edge label

@@ -24,13 +24,29 @@ import exmergo_dex_core
 ROOT = Path(exmergo_dex_core.__file__).parent
 
 
-def imported_by(module: str) -> set[str]:
-    """Every dex module a fresh interpreter pulls in to import ``module``."""
+#: Third-party module prefixes worth naming when they arrive, alongside dex's
+#: own. The dex half catches a reader importing the other format's reader; this
+#: half catches the same mistake arriving one level down, through a library. A
+#: probe that only reported `exmergo_dex_core` modules would pass a change that
+#: imported `dbt.contracts` directly, which is the heavier dependency of the two.
+WATCHED_PREFIXES = ("exmergo_dex_core", "dbt", "metricflow", "sqlglot", "jsonschema")
+
+
+def imported_by(
+    module: str, *, prefixes: tuple[str, ...] = WATCHED_PREFIXES
+) -> set[str]:
+    """Every watched module a fresh interpreter pulls in to import ``module``.
+
+    A fresh interpreter, and the module graph rather than the import lines,
+    because an import that arrives transitively breaks a boundary exactly as
+    thoroughly as one written by hand and a grep cannot see it.
+    """
 
     probe = (
         f"import {module}; import sys;"
+        f"watched = {prefixes!r};"
         "print('\\n'.join(sorted("
-        "m for m in sys.modules if m.startswith('exmergo_dex_core'))))"
+        "m for m in sys.modules if m.startswith(watched))))"
     )
     out = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True
@@ -38,9 +54,20 @@ def imported_by(module: str) -> set[str]:
     return set(out.stdout.split())
 
 
+def top_level(modules: set[str]) -> set[str]:
+    """The distributions behind a set of module names, for a readable failure."""
+
+    return {name.split(".")[0] for name in modules}
+
+
 def test_ossie_imports_no_dbt_or_metricflow_reader():
     """Ossie is the portability blueprint for the next semantic integration, so
-    it must be readable without the format it is meant to be independent of."""
+    it must be readable without the format it is meant to be independent of.
+
+    Both levels: dex's own dbt and MetricFlow readers, and the third-party
+    libraries behind them. The second is the one a `[ossie]`-only install
+    actually cannot satisfy, since neither library is there to import.
+    """
 
     pulled = imported_by("exmergo_dex_core.ossie")
     forbidden = {
@@ -51,6 +78,7 @@ def test_ossie_imports_no_dbt_or_metricflow_reader():
     }
 
     assert not pulled & forbidden, sorted(pulled & forbidden)
+    assert not top_level(pulled) & {"dbt", "metricflow"}, sorted(pulled)
 
 
 def test_ossie_authoring_imports_no_transformation_reader():
@@ -65,13 +93,32 @@ def test_ossie_authoring_imports_no_transformation_reader():
     }
 
     assert not pulled & forbidden, sorted(pulled & forbidden)
+    assert not top_level(pulled) & {"dbt", "metricflow"}, sorted(pulled)
+
+
+def test_the_semantic_source_seam_pulls_in_no_reader_at_all():
+    """The seam every semantic source is constructed through has to be
+    importable without any of them.
+
+    It resolves a factory by dotted path, so importing it must not import what
+    it can resolve: a base install that eagerly loaded the Ossie reader to define
+    the seam would pull the schema validator that install does not have.
+    """
+
+    pulled = imported_by("exmergo_dex_core.semantic_source")
+
+    assert "exmergo_dex_core.ossie" not in pulled, sorted(pulled)
+    assert not top_level(pulled) - {"exmergo_dex_core"}, sorted(pulled)
 
 
 def test_the_dbt_reader_does_not_import_ossie():
     """The other direction, which is the one that would make an existing dbt
     deployment depend on a draft interchange schema."""
 
-    assert "exmergo_dex_core.ossie" not in imported_by("exmergo_dex_core.dbt_project")
+    pulled = imported_by("exmergo_dex_core.dbt_project")
+
+    assert "exmergo_dex_core.ossie" not in pulled, sorted(pulled)
+    assert "jsonschema" not in top_level(pulled), sorted(pulled)
 
 
 def test_the_tier_one_type_is_reachable_without_either_format():
@@ -140,11 +187,11 @@ def test_no_source_file_carries_a_blanket_line_length_suppression():
 
 @pytest.mark.parametrize("suffix", [".yaml", ".yml", ".json"])
 def test_every_documented_suffix_is_accepted(suffix, tmp_path: Path):
-    from exmergo_dex_core.adapters.project import ProjectContext
-    from exmergo_dex_core.ossie import OssieProject
+    from exmergo_dex_core.ossie import OssieSemanticLayer
+    from exmergo_dex_core.semantic_source import SemanticSourceContext
 
-    OssieProject.from_context(
-        ProjectContext(
+    OssieSemanticLayer.from_context(
+        SemanticSourceContext(
             repo_root=str(tmp_path),
             connector="duckdb",
             options={"files": [f"a.ossie{suffix}"]},

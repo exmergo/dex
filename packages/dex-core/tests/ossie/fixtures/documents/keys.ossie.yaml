@@ -1,0 +1,72 @@
+# Keys and relationships in the shapes that separate a real implementation from
+# one that special-cases the pair.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: grain
+    datasets:
+      # Three columns, because a pair cannot tell you what you came to find out:
+      # an implementation that special-cases the pair passes a two-column
+      # fixture and fails a four-column one.
+      - name: allocations
+        source: demo.main.allocations
+        primary_key: [order_id, line_no, warehouse_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: order_id}]
+          - name: line_no
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: line_no}]
+          - name: warehouse_id
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: warehouse_id}]
+      # A primary key beside two further independent unique keys: three separate
+      # claims about one relation, none of which implies another.
+      - name: customers
+        source: demo.main.customers
+        primary_key: [customer_id]
+        unique_keys:
+          - [email]
+          - [tenant_id, external_ref]
+        fields:
+          - name: customer_id
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: customer_id}]
+          - name: email
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: email}]
+          - name: tenant_id
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: tenant_id}]
+          - name: external_ref
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: external_ref}]
+      - name: orders
+        source: demo.main.orders
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: order_id}]
+          - name: buyer_ref
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: buyer_ref}]
+          - name: buyer_tenant
+            expression:
+              dialects: [{dialect: ANSI_SQL, expression: buyer_tenant}]
+    relationships:
+      # Differently named sides, which is the ordinary case rather than the
+      # exotic one: a mirrored fixture cannot detect an implementation that
+      # reads one side and copies it onto the other.
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [buyer_tenant, buyer_ref]
+        to_columns: [tenant_id, external_ref]
+      # Declaration order is the tuple order. Reversing it probes a different
+      # predicate than the author wrote.
+      - name: allocations_to_orders
+        from: allocations
+        to: orders
+        from_columns: [order_id]
+        to_columns: [order_id]

@@ -190,7 +190,7 @@ def load_documents(
 ) -> LoadResult:
     """Read, validate, and return every configured document.
 
-    Never raises for a bad document: a caller on the tier-1 channel may not
+    Never raises for a bad document: a caller on the declarations channel may not
     raise, and a caller on the catalog channel wants to decide for itself
     whether an error is fatal. The one thing that does raise is the missing
     extra, because that is a wiring problem rather than a document problem and no

@@ -12,15 +12,15 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.adapters.project import ProjectContext
-from exmergo_dex_core.ossie import OssieProject
+from exmergo_dex_core.ossie import OssieSemanticLayer
+from exmergo_dex_core.semantic_source import SemanticSourceContext
 
 from .conftest import dataset, document, expression, field, model, write
 
 
-def build(root: Path, *names: str, connector: str = "duckdb") -> OssieProject:
-    return OssieProject.from_context(
-        ProjectContext(
+def build(root: Path, *names: str, connector: str = "duckdb") -> OssieSemanticLayer:
+    return OssieSemanticLayer.from_context(
+        SemanticSourceContext(
             repo_root=str(root), connector=connector, options={"files": list(names)}
         )
     )
@@ -33,7 +33,7 @@ def catalog(repo: Path):
 
 @pytest.fixture
 def declared(repo: Path):
-    return build(repo, "commerce.ossie.yaml").definitions()
+    return build(repo, "commerce.ossie.yaml").declared_definitions()
 
 
 def dimension(catalog, name):
@@ -465,7 +465,7 @@ def test_relationship_columns_need_not_be_declared_fields(tmp_path: Path):
         ),
     )
 
-    declared = build(tmp_path, "undeclared.ossie.yaml").definitions()
+    declared = build(tmp_path, "undeclared.ossie.yaml").declared_definitions()
 
     assert declared.foreign_keys[0].column == "parent_fk"
 

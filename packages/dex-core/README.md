@@ -31,16 +31,23 @@ exmergo-dex-core[clickhouse]
 exmergo-dex-core[all]          # every optional capability at once
 ```
 
-Two capabilities sit behind their own extras rather than a connector's:
+Some capabilities sit behind their own extras rather than a connector's:
 `[semantic]` and `[semantic-api]` for the local and hosted semantic-layer query
-backends, and `[cluster]` for `explore cluster`. `[all]` covers all of these too.
+backends, `[ossie]` for reading native Apache Ossie semantic documents out of the
+repository, and `[cluster]` for `explore cluster`. `[all]` covers all of these
+too.
 
-`[semantic-api]` is the one extra that stands completely alone: dbt Cloud owns the
-warehouse connection and executes server-side, so a deployment that only queries a
-hosted semantic layer needs no connector, no dbt-core, and no SQL parser. Every
-other command validates SQL before running it, which is why the connector extras
-carry the dialect engine; run one without a connector installed and dex refuses
-with the install to use rather than guessing.
+Two of them stand alone, and for different reasons. `[semantic-api]` needs no
+connector, no dbt-core, and no SQL parser, because dbt Cloud owns the warehouse
+connection and executes server-side. `[ossie]` needs none of those either,
+because a native semantic layer is files in the repository: reading, validating,
+snapshotting, and authoring them all happen without a warehouse. Checking that an
+authored SQL expression parses is the one part that wants the dialect engine, and
+without it that check names itself as skipped rather than passing silently.
+
+Every command that generates or runs SQL validates it first, which is why the
+connector extras carry the dialect engine; run one without a connector installed
+and dex refuses with the install to use rather than guessing.
 
 ## First run, with nothing to point it at
 

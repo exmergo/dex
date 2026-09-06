@@ -130,7 +130,7 @@ def _declared(expression: object) -> dict[str, str]:
     """Every ``dialect -> expression`` pair, in the document's own order.
 
     Shape-guarded rather than trusting, because the catalog reads documents the
-    validator has already judged *and* the tier-1 declarations channel may not
+    validator has already judged *and* the declarations channel may not
     raise, so this has to survive being handed something malformed.
     """
 

@@ -505,19 +505,25 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     "ossie": ("local",),
 }
 
-#: The project format that answers a vendor's semantic catalog, where the vendor
-#: is not the project itself. A table rather than a branch, and this is the
-#: mechanism that lets `semantic.vendor: ossie` sit beside `project.format: dbt`
-#: without any command learning a vendor name: the engine builds the named format
-#: and injects it, and the backend reads a catalog through the same seam it
-#: always did. `dbt` is absent because the configured project format already
-#: answers for it.
+#: The factory that builds a vendor's own semantic source, for the vendors whose
+#: layer is not the transformation project. A table rather than a branch, and
+#: this is the mechanism that lets `semantic.vendor: ossie` sit beside
+#: `project.format: dbt` without any command learning a vendor name: the engine
+#: builds the named source and injects it, and every reader downstream asks for a
+#: catalog through the same seam it always did. `dbt` is absent because the
+#: configured project already answers for it.
 #:
-#: A vendor listed here reads its format's coordinates from the `SemanticConfig`
-#: field named after the vendor (`semantic.ossie` for `ossie`), which is passed
-#: through to the format as its options verbatim. That convention is what keeps
-#: the engine from growing a per-vendor coordinate reader.
-SEMANTIC_PROJECT_FORMATS: dict[str, str] = {
+#: The value is a dotted `module:callable` path resolved through
+#: :mod:`.semantic_source`, which checks that what comes back can answer a
+#: catalog. It deliberately does not go through the project resolver: a semantic
+#: source owns no model graph and no write surface, so holding it to the project
+#: tiers would make it claim capabilities it does not have.
+#:
+#: A vendor listed here reads its coordinates from the `SemanticConfig` field
+#: named after the vendor (`semantic.ossie` for `ossie`), which is passed through
+#: as the source's options verbatim. That convention is what keeps the engine
+#: from growing a per-vendor coordinate reader.
+SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
     "ossie": "exmergo_dex_core.ossie.project:build_semantic_layer"
 }
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
@@ -693,15 +699,15 @@ class SemanticConfig(BaseModel):
 
 
 def _vendor_sections(semantic: SemanticConfig) -> list[tuple[str, Any]]:
-    """Every ``(vendor, its config section)`` pair a project format reads.
+    """Every ``(vendor, its config section)`` pair a semantic source reads.
 
     The section is the `SemanticConfig` field named after the vendor, which is
-    the convention `SEMANTIC_PROJECT_FORMATS` documents and the engine relies on
-    when it passes a section through as a format's options.
+    the convention `SEMANTIC_SOURCE_FACTORIES` documents and the engine relies on
+    when it passes a section through as a source's options.
     """
 
     pairs = []
-    for named in SEMANTIC_PROJECT_FORMATS:
+    for named in SEMANTIC_SOURCE_FACTORIES:
         section = getattr(semantic, named, None)
         if section is not None:
             pairs.append((named, section))

@@ -41,9 +41,16 @@ ignore = ["UP042"]
 # The semantic edit-target conformance contract also ships for reuse and uses
 # pytest assertions for the same reason (S101).
 "packages/dex-core/src/exmergo_dex_core/edits_conformance.py" = ["S101"]
-# The semantic-backend conformance contract, third of the three, same reason and
-# same idiom (S101).
+# The semantic-backend conformance contract, same reason and same idiom (S101).
 "packages/dex-core/src/exmergo_dex_core/explore/semantic/conformance.py" = ["S101"]
+# The semantic-source conformance contract, same again. B017 rides along because
+# one assertion is that construction refuses an unknown option *somehow*: which
+# exception type a source raises is its own business, and pinning one here would
+# make the contract dictate an implementation detail it has no view on.
+"packages/dex-core/src/exmergo_dex_core/semantic_source_conformance.py" = [
+  "S101",
+  "B017",
+]
 # The skill wrappers shell out to the pinned dex CLI by design; the command is
 # a fixed path plus an argv passthrough, not untrusted input (S603). The engine
 # is reached by exec rather than a spawn, so the wrapper does not sit waiting on

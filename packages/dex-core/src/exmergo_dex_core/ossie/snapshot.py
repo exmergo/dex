@@ -1,11 +1,19 @@
-"""Ossie's own tier-2 fingerprint: the maintain snapshot channel (#409).
+"""Ossie's own drift fingerprint: the maintain snapshot channel.
 
-Builds the same format-neutral shapes `maintain.snapshot` defines for dbt
-(`TransformLayer`, `SemanticLayerSnapshot`), from Ossie's own validated
-documents. This module never imports `dbt_project` or anything MetricFlow
-shaped, and `maintain.snapshot` never imports this one: the two formats read
-their own sources into one shared shape rather than one depending on the
-other's reader.
+Builds the same neutral shape `maintain.snapshot` defines for dbt
+(`SemanticLayerSnapshot`) from Ossie's own validated documents. This module
+never imports `dbt_project` or anything MetricFlow shaped, and
+`maintain.snapshot` never imports this one: the two read their own sources into
+one shared shape rather than one depending on the other's reader.
+
+There is no `transform_layer` counterpart here, and its absence is deliberate.
+Ossie declares no build step, so a transform baseline would be a baseline of
+nothing: a dataset's source is already the physical relation its semantic model
+records, not a name a transformation project resolves later the way a dbt
+`ref()`/`source()` does. A repository with dbt beside Ossie gets its transform
+layer from dbt; one without gets none, which is the honest answer rather than a
+set of empty collections that read as "this source has none of these to
+declare".
 
 Reuses `catalog.py`'s column-resolution and relationship-resolution helpers
 rather than re-deriving them, so a field's link to a physical column, and a
@@ -17,7 +25,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 from typing import Any
 
 from ..maintain.snapshot import (
@@ -25,7 +32,6 @@ from ..maintain.snapshot import (
     RelationshipDef,
     SemanticLayerSnapshot,
     SemanticModelDef,
-    TransformLayer,
 )
 from ..project_definitions import DeclaredRelationship
 from . import catalog as catalog_mod
@@ -34,46 +40,14 @@ from .loader import LoadResult
 
 def _content_hash(text: str) -> str:
     """A definition's fingerprint. Deliberately not `dbt_project.content_hash`:
-    importing a one-line sha256 wrapper across the format boundary would still
-    be a dependency on the dbt module, which #409's own constraint refuses."""
+    importing a one-line sha256 wrapper across the boundary would still be a
+    dependency on the dbt module, which the independence constraint refuses."""
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _definition_hash(entry: Any) -> str:
     return _content_hash(json.dumps(entry, sort_keys=True, default=str))
-
-
-def transform_layer(repo_root: Path, files: list[str]) -> TransformLayer:
-    """The document set's own fingerprint: file hashes and nothing else.
-
-    ``models``, ``model_paths``, ``sources``, ``model_sources``, and
-    ``model_refs`` all stay empty: Ossie documents declare no build step, and
-    a dataset's source is already the physical relation its semantic model
-    records on ``SemanticModelDef.relation`` (#409), not a name a
-    transformation project resolves later the way a dbt ``ref()``/``source()``
-    does. The note says this once here rather than leaving five empty
-    collections to be misread as "this format has none of these to declare".
-    """
-
-    hashed: dict[str, str] = {}
-    for name in files:
-        try:
-            hashed[name] = _content_hash((repo_root / name).read_text(encoding="utf-8"))
-        except OSError:
-            # Absent or unreadable: declared_definitions()/semantic_layer()
-            # already carry the diagnostic naming this file, so a missing
-            # hash here is that same fact, not a second one to explain.
-            continue
-    return TransformLayer(
-        files=hashed,
-        notes=[
-            "native Ossie documents declare no build step, so `models` and "
-            "`model_refs` stay empty: a dataset's source is already the "
-            "physical relation its semantic model records, not a name a "
-            "transformation project resolves later"
-        ],
-    )
 
 
 def semantic_layer(

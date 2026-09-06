@@ -1,0 +1,36 @@
+# The baseline half of the drift pair. Its `after` twin changes a definition,
+# drops a key column, and breaks a relationship endpoint, so one comparison
+# exercises three drift classes against one baseline.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: drift
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        primary_key: [order_id, tenant_id]
+        fields:
+          - name: order_id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: order_id}]}
+          - name: tenant_id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: tenant_id}]}
+          - name: net_total
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_total - discount
+      - name: customers
+        source: demo.main.customers
+        primary_key: [customer_id]
+        fields:
+          - name: customer_id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: customer_id}]}
+    relationships:
+      - name: orders_to_customers
+        from: orders
+        to: customers
+        from_columns: [order_id]
+        to_columns: [customer_id]
+    metrics:
+      - name: revenue
+        expression:
+          dialects: [{dialect: ANSI_SQL, expression: SUM(orders.net_total)}]

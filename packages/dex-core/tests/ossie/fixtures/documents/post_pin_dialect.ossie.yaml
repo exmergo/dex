@@ -1,0 +1,16 @@
+# THOUGHTSPOT was added upstream after the schema dex pins, so under this pin it
+# is not a member of the enum and the document is refused. Recorded as a known
+# delta rather than accommodated: accepting a token the pinned schema does not
+# define would make the pin decorative.
+version: "0.2.0.dev0"
+semantic_model:
+  - name: post_pin
+    datasets:
+      - name: orders
+        source: demo.main.orders
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: THOUGHTSPOT
+                  expression: order_id

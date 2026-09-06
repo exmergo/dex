@@ -639,7 +639,8 @@ never told. The documents are named in `semantic.ossie.files`, including for an
 Ossie-only repository. They are confined to the repository, and selecting Ossie
 without the `[ossie]` extra refuses and names it. dex pins the Ossie schema by
 content hash rather than by the version string the document carries. See
-`references/semantic-layer.md`.
+`references/semantic-layer.md`, and `references/ossie-compatibility.md` for what
+dex accepts, checks, links, and declines to claim under that pin.
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than

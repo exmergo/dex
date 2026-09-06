@@ -1,0 +1,29 @@
+version: "0.2.0.dev0"
+semantic_model:
+  - name: drift
+    datasets:
+      - name: orders
+        # The key lost a column: a two-column grain is now a one-column claim.
+        source: demo.main.orders
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: order_id}]}
+          - name: tenant_id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: tenant_id}]}
+          # The definition changed: the discount is no longer subtracted.
+          - name: net_total
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_total
+      - name: customers
+        source: demo.main.customers
+        primary_key: [customer_id]
+        fields:
+          - name: customer_id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: customer_id}]}
+    metrics:
+      - name: revenue
+        expression:
+          dialects: [{dialect: ANSI_SQL, expression: SUM(orders.net_total)}]
