@@ -63,6 +63,7 @@ from . import (
     EXECUTION_VENDOR,
     SemanticQueryRefusedError,
 )
+from .backend import descriptor_from_backend
 
 __all__ = [
     "REFERENCE_LAYER",
@@ -558,6 +559,168 @@ class SemanticBackendContract:
         for axis in ("backend", "vendor", "deployment", "execution"):
             assert payload[axis], f"{axis} is empty in the payload"
 
+    def test_the_descriptor_and_the_payload_say_the_same_thing(self) -> None:
+        """The descriptor is what a resolver reads before a catalog exists, and
+        the payload is what a caller reads after. A backend where the two
+        disagree reports one provenance to the machinery that selects it and a
+        different one to the person reading the answer, and only the second one
+        is ever looked at again.
+
+        ``catalog_gaps`` is the field this matters most for: it is declared once
+        on the descriptor and consumed off the catalog, so a gap that reaches one
+        and not the other is a structural absence a caller is never told about.
+        """
+
+        backend = self.make_backend()
+        descriptor = descriptor_from_backend(backend)
+        catalog = backend.list_definitions()
+        payload = catalog.to_data()
+
+        assert payload["backend"] == descriptor.name
+        assert payload["vendor"] == descriptor.vendor
+        assert payload["deployment"] == descriptor.deployment
+        assert payload["execution"] == descriptor.execution
+
+        declared = {k: sorted(v) for k, v in (descriptor.catalog_gaps or {}).items()}
+        reported = {k: sorted(v) for k, v in (catalog.unavailable or {}).items() if v}
+        assert reported == {k: v for k, v in declared.items() if v}, (
+            "the gaps the descriptor declares and the gaps the catalog reports "
+            f"disagree: descriptor {declared}, catalog {reported}. A caller reads "
+            "the catalog, so a gap that lives only on the descriptor is one "
+            "nobody is told about"
+        )
+
+    def test_a_declared_gap_names_a_real_field_of_a_real_element_kind(self) -> None:
+        """A misspelled gap is worse than none.
+
+        It reads as a declaration a consumer can branch on and matches nothing it
+        will ever look for, so the field it was meant to cover goes back to being
+        an unexplained absence. Layer-independent, unlike the reference-layer
+        assertions in :class:`SemanticCatalogContract`: this asks only that a
+        declaration name something real.
+        """
+
+        catalog = self.make_backend().list_definitions()
+
+        for kind, gaps in (catalog.unavailable or {}).items():
+            assert kind in _DECLARED_FIELDS, (
+                f"catalog_gaps names element kind {kind!r}, which is not one of "
+                f"{', '.join(sorted(_DECLARED_FIELDS))}"
+            )
+            for field_name in gaps:
+                assert field_name in declared_fields(kind), (
+                    f"catalog_gaps declares {kind}.{field_name}, which is not a "
+                    f"field of a {kind} element, so nothing can check it"
+                )
+
+    def test_a_declared_gap_is_not_a_field_the_backend_populates_anyway(self) -> None:
+        """The other direction, and the more expensive one to get wrong.
+
+        A gap says "this format has nowhere to put this". A caller that reads it
+        stops looking, so declaring one for a field the backend does fill hides
+        real data behind a claim that it cannot exist. Checked against the
+        backend's own layer rather than a reference one, which is what makes it
+        applicable to a format the reference layer cannot describe.
+
+        **Content, not presence.** A field named as a gap still holds its type's
+        neutral value in the payload, because a dataclass has to hold something,
+        and an empty list there is the absence the gap already explained rather
+        than a second claim. What fails is a gap over a field carrying actual
+        content, which is the case where the declaration and the data disagree.
+        Note the asymmetry with the forward assertion in
+        :class:`SemanticCatalogContract`, which treats an empty list as an
+        answer: there the question is whether a backend *stayed silent*, and
+        `[]` is a stated fact ("no queryable grain"); here the question is
+        whether it *contradicted itself*, and `[]` contradicts nothing.
+        """
+
+        catalog = self.make_backend().list_definitions()
+        elements = {
+            "semantic_models": catalog.semantic_models,
+            "metrics": catalog.metrics,
+            "dimensions": catalog.dimensions,
+            "entities": catalog.entities,
+            "measures": catalog.measures,
+        }
+
+        contradicted = sorted(
+            {
+                f"{kind}.{field_name}"
+                for kind, gaps in (catalog.unavailable or {}).items()
+                for field_name in gaps
+                if any(
+                    getattr(element, field_name, None)
+                    for element in elements.get(kind, ())
+                )
+            }
+        )
+
+        assert not contradicted, (
+            "these fields are declared unavailable and carry content anyway, so a "
+            "caller is told data cannot exist while it sits in the same payload: "
+            f"{', '.join(contradicted)}"
+        )
+
+    # --- the declaration channels, which feed grain and relationships ---------
+
+    def test_declared_relationships_carry_complete_ordered_pairs(self) -> None:
+        """Declared joins reach the relationship channel at confidence 1.0, so a
+        half-read one is acted on rather than ignored.
+
+        A composite join is atomic: every ordered pair or none. A backend that
+        returned the pairs as two unpaired lists, or dropped the far side of one,
+        would have the verifier probe a predicate the author never wrote and
+        report the mismatch as a data problem.
+
+        A backend with no relationship channel answers empty, which is a fact
+        about the format and passes here without inventing one.
+        """
+
+        declared = self.make_backend().declared_relationships()
+
+        assert isinstance(declared, list)
+        for relationship in declared:
+            assert relationship.model and relationship.to_model, (
+                f"a declared relationship names no endpoint: {relationship!r}"
+            )
+            assert relationship.column_pairs, (
+                f"declared relationship {relationship!r} carries no column pairs, "
+                "so nothing can be probed and nothing can be drawn"
+            )
+            for pair in relationship.column_pairs:
+                assert len(pair) == 2 and all(pair), (
+                    f"a column pair of {relationship!r} is incomplete: {pair!r}. "
+                    "The far side is a column the target may not even have"
+                )
+            assert relationship.source, (
+                f"declared relationship {relationship!r} names no source, so a "
+                "conflict between two declarations cannot say who said what"
+            )
+
+    def test_declared_keys_keep_single_and_composite_grains_apart(self) -> None:
+        """Two lists, because the claims are different strengths.
+
+        A single key says one column is unique on its own; a composite key says a
+        combination is, and none of its members are. Collapsing a composite into
+        several single keys makes the grain axis verify combinations the layer
+        never declared, and reconcile propose ``unique`` tests on columns that are
+        not.
+        """
+
+        keys, composite = self.make_backend().declared_keys()
+
+        assert isinstance(keys, list)
+        assert isinstance(composite, list)
+        for key in keys:
+            assert key.model and key.column and key.source
+        for key in composite:
+            assert key.model and key.source
+            assert len(key.columns) > 1, (
+                f"composite key {key!r} carries {len(key.columns)} column(s). A "
+                "one-column grain is a single key: putting it here says a "
+                "combination is unique where the layer claimed a column is"
+            )
+
     def test_a_catalog_names_its_own_provenance_not_the_instance(self) -> None:
         """``name`` identifies the backend, so two instances agree on it.
 
@@ -966,27 +1129,6 @@ class SemanticCatalogContract:
             "element, and named in no catalog gap, so a caller cannot tell a "
             f"structural absence from an undeclared field: {', '.join(undeclared)}"
         )
-
-    def test_a_declared_gap_is_a_field_the_catalog_could_have_carried(self) -> None:
-        """The reverse direction: a gap names a real field of a real element kind.
-
-        A misspelled gap is worse than none. It reads as a declaration a consumer
-        can branch on and matches nothing it will ever look for, so the field it
-        was meant to cover goes back to being an unexplained absence.
-        """
-
-        catalog = self.make_reference_backend().list_definitions()
-
-        for kind, gaps in catalog.unavailable.items():
-            assert kind in _DECLARED_FIELDS, (
-                f"catalog_gaps names element kind {kind!r}, which is not one of "
-                f"{', '.join(sorted(_DECLARED_FIELDS))}"
-            )
-            for field_name in gaps:
-                assert field_name in declared_fields(kind), (
-                    f"catalog_gaps declares {kind}.{field_name}, which the "
-                    "reference layer does not declare, so nothing can check it"
-                )
 
     def test_the_shared_entity_carries_a_declaration_per_model_with_its_own_key(
         self,
