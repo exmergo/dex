@@ -16,13 +16,20 @@ satisfy, and what dex promises to do with it.
 One reason, and it is a real one: your models are not a dbt project.
 
 A host that builds its transformation graph in something else (an orchestrator's
-asset graph, SQLMesh, a semantic layer that owns its own definitions) still has
-everything dex needs to be useful. It knows which tables it builds, at what grain,
-and how they relate. What it does not have is a `dbt_project.yml`, and generating a
-fake one to satisfy dex means maintaining a translation nobody reads and dex cannot
-check.
+asset graph, SQLMesh) still has everything dex needs to be useful. It knows which
+tables it builds, at what grain, and how they relate. What it does not have is a
+`dbt_project.yml`, and generating a fake one to satisfy dex means maintaining a
+translation nobody reads and dex cannot check.
 
 The seam exists so that translation can be code you own instead.
+
+**A semantic layer that owns its own definitions is not one of these**, and
+writing it as a project format is the wrong shape. It builds nothing, so it has
+no model graph to fingerprint and no relation it could claim to own. It belongs
+on the semantic axis instead, as a semantic source with its own contracts. That
+distinction is spelled out under
+[the two protocols beside the tiers](#the-three-tiers) further down, and in full
+in [`semantic-layer.md`](semantic-layer.md).
 
 ## The three tiers
 

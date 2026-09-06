@@ -7,8 +7,11 @@ through one stable command contract.
 
 Dex is the agent-native analytics engineering toolkit: explore an unfamiliar
 warehouse, transform raw data into clean dbt models and a semantic layer on top,
-and maintain all of it as the data underneath changes. Read-only against your data;
-every change is a reviewable diff.
+and maintain all of it as the data underneath changes. The semantic layer is a
+separate axis from the transformation project, so it can be dbt's own, a hosted
+dbt Cloud deployment, or native Apache Ossie documents in a repository with no
+dbt project at all. Read-only against your data; every change is a reviewable
+diff.
 
 ## Install
 
@@ -220,6 +223,18 @@ exception, stated so it is never overclaimed: `explore semantic query --local`
 renders through MetricFlow, which ships no ClickHouse renderer, so that one
 capability refuses on ClickHouse by name rather than running.
 
+The semantic axis carries a second and larger set of named refusals, and they are
+a property of a format rather than an unfinished path. A native Apache Ossie
+layer is catalog-first: `explore semantic list` answers on every connector, while
+`explore semantic query`, `explore semantic values`, and
+`explore semantic list --for-dimension` refuse by name, because Ossie specifies
+interchange metadata and no portable query runtime, and states no
+metric-to-dimension relationship to invert. `--api` refuses too, since Ossie has
+no hosted deployment. Each refusal names the governed alternative rather than
+leaving the caller stuck, and the catalog declares what the format structurally
+cannot carry (no measures, no entities, no metric groupability) instead of
+returning empty fields a caller would read as facts about the layer.
+
 ### Commands
 
 `demo`: generates a seeded local DuckDB warehouse and wires it up, so a first run
@@ -242,7 +257,7 @@ one. It starts bare by default; with `--use-project` it reads an existing
 dbt project, promoting declared `relationships` joins, honoring declared grain
 and `unique` tests, and letting metric-backing models surface first in the
 ranking. A repeatable `--scope` narrows the source scope per command without
-writing back to `.dex/config.yml`. It also reads and queries the dbt semantic layer
+writing back to `.dex/config.yml`. It also reads and queries the semantic layer
 (`explore semantic list` / `values` / `query`). `list` returns the layer's objects,
 semantic models and metrics and their composition and measures and dimensions and
 the declared entity graph, in one shape from either backend, scopeable to the
@@ -261,15 +276,29 @@ value domain, which is what you need before writing a filter and the only way to
 reach it at all on a hosted layer. Metric queries run either locally
 through MetricFlow and dex's own cost handshake (`--local`), or against a hosted dbt
 Cloud deployment (`--api`), where dbt Cloud executes server-side and every result
-warns that dex's cost guard does not apply there.
+warns that dex's cost guard does not apply there. A native Apache Ossie layer
+answers `list` the same way and refuses the two query verbs, and its declarations
+reach `--use-project` through the same channels a dbt project's do: source
+annotations on the map, declared keys including a composite grain, and declared
+relationships whose ordered column pairs stay whole through the diagram and
+through `--verify`, which measures a composite as one complete tuple and never
+one column at a time.
 
 `transform`: bootstraps a dbt project where none exists (`transform init`, with an
 explicit connector, never a default), turns agent-authored edits and
 deterministic staging scaffolds into reviewable, conflict-checked diffs
 (`transform plan` / `apply`, with human edits authoritative on conflict), runs
 gated dev-target-only builds with cost surfaced before any spend
-(`transform build`), and authors the semantic layer as MetricFlow-validated dbt
-semantic models (`semantic define|update|plan`, applied with `transform apply`).
+(`transform build`), and authors the semantic layer, either as
+MetricFlow-validated dbt semantic models
+(`semantic define|update|plan`, applied with `transform apply`) or as whole
+native Apache Ossie documents (`semantic ossie define|update|plan`, applied the
+same way). The native route is validated against the pinned Ossie schema, its own
+integrity rules, and expression syntax, and then against the exploration cache
+without opening a connection, so a reference the cache contradicts refuses and
+stores no plan while anything the cache cannot speak to is a named note. Accepted
+bytes are written exactly as authored, comments and formatting included, and only
+to the exact documents the semantic axis declares.
 It also answers, and then acts on, "where is this used": `transform references`
 reports every use of a name across model SQL, `schema.yml`, `dbt_project.yml`,
 macros, semantic YAML, seed headers and installed packages, jinja-aware and honest
@@ -288,7 +317,13 @@ proposes reviewable diffs tagged mechanical or advisory, applied through
 `transform apply`. Detection is read-only on every connector; on billed
 connectors the metadata axes (schema, volume, references) stay free while the
 scanning axes (grain, dimension cardinality) take the `--confirm --budget`
-handshake, so `check` is two-phase.
+handshake, so `check` is two-phase. The transformation project and the semantic
+layer are fingerprinted independently, so a repository with a semantic layer and
+no dbt project still gets a baseline and still runs every free axis; a native
+semantic layer contributes its definitions, its declared keys, and its
+relationships with every ordered column pair, and whether that side was captured
+is itself recorded, so a baseline written before it reports the relationship axis
+as unchecked rather than as clean.
 
 ### Connectors
 

@@ -325,6 +325,17 @@ ClickHouse renderer. This is declared as an inert capability with a named refusa
 listing the connectors that do work, rather than degrading to another dialect's
 renderer, which would produce SQL that runs and returns wrong numbers.
 
+A native Apache Ossie layer behaves differently here than on a three-part
+connector, and both differences are worth knowing before writing a document
+against ClickHouse. Ossie's dialect enum has no ClickHouse token, so expressions
+are read in the portable `ANSI_SQL` dialect rather than in something close, which
+is the correct answer and not a fallback to guess about. And a dataset source
+links to a relation only when this connector accepts the whole source as one
+identifier, which here means two parts (`database.table`) rather than three: a
+document written as `database.schema.table` reads cleanly and links to nothing on
+ClickHouse while linking on DuckDB. See
+[Apache Ossie compatibility](ossie-compatibility.md).
+
 ## Testing
 
 Offline, deterministic, and free: `tests/fakes/clickhouse.py` is a stateful fake

@@ -596,9 +596,11 @@ class SemanticConfig(BaseModel):
     specifies an interchange document rather than a service to reach.
 
     ``ossie.files`` names those documents, relative to the repository root, and
-    is required with ``vendor: ossie`` and refused without it. It is the
-    This remains true for a repository with no dbt project: Ossie is configured
-    on the semantic axis and supplies the semantic catalog only.
+    is required with ``vendor: ossie`` and refused without it. It is the whole
+    of the layer's coordinates: there is no discovery step and no glob, because
+    a document dex was not told to read is a document nobody reviewed. This
+    remains true for a repository with no dbt project: Ossie is configured on
+    the semantic axis and supplies the semantic catalog only.
 
     A third property, **who executes**, is derived from those two and never
     configured, because it is what decides whether the cost guard can apply at

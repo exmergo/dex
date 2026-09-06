@@ -4,8 +4,11 @@ dex connects to data warehouses, discovers credentials, and writes to your
 repository, so security is a first-class concern and several guarantees are
 enforced in the engine itself: read-only against your data, writes confined to
 reviewable diffs, dev-target-only builds, cost surfaced before any spend, and
-credentials and raw rows kept out of agent context. If you find a way to violate
-any of these, we want to hear about it.
+credentials and raw rows kept out of agent context. Repository confinement runs
+in both directions: a path dex reads a semantic-layer document from, and a path
+it writes one to, must resolve inside the repository, so an absolute path, a `..`
+that walks out, and a symlink resolving out are each refused rather than
+followed. If you find a way to violate any of these, we want to hear about it.
 
 ## Reporting a vulnerability
 
