@@ -1,6 +1,6 @@
 ---
 name: transform
-description: 'Use this to author and change a dbt project: bootstrap a project in a repo that has none (`transform init`), write or refactor model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer (dbt semantic models / MetricFlow: entities, dimensions, measures, metrics). Reach for this rather than editing model files by hand whenever the change spans more than one file or has to stay consistent with the rest of the project: it validates the edit against the real schema before writing, returns the change as a reviewable diff with a plan id, and catches the class of error that only surfaces at `dbt run`, such as wrong column names, broken refs, or a materialization that fights the project config. On a large project that check is worth more than the round trip costs. It applies to bug-fix tickets too: "this model returns wrong numbers, fix it" is a transform task. Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", or "add a dimension to this entity". Any warehouse build is dev-target only, gated, and cost-surfaced first. If you do not yet know the source tables'' columns or grain, use explore first, then come back. To reconcile a project that has drifted out of sync with the warehouse, use maintain.'
+description: 'Use this to author and change a dbt project or a semantic layer: bootstrap a project in a repo that has none (`transform init`), write or refactor model SQL from staging to marts, add tests and docs in schema.yml, manage dependencies, and define or update the semantic layer, whether that is dbt semantic models (MetricFlow: entities, dimensions, measures, metrics) or native Apache Ossie documents in a repo with no dbt project at all. Reach for this rather than editing model files by hand whenever the change spans more than one file or has to stay consistent with the rest of the project: it validates the edit against the real schema before writing, returns the change as a reviewable diff with a plan id, and catches the class of error that only surfaces at `dbt run`, such as wrong column names, broken refs, or a materialization that fights the project config. On a large project that check is worth more than the round trip costs. It applies to bug-fix tickets too: "this model returns wrong numbers, fix it" is a transform task. Trigger it for requests like "set up a dbt project in this repo", "build a staging model for this table", "refactor this model", "add tests to this model", "create a mart for X", "define a revenue metric", "add a dimension to this entity", "add a metric to my Ossie semantic model", or "update semantics/commerce.ossie.yaml". Any warehouse build is dev-target only, gated, and cost-surfaced first. If you do not yet know the source tables'' columns or grain, use explore first, then come back. To reconcile a project that has drifted out of sync with the warehouse, use maintain.'
 ---
 
 # Transform
@@ -461,6 +461,38 @@ database, which is fine for model-only builds.
   validates the complete prospective configured layer, and writes the accepted
   bytes exactly when the plan is later applied. This is a semantic-layer write
   surface and does not make Ossie the transformation project.
+
+  The namespace guards match the dbt ones: `define` refuses a semantic-model name
+  the layer already has, `update` refuses one it does not, and `plan` accepts
+  both and reports each under `defined` or `updated`. Neither removes a model, and
+  a configured file may be absent before `define`, so a new document is planned
+  once its path is committed to config.
+
+  What validates an Ossie plan is not what validates a dbt one, and the
+  difference matters. There is no external parser to gate on: dex checks the
+  document's structure against the Ossie schema it pins (needs `[ossie]`), its
+  internal consistency in pure Python, and each SQL expression's syntax through
+  the dialect engine (needs `[sql]`, which every connector extra carries).
+  Without `[sql]` the third layer degrades to a named skipped-validation note,
+  never to a silent pass. All three run over the complete prospective layer, your
+  edits overlaid on the other configured documents, before a plan is stored.
+
+  It then checks the references against the exploration cache, opening no
+  connection. A source relation the cached inventory positively lacks, or a
+  column absent from a relation the cache profiled, refuses and stores no plan.
+  Anything the cache cannot speak to is a named note instead: an unprofiled
+  relation, a computed or non-SQL expression, a quoted identifier, a query-backed
+  source. Read those notes rather than treating them as failures; they say what
+  was not checked.
+
+  Accepted bytes are written exactly as authored on apply. dex does not parse and
+  re-serialize the document, so comments, key order, quoting and whitespace all
+  survive, and a configured document the payload did not mention is untouched. A
+  target file that changed after planning refuses the whole apply rather than
+  writing part of it, unless you confirm the overwrite deliberately.
+
+  `references/ossie-walkthrough.md` in the engine repository runs the whole
+  sequence on a local warehouse if you want to see it end to end.
 - dbt cannot parse semantic models in a project without a MetricFlow **time
   spine**; the engine warns when one is missing and defers the parse gate until
   one exists. Author it like any other model (a day-grain date model plus YAML
@@ -470,16 +502,18 @@ database, which is fine for model-only builds.
 
 ## Guardrails (enforced in the engine, not here)
 
-- Writes confined to the repo, and within it to the dbt project's authored path
-  families (models, macros, snapshots, seeds, tests, analyses) plus the
-  project-root manifests dbt keeps there. dex never writes to source warehouse
-  data.
+- Writes confined to the repo, and within it to two disjoint surfaces: the dbt
+  project's authored path families (models, macros, snapshots, seeds, tests,
+  analyses) plus the project-root manifests dbt keeps there, and the exact
+  native semantic documents named in `semantic.ossie.files`. Neither surface can
+  reach the other, an absolute path or a `..` escape is refused on both, and dex
+  never writes to source warehouse data.
 - Dev-target only. Prod-target execution is never initiated by dex.
 - Cost surfaced before any spend. A build that would spend requires explicit
   confirmation and a session budget.
-- Propose, don't impose. Human edits to dbt (SQL and semantic YAML) are
-  authoritative; on conflict the engine surfaces a diff and asks rather than
-  overwriting.
+- Propose, don't impose. Human edits to the project (SQL and semantic YAML) and
+  to a native semantic document are authoritative; on conflict the engine
+  surfaces a diff and asks rather than overwriting.
 - PII flags propagate from the cache into emitted dbt (model and column `meta`),
   never example values. Stamping is presence-based at any confidence; only a
   column cleared by a human `pii_overrides` entry in `.dex/config.yml` is

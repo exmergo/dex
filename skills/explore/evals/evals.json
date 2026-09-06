@@ -21,7 +21,8 @@
       "Build a mart that scores each customer for churn risk. Source data: int_sales__orders_enriched. Explore to understand available columns.",
       "Fix the rpt_customer_metrics.sql model. It produces inf and NaN values in calculated columns and does not exclude NULL customer_id. The model reads from int_sales__orders_enriched.",
       "Create models/marts/customer_cohorts.sql showing monthly retention by acquisition cohort. Use the orders and customers source tables.",
-      "The finance team says fct_daily_revenue is double counting refunds since the SAP migration. Find the cause and fix it."
+      "The finance team says fct_daily_revenue is double counting refunds since the SAP migration. Find the cause and fix it.",
+      "What metrics does this repo's semantic layer define, and what tables are behind them?"
     ],
     "negative": [
       "Set up a dbt project in this repo.",
@@ -31,7 +32,8 @@
       "Build models/marts/basket_composition.sql. Source: ORDERS (order_id VARCHAR, customer_id VARCHAR, ordered_at TIMESTAMP, grand_total DECIMAL, status VARCHAR) and ORDER_LINES (line_id VARCHAR, order_id VARCHAR, sku VARCHAR, qty INTEGER, unit_price DECIMAL). Group baskets by size band and report average margin per band.",
       "Rename the column cust_id to customer_id across models/staging/sap/, about 30 files, and keep the yml docs in sync.",
       "The CI job fails on dbt parse after I merged main. Jinja compilation error in macros/cents_to_dollars.sql, undefined variable. Fix the macro.",
-      "Bump dbt-core to 1.10 in requirements.txt and fix the deprecation warnings in dbt_project.yml."
+      "Bump dbt-core to 1.10 in requirements.txt and fix the deprecation warnings in dbt_project.yml.",
+      "Add a revenue metric to my Ossie semantic model."
     ]
   },
   "evals": [

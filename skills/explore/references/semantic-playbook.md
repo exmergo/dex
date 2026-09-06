@@ -41,7 +41,9 @@ Before concluding anything about the layer, read four payload fields:
   into `--group-by`. `declarations` means the list is the single-hop declared view
   and a query can group by more than it names, which is what `--local` reports
   without the `[semantic]` extra. Two backends reporting different dimension
-  counts for one layer is this field, not a bug.
+  counts for one layer is this field, not a bug. A native Ossie layer always
+  reports `declarations`, because the format states no join graph to resolve
+  through.
 - `unavailable`. Fields the answering backend structurally cannot supply. An
   absent `label` here means "this path cannot carry one", not "the project
   declared none", and the difference decides whether looking elsewhere is worth
@@ -167,6 +169,9 @@ statement it could price or cap, so the result carries an explicit warning that
 spend is governed there. Do not present a hosted result as cost-guarded, and do
 not treat the absence of an estimate as "it was free".
 
-`list` and the catalog side cost no warehouse query on either backend: one GraphQL
-round trip hosted, one compiled-artifact read locally. `values` and `query` do
-spend, on both.
+`list` and the catalog side cost no warehouse query on any backend: one GraphQL
+round trip hosted, one compiled-artifact read locally, one repository read for a
+native layer. `values` and `query` do spend on the two dbt backends. On a native
+Ossie layer neither runs at all, so the only spend on that path is the
+`explore profile` and `explore query` you reach for instead, and those carry
+their own estimate and confirmation.

@@ -1,6 +1,6 @@
 ---
 name: explore
-description: 'Use this whenever you need to know what is actually in a database, warehouse, or DuckDB file before you trust it: ranked inventory of what exists, column profiles, PII detection, grain and data-quality problems, verified join inference, Mermaid ER diagrams, guarded ad-hoc SQL probes, and k-means segmentation, producing a draft map without dumping the whole schema into context. Trigger it on an unmet precondition, not on any particular phrasing: if you are about to write or fix SQL against tables whose columns, types, grain, or join keys you have not verified in this session, use this FIRST. That includes dbt work: building a staging or mart model, fixing a broken model, or debugging wrong numbers, whenever the ticket names source tables without spelling out their schema. It also applies mid-task: if you are partway through and hit a table you have not inspected, stop and use this rather than guessing column names or firing off one-off SELECTs. Also use it for direct questions like "what''s in my duckdb", "which tables matter", "how do these tables relate", "is this data any good", "any PII in here", "how many orders have no customer", or "cluster my customers". Explore is read-only and writes nothing but the .dex/ cache. It does not author the model: pair it with transform, which writes the change once you know what you are writing against. To reconcile a project that has fallen out of sync, use maintain.'
+description: 'Use this whenever you need to know what is actually in a database, warehouse, or DuckDB file before you trust it: ranked inventory of what exists, column profiles, PII detection, grain and data-quality problems, verified join inference, Mermaid ER diagrams, guarded ad-hoc SQL probes, k-means segmentation, and reading the semantic layer a repo declares (dbt semantic models, a hosted dbt Cloud layer, or native Apache Ossie documents), producing a draft map without dumping the whole schema into context. Trigger it on an unmet precondition, not on any particular phrasing: if you are about to write or fix SQL against tables whose columns, types, grain, or join keys you have not verified in this session, use this FIRST. That includes dbt work: building a staging or mart model, fixing a broken model, or debugging wrong numbers, whenever the ticket names source tables without spelling out their schema. It also applies mid-task: if you are partway through and hit a table you have not inspected, stop and use this rather than guessing column names or firing off one-off SELECTs. Also use it for direct questions like "what''s in my duckdb", "which tables matter", "how do these tables relate", "is this data any good", "any PII in here", "how many orders have no customer", "cluster my customers", or "what metrics does this semantic layer define". Explore is read-only and writes nothing but the .dex/ cache. It does not author the model: pair it with transform, which writes the change once you know what you are writing against. To reconcile a project that has fallen out of sync, use maintain.'
 ---
 
 # Explore
@@ -218,15 +218,16 @@ Subcommands, in the usual order:
 
    Two payload fields carry legitimate differences between the backends rather
    than leaving them to be inferred: `dimension_scope` says whether a dimension
-   row is one declaration or one groupable path, which is why the two backends can
+   row is one declaration or one groupable path, which is why two backends can
    report different dimension counts for one layer, and `unavailable` names fields
    a backend structurally cannot supply. `--local` resolves the join graph through
    MetricFlow where the `[semantic]` extra is installed, which is what makes its
    dimension lists the tokens a query can actually use; without it the payload says
    `declarations` and a note names the extra.
 
-   Two backends answer all three, chosen by `.dex/config.yml` `semantic.vendor`
-   and `semantic.deployment` (the older `semantic.backend` spelling still works),
+   Three backends answer these commands, chosen by `.dex/config.yml`
+   `semantic.vendor` and `semantic.deployment` (the older `semantic.backend`
+   spelling still works),
    overridable with `--local` / `--api`. Those two flags name **who executes**, not
    which vendor, and every result reports it as `execution` (`dex` or `vendor`).
    `--local` renders the SQL with MetricFlow and executes it through dex's own
@@ -242,11 +243,22 @@ Subcommands, in the usual order:
    layer's own PII metadata is fetched per metric so a multi-metric query stays
    authoritative rather than falling back to names.
 
+   The third backend is `semantic.vendor: ossie`, native Apache Ossie documents
+   read out of the repository with no dbt project and no MetricFlow in the path
+   (needs the `[ossie]` extra). It is catalog-first: `list` answers, and `values`,
+   `query` and `--for-dimension` refuse by name, because Ossie specifies
+   interchange metadata and no portable query runtime. Those refusals are the
+   format's shape rather than a missing feature, and each one names the physical
+   route instead: a dimension carries its `semantic_model`, that model carries its
+   `relation`, and `explore profile` then `explore query` reach the values under
+   the firewall and the cost guard. `--api` is refused too; Ossie has no hosted
+   deployment.
+
    Read `${CLAUDE_SKILL_DIR}/references/semantic-playbook.md` before running a
    metric query: a metric's `time_axis`, `filter` and measures decide what the
    number *is*, and the playbook covers the discovery order, the additivity and
-   time-axis traps this surface is full of, and when `values` answers rather than
-   a query.
+   time-axis traps this surface is full of, when `values` answers rather than a
+   query, and what changes when the layer is native Ossie.
 
 Rules of engagement for `query`: prefer the fixed commands when they answer the
 question; one probe answers one question; batch related measures into a single

@@ -1,22 +1,32 @@
 ---
 name: maintain
-description: 'Use this to keep a dbt project correct as the warehouse and the business change. It detects drift on four axes and proposes the fix: schema drift (source columns and tables added, dropped, retyped, or renamed), volume drift (a row count that collapsed, a table that emptied, a load that half-failed), grain drift (a key that lost uniqueness, a changed row-per-entity cardinality, an increased join fanout), and semantic drift (a metric, measure, dimension, or entity definition that no longer matches, new categorical values, dangling semantic references). Reach for this when something that used to work has started failing or producing different numbers and the cause is more likely upstream than in the code you just wrote: a test that began failing with no code change, a dashboard whose numbers moved, a model that is suddenly empty or duplicated. Trigger it for requests like "what changed in the warehouse", "did anything drift", "is my dbt project still in sync", "my primary key has duplicates now", "the row count dropped", "did the load run", "the data stopped flowing", "the revenue metric definition changed", "reconcile my models with the source schema", or "which models are stale". It reads the .dex/ snapshot and proposes reviewable diffs; it never overwrites hand-written work. To author new models or metrics from scratch, use transform. To learn an unfamiliar warehouse for the first time, use explore.'
+description: 'Use this to keep a dbt project and its semantic layer correct as the warehouse and the business change, including a semantic layer that is native Apache Ossie documents rather than dbt. It detects drift on four axes and proposes the fix: schema drift (source columns and tables added, dropped, retyped, or renamed), volume drift (a row count that collapsed, a table that emptied, a load that half-failed), grain drift (a key that lost uniqueness, a changed row-per-entity cardinality, an increased join fanout), and semantic drift (a metric, measure, dimension, or entity definition that no longer matches, new categorical values, dangling semantic references). Reach for this when something that used to work has started failing or producing different numbers and the cause is more likely upstream than in the code you just wrote: a test that began failing with no code change, a dashboard whose numbers moved, a model that is suddenly empty or duplicated. Trigger it for requests like "what changed in the warehouse", "did anything drift", "is my dbt project still in sync", "my primary key has duplicates now", "the row count dropped", "did the load run", "the data stopped flowing", "the revenue metric definition changed", "reconcile my models with the source schema", "which models are stale", "did my Ossie semantic layer drift", or "is this relationship still valid". It reads the .dex/ snapshot and proposes reviewable diffs; it never overwrites hand-written work. To author new models or metrics from scratch, use transform. To learn an unfamiliar warehouse for the first time, use explore.'
 ---
 
 # Maintain
 
-Keep the dbt project correct as the world underneath it moves. Maintenance is the
-recurring half of the loop: warehouses drift, loads half-fail, models go stale,
-keys stop being unique, and business definitions change. This skill compares a
-known-good baseline against current reality, classifies what drifted, and proposes
-the reconciling edit. It is manual and on-demand here; continuous drift detection
-and automated PRs are the commercial product.
+Keep the repository correct as the world underneath it moves, on both of its
+axes: the dbt project and the semantic layer. Maintenance is the recurring half
+of the loop: warehouses drift, loads half-fail, models go stale, keys stop being
+unique, and business definitions change. This skill compares a known-good
+baseline against current reality, classifies what drifted, and proposes the
+reconciling edit. It is manual and on-demand here; continuous drift detection and
+automated PRs are the commercial product.
 
 ## The model: baseline, detect, reconcile
 
 Drift is measured against a **baseline** (the `.dex/snapshot.json` fingerprint of
-the warehouse map and the project's per-layer definitions). Detection is
+the warehouse map and the repository's per-layer definitions). Detection is
 read-only; only reconcile proposes edits.
+
+**The two project layers are fingerprinted independently.** The transform layer
+comes from the dbt project; the semantic layer comes from whichever vendor
+`semantic.vendor` names, which may be dbt's own or a native format such as
+Apache Ossie. A repository with a semantic layer and no dbt project at all still
+gets a baseline and still runs every free axis: `transform_layer` comes back
+null, and the warning that names why no project was fingerprinted is reserved for
+the case where neither layer answered, since that is the one you could otherwise
+mistake for a clean read.
 
 **Snapshot discipline matters.** A snapshot is only as trustworthy as the moment
 it froze. Take one right after a known-good build (`maintain snapshot`), and
@@ -61,7 +71,13 @@ Offer it once at setup. It is not something to run before an ordinary command.
   explore or transform session so later runs have a known-good reference. It pins
   the current `.dex/cache.json` (so the grain baseline is the exact-distinct
   verdicts `explore map` already computed) plus per-layer fingerprints of the dbt
-  project. Without a cache it captures a metadata-only baseline and says so. It
+  project and of the semantic layer. A native semantic layer contributes its
+  definitions per dataset and per metric, each with a content hash, the relation
+  behind it, the column each field resolves to, its declared keys in the arity
+  they were written, and its relationships with every ordered column pair;
+  whether that side was captured is itself recorded, so a baseline written before
+  it reports the relationship axis as unchecked rather than clean.
+  Without a cache it captures a metadata-only baseline and says so. It
   also warns when the cache it pinned is thin (objects without column detail) or
   older than the profile freshness window, because either makes an "accept
   current state" only partly true.
@@ -80,9 +96,17 @@ Offer it once at setup. It is not something to run before an ordinary command.
   correctly?" axis, distinct from "did the shape change?".
 - `maintain grain [<objects>]` detects **grain drift**: a key that now has
   duplicates, a changed row-per-entity cardinality, or an increased join fanout.
-  It also re-verifies the grains your project *declares* (a model-level
-  `unique_combination_of_columns`), which measurement on its own can miss. Uses
-  aggregates, never raw rows.
+  It also re-verifies the grains the repository *declares*, which measurement on
+  its own can miss: a dbt model-level `unique_combination_of_columns`, and a
+  semantic layer's own key declarations. A multi-column declaration is measured
+  as one complete composite and never one column at a time. Uses aggregates,
+  never raw rows.
+
+  A native semantic layer's keys reach this axis and nothing else reaches it for
+  them, since such a layer is never the transformation project. They go through
+  the identical billed handshake on a metered warehouse: nothing here is cheaper
+  or less gated because the declaration came from a document rather than from
+  dbt.
 
   Two findings come out of the uniqueness checks and the difference is the
   baseline. `key_lost_uniqueness` is a key that was proven unique and is not any
@@ -90,13 +114,27 @@ Offer it once at setup. It is not something to run before an ordinary command.
   combination that does not hold, and nothing changed at all: the project asserts
   a grain the data never had, so the fix is to the declaration (widen it, dedup
   upstream, or drop the claim) rather than to the data.
-- `maintain semantic [<objects>]` detects **definition drift**: metric, measure,
-  dimension, or entity definitions that changed against the baseline; semantic
-  references that no longer resolve to a model or column; and categorical
-  dimensions whose set of values widened or narrowed underneath their metrics.
+- `maintain semantic [<objects>]` detects **definition drift**: definitions that
+  changed, were added, or were removed against the baseline; a source relation
+  that is gone; a dimension, entity, measure, or declared key naming a column
+  that is gone; a relationship whose endpoint or column pairs no longer resolve,
+  which is `high` because a join nothing can resolve is a broken layer rather
+  than a stale one; and categorical dimensions whose set of values widened or
+  narrowed underneath their metrics.
+
+  Read `unavailable` on the layer before hunting for an element kind. A native
+  Ossie layer has no measures and no entities at all, so their absence is the
+  format rather than drift. Its cardinality half also never fires, because that
+  check needs a semantic model naming a transformation model and Ossie names
+  none: on such a layer this command is free and offers no scan.
 - `maintain reconcile [<class>]` proposes the dbt edits that bring the project
   back in sync, as reviewable diffs. Optionally scope it to one class (`schema`,
-  `volume`, `grain`, or `semantic`).
+  `volume`, `grain`, or `semantic`). It composes every layer's declarations
+  first, so a grain the semantic layer already declares is not proposed as though
+  nothing declared it. Where there is no editable dbt project it has nothing to
+  author: every proposal is advisory and no plan is stored. Authoring into a
+  native semantic layer is `semantic ossie` in the transform skill, never this
+  command.
 
 The usual flow: `check` to triage, a focused detector to understand one axis in
 depth, then `reconcile` to get the proposed fix.
@@ -183,7 +221,8 @@ since detection surfaces as a conflict, never a silent overwrite.
   metadata and the snapshot; grain and dimension-cardinality use aggregates only.
   Raw rows and dimension values never cross the envelope.
 - Propose, don't impose. Reconciliation is always a reviewable diff, applied
-  through `transform apply`. Human dbt edits are authoritative; on conflict the
-  engine surfaces the divergence and asks rather than overwriting.
-- The dbt project is the source of truth; the `.dex/` snapshot is a non-canonical
-  fingerprint used only to detect change.
+  through `transform apply`. Human edits to the project and to the semantic layer
+  are authoritative; on conflict the engine surfaces the divergence and asks
+  rather than overwriting.
+- The repository is the source of truth, on both axes; the `.dex/` snapshot is a
+  non-canonical fingerprint used only to detect change.

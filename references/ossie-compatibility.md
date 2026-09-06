@@ -4,8 +4,10 @@ What dex accepts from a native [Apache Ossie](https://github.com/apache/ossie)
 (incubating) document, what it checks, what it makes of what it read, and what it
 does not claim. Read it beside
 [Native Apache Ossie](semantic-layer.md#native-apache-ossie-vendor-ossie), which
-describes how to configure and use the layer; this page is the compatibility
-statement behind it.
+describes how to configure and use the layer, and
+[A native Ossie layer end to end](ossie-walkthrough.md), which runs one document
+through every command on a local warehouse. This page is the compatibility
+statement behind both.
 
 Every row here is backed by a case in the reviewed corpus at
 `packages/dex-core/tests/ossie/fixtures/`, named by its case id. The corpus runs

@@ -3,9 +3,10 @@
 dex writes two kinds of things, and only one of them is a storage backend's
 business.
 
-The **source of truth** is the dbt project: model SQL, `schema.yml`, semantic
-definitions. It is a git-reviewable filesystem artifact by design, it stays one,
-and it never moves into a datastore. No backend choice changes that.
+The **source of truth** is the repository: model SQL, `schema.yml`, and the
+semantic layer's definitions, whether those are dbt's or a native format's. It is
+a git-reviewable filesystem artifact by design, it stays one, and it never moves
+into a datastore. No backend choice changes that.
 
 The **scratch state** is everything dex learns along the way: the exploration
 cache, the reconcile baseline, the last drift report, the append-only query and
@@ -508,10 +509,18 @@ connector resolved and no credential in play. Hosted semantic-layer calls
 `semantic_query` against dbt Cloud) need even less: no store, no connector, no
 repo root.
 
-Everything in transform needs `repo_root`, because the dbt project is a
-filesystem artifact and stays one. So does `explore map --use-project`, which
-reads the dbt project to rank and annotate what it found. Those refuse with a
-message naming what needed the root rather than inventing one.
+A native semantic layer is the mirror image of that hosted case and worth stating
+because the pairing is easy to get backwards. It needs a `repo_root`, since the
+documents are files, and it needs no connector and no warehouse at all: reading,
+validating, fingerprinting and authoring one are repository operations. The
+connector enters only where the layer is resolved onto physical relations, which
+is what decides whether a field links to a column.
+
+Everything in transform needs `repo_root`, because the project is a filesystem
+artifact and stays one, and so is a native semantic document. So does
+`explore map --use-project`, which reads the project and the semantic layer to
+rank and annotate what it found. Those refuse with a message naming what needed the root
+rather than inventing one.
 
 ## Selecting a backend
 

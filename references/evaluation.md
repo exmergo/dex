@@ -7,7 +7,7 @@ scores).
 
 ```
 TIER 3  BENCHMARKS (external, published)   few, expensive, periodic
-        ADE-bench (home) - Spider 2.0      -> marketing + north-star
+        ADE-bench, data-eng-bench          -> marketing + north-star
 TIER 2  AGENT EVALS (skill-creator)        per-skill, LLM-in-loop, CI-gated
         triggering - output-quality        -> does the skill help?
 TIER 1  UNIT TESTS (dex-core, pytest)      many, deterministic, fast
@@ -27,14 +27,24 @@ benchmark score:
 1. Read-only against data; SELECT-only generation; prod-target execution refused.
 2. Cost-guard binds per paradigm.
 3. PII flagged as (column, category, confidence), never surfaced.
-4. Propose-don't-impose: changes are diffs, hand-written dbt never silently
+4. Propose-don't-impose: changes are diffs, hand-written files never silently
    overwritten.
 5. Sanitized envelope: credentials never appear in stdout `data`, and data
    values only via `explore query`'s firewall-cleared row-major results.
 
-The spine lives in `tests/test_safety_spine.py`. Families whose engine lands in a
-later phase are wired as explicit `xfail` placeholders so the spine is complete
-from the start and turns green as the logic arrives.
+The spine lives in `tests/test_safety_spine.py`. A family whose engine has not
+landed yet is wired as an explicit `xfail` placeholder, so the spine is complete
+before the logic is and turns green as it arrives.
+
+Two kinds of tier-1 asset sit beside the ordinary unit tests. **Conformance
+suites** are shipped rather than internal, under the `[storage-conformance]`,
+`[project-conformance]` and `[semantic-conformance]` extras, so an implementation
+written outside this repository is held to the same assertions the shipped ones
+are. And a **reviewed fixture corpus** pins behavior a test alone would not: the
+native Ossie corpus under `tests/ossie/fixtures/` pairs each document with the
+verdict it must produce, so a schema upgrade is a diff of verdicts somebody read
+rather than a hash somebody bumped, and a test refuses a documented claim whose
+case does not exist.
 
 ## Tier 2: agent evals (skill-creator framework)
 
@@ -46,12 +56,15 @@ first-class.
 
 ## Tier 3: external benchmarks (published)
 
-Scheduled and cost-capped, not per-commit. **ADE-bench** is the home benchmark
-(no official leaderboard, so publish attributed numbers; semantic-model
-maintenance is a confirmed gap dex contributes into). **Spider 2.0** is the
-academic north-star, led by **Spider2.0-DBT** (the still-hard, AE-aligned track;
-the old 17-36% headline is retired). No Spider validation is claimed for Postgres
-or Databricks (no coverage). Runbooks live in `benchmarks/`.
+Scheduled and cost-capped, not per-commit. Two are published, each with its raw
+per-task results committed. **ADE-bench** is the home benchmark (no official
+leaderboard, so publish attributed numbers; semantic-model maintenance is a
+confirmed gap dex contributes into). **data-eng-bench** is the larger of the two,
+a 2,356-model dbt project scored by a hidden pytest suite after a cold `dbt run`.
+Both publish how often dex actually fired beside the accuracy, because a score
+with the tool firing on 98% of trials and the same score with it firing on 20%
+are different claims. **Spider 2.0**, led by **Spider2.0-DBT**, remains the
+academic north-star and has no harness here yet. Runbooks live in `benchmarks/`.
 
 ## CI gating
 

@@ -1,10 +1,12 @@
 # Querying the semantic layer (`explore semantic`)
 
-dex can author the dbt semantic layer (`transform` / `semantic define|update`) and
-detect drift in it (`maintain semantic`). `explore semantic` is the third piece:
-it *queries* the layer, so an agent can discover metrics and run governed metric
-queries. Two backends answer the same commands through one abstraction, and the
-difference between them is load-bearing, so it is spelled out here.
+dex can author a semantic layer (`transform` / `semantic define|update` for dbt,
+`semantic ossie define|update` for native Apache Ossie documents) and detect drift
+in it (`maintain semantic`). `explore semantic` is the third piece: it *queries*
+the layer, so an agent can discover metrics and, where the layer defines a
+runtime, run governed metric queries. Three backends answer the same commands
+through one abstraction, and the differences between them are load-bearing, so
+they are spelled out here.
 
 ## The three commands
 
@@ -159,7 +161,7 @@ object), and folds the layer's declared entity graph into the map's join edges;
 see [the command contract](command-contract.md). Both are opt-in, because
 exploration starts bare.
 
-### Two things the two backends legitimately disagree about
+### Two things backends legitimately disagree about
 
 Both are stated in the payload rather than left to be inferred, because a caller
 that cannot tell a structural absence from an undeclared field will read the first
@@ -180,7 +182,7 @@ it see that several paths reach one declaration.
 **`unavailable`.** The hosted `SemanticModel` GraphQL type carries only a name, its
 `Entity` type has no `label` at all, and its `Measure` type carries no words, so a
 hosted catalog declares those gaps per element kind. `relation` is in that list,
-which makes the physical link the sharpest asymmetry between the two backends: the
+which makes the physical link the sharpest asymmetry between the two dbt backends: the
 hosted API returns `expr` on dimensions, entities and measures, so a hosted catalog
 names the column behind every element and cannot say which table that column is in.
 Read `--local` for the relations. A hosted catalog is also reached metric by metric,
@@ -584,7 +586,9 @@ repository, with no dbt project and no MetricFlow anywhere in the path.
 What dex accepts, checks, links, and declines to claim is written out row by row
 in [Apache Ossie compatibility](ossie-compatibility.md), with the pinned schema
 hash and a named corpus case behind each claim. This section is how to use the
-layer; that one is what it promises.
+layer; that one is what it promises. For the whole sequence run end to end on a
+local warehouse, with one document and no dbt project, read
+[A native Ossie layer end to end](ossie-walkthrough.md).
 
 It is **catalog-first**, and that is a statement about the format rather than
 about how far the implementation got. Ossie specifies interchange metadata and
@@ -646,6 +650,57 @@ confirmed replacement, and atomic multi-file application. This is the
 semantic-source counterpart of the editable and placement project contracts,
 not an implementation of `EditableProject` or `PlacingProject`; Ossie remains
 outside the transformation-project hierarchy by design.
+
+### What a plan is checked against, and what it declines to check
+
+The three validation layers below run over the whole prospective layer, not over
+the edit alone. After them, and before the plan is stored, references are checked
+against the exploration cache. **That check opens no connection and scans
+nothing**: the cache is evidence, not the source of truth, so it may only
+contradict a reference, never confirm the absence of one.
+
+Two shapes refuse and store no plan:
+
+- a dataset source absent from a namespace the cache inventoried *completely*.
+  Completeness is tracked as provenance, so a partial profile can never
+  masquerade as an inventory and turn a silence into a refusal.
+- a column absent from a relation the cache actually profiled, in a field
+  expression, a `primary_key`, a `unique_keys` entry, or either side of a
+  relationship.
+
+Everything else is a named note: no cache at all, a cache captured on a different
+connector, a relation outside a completely inventoried namespace, a relation
+whose columns were never profiled, and the counts of query-backed, quoted,
+computed and non-SQL references that dex declined to over-validate. A closing
+note states what was checked and that no connection was opened, so an unchecked
+reference is never mistaken for a checked one.
+
+### What `maintain` makes of the layer
+
+`maintain snapshot` fingerprints the semantic axis independently of the project
+axis, so an Ossie-only repository gets a baseline: `transform_layer` comes back
+null, because Ossie declares no build step and a transform baseline over it would
+be a baseline of nothing. Each dataset and metric is recorded with a content
+hash, the relation behind it, the column each field resolves to, its declared
+keys in the arity they were written, and each relationship with its full ordered
+column pairs. Whether relationships and keys were captured at all is itself
+recorded, so a baseline written before that was possible reports the relationship
+axis as unchecked rather than as clean.
+
+`maintain semantic` then reports a definition added, removed or changed; a source
+relation that is gone; a dimension or declared key naming a column that is gone;
+and a relationship whose endpoint or column pairs no longer resolve, which is
+`high` because a join nothing can resolve is a broken layer rather than a stale
+one. All of it is free. The command's billed half, dimension cardinality, needs a
+semantic model naming a transformation model, and an Ossie dataset names none, so
+that axis never offers a scan here.
+
+`maintain grain` is the one place Ossie's declarations meet the warehouse for
+money. A declared composite is measured as one composite through the identical
+confirmation, budget and ledger machinery every other scanning command uses, and
+a declaration the data does not support is a finding rather than an edit.
+`maintain reconcile` has no write tier to author into, so its output for this
+layer is advisory and no plan is stored.
 
 ### Two extras, three validation layers
 
@@ -759,9 +814,11 @@ absence from a field the author left blank:
   expression text: Ossie has not defined its grammar or scope, and promoting one
   would turn an interpretation into a fact.
 
-### Reaching tier 1
+### What the declarations reach in `explore`
 
-An Ossie-only repository contributes its declarations to `explore`:
+Ossie satisfies none of the project tiers and never becomes the transformation
+project, so this is the only route its declarations have into exploration. An
+Ossie-only repository still contributes all of it:
 
 - a single-column `primary_key` or `unique_keys` entry becomes a declared unique
   key;
@@ -773,15 +830,26 @@ An Ossie-only repository contributes its declarations to `explore`:
   tuple; no first-column proxy is emitted or measured.
 
 `explore map --use-project` marks each source relation with the Ossie semantic
-models sitting on it.
+models sitting on it, and rewrites that mark on every read, so a dataset dropped
+from the layer clears rather than leaving a stale claim. `explore profile
+--use-project` lets a declared key override the heuristic grain, noting the
+disagreement rather than replacing it silently, and
+`explore relationships --verify` measures a declared composite as one complete
+tuple. A measurement never revises a declared join's confidence: it stays at the
+1.0 the document asserts, and a probe that finds the parent largely missing is
+reported as a finding instead.
+
+Where a declared relationship is contributed through more than one channel and
+the two declarations join the same pair of datasets on different columns, both
+are kept and the disagreement is reported as a conflict. dex does not pick a
+winner between two things a repository asserts.
 
 ### Upgrading the pinned schema
 
-1. Copy the new `core-spec/ossie-schema.json` in verbatim.
-2. Update the commit, hash, and declared version in `PROVENANCE.md`.
-3. Update `SCHEMA_SHA256` in `exmergo_dex_core/ossie/loader.py`.
-4. Run the Ossie fixture suite and read the diffs. A fixture that changes verdict
-   is the upgrade telling you what moved.
+The pin lives in four places and two of them are asserted by an offline test, so
+the procedure is written out once in
+[Apache Ossie compatibility](ossie-compatibility.md#upgrading-the-pin). Follow it
+there rather than from memory; updating the hash alone is not an upgrade.
 
 ## Internal architecture
 
@@ -931,40 +999,41 @@ owns a model graph, compilation, targets, and a write surface;
 `exmergo_dex_core.semantic_source` are one method each and inherit nothing from
 `ExploreProject`.
 
-dex binds its own two backends to the runtime contract in
+dex binds its dbt backends to the runtime contract in
 `tests/explore/test_semantic_conformance.py`, three times: `--local` with
 MetricFlow resolving the join graph, `--local` with no resolver (the declared
 single-hop read), and `--api` against a transport reproducing the dbt Cloud API's
-real asymmetries. A fourth test compares the two backends directly on the same
-layer, which is the thing the per-backend assertions cannot catch.
+real asymmetries. A fourth test compares those two directly on the same layer,
+which is the thing the per-backend assertions cannot catch. The native Ossie
+backend is bound to the same runtime contract in
+`tests/ossie/test_conformance.py`.
 
 ## The asymmetry at a glance
-
-| | Local (`--local`) | Hosted (`--api`) |
-|---|---|---|
-| `execution` reported | `dex` | `vendor` |
-| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud |
-| Executes the SQL | dex, through the active connector | dbt Cloud, server-side |
-| Needs a local dbt project | yes | no |
-| Cost surfaced before spend | yes, the full handshake | no: cost guard unavailable, warns on every result |
-| Ceiling enforced by dex | yes (`maximum_bytes_billed` / timeout) | no: the dbt Cloud environment's own limits |
-| `--confirm` required | yes, on billed connectors | no (nothing dex can gate) |
-| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic |
-| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about |
-| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations |
-| Credentials | the connector's, never in context | a dbt Cloud service token, never in context |
-| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) |
-| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` |
-| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else |
-| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads |
-| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three |
-| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none |
-| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved |
-| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always |
-| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric |
-| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud |
-| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal |
-| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent |
-| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip |
-| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` |
-| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries |
+| | Local (`--local`) | Hosted (`--api`) | Native Ossie (`vendor: ossie`) |
+|---|---|---|---|
+| `execution` reported | `dex` | `vendor` | `dex` |
+| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime |
+| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse |
+| Needs a local dbt project | yes | no | no, and it never reads one |
+| Cost surfaced before spend | yes, the full handshake | no: cost guard unavailable, warns on every result | not applicable: reading the layer spends nothing |
+| Ceiling enforced by dex | yes (`maximum_bytes_billed` / timeout) | no: the dbt Cloud environment's own limits | not applicable: nothing runs |
+| `--confirm` required | yes, on billed connectors | no (nothing dex can gate) | no: the catalog is free on every connector |
+| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none |
+| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies |
+| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing |
+| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse |
+| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name |
+| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` |
+| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else | name, label, description and `relation`; no `model_ref` and no default time dimension |
+| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads | yes, where the dataset source is one relation this connector can address |
+| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier |
+| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none | no measures at all, declared in `unavailable` |
+| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved | `declarations`, always: the format states no join graph to resolve through |
+| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks |
+| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary |
+| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead |
+| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason |
+| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent | every configured document in full, whether or not a metric reads it |
+| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip | the configured documents in this repository, through the semantic-source seam |
+| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax |
+| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts |

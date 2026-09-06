@@ -1,8 +1,16 @@
-# dbt as a first-class input (and the only write target)
+# dbt as a first-class input (and the write target for transformations)
 
-The dbt project is the source of truth. dex maintains no parallel model: it loads
-the project, reasons over it together with warehouse introspection and the
-`.dex/` cache, and writes changes back into the source files as reviewable diffs.
+The dbt project is the source of truth for the transformation model. dex
+maintains no parallel model: it loads the project, reasons over it together with
+warehouse introspection and the `.dex/` cache, and writes changes back into the
+source files as reviewable diffs.
+
+It is not dex's only write surface. A semantic layer can own its own definitions
+on the semantic axis, and `semantic ossie define|update|plan` followed by
+`transform apply` writes the exact documents named in `semantic.ossie.files`,
+confined to the repository and byte for byte. That surface shares this one's plan
+and apply spine and none of the path families below, which is why it is described
+in [`semantic-layer.md`](semantic-layer.md) rather than here.
 
 ## What dex reads
 
@@ -67,8 +75,11 @@ agent context.
 The project is discovered automatically (the repo root, or a unique child
 directory holding a `dbt_project.yml`); `dbt_project_dir` in `.dex/config.yml`
 pins it when discovery would be ambiguous. Absent a dbt project, explore still
-works (writing only to the `.dex/` cache); transform and maintain require one,
-since dbt is what they edit and diff.
+works, writing only to the `.dex/` cache. dbt authoring and `maintain
+reconcile`'s mechanical edits do need one, since dbt is what they edit and diff.
+The semantic axis does not: a repository whose only declarations are native
+semantic documents authors them through `semantic ossie`, and `maintain` still
+fingerprints that layer and runs its free drift axes against it.
 
 dbt is the format dex ships, not the only one it can read. `maintain`'s four
 detection commands read whichever format `project.format` names, so a host whose
@@ -105,7 +116,9 @@ create the new one, and update every referrer, validated together.
 Human edits to dbt are authoritative by construction; dex holds no competing copy
 to overwrite them from. Writes are confined to the six authored path families
 plus the project-root manifests dbt keeps there (`dbt_project.yml`,
-`profiles.yml`, `packages.yml`, `dependencies.yml`); path escapes are refused.
+`profiles.yml`, `packages.yml`, `dependencies.yml`); path escapes are refused. A
+native semantic document is not in this surface and is never reached through it:
+it carries its own confinement rule, the exact paths the semantic axis declares.
 Within the surface, an edit's kind and its location have to agree: a snapshot
 belongs under the snapshot paths and nowhere else, a seed under the seed paths, a
 macro under the macro paths, a singular or generic test under the test paths, an

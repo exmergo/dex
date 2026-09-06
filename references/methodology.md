@@ -140,10 +140,17 @@ likely grain come from the uniqueness signals: single columns proven unique, plu
 the composite keys proven at profile time; a single-column key is always
 preferred as the grain, and a member of a composite key is never treated as
 unique on its own. Declared joins come
-from the dbt project when one is present; absent a dbt project, declared joins are
-simply empty, which is expected because explore is designed to work without one.
+from whichever channels declare one: the dbt project when one is present, and the
+semantic layer when one is configured, which need not be dbt's. Absent both,
+declared joins are simply empty, which is expected because explore is designed to
+work without either. A declared join carries every column pair it was written
+with, so a composite is one declaration measured as one complete tuple rather
+than a first-column proxy that would report a healthy join three times over while
+no tuple matched. Where two channels declare a join between the same pair of
+relations on different columns, both are kept and the disagreement is reported;
+dex does not pick a winner between two things the repository asserts.
 
-A project's declarations refine those verdicts without entering them. A declared
+Declarations refine those verdicts without entering them. A declared
 grain fills in where measurement found none, and is noted where it disagrees, but
 a measurement-proven single column still wins the reported grain and the candidate
 keys stay measurement-only: an unmeasured declared key is a claim, and the cache is
@@ -191,7 +198,7 @@ A diagram is trusted more readily than the JSON it came from, so the cardinality
 rules are strict. Mermaid requires a glyph on every edge and dex's relationship
 record carries no cardinality, so the renderer derives one only from what was
 proven. It claims "exactly one" on the parent side only when the parent key is a
-proven key **and** the join was declared in the project or measured with no
+proven key **and** the join was declared in the repository or measured with no
 orphans; it degrades to "zero or one" when uniqueness is proven but nothing
 measured the overlap; and it degrades to "zero or many" when uniqueness was never
 established at all. Declared joins are drawn solid and inferred joins dotted, and
@@ -214,4 +221,4 @@ Every command prints exactly one sanitized JSON envelope (see
 `command-contract.md`); credentials and raw rows can never cross that boundary,
 and a leak is a hard failure rather than a silent scrub. The agent reads the
 envelope and decides the next step, so multi-step exploration is the agent
-orchestrating stateless subcommands over the dbt project and the `.dex/` cache.
+orchestrating stateless subcommands over the repository and the `.dex/` cache.

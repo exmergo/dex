@@ -11,7 +11,9 @@
       "Which of my models are stale after the upstream change?",
       "The row count on orders dropped overnight; did a load half-fail?",
       "The unique test on order_id started failing yesterday and nobody changed the model. Figure out what happened.",
-      "Our revenue dashboard dropped 40% overnight but the code has not changed. What is going on upstream?"
+      "Our revenue dashboard dropped 40% overnight but the code has not changed. What is going on upstream?",
+      "Did my Ossie semantic layer drift from the warehouse?",
+      "One of my semantic layer's relationships stopped resolving. What broke?"
     ],
     "negative": [
       "What's in this warehouse and which tables matter?",
@@ -19,7 +21,8 @@
       "Set up a dbt project in this repo.",
       "Build a staging model for raw orders.",
       "Define a revenue metric on top of fct_orders.",
-      "I just rewrote stg_orders and now the not_null test fails. Fix my SQL."
+      "I just rewrote stg_orders and now the not_null test fails. Fix my SQL.",
+      "Add a revenue metric to my Ossie semantic model."
     ]
   },
   "evals": [

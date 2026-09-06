@@ -1,28 +1,39 @@
-# The source of truth (dbt) and the `.dex/` cache
+# The source of truth (the repository) and the `.dex/` cache
 
-dex maintains no canonical model of its own. **The dbt project is the source of
-truth.** dex reads it, reasons over it together with warehouse introspection, and
-writes changes back into it as reviewable diffs. The only state dex keeps of its
-own is a non-canonical cache under `.dex/`.
+dex maintains no canonical model of its own. **The repository is the source of
+truth**, on two axes: the transformation project, which is dbt, and the semantic
+layer, which is dbt's own or a native format that owns its definitions in files
+beside it. dex reads whichever are present, reasons over them together with
+warehouse introspection, and writes changes back as reviewable diffs. The only
+state dex keeps of its own is a non-canonical cache under `.dex/`.
 
 ## Why dbt, not a dex-native model
 
-An earlier design made the source of truth a dex-invented semantic model, with dbt
-and OSI as projections. That was an over-correction. The reasoning was "OSI is
-immature, so build our own," but the right response to an immature standard is to
-anchor on the mature thing, not to invent a third one: a representation dex
-invents has no spec, no tooling, and no users, so it is the least mature option,
-not the most stable. And the premise was largely wrong on the facts: **dbt's
-MetricFlow already expresses nearly all of the richness** in question (entities;
-categorical and time dimensions with granularity; measures; and metrics of kind
-simple, ratio, derived, and cumulative, with time spines). The dex-native model
-was, in effect, a plan to re-implement MetricFlow, worse. dbt is mature, versioned,
-adopted, and where AEs already live, so it is the correct anchor.
+An earlier design made the source of truth a dex-invented semantic model, with
+every other format a projection of it. That was an over-correction. The reasoning
+was "the interchange formats are immature, so build our own," but the right
+response to an immature standard is to anchor on the mature thing, not to invent
+a third one: a representation dex invents has no spec, no tooling, and no users,
+so it is the least mature option, not the most stable. And the premise was
+largely wrong on the facts: **dbt's MetricFlow already expresses nearly all of
+the richness** in question (entities; categorical and time dimensions with
+granularity; measures; and metrics of kind simple, ratio, derived, and
+cumulative, with time spines). The dex-native model was, in effect, a plan to
+re-implement MetricFlow, worse. dbt is mature, versioned, adopted, and where AEs
+already live, so it is the correct anchor for the transformation model.
 
-The decisive practical win: with dbt as the source of truth there is no parallel
-copy to reconcile, so the round-trip fidelity problem, the per-element provenance
-and identity machinery, and "human dbt wins" conflict resolution all disappear.
-Human edits are authoritative by construction.
+The decisive practical win: with the repository as the source of truth there is
+no parallel copy to reconcile, so the round-trip fidelity problem, the
+per-element provenance and identity machinery, and "the human's file wins"
+conflict resolution all disappear. Human edits are authoritative by construction.
+
+That reasoning is about not inventing a model, and it does not argue against
+reading a format somebody else specifies. A semantic layer that owns its own
+definitions is read where it lives, on its own axis, with no translation into
+dbt's vocabulary and no dbt project required. Those definitions are source of
+truth in exactly the same sense the dbt project is: they are files in git, dex
+holds no competing copy of them, and every change dex makes to them is a diff.
+See [`semantic-layer.md`](semantic-layer.md).
 
 ## How dex reads and writes the dbt project
 
@@ -36,7 +47,7 @@ Human edits are authoritative by construction.
 
 ## The `.dex/` cache (not canonical)
 
-`.dex/` holds only what the dbt project has no home for, and it is a cache that
+`.dex/` holds only what the repository has no home for, and it is a cache that
 informs proposals, never the source of truth:
 
 ```
@@ -48,8 +59,11 @@ informs proposals, never the source of truth:
                   (distinct_count_exact); each dataset carries the time it was profiled
                   (profiled_at) so carried-forward profiles stay attributable
   snapshot.json   the maintain baseline: a frozen fingerprint of the warehouse schema, the
-                  dbt manifest state, and declared grain/semantic assumptions. Written by
-                  `maintain snapshot`; the drift detectors diff current reality against it.
+                  transformation project's state, the semantic layer's definitions with the
+                  relationships and keys they declare, and declared grain assumptions. The
+                  two project layers are fingerprinted independently, so a repository with a
+                  semantic layer and no transformation project still gets a baseline. Written
+                  by `maintain snapshot`; the drift detectors diff current reality against it.
   queries.jsonl   the `explore query` audit log: one line per firewall decision (allowed,
                   refused, or failed) with the SQL text and result counts, never result
                   values. A decision that profiled an object on demand first names it
@@ -62,8 +76,8 @@ informs proposals, never the source of truth:
                   recur here are candidates for promotion to named commands.
 ```
 
-Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the dbt
-project and the warehouse. The cache types live in `cache.py`; secrets never live
+Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the
+repository and the warehouse. The cache types live in `cache.py`; secrets never live
 here. PII is recorded as `(column, category, confidence)` with no example values.
 
 The layout above is the CLI's choice, not the engine's. Where this state lands is
@@ -71,7 +85,7 @@ a backend behind the `Store` protocol, injected at the entry point: the CLI pick
 the filesystem so subcommands stay stateless across processes and the session
 budget carries from one command to the next, while an in-process library caller
 gets an in-memory store by default and writes nothing at all. A host can
-implement the protocol over its own session store or database. The dbt project is
+implement the protocol over its own session store or database. The repository is
 unaffected by any of this: it is the source of truth and stays a git-reviewable
 filesystem artifact, which is why `repo_root` remains separate from the store.
 
@@ -98,7 +112,10 @@ protocols in `adapters/project.py`, and a format implements the tiers it can ser
 
 `DbtProject` is the one implementation dex ships. Future sources (SQLMesh, Cube, an
 orchestrated asset graph) become new implementations of the same protocols without
-touching the engine that reasons over a project. Nothing behind the seam is a rich
+touching the engine that reasons over a project. A semantic layer that builds
+nothing is not one of them: it owns no model graph, no compilation, and no
+targets, so it sits on a separate seam described in
+[`semantic-layer.md`](semantic-layer.md) and satisfies none of the tiers above. Nothing behind the seam is a rich
 neutral model: `definitions()` returns the engine's existing `ProjectDefinitions`
 rather than a parallel vocabulary that would have to be mapped at every call site,
 and dex does not project the dbt model back out into other formats. dex reasons
@@ -121,8 +138,9 @@ Read that before writing a format; this section only says where the seam sits.
 ## The round-trip rule (reconcile, simplified)
 
 1. Re-read the dbt project and warehouse on every transform or maintain run.
-2. Human edits are already authoritative (dbt is canonical); there is no internal
-   copy to reconcile against, only the `.dex/` snapshot used to detect change.
+2. Human edits are already authoritative (the repository is canonical); there is
+   no internal copy to reconcile against, only the `.dex/` snapshot used to
+   detect change.
 3. Diff the current dbt project and warehouse against the snapshot; propose edits.
 4. On any ambiguous or overwriting change, surface a diff and ask. Never silently
    overwrite.
