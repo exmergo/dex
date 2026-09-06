@@ -198,13 +198,20 @@ def _semantic_layer(
     return project.semantic_layer()
 
 
-def _composed_definitions(engine: DexEngine) -> ProjectDefinitions:
+def _composed_definitions(
+    engine: DexEngine, project: ExploreProject | None
+) -> ProjectDefinitions | None:
     """Declared keys and joins, with a differing semantic vendor's own keys
     folded in additively (#410).
 
+    Takes the project the caller already read rather than resolving one of its
+    own: the format is built once per command, and a repo-less host has no
+    project to build, so ``None`` in is ``None`` out and the grain survey runs
+    on its measured half alone.
+
     Grain verification (`maintain grain`/`maintain check`) reads declared
     composite keys off ``ProjectDefinitions.declared_composite_keys``, which
-    ``engine.project_format().definitions()`` alone never carries for Ossie:
+    the project's own ``definitions()`` alone never carries for Ossie:
     Ossie is never the transformation project that method resolves (the same
     fact #408 already worked around for the explore-side grain channel, in
     `explore.commands._fold_semantic_layer_keys`). Mirrored here rather than
@@ -219,7 +226,9 @@ def _composed_definitions(engine: DexEngine) -> ProjectDefinitions:
     changes nothing.
     """
 
-    defs = engine.project_format().definitions()
+    if project is None:
+        return None
+    defs = project.definitions()
     if engine.repo_root is None:
         return defs
     try:
@@ -647,10 +656,8 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         else None
     )
     project, _ = _read_project(engine)
-    composed_definitions = _composed_definitions(engine)
-    plan = drift_mod.grain_plan(
-        adapter, snap, scope, composed_definitions if project is not None else None
-    )
+    composed_definitions = _composed_definitions(engine, project)
+    plan = drift_mod.grain_plan(adapter, snap, scope, composed_definitions)
     if (
         plan.key_checks
         or plan.fanout_pairs
@@ -950,10 +957,8 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     # baseline tier, and a format narrower than it still declares a grain worth
     # re-verifying here.
     project, _ = _read_project(engine)
-    composed_definitions = _composed_definitions(engine)
-    plan = drift_mod.grain_plan(
-        adapter, snap, scope, composed_definitions if project is not None else None
-    )
+    composed_definitions = _composed_definitions(engine, project)
+    plan = drift_mod.grain_plan(adapter, snap, scope, composed_definitions)
     # Added before both returns, so a declared grain the survey could not reach
     # is reported whether the scans run or stop at the handshake.
     warnings.extend(plan.notes)
@@ -1162,8 +1167,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # differing semantic vendor's own keys (#410), so a proposal for a column
     # Ossie already covers via a declared composite is not suggested as if
     # nothing declared it.
-    composed_definitions = _composed_definitions(engine)
-    definitions = composed_definitions if project is not None else None
+    definitions = _composed_definitions(engine, project)
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,

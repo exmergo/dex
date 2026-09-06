@@ -36,6 +36,7 @@ from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
 from . import semantic as semantic_mod
+from .native_semantic import edits_from_payload, plan_hint, read_payload_file
 from .plans import EditKind, PlanEdit, PlanError
 from .results import (
     ApplyResult,
@@ -361,11 +362,11 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         result = plan(
             engine,
             getattr(args, "argument", None) or "",
-            edits=_edits_from_payload(getattr(args, "edits_file", None)),
+            edits=edits_from_payload(getattr(args, "edits_file", None)),
             scaffold=getattr(args, "scaffold", None),
             attribute_rows=getattr(args, "attribute_rows", None),
         )
-        return to_envelope(result, hints=_plan_hint(result))
+        return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
@@ -433,7 +434,7 @@ def _propagate(
         kind,
         old,
         new,
-        extra_edits=_edits_from_payload(edits_file),
+        extra_edits=edits_from_payload(edits_file),
     )
     planned = plan(engine, outcome.intent, edits=outcome.edits, attribute_rows=False)
     return PropagationResult(
@@ -459,7 +460,7 @@ def cmd_rename(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             args.new,
             edits_file=getattr(args, "edits_file", None),
         )
-        return to_envelope(result, hints=_plan_hint(result))
+        return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
@@ -471,7 +472,7 @@ def cmd_remove(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         result = remove(
             engine, args.kind, args.name, edits_file=getattr(args, "edits_file", None)
         )
-        return to_envelope(result, hints=_plan_hint(result))
+        return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
@@ -645,7 +646,7 @@ def cmd_macro(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         )
     if result.up_to_date:
         return to_envelope(result)
-    return to_envelope(result, hints=_plan_hint(result))
+    return to_envelope(result, hints=plan_hint(result))
 
 
 def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResult:
@@ -698,7 +699,7 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
     try:
         result = test_scaffold(engine, getattr(args, "scaffold", None))
-        return to_envelope(result, hints=_plan_hint(result))
+        return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except (ValueError, TestScaffoldError) as exc:
@@ -1089,85 +1090,6 @@ def cmd_semantic_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
     return _semantic_envelope(args, engine, "plan")
 
 
-def semantic_ossie(
-    engine: DexEngine, intent: str, edits: list[PlanEdit], *, mode: str
-) -> PlanResult:
-    """Author configured native Ossie documents without involving dbt."""
-
-    if mode not in _SEMANTIC_AUTHORING:
-        raise ValueError(f"unknown semantic ossie mode '{mode}'")
-    if not edits:
-        raise ValueError(
-            f"semantic ossie {mode} needs content: pass --edits-file <path|-> "
-            "with whole configured Ossie documents"
-        )
-    wrong = [e.path for e in edits if e.kind is not EditKind.SEMANTIC_DOCUMENT]
-    if wrong:
-        raise ValueError(
-            f"semantic ossie {mode} takes only semantic_document edits; got "
-            "other kinds for: " + ", ".join(wrong)
-        )
-    deleted = [e.path for e in edits if e.op is EditOp.DELETE]
-    if deleted:
-        raise ValueError(
-            f"semantic ossie {mode} authors content and does not delete: "
-            + ", ".join(deleted)
-        )
-
-    layer = engine.semantic_catalog_format()
-    if not isinstance(layer, SemanticEditTarget):
-        named = getattr(layer, "name", type(layer).__name__)
-        raise ValueError(
-            f"the configured '{named}' semantic layer does not support native "
-            "semantic-document authoring; configure `semantic.vendor: ossie`"
-        )
-
-    from ..ossie.authoring import validate_plan
-    from ..storage import readable_cache
-
-    classification, validation_notes, validation_warnings = validate_plan(
-        layer, edits, mode, cache=readable_cache(engine.store)
-    )
-    repo_root = engine.require_repo_root("storing a native semantic plan")
-    stored, diffs, plan_warnings = plans_mod.plan(
-        intent,
-        edits,
-        repo_root=repo_root,
-        store=engine.require_full_store("storing a native semantic plan"),
-        semantic_layer=layer,
-        edit_target="semantic",
-    )
-    return PlanResult(
-        plan_id=stored.plan_id,
-        intent=stored.intent,
-        paths=[edit.path for edit in stored.edits],
-        plan_path=engine.require_full_store("locating a plan").plan_locator(
-            stored.plan_id
-        ),
-        diffs=diffs,
-        notes=validation_notes,
-        warnings=[*plan_warnings, *validation_warnings],
-        defined=classification["defined"],
-        updated=classification["updated"],
-    )
-
-
-def cmd_semantic_ossie(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    try:
-        result = semantic_ossie(
-            engine,
-            getattr(args, "argument", None) or "",
-            _edits_from_payload(
-                getattr(args, "edits_file", None),
-                default_kind=EditKind.SEMANTIC_DOCUMENT,
-            ),
-            mode=args.mode,
-        )
-        return to_envelope(result, hints=_plan_hint(result))
-    except (DexError, ValueError) as exc:
-        return env.error_for(exc)
-
-
 def _semantic_envelope(
     args: argparse.Namespace, engine: DexEngine, mode: str
 ) -> env.Envelope:
@@ -1175,7 +1097,7 @@ def _semantic_envelope(
         result = _SEMANTIC_AUTHORING[mode](
             engine,
             getattr(args, "argument", None) or "",
-            _edits_from_payload(
+            edits_from_payload(
                 getattr(args, "edits_file", None), default_kind=EditKind.SEMANTIC_YML
             ),
             definitions=_definitions_from_payload(
@@ -1189,7 +1111,7 @@ def _semantic_envelope(
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
         return env.error_for(exc)
-    return to_envelope(result, hints=_plan_hint(result))
+    return to_envelope(result, hints=plan_hint(result))
 
 
 # --- helpers -----------------------------------------------------------------
@@ -1206,10 +1128,6 @@ class DbtParseError(DexError):
     def __init__(self, message: str, *, warnings: list[str] | None = None):
         super().__init__(message)
         self.warnings = warnings or []
-
-
-def _plan_hint(result: PlanResult) -> dict[str, str]:
-    return {"next": f"review the diffs, then `transform apply {result.plan_id}`"}
 
 
 def _record_build_spend(
@@ -1732,7 +1650,11 @@ def _definitions_from_payload(
 
     if definitions_file is None:
         return []
-    raw = sys.stdin.read() if definitions_file == "-" else _read_file(definitions_file)
+    raw = (
+        sys.stdin.read()
+        if definitions_file == "-"
+        else read_payload_file(definitions_file)
+    )
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -1741,68 +1663,3 @@ def _definitions_from_payload(
     if not isinstance(entries, list):
         raise ValueError('definitions payload must be {"definitions": [...]}')
     return semantic_mod.parse_definition_payload(entries)
-
-
-def _edits_from_payload(
-    edits_file: str | None, default_kind: EditKind | None = None
-) -> list[PlanEdit]:
-    """Read the agent-authored edits payload (a file path, or ``-`` for stdin).
-
-    Shape: ``{"edits": [{"path": ..., "kind": ..., "op": ..., "content": ...},
-    ...]}``. ``op`` defaults to ``"upsert"`` (create or update): those carry
-    ``content``. An ``op`` of ``"delete"`` removes the file and carries no
-    ``content``. ``kind`` may be omitted when the command implies it (semantic
-    define/update).
-    """
-
-    if edits_file is None:
-        return []
-    raw = sys.stdin.read() if edits_file == "-" else _read_file(edits_file)
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"edits payload is not valid JSON: {exc}") from exc
-    entries = payload.get("edits") if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        raise ValueError('edits payload must be {"edits": [...]}')
-
-    edits: list[PlanEdit] = []
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, dict) or "path" not in entry:
-            raise ValueError(f"edits[{i}] needs at least a path")
-        try:
-            op = EditOp(entry.get("op") or EditOp.UPSERT.value)
-        except ValueError as exc:
-            raise ValueError(
-                f"edits[{i}] has an unknown op '{entry.get('op')}': one of "
-                + ", ".join(o.value for o in EditOp)
-            ) from exc
-        kind = entry.get("kind") or default_kind
-        if kind is None:
-            raise ValueError(
-                f"edits[{i}] needs a kind: one of "
-                + ", ".join(k.value for k in EditKind)
-            )
-        has_content = "content" in entry
-        if op is EditOp.UPSERT and not has_content:
-            raise ValueError(f"edits[{i}] is an upsert and needs content")
-        if op is EditOp.DELETE and has_content:
-            raise ValueError(f"edits[{i}] is a delete and must not carry content")
-        edits.append(
-            PlanEdit(
-                path=entry["path"],
-                kind=EditKind(kind),
-                op=op,
-                new_content=entry.get("content"),
-            )
-        )
-    return edits
-
-
-def _read_file(path: str) -> str:
-    from pathlib import Path
-
-    p = Path(path)
-    if not p.is_file():
-        raise ValueError(f"edits file not found: {path}")
-    return p.read_text(encoding="utf-8")

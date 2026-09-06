@@ -1280,9 +1280,9 @@ class DexEngine:
     ) -> PlanResult:
         """Plan native semantic-document edits on the semantic-layer axis."""
 
-        from .transform import commands as transform
+        from .transform import native_semantic
 
-        return transform.semantic_ossie(self, intent, edits, mode=mode)
+        return native_semantic.semantic_ossie(self, intent, edits, mode=mode)
 
     # --- lifecycle ------------------------------------------------------------
 

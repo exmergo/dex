@@ -26,6 +26,7 @@ import sys
 
 from . import command_args
 from . import envelope as env
+from .config import SEMANTIC_PROJECT_FORMATS
 from .engine import DexEngine
 from .guards.cost_guard import ConfirmationRequiredError, CostGuardError
 from .guards.dialect import DialectDependencyError
@@ -69,7 +70,10 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "place",
         "test",
     ],
-    "semantic": ["define", "update", "plan", "ossie"],
+    # `define`/`update`/`plan` author the dbt semantic layer; each vendor whose
+    # semantic layer is its own project format gets a subcommand of its own name
+    # for authoring that layer's native documents.
+    "semantic": ["define", "update", "plan", *SEMANTIC_PROJECT_FORMATS],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
     # `schema`/`volume`/`grain`/`semantic` are the per-axis deep detectors;
@@ -516,7 +520,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     # away: never by going unmentioned.
                     sp.add_argument("--definitions-file", default=None)
                     sp.add_argument("--no-parse", action="store_true", default=False)
-                if group == "semantic" and name == "ossie":
+                if group == "semantic" and name in SEMANTIC_PROJECT_FORMATS:
+                    # Whole documents in, so no `--definitions-file`: a native
+                    # document is authored as a unit, and the mode the dbt
+                    # routes carry in their subcommand name is an argument here.
                     sp.add_argument(
                         "mode",
                         nargs="?",
@@ -668,7 +675,6 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
-        ("semantic", "ossie"): "cmd_semantic_ossie",
     }
     # `transform references` is routed before the authoring table and from its
     # own module on purpose, the same trade `explore semantic` makes above. It
@@ -681,14 +687,20 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
         return cmd_references(args, engine)
 
+    # Native semantic authoring is routed around the table for the same trade,
+    # and without `ensure_dialect_available`: it authors whole documents through
+    # the vendor's own reader, so structure and integrity need only that
+    # vendor's extra. Parsing a SQL expression inside a document is optional and
+    # names its own skip when the dialect engine is absent, which is a weaker
+    # floor than the dbt authoring routes below can accept.
+    if args.group == "semantic" and args.subcommand in SEMANTIC_PROJECT_FORMATS:
+        from .transform.native_semantic import cmd_semantic_ossie
+
+        return cmd_semantic_ossie(args, engine)
+
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
-        # Native Ossie structure/integrity validation needs only [ossie]. SQL
-        # expression parsing is optional and produces a named skip when [sql]
-        # is absent, so this one authoring route must not impose the connector
-        # dialect floor used by dbt transformations.
-        if (args.group, args.subcommand) != ("semantic", "ossie"):
-            ensure_dialect_available()
+        ensure_dialect_available()
         from .transform import commands as transform_cmds
 
         return getattr(transform_cmds, handler)(args, engine)
