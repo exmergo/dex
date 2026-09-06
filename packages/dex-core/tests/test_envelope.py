@@ -8,6 +8,7 @@ import json
 import pytest
 
 from exmergo_dex_core import envelope as env
+from exmergo_dex_core import results
 
 
 def test_envelope_round_trips_to_json():
@@ -198,3 +199,58 @@ def test_reason_is_none_outside_error_status():
     assert env.ok().reason is None
     assert env.needs_confirmation().reason is None
     assert env.not_implemented("x").reason is None
+
+
+# --- the two shapes of a priced second phase ---------------------------------
+
+
+class _Findings(results.Result):
+    """A result with a payload of its own, so key collisions would show."""
+
+    def data(self):
+        return {"findings": ["a", "b"], "axes_run": ["schema"]}
+
+
+def _request(estimate: float) -> results.ConfirmationRequest:
+    return results.ConfirmationRequest(
+        cost=env.Cost(paradigm=env.Paradigm.BYTES_SCANNED, estimate=estimate),
+        data={
+            "command": "maintain check",
+            "estimated_bytes": estimate,
+            "axes": ["grain"],
+        },
+    )
+
+
+def test_an_unrequested_paid_phase_is_an_offer_on_a_complete_answer():
+    """`ok`, because the caller got what they asked for.
+
+    Reporting a finished free sweep as `needs_confirmation` teaches a caller to
+    confirm work that costs nothing, which is the habit the handshake depends on
+    them not having.
+    """
+
+    result = _Findings(pending_offer=_request(4096.0))
+    envelope = results.to_envelope(result)
+
+    assert envelope.status is env.Status.OK
+    assert envelope.data["findings"] == ["a", "b"]
+    assert envelope.data["offer"]["estimated_bytes"] == 4096.0
+    # The estimate never reaches `cost`, where on an `ok` it would read as what
+    # this run already spent.
+    assert envelope.cost.estimate is None
+
+
+def test_a_requested_paid_phase_still_waits_on_confirmation():
+    result = _Findings(pending_confirmation=_request(4096.0))
+    envelope = results.to_envelope(result)
+
+    assert envelope.status is env.Status.NEEDS_CONFIRMATION
+    assert envelope.cost.estimate == 4096.0
+    assert "offer" not in envelope.data
+
+
+def test_a_result_cannot_both_wait_and_offer():
+    result = _Findings(pending_confirmation=_request(1.0), pending_offer=_request(1.0))
+    with pytest.raises(ValueError, match="cannot both"):
+        results.to_envelope(result)

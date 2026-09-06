@@ -249,6 +249,77 @@ def test_scope_limits_the_scan(maintain_repo):
     assert payload["data"]["finding_count"] == 0
 
 
+def test_fully_null_join_side_columns_name_the_failed_join(maintain_repo):
+    """A left join that matches no rows leaves every projected right-side
+    column NULL; the finding must retain the join that explains the symptom."""
+
+    maintain_repo.sql(
+        "CREATE TABLE failed_join_orders AS "
+        "SELECT o.order_id, o.customer_id, c.name AS customer_name "
+        "FROM orders o LEFT JOIN customers c ON 1 = 0"
+    )
+    rc, payload = maintain_repo.dex("explore", "map", "--verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "grain", "failed_join_orders")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [
+        finding
+        for finding in payload["data"]["findings"]
+        if finding["code"] == "fully_null_column"
+        and finding["identifier"] == "warehouse.main.failed_join_orders"
+    ]
+    assert [finding["column"] for finding in findings] == ["customer_name"]
+    assert findings[0]["severity"] == "high"
+    assert any(
+        join["to_dataset"] == "warehouse.main.customers"
+        for join in findings[0]["data"]["joins"]
+    )
+
+
+def test_mostly_null_column_is_a_low_severity_near_miss(maintain_repo):
+    maintain_repo.sql(
+        "CREATE TABLE optional_values AS "
+        "SELECT i AS id, CASE WHEN i <= 96 THEN NULL ELSE 'present' END AS note "
+        "FROM range(1, 101) t(i)"
+    )
+    rc, payload = maintain_repo.dex("explore", "map")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "grain", "optional_values")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [
+        finding
+        for finding in payload["data"]["findings"]
+        if finding["identifier"] == "warehouse.main.optional_values"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["code"] == "mostly_null_column"
+    assert findings[0]["column"] == "note"
+    assert findings[0]["severity"] == "low"
+    assert findings[0]["data"]["null_fraction"] == 0.96
+
+
+def test_empty_relation_reports_no_rows_once(maintain_repo):
+    maintain_repo.sql("CREATE TABLE empty_result (id INTEGER, detail VARCHAR)")
+    rc, payload = maintain_repo.dex("explore", "map")
+    assert rc == 0 and payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "grain", "empty_result")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [
+        finding
+        for finding in payload["data"]["findings"]
+        if finding["identifier"] == "warehouse.main.empty_result"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["code"] == "no_rows"
+    assert findings[0]["column"] is None
+
+
 def test_metadata_only_baseline_warns_grain_has_nothing(dex, tmp_path):
     import duckdb
 
@@ -266,7 +337,8 @@ def test_metadata_only_baseline_warns_grain_has_nothing(dex, tmp_path):
 
     rc, payload = dex("--repo-root", str(root), "maintain", "grain")
     assert rc == 0 and payload["status"] == "ok"
-    assert payload["data"]["finding_count"] == 0
+    assert payload["data"]["finding_count"] == 1
+    assert payload["data"]["findings"][0]["code"] == "no_rows"
     assert any("metadata-only" in w for w in payload["warnings"])
 
 

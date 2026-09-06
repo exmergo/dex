@@ -13,6 +13,7 @@ import json
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -2163,6 +2164,87 @@ def test_a_format_that_declines_the_write_tier_gets_no_mechanical_edit(
     assert any("does not implement the write tier" in w for w in declined.warnings)
 
 
+class _DeclaringProject(_NotEditableProject):
+    """Tier 3 for one channel: it places a declaration and no staging model.
+
+    The shape the placement seam exists for. It can receive an edit to the file a
+    person wrote, and it cannot receive a model, because its models are nodes in a
+    graph that regenerates.
+    """
+
+    name = "declaring"
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def load(self):
+        from exmergo_dex_core.dbt_project import SourceFile, content_hash
+
+        files = {}
+        for path in sorted((self._root / "declarations").glob("*.yml")):
+            content = path.read_text(encoding="utf-8")
+            key = f"declarations/{path.name}"
+            files[key] = SourceFile(
+                path=key, content=content, sha256=content_hash(content)
+            )
+        return SimpleNamespace(root=str(self._root), files=files)
+
+    def edit_path(self, kind, model):
+        from exmergo_dex_core.transform.plans import EditKind
+
+        return f"declarations/{model}.yml" if kind is EditKind.SCHEMA_YML else None
+
+    def editing_surface(self):
+        return ["declarations"]
+
+    def write_edits(self, edits, project_dir=None, *, confirmed: bool = False):
+        from exmergo_dex_core.dbt_project import ApplyResult
+
+        return ApplyResult(written=[], diffs=[], conflicts=[])
+
+
+def test_a_format_that_places_only_declarations_never_receives_dbt_sql(
+    dbt_project_dir: Path,
+):
+    """Widening the write path opened no channel for dbt SQL into a foreign tree.
+
+    A format that answers `None` for the staging model now receives a mechanical
+    edit rather than advice, which is the point of asking placement per kind. What
+    must not follow is dex authoring the half the format declined: the scaffold
+    generates dbt SQL alongside its path, and a tree whose models are graph nodes
+    has nowhere to put it and nothing that would read it.
+
+    Paired with the tier-2 assertion above rather than replacing it. That one pins
+    that declining the write tier declines everything; this one pins that
+    declining one kind declines only that kind.
+    """
+
+    store, _ = _reconcile_fixtures(dbt_project_dir)
+    root = dbt_project_dir.parent
+    declarations = root / "declarations"
+    declarations.mkdir()
+    (declarations / "orders.yml").write_text(
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n      - name: id\n",
+        encoding="utf-8",
+    )
+
+    result = DexEngine(
+        config=DexConfig(dbt_project_dir="analytics"),
+        store=store,
+        repo_root=str(root),
+        project_format=_DeclaringProject(root),
+    ).reconcile()
+
+    assert [p.kind for p in result.proposals] == ["mechanical"], result.proposals
+    assert result.plan_id is not None
+    stored = store.latest_plan()
+    assert [edit.path for edit in stored.edits] == ["declarations/orders.yml"]
+    for edit in stored.edits:
+        assert edit.kind.value != "model_sql"
+        assert "{{ source(" not in (edit.new_content or "")
+        assert "{{ ref(" not in (edit.new_content or "")
+
+
 def test_profiles_edit_never_carries_a_credential_into_a_diff(dbt_project_dir: Path):
     # profiles.yml is an editable surface, but a credential must never reach the
     # plan diff (and thus agent context). An inlined literal is refused whether
@@ -3083,6 +3165,42 @@ def test_bigquery_generated_sql_is_select_only(fake_bq_client):
     assert "tc_da_" in sql and "tp_d_" in sql and "tg_h_" in sql
     assert "TIMESTAMP_TRUNC" in sql and "TIMESTAMP_DIFF" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
+
+
+def test_bigquery_month_gap_on_a_timestamp_column_never_asks_timestamp_diff():
+    # TIMESTAMP_DIFF supports MICROSECOND through DAY only, so a MONTH part on
+    # a TIMESTAMP column is refused at job insert, and because the continuity
+    # subqueries ride the same flat SELECT as every other aggregate, that one
+    # expression degraded the entire table to metadata-only (#430). The
+    # expected form diffs the periods' UTC dates instead; day and hour keep
+    # TIMESTAMP_DIFF, and DATETIME and DATE columns are untouched.
+    from exmergo_dex_core.adapters import bigquery as bq
+    from exmergo_dex_core.adapters.base import ColumnMeta
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = bq.BigQueryAdapter.__new__(bq.BigQueryAdapter)
+
+    def build(data_type: str) -> str:
+        col = ColumnMeta(name="t", data_type=data_type, nullable=True, ordinal=1)
+        sql, _plan = bq.BigQueryAdapter._build_aggregate_sql(
+            adapter, "p.d.t", [col], set(), set(), set(), set(), {"t"}
+        )
+        assert assert_select_only(sql, dialect="bigquery") == sql
+        return sql
+
+    ts = build("TIMESTAMP")
+    assert "TIMESTAMP_DIFF(period, prev_period, MONTH)" not in ts
+    assert "DATE_DIFF(DATE(period), DATE(prev_period), MONTH)" in ts
+    assert "TIMESTAMP_DIFF(period, prev_period, DAY)" in ts
+    assert "TIMESTAMP_DIFF(period, prev_period, HOUR)" in ts
+
+    dt = build("DATETIME")
+    assert "DATETIME_DIFF(period, prev_period, MONTH)" in dt
+    assert "DATE_DIFF(DATE(" not in dt
+
+    d = build("DATE")
+    assert "DATE_DIFF(period, prev_period, MONTH)" in d
+    assert "DATE_DIFF(DATE(" not in d
 
 
 def test_select_only_guard_rejects_bigquery_writes_and_scripts():
@@ -5765,9 +5883,7 @@ semantic_model:
 """
 
 
-def test_invalid_ossie_authoring_stores_no_plan_and_writes_nothing(
-    tmp_path, capsys
-):
+def test_invalid_ossie_authoring_stores_no_plan_and_writes_nothing(tmp_path, capsys):
     """Family 4: validation precedes both plan storage and source writes."""
 
     _ossie_repo(tmp_path, _OSSIE_DOCUMENT)
@@ -5775,11 +5891,7 @@ def test_invalid_ossie_authoring_stores_no_plan_and_writes_nothing(
     edits = tmp_path / "invalid-ossie-edits.json"
     edits.write_text(
         json.dumps(
-            {
-                "edits": [
-                    {"path": "layer.ossie.yaml", "content": "version: wrong\n"}
-                ]
-            }
+            {"edits": [{"path": "layer.ossie.yaml", "content": "version: wrong\n"}]}
         ),
         encoding="utf-8",
     )
@@ -5861,9 +5973,7 @@ def test_stale_ossie_authoring_refuses_the_whole_apply(tmp_path, capsys):
             duckdb={"path": "demo.duckdb"},
             semantic={
                 "vendor": "ossie",
-                "ossie": {
-                    "files": ["first.ossie.yaml", "second.ossie.yaml"]
-                },
+                "ossie": {"files": ["first.ossie.yaml", "second.ossie.yaml"]},
             },
         ),
         tmp_path,
@@ -5903,9 +6013,7 @@ def test_stale_ossie_authoring_refuses_the_whole_apply(tmp_path, capsys):
 
     first.write_text("# human edit\n" + _OSSIE_DOCUMENT, encoding="utf-8")
     before_second = second.read_bytes()
-    applied = _run(
-        ["--repo-root", str(tmp_path), "transform", "apply"], capsys
-    )
+    applied = _run(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
 
     assert applied["status"] == "needs_confirmation"
     assert second.read_bytes() == before_second
@@ -6202,6 +6310,74 @@ def test_api_verify_checkpoint_keeps_what_it_already_paid_for(
     cached = FilesystemStore(tmp_path).load_cache()
     assert cached is not None and cached.datasets
     assert any("saved unverified" in note for note in result.notes)
+
+
+def test_api_unrequested_paid_work_is_offered_not_demanded(
+    api_engine, fake_bq_client, tmp_path
+):
+    """Family 2: the handshake guards spend, not the delivery of free answers.
+
+    `maintain check` completes its free axes on every call. Returning those
+    inside a `needs_confirmation` envelope asked the caller to confirm work they
+    had not requested in order to read work that cost nothing, which teaches the
+    habit of confirming reflexively. The guarantee that matters is unchanged and
+    asserted here: no scan runs, and the estimate is surfaced first. What
+    changed is that the free answer is delivered as one.
+    """
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+    from exmergo_dex_core.results import to_envelope
+
+    now = datetime.now(UTC).isoformat()
+    FilesystemStore(tmp_path).save_snapshot(
+        Snapshot(
+            created_at=now,
+            connector="bigquery",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="test-proj.shop.customers",
+                        row_count=100,
+                        byte_size=5_000,
+                        columns=[
+                            ColumnProfile(
+                                name="id",
+                                data_type="INTEGER",
+                                nullable=False,
+                                null_fraction=0.0,
+                                distinct_count=100,
+                                distinct_count_exact=True,
+                                is_unique=True,
+                            )
+                        ],
+                        candidate_keys=[["id"]],
+                        grain=["id"],
+                        profiled_at=now,
+                    )
+                ]
+            ),
+            warehouse_from="cache",
+        )
+    )
+
+    with api_engine() as engine:
+        from exmergo_dex_core.maintain import commands as maintain_cmds
+
+        result = maintain_cmds.check(engine)
+
+    # Nothing dex was not asked to do has run, and nothing was billed.
+    assert result.pending_confirmation is None
+    assert result.pending_offer is not None
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    assert result.spend is None
+
+    envelope = to_envelope(result)
+    assert envelope.status is env.Status.OK
+    # Cost before spend still holds: the price is on the response, in the one
+    # place that means "not yet spent" rather than "already spent".
+    assert envelope.data["offer"]["estimated_bytes"] > 0
+    assert envelope.cost.estimate is None
 
 
 def test_api_pii_stays_flagged_and_never_surfaced(duckdb_file: Path):

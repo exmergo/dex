@@ -93,6 +93,11 @@ proposal, with no edits and no stored plan, and a warning naming the format and 
 tier it declined. The findings themselves are still surfaced: declining the write
 tier removes dex's authority to author an edit, not your need to see the drift.
 
+Declining the tier and declining one kind are different statements and they no longer
+produce the same outcome. A format that implements tier 3 and answers `None` for one
+kind has refused that artifact, not the write path, and reconcile still writes to the
+kinds it placed.
+
 That used to hold by accident. Reconcile's two mechanical write paths gated on the
 `models/staging/stg_<table>.*` scaffold convention and failed closed, so a generated
 tree was safe as long as its own directory naming happened not to collide, and a
@@ -273,8 +278,17 @@ keyspace.
 are not equally receivable and you are expected to differ across them. `SCHEMA_YML`
 is a mutation of a file you already have. `MODEL_SQL` carries dbt SQL that dex
 generates alongside the path, so placement alone cannot open that channel: a format
-that places a staging model elsewhere gets the proposal as advice rather than having
-dbt written into its tree. One `None` and one path is the shape this exists for.
+that places a staging model elsewhere gets that half as advice rather than having
+dbt written into its tree. One `None` and one path is the shape this exists for, and
+the two halves are answered separately.
+
+Declining `MODEL_SQL` costs you the model and nothing else. Schema drift on a table
+you place a `SCHEMA_YML` for still arrives as a mechanical edit to that declaration,
+because a column appearing or disappearing upstream is a fact about the declaration
+rather than about dbt SQL. The proposal says in its own words that dex authored
+nothing for the model, so a reader can tell a half you declined from a half dex
+dropped. What lands in the declaration is described under
+[What reconcile writes into a declaration](#what-reconcile-writes-into-a-declaration).
 
 The kind list grows over time (`MACRO_SQL`, `SNAPSHOT_SQL`, `SEED_CSV`, `TEST_SQL`
 and `ANALYSIS_SQL` are all dbt-shaped artifacts a non-dbt format may have no
@@ -314,11 +328,10 @@ declaration narrower than the writer is not a modest one: it refuses the project
 config, the profiles and the package manifests at apply, every one of which is a path
 dex authors through a plan.
 
-**One thing dex still spells its own way.** The `unique` test edit finds your model
-inside the placed file by the file's own name (`declarations/orders.yml` means a
-model named `orders`). If you pack several models into one file, no entry matches and
-you get a warning instead of an edit, which is a refusal to guess rather than a wrong
-write.
+**One thing dex still spells its own way.** Every edit finds your model inside the
+placed file by the file's own name (`declarations/orders.yml` means a model named
+`orders`). If you pack several models into one file, no entry matches and you get a
+warning instead of an edit, which is a refusal to guess rather than a wrong write.
 
 **That edit is checked against your declarations before it is proposed.** If
 `definitions()` reports a composite grain covering the column, no column-level
@@ -338,6 +351,57 @@ their member columns. Splitting one grain across several entries is worse than
 leaving it out, because each entry then claims a column is unique on its own, which
 is a stronger claim than the one you made and the one that gets acted on. The
 conformance suite checks both shapes.
+
+## What reconcile writes into a declaration
+
+Your file is one a person wrote and nothing regenerates, so dex splices it: the bytes
+that declare the drifted column change and every other byte stays where it was.
+Comments, descriptions, key order and formatting survive, and the diff a reviewer
+reads is the size of the change rather than the size of the file.
+
+| finding | what lands |
+|---|---|
+| `column_added` | a column entry at the end of the model's `columns:`, carrying `meta.contains_pii` and the category when the name scores as PII |
+| `column_dropped` | the column's entry, removed with the lines that only described it |
+| `nullability_changed` | `not_null` added or removed on that column, in whichever direction the source moved |
+| `column_retyped` | nothing, and a proposal saying why |
+| `key_lost_uniqueness` | `unique` added to that column, subject to the declared-grain check below |
+
+**A retype is the one dex declines, and the reason is worth stating.** Nothing dex
+authors declares a type, and the type it holds is the connector's own spelling rather
+than a canonical one: Snowflake reports `NUMBER(38,0)` and `NUMBER(10,2)` both as
+`FIXED`, BigQuery reports a repeated record as `ARRAY<STRUCT>`, ClickHouse carries
+nullability inside the type as `Nullable(Int64)`. A type written from that would be
+one warehouse's word for the column rather than the column's, so the change is
+surfaced with both spellings named and the edit is yours to make.
+
+Two consequences of that last point are worth knowing before you read a drift report:
+
+- On **ClickHouse**, nullability *is* the type constructor, so a column that starts
+  or stops accepting nulls is reported as `column_retyped` and never as
+  `nullability_changed`. It therefore arrives as advice where every other connector
+  produces an edit.
+- On **Snowflake**, a precision or scale change produces no schema finding at all,
+  because both spellings render identically.
+
+**The mechanics, for a format whose files dex did not write.** A new column entry
+takes its indent from the entries already there rather than from a convention, and a
+model declaring no columns is declined instead of being given a `columns:` block it
+never had. A `tests` list stays flow if it was flow and block if it was block, the
+file's own choice between `tests` and `data_tests` is kept, and removing the last
+test removes the key rather than leaving an empty list. A test written as a mapping
+is counted and never rewritten, so a configured `accepted_values` survives an edit to
+the plain names beside it. A file dex cannot span safely, one indented with tabs, one
+holding several YAML documents, or one using anchors and aliases, is declined by name
+rather than spliced at an offset nobody chose. Every result is re-parsed and compared
+against what the edit intended before it can reach the plan store.
+
+**A table that drifted on two axes arrives as one edit.** Schema drift and a lost
+unique key both land in the same declaration, and two edits on one path would pin the
+same content hash, so the second would overwrite the first and the change a reviewer
+approved would not be the change that got written. Everything folds into one edit per
+path, and an edit that would have reproduced the file you already have is dropped
+rather than offered.
 
 ## The one rule that is not visible in the signatures
 

@@ -65,6 +65,11 @@ Offer it once at setup. It is not something to run before an ordinary command.
   also warns when the cache it pinned is thin (objects without column detail) or
   older than the profile freshness window, because either makes an "accept
   current state" only partly true.
+- `maintain snapshot --project-only` is for a project-only refactor, such as
+  moved model files or a dbt project rename. It refreshes transform and semantic
+  fingerprints without opening the warehouse, carrying the previous warehouse
+  evidence and original capture time forward instead. It requires an existing
+  snapshot and refuses connection-target flags.
 - `maintain check` is the everyday entry point: it sweeps every axis and returns
   a report ranked by blast radius. Read-only.
 - `maintain schema [<objects>]` detects **structural drift**: source columns and
@@ -105,23 +110,33 @@ The axes split:
 - **Schema, volume, and the reference/definition half of semantic are free**
   everywhere: they read metadata and the snapshot, and run immediately.
 - **Grain and the dimension-cardinality half of semantic scan the warehouse**, so
-  on a metered connector they run the two-step handshake. The first call returns
-  `needs_confirmation` with an estimate in `cost.estimate` (and a per-table
-  breakdown). Surface it to the user in human units, get an explicit budget, and
-  re-issue the same command with `--confirm --budget <magnitude>` in the
-  paradigm's unit (bytes on BigQuery, warehouse-seconds on Snowflake and
-  Databricks, compute-seconds on Redshift, database-seconds on Postgres and
-  ClickHouse).
-  Never invent a budget the user did not agree to, and never retry with a
-  raised budget on an over-ceiling refusal without asking. An over-ceiling
+  on a metered connector they run the two-step handshake. Asked for directly,
+  `maintain grain` returns `needs_confirmation` with an estimate in
+  `cost.estimate` (and a per-table breakdown). Surface it to the user in human
+  units, get an explicit budget, and re-issue the same command with
+  `--confirm --budget <magnitude>` in the paradigm's unit (bytes on BigQuery,
+  warehouse-seconds on Snowflake and Databricks, compute-seconds on Redshift,
+  database-seconds on Postgres and
+  ClickHouse). Never invent a budget the user did not agree
+  to, and never retry with a raised budget on an over-ceiling refusal without
+  asking. An over-ceiling
   refusal carries a calibration line from `.dex/spend.jsonl` (what this
   connector's recent commands billed as a fraction of estimate, or a sentence
   saying there is too little history to say): relay it, and note that the
   ceiling binds on the estimate, so a budget set at that fraction of the
   estimate is refused again.
-- **`check` is two-phase on a metered connector**: the free axes complete
-  immediately and their findings ride along in the `needs_confirmation` envelope,
-  with one combined estimate for the scanning axes. Confirm to complete the sweep.
+- **`check` and `semantic` answer first and offer second.** Their free axes
+  complete on every call, so the envelope is `ok` and the findings in it are
+  final. The price of the scanning axes sits in `data.offer`, with `axes` naming
+  what it would add; `data.axes_run` names what already ran. Confirming is a
+  choice, not a required next step: quote the estimate, say which axes are still
+  dark, and let the user decide. A triage pass that stops at the free axes is a
+  complete piece of work, not an abandoned one.
+- **Read `warnings` on these responses, always.** They carry the reasons the
+  baseline may no longer describe the warehouse (a cache newer than the
+  snapshot, a baseline pinned from a stale cache), which bound every finding
+  above them. A stale baseline is often the most important line in the response
+  and it is never in `findings`.
 
 On DuckDB everything is free and local, so nothing prompts.
 
@@ -136,9 +151,12 @@ them.
 
 Reconcile tags every proposal by `kind`, because the fix differs sharply by axis:
 
-- **`mechanical`**: schema drift on a dex-scaffolded staging model re-scaffolds
-  the model from the drifted source. High-confidence, but still a reviewable diff:
-  read it for hand-written logic the scaffold cannot know about.
+- **`mechanical`**: schema drift reconciles in one of two shapes. On a
+  dex-scaffolded staging model it re-scaffolds the model from the drifted source;
+  on a project format that places a declaration but authors no staging model, it
+  edits the drifted columns into that declaration and says so. High-confidence, but
+  still a reviewable diff: read it for hand-written logic the scaffold cannot know
+  about.
 - **`advisory`**: grain, volume, and semantic drift are decisions, not auto-fixes
   (dex cannot dedup your warehouse or decide whether a new `'refunded'` status
   belongs in a metric). The proposal is the decision surfaced, at most backed by a
@@ -147,6 +165,13 @@ Reconcile tags every proposal by `kind`, because the fix differs sharply by axis
   column, no column-level `unique` is proposed on it, and the warning names the
   combination so you can tell "re-baseline, this is still the grain" from
   "something relied on that column alone".
+
+**A type change is advisory on every format.** Nothing dex writes declares a type,
+and the type it holds is the connector's own spelling rather than a canonical one
+(Snowflake reports `NUMBER(38,0)` and `NUMBER(10,2)` both as `FIXED`), so the
+proposal names both spellings and the edit is yours. One consequence to know: on
+ClickHouse nullability is part of the type, so a column that starts accepting nulls
+is reported as a retype and gets advice where other connectors get an edit.
 
 When reconcile produces edits it stores them as a plan and prints a `plan_id`.
 Apply them with `transform apply <plan-id>` (the one apply door): a human edit made

@@ -95,6 +95,7 @@ if TYPE_CHECKING:
         PlanResult,
         PropagationResult,
     )
+    from .transform.semantic import DefinitionEdit
 
 
 class DexEngine:
@@ -1076,10 +1077,10 @@ class DexEngine:
 
     # --- maintain -------------------------------------------------------------
 
-    def snapshot(self) -> SnapshotResult:
+    def snapshot(self, *, project_only: bool = False) -> SnapshotResult:
         from .maintain import commands as maintain
 
-        return maintain.snapshot(self)
+        return maintain.snapshot(self, project_only=project_only)
 
     def check(self, objects: list[str] | None = None) -> DriftResult:
         from .maintain import commands as maintain
@@ -1233,25 +1234,46 @@ class DexEngine:
         return transform.deps(self)
 
     def semantic_define(
-        self, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+        self,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        definitions: list[DefinitionEdit] | None = None,
+        no_parse: bool = False,
     ) -> PlanResult:
         from .transform import commands as transform
 
-        return transform.semantic_define(self, intent, edits, no_parse=no_parse)
+        return transform.semantic_define(
+            self, intent, edits, definitions=definitions, no_parse=no_parse
+        )
 
     def semantic_update(
-        self, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+        self,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        definitions: list[DefinitionEdit] | None = None,
+        no_parse: bool = False,
     ) -> PlanResult:
         from .transform import commands as transform
 
-        return transform.semantic_update(self, intent, edits, no_parse=no_parse)
+        return transform.semantic_update(
+            self, intent, edits, definitions=definitions, no_parse=no_parse
+        )
 
     def semantic_plan(
-        self, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+        self,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        definitions: list[DefinitionEdit] | None = None,
+        no_parse: bool = False,
     ) -> PlanResult:
         from .transform import commands as transform
 
-        return transform.semantic_plan(self, intent, edits, no_parse=no_parse)
+        return transform.semantic_plan(
+            self, intent, edits, definitions=definitions, no_parse=no_parse
+        )
 
     def semantic_ossie(
         self, mode: str, intent: str, edits: list[PlanEdit]

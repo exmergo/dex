@@ -56,6 +56,93 @@ def test_snapshot_pins_cache_and_fingerprints_layers(maintain_repo):
     assert revenue.input_measures == ["order_amount"]
 
 
+def test_project_only_snapshot_carries_warehouse_forward_without_an_adapter(
+    maintain_repo, monkeypatch
+):
+    """A project refactor must not turn a project fingerprint refresh into a scan.
+
+    The adapter is deliberately made unusable after the initial baseline.  The
+    command still has to record the moved model file while preserving warehouse
+    evidence, including its original cache capture time.
+    """
+
+    from exmergo_dex_core.engine import DexEngine
+
+    maintain_repo.snapshot()
+    store = FilesystemStore(maintain_repo.root)
+    before = store.load_snapshot()
+    before_warehouse = before.warehouse.model_dump(mode="json")
+    before_cache_updated_at = before.cache_updated_at
+    before_warehouse_from = before.warehouse_from
+
+    moved = maintain_repo.root / "models" / "reorganized"
+    moved.mkdir()
+    (maintain_repo.root / "models" / "staging" / "stg_orders.sql").rename(
+        moved / "stg_orders.sql"
+    )
+    project = maintain_repo.root / "dbt_project.yml"
+    project.write_text(
+        project.read_text(encoding="utf-8").replace(
+            "name: maintain_test", "name: refactored_project"
+        ),
+        encoding="utf-8",
+    )
+
+    def no_adapter(*_args, **_kwargs):
+        pytest.fail("--project-only must not open a warehouse adapter")
+
+    from exmergo_dex_core import cli
+
+    monkeypatch.setattr(DexEngine, "_adapter", no_adapter)
+    monkeypatch.setattr(
+        cli,
+        "ensure_dialect_available",
+        lambda: pytest.fail("--project-only must not load a warehouse dialect"),
+    )
+    rc, payload = maintain_repo.dex("maintain", "snapshot", "--project-only")
+
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert payload["cost"]["paradigm"] == "free_local"
+    assert payload["cost"]["estimate"] is None
+    assert any("carried forward" in warning for warning in payload["warnings"])
+    after = store.load_snapshot()
+    assert after.warehouse.model_dump(mode="json") == before_warehouse
+    assert after.cache_updated_at == before_cache_updated_at
+    assert after.warehouse_from == before_warehouse_from
+    assert "models/reorganized/stg_orders.sql" in after.transform_layer.files
+
+
+def test_project_only_snapshot_rejects_warehouse_target_options(maintain_repo):
+    """A warehouse target would make a connection-free refresh ambiguous."""
+
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex(
+        "maintain",
+        "snapshot",
+        "--project-only",
+        "--path",
+        str(maintain_repo.db_path),
+    )
+
+    assert rc == 1
+    assert payload["reason"] == "request"
+    assert "--project-only" in " ".join(payload["errors"])
+
+
+def test_project_only_snapshot_leaves_an_unchanged_warehouse_drift_free(maintain_repo):
+    """Refreshing only project fingerprints does not manufacture warehouse drift."""
+
+    maintain_repo.snapshot()
+    rc, payload = maintain_repo.dex("maintain", "snapshot", "--project-only")
+    assert rc == 0 and payload["status"] == "ok", payload
+
+    rc, payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0 and payload["status"] == "ok", payload
+    for axis in ("schema", "volume", "grain"):
+        assert payload["data"]["axes"][axis]["finding_count"] == 0
+
+
 def test_layer_notes_are_collected_from_every_side_and_deduplicated():
     """Both layers a command read, baseline and current, with repeats folded.
 

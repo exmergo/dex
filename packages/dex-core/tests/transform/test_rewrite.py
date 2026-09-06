@@ -15,8 +15,12 @@ import pytest
 
 from exmergo_dex_core.transform.rewrite import (
     RewriteError,
+    column_anchor,
+    column_tests,
+    column_tests_span,
     jinja_names,
     output_columns,
+    prevailing_test_key,
     project_column_in_sql,
     rename_column_in_sql,
     splice,
@@ -207,6 +211,150 @@ class TestYaml:
 
         assert "stg_orders" not in removed
         assert "stg_customers" in removed
+
+
+class TestColumnDeclarations:
+    """Editing one column entry inside a schema.yml, by span.
+
+    Every case here is the same assertion as the rest of the module: the bytes
+    that declared the thing changed, and every other byte is where it was. What
+    makes these worth their own class is that the target is a hand-written file,
+    so a comment surviving is part of the contract rather than a nicety.
+    """
+
+    FLOW = (
+        "version: 2\n"
+        "\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      # the natural key\n"
+        "      - name: order_id\n"
+        "        tests: [not_null]\n"
+        "      - name: customer_id\n"
+        "        description: who ordered\n"
+        "        tests: [not_null]\n"
+        "      - name: status\n"
+        "\n"
+    )
+
+    BLOCK = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        tests:\n"
+        "          - not_null\n"
+        "          - accepted_values:\n"
+        "              values: [1, 2]\n"
+    )
+
+    def _spliced(self, content, column, wanted, key="tests"):
+        current = column_tests(content, "orders", column)
+        span = column_tests_span(content, current, wanted, key=key)
+        return content if span is None else splice(content, [span])
+
+    def test_a_flow_list_gains_a_name_without_reflowing_its_line(self):
+        out = self._spliced(self.FLOW, "order_id", ["not_null", "unique"])
+
+        assert "        tests: [not_null, unique]\n" in out
+        assert "      # the natural key\n" in out
+        assert "        description: who ordered\n" in out
+
+    def test_removing_the_last_test_removes_the_key_not_its_contents(self):
+        out = self._spliced(self.FLOW, "customer_id", [])
+
+        assert "tests" not in out.split("- name: customer_id")[1].split("- name:")[0]
+        assert "        description: who ordered\n" in out
+        assert "tests: []" not in out
+
+    def test_a_column_with_no_test_list_gains_one_at_the_field_indent(self):
+        out = self._spliced(self.FLOW, "status", ["not_null"])
+
+        assert out.endswith("      - name: status\n        tests: [not_null]\n\n")
+
+    def test_two_columns_carrying_the_same_test_are_edited_independently(self):
+        content = (
+            "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+            "      - name: a\n        tests: [not_null]\n"
+            "      - name: b\n        tests: [not_null]\n"
+        )
+
+        out = self._spliced(content, "b", [])
+
+        # The reader scopes to one column's own span before it looks at a test,
+        # so the identical name on the sibling is never a candidate.
+        assert "      - name: a\n        tests: [not_null]\n" in out
+        assert out.endswith("      - name: b\n")
+
+    def test_a_configured_test_in_the_same_list_is_left_untouched(self):
+        out = self._spliced(
+            self.BLOCK, "order_id", ["not_null", "accepted_values", "unique"]
+        )
+
+        assert "          - accepted_values:\n              values: [1, 2]\n" in out
+        assert "          - unique\n" in out
+
+    def test_a_block_list_loses_only_the_item_named(self):
+        out = self._spliced(self.BLOCK, "order_id", ["accepted_values"])
+
+        assert "          - not_null\n" not in out
+        assert "          - accepted_values:\n              values: [1, 2]\n" in out
+
+    def test_a_new_column_takes_the_indent_the_file_already_uses(self):
+        content = (
+            "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+            "        - name: order_id\n"
+        )
+
+        at, indent = column_anchor(content, "orders")
+
+        # Eight spaces here, six in the fixtures above: read from the file rather
+        # than assumed, because these files are not ones dex wrote.
+        assert indent == "        "
+        assert splice(content, [(at, at, f"{indent}- name: discount\n")]).endswith(
+            "        - name: order_id\n        - name: discount\n"
+        )
+
+    def test_a_model_declaring_no_columns_has_no_anchor(self):
+        content = "version: 2\nmodels:\n  - name: orders\n"
+
+        # No precedent to read an indent from and no contract to keep current.
+        assert column_anchor(content, "orders") is None
+
+    def test_an_insertion_lands_before_the_blank_line_that_follows(self):
+        at, indent = column_anchor(self.FLOW, "orders")
+
+        out = splice(self.FLOW, [(at, at, f"{indent}- name: discount\n")])
+
+        assert out.endswith("      - name: status\n      - name: discount\n\n")
+
+    def test_a_file_keeps_the_test_spelling_it_already_uses(self):
+        assert prevailing_test_key(self.FLOW) == "tests"
+        assert (
+            prevailing_test_key(
+                "models:\n  - name: orders\n    columns:\n"
+                "      - name: a\n        data_tests: [not_null]\n"
+                "      - name: b\n        data_tests: [not_null]\n"
+            )
+            == "data_tests"
+        )
+        # No precedent falls back to what the scaffold writes.
+        assert prevailing_test_key("models: []\n") == "tests"
+
+    def test_a_list_that_already_says_it_produces_no_span(self):
+        current = column_tests(self.FLOW, "orders", "order_id")
+
+        assert column_tests_span(self.FLOW, current, ["not_null"], key="tests") is None
+
+    def test_more_than_one_change_at_a_time_is_refused(self):
+        current = column_tests(self.FLOW, "orders", "order_id")
+
+        with pytest.raises(RewriteError):
+            column_tests_span(
+                self.FLOW, current, ["unique", "relationships"], key="tests"
+            )
 
 
 class TestJinja:

@@ -73,6 +73,7 @@ def test_check_sweeps_all_axes_and_ranks_by_blast_radius(maintain_repo):
         "row_count_changed",
         "key_lost_uniqueness",
         "join_orphans_increased",
+        "fully_null_column",
         "definition_changed",
     }
     severities = [f["severity"] for f in findings]

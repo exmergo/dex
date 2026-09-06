@@ -37,7 +37,13 @@ from .. import command_args
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
-from ..errors import DexError, PrerequisiteError, ProjectError, RepoRootRequiredError
+from ..errors import (
+    DexError,
+    PrerequisiteError,
+    ProjectError,
+    RepoRootRequiredError,
+    RequestError,
+)
 from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
@@ -52,7 +58,7 @@ from .results import (
 )
 
 if TYPE_CHECKING:
-    from ..adapters.project import MaintainProject
+    from ..adapters.project import ExploreProject, MaintainProject
     from ..dbt_project import ProjectDefinitions
     from ..engine import DexEngine
     from .snapshot import SemanticLayer, TransformLayer
@@ -71,6 +77,33 @@ _NO_SNAPSHOT_ERROR = (
     "no drift baseline yet; run `maintain snapshot` first (ideally right after "
     "a known-good build)"
 )
+
+
+def _read_project(engine: DexEngine) -> tuple[ExploreProject | None, str | None]:
+    """The constructed project format, or why there is none.
+
+    The counterpart to :func:`_read_layers` for the commands that want the
+    format itself: its tier-1 declarations, or the instance to ask about the
+    write tier. Same shape and same reason, so there is one place deciding which
+    project failures degrade rather than one per call site.
+
+    ``definitions()`` never raises by contract, but the format holding it still
+    has to be built, and construction refuses coordinates it cannot honor: the
+    shipped dbt format has no project to read without a repo root. A host
+    pointed at a warehouse and a baseline with no repository is an ordinary
+    state, and nothing here needs a project to answer at all, so a format that
+    cannot be built costs the declarations and the write tier and nothing else.
+
+    Call it once per command and reuse the instance. A project is deliberately
+    not held across commands, because a previous command may have rewritten it,
+    but the expensive part is memoized inside the instance, so building it twice
+    in one command loads it twice.
+    """
+
+    try:
+        return engine.project_format(), None
+    except (ProjectError, RepoRootRequiredError, ValidationError) as exc:
+        return None, str(exc)
 
 
 def _read_layers(
@@ -375,7 +408,7 @@ def _stored_drift(store: MaintainStore) -> drift_mod.DriftReport | None:
         return None
 
 
-def snapshot(engine: DexEngine) -> SnapshotResult:
+def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult:
     """Capture the known-good baseline every drift axis is measured against.
 
     Prefers the exploration cache, which carries the grain and cardinality
@@ -388,36 +421,52 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
     config = engine.config
     warnings: list[str] = []
 
-    cache = readable_cache(store)
-    requested = engine.connector or config.connector
-    usable = cache is not None and bool(cache.datasets)
-    if usable and cache.provenance.connector not in (None, requested):
+    if project_only:
+        previous = _require_baseline(store)
+        # Copy the old warehouse block as a unit.  Project-only mode must not
+        # consult a cache (which may be newer) or a connector: the old evidence
+        # and the timestamp that tells a future check how old it is travel
+        # together.
+        warehouse = previous.warehouse.model_copy(deep=True)
+        connector = previous.connector
+        warehouse_from = previous.warehouse_from
+        cache_updated_at = previous.cache_updated_at
         warnings.append(
-            f"the exploration cache was mapped on '{cache.provenance.connector}' but "
-            f"the active connector is '{requested}'; capturing a fresh "
-            "metadata-only baseline instead"
+            "warehouse baseline was carried forward without re-measuring it; no "
+            "warehouse connection was opened and zero warehouse bytes were billed"
         )
-        usable = False
-
-    if usable:
-        warehouse = snapshot_mod.warehouse_from_cache(cache)
-        connector = cache.provenance.connector or requested
-        warehouse_from = "cache"
-        cache_updated_at = cache.provenance.updated_at
     else:
-        # No cache to pin: capture directly. Metadata is free on every
-        # connector, so this path needs no confirm handshake.
-        adapter = engine._adapter("maintain snapshot")
-        warehouse = snapshot_mod.warehouse_from_metadata(adapter)
-        connector = adapter.name
-        warehouse_from = "metadata"
-        cache_updated_at = None
-        if cache is None or not cache.datasets:
+        cache = readable_cache(store)
+        requested = engine.connector or config.connector
+        usable = cache is not None and bool(cache.datasets)
+        if usable and cache.provenance.connector not in (None, requested):
             warnings.append(
-                "no exploration cache to pin, so this baseline is metadata-only "
-                "(schema and volume axes); run `explore map` and re-snapshot "
-                "to give the grain and cardinality axes a baseline"
+                "the exploration cache was mapped on "
+                f"'{cache.provenance.connector}' but "
+                f"the active connector is '{requested}'; capturing a fresh "
+                "metadata-only baseline instead"
             )
+            usable = False
+
+        if usable:
+            warehouse = snapshot_mod.warehouse_from_cache(cache)
+            connector = cache.provenance.connector or requested
+            warehouse_from = "cache"
+            cache_updated_at = cache.provenance.updated_at
+        else:
+            # No cache to pin: capture directly. Metadata is free on every
+            # connector, so this path needs no confirm handshake.
+            adapter = engine._adapter("maintain snapshot")
+            warehouse = snapshot_mod.warehouse_from_metadata(adapter)
+            connector = adapter.name
+            warehouse_from = "metadata"
+            cache_updated_at = None
+            if cache is None or not cache.datasets:
+                warnings.append(
+                    "no exploration cache to pin, so this baseline is metadata-only "
+                    "(schema and volume axes); run `explore map` and re-snapshot "
+                    "to give the grain and cardinality axes a baseline"
+                )
 
     transform_layer, semantic_layer, no_project = _read_layers(engine)
     if no_project is not None:
@@ -433,6 +482,7 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
         warehouse=warehouse,
         warehouse_from=warehouse_from,
         cache_updated_at=cache_updated_at,
+        warehouse_carried_forward=project_only,
         transform_layer=transform_layer,
         semantic_layer=semantic_layer,
     )
@@ -479,6 +529,21 @@ def snapshot(engine: DexEngine) -> SnapshotResult:
 
 
 def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    project_only = getattr(args, "project_only", False)
+    if project_only:
+        warehouse_options = {
+            "--connector": getattr(args, "connector", None),
+            "--path": getattr(args, "path", None),
+            "--scope": getattr(args, "scope", None),
+            "--project": getattr(args, "project", None),
+            "--dataset": getattr(args, "dataset", None),
+        }
+        supplied = [name for name, value in warehouse_options.items() if value]
+        if supplied:
+            raise RequestError(
+                "`maintain snapshot --project-only` cannot be combined with "
+                "warehouse target options: " + ", ".join(supplied)
+            )
     # Which advice is true depends on where the baseline landed, so the hint is
     # built from the store rather than fixed. The shipped filesystem backend is
     # the only one dex knows puts a reviewable file in the repo; a backend it
@@ -487,7 +552,9 @@ def cmd_snapshot(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # real location either way.
     reviewable = isinstance(engine.store, FilesystemStore)
     hint = (_REVIEWABLE_SNAPSHOT_HINT if reviewable else "") + _SNAPSHOT_HINT
-    return to_envelope(snapshot(engine), hints={"hint": hint})
+    return to_envelope(
+        snapshot(engine, project_only=project_only), hints={"hint": hint}
+    )
 
 
 def schema_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
@@ -579,7 +646,11 @@ def grain_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftRes
         if scope_names
         else None
     )
-    plan = drift_mod.grain_plan(adapter, snap, scope, _composed_definitions(engine))
+    project, _ = _read_project(engine)
+    composed_definitions = _composed_definitions(engine)
+    plan = drift_mod.grain_plan(
+        adapter, snap, scope, composed_definitions if project is not None else None
+    )
     if (
         plan.key_checks
         or plan.fanout_pairs
@@ -727,9 +798,10 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     """Definitions that no longer match: dangling references, new categoricals.
 
     Two-phase on billed connectors: definition and reference checks are free and
-    run immediately; the dimension-cardinality scan waits behind the handshake,
-    and an unconfirmed call still returns the complete free findings alongside
-    the estimate rather than throwing away work that cost nothing but is real.
+    run immediately; the dimension-cardinality scan is offered on top. An
+    unconfirmed call is a complete answer for the free half, not a pending
+    charge, so it returns ``ok`` carrying those findings and an offer for the
+    scan rather than throwing away work that cost nothing but is real.
     """
 
     store = engine.store
@@ -762,22 +834,23 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
     checks = drift_mod.cardinality_plan(
         current_semantic, snap, _semantic_names(scope_names) if scope_names else None
     )
-    pending: ConfirmationRequest | None = None
+    offer: ConfirmationRequest | None = None
     billed_findings: list[drift_mod.DriftFinding] = []
     if checks:
         estimate, per_table = drift_mod.cardinality_estimate(adapter, checks)
-        pending = command_args.confirmation_request(
+        offer = command_args.confirmation_request(
             "maintain semantic",
             adapter,
             estimate,
             per_table=per_table,
+            axes=["semantic_cardinality"],
             notes=[
-                "the definition and reference checks are free and already "
-                "complete (their findings are included in this envelope); "
-                "the estimate covers only the dimension-cardinality scan"
+                "the definition and reference findings in this envelope are "
+                "final; the estimate buys the dimension-cardinality scan on top "
+                "of them"
             ],
         )
-    if pending is None:
+    if offer is None:
         billed_findings = _semantic_scope(
             drift_mod.cardinality_drift(adapter, checks, current_semantic),
             scope_names,
@@ -785,19 +858,20 @@ def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> Drift
 
     ranked = drift_mod.rank_findings(free_findings + billed_findings)
     by_axis = _record_axes(store, snap, connector, {"semantic": (ranked, scope_names)})
-    if pending is not None:
-        # The free half is complete and real, so it returns alongside the ask
-        # for the scanning half rather than being discarded and re-derived.
-        result = _drift_result(by_axis, snap, store, warnings=warnings)
-        result.pending_confirmation = pending
-        return result
-    result = _drift_result(
-        by_axis,
-        snap,
-        store,
-        warnings=warnings
-        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
+    # Identical warnings either way. Every reason this baseline may not describe
+    # the warehouse bounds the free findings exactly as it bounds the settled
+    # ones, and the unconfirmed call is the one a session makes first, so it is
+    # the last place that caveat should go missing.
+    warnings = warnings + _baseline_warnings(
+        store, snap, engine.config.profile_freshness_hours
     )
+    if offer is not None:
+        # The free half is complete and real, so it returns as the answer it is,
+        # with the scanning half offered on top rather than gating it.
+        result = _drift_result(by_axis, snap, store, warnings=warnings)
+        result.pending_offer = offer
+        return result
+    result = _drift_result(by_axis, snap, store, warnings=warnings)
     return command_args.stamp_spend(result, adapter)
 
 
@@ -811,7 +885,10 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     Two-phase by construction: the free axes (schema, volume, semantic
     references) always run and their findings always return; the scanning axes
     (grain, cardinality) run immediately on free connectors and behind one
-    combined estimate on billed ones.
+    combined estimate on billed ones. An unconfirmed call on a billed connector
+    is therefore a complete answer for three axes rather than a pending charge,
+    and says so: ``ok``, with ``axes_run`` naming what finished and ``offer``
+    naming what the estimate would add.
 
     ``objects`` narrows every axis exactly like the focused detectors do:
     schema/volume/grain resolve it against known identifiers (raising if a
@@ -869,7 +946,14 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         else []
     )
 
-    plan = drift_mod.grain_plan(adapter, snap, scope, _composed_definitions(engine))
+    # Rebuilt rather than carried over from `_read_layers`: that one asks for the
+    # baseline tier, and a format narrower than it still declares a grain worth
+    # re-verifying here.
+    project, _ = _read_project(engine)
+    composed_definitions = _composed_definitions(engine)
+    plan = drift_mod.grain_plan(
+        adapter, snap, scope, composed_definitions if project is not None else None
+    )
     # Added before both returns, so a declared grain the survey could not reach
     # is reported whether the scans run or stop at the handshake.
     warnings.extend(plan.notes)
@@ -881,27 +965,46 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         or plan.declared_composite_checks
         or checks
     )
-    pending: ConfirmationRequest | None = None
+    offer: ConfirmationRequest | None = None
     if scans_needed and command_args.cost_gate(adapter) is not None:
         grain_total, grain_per = drift_mod.grain_estimate(adapter, plan)
         card_total, card_per = drift_mod.cardinality_estimate(adapter, checks)
         per_table = dict(grain_per)
         for identifier, estimate in card_per.items():
             per_table[identifier] = per_table.get(identifier, 0.0) + estimate
-        pending = command_args.confirmation_request(
+        # Only the axes with work planned, so the offer names what the estimate
+        # actually buys rather than the pair it usually covers.
+        grain_planned = bool(
+            plan.key_checks or plan.fanout_pairs or plan.composite_checks
+        )
+        offered_axes = [
+            axis
+            for axis, planned in (
+                ("grain", grain_planned),
+                ("semantic_cardinality", bool(checks)),
+            )
+            if planned
+        ]
+        offer = command_args.confirmation_request(
             "maintain check",
             adapter,
             grain_total + card_total,
             per_table=per_table,
+            axes=offered_axes,
             notes=[
-                "the schema, volume, and semantic reference checks are free "
-                "and already complete (their findings are included in this "
-                "envelope); the estimate covers the grain and "
-                "dimension-cardinality scans"
+                "the schema, volume, and semantic reference findings in this "
+                "envelope are final; the estimate buys the grain and "
+                "dimension-cardinality scans on top of them"
             ],
         )
 
-    if pending is not None:
+    # Identical warnings on both paths: what bounds the settled answer bounds the
+    # free one too, and the unconfirmed call is the one a session opens with.
+    warnings = warnings + _baseline_warnings(
+        store, snap, engine.config.profile_freshness_hours
+    )
+
+    if offer is not None:
         drift_mod.annotate_impacts(schema_findings + volume_findings, snap)
         by_axis = {
             "schema": drift_mod.rank_findings(schema_findings),
@@ -913,7 +1016,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
             store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
         )
         result = _drift_result(axis_results, snap, store, warnings=warnings)
-        result.pending_confirmation = pending
+        result.pending_offer = offer
         return result
 
     grain_findings = drift_mod.grain_drift(
@@ -937,13 +1040,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     axis_results = _record_axes(
         store, snap, connector, {a: (f, scope_names) for a, f in by_axis.items()}
     )
-    result = _drift_result(
-        axis_results,
-        snap,
-        store,
-        warnings=warnings
-        + _baseline_warnings(store, snap, engine.config.profile_freshness_hours),
-    )
+    result = _drift_result(axis_results, snap, store, warnings=warnings)
     return command_args.stamp_spend(result, adapter)
 
 
@@ -971,7 +1068,7 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     coincidence survivable.
     """
 
-    from ..adapters.project import PlacingProject, placement_gap
+    from ..adapters.project import EditableProject, PlacingProject, placement_gap
     from ..transform import plans as plans_mod
     from . import reconcile as reconcile_mod
 
@@ -1003,10 +1100,24 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     if not findings:
         return ReconcileResult(warnings=warnings)
 
-    editable = engine.editable_project()
+    # One construction for the whole command, reused for the write tier and the
+    # declarations below. Three separate reads is three loads of the same
+    # project, and only the first of them was guarded against a format that
+    # cannot be built at all.
+    project, no_project = _read_project(engine)
+    editable = project if isinstance(project, EditableProject) else None
     view = None
-    if editable is None:
-        named = getattr(engine.project_format(), "name", "this")
+    if no_project is not None:
+        # Its own sentence rather than the write-tier one below: a format that
+        # could not be built declined nothing, and telling someone their format
+        # refuses edits sends them to implement a tier they already have.
+        warnings.append(
+            "no project format could be built, so every proposal below is "
+            f"advisory and no plan is stored: {no_project}. Reconcile what these "
+            "findings describe wherever your models are actually defined"
+        )
+    elif editable is None:
+        named = getattr(project, "name", "this")
         warnings.append(
             f"the '{named}' project format does not implement the write tier, so "
             "every proposal below is advisory and no plan is stored: dex will not "
@@ -1046,11 +1157,13 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # What the project declares, which is a different question from what its
     # files contain. `view` carries the bytes an edit is pinned against; this
     # carries the grain, and an edit that contradicts a declared grain is one no
-    # format is obliged to keep. Tier 1, so it cannot raise. Composed with a
+    # format is obliged to keep. Tier 1, so the read cannot raise; `None` is the
+    # answer when there was no format to read it from. Composed with a
     # differing semantic vendor's own keys (#410), so a proposal for a column
     # Ossie already covers via a declared composite is not suggested as if
     # nothing declared it.
-    definitions = _composed_definitions(engine)
+    composed_definitions = _composed_definitions(engine)
+    definitions = composed_definitions if project is not None else None
     proposals, edits, build_warnings = reconcile_mod.build(
         findings,
         snap,

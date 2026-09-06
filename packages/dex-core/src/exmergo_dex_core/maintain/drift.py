@@ -25,7 +25,7 @@ from typing import NamedTuple
 
 from pydantic import BaseModel, Field
 
-from ..adapters.base import Adapter, distinct_combination_sql
+from ..adapters.base import Adapter, ColumnMeta, distinct_combination_sql
 from ..cache import Dataset, Relationship, match_identifier
 from ..dbt_project import ProjectDefinitions
 from ..explore import relationships as rel_mod
@@ -533,6 +533,11 @@ class GrainPlan(NamedTuple):
     # What the plan could not survey, so an unchecked declaration never reads as
     # a clean bill.
     notes: list[str]
+    # Every selected relation gets a null-fraction survey.  This does not need a
+    # baseline measurement: a column that is wholly NULL in a non-empty result
+    # is a defect in its present shape, not a before-and-after drift claim.
+    # Last/defaulted to retain compatibility with focused detector test plans.
+    null_checks: list[tuple[Dataset, list[ColumnMeta], int]] | None = None
 
 
 def grain_plan(
@@ -684,7 +689,24 @@ def grain_plan(
             "grains on " + ", ".join(sorted(set(unsurveyed))) + " were not verified",
         ]
         declared_checks = []
-    return GrainPlan(key_checks, fanout_pairs, composite_checks, declared_checks, notes)
+    null_checks: list[tuple[Dataset, list[ColumnMeta], int]] = []
+    if callable(getattr(adapter, "column_aggregates", None)):
+        for dataset in snap.warehouse.datasets:
+            if scope is not None and dataset.identifier not in scope:
+                continue
+            if dataset.identifier not in current:
+                continue
+            meta, columns = adapter.table_metadata(dataset.identifier)
+            null_checks.append((dataset, columns, meta.row_count or 0))
+
+    return GrainPlan(
+        key_checks,
+        fanout_pairs,
+        composite_checks,
+        declared_checks,
+        notes,
+        null_checks,
+    )
 
 
 def _same_combo(left: list[str], right: list[str]) -> bool:
@@ -767,6 +789,24 @@ def grain_estimate(adapter: Adapter, plan: GrainPlan) -> tuple[float, dict[str, 
     )
     if probes:
         per_table["(join overlap probes)"] = sum(query_estimate(sql) for sql in probes)
+    profile_estimate = getattr(adapter, "profile_estimate", None)
+    if profile_estimate is not None and plan.null_checks:
+        identifiers = [
+            dataset.identifier for dataset, _columns, _rows in plan.null_checks
+        ]
+        # A NULL fraction is meaningful for binary columns too, unlike an
+        # explore value profile; opt blobs back into the survey so the estimate
+        # and the aggregate execution cover exactly the same columns.
+        include_blobs = {
+            f"{dataset.identifier}.{column.name}"
+            for dataset, columns, _rows in plan.null_checks
+            for column in columns
+        }
+        _total, null_per_table = profile_estimate(
+            identifiers, include_blobs=include_blobs
+        )
+        for identifier, estimate in null_per_table.items():
+            per_table[identifier] = per_table.get(identifier, 0.0) + estimate
     return sum(per_table.values()), per_table
 
 
@@ -964,6 +1004,65 @@ def grain_drift(
                 },
             )
         )
+    aggregate_columns = getattr(adapter, "column_aggregates", None)
+    for dataset, columns, row_count in plan.null_checks or []:
+        if not callable(aggregate_columns):
+            continue
+        if row_count == 0:
+            findings.append(
+                DriftFinding(
+                    axis="grain",
+                    code="no_rows",
+                    identifier=dataset.identifier,
+                    severity="low",
+                    detail=(
+                        f"{dataset.identifier} has no rows; null fractions were not "
+                        "reported"
+                    ),
+                    data={"row_count": 0},
+                )
+            )
+            continue
+        joins = [
+            {
+                "from_dataset": relation.from_dataset,
+                "from_columns": relation.from_columns,
+                "to_dataset": relation.to_dataset,
+                "to_columns": relation.to_columns,
+            }
+            for _baseline, relation in plan.fanout_pairs
+            if relation.from_dataset == dataset.identifier
+        ]
+        for aggregate in aggregate_columns(dataset.identifier, columns):
+            fraction = aggregate.null_fraction
+            if fraction is None or fraction < 0.95:
+                continue
+            fully_null = fraction == 1.0
+            finding_data = {"null_fraction": fraction, "row_count": row_count}
+            if fully_null and joins:
+                # A right-side projection that is NULL for every result row is
+                # the observable form of a failed join.  Multiple joins remain
+                # explicit rather than guessing which one supplied the column.
+                finding_data["joins"] = joins
+            findings.append(
+                DriftFinding(
+                    axis="grain",
+                    code="fully_null_column" if fully_null else "mostly_null_column",
+                    identifier=dataset.identifier,
+                    column=aggregate.name,
+                    severity="high" if fully_null else "low",
+                    detail=(
+                        f"{aggregate.name} on {dataset.identifier} is "
+                        + ("100% NULL" if fully_null else f"{fraction:.1%} NULL")
+                        + (
+                            "; its joined relation may have matched nothing"
+                            if fully_null and joins
+                            else ""
+                        )
+                    ),
+                    data=finding_data,
+                )
+            )
     return findings
 
 

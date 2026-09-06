@@ -223,6 +223,358 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   a single pair sharing one name on both sides, the common case, still renders
   as that bare name unchanged.
 
+## [1.10.0] - 2026-09-05
+
+### Changed
+
+- **Reconcile edits a `schema.yml` by splicing it, not by reprinting it.** The
+  `unique` test edit parsed the file, mutated the tree and dumped it back, which
+  reflows every line and drops every comment, so the diff a reviewer read to approve
+  a one-word change described the whole document. It now changes the bytes that
+  declare the test and leaves the rest alone, which is the rule every other rewrite
+  in the engine already followed. A one-word change renders as one line added and
+  one removed.
+
+  This matters most for the formats above, whose declarations are hand-written, but
+  it applies to dbt too and the output shape moves for both. A new column entry takes
+  its indent from the entries already in the file, a flow test list stays flow, the
+  file's own choice between `tests` and `data_tests` is kept, removing the last test
+  removes the key rather than leaving an empty list, and a configured test written as
+  a mapping is never rewritten. A file dex cannot span safely, indented with tabs,
+  holding several YAML documents, or using anchors and aliases, is declined by name
+  rather than spliced at a guessed offset, and every result is re-parsed and checked
+  against what the edit intended before it can reach the plan store.
+
+- **A free answer stops arriving shaped like a bill** ([#136]). `maintain check`
+  and `maintain semantic` complete their free axes on every call: schema, volume,
+  and the reference and definition half of semantic are metadata reads that finish
+  and settle. Both returned that finished work inside a `needs_confirmation`
+  envelope, because the axes that scan were priced and unconfirmed. So the command
+  a maintenance session opens with reported its entire triage, in one field report
+  373 findings, in a response shaped like a pending charge for work the caller had
+  not asked for and might never want.
+
+  Two costs came out of that. Confirming things that cost nothing is a habit, and
+  the handshake only works on commands where it does cost something. And the
+  framing taught the wrong reading: reaching for `data.findings` inside a refusal
+  is the natural move, and doing it is how the stale-baseline line in `warnings`
+  got missed.
+
+  The split is now on whether the caller asked. `needs_confirmation` means dex is
+  waiting on you for work you requested, and nothing you asked for has run.
+  Optional priced work rides on a completed answer instead: `status: ok`, findings
+  final, and the estimate under `data.offer` with the same breakdown and
+  `--confirm --budget` hint a refusal carried. `data.offer.axes` names what the
+  estimate would add and `data.axes_run` what already finished, which is what now
+  separates "grain found nothing" from "grain did not run" since the status no
+  longer implies it. `cost.estimate` stays unset, so an `ok` never carries a
+  number that reads as spend. Nothing about the spend gate moved: the confirmed
+  re-issue is identical and no scan runs without it.
+  `explore relationships --verify` and `explore map --verify` keep
+  `needs_confirmation`, correctly, since there the caller did ask for the probes
+  and the budget ran out mid-command.
+
+  A host reading `data["estimated_bytes"]` on these two commands reads
+  `data["offer"]["estimated_bytes"]`.
+
+- **The same two commands stopped dropping their baseline caveats on the
+  unconfirmed call.** The branch that returned early built its result without
+  `_baseline_warnings`, which the settled branch includes, so the warnings that a
+  baseline no longer describes the warehouse (a cache newer than the snapshot, a
+  snapshot pinned from an already-stale cache) were missing from precisely the
+  response most sessions read. Confirmed against the dogfood project, where
+  `maintain semantic` reported a 327-hour-old baseline and `maintain check`, same
+  session and same baseline, reported nothing. Both paths now carry identical
+  warnings, because what bounds the settled answer bounds the free one.
+
+- **`semantic plan` reports what changed, not what was re-typed** ([#109]).
+  Classification compared names against the project and nothing else, so any name
+  already present read as `updated`. The edit unit is a whole file, so extending a
+  shared `semantic_models.yml` means re-stating every definition in it, and a
+  two-metric change reported 27 objects as updated with a `+16/-0` diff. The one
+  place a reviewer confirms blast radius was the place it was hidden.
+
+  There is now a third class. `updated` means the parsed definition actually
+  differs from the project's; a definition re-stated identically in the file that
+  already holds it is `unchanged`. Key order and formatting are not changes; list
+  order is, and identical content written to a different file is a move, so both
+  still read as `updated`. A plan whose every definition is unchanged warns that
+  it changes nothing.
+
+### Added
+
+- **A definition can now be removed through `--definitions-file`** ([#254]). An
+  entry carrying `"op": "delete"` names one semantic model or metric and takes it
+  out of the file that declares it. `name` is declared beside `kind`, there being
+  no body to read it from, and no `content` rides along. Deleting used to mean
+  sending the whole file back without the definition, which is the exact cost the
+  per-definition unit exists to remove: the diff then describes the file rather
+  than the change, and every restated line is a chance to corrupt a definition
+  nobody meant to touch.
+
+  Removal is declared, never inferred. A definitions payload does not remove a
+  definition for having gone unmentioned, in any circumstance: an unmentioned
+  definition is untouched, and that is the property the unit is for. `op` is
+  dbt's own edit vocabulary rather than a second spelling of it, and one payload
+  names each definition exactly once, so what it asks for cannot depend on the
+  order it is read in. `semantic define` refuses a removal, a verb that adds a
+  name being unable to take one away in the same call; `update` and `plan` accept
+  one. The envelope reports a fourth class, `removed`, beside `defined`,
+  `updated`, and `unchanged`, because a removal states no content and is the one
+  change a reviewer cannot read off the other three.
+
+  **A removal the surviving project still reads is refused**, which is the
+  decision this turned on. The whole-plan delete guard asks that question about
+  files and `ref()`, and it cannot answer it here: a definition removal deletes no
+  file, and the name it takes away is a name in YAML inside a file that survives.
+  So the same guard is repeated one namespace over. The project the payload leaves
+  behind is computed in memory and every surviving metric re-resolved against it;
+  a metric still reading a removed metric, or a measure of a removed semantic
+  model (`create_metric` included), refuses the plan and names the reader and its
+  file. Adding those definitions' own removals to the same payload satisfies it,
+  in any order, since the guard reads the end state rather than the sequence.
+  Warning instead, and leaving it to `maintain semantic`, was the alternative: a
+  dangling metric input fails `dbt parse`, the gate every semantic plan already
+  passes, so warning would differ only where that gate is off (`--no-parse`, or no
+  dbt installed) and there it would store a plan dex knows cannot be applied.
+  Detection after the fact is the tool for drift that arrived from the warehouse
+  on its own, not for a break the command is in the middle of authoring. What a
+  reference index cannot see statically, a `Metric()` call inside a filter string,
+  stays dbt's parser's to catch.
+
+  Removing the last definition in a file is refused as well, pointing at
+  `transform plan --edits-file`: emptying or deleting a file is a file-level act,
+  the semantic verbs delete no files, and whether what is left should remain as
+  plain model documentation is the caller's call rather than this unit's. The
+  removal itself lowers to the same whole-file `PlanEdit` an authored definition
+  does, so the plan format, the diffs, the conflict hashing, and `transform apply`
+  are unchanged, and every byte outside the definition removed is preserved,
+  comments included: a block's `key:` line goes only with its last item.
+  `DexEngine.semantic_update` and `semantic_plan` take the same payload through
+  `definitions=`, so removal is not a CLI feature either.
+
+- **A per-definition edit unit for the semantic layer** ([#109]).
+  `semantic define|update|plan` take `--definitions-file <path|->` beside
+  `--edits-file`: `{"definitions": [{"kind", "path", "content"}, ...]}`, where
+  `kind` is `semantic_model` or `metric` and `content` is that one definition's
+  YAML body. This is the stronger half of the fix. The whole-file unit is what
+  generated the `updated` noise, and re-typing twenty-seven untouched definitions
+  to add two is also how a stray key gets injected into a metric by hand, caught
+  in the field only by eye and by the parse gate.
+
+  The name is read from the content, so the two cannot disagree, and `path` may be
+  omitted for a definition the project already declares, defaulting to the file
+  that holds it. An explicit path that would relocate an existing definition is
+  refused, because writing it to a second file duplicates the name. Each
+  definition is spliced into its file as text, preserving every other byte
+  including the comments a semantic layer accumulates; a round trip through
+  `safe_dump` would reformat the file and produce a larger diff than the payload
+  it replaces. The result is re-parsed and compared against what was sent, and a
+  layout the splice cannot span safely (a flow-style sequence, anchors or aliases,
+  multiple documents, tab indentation) is refused with `--edits-file` named as the
+  way in. Classification is scoped to the definitions named, so a spliced file's
+  other definitions appear in no class at all.
+
+  It lowers to the whole-file `PlanEdit` the engine already stores, so the plan
+  format, the diffs, the conflict hashing, and `transform apply` are unchanged.
+  Removing a definition came later, as a declared `op` ([#254]).
+
+  The unit is not a CLI feature. `DexEngine.semantic_define`, `semantic_update`,
+  and `semantic_plan` take the parsed payload as `definitions=`, so a host
+  driving dex programmatically writes one definition where the flag writes one
+  definition. A flag the CLI parses into a keyword the engine cannot pass would
+  be a capability only one of the two surfaces has.
+
+  `AGENTS.md`, `references/command-contract.md`, and both the `transform` and
+  `maintain` skills document the new payload, the third class, and the offer.
+
+- **A column that is wholly or almost wholly NULL is now a grain finding, and a
+  fully NULL column names the join that could explain it** ([#227]). A column
+  that is 100% NULL in a relation that has rows is the visible symptom of a join
+  that matched nothing, a rename that missed, a `CASE` whose branches never
+  fire, or a source column that stopped arriving. Nothing in the sweep was
+  looking at it, so the caller had to notice it in output they were not reading.
+
+  `maintain grain`, and `maintain check` which sweeps every axis, now survey the
+  null fraction of every column of every in-scope relation and emit three new
+  codes on the grain axis. `fully_null_column` is `high` and fires at exactly
+  1.0. `mostly_null_column` is `low` and covers the near-miss band from 0.95 up
+  to but not including 1.0, because a legitimately optional column is often
+  sparse and is not the same event. Below 0.95 the survey says nothing. An empty
+  relation reports `no_rows` once, at `low`, with no column attached and no
+  per-column finding at all: with no rows there is no null fraction to report,
+  and a column-by-column sweep of an empty table would bury the one fact that
+  matters.
+
+  Where a fully NULL column sits on a relation that joins outward, the finding
+  carries every join whose left side is that relation in `data.joins`, with the
+  columns on both sides, and the detail adds that the joined relation may have
+  matched nothing. Every such join stays in the payload rather than dex guessing
+  which one supplied the column. The joins come from the relationships already
+  in the snapshot and already priced for the fanout check, so naming them costs
+  no extra query. A fully NULL column on a relation with no known join is still
+  reported at `high`, without the clause it cannot support.
+
+  The survey needs no baseline: a wholly NULL column in a non-empty relation is
+  a defect in the shape the table has now, not a before-and-after drift claim.
+  So it speaks on the first snapshot, and on tables the other grain checks skip
+  for having neither a measured nor a declared key, which is why a
+  metadata-only baseline that previously produced no findings now reports its
+  empty tables.
+
+  It is priced inside the gated half rather than added on top of it. The null
+  scan goes through the adapter's `profile_estimate` and lands in the same
+  per-table estimate as the distinct-count and join-overlap probes, so an
+  unconfirmed `maintain grain` or `maintain check` on a metered warehouse quotes
+  it up front and a confirmed run spends it against the declared budget. Binary
+  and blob columns, which an explore value profile leaves out, are opted back
+  into this survey, because a null fraction is meaningful for a blob even where
+  a value domain is not, and the estimate then covers exactly the columns the
+  executed aggregates do. Only `null_fraction` is read: the aggregates are
+  requested without the min/max, shape, and type extras, so no value crosses the
+  envelope. An adapter that does not implement `column_aggregates` skips the
+  survey rather than failing.
+
+  Not where the issue put it: #227 proposed this under `maintain verify`, the
+  free, baseline-free correctness command from #224. It landed on the grain axis
+  instead, because the survey is a real scan and a scan belongs behind the
+  confirmation gate and the budget. `verify` stays free.
+
+- **`maintain snapshot --project-only` re-pins the project layers without
+  re-measuring the warehouse** ([#281]). A repo-wide move of every model file
+  and a dbt project rename changes no warehouse object, but the documented way
+  to re-pin the baseline afterwards was `explore map --full` and a fresh
+  snapshot, which the issue priced at 8.69 GB on its own project. A discipline
+  that costs that much to follow after a routine refactor gets skipped, and the
+  session that reported this ended green against a baseline 363 hours old.
+
+  The flag reads the transform and semantic layers from the project files as
+  usual, and carries the warehouse half of the previous baseline forward as a
+  unit: the `warehouse` block itself, the `connector` it was measured on,
+  `warehouse_from`, and `cache_updated_at`. It consults neither a connector nor
+  the exploration cache, because a cache that has moved on since the baseline
+  would silently upgrade the warehouse side of a command whose whole point is
+  not to touch it. Preserving the original `cache_updated_at` is what keeps the
+  staleness honest rather than laundered: the thin-column-detail and cache-age
+  warnings still run against the baseline just written, so an aging warehouse
+  side is restated on every project-only refresh instead of being reset to look
+  freshly measured.
+
+  Nothing about the run reaches a warehouse. The dialect availability check is
+  skipped for this path, so it also runs where no warehouse driver is installed;
+  the cost stays `free_local` with no estimate; and the envelope says so in both
+  a `warnings` line naming the carry-forward and zero billed bytes, and
+  `data.warehouse.carried_forward`, which a host automating the accept can gate
+  on. A `maintain check` straight afterwards, against an unchanged warehouse,
+  reports no schema, volume, or grain drift.
+
+  Two refusals keep the mode unambiguous. It requires an existing readable
+  baseline, since there is no warehouse evidence to carry forward without one,
+  and says which command produces one rather than quietly capturing a fresh
+  baseline the caller did not ask for. And it cannot be combined with a
+  warehouse target (`--connector`, `--path`, `--scope`, `--project`,
+  `--dataset`), which is a request error: naming a target for a command that
+  opens no connection can only mean the caller expected something else to
+  happen. Library callers reach it as `DexEngine.snapshot(project_only=True)`.
+
+### Fixed
+
+- **A project format that declines the staging model still gets its declaration
+  reconciled** ([#429], reported by @catincloudlabs). `PlacingProject` was built so
+  a format could answer a path for one edit kind and `None` for another, and the
+  documented case is a project reduced from a running graph: no authored staging
+  model, but hand-written declarations that nothing regenerates. Reconcile asked
+  for the `MODEL_SQL` path first and treated `None` as a refusal for the whole
+  table, so every schema finding came back advisory with "this project format has
+  nowhere for a staging model to land", including the ones that were never about
+  dbt SQL. The one mechanical edit such a format could reach was the `unique` test
+  on a single-column key, so a tree whose keys were already declared unique could
+  not receive an edit at all, and the write tier it implemented was exercised by no
+  natural event.
+
+  Schema drift now lands in the declaration the format placed. `column_added` and
+  `column_dropped` add and remove the column entry, `nullability_changed` adds or
+  removes `not_null`, and the proposal says in its own words that dex authored
+  nothing for the model, because a consumer has to be able to tell a half the
+  format declined from a half dex dropped. Nothing changes for dbt, which places
+  both kinds and takes the re-scaffold as before.
+
+- **A type change no longer reconciles to a plan that changes nothing.** Neither
+  the model SQL nor the `schema.yml` dex writes carries a type, so re-scaffolding
+  from a retyped profile reproduced both files byte for byte: `column_retyped`
+  returned `mechanical`, stored a plan, and rendered two diffs whose every hunk was
+  empty. A retype is now advisory on every format, and the proposal names both
+  spellings.
+
+  It is not a gap waiting to be filled. `data_type` in the snapshot is the
+  connector's own spelling and is never canonicalized, so Snowflake reports
+  `NUMBER(38,0)` and `NUMBER(10,2)` both as `FIXED`, BigQuery reports a repeated
+  record as `ARRAY<STRUCT>`, and ClickHouse carries `Nullable(Int64)` verbatim. A
+  type written from that would be one warehouse's word for the column rather than
+  the column's. Two consequences are now stated in the connector references: on
+  ClickHouse nullability is part of the type, so a nullability change is reported
+  as a retype and gets advice where other connectors get an edit; on Snowflake a
+  precision or scale change produces no schema finding at all.
+
+- **A table that drifted on two axes stopped losing one of them.** Schema drift and
+  a lost unique key both reconcile into the same `schema.yml`, and reconcile emitted
+  two edits on that one path, each pinned to the same content hash. `transform apply`
+  wrote them in order and reported `ok`, listing the path twice as written, so the
+  second silently replaced the first: the applied project selected the added column
+  in its model SQL and did not declare it in its `schema.yml`. Reachable on a plain
+  dbt project with `maintain check` followed by `maintain reconcile`, with no second
+  format involved, and it is a propose-don't-impose failure, since the edit a human
+  reviewed in the diff is not the edit that landed. Everything now folds into one
+  edit per path, and an edit that would reproduce the file already there is dropped
+  rather than offered.
+
+- **BigQuery `explore map` profiles a table with a `TIMESTAMP` column again**
+  ([#430]). Temporal continuity asked for a month-grain gap on every non-PII
+  `TIMESTAMP` column as `TIMESTAMP_DIFF(period, prev_period, MONTH)`, and
+  BigQuery's `TIMESTAMP_DIFF` stops at `DAY`, so the statement was refused at
+  job insert. The continuity subqueries ride the same flat `SELECT` as the
+  batch's other aggregates, and the `BadRequest` fallback in `column_aggregates`
+  degrades the whole batch, so one optional fraction took every column's null
+  fraction, distinct count, min and max, key detection and grain with it, and
+  recorded `aggregate profiling failed and was skipped` in `data_quality`. The
+  run still returned `ok`. Present since 1.6.6 shipped the feature ([#206]);
+  `DATETIME` and `DATE` columns were never affected because their diff
+  families accept `MONTH`.
+
+  The month gap on a `TIMESTAMP` column is now
+  `DATE_DIFF(DATE(period), DATE(prev_period), MONTH)`. Both operands are
+  already `TIMESTAMP_TRUNC(..., MONTH)` periods, so their UTC dates are month
+  boundaries and the diff is exact; day and hour keep `TIMESTAMP_DIFF`, and
+  the other two temporal types render as before. Whether the batch should
+  retry without the optional temporal expressions before degrading to
+  metadata-only is left open on the issue: it is a change to the fallback
+  contract, not to the expression that broke it.
+
+- **`maintain` stops refusing an engine that was never given a repo root.**
+  `check`, `grain`, and `reconcile` each read the project format without
+  guarding the construction, and the shipped dbt format correctly refuses to
+  build without a repo root, because a dbt project is a filesystem artifact. So
+  a host pointed at a warehouse and a baseline with no repository in the picture
+  got a refusal from all three, including for the answers that need no project
+  at all. Both commands already intended otherwise and said so in their own
+  code: `check` builds the warning naming the missing project, runs schema and
+  volume, and then died reading the project a second time for the declared
+  grain, and `reconcile` notes that only the plan store needs a repo root "so
+  the advisory-only path stays reachable for an engine that has none", which it
+  was not.
+
+  A project that cannot be built now costs the declarations and the write tier
+  and nothing else. `check` returns its free axes, `grain` surveys the measured
+  half, and `reconcile` proposes advisory fixes with no stored plan and a
+  warning naming the real reason rather than claiming the format declined a
+  tier. Nothing changes for an engine that has a repo root.
+
+  `reconcile` also built the project format three times per call, and only the
+  first of those was reachable, so it now builds it once and reuses it. A
+  project is deliberately not held across commands, but the expensive load is
+  memoized inside the instance, so reading it three times in one command loaded
+  it three times.
+
 ## [1.9.2] - 2026-09-02
 
 ### Added
