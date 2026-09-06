@@ -5,7 +5,7 @@ project two different questions and the answers are shaped differently:
 
 - :func:`semantic_catalog` builds the neutral read catalog `explore semantic
   list` renders, which carries labels, types, dialects and lineage.
-- :func:`definitions` builds the tier-1 declarations channel, which carries
+- :func:`definitions` builds the declarations channel, which carries
   declared keys and joins and nothing else.
 
 **The rule running through both is that dex claims less than it could.** Ossie
@@ -414,7 +414,7 @@ def definitions(
     notes: Sequence[str] = (),
     present: bool = True,
 ) -> ProjectDefinitions:
-    """The tier-1 declarations channel: declared keys, joins, and relations.
+    """The declarations channel: declared keys, joins, and relations.
 
     Separate from the catalog because the consumers are separate. This is what
     `explore profile --use-project` reads to override a heuristic grain and what
@@ -530,10 +530,13 @@ def _join(
     Ossie writes `from` as the many side and `to` as the one side, which is the
     direction `DeclaredForeignKey` already uses, so no side-swapping is needed.
 
-    **#405--#407 preserve a composite relationship as a note rather than a
-    dangerous partial edge.** #408 must carry its full ordered column pairs
-    through the neutral relationship/`EntityJoin` path before map,
-    relationships, and diagram can render it.
+    **A composite relationship becomes a note here rather than a partial
+    edge.** ``DeclaredForeignKey`` carries one column per side, so half of a
+    composite join written into it would be a join the author never declared and
+    a predicate the verifier would probe as though they had. The full ordered
+    pairs reach map, relationships, and diagram through
+    :func:`_declared_relationship` instead, which is the shape that can hold
+    them.
     """
 
     name = rel.get("name")
@@ -568,7 +571,11 @@ def _join(
 def _declared_relationship(
     rel: dict[str, Any], by_name: dict[str, str], relations: dict[str, str]
 ) -> tuple[DeclaredRelationship | None, str | None]:
-    """Preserve an Ossie relationship's full ordered pairs for #408 consumers."""
+    """Preserve an Ossie relationship's full ordered pairs.
+
+    The neutral shape a composite join survives in: every pair, in declared
+    order, so a consumer probes the complete tuple rather than a component.
+    """
 
     name = rel.get("name")
     child = by_name.get(str(rel.get("from")))
