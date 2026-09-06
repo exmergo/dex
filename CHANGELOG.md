@@ -11,6 +11,57 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **Native Apache Ossie workflows are documented end to end, and the pages that
+  still described a dbt-only world are corrected** ([#414]). `references/ossie-walkthrough.md`
+  is new: one document, one local DuckDB warehouse, and every command the native
+  semantic axis has, in the order you would run them. It covers configuration on
+  both axes, reading the catalog, the four cases that carry no physical column,
+  the governed route to take when `query` and `values` refuse, declared keys and
+  composite relationships reaching `explore` and `--verify`, a baseline and drift
+  with no transformation project present, and authoring through
+  `semantic ossie` and `transform apply`. Every command, envelope field, note,
+  and refusal quoted on that page came from a real run against `dex demo`.
+
+  The correction half matters more than the addition. Several committed pages
+  made claims that stopped being true when the native semantic axis shipped, and
+  a stale claim in a reference is worse than a missing one: `dbt-project.md` was
+  titled "the only write target" and said `transform` and `maintain` require a
+  dbt project; `skills/explore/SKILL.md` said two backends answer the semantic
+  commands when there are three; `canonical-model.md` argued against building on
+  an immature interchange format, using the predecessor name of the format dex
+  now reads; and `project.md` and `CONTRIBUTING.md` both offered "a semantic
+  layer that owns its own definitions" as a reason to write a project format,
+  which is now the case that must not be one. Those are fixed at the source
+  rather than annotated.
+
+  `skills/maintain/SKILL.md` had no native semantic content at all, so an agent
+  driving `maintain` against an Ossie-only repository had nothing to read: it now
+  covers the independent per-layer baseline, the two finding classes the semantic
+  axis adds, declared keys reaching `maintain grain` through the identical billed
+  handshake, why the dimension-cardinality scan never fires there, and why
+  `maintain reconcile` is advisory. `AGENTS.md` gains the `semantic_document`
+  edit kind it was already using in its own table, the Ossie behavior on the
+  `explore semantic values`, `explore semantic query` and four `maintain` rows,
+  the extras that are not connectors, and pointers to the semantic-layer
+  references it never listed. `CONTRIBUTING.md` gains a "Writing a semantic
+  source" section, so all three public extension seams are documented rather than
+  two. The asymmetry table in `references/semantic-layer.md` gains its third
+  column.
+
+  The three skill descriptions are widened to cover a semantic layer that is not
+  dbt, since a description is a triggering specification and none of them
+  mentioned one. Triggering cases were added to each eval corpus alongside, and
+  the new positives are cross-listed as negatives on the sibling skills so the
+  widening is measured rather than assumed.
+
+  Two claims in this changelog's own unreleased section were corrected in place:
+  `OssieSemanticLayer` never answered `transform_layer()`, and its absence is
+  deliberate, because Ossie declares no build step and a transform baseline over
+  it would be a baseline of nothing; and one entry still used
+  `SEMANTIC_PROJECT_FORMATS` as current after another recorded it renamed to
+  `SEMANTIC_SOURCE_FACTORIES`. No engine behavior changes here. The single source
+  edit is a truncated sentence in `SemanticConfig`'s docstring.
+
 - **Native Apache Ossie is constructed as a semantic source rather than through
   the transformation-project factory, and can no longer be used as a project at
   all** ([#413]). Ossie was already absent from the shipped project registry and
@@ -164,10 +215,12 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 - **Native Ossie documents reach maintain's tier 2, so `maintain snapshot` and
   `maintain check` get a real drift baseline for a semantic vendor that is not
-  dbt** ([#409]). `OssieSemanticLayer` now answers `transform_layer()` (file
-  hashes only; Ossie declares no build step) and `semantic_layer()` (named
+  dbt** ([#409]). `OssieSemanticLayer` answers `semantic_layer()` (named
   definitions, each with a content hash and the physical column behind it),
-  the same two methods `DbtProject` already implements.
+  which is the half of the baseline it can honestly fill. It answers no
+  transform layer at all: Ossie declares no build step, so a transformation
+  baseline over it would be a baseline of nothing, and `maintain snapshot`
+  names the missing half in a warning rather than recording it as empty.
 
   The snapshot shape gained two things it could not hold before, both additive
   and both defaulted so a committed `.dex/snapshot.json` from before this
@@ -196,8 +249,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
   The two layers are read independently now (`maintain/commands.py`'s
   `_read_layers`), through the same seam #408 added on the explore side: the
-  semantic half comes from whichever format answers `semantic.vendor`
-  (`SEMANTIC_PROJECT_FORMATS`, a table lookup rather than a name check), not
+  semantic half comes from whichever source answers `semantic.vendor`
+  (`SEMANTIC_SOURCE_FACTORIES`, a table lookup rather than a name check), not
   always from the configured `project.format`. A repository with no dbt
   project at all and `semantic.vendor: ossie` gets a semantic baseline even
   though the transform half has nothing to answer with, and a repository that
