@@ -379,6 +379,12 @@ class CacheProvenance(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     tool_version: str | None = Field(default_factory=tool_version)
+    #: Namespaces whose complete object inventory contributed to this cache.
+    #: A named relation absent from one of these namespaces is known missing;
+    #: absence elsewhere is only unknown because ``explore profile`` may write
+    #: a deliberately partial cache.  Kept as provenance rather than inferred
+    #: from ``datasets`` so a partial profile can never masquerade as inventory.
+    inventory_namespaces: list[str] = Field(default_factory=list)
 
 
 class DexCache(BaseModel):
