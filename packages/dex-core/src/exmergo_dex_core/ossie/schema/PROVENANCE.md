@@ -30,11 +30,26 @@ reviewed diff in a commit rather than a quiet update. The document's own
 `version` field is still required and still checked, because upstream requires
 it, and the schema itself is what checks it.
 
+## What this pin promises
+
+The compatibility matrix in `references/ossie-compatibility.md` states, row by
+row, what dex accepts from a document under this pin, which checks run at which
+severity, where each rule comes from, what links to a warehouse column, and what
+dex does not claim. Each row names a case in the reviewed corpus at
+`packages/dex-core/tests/ossie/fixtures/`, and an offline test asserts that the
+hash above, the constant in the loader, the corpus manifest, and the matrix all
+agree.
+
 ## Upgrading
 
 1. Copy the new `core-spec/ossie-schema.json` in verbatim.
 2. Update the commit, hash, and declared version in the table above.
-3. Update `SCHEMA_SHA256` in `exmergo_dex_core/ossie/loader.py`.
+3. Update `SCHEMA_SHA256` in `exmergo_dex_core/ossie/loader.py`, the `schema:`
+   block in the corpus manifest, and the table in the compatibility matrix.
 4. Run the Ossie fixture suite and read the diffs. A fixture that changes
-   verdict is the upgrade telling you what moved; record it in the changelog
-   with the behavior it changes.
+   verdict is the upgrade telling you what moved; decide for each one whether
+   the new verdict is what upstream now intends, record it in the changelog with
+   the behavior it changes, and update the matrix and its known-deltas list.
+
+Updating the hash alone is not an upgrade. The offline test checks that the four
+places agree; it cannot check that anybody read the diff.
