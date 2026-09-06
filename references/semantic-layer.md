@@ -610,6 +610,38 @@ confined the way writes are, because a committed config file naming a path
 outside the repository would otherwise have dex parse it, and what it parsed
 would reach an envelope.
 
+### Authoring native documents
+
+Use `semantic ossie define|update|plan <intent> --edits-file <path|->`. The
+payload has the normal Dex edits shape, and `kind` may be omitted because this
+command implies `semantic_document`:
+
+```json
+{"edits": [{"path": "semantics/commerce.ossie.yaml", "content": "..."}]}
+```
+
+Every path must be listed exactly in `semantic.ossie.files`. A configured file
+may be absent before `define`, allowing a new document to be planned after its
+path is committed to config. Dex overlays all supplied whole-document contents
+on the other configured files and validates the complete prospective layer
+before storing the plan. `define` refuses an existing semantic-model name;
+`update` refuses a new one; `plan` accepts and reports both. These commands do
+not remove models or files.
+
+The preservation contract is exact and predictable: Dex does not parse and
+re-serialize accepted content. Apply writes the authored bytes byte-for-byte,
+including comments, quoting, ordering, and whitespace; configured files absent
+from the payload are untouched. `transform apply [plan-id]` re-hashes every
+target first and writes nothing if any file changed after planning, unless the
+caller explicitly confirms the overwrite.
+
+These guarantees are executable in the shipped `SemanticEditTargetContract`:
+view and hash pinning, declared-surface confinement, stale-target refusal,
+confirmed replacement, and atomic multi-file application. This is the
+semantic-source counterpart of the editable and placement project contracts,
+not an implementation of `EditableProject` or `PlacingProject`; Ossie remains
+outside the transformation-project hierarchy by design.
+
 ### Two extras, three validation layers
 
 Selecting Ossie without the `[ossie]` extra refuses by name and names the extra.

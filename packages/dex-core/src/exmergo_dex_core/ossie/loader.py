@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -51,6 +51,7 @@ __all__ = [
     "OssieDependencyError",
     "load_documents",
     "schema_bytes",
+    "validate_document_contents",
 ]
 
 #: The sha256 of the bundled upstream schema. Asserted by a test, so a
@@ -199,12 +200,47 @@ def load_documents(
     ensure_available()
     root = Path(repo_root).resolve()
     result = LoadResult()
+    contents: dict[str, str] = {}
     for name in files:
         path, refusal = _resolve(root, name)
         if refusal is not None:
             result.diagnostics.append(refusal)
             continue
-        document, parse_errors = _parse(path, name)
+        try:
+            contents[name] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            result.diagnostics.append(
+                Diagnostic(
+                    file=name,
+                    path="(root)",
+                    layer="parse",
+                    rule="unreadable",
+                    severity=ERROR,
+                    message=f"could not read the file: {exc}",
+                )
+            )
+    validated = validate_document_contents(contents, connector=connector)
+    result.documents.extend(validated.documents)
+    result.diagnostics.extend(validated.diagnostics)
+    return result
+
+
+def validate_document_contents(
+    contents: Mapping[str, str], *, connector: str | None = None
+) -> LoadResult:
+    """Validate an in-memory configured Ossie document set.
+
+    Native authoring overlays proposed whole-document content on the configured
+    files before anything is stored.  Keeping that gate here makes reads and
+    writes use the same bundled schema, integrity rules, expression checks, and
+    cross-document namespace check without writing a temporary file or opening
+    a connector.
+    """
+
+    ensure_available()
+    result = LoadResult()
+    for name, text in contents.items():
+        document, parse_errors = _parse_text(text, name)
         result.diagnostics.extend(parse_errors)
         if document is None:
             continue
@@ -303,10 +339,30 @@ def _parse(path: Path, name: str) -> tuple[dict[str, Any] | None, list[Diagnosti
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return refusal("unreadable", f"could not read the file: {exc}")
+    return _parse_text(text, name)
+
+
+def _parse_text(
+    text: str, name: str
+) -> tuple[dict[str, Any] | None, list[Diagnostic]]:
+    """Parse supplied document text with the same diagnostics as a file read."""
+
+    def refusal(rule: str, message: str) -> tuple[None, list[Diagnostic]]:
+        return None, [
+            Diagnostic(
+                file=name,
+                path="(root)",
+                layer="parse",
+                rule=rule,
+                severity=ERROR,
+                message=message,
+            )
+        ]
+
     try:
-        raw = json.loads(text) if path.name.endswith(".json") else yaml.safe_load(text)
+        raw = json.loads(text) if name.endswith(".json") else yaml.safe_load(text)
     except (ValueError, yaml.YAMLError) as exc:
-        kind = "JSON" if path.name.endswith(".json") else "YAML"
+        kind = "JSON" if name.endswith(".json") else "YAML"
         return refusal("malformed", f"not valid {kind}: {exc}")
     if not isinstance(raw, dict):
         return refusal(

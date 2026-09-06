@@ -53,6 +53,20 @@ def test_ossie_imports_no_dbt_or_metricflow_reader():
     assert not pulled & forbidden, sorted(pulled & forbidden)
 
 
+def test_ossie_authoring_imports_no_transformation_reader():
+    """The neutral plan values must not turn semantic writeback into dbt."""
+
+    pulled = imported_by("exmergo_dex_core.ossie.authoring")
+    forbidden = {
+        "exmergo_dex_core.dbt_project",
+        "exmergo_dex_core.dbt_semantic",
+        "exmergo_dex_core.metricflow_dialect",
+        "exmergo_dex_core.explore.semantic.local",
+    }
+
+    assert not pulled & forbidden, sorted(pulled & forbidden)
+
+
 def test_the_dbt_reader_does_not_import_ossie():
     """The other direction, which is the one that would make an existing dbt
     deployment depend on a draft interchange schema."""

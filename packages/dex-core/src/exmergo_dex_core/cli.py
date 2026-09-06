@@ -69,7 +69,7 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "place",
         "test",
     ],
-    "semantic": ["define", "update", "plan"],
+    "semantic": ["define", "update", "plan", "ossie"],
     # maintain: keep the dbt project correct as the world drifts. `snapshot`
     # captures the known-good baseline; `check` sweeps every axis against it;
     # `schema`/`volume`/`grain`/`semantic` are the per-axis deep detectors;
@@ -195,7 +195,7 @@ _GROUP_HELP: dict[str, str] = {
     "connect": "check a connector's own credentials and capabilities",
     "explore": "make sense of a warehouse: rank objects, profile columns, infer joins",
     "transform": "author and refactor dbt models, tests, and the semantic layer",
-    "semantic": "define dbt semantic models and metrics as reviewable diffs",
+    "semantic": "define dbt or native Ossie semantics as reviewable diffs",
     "maintain": "detect drift against the last snapshot and propose the fix",
     "viz": "preview the semantic layer (not yet implemented)",
     "demo": "create a seeded local DuckDB warehouse to try dex against "
@@ -503,10 +503,19 @@ def _build_parser() -> argparse.ArgumentParser:
                     # unit_tests: skeleton from. No bare `transform test`
                     # mode exists yet, unlike `macro`'s list-when-bare shape.
                     sp.add_argument("--scaffold", default=None)
-                if group == "semantic":
+                if group == "semantic" and name in {"define", "update", "plan"}:
                     sp.add_argument("argument", nargs="?", default=None)
                     sp.add_argument("--edits-file", default=None)
                     sp.add_argument("--no-parse", action="store_true", default=False)
+                if group == "semantic" and name == "ossie":
+                    sp.add_argument(
+                        "mode",
+                        nargs="?",
+                        choices=["define", "update", "plan"],
+                        default=None,
+                    )
+                    sp.add_argument("argument", nargs="?", default=None)
+                    sp.add_argument("--edits-file", default=None)
                 # maintain detectors take an optional object scope (default: whole
                 # project); reconcile takes an optional drift class to fix.
                 if group == "maintain" and name in {
@@ -646,6 +655,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
+        ("semantic", "ossie"): "cmd_semantic_ossie",
     }
     # `transform references` is routed before the authoring table and from its
     # own module on purpose, the same trade `explore semantic` makes above. It
@@ -660,7 +670,12 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
-        ensure_dialect_available()
+        # Native Ossie structure/integrity validation needs only [ossie]. SQL
+        # expression parsing is optional and produces a named skip when [sql]
+        # is absent, so this one authoring route must not impose the connector
+        # dialect floor used by dbt transformations.
+        if (args.group, args.subcommand) != ("semantic", "ossie"):
+            ensure_dialect_available()
         from .transform import commands as transform_cmds
 
         return getattr(transform_cmds, handler)(args, engine)

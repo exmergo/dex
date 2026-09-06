@@ -1253,6 +1253,15 @@ class DexEngine:
 
         return transform.semantic_plan(self, intent, edits, no_parse=no_parse)
 
+    def semantic_ossie(
+        self, mode: str, intent: str, edits: list[PlanEdit]
+    ) -> PlanResult:
+        """Plan native semantic-document edits on the semantic-layer axis."""
+
+        from .transform import commands as transform
+
+        return transform.semantic_ossie(self, intent, edits, mode=mode)
+
     # --- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:

@@ -28,15 +28,13 @@ import yaml
 
 from .. import command_args
 from .. import envelope as env
-from ..adapters.project import PlacingProject, placement_gap
 from ..config import pii_override_paths
-from ..dbt_project import ApplyResult as PlanApplyResult
-from ..dbt_project import EditOp
+from ..edits import ApplyResult as PlanApplyResult
+from ..edits import EditOp, SemanticEditTarget
 from ..errors import DexError
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
-from . import semantic as semantic_mod
 from .plans import EditKind, PlanEdit, PlanError
 from .results import (
     ApplyResult,
@@ -726,7 +724,13 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
             )
         plan_id = latest.plan_id
 
-    repo_root = engine.require_repo_root("applying a plan to the dbt project")
+    repo_root = engine.require_repo_root("applying a plan")
+    stored = store.load_plan(plan_id)
+    semantic_layer = None
+    if stored.edit_target == "semantic":
+        candidate = engine.semantic_catalog_format()
+        if isinstance(candidate, SemanticEditTarget):
+            semantic_layer = candidate
     outcome: PlanApplyResult = plans_mod.apply(
         plan_id,
         repo_root,
@@ -736,7 +740,10 @@ def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
         # format that placed an edit into its own keyspace is the one that writes
         # it. `None` here is a format declining the write tier, and falls back to
         # dbt's writer, which is where every plan went before the seam.
-        project_format=engine.editable_project(),
+        project_format=(
+            None if stored.edit_target == "semantic" else engine.editable_project()
+        ),
+        semantic_layer=semantic_layer,
     )
     conflicts = [c.model_dump(mode="json") for c in outcome.conflicts]
     if outcome.conflicts and not outcome.written:
@@ -1056,6 +1063,81 @@ def cmd_semantic_update(args: argparse.Namespace, engine: DexEngine) -> env.Enve
 
 def cmd_semantic_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return _semantic_envelope(args, engine, "plan")
+
+
+def semantic_ossie(
+    engine: DexEngine, intent: str, edits: list[PlanEdit], *, mode: str
+) -> PlanResult:
+    """Author configured native Ossie documents without involving dbt."""
+
+    if mode not in _SEMANTIC_AUTHORING:
+        raise ValueError(f"unknown semantic ossie mode '{mode}'")
+    if not edits:
+        raise ValueError(
+            f"semantic ossie {mode} needs content: pass --edits-file <path|-> "
+            "with whole configured Ossie documents"
+        )
+    wrong = [e.path for e in edits if e.kind is not EditKind.SEMANTIC_DOCUMENT]
+    if wrong:
+        raise ValueError(
+            f"semantic ossie {mode} takes only semantic_document edits; got "
+            "other kinds for: " + ", ".join(wrong)
+        )
+    deleted = [e.path for e in edits if e.op is EditOp.DELETE]
+    if deleted:
+        raise ValueError(
+            f"semantic ossie {mode} authors content and does not delete: "
+            + ", ".join(deleted)
+        )
+
+    layer = engine.semantic_catalog_format()
+    if not isinstance(layer, SemanticEditTarget):
+        named = getattr(layer, "name", type(layer).__name__)
+        raise ValueError(
+            f"the configured '{named}' semantic layer does not support native "
+            "semantic-document authoring; configure `semantic.vendor: ossie`"
+        )
+
+    from ..ossie.authoring import validate_plan
+
+    classification, validation_warnings = validate_plan(layer, edits, mode)
+    repo_root = engine.require_repo_root("storing a native semantic plan")
+    stored, diffs, plan_warnings = plans_mod.plan(
+        intent,
+        edits,
+        repo_root=repo_root,
+        store=engine.require_full_store("storing a native semantic plan"),
+        semantic_layer=layer,
+        edit_target="semantic",
+    )
+    return PlanResult(
+        plan_id=stored.plan_id,
+        intent=stored.intent,
+        paths=[edit.path for edit in stored.edits],
+        plan_path=engine.require_full_store("locating a plan").plan_locator(
+            stored.plan_id
+        ),
+        diffs=diffs,
+        warnings=[*plan_warnings, *validation_warnings],
+        defined=classification["defined"],
+        updated=classification["updated"],
+    )
+
+
+def cmd_semantic_ossie(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        result = semantic_ossie(
+            engine,
+            getattr(args, "argument", None) or "",
+            _edits_from_payload(
+                getattr(args, "edits_file", None),
+                default_kind=EditKind.SEMANTIC_DOCUMENT,
+            ),
+            mode=args.mode,
+        )
+        return to_envelope(result, hints=_plan_hint(result))
+    except (DexError, ValueError) as exc:
+        return env.error_for(exc)
 
 
 def _semantic_envelope(
@@ -1400,6 +1482,8 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
 
 
 def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
+    from ..adapters.project import PlacingProject, placement_gap
+
     repo_root = engine.require_repo_root("storing a transform plan")
     editable = engine.editable_project()
     # The directory these edits are pinned against has to name the same project
@@ -1471,6 +1555,8 @@ def _semantic_plan(
     mode: str,
     no_parse: bool = False,
 ) -> PlanResult:
+    from . import semantic as semantic_mod
+
     if not edits:
         raise ValueError(
             f"semantic {mode} needs content: pass --edits-file <path|-> with the "
