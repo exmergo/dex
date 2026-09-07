@@ -108,6 +108,19 @@ def _timeout_error() -> rs_errors.ProgrammingError:
     )
 
 
+def _read_only_planner_error() -> rs_errors.ProgrammingError:
+    """The SQLSTATE Redshift returns when a distinct aggregate is combined
+    with both temporal scalar subqueries under a read-only transaction."""
+
+    return rs_errors.ProgrammingError(
+        {
+            "S": "ERROR",
+            "C": "25006",
+            "M": "transaction is read-only",
+        }
+    )
+
+
 _CATALOG_MARKERS = (
     "pg_catalog.",
     "svv_table_info",
@@ -143,6 +156,16 @@ class FakeCursor:
         if _is_catalog(stripped):
             self._serve_catalog(stripped)
             return self
+
+        if (
+            self._conn.reject_read_only_temporal_plan
+            and self._conn.session_parameters.get("default_transaction_read_only")
+            == "on"
+            and ("HLL(" in upper or "COUNT(DISTINCT" in upper)
+            and "(SELECT COUNT(*)" in upper
+            and "(SELECT COALESCE(MAX(" in upper
+        ):
+            raise _read_only_planner_error()
 
         # A data statement: simulate duration, enforce the session timeout the
         # way the server does (kill and bill what ran).
@@ -314,6 +337,7 @@ class FakeRedshiftConnection:
         users: list[FakeUser] | None = None,
         empty_schemas: list[str] | None = None,
         reject_read_only: bool = False,
+        reject_read_only_temporal_plan: bool = False,
     ):
         self.tables = tables or []
         # Users the database knows, and their privileges: what the dev-target
@@ -329,6 +353,10 @@ class FakeRedshiftConnection:
         # A server that does not speak the session read-only parameter: the
         # adapter must tolerate the refusal and report it honestly.
         self.reject_read_only = reject_read_only
+        # Models a live Redshift planner limitation: a distinct aggregate plus
+        # the two scalar temporal-continuity subqueries is rejected in a
+        # read-only transaction even though every component is a SELECT.
+        self.reject_read_only_temporal_plan = reject_read_only_temporal_plan
         self.statements: list[FakeStatement] = []
         self.session_parameters: dict[str, object] = {}
         self.closed = False
@@ -357,5 +385,6 @@ class FakeRedshiftConnection:
         return [
             s
             for s in self.statements
-            if s.sql.strip().upper().startswith("SELECT") and not _is_catalog(s.sql)
+            if s.sql.strip().upper().startswith(("SELECT", "WITH"))
+            and not _is_catalog(s.sql)
         ]
