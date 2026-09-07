@@ -512,6 +512,63 @@ def test_billing_rounding_retry_still_refuses_past_the_confirmed_ceiling(
     assert len(non_dry) == 1
 
 
+def test_a_bytes_billed_refusal_reported_as_a_server_error_still_retries(
+    fake_bq_client,
+):
+    """BigQuery reports the same refusal under two classes: a 400 when it
+    rejects the job at admission, a 500 when the job fails on the limit during
+    execution. A query over a view takes the second path, because the tables it
+    really reads are only expanded server-side, which is exactly the case whose
+    cost a dry run predicts worst. Keying the retry on the class rather than the
+    condition left those queries with no retry at all."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    fake_bq_client.dry_run_underestimate = 0.99
+    fake_bq_client.tables["test-proj.shop.customers"].num_bytes = 160 * MB
+    adapter = make_adapter(
+        fake_bq_client, ceiling=1_000 * MB, session_ceiling=10_000 * MB
+    )
+    sql = "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`"
+    adapter.cost_gate.preflight_command(adapter.query_estimate(sql))
+
+    original = fake_bq_client._execution_error
+
+    def as_a_server_error(sql_text, job_config, total_bytes):
+        error = original(sql_text, job_config, total_bytes)
+        if isinstance(error, api_exceptions.BadRequest) and "bytes billed" in str(
+            error
+        ):
+            return api_exceptions.InternalServerError(str(error))
+        return error
+
+    fake_bq_client._execution_error = as_a_server_error
+
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+
+    non_dry = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(non_dry) == 2
+    assert non_dry[1].job_config.maximum_bytes_billed == 160 * MB
+
+
+def test_a_server_error_that_is_not_about_bytes_billed_still_propagates(
+    fake_bq_client,
+):
+    """The widened catch must not turn every server fault into a retry or a
+    statement refusal: only the bytes-billed condition is handled here."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    fake_bq_client.result_error = api_exceptions.InternalServerError("backend error")
+    adapter = make_adapter(fake_bq_client, ceiling=1_000 * MB)
+    with pytest.raises(api_exceptions.InternalServerError):
+        adapter.run_query(
+            "SELECT COUNT(*) FROM `test-proj`.`shop`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+
+
 def test_parse_bytes_billed_required_reads_bigquerys_own_number():
     from exmergo_dex_core.adapters.bigquery import _parse_bytes_billed_required
 

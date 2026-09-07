@@ -44,6 +44,8 @@ from ..errors import (
     RepoRootRequiredError,
     RequestError,
 )
+from ..guards import dialect as dialect_guard
+from ..guards.dialect import DialectDependencyError
 from ..results import ConfirmationRequest, to_envelope
 from ..storage import Document, FilesystemStore, MaintainStore, readable_cache
 from . import drift as drift_mod
@@ -713,12 +715,22 @@ def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     """Is the project correct right now, with no baseline required (#224).
 
-    The first finding class (#225): build-status gaps read from the compiled
-    manifest and the last run's ``run_results.json`` (failed nodes, nodes
-    skipped by a failed parent), plus models the project declares that have
-    no relation in the warehouse. Entirely free: the manifest/run-results
-    read touches no connection, and the relation check reads only cheap
-    object metadata, never a scan.
+    Two finding classes. Build-status gaps (#225) read the compiled manifest
+    and the last run's ``run_results.json`` (failed nodes, nodes skipped by a
+    failed parent), plus models the project declares that have no relation in
+    the warehouse. Row population (#226) reads each model's compiled SQL for
+    the relation it is built from and compares the two row counts, reporting a
+    model that lost rows with nothing in its SQL to account for it, or one that
+    fanned out on a join.
+
+    Free wherever the answer is free, which is most of it: the manifest read
+    touches no connection, the relation check and the row counts read cheap
+    object metadata, and on a connector with no cost gate the counts are made
+    exact because doing so bills nothing. Only the counts a warehouse keeps no
+    metadata for cost anything, and those are offered rather than taken: the
+    envelope returns its free findings as the complete answer they are, with
+    the scan priced beside them, exactly as `maintain check` and
+    `maintain semantic` do.
 
     A project that does not compile is reported first and suppresses every
     other check here, since a finding computed from a manifest a broken
@@ -748,10 +760,15 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         reason = "the project does not compile"
         result = VerifyResult(
             findings=drift_mod.rank_findings(findings),
-            suppressed={"build_status": reason, "no_relation": reason},
+            suppressed={
+                "build_status": reason,
+                "no_relation": reason,
+                "row_population": reason,
+            },
             warnings=[
-                "build-status and no-relation findings suppressed: the project "
-                "does not compile, so its manifest cannot be trusted"
+                "build-status, no-relation and row-population findings "
+                "suppressed: the project does not compile, so its manifest "
+                "cannot be trusted"
             ],
         )
         return result
@@ -765,8 +782,11 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
 
     definitions = engine.project_format().definitions()
     cost = None
+    adapter = None
+    offer = None
     if not definitions.present:
         suppressed["no_relation"] = "no dbt project found"
+        suppressed["row_population"] = "no dbt project found"
     else:
         model_relations = {
             name: relation
@@ -777,13 +797,23 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             adapter = engine._adapter("maintain verify")
         except DexError as exc:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
+            suppressed["row_population"] = f"warehouse unreachable: {exc}"
         else:
             cost = command_args.preflight_cost(adapter)
-            live = [o.identifier for o in adapter.list_objects()]
+            live = adapter.list_objects()
             already = {f.identifier for f in findings if f.identifier}
             findings.extend(
-                verify_mod.missing_relation_findings(model_relations, live, already)
+                verify_mod.missing_relation_findings(
+                    model_relations, [o.identifier for o in live], already
+                )
             )
+            row_findings, row_warnings, row_reason, offer = _row_population(
+                engine, adapter, project_dir, live
+            )
+            findings.extend(row_findings)
+            warnings.extend(row_warnings)
+            if row_reason is not None:
+                suppressed["row_population"] = row_reason
 
     if objects:
         wanted = {
@@ -801,7 +831,53 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     )
     if cost is not None:
         result.cost = cost
-    return result
+    if offer is not None:
+        # The free half is complete and real, so it returns as the answer it
+        # is, with the counts offered on top rather than gating it.
+        result.pending_offer = offer
+        return result
+    return result if adapter is None else command_args.stamp_spend(result, adapter)
+
+
+def _row_population(engine: DexEngine, adapter, project_dir, live):
+    """The row-loss and fanout half of `maintain verify`, end to end.
+
+    Split out because it is the only part of the command with a cost decision
+    in it, and because its inert cases are its own: an install with no dialect
+    engine, a project never compiled, a model whose driving parent cannot be
+    identified. Returns ``(findings, warnings, suppressed_reason, offer)``.
+    """
+
+    try:
+        dialect_guard.ensure_available()
+    except DialectDependencyError as exc:
+        return [], [], str(exc), None
+
+    checks, plan_notes = verify_mod.row_population_plan(project_dir, adapter.dialect)
+    if not checks:
+        # The plan's own first note is the reason where it has one (no compiled
+        # manifest, every model skipped): it is more specific than anything this
+        # layer could say, and it is already phrased for a reader.
+        reason = (
+            plan_notes[0]
+            if plan_notes
+            else "no compiled model could be lined up against a driving parent"
+        )
+        return [], plan_notes, reason, None
+
+    wanted = sorted({relation for check in checks for relation in check.relations})
+    measured = verify_mod.relation_counts(
+        adapter, wanted, live, timeout_seconds=engine.config.query.timeout_seconds
+    )
+    findings, finding_notes = verify_mod.row_population_findings(
+        checks,
+        measured.counts,
+        measured.counted,
+        measured.absent,
+        measured.deferred,
+    )
+    notes = plan_notes + measured.notes + finding_notes
+    return findings, notes, None, measured.offer
 
 
 def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:

@@ -1129,7 +1129,7 @@ def definitions(
     return defs
 
 
-def _strip_relation_quoting(relation: str) -> str:
+def strip_relation_quoting(relation: str) -> str:
     """``"db"."schema"."table"`` / `` `project.dataset.table` `` / bracketed
     forms down to plain dotted parts, matching adapter-normalized identifiers."""
 
@@ -1184,7 +1184,7 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
         # Ephemeral models compile with a null relation_name: referable in the
         # project but not physically resolvable, so they stay out of relations.
         if isinstance(relation, str) and relation:
-            relations[name] = _strip_relation_quoting(relation)
+            relations[name] = strip_relation_quoting(relation)
     for uid, node in sources.items():
         if not isinstance(node, dict):
             continue
@@ -1195,7 +1195,7 @@ def _declared_from_manifest(manifest: dict[str, Any], defs: ProjectDefinitions) 
         names[uid] = key
         relation = node.get("relation_name")
         if isinstance(relation, str) and relation:
-            relations[key] = _strip_relation_quoting(relation)
+            relations[key] = strip_relation_quoting(relation)
 
     def attached_name(node: dict[str, Any], exclude: str | None = None) -> str | None:
         attached = node.get("attached_node")
@@ -1484,7 +1484,7 @@ def semantic_catalog(
         defaults = defaults if isinstance(defaults, dict) else {}
         agg_time = defaults.get("agg_time_dimension")
         relation = node_relation.get("relation_name")
-        relation = _strip_relation_quoting(str(relation)) if relation else None
+        relation = strip_relation_quoting(str(relation)) if relation else None
 
         declared_entities = [
             e for e in entry.get("entities") or [] if isinstance(e, dict)
@@ -1953,7 +1953,7 @@ def _semantic_from_manifest(payload: dict[str, Any], defs: ProjectDefinitions) -
             continue
         relation = node_relation.get("relation_name")
         if isinstance(relation, str) and relation:
-            defs.model_relations.setdefault(model, _strip_relation_quoting(relation))
+            defs.model_relations.setdefault(model, strip_relation_quoting(relation))
         grain = _primary_entity_column(entry.get("entities"))
         if grain:
             defs.primary_entities[model] = grain

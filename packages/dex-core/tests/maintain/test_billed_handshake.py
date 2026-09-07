@@ -5,6 +5,7 @@ free phase of a two-phase command completes before any confirmation."""
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -459,3 +460,148 @@ def test_volume_names_an_external_table_it_could_not_compare(
     ), envelope.warnings
     # Free, as this axis always is: naming what it skipped costs no query.
     assert fake_bq_client.query_calls == []
+
+
+# --- row population on a metered connector (#226) -------------------------------
+#
+# BigQuery keeps a stored row count for a base table and none at all for a view,
+# which is what dbt's default materialization produces. So the two halves of the
+# same finding class sit on opposite sides of the free/gated split, and this is
+# where that split is held: the metadata half always answers, the counting half
+# is priced and offered, never taken.
+
+
+def _seed_verify_project(tmp_path: Path, monkeypatch) -> None:
+    """A dbt project whose one model is a view over `customers` that inner-joins
+    `events`, plus a compiled manifest for it. The compile check is faked to a
+    pass, as in the verify suite: dbt itself is not what these assert."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    monkeypatch.setattr(
+        verify_mod,
+        "shadow_parse",
+        lambda *a, **k: {
+            "available": True,
+            "reason": None,
+            "success": True,
+            "messages": [],
+        },
+    )
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: shop\nversion: "1.0.0"\nprofile: shop\nmodel-paths: ["models"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "models").mkdir(exist_ok=True)
+    target = tmp_path / "target"
+    target.mkdir(exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.shop.mart_customers": {
+                        "name": "mart_customers",
+                        "resource_type": "model",
+                        "relation_name": "`test-proj`.`shop`.`mart_customers`",
+                        "config": {"materialized": "view"},
+                        "compiled_code": (
+                            "select c.id from `test-proj`.`shop`.`customers` c "
+                            "inner join `test-proj`.`shop`.`events` e "
+                            "on c.id = e.id"
+                        ),
+                    }
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _client_with_a_view(fake_bq_client):
+    """The standard fake plus a view, which BigQuery keeps no row count for."""
+
+    from fakes.bigquery import FakeTable
+
+    view = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="mart_customers",
+        schema=list(fake_bq_client.tables["test-proj.shop.customers"].schema),
+        num_rows=0,
+        num_bytes=0,
+        table_type="VIEW",
+    )
+    fake_bq_client.tables[view.identifier] = view
+    return fake_bq_client
+
+
+def test_unconfirmed_verify_answers_and_offers_the_counts(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """The free half is a complete answer, not a pending charge: `ok`, with the
+    row counts BigQuery keeps no metadata for priced beside it."""
+
+    _seed_verify_project(tmp_path, monkeypatch)
+    route_adapter(_client_with_a_view(fake_bq_client))
+
+    envelope = _dispatch(tmp_path, "verify")
+    assert envelope.status == "ok", envelope.model_dump()
+    offer = envelope.data["offer"]
+    assert offer["axes"] == ["row_population"]
+    assert offer["estimated_bytes"] > 0
+    assert any("row population was not judged" in w for w in envelope.warnings)
+    # What this run cost, beside what the offer would cost: the free half spent
+    # nothing, and every statement it issued was a dry run.
+    assert envelope.cost.estimate == 0.0
+    assert all(c.dry_run for c in fake_bq_client.query_calls)
+    # Nothing was suppressed: the class ran, priced what it could not read for
+    # free, and said so. A suppression here would claim it never ran at all.
+    assert "row_population" not in envelope.data["suppressed"]
+
+
+def test_confirmed_verify_counts_what_the_catalog_does_not_keep(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """Confirmed, the view is counted and the finding lands. `exact` stays False
+    because the parent's side came from the catalog, which is the honest flag
+    for a verdict that is part measurement and part metadata."""
+
+    _seed_verify_project(tmp_path, monkeypatch)
+    client = _client_with_a_view(fake_bq_client)
+    client.row_resolver = lambda sql: [{"dex_rows_0": 42}]
+    route_adapter(client)
+
+    envelope = _dispatch(tmp_path, "verify", confirm=True, budget=100 * MB)
+    assert envelope.status == "ok", envelope.model_dump()
+    assert "offer" not in envelope.data
+    findings = [f for f in envelope.data["findings"] if f["code"] == "row_loss"]
+    assert len(findings) == 1, envelope.data["findings"]
+    assert findings[0]["identifier"] == "mart_customers"
+    assert findings[0]["data"]["row_count"] == 42
+    assert findings[0]["data"]["parent_row_count"] == 100
+    assert findings[0]["severity"] == "high"
+    assert findings[0]["exact"] is False
+    assert "inner join to 'test-proj.shop.events'" in findings[0]["detail"]
+
+
+def test_the_counting_statement_is_one_aggregate_only_query(
+    fake_bq_client, route_adapter, tmp_path, monkeypatch
+):
+    """Aggregate-only and batched, so it can carry a row count and nothing else,
+    and a metered connector pays its per-query floor once rather than per
+    relation."""
+
+    _seed_verify_project(tmp_path, monkeypatch)
+    client = _client_with_a_view(fake_bq_client)
+    client.row_resolver = lambda sql: [{"dex_rows_0": 42}]
+    route_adapter(client)
+
+    _dispatch(tmp_path, "verify", confirm=True, budget=100 * MB)
+    counting = [c for c in client.query_calls if "dex_rows_0" in c.sql]
+    assert len({c.sql for c in counting}) == 1
+    statement = counting[0].sql
+    assert statement.count("COUNT(*)") == 1
+    assert "mart_customers" in statement
+    # The tables the catalog already answered for are not re-counted.
+    assert "`customers`" not in statement

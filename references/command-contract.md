@@ -237,13 +237,21 @@ dex maintain semantic [<objects>] -> definition drift and dangling refs (free) +
 dex maintain reconcile [<class>]  -> propose the edits that reconcile detected drift, as a stored plan
                                      of diffs tagged mechanical/advisory (applied with transform apply)
 dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
-                                     required (unlike every subcommand above): failed/skipped build
-                                     nodes (naming the failed cause, walking back through transitively
-                                     skipped parents) and models with no relation in the warehouse; all
-                                     free (compiled manifest + last run_results.json + cheap object
-                                     metadata, never a scan). A project that fails to compile is
-                                     reported first and suppresses every other check; data.suppressed
-                                     names each finding class that did not run and why
+                                     required (unlike every subcommand above). Build status:
+                                     failed/skipped build nodes (naming the failed cause, walking back
+                                     through transitively skipped parents) and models with no relation
+                                     in the warehouse. Row population: row_loss and row_fanout against
+                                     each model's driving parent, the FROM-clause relation read out of
+                                     the compiled SQL through its CTE chain, naming the join and its
+                                     key and stating both counts; a model with a filter, aggregate,
+                                     de-duplication or set operation is never reported for loss, and an
+                                     incremental model is skipped. Free on metadata alone, and every
+                                     count made exact where counting bills nothing; a relation the
+                                     warehouse keeps no count for (any view) is priced as one batched
+                                     aggregate and returned as an offer beside findings already final.
+                                     A project that fails to compile is reported first and suppresses
+                                     every other check; data.suppressed names each finding class that
+                                     did not run and why
 dex viz preview                   -> emit the dbt semantic model to the Viz preview (not yet implemented;
                                      the Viz integration arrives later)
 ```

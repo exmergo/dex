@@ -127,6 +127,29 @@ Offer it once at setup. It is not something to run before an ordinary command.
   format rather than drift. Its cardinality half also never fires, because that
   check needs a semantic model naming a transformation model and Ossie names
   none: on such a layer this command is free and offers no scan.
+- `maintain verify [<selector>]` answers a different question from every command
+  above it: not "what changed since the baseline" but **"is this project right
+  now"**, and it needs no baseline at all, so it works on a project that was
+  never correct and on one somebody else just built. Two classes of finding.
+  Build status: nodes that failed, nodes skipped because a parent failed (naming
+  the one that actually failed), and models the project declares that built no
+  relation. Row population: `row_loss` where a model holds materially fewer rows
+  than its **driving parent** (the relation in its FROM clause, followed through
+  the CTE chain, as distinct from anything it joins) and nothing in its SQL
+  accounts for the shortfall, and `row_fanout` where it holds materially more,
+  each naming the join and its key and stating both counts.
+
+  Row population is conservative on purpose. A model with a `WHERE`, `GROUP BY`,
+  `DISTINCT`, `QUALIFY`, `LIMIT`, a semi or anti join, or a set operation was
+  written to hold a different number of rows and is never reported for loss; an
+  incremental model is skipped outright. So a quiet answer here is weaker
+  evidence than a finding, and the `warnings` say which models could not be
+  lined up at all.
+
+  A project that does not compile is reported first and suppresses everything
+  else, since a manifest a broken project could not have produced is not
+  evidence. Read `data.suppressed` before reading an empty `data.findings` as a
+  clean bill of health.
 - `maintain reconcile [<class>]` proposes the dbt edits that bring the project
   back in sync, as reviewable diffs. Optionally scope it to one class (`schema`,
   `volume`, `grain`, or `semantic`). It composes every layer's declarations
@@ -137,7 +160,10 @@ Offer it once at setup. It is not something to run before an ordinary command.
   command.
 
 The usual flow: `check` to triage, a focused detector to understand one axis in
-depth, then `reconcile` to get the proposed fix.
+depth, then `reconcile` to get the proposed fix. With no baseline, or on a
+project whose numbers were never right, start at `verify` instead: it is the one
+command here that does not need a snapshot, and it answers "is this right"
+rather than "what moved".
 
 ## Per-axis cost: what is free and what scans
 
@@ -163,7 +189,14 @@ The axes split:
   saying there is too little history to say): relay it, and note that the
   ceiling binds on the estimate, so a budget set at that fraction of the
   estimate is refused again.
-- **`check` and `semantic` answer first and offer second.** Their free axes
+- **`verify` is free except for the counts a warehouse does not keep.** Its
+  build-status findings read artifacts on disk, and its row counts come from
+  object metadata. A view has no stored row count anywhere, and a view is dbt's
+  default materialization, so on a metered connector those counts are batched
+  into one aggregate-only statement, priced, and returned in `data.offer` beside
+  findings that are already final. On DuckDB there is no gate, so every count is
+  measured rather than estimated and the findings come back `exact`.
+- **`check`, `semantic` and `verify` answer first and offer second.** Their free axes
   complete on every call, so the envelope is `ok` and the findings in it are
   final. The price of the scanning axes sits in `data.offer`, with `axes` naming
   what it would add; `data.axes_run` names what already ran. Confirming is a

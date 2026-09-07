@@ -9,6 +9,67 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain verify` reports row loss and fanout against a model's driving
+  parent** ([#226]). A model that quietly returns fewer rows than the relation
+  it is built from is the most common silent defect in a dbt project: an inner
+  join where a left join was meant, a filter that excludes NULLs by accident, a
+  de-duplication keyed on the wrong column. None raises an error, and every
+  uniqueness and not-null test still passes over the smaller result. Fanout is
+  the same defect mirrored, and every downstream sum is inflated by it.
+
+  `row_loss` names a model holding materially fewer rows than its **driving
+  parent**, and `row_fanout` one holding materially more, naming the join and
+  the key columns it joins on. Both state the two counts, so the threshold is
+  dex's opinion and the evidence is the reader's. The driving parent is the
+  relation in the model's FROM clause as distinct from anything it joins, read
+  out of the compiled SQL and followed through the chain of CTEs a dbt model
+  compiles to, because the FROM of a compiled model's final select names an
+  internal CTE almost every time.
+
+  **Conservative on purpose.** A model carrying a `WHERE`, `HAVING`, `QUALIFY`,
+  `GROUP BY`, `DISTINCT`, `LIMIT`, a semi or anti join, or a set operation was
+  written to hold fewer rows than its parent, and nothing in static SQL bounds
+  how many rows a filter should have removed, so those are not reported for loss
+  at all. An `UNNEST` or a lateral is the same argument for growth. An
+  incremental model is skipped outright, since it holds what previous runs
+  loaded rather than a function of this run's parent, and the skip is named
+  rather than silent.
+
+  **Free wherever the answer is free.** Row counts come from object metadata,
+  and on a connector with no cost gate every count is made exact instead,
+  because doing so bills nothing and a verdict about a ten percent difference
+  should not rest on a catalog estimate. A warehouse keeps no row count for a
+  view, and a view is dbt's default materialization, so those counts are batched
+  into one aggregate-only statement, priced, and returned in `data.offer` beside
+  findings that are already final. On a dogfood against BigQuery, two of three
+  findings came back for zero bytes and the third was offered at the per-query
+  floor.
+
+### Fixed
+
+- **A bytes-billed refusal that BigQuery reports as a server error retries like
+  the one it reports as a bad request** ([#226]). BigQuery raises the same
+  `bytesBilledLimitExceeded` condition under two classes: a 400 when it rejects
+  the job at admission, and a 500 when the job fails on the cap during
+  execution. A query over a view takes the second path, because the tables it
+  really reads are expanded server-side, which is also the query whose cost a
+  dry run predicts worst. The widen-and-retry that exists for exactly this case
+  was keyed on the class rather than the condition, so those queries had no
+  retry at all and surfaced the raw API error instead. Found by running
+  `maintain verify` against a view on a live BigQuery dataset.
+
+### Changed
+
+- **The SQL shape readers that both `transform plan` and `maintain verify` need
+  are one module** ([#226]). Reading a statement's driving relation, its joins
+  and their keys, its CTE scopes, and the clauses that reduce its row count now
+  lives in `sql_shape`, rather than privately inside row attribution. Both
+  callers must agree about what a query does, and sqlglot renamed the `from` and
+  `with` argument keys between majors, so every reader of a FROM clause has to
+  accept both spellings; that workaround was in four places and is now in one.
+
 ## [1.11.0] - 2026-09-06
 
 ### Added

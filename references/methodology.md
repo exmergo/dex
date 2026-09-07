@@ -162,6 +162,48 @@ after, so it lapsed. A declared combination that does not hold has neither: noth
 changed, the project is asserting a grain the data never had, and the fix is to the
 declaration rather than to the data.
 
+## Row population: a model against the relation it is built from
+
+Everything above measures a relation on its own terms. A transformation project
+raises a question none of it answers: not what this relation looks like, but
+whether it holds the rows it should, given the relation it was built from. That
+is where the expensive errors live, because they raise nothing. An inner join
+written where a left join was meant, a filter that quietly excludes NULLs, a
+de-duplication keyed on the wrong column: each drops rows, none is an error, and
+uniqueness and not-null tests all still pass over the smaller result.
+
+The comparison needs one thing the warehouse cannot supply, which is the model's
+**driving parent**: the relation in its FROM clause, as distinct from the ones it
+joins. Those are different roles. The driving relation sets how many rows the
+model starts with, and a join can only reduce that number or multiply it. So the
+parent is read out of the compiled SQL rather than out of the dependency graph,
+which knows a model's parents but not which of them drives it, and it is followed
+through the chain of CTEs a dbt model compiles to, since the FROM of a compiled
+model's final select names an internal CTE almost every time.
+
+**What the SQL says about itself decides whether the numbers mean anything.** A
+model carrying a filter, an aggregate, a de-duplication, or a set operation was
+written to hold fewer rows than its parent, and no amount of arithmetic
+distinguishes a filter that removed the rows it should from one that removed too
+many. There is no principled bound to compute, so those models are not reported
+at all rather than reported with a caveat. The cost of that choice is real: a
+filtered model that also lost rows to a bad join says nothing. The cost of the
+other choice is worse, because a detector that fires on every aggregate in a
+project is one nobody reads twice. The same logic runs the other way for growth,
+where an `UNNEST` or a lateral is a construct whose entire purpose is turning one
+row into several.
+
+Row counts themselves come from the cheapest source that can answer, and which
+one answered changes what the finding claims. A stored catalog count is free but
+is treated as an estimate, so the finding is not marked exact; an actual count is
+a proof. Where counting bills nothing, everything is counted, because a verdict
+about a ten percent difference has no business resting on an estimate. Where it
+bills something, it is priced and offered rather than taken, and the models it
+would have covered are named as uncompared. That last part matters more than it
+looks: a warehouse keeps no row count for a view, and a view is dbt's default
+materialization, so on a metered connector the models this can judge for free and
+the ones it cannot are split down exactly that line.
+
 ## The draft map: composing and persisting
 
 `explore map` composes the above into the `.dex/` cache (never the source of

@@ -1175,7 +1175,13 @@ class BigQueryAdapter:
         )
         try:
             iterator = job.result(timeout=timeout_seconds, max_results=max_results)
-        except self._api_exceptions.BadRequest as exc:
+        # Keyed on the condition rather than on one class. BigQuery reports the
+        # bytes-billed refusal as a 400 when it rejects the job at admission and
+        # as a 500 when the job fails on it during execution (a query over a
+        # view, where the referenced tables are only expanded server-side, takes
+        # the second path). Catching only the 400 left the widen-and-retry below
+        # unreachable for exactly the queries whose cost is hardest to predict.
+        except self._api_exceptions.GoogleAPICallError as exc:
             if "bytes billed" in str(exc) or "bytesBilledLimitExceeded" in str(exc):
                 required = _parse_bytes_billed_required(str(exc))
                 if required is not None and not _retried:
@@ -1207,8 +1213,12 @@ class BigQueryAdapter:
             # (an invalid query, a type it will not coerce). Typed, so the
             # envelope carries `execution_failure` and BigQuery's own words
             # rather than the `internal` an untyped API exception falls
-            # through to.
-            raise warehouse_refusal(str(exc)) from exc
+            # through to. Anything else in the family is a transport or server
+            # fault rather than a verdict on the statement, and is left to
+            # propagate exactly as it did before.
+            if isinstance(exc, self._api_exceptions.BadRequest):
+                raise warehouse_refusal(str(exc)) from exc
+            raise
         except TimeoutError as exc:
             # concurrent.futures.TimeoutError is the builtin on Python 3.11+.
             self._cancel(job)

@@ -32,6 +32,7 @@ import sqlglot
 from pydantic import BaseModel, Field
 from sqlglot import expressions as exp
 
+from .. import sql_shape
 from ..adapters import get_dialect, is_free_connector
 from ..cache import DexCache, match_identifier
 from ..dbt_project import EditOp, jinja_regions
@@ -256,137 +257,6 @@ def _reason(exc: Exception, limit: int = 240) -> str:
     return text if len(text) <= limit else f"{text[: limit - 3]}..."
 
 
-# --- scopes and row-population features ----------------------------------------
-
-MAIN_SCOPE = "(final select)"
-
-
-def _scopes(tree: exp.Expression) -> dict[str, exp.Select]:
-    """Every scope whose shape can move rows: each top-level CTE, plus the final
-    select.
-
-    Only top-level CTEs, deliberately. A CTE nested inside another is reachable
-    but has no stable name across two versions of a file, and an alignment that
-    can silently pair the wrong pair of scopes is worse than declining to align.
-    """
-
-    scopes: dict[str, exp.Select] = {}
-    # sqlglot renamed the arg key "with" to "with_" between major versions, the
-    # same rename the query firewall absorbs for "from". Both spellings are in
-    # the supported range, so both are read.
-    with_clause = tree.args.get("with_") or tree.args.get("with")
-    if with_clause is not None:
-        for cte in with_clause.expressions:
-            if isinstance(cte.this, exp.Select):
-                scopes[cte.alias_or_name.lower()] = cte.this
-    if isinstance(tree, exp.Select):
-        scopes[MAIN_SCOPE] = tree
-    return scopes
-
-
-def _predicates(select: exp.Select, key: str) -> list[exp.Expression]:
-    """A WHERE/HAVING/QUALIFY condition flattened across its top-level ANDs.
-
-    Flattening is what makes attribution per-predicate rather than per-clause:
-    ``where a and b`` edited to ``where a and c`` is one change to ``b``, not a
-    wholesale replacement of the filter.
-    """
-
-    clause = select.args.get(key)
-    if clause is None:
-        return []
-
-    flat: list[exp.Expression] = []
-    stack = [clause.this]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, exp.And):
-            stack.extend((node.expression, node.this))
-        elif isinstance(node, exp.Paren) and isinstance(node.this, exp.And):
-            stack.append(node.this)
-        else:
-            flat.append(node)
-    return flat
-
-
-def _text(node: exp.Expression | None) -> str:
-    """What a fragment says, normalized by sqlglot's own generator and no further.
-
-    This is the display form, so it keeps the case the author wrote. Lowercasing
-    it would rewrite string literals, and a finding that reports
-    ``status <> 'cancelled'`` for an edit to ``'CANCELLED'`` names a predicate
-    the model does not contain.
-    """
-
-    return "" if node is None else node.sql(comments=False).strip()
-
-
-def _key(node: exp.Expression | None) -> str:
-    """The matching form of :func:`_text`: case-insensitive, so re-casing an
-    identifier is not mistaken for a row-affecting edit."""
-
-    return _text(node).lower()
-
-
-def _relation_key(node: exp.Expression | None) -> str:
-    """A relation's identity with its alias removed.
-
-    Aliasing cannot change which rows a relation contributes, so it must not
-    split one relation into two. Keying on the aliased text would read
-    ``from orders`` edited to ``from orders o`` as a source swap and go on to
-    report a delta for a change that is pure notation.
-    """
-
-    if node is None:
-        return ""
-    bare = node.copy()
-    bare.set("alias", None)
-    return _key(bare)
-
-
-@dataclass
-class _Join:
-    side: str
-    relation: exp.Expression
-    on: exp.Expression | None
-    node: exp.Join
-
-    @property
-    def key(self) -> str:
-        return _relation_key(self.relation)
-
-    @property
-    def name(self) -> str:
-        return _text(self.relation)
-
-    @property
-    def label(self) -> str:
-        on = f" on {_text(self.on)}" if self.on is not None else ""
-        return f"{self.side} join {self.name}{on}"
-
-
-def _joins(select: exp.Select) -> list[_Join]:
-    out = []
-    for node in select.args.get("joins") or []:
-        side = " ".join(
-            part for part in (node.side or "", node.kind or "") if part
-        ).lower()
-        out.append(
-            _Join(
-                side=side or "inner",
-                relation=node.this,
-                on=node.args.get("on"),
-                node=node,
-            )
-        )
-    return out
-
-
-def _group_by(select: exp.Select) -> list[str]:
-    group = select.args.get("group")
-    return [] if group is None else [_text(e) for e in group.expressions]
-
-
 # --- change detection ----------------------------------------------------------
 
 
@@ -432,9 +302,9 @@ def _predicate_mutator(
     clause: str, dialect: str, *, drop: str | None = None, add: str | None = None
 ) -> Callable[[exp.Select], None]:
     def mutate(select: exp.Select) -> None:
-        preds = _predicates(select, clause)
+        preds = sql_shape.predicates(select, clause)
         if drop is not None:
-            preds = [p for p in preds if _key(p) != drop]
+            preds = [p for p in preds if sql_shape.match_key(p) != drop]
         if add is not None:
             preds.append(sqlglot.parse_one(add, dialect=dialect))
         _set_predicates(select, clause, preds)
@@ -453,8 +323,14 @@ def _clause_changes(
     guessing which new predicate stands in for which old one.
     """
 
-    before = {_key(p): _text(p) for p in _predicates(prior, clause)}
-    after = {_key(p): _text(p) for p in _predicates(authored, clause)}
+    before = {
+        sql_shape.match_key(p): sql_shape.text(p)
+        for p in sql_shape.predicates(prior, clause)
+    }
+    after = {
+        sql_shape.match_key(p): sql_shape.text(p)
+        for p in sql_shape.predicates(authored, clause)
+    }
     removed = [k for k in before if k not in after]
     added = [k for k in after if k not in before]
     noun = {
@@ -523,12 +399,14 @@ def _join_changes(
 
     # A join onto a renamed CTE is the same bookkeeping _source_changes skips.
     before = {
-        j.key: j for j in _joins(prior) if not _names_a_cte(j.relation, prior_ctes)
+        j.key: j
+        for j in sql_shape.joins(prior)
+        if not sql_shape.names_a_cte(j.relation, prior_ctes)
     }
     after = {
         j.key: j
-        for j in _joins(authored)
-        if not _names_a_cte(j.relation, authored_ctes)
+        for j in sql_shape.joins(authored)
+        if not sql_shape.names_a_cte(j.relation, authored_ctes)
     }
     changes: list[_Change] = []
 
@@ -566,7 +444,7 @@ def _join_changes(
                     ),
                 )
             )
-        elif _key(old.on) != _key(join.on):
+        elif sql_shape.match_key(old.on) != sql_shape.match_key(join.on):
             on = join.on.copy() if join.on is not None else None
             changes.append(
                 _Change(
@@ -591,7 +469,7 @@ def _join_changes(
                 [
                     j
                     for j in (select.args.get("joins") or [])
-                    if _relation_key(j.this) != key
+                    if sql_shape.relation_key(j.this) != key
                 ],
             ),
         )
@@ -603,14 +481,14 @@ def _join_changes(
 
 def _retype_join(select: exp.Select, key: str, side: Any, kind: Any) -> None:
     for node in select.args.get("joins") or []:
-        if _relation_key(node.this) == key:
+        if sql_shape.relation_key(node.this) == key:
             node.set("side", side)
             node.set("kind", kind)
 
 
 def _rejoin_on(select: exp.Select, key: str, on: exp.Expression | None) -> None:
     for node in select.args.get("joins") or []:
-        if _relation_key(node.this) == key:
+        if sql_shape.relation_key(node.this) == key:
             node.set("on", on.copy() if on is not None else None)
 
 
@@ -635,7 +513,7 @@ def _grain_changes(
             )
         )
 
-    before, after = _group_by(prior), _group_by(authored)
+    before, after = sql_shape.group_by(prior), sql_shape.group_by(authored)
     if before != after:
         group = authored.args.get("group")
         changes.append(
@@ -656,24 +534,6 @@ def _grain_changes(
     return changes
 
 
-def _from_relation(select: exp.Select) -> exp.Expression | None:
-    # sqlglot renamed the arg key "from" to "from_" between major versions.
-    clause = select.args.get("from_") or select.args.get("from")
-    return None if clause is None else clause.this
-
-
-def _names_a_cte(node: exp.Expression, ctes: set[str]) -> bool:
-    """Whether a FROM/JOIN relation is one of this query's own CTEs.
-
-    A CTE is an internal name, so renaming one is bookkeeping rather than a
-    change of source. Without this check a renamed CTE reads as the model being
-    repointed at a different table, which is both wrong and alarming, and the
-    scope-alignment findings already report the rename properly.
-    """
-
-    return isinstance(node, exp.Table) and node.name.lower() in ctes
-
-
 def _source_changes(
     scope: str,
     prior: exp.Select,
@@ -689,12 +549,14 @@ def _source_changes(
     the same relation reports nothing.
     """
 
-    before, after = _from_relation(prior), _from_relation(authored)
+    before, after = sql_shape.from_relation(prior), sql_shape.from_relation(authored)
     if before is None or after is None:
         return []
-    if _relation_key(before) == _relation_key(after):
+    if sql_shape.relation_key(before) == sql_shape.relation_key(after):
         return []
-    if _names_a_cte(before, prior_ctes) or _names_a_cte(after, authored_ctes):
+    if sql_shape.names_a_cte(before, prior_ctes) or sql_shape.names_a_cte(
+        after, authored_ctes
+    ):
         return []
 
     replacement = after.copy()
@@ -709,11 +571,11 @@ def _source_changes(
             kind="source_changed",
             scope=scope,
             detail=(
-                f"the driving relation changed from `{_text(before)}` to "
-                f"`{_text(after)}`"
+                f"the driving relation changed from `{sql_shape.text(before)}` to "
+                f"`{sql_shape.text(after)}`"
             ),
-            prior=_text(before),
-            authored=_text(after),
+            prior=sql_shape.text(before),
+            authored=sql_shape.text(after),
             mutate=mutate,
         )
     ]
@@ -737,7 +599,7 @@ def classify(
     except sqlglot.errors.ParseError as exc:
         return [], [
             RowPopulationChange(
-                scope=MAIN_SCOPE,
+                scope=sql_shape.MAIN_SCOPE,
                 kind="unattributable",
                 detail="the model's SQL could not be parsed for comparison",
                 attributed=False,
@@ -745,9 +607,9 @@ def classify(
             )
         ]
 
-    prior_scopes, authored_scopes = _scopes(prior), _scopes(authored)
-    prior_ctes = prior_scopes.keys() - {MAIN_SCOPE}
-    authored_ctes = authored_scopes.keys() - {MAIN_SCOPE}
+    prior_scopes, authored_scopes = sql_shape.scopes(prior), sql_shape.scopes(authored)
+    prior_ctes = prior_scopes.keys() - {sql_shape.MAIN_SCOPE}
+    authored_ctes = authored_scopes.keys() - {sql_shape.MAIN_SCOPE}
     changes: list[_Change] = []
     unresolved: list[RowPopulationChange] = []
 
@@ -791,7 +653,7 @@ def classify(
 
     # A stable order so a re-plan of the same edit reports the same sequence:
     # the final select last, since that is where a reader ends up looking.
-    changes.sort(key=lambda c: (c.scope == MAIN_SCOPE, c.scope, c.kind))
+    changes.sort(key=lambda c: (c.scope == sql_shape.MAIN_SCOPE, c.scope, c.kind))
     return changes, unresolved
 
 
@@ -824,7 +686,7 @@ def count_sql(tree: exp.Expression, dialect: str) -> str:
 
 def _variant(prior: exp.Expression, change: _Change, dialect: str) -> str:
     copy = prior.copy()
-    scope = _scopes(copy).get(change.scope)
+    scope = sql_shape.scopes(copy).get(change.scope)
     if scope is None:  # pragma: no cover - alignment guarantees the scope exists
         raise UnattributableError(
             f"scope `{change.scope}` vanished from the prior model"
@@ -995,7 +857,7 @@ def _prepare(
                 return None
             record.changes.append(
                 RowPopulationChange(
-                    scope=MAIN_SCOPE,
+                    scope=sql_shape.MAIN_SCOPE,
                     kind="unattributable",
                     detail="this edit's effect on the row population is unknown",
                     attributed=False,
