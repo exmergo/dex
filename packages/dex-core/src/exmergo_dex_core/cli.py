@@ -459,6 +459,11 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                    # Opt-in on every connector, free ones included. Verifying
+                    # on DuckDB costs nothing, so defaulting it on there was
+                    # available; one flag meaning one thing everywhere is worth
+                    # more than saving the flag on one connector.
+                    sp.add_argument("--verify", action="store_true", default=False)
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is
                     # each of these used", which is the shape of a rename. `--kind`

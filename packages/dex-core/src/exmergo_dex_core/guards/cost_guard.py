@@ -753,6 +753,19 @@ class CostGate:
         )
 
     @property
+    def billed(self) -> float:
+        """What statements issued through this gate have actually charged.
+
+        ``settle`` releases the reservation and folds this into the ledger, so a
+        caller that needs the figure for its own reporting has to read it first.
+        The one caller that does is ``transform build``, where dbt's spend is
+        billed outside the gate entirely and this therefore holds exactly what
+        the folded verification phase charged on top of it.
+        """
+
+        return self._billed
+
+    @property
     def serialized(self) -> bool:
         """Whether the spend admission is safe from being raced.
 

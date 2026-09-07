@@ -590,7 +590,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     ("transform", "apply"): {"method": "apply", "args": {"argument": _TRANSLATED}},
     ("transform", "build"): {
         "method": "build",
-        "args": {"target": "target", "select": "select"},
+        "args": {"target": "target", "select": "select", "verify": "verify"},
     },
     ("transform", "deps"): {"method": "deps", "args": {}},
     ("transform", "plans"): {"method": "plans", "args": {}},

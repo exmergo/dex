@@ -22,6 +22,7 @@ import argparse
 import contextlib
 import json
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -54,6 +55,7 @@ from .results import (
 if TYPE_CHECKING:
     from ..engine import DexEngine
     from . import semantic as semantic_mod
+    from .verify import BuildVerification
 
 # Two of this module's neighbours reach the dialect engine at import (`.semantic`
 # for MetricFlow-shaped YAML, `.validate` for SQL), and importing either here
@@ -824,9 +826,20 @@ def cmd_plans(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def build(
-    engine: DexEngine, *, target: str | None = None, select: str | None = None
+    engine: DexEngine,
+    *,
+    target: str | None = None,
+    select: str | None = None,
+    verify: bool = False,
 ) -> BuildResult:
     """Run ``dbt build`` against the dev target, cost-surfaced first.
+
+    ``verify`` folds the correctness sweep onto the run, scoped to the nodes it
+    touched: dbt reports that it executed, and this reports whether what it
+    produced holds the rows it should. Opt-in on every connector, including the
+    free ones, so one flag means one thing everywhere. Its findings never
+    change the status, and on a billed connector its scan is priced into the
+    same estimate the build is priced into, so the caller confirms one number.
 
     The order mirrors the documented gate: the dev-target check runs first (free,
     and it must refuse a broken or undeployable target before anyone weighs a
@@ -865,6 +878,8 @@ def build(
     connector = engine.connector or config.connector
 
     project = engine.project_dir()
+    if verify:
+        _widen_scope_to_the_dev_target(engine)
     # A --connector flag governs this build, so the drift check must compare the
     # profile against that connector's config block, not the committed default.
     effective = config.model_copy(update={"connector": connector})
@@ -893,6 +908,9 @@ def build(
             connector=connector,
             dev_target_check=dev_check,
         )
+        # Before the shaping on both paths, so the two read the same way; here
+        # there is no gate to outlive, on the billed path below there is.
+        verification = _verify_build(engine, project, summary, verify)
         return _shape_build_result(
             summary,
             cost,
@@ -900,11 +918,12 @@ def build(
             connector,
             store,
             extra_notes=skipped_handshake_warning(paradigm, engine.confirmed),
+            verification=verification,
         )
 
     dev_warnings = dev_check()
     estimate, per_node, price_notes, adapter = _price_build(
-        engine, project, target, select
+        engine, project, target, select, verify=verify
     )
     if estimate is not None:
         command_args.billed_handshake(
@@ -952,6 +971,10 @@ def build(
         )
         raise
 
+    # Between the run and the shaping, deliberately: `_shape_build_result`
+    # settles the gate, and a statement issued after that is charged against a
+    # reservation that has already been released.
+    verification = _verify_build(engine, project, summary, verify, adapter=adapter)
     return _shape_build_result(
         summary,
         cost,
@@ -963,6 +986,87 @@ def build(
         session_ceiling_declined=config.budget.session_ceiling_declined,
         gate=command_args.cost_gate(adapter) if adapter is not None else None,
         adapter=adapter,
+        verification=verification,
+    )
+
+
+def _verify_build(
+    engine: DexEngine,
+    project,
+    summary: dict,
+    requested: bool,
+    *,
+    adapter=None,
+) -> BuildVerification:
+    """The sweep, or the statement that it did not run.
+
+    Opt-in on every connector, free ones included. Verification on DuckDB costs
+    nothing, so making it automatic there was tempting; one flag that means one
+    thing on every connector is worth more than saving a caller the flag on one
+    of them, and a build whose payload changes shape with the connector is a
+    worse contract than a build that always says what it did.
+
+    ``adapter`` is the one the pricing pass already opened, passed through
+    rather than re-derived: opening again would settle the gate holding this
+    command's reservation and rebuild it, and the counts would then be charged
+    against nothing.
+    """
+
+    from .verify import BuildVerification, verify_build
+
+    if not requested:
+        return BuildVerification(
+            ran=False, reason="not requested; re-run with --verify to sweep"
+        )
+    opener = (
+        (lambda: adapter)
+        if adapter is not None
+        else (lambda: engine._adapter("transform build"))
+    )
+    return verify_build(engine, Path(project), summary, resolve_adapter=opener)
+
+
+def _widen_scope_to_the_dev_target(engine: DexEngine) -> None:
+    """Let this command read the namespace dbt is about to write into.
+
+    Every other command refuses that namespace as a source, so exploration can
+    never mistake a built model for a source table. Verification is the one
+    whose subject *is* that output: without this, a metered connector reports
+    that it can see nothing to judge, because dbt writes to a namespace the
+    source allowlist deliberately excludes.
+
+    Applied to this command's own copy of the config, not through the
+    ``--scope`` override. That override may only narrow, by design: a committed
+    allowlist is a cost boundary and a flag must not reach past it. This is not
+    a flag. It is dex adding the one namespace its own config already names as
+    the dev target, for the length of one command, and the spend that namespace
+    can attract is still bound by the budget and the handshake like any other.
+
+    Called before anything opens a connection, because the adapter resolves its
+    scope once on the first open and caches it for the command. Nothing is
+    written back to `.dex/config.yml`, and the widened scope is what the
+    envelope's connection block reports, so it is visible rather than silent.
+    """
+
+    from .verify import dev_source_scope
+
+    connector = engine.connector or engine.config.connector
+    widening = dev_source_scope(engine.config, connector)
+    if widening is None:
+        return
+    field, entries = widening
+    target = getattr(engine.config, connector)
+    committed = [str(entry) for entry in getattr(target, field)]
+    # An empty allowlist already means "everything this connection can see", so
+    # narrowing it to the dev namespace would be a widening in name and a
+    # narrowing in fact.
+    if not committed:
+        return
+    widened = [*committed, *(e for e in entries if e not in committed)]
+    if widened == committed:
+        return
+    engine.config = engine.config.model_copy(
+        update={connector: target.model_copy(update={field: widened})}
     )
 
 
@@ -973,6 +1077,7 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 engine,
                 target=getattr(args, "target", None),
                 select=getattr(args, "select", None),
+                verify=getattr(args, "verify", False),
             )
         )
     except BuildFailedError as exc:
@@ -1158,6 +1263,8 @@ def _record_build_spend(
     billed: float | None,
     paradigm,
     estimate: float | None = None,
+    *,
+    gate_billed: float = 0.0,
 ) -> dict[str, float | None]:
     """Account a billed dbt build in the spend ledger and report what it cost.
 
@@ -1220,12 +1327,26 @@ def _record_build_spend(
             utc_day_start(), field=field, connector=connector
         )
     return {
-        spend_field(paradigm): None if billed is None else float(billed),
+        # `gate_billed` is what statements dex issued through the gate charged
+        # (the folded verification), already in the ledger under this command's
+        # own settlement, so it is added to what is reported and not appended
+        # again. Reporting dbt's figure alone would under-report the command,
+        # which is the one direction a cost guard must never round.
+        spend_field(paradigm): None
+        if billed is None
+        else float(billed) + float(gate_billed),
         "session_spent_today": session_spent,
     }
 
 
-def _price_build(engine: DexEngine, project, target: str, select: str | None):
+def _price_build(
+    engine: DexEngine,
+    project,
+    target: str,
+    select: str | None,
+    *,
+    verify: bool = False,
+):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
     Returns ``(estimate, per_node, notes, adapter)``. ``estimate`` is ``None``
@@ -1274,6 +1395,22 @@ def _price_build(engine: DexEngine, project, target: str, select: str | None):
         estimate, per_node, notes = compile_estimate(
             project, adapter, target=target, select=select, env=compile_env
         )
+        if verify:
+            # The compile above wrote the manifest this reads, so the sweep's
+            # scan can be priced here and confirmed with the build rather than
+            # asked about again once the build has already spent.
+            from .build import compiled_model_names
+            from .verify import price_verification
+
+            scan, scan_notes = price_verification(
+                adapter,
+                Path(project),
+                scope=compiled_model_names(Path(project)),
+            )
+            notes = [*notes, *scan_notes]
+            if scan:
+                estimate += scan
+                per_node = {**per_node, "(row counts)": scan}
         return estimate, per_node, notes, adapter
     except Exception as exc:
         if cloud_capacity_required and not cloud_capacity_proved:
@@ -1311,6 +1448,7 @@ def _shape_build_result(
     session_ceiling_declined: bool = False,
     gate=None,
     adapter=None,
+    verification: BuildVerification | None = None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -1344,10 +1482,23 @@ def _shape_build_result(
         unserialized_ledger_warning,
     )
 
+    # Read before the settle releases it: on this command the gate bills for the
+    # folded verification and nothing else, because dbt spends outside the gate
+    # entirely and the compile that priced the run only dry-ran.
+    gate_billed = gate.billed if gate is not None else 0.0
     if gate is not None:
         gate.settle()
     messages = summary.pop("messages", [])
     notes = [*extra_notes, *summary.pop("notes", [])]
+    if verification is not None:
+        notes = [*notes, *verification.warnings]
+        if verification.findings:
+            notes = [
+                *notes,
+                f"verification found {len(verification.findings)} issue(s) in the "
+                "nodes this build touched; they are reported in "
+                "data.verification.findings and do not change the build's status",
+            ]
     spend: dict[str, float | None] | None = None
     # What the handshake priced this build at, ledgered beside what it billed so
     # a later over-ceiling refusal on this connector can say how far the two
@@ -1380,9 +1531,19 @@ def _shape_build_result(
                 "so spend is unknown rather than zero and nothing was appended "
                 "to the spend ledger",
             ]
+            if gate_billed:
+                notes = [
+                    *notes,
+                    "the verification row counts did bill, and are in the "
+                    "ledger and in session_spent_today; an unknown build "
+                    "figure plus a known one is still unknown, so they are "
+                    "not added into the reported spend",
+                ]
         else:
             billed = float(billed or 0.0)
-        spend = _record_build_spend(store, connector, billed, paradigm, estimate)
+        spend = _record_build_spend(
+            store, connector, billed, paradigm, estimate, gate_billed=gate_billed
+        )
     elif paradigm is Paradigm.COMPUTE_TIME:
         cap_note = _COMPUTE_TIME_CAP_NOTES.get(
             connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
@@ -1395,7 +1556,9 @@ def _shape_build_result(
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )
-        spend = _record_build_spend(store, connector, seconds, paradigm, estimate)
+        spend = _record_build_spend(
+            store, connector, seconds, paradigm, estimate, gate_billed=gate_billed
+        )
         translate = getattr(adapter, "compute_spend_translation", None)
         if translate is not None:
             # Unconditional, including at zero seconds: the translated keys
@@ -1410,7 +1573,9 @@ def _shape_build_result(
         seconds = sum(
             float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
         )
-        spend = _record_build_spend(store, connector, seconds, paradigm, estimate)
+        spend = _record_build_spend(
+            store, connector, seconds, paradigm, estimate, gate_billed=gate_billed
+        )
     notes = [
         *notes,
         *no_session_ceiling_warning(
@@ -1423,13 +1588,22 @@ def _shape_build_result(
         ),
     ]
     if summary["success"]:
-        return BuildResult(
+        result = BuildResult(
             success=True,
             summary=summary,
             cost=cost,
             spend=spend,
             warnings=[*notes, *messages],
         )
+        if verification is not None:
+            result.verification = verification.payload()
+            # An offer, never a pending confirmation, and the departure from
+            # `Result`'s usual rule is deliberate: the build the caller asked
+            # for is finished and billed. Reporting `needs_confirmation` would
+            # tell a host nothing had run and invite it to pay for the whole
+            # build a second time to get the counts.
+            result.pending_offer = verification.offer
+        return result
     # Agents triage from `errors` first, so the first real dbt message rides there;
     # the rest stay in warnings.
     deps_info = summary.get("deps")
@@ -1438,16 +1612,19 @@ def _shape_build_result(
         if deps_info and not deps_info.get("success", True)
         else "dbt build failed"
     )
-    raise BuildFailedError(
-        _failure_message(prefix, messages),
-        result=BuildResult(
-            success=False,
-            summary=summary,
-            cost=cost,
-            spend=spend,
-            warnings=[*notes, *(messages[1:] if messages else [])],
-        ),
+    failed = BuildResult(
+        success=False,
+        summary=summary,
+        cost=cost,
+        spend=spend,
+        warnings=[*notes, *(messages[1:] if messages else [])],
     )
+    if verification is not None:
+        # A failed build is when "which node failed, and which were skipped
+        # because of it" is worth most, and `cmd_build` builds that envelope by
+        # hand from `result.data()`, so the payload reaches it from here.
+        failed.verification = verification.payload()
+    raise BuildFailedError(_failure_message(prefix, messages), result=failed)
 
 
 def _failure_message(prefix: str, messages: list[str]) -> str:

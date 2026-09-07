@@ -1238,11 +1238,15 @@ class DexEngine:
         return transform.place(self, column, targets, expression, explain=explain)
 
     def build(
-        self, *, target: str | None = None, select: str | None = None
+        self,
+        *,
+        target: str | None = None,
+        select: str | None = None,
+        verify: bool = False,
     ) -> BuildResult:
         from .transform import commands as transform
 
-        return transform.build(self, target=target, select=select)
+        return transform.build(self, target=target, select=select, verify=verify)
 
     def deps(self) -> DepsResult:
         from .transform import commands as transform
