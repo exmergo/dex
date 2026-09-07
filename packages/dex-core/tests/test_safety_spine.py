@@ -4439,7 +4439,6 @@ def test_redshift_generated_sql_is_select_only(fake_redshift_connection):
         key_shape_req,
         temporal_req,
     )
-    assert sql.lstrip().upper().startswith("SELECT")
     assert "su_" in sql and "sp_" in sql and "st_" in sql
     assert "ts_ns_" in sql and "ts_ep_s_" in sql
     # ...with every cast in them total, so no dialect can raise on a

@@ -68,7 +68,6 @@ from .base import (
     shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
-    temporal_continuity_sql,
     temporal_units_for,
     type_contradiction_aggregate_kwargs,
     type_contradiction_expressions,
@@ -188,6 +187,46 @@ def _date_diff_expr(unit: str, later: str, earlier: str) -> str:
     # it shifts nothing: both operands convert to the session timezone by the
     # same rule, so their difference is what it was.
     return f"DATEDIFF({unit}, {earlier}::TIMESTAMP, {later}::TIMESTAMP)"
+
+
+def _temporal_continuity_ctes(
+    qcol: str, i: int, unit: str, table_sql: str
+) -> tuple[list[str], list[str], str]:
+    """Build Redshift's temporal continuity branch as named CTEs.
+
+    Redshift rejects a flat aggregate containing a distinct aggregate plus
+    both scalar temporal subqueries under ``default_transaction_read_only``
+    (SQLSTATE 25006), even though every component is a SELECT. Keeping the
+    period and gap work in a separate aggregate branch avoids that planner
+    path without dropping session-level read-only protection or issuing a
+    second billed statement.
+    """
+
+    alias = {"day": "d", "month": "m", "hour": "h"}[unit]
+    periods = f"periods_{alias}_{i}"
+    lagged = f"lagged_{alias}_{i}"
+    continuity = f"continuity_{alias}_{i}"
+    period_expr = _date_trunc_expr(qcol, unit)
+    gap_expr = _date_diff_expr(unit, "period", "prev_period")
+    ctes = [
+        (
+            f"{periods} AS (SELECT DISTINCT {period_expr} AS period "  # noqa: S608
+            f"FROM {table_sql} WHERE {qcol} IS NOT NULL)"
+        ),
+        (
+            f"{lagged} AS (SELECT period, "  # noqa: S608
+            f"LAG(period) OVER (ORDER BY period) AS prev_period FROM {periods})"
+        ),
+        (
+            f"{continuity} AS (SELECT COUNT(*) AS tp_{alias}_{i}, "  # noqa: S608
+            f"COALESCE(MAX({gap_expr} - 1), 0) AS tg_{alias}_{i} FROM {lagged})"
+        ),
+    ]
+    projections = [
+        f"{continuity}.tp_{alias}_{i} AS tp_{alias}_{i}",
+        f"{continuity}.tg_{alias}_{i} AS tg_{alias}_{i}",
+    ]
+    return ctes, projections, continuity
 
 
 class RedshiftConnectionError(ConnectorError):
@@ -839,6 +878,9 @@ class RedshiftAdapter:
         # does), and MIN/MAX would carry values.
         table_sql = self._quote(identifier)
         select_parts = ["COUNT(*) AS n_total"]
+        continuity_ctes: list[str] = []
+        continuity_projections: list[str] = []
+        continuity_relations: list[str] = []
         plan: list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool]] = []
         for i, col in enumerate(columns):
             qcol = _quote_ident(col.name)
@@ -880,16 +922,12 @@ class RedshiftAdapter:
                     temporal_alignment_expressions(qcol, i, _date_trunc_expr)
                 )
                 for unit in temporal_units_for(col.data_type):
-                    select_parts.extend(
-                        temporal_continuity_sql(
-                            qcol,
-                            i,
-                            unit,
-                            table_sql,
-                            _date_trunc_expr,
-                            _date_diff_expr,
-                        )
+                    ctes, projections, relation = _temporal_continuity_ctes(
+                        qcol, i, unit, table_sql
                     )
+                    continuity_ctes.extend(ctes)
+                    continuity_projections.extend(projections)
+                    continuity_relations.append(relation)
             plan.append(
                 (
                     i,
@@ -904,7 +942,19 @@ class RedshiftAdapter:
             )
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
-        sql = f"SELECT {', '.join(select_parts)} FROM {table_sql}"  # noqa: S608
+        main_sql = f"SELECT {', '.join(select_parts)} FROM {table_sql}"  # noqa: S608
+        if continuity_ctes:
+            ctes = [f"main_aggregates AS ({main_sql})", *continuity_ctes]
+            joins = " ".join(
+                f"CROSS JOIN {relation}" for relation in continuity_relations
+            )
+            sql = (
+                f"WITH {', '.join(ctes)} "  # noqa: S608
+                f"SELECT main_aggregates.*, {', '.join(continuity_projections)} "
+                f"FROM main_aggregates {joins}"
+            )
+        else:
+            sql = main_sql
         return assert_select_only(sql, dialect=self.dialect), plan
 
     @staticmethod
