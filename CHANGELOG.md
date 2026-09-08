@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-08
+
 ### Added
 
 - **Public contracts for running the lifecycle across more than one process**
