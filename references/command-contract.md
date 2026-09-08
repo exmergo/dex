@@ -203,9 +203,12 @@ dex transform place <column>      -> where a derived column shared by several mo
                                      being done quietly. --explain returns the reasoning and stores no
                                      plan. Repo-only and free
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
-    [--for-plan <id>]                auto-runs dbt deps when packages are declared but not installed.
-    [--for-plan-file <f>]            data.outcome says what the run established, which success cannot:
-    [--no-install-deps]              success is dbt's exit code and an empty selection exits zero, so
+             [--verify]              auto-runs dbt deps when packages are declared but not installed.
+             [--for-plan <id>]       --verify sweeps the nodes this build ran for correctness and
+             [--for-plan-file <f>]   reports the findings in the same envelope, under
+             [--no-install-deps]     data.verification; findings never change the status
+                                     data.outcome says what the run established, which success cannot:
+                                     success is dbt's exit code and an empty selection exits zero, so
                                      empty_selection, unrelated, partial, skipped, stale, failed and
                                      not_run are all distinguishable from validated. data.evidence
                                      carries the invocation, typed per-node statuses, the selection
@@ -284,8 +287,8 @@ dex maintain reconcile [<class>]  -> propose the edits that reconcile detected d
 dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
                                      required (unlike every subcommand above). Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
-                                     through transitively skipped parents) and models with no relation
-                                     in the warehouse. Row population: row_loss and row_fanout against
+                                     through transitively skipped parents), nodes that warned rather
+                                     than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
                                      the compiled SQL through its CTE chain, naming the join and its
                                      key and stating both counts; a model with a filter, aggregate,
@@ -575,7 +578,7 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   is, and what its edits actually contain. Both are repo-only and free. See
   `references/host-integration.md` for the whole seam, including the
   conformance vectors shipped for a consumer to assert its own reader against.
-- `transform build` accepts `--target` and `--select`. The target must be `dev`
+- `transform build` accepts `--target`, `--select` and `--verify`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
   the refusal. On a billed connector the cost gate is priced upfront: dex runs a
@@ -594,6 +597,12 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   warning otherwise. On failure the envelope's `errors[0]` carries the first
   real dbt message; the rest land in `warnings`, per-entry capped, deduplicated,
   with a pointer to the full log when anything was trimmed.
+
+  Each node in `data.nodes` carries dbt's `unique_id` alongside a readable
+  `name`. The two are distinct because a generic test's id ends in a content
+  hash, so a name taken from the last segment reads as `3249b83c15`; a green
+  build reporting seventeen warning tests has to be able to say which
+  seventeen.
 - **`transform build`'s `success` is dbt's exit code, and `data.outcome` is what
   the run established.** The two are not the same question and the gap between
   them is not small: a build whose `--select` matched no nodes at all exits zero,
@@ -641,6 +650,53 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   declaration dex cannot check by name (a git URL names a repository, and dbt
   installs under the package's own name) is reported separately rather than named
   on a guess.
+- `transform build --verify` runs the `maintain verify` sweep over the nodes
+  this build touched and reports it under `data.verification`, in one envelope
+  with the build result. Opt-in on every connector, free ones included.
+
+  `data.verification.ran` is always present: a build that did not verify and a
+  build that verified and found nothing are different answers, and only the
+  second means the models are clean. When it ran, the payload adds `scope` (the
+  models this build ran), `findings` and `finding_count` in the shape `maintain
+  verify` returns them, and `suppressed`, naming every finding class that did
+  not run and why.
+
+  **Findings never fail the build.** A build dbt completed is a build that
+  completed; whether a `row_loss` should gate a pipeline is a caller's policy,
+  so findings stay out of `errors` and never change the status. A pointer line
+  in `warnings` names the count so a caller reading warnings alone still learns
+  they are there. A build that failed partway still reports the build-status
+  half, which is when "which node failed, and what did it take down with it" is
+  worth most; row population is suppressed there, because a half-built dev
+  target is a mix of this run's output and the last one's.
+
+  `no_relation` is never reported from a build: dbt's run results are
+  authoritative for the nodes it just ran, and a node it reports as `success`
+  has a relation whether or not dex's source scope covers it.
+
+  **Cost.** The row counts a verdict needs are priced during the build's own
+  pricing pass, off the manifest the free `dbt compile` wrote, and folded into
+  the same estimate under a `(row counts)` entry in the per-table breakdown, so
+  one `--budget` covers both phases. Only relations the warehouse keeps no row
+  count for cost anything, which is any view, and a view is dbt's default
+  materialization; a table's count is free metadata. On a connector with no
+  cost gate every count is made exact instead, because doing so bills nothing.
+  Where the counts cannot be priced upfront (a cold dev target has nothing to
+  dry-run against yet) a note says so, and they are priced again after the
+  build as a phase of it, drawn against the reservation the build is already
+  holding rather than as a second command. A phase that does not fit returns
+  `ok` with the counts priced in `data.offer`, never `needs_confirmation`: the
+  build is finished and billed, and reporting otherwise would invite a caller
+  to pay for it twice.
+
+  **Read scope.** Every other command refuses the namespace dbt writes to as a
+  source, so exploration can never mistake a built model for a source table.
+  `--verify` folds that namespace into its own read scope for the length of the
+  command, because the relations dbt just wrote are its subject; the widening
+  shows in the envelope's `connection.target` and nothing is written back to
+  `.dex/config.yml`. Where the built relations still cannot be seen, row
+  population is suppressed with a reason that names the gap rather than
+  comparing nothing and reporting clean.
 - `semantic define` refuses names that already exist in the project (use
   `update`); `update` refuses names that do not (use `define`); `semantic plan`
   accepts a mix and classifies per name, reporting `defined`, `updated`,

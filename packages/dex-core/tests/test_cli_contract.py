@@ -603,6 +603,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "args": {
             "target": "target",
             "select": "select",
+            "verify": "verify",
             "for_plan": "for_plan",
             # Read from the file into `for_plan_document`.
             "for_plan_file": _TRANSLATED,

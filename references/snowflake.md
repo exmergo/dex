@@ -137,6 +137,23 @@ probe against a cold warehouse is quoted at what the account will actually
 see. The same estimator prices `transform build`: each compiled model,
 snapshot, and test is estimated and summed into the build's upfront cost.
 
+`transform build --verify` prices its row counts into the same estimate as the
+build itself, as a `(row counts)` entry in the per-table breakdown, so one
+`--budget` covers both phases. Only a relation the warehouse keeps no row count
+for costs anything, which is any view (dbt's default materialization); a table's
+count is free metadata, and a verdict resting on it is reported `exact: false`
+to say so. On a cold dev target the counts cannot be priced before the build has
+written the relations, so a note says so and they are priced again afterwards as
+a phase drawn against the reservation the build is already holding. A phase that
+does not fit returns `ok` with the counts in `data.offer`, never
+`needs_confirmation` for a build that has already run and billed.
+
+`--verify` also folds `snowflake.dev_database` / `snowflake.dev_schema` into its read scope for the length of that one
+command, because dbt writes the relations it is judging there and that namespace
+is refused as a source everywhere else. The widening shows in the envelope's
+`connection.target`; nothing is written back to `.dex/config.yml`.
+
+
 **The budget is hard-enforced regardless of estimate quality.** Before every
 billed statement the session's `STATEMENT_TIMEOUT_IN_SECONDS` is set to the
 remaining budget, so a wrong heuristic cannot overrun the ceiling: Snowflake
