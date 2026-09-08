@@ -374,11 +374,21 @@ magnitude, and that is the one thing to know here: a backend that clamps or
 filters on sign would leak held headroom for the rest of the UTC day. Sum what
 you are given.
 
-A `settlement` also carries `estimate`, the whole-command preflight figure the
-command was admitted on, so the ledger holds both halves of every "estimated
-this, billed that" pair rather than only the half a budget is measured against.
-It is a plain extra key that no backend has to know is there; `SpendHistory` is
-what reads it back.
+**Every entry has the same keys**, with `null` where one does not apply, because
+the ledger is an artifact other tooling reads and an absent key there is a claim
+of its own. So a reservation and a release carry `estimate`, `job_id` and
+`statement_sha256` as nulls, and a `transform build` settlement carries a null
+`reservation_id` rather than omitting it, which is how it says it settled outside
+any gate. A backend needs to know none of this, and that is the point: store the
+dict you were handed, whole, and the shape stays whatever dex wrote. A backend
+that drops keys it does not recognize breaks a reader joining settlements to
+reservations, and one that projects the entry onto columns of its own diverges
+the first time a key is added.
+
+`estimate` is the whole-command preflight figure the command was admitted on, so
+the ledger holds both halves of every "estimated this, billed that" pair rather
+than only the half a budget is measured against. `SpendHistory` is what reads it
+back.
 
 Two properties follow, and neither required a change to any backend written
 before reservations existed:

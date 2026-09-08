@@ -1187,6 +1187,24 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     # that refusal.
     assert entry["entry"] == "settlement"
     assert entry["estimate"] == envelope["cost"]["estimate"] == 5_000_000.0
+    # Issue #277: the whole row, not only the keys this test cares about. A build
+    # settles outside any gate, and the row it wrote used to say so by omission,
+    # carrying no `reservation_id` at all where every gate-written row carries
+    # one. A reader joining settlements on that key skipped or mis-joined every
+    # build, so the row now declares the absence instead of leaving it to be
+    # inferred, and pinning the shape here is what keeps the next writer honest.
+    assert set(entry) == {
+        "at",
+        "connector",
+        "command",
+        "entry",
+        "reservation_id",
+        "billed_bytes",
+        "estimate",
+        "job_id",
+        "statement_sha256",
+    }
+    assert entry["reservation_id"] is None
 
 
 def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(

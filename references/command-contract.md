@@ -1104,6 +1104,47 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   binding ceiling and ledger unit, and adds approximate compute-unit-hours from
   live per-replica memory plus optional USD from the configured price. Missing
   or partial capacity refuses before billed work.
+- **The ledger is a readable artifact, and every row says what it is.**
+  `.dex/spend.jsonl` is one JSON object per line, appended and never rewritten.
+  Every row carries the same keys, `null` where one does not apply, so the file
+  parses to a stable schema and no reader has to interpret an absent key:
+
+  | key | what it holds |
+  |---|---|
+  | `at` | UTC ISO-8601 stamp of the write |
+  | `connector` | the connector that billed. Several can share one file, so filter on it before summing |
+  | `command` | the command that wrote the row |
+  | `entry` | the kind: `reservation`, `settlement` or `release`, and nothing else |
+  | `reservation_id` | ties one command's rows together. `null` on a `transform build` settlement, which settles outside any gate because dbt runs the statements |
+  | `billed_bytes` or `billed_seconds` | the magnitude, in the connector's unit. Signed |
+  | `estimate` | the whole-command preflight figure the settlement was admitted on. `null` on the other two kinds, and on a settlement whose pricing degraded to no estimate at all |
+  | `job_id` | the warehouse's identifier for the job, where it has one |
+  | `statement_sha256` | a hash of the statement. Never its text, never a value |
+
+  **Settled spend is the `entry == "settlement"` filter**, summed over one
+  connector's unit. That is not the same number as `session_spent_today`
+  whenever a command is still in flight: a reservation is positive and its
+  release is the same magnitude negative, so the three kinds net to actual spend
+  once a command has settled, and until then the day's total legitimately reads
+  higher by the headroom being held. A process killed outright leaves its
+  reservation standing until the UTC rollover. So the two figures agree exactly
+  when nothing is running, and where they differ the difference is held
+  headroom rather than an accounting error. Sum what you are given; clamping the
+  negative would leave a release uncancelled.
+
+  **A ledger holding settlements alone is not a ledger missing rows.** A
+  reservation exists to be seen by a concurrent command settling against
+  `budget.session_ceiling`, so a project that has never set a daily cap has
+  nothing for one to protect and writes none, and no release either. Both kinds
+  appear from the first billed command after a ceiling is set.
+
+  **A row with no `entry` at all was written by a dex older than v1.5.1**, and it
+  is a settlement. The ledger is an append-only audit trail and dex does not
+  rewrite it, so a project that has been running since before that release has
+  both shapes in one file. Filter on `entry` being `"settlement"` or absent to
+  include them. dex's own reads already sum them correctly, because the day's
+  total does not branch on kind.
+
 - **The spend ledger is a dependency of billing, not of every command.** A gate
   is built at every connection assembly on a billed connector, free commands
   included, but nothing reads the ledger until something needs the day's total.

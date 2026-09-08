@@ -3620,7 +3620,11 @@ def test_bigquery_capabilities_pass_the_sanitizer(fake_bq_client, capsys):
 
 
 def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_client):
-    # Family 5: the audit trail is byte counts and statement hashes only.
+    # Family 5: the audit trail is byte counts and statement hashes only, and it
+    # says what each of its rows is. A row that did not declare its kind was
+    # still a correct spend record and an unreadable audit trail: the field a
+    # reader filters on to get settled spend read as null, so the filter dropped
+    # the row while the accounting behind it stayed right.
     import json
 
     from exmergo_dex_core.storage import FilesystemStore
@@ -3639,6 +3643,8 @@ def test_bigquery_spend_ledger_holds_no_sql_or_values(tmp_path: Path, fake_bq_cl
     assert "SELECT" not in json.dumps(entry)
     assert entry["billed_bytes"] == 5_000
     assert entry["statement_sha256"]
+    assert entry["entry"] == "settlement"
+    assert entry["reservation_id"]
 
 
 # --- Snowflake: the compute-time connector exercises every family ---------------

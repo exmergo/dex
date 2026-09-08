@@ -225,12 +225,20 @@ class ExploreStore(Protocol):
         for the rest of the UTC day. Sum what you are given, the way
         :func:`spend_total` does.
 
-        A ``settlement`` additionally carries ``estimate``, the whole-command
-        preflight figure the command was admitted on, so the ledger holds both
-        halves of every "estimated this, billed that" pair rather than only the
-        half a budget is measured against. It is a plain extra key on the entry
-        and no backend needs to know it is there; :class:`SpendHistory` is what
-        reads it back.
+        **Store the dict whole.** Every entry carries the same keys, ``null``
+        where one does not apply, because the ledger is an artifact other tooling
+        reads and an absent key there is a claim of its own: a reservation and a
+        release carry ``estimate``, ``job_id`` and ``statement_sha256`` as nulls,
+        and a ``transform build`` settlement carries a null ``reservation_id``
+        rather than omitting it, which is how it says it settled outside any
+        gate. A backend that drops keys it does not recognize, or projects the
+        entry onto columns of its own, breaks a reader joining settlements to
+        reservations and diverges the first time a key is added.
+
+        ``estimate`` is the whole-command preflight figure the command was
+        admitted on, so the ledger holds both halves of every "estimated this,
+        billed that" pair rather than only the half a budget is measured against.
+        :class:`SpendHistory` is what reads it back.
         """
         ...
 

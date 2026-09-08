@@ -1,16 +1,26 @@
-"""Envelope-shape parity for spend: every billed command reports what it cost in
-one place, under the same keys (issue #276).
+"""Shape parity for spend, on both surfaces a caller reads it from: the envelope
+each billed command returns (issue #276) and the `.dex/spend.jsonl` ledger those
+commands write (issue #277).
 
-`transform build` used to stamp its billed magnitude at the top of `data` *and*
-under `data.spend`, while every other billed command reported only the latter. A
-caller that read `data.bytes_billed` and defaulted a miss to zero therefore
-reported a `maintain check` that had just scanned 0.89 GB as free, which is the
-one direction a cost guarantee must never round.
+One defect twice. `transform build` used to stamp its billed magnitude at the top
+of `data` *and* under `data.spend`, while every other billed command reported
+only the latter, so a caller that read `data.bytes_billed` and defaulted a miss to
+zero reported a `maintain check` that had just scanned 0.89 GB as free. In the
+ledger the same command wrote a row carrying no `entry` at all, so a caller
+filtering the documented artifact on `entry == "settlement"` dropped every build,
+which is the largest spender in a normal session: an 85% undercount in the one
+direction a cost guarantee must never round.
 
-The fix is a contract rather than a per-command patch, so the test is too: it
-drives the five billed commands through the real CLI against one fake BigQuery
-warehouse and compares the *shape* of what came back, not the figures. A sixth
-command growing its own spelling of spend fails here.
+Both fixes are contracts rather than per-command patches, so the tests are too:
+one run of the five billed commands through the real CLI against one fake
+BigQuery warehouse, and assertions on the *shape* of the envelope and of the
+rows, not on the figures. A sixth command growing its own spelling of spend, or
+building a ledger row by hand, fails here.
+
+A cumulative ceiling is set, generously, so the run writes all three entry kinds
+rather than settlements alone: a reservation and a release exist only where a
+project has a daily cap, and their shape is as much a part of the artifact as a
+settlement's.
 """
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ from __future__ import annotations
 import importlib
 import json
 import subprocess
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,12 +41,21 @@ from exmergo_dex_core.cli import main
 from exmergo_dex_core.config import BigQueryTarget
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.envelope import Paradigm
-from exmergo_dex_core.guards.cost_guard import CostGate, ledger_field, utc_day_start
+from exmergo_dex_core.guards.cost_guard import (
+    LEDGER_ENTRY_KINDS,
+    CostGate,
+    ledger_field,
+    utc_day_start,
+)
 from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
 from exmergo_dex_core.storage import FilesystemStore
 
 MB = 1024 * 1024
 BUDGET = str(float(500 * MB))
+# Far above anything these commands can bill, so the cap is present without being
+# binding: what it buys the test is the reservation and release rows, which a
+# project with no daily cap never writes.
+SESSION_CEILING = float(100 * 1024 * MB)
 
 # Every spelling of "what this cost" that has ever appeared in an envelope or in
 # the ledger. None of them may appear at the top of `data`: that is the level
@@ -79,6 +99,36 @@ def _scan_resolver(sql: str):
     return [values]
 
 
+@dataclass(frozen=True)
+class BilledRun:
+    """One billed command's two spend surfaces, as a caller sees them.
+
+    Kept together because the contract under test is that they agree: the
+    envelope says what the command billed and the ledger says the same thing in
+    a form other tooling reads back.
+    """
+
+    data: dict
+    ledger: list[dict]
+
+
+def _ledger(root: Path) -> list[dict]:
+    """Every row a command left in its own repo root's ledger, in append order.
+
+    Read as the artifact rather than through the store, because what this file
+    asserts is what an external reader of `.dex/spend.jsonl` gets.
+    """
+
+    path = root / ".dex" / "spend.jsonl"
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def _run(argv: list[str], capsys) -> dict:
     """One command through the real CLI, as an agent wrapper sees it."""
 
@@ -98,7 +148,7 @@ def _billed_gate(store: FilesystemStore, command: str) -> CostGate:
     return CostGate(
         paradigm=Paradigm.BYTES_SCANNED,
         ceiling=float(500 * MB),
-        session_ceiling=None,
+        session_ceiling=SESSION_CEILING,
         session_spent=lambda: store.spend_since(
             utc_day_start(),
             field=ledger_field(Paradigm.BYTES_SCANNED),
@@ -285,19 +335,23 @@ def bigquery_project(dbt_project_dir: Path) -> Path:
 
 
 @pytest.fixture
-def billed_data(
+def billed_runs(
     fake_bq_client, bigquery_project: Path, tmp_path: Path, capsys, monkeypatch
-) -> dict[str, dict]:
-    """The `data` payload of each billed command, run against one fake warehouse.
+) -> dict[str, BilledRun]:
+    """What each billed command reported and what it wrote, run against one fake
+    warehouse.
 
     Each command gets its own repo root: they disagree about what the `.dex/`
     cache should hold going in (a seeded query cache, a drift baseline, a cold
     cache for `map`), and a shared root would make one command's prerequisite
     another's cache hit, which is the fastest way to a billed command that
-    quietly bills nothing.
+    quietly bills nothing. The separate roots give the ledger assertions
+    something they need too: one file per command, so a row's shape can be
+    attributed to the command that wrote it.
     """
 
     payloads: dict[str, dict] = {}
+    roots: dict[str, Path] = {}
 
     def root(name: str) -> Path:
         path = tmp_path / name
@@ -306,6 +360,7 @@ def billed_data(
 
     # `transform build` alone runs at the repo root the dbt project lives under,
     # because that is how the project is discovered.
+    roots["transform build"] = tmp_path
     with monkeypatch.context() as patch:
         _route_build(patch, tmp_path, bigquery_project)
         payloads["transform build"] = _run(
@@ -331,6 +386,7 @@ def billed_data(
     _seed_snapshot(check_root)
     with monkeypatch.context() as patch:
         _route_warehouse(patch, fake_bq_client, check_root, "maintain")
+        roots["maintain check"] = check_root
         payloads["maintain check"] = _run(
             [
                 "--repo-root",
@@ -351,6 +407,7 @@ def billed_data(
     with monkeypatch.context() as patch:
         _route_warehouse(patch, fake_bq_client, query_root, "explore")
         fake_bq_client.row_resolver = lambda sql: [{"n": 100}]
+        roots["explore query"] = query_root
         payloads["explore query"] = _run(
             [
                 "--repo-root",
@@ -372,6 +429,7 @@ def billed_data(
     map_root = root("explore-map")
     with monkeypatch.context() as patch:
         _route_warehouse(patch, fake_bq_client, map_root, "explore")
+        roots["explore map"] = map_root
         payloads["explore map"] = _run(
             [
                 "--repo-root",
@@ -390,6 +448,7 @@ def billed_data(
     profile_root = root("explore-profile")
     with monkeypatch.context() as patch:
         _route_warehouse(patch, fake_bq_client, profile_root, "explore")
+        roots["explore profile"] = profile_root
         payloads["explore profile"] = _run(
             [
                 "--repo-root",
@@ -406,10 +465,15 @@ def billed_data(
             capsys,
         )["data"]
 
-    return payloads
+    return {
+        command: BilledRun(data=data, ledger=_ledger(roots[command]))
+        for command, data in payloads.items()
+    }
 
 
-def test_every_billed_command_reports_what_it_billed(billed_data: dict[str, dict]):
+def test_every_billed_command_reports_what_it_billed(
+    billed_runs: dict[str, BilledRun],
+):
     """The acceptance criterion, stated directly: one key, on all of them.
 
     The figure is asserted nonzero to keep the test honest about its own premise.
@@ -418,7 +482,8 @@ def test_every_billed_command_reports_what_it_billed(billed_data: dict[str, dict
     run, and it is precisely a spend of zero that this issue is about misreading.
     """
 
-    for command, data in billed_data.items():
+    for command, run in billed_runs.items():
+        data = run.data
         assert "spend" in data, f"{command} reported no spend at all"
         assert "bytes_billed" in data["spend"], (
             f"{command} reported spend without the connector's unit: {data['spend']}"
@@ -429,7 +494,7 @@ def test_every_billed_command_reports_what_it_billed(billed_data: dict[str, dict
 
 
 def test_no_billed_command_spells_spend_at_the_top_of_data(
-    billed_data: dict[str, dict],
+    billed_runs: dict[str, BilledRun],
 ):
     """`data.spend` is the only place spend is reported.
 
@@ -438,13 +503,13 @@ def test_no_billed_command_spells_spend_at_the_top_of_data(
     worked on a build reported the next command as free.
     """
 
-    for command, data in billed_data.items():
-        stray = SPEND_SPELLINGS & set(data)
+    for command, run in billed_runs.items():
+        stray = SPEND_SPELLINGS & set(run.data)
         assert not stray, f"{command} reports spend outside data.spend: {sorted(stray)}"
 
 
 def test_the_spend_payload_has_the_same_keys_on_every_billed_command(
-    billed_data: dict[str, dict],
+    billed_runs: dict[str, BilledRun],
 ):
     """Parity, which is the property that makes one read work everywhere.
 
@@ -455,9 +520,98 @@ def test_the_spend_payload_has_the_same_keys_on_every_billed_command(
     """
 
     shapes = {
-        command: frozenset(data["spend"]) for command, data in billed_data.items()
+        command: frozenset(run.data["spend"]) for command, run in billed_runs.items()
     }
     assert len(set(shapes.values())) == 1, (
         "billed commands disagree about the spend payload's keys: "
         f"{ {command: sorted(keys) for command, keys in shapes.items()} }"
     )
+
+
+# --- the ledger side: issue #277 ---------------------------------------------
+
+
+def test_every_ledger_row_declares_its_kind(billed_runs: dict[str, BilledRun]):
+    """No row carries a null or absent `entry`, and no row invents a kind.
+
+    The reported defect, stated where a sixth billed command would trip over it.
+    `entry` is the field an external reader filters on to get settled spend, and
+    a `transform build` row that left it null dropped the largest spender in the
+    session out of that filter while still holding a correct `billed_bytes`, so
+    the artifact under-reported spend while the accounting behind it was right.
+    """
+
+    for command, run in billed_runs.items():
+        assert run.ledger, f"{command} wrote no ledger rows, so it proves nothing here"
+        kinds = [row.get("entry") for row in run.ledger]
+        assert all(kind in LEDGER_ENTRY_KINDS for kind in kinds), (
+            f"{command} wrote a ledger row with no kind or a kind outside the "
+            f"closed vocabulary {LEDGER_ENTRY_KINDS}: got {kinds}"
+        )
+
+
+def test_the_run_writes_every_entry_kind(billed_runs: dict[str, BilledRun]):
+    """The premise the two tests below rest on.
+
+    A project with no cumulative ceiling writes settlements alone, and against
+    that ledger a parity assertion across kinds passes without ever having seen a
+    reservation. The fixture sets a ceiling precisely so it has, and this is what
+    fails if that ever stops being true.
+    """
+
+    kinds = {row["entry"] for run in billed_runs.values() for row in run.ledger}
+    assert kinds == set(LEDGER_ENTRY_KINDS), (
+        "the run was meant to exercise every entry kind and did not, so the "
+        f"shape assertions below cover less than they claim: saw {sorted(kinds)}"
+    )
+
+
+def test_every_ledger_row_has_the_same_key_set(billed_runs: dict[str, BilledRun]):
+    """One shape, across every command and every kind.
+
+    Asserted as an equality rather than against a literal list, for the reason
+    the envelope parity test above gives: what a row carries can be the ledger's
+    business, but it cannot be the business of which command wrote it or which
+    kind it is. This is the assertion that fails if a future writer builds a row
+    by hand instead of going through `ledger_row`, which is exactly how
+    `transform build` came to write a settlement carrying no `reservation_id` at
+    all: a reader joining settlements on that key skipped or mis-joined every
+    build, because an absent key and a null one are different claims.
+    """
+
+    shapes: dict[tuple[str, str], frozenset[str]] = {}
+    for command, run in billed_runs.items():
+        for row in run.ledger:
+            shapes[(command, row["entry"])] = frozenset(row)
+    assert len(set(shapes.values())) == 1, (
+        "ledger rows disagree about their keys: "
+        f"{ {key: sorted(keys) for key, keys in shapes.items()} }"
+    )
+
+
+def test_summing_settlements_reproduces_the_days_total(
+    billed_runs: dict[str, BilledRun],
+):
+    """Settled spend is the `entry == "settlement"` filter, and on a quiesced day
+    it is the day's total.
+
+    The precondition is load-bearing and is why this is stated per command rather
+    than as an invariant: `session_spent_today` is settled spend *plus* headroom
+    held by commands still in flight, deliberately, because that is the number a
+    concurrent command has to be measured against. Each command here ran alone
+    and settled, so every reservation it took has been released and the two
+    figures meet. They would not while another billed command was running, and
+    they would not for a day holding the reservation of a process that was
+    killed outright.
+    """
+
+    for command, run in billed_runs.items():
+        settled = sum(
+            row["billed_bytes"] for row in run.ledger if row["entry"] == "settlement"
+        )
+        assert settled == run.data["spend"]["session_spent_today"], (
+            f"{command}: summing the ledger's settlements gave {settled}, and the "
+            f"envelope reported a day's total of "
+            f"{run.data['spend']['session_spent_today']}. Nothing else was "
+            "running, so these have to be the same number"
+        )

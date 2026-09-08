@@ -198,6 +198,32 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   retry at all and surfaced the raw API error instead. Found by running
   `maintain verify` against a view on a live BigQuery dataset.
 
+- **Every spend-ledger row now declares what it is** ([#277]).
+  `.dex/spend.jsonl` is an artifact other tooling is invited to read, and `entry`
+  is the field you would filter on to get settled spend. `transform build` wrote
+  rows with `entry: null` while holding a correct `billed_bytes`, so that filter
+  dropped the largest spender in a normal session: one reported day summed to
+  0.90 GB against a true 6.60 GB. dex's own accounting was right throughout. The
+  artifact was not.
+
+  The kind itself was stamped in 1.9.2. What is fixed here is the shape around
+  it. The gate and the build built their rows independently and disagreed: a
+  build settlement carried no `reservation_id` at all, so a reader joining
+  settlements to the command that reserved them silently skipped or mis-joined
+  every build, and an absent key is a different claim from a null one. Both
+  writers now go through one `ledger_row`, every row carries the same keys with
+  `null` where one does not apply, and the vocabulary (`reservation`,
+  `settlement`, `release`) is closed and refuses anything else. A build's
+  settlement declares a null `reservation_id`, which says it settled outside any
+  gate.
+
+  The format is documented for whoever reads the file, including the part that
+  is not an equality: summing `entry == "settlement"` gives settled spend, while
+  `session_spent_today` also counts headroom held by commands still in flight,
+  so the two agree exactly when nothing is running. A row carrying no `entry` at
+  all was written by a dex older than 1.5.1 and is a settlement; the ledger is
+  append-only and dex does not rewrite it.
+
 ### Changed
 
 - **The SQL shape readers that both `transform plan` and `maintain verify` need

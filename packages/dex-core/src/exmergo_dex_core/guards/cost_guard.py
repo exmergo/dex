@@ -278,6 +278,70 @@ def utc_day_start() -> str:
     )
 
 
+LEDGER_ENTRY_KINDS = ("reservation", "settlement", "release")
+"""Every kind a ledger row may declare, and there are no others.
+
+A closed vocabulary because the ledger is an artifact other tooling reads, and
+the field a reader filters on to get settled spend has to mean one thing. See
+:func:`ledger_row` for the shape the kind sits in.
+"""
+
+
+def ledger_row(
+    *,
+    connector: str,
+    command: str | None,
+    entry: str,
+    field: str,
+    amount: float,
+    reservation_id: str | None = None,
+    estimate: float | None = None,
+    job_id: str | None = None,
+    statement_sha256: str | None = None,
+) -> dict:
+    """One row of the spend ledger, in the one shape every row has.
+
+    Module level for :func:`ledger_field`'s reason and its corollary: ``transform
+    build`` settles outside any gate, so the shape cannot live on the gate or a
+    build would write a row that only resembles the others. It resembled them
+    closely enough to read as the same record and differed in exactly the way
+    that matters, carrying no ``reservation_id`` at all, so a reader joining
+    settlements on that key skipped or mis-joined every build.
+
+    **Every key is present on every row, null where it does not apply.** An
+    absent key and a null one are different claims: absent says nothing, null
+    says this row has no reservation, no estimate, no job. A reservation and a
+    release therefore carry ``estimate``, ``job_id`` and ``statement_sha256`` as
+    nulls, which no reader has to know about (``spend_total`` sums one numeric
+    key and ignores the rest) and which makes the file parse to a stable schema
+    for anything that reads it as a table.
+
+    ``amount`` is signed: a release is a reservation with the sign flipped, and
+    the three kinds net to actual spend precisely because nothing clamps it.
+
+    Raises on a kind outside :data:`LEDGER_ENTRY_KINDS`. Every call site passes a
+    literal, so this can only fire on a writer being added, which is the moment
+    the vocabulary needs defending.
+    """
+
+    if entry not in LEDGER_ENTRY_KINDS:
+        raise ValueError(
+            f"{entry!r} is not a spend-ledger entry kind; the vocabulary is "
+            f"closed to {', '.join(LEDGER_ENTRY_KINDS)}"
+        )
+    return {
+        "at": datetime.now(UTC).isoformat(),
+        "connector": connector,
+        "command": command,
+        "entry": entry,
+        "reservation_id": reservation_id,
+        field: float(amount),
+        "estimate": estimate,
+        "job_id": job_id,
+        "statement_sha256": statement_sha256,
+    }
+
+
 def no_session_ceiling_warning(
     paradigm: Paradigm, session_ceiling: float | None, *, declined: bool = False
 ) -> list[str]:
@@ -898,19 +962,36 @@ class CostGate:
         self._refresh(strict=False)
         return self.session_spent
 
-    def _append(self, kind: str, amount: float, **extra) -> None:
+    def _append(
+        self,
+        kind: str,
+        amount: float,
+        *,
+        estimate: float | None = None,
+        job_id: str | None = None,
+        statement_sha256: str | None = None,
+    ) -> None:
+        """Write one row and charge it to this gate's own running total.
+
+        Named settlement keys rather than the ``**extra`` this used to take, so
+        the gate and the build settling outside it reach :func:`ledger_row`
+        through signatures that cannot diverge.
+        """
+
         if self._record is None:
             return
         self._record(
-            {
-                "at": datetime.now(UTC).isoformat(),
-                "connector": self.connector,
-                "command": self.command,
-                "entry": kind,
-                "reservation_id": self._reservation_id,
-                self.ledger_field(): amount,
-                **extra,
-            }
+            ledger_row(
+                connector=self.connector,
+                command=self.command,
+                entry=kind,
+                field=self.ledger_field(),
+                amount=amount,
+                reservation_id=self._reservation_id,
+                estimate=estimate,
+                job_id=job_id,
+                statement_sha256=statement_sha256,
+            )
         )
         self._ledger_written += amount
 

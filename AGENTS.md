@@ -254,7 +254,13 @@ spend of zero rather than as a key to look for elsewhere. That ledger gates bill
 nothing else: it is read where work is admitted, not where a connection is
 assembled, so a command that cannot spend does not depend on it, and a ledger
 that cannot be read refuses billed work by name while reporting the day's total
-as `null` on the two surfaces that quote it. The ledger also records each
+as `null` on the two surfaces that quote it. Every row in it declares what
+it is, so the file is readable by anything that wants to audit spend: one JSON
+object per line, always the same keys, an `entry` of `reservation`, `settlement`
+or `release`, and settled spend is the `entry == "settlement"` filter summed over
+one connector's unit. A reservation and its release cancel, so that filter and
+the day's total agree whenever nothing is still running, and where they differ
+the difference is headroom a live command is holding. The ledger also records each
 command's estimate beside what it settled at, which is what lets a refusal over
 the ceiling end with this connector's own observed ratio ("the last 8 settled
 bigquery commands billed a median 69% of estimate, range 61%-88%") instead of

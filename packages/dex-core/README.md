@@ -354,9 +354,11 @@ BigQuery: connects through Application Default Credentials
 asks for keys). Metadata is free; every scan is dry-run first, returned as a
 `needs_confirmation` estimate, and runs only with `--confirm --budget <bytes>`,
 capped server-side by `maximum_bytes_billed` and recorded in a local
-`.dex/spend.jsonl` ledger. dbt builds go to a dedicated dev dataset via
-dbt-bigquery, which the `[bigquery]` extra carries. See
-[`references/bigquery.md`](../../references/bigquery.md).
+`.dex/spend.jsonl` ledger (one JSON object per line, every row declaring its
+kind, documented in
+[`references/command-contract.md`](../../references/command-contract.md)). dbt
+builds go to a dedicated dev dataset via dbt-bigquery, which the `[bigquery]`
+extra carries. See [`references/bigquery.md`](../../references/bigquery.md).
 
 Snowflake: connects through discovered credentials (`connections.toml`,
 `SNOWFLAKE_*` env, or a dbt profile; dex never asks for or persists a

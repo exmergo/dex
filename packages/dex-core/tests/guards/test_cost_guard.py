@@ -6,10 +6,12 @@ import pytest
 
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import (
+    LEDGER_ENTRY_KINDS,
     CeilingRequiredError,
     ConfirmationRequiredError,
     CostGate,
     OverCeilingError,
+    ledger_row,
     preflight,
 )
 
@@ -422,6 +424,76 @@ def test_settling_releases_what_was_held_but_not_spent():
     gate.settle()
     assert ledger.kinds() == ["reservation", "settlement", "release"]
     assert ledger.total() == 400.0
+
+
+def test_an_unreleased_hold_puts_the_days_total_above_settled_spend():
+    """The limit of "sum the settlements to get the day", stated as a test.
+
+    Summing `entry == "settlement"` gives settled spend, and that is what a
+    reader of the ledger wants. It is not always `session_spent_today`, which
+    also counts headroom held by commands that have not finished paying, and
+    deliberately so: that is the figure a concurrent command has to be measured
+    against, and a process killed outright leaves its hold standing until the UTC
+    rollover rather than expiring it. The two meet when nothing is in flight,
+    which is the case the CLI-level parity suite pins. This is the other one, and
+    it is why the docs state a relation rather than an equality.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    gate.record_billed(400.0)
+    # No `settle()`: this is the killed process. Its hold of 600 stands beside
+    # the 400 it settled, because what cancels the hold is the release it never
+    # got to write.
+    settled = sum(
+        e["billed_bytes"] for e in ledger.entries if e["entry"] == "settlement"
+    )
+    assert settled == 400.0
+    assert ledger.total() == 1_000.0
+
+
+def test_every_row_a_gate_writes_has_one_shape():
+    """One key set across all three kinds, nulls included.
+
+    A reader that keys settlements by `reservation_id` gets a row that either
+    carries one or says it has none; it never gets a row where the key is simply
+    missing and the absence has to be interpreted. `transform build` wrote that
+    third shape for a year, which is what made it invisible to a settlement join.
+    """
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(600.0)
+    gate.record_billed(400.0, job_id="job-1", statement="SELECT 1")
+    gate.settle()
+    shapes = {e["entry"]: frozenset(e) for e in ledger.entries}
+    assert len(set(shapes.values())) == 1, (
+        f"a gate's rows disagree about their keys: "
+        f"{ {kind: sorted(keys) for kind, keys in shapes.items()} }"
+    )
+    release = next(e for e in ledger.entries if e["entry"] == "release")
+    assert release["billed_bytes"] == -600.0, (
+        "a release is a reservation with the sign flipped, and a reader that "
+        "clamps it would leak the hold for the rest of the UTC day"
+    )
+    assert release["estimate"] is None and release["job_id"] is None
+
+
+def test_the_ledger_vocabulary_is_closed():
+    """A kind outside the vocabulary is a writer being added, which is the moment
+    it needs defending. Every call site passes a literal, so this cannot fire on a
+    spend path."""
+
+    assert LEDGER_ENTRY_KINDS == ("reservation", "settlement", "release")
+    with pytest.raises(ValueError, match="closed to"):
+        ledger_row(
+            connector="bigquery",
+            command="transform build",
+            entry="build",
+            field="billed_bytes",
+            amount=1.0,
+        )
 
 
 def test_the_freed_headroom_admits_the_next_command():

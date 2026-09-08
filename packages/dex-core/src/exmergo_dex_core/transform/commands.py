@@ -1538,28 +1538,31 @@ def _record_build_spend(
     than counting as a ratio of nothing.
     """
 
-    from datetime import UTC, datetime
-
-    from ..guards.cost_guard import ledger_field, spend_field, utc_day_start
+    from ..guards.cost_guard import (
+        ledger_field,
+        ledger_row,
+        spend_field,
+        utc_day_start,
+    )
 
     field = ledger_field(paradigm)
     if billed is not None:
         store.append_spend_log(
-            {
-                "at": datetime.now(UTC).isoformat(),
-                "connector": connector,
-                "command": "transform build",
-                # The kind every gate-written settlement carries. A build settles
-                # outside any gate and used to write an entry with no kind at all,
-                # which sums identically (the totals branch on no kind) but reads
-                # as a different sort of record to anything walking the ledger
-                # back.
-                "entry": "settlement",
-                field: float(billed),
-                "estimate": estimate,
-                "job_id": None,
-                "statement_sha256": None,
-            }
+            # Through the shared builder rather than a dict of its own, which is
+            # what keeps a build's row the same row a gate writes. It carries the
+            # kind every gate-written settlement carries, because that is what it
+            # is, and declares `reservation_id` as null rather than omitting it:
+            # a reader joining settlements on that key reads an absent key and a
+            # null one as different claims, and only the null one says "this
+            # settled outside any reservation".
+            ledger_row(
+                connector=connector,
+                command="transform build",
+                entry="settlement",
+                field=field,
+                amount=billed,
+                estimate=estimate,
+            )
         )
     # Read back best-effort, exactly as gate settlement reports the day's total:
     # what this build billed came from dbt and is exact either way, so a ledger
