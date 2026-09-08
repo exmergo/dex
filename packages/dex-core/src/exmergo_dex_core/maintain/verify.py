@@ -21,6 +21,7 @@ here be judged on artifacts alone.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,12 @@ from .drift import DriftFinding
 
 #: dbt's own run_results.json status strings that mean the node did not build.
 _FAILURE_STATUSES = frozenset({"error", "fail"})
+
+# A test dbt ran at `severity: warn` passed the run and failed the assertion.
+# Neither a failure nor a skip, so it fell through both branches and was
+# reported nowhere: a build whose seventeen warnings are normal and whose
+# eighteenth is a regression had no way to say which seventeen they were.
+_WARNING_STATUSES = frozenset({"warn"})
 
 # Deliberately the same numbers `volume_drift` uses, because it is the same
 # judgement asked of a different pair of counts: below the first, a row-count
@@ -99,15 +106,21 @@ def _run_results(project_dir: Path) -> list[dict] | None:
 
 
 def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[str]]:
-    """Nodes that failed, or were skipped because a parent failed, from the
-    last run's ``run_results.json`` joined to the compiled manifest for names
-    and the dependency graph. Free: reads artifacts already on disk, opens no
-    connection.
+    """Nodes that failed, were skipped because a parent failed, or warned, from
+    the last run's ``run_results.json`` joined to the compiled manifest for
+    names and the dependency graph. Free: reads artifacts already on disk,
+    opens no connection.
 
     A skip is walked back through however many transitively-skipped parents
     it takes to name the node that actually failed, since a two-layer partial
     build (a grandparent failure skipping both its child and grandchild)
     would otherwise only ever name the immediate, also-skipped parent.
+
+    A warning ranks low on purpose. A project that runs relationship tests at
+    ``severity: warn`` over documented gaps has warnings by design, so this is
+    a list to compare against last run's rather than a defect on its own; what
+    it must not be is absent, which is what leaves a caller counting statuses
+    in the raw node list to find out which ones warned.
     """
 
     nodes = _manifest_nodes(project_dir) or {}
@@ -152,9 +165,22 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
     for result in results:
         uid = result.get("unique_id")
         status = str(result.get("status", "unknown"))
-        if not uid or status not in _FAILURE_STATUSES | {"skipped"}:
+        if not uid or status not in _FAILURE_STATUSES | _WARNING_STATUSES | {"skipped"}:
             continue
         name = name_of(uid)
+        if status in _WARNING_STATUSES:
+            message = result.get("message") or status
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="node_warned",
+                    identifier=name,
+                    severity="low",
+                    detail=f"'{name}' warned rather than failed: {message}",
+                    data={"status": status},
+                )
+            )
+            continue
         if status in _FAILURE_STATUSES:
             message = result.get("message") or status
             findings.append(
@@ -436,17 +462,26 @@ def _driving_parent(tree, sql_shape):
 
 
 def row_population_plan(
-    project_dir: Path, dialect: str
+    project_dir: Path,
+    dialect: str,
+    *,
+    scope: set[str] | None = None,
 ) -> tuple[list[RowPopulationCheck], list[str]]:
     """Line every buildable model up against the relation it is built from.
 
     Free and connectionless: the compiled SQL and the relation names are both
     already in ``target/manifest.json``, so this settles the whole static half
-    of #226 before anything decides what a count would cost.
+    of row population before anything decides what a count would cost.
 
     A model this cannot line up is named in the notes rather than dropped. An
     unfollowable chain and a clean model are the same empty result otherwise,
     and only one of them means the model was checked.
+
+    ``scope`` narrows to a set of model names, which is what a caller verifying
+    one build rather than a whole project has: the notes narrow with it, so a
+    model outside the scope is neither checked nor reported as unchecked. Both
+    halves matter, because a note naming models this caller never asked about
+    reads as a gap in the answer it did ask for.
     """
 
     import sqlglot
@@ -498,6 +533,8 @@ def row_population_plan(
         relation = node.get("relation_name")
         code = node.get("compiled_code")
         if not (isinstance(name, str) and name):
+            continue
+        if scope is not None and name not in scope:
             continue
         # An ephemeral model compiles with no relation of its own and is inlined
         # into whatever reads it, so it has no row count to compare; a model
@@ -765,8 +802,38 @@ class RelationCounts:
     notes: list[str]
 
 
+def _standalone_handshake(adapter) -> Callable[[float, int], object | None]:
+    """The ask `maintain verify` makes: a whole-command handshake, priced before
+    anything on this axis has spent, returned rather than raised because the
+    free findings beside it are already final."""
+
+    from .. import command_args
+
+    def ask(estimate: float, relation_count: int):
+        return command_args.confirmation_request(
+            "maintain verify",
+            adapter,
+            estimate,
+            per_table={"(row counts)": estimate},
+            axes=["row_population"],
+            notes=[
+                "the build-status and no-relation findings in this envelope are "
+                f"final; the estimate buys {relation_count} row count(s) the "
+                "warehouse keeps no metadata for, which is what row loss and "
+                "fanout are judged from"
+            ],
+        )
+
+    return ask
+
+
 def relation_counts(
-    adapter, wanted: list[str], live: list, timeout_seconds: float
+    adapter,
+    wanted: list[str],
+    live: list,
+    timeout_seconds: float,
+    *,
+    handshake: Callable[[float, int], object | None] | None = None,
 ) -> RelationCounts:
     """The row counts a row-population verdict needs, cheapest source first.
 
@@ -781,6 +848,14 @@ def relation_counts(
       on the catalog's estimate;
     - the same count on a metered connector, which is a scan and therefore
       offered through the ordinary handshake rather than taken.
+
+    ``handshake`` is how the caller gates that third tier, given the estimate
+    and how many relations it buys; it returns a request to defer behind, or
+    ``None`` to proceed. It is injected because the gate primitive differs by
+    caller and nothing else does: a standalone sweep prices a whole command and
+    asks up front, while a sweep folded onto a build that has already spent
+    prices a phase against the reservation that build is holding. Default is
+    the standalone ask, so the caller that has no opinion gets the safe one.
     """
 
     from .. import command_args
@@ -819,19 +894,8 @@ def relation_counts(
     )
     estimator = getattr(adapter, "query_estimate", None)
     estimate = estimator(sql) if estimator is not None and not free else 0.0
-    offer = command_args.confirmation_request(
-        "maintain verify",
-        adapter,
-        estimate,
-        per_table={"(row counts)": estimate},
-        axes=["row_population"],
-        notes=[
-            "the build-status and no-relation findings in this envelope are "
-            f"final; the estimate buys {len(to_count)} row count(s) the "
-            "warehouse keeps no metadata for, which is what row loss and "
-            "fanout are judged from"
-        ],
-    )
+    ask = handshake if handshake is not None else _standalone_handshake(adapter)
+    offer = ask(estimate, len(to_count))
     if offer is not None:
         return RelationCounts(
             counts,

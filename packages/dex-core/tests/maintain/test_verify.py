@@ -5,6 +5,7 @@ plus a project that fails to compile (#225)."""
 from __future__ import annotations
 
 import json
+import types
 from pathlib import Path
 
 import pytest
@@ -850,3 +851,160 @@ def test_a_project_that_was_never_compiled_says_so(
     assert rc == 0 and payload["status"] == "ok", payload
     assert "no compiled manifest" in payload["data"]["suppressed"]["row_population"]
     assert any("dbt compile" in w for w in payload["warnings"])
+
+
+# --- seams the build-time sweep shares with this one --------------------------
+
+
+def test_a_warning_node_is_reported_rather_than_dropped(tmp_path: Path):
+    """`warn` is neither a failure nor a skip, so it fell through both branches
+    and was reported nowhere. A project that runs relationship tests at
+    `severity: warn` over documented gaps has warnings by design; what it needs
+    is a list to compare against last run's, not silence."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "test.p.relationships_orders_customer.abc123": {
+                "name": "relationships_orders_customer",
+                "resource_type": "test",
+            }
+        },
+        results=[
+            {
+                "unique_id": "test.p.relationships_orders_customer.abc123",
+                "status": "warn",
+                "message": "got 12 results, configured to warn if != 0",
+            }
+        ],
+    )
+    findings, notes = build_status_findings(tmp_path)
+    assert notes == []
+    assert len(findings) == 1
+    assert findings[0].code == "node_warned"
+    assert findings[0].severity == "low"
+    assert findings[0].identifier == "relationships_orders_customer"
+    assert "12 results" in findings[0].detail
+
+
+def test_a_passing_node_is_still_reported_nowhere(tmp_path: Path):
+    """The other half of the same rule: a clean run has no findings at all."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.a": {"name": "a", "resource_type": "model"}},
+        results=[{"unique_id": "model.p.a", "status": "success"}],
+    )
+    findings, _ = build_status_findings(tmp_path)
+    assert findings == []
+
+
+def test_the_plan_can_be_scoped_to_one_build_s_models(tmp_path: Path):
+    """A caller verifying one build has a selection; the whole project is a
+    different and more expensive question. The notes narrow with the scope,
+    because a note about a model this caller never asked about reads as a gap
+    in the answer it did ask for."""
+
+    target = tmp_path / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    nodes = {
+        "m.1": _model("stg_orders", 'select * from "wh"."main"."orders"'),
+        "m.2": _model(
+            "fct_orders",
+            'select * from "wh"."main"."stg_orders"',
+        ),
+        "m.3": _model(
+            "incremental_events",
+            'select * from "wh"."main"."events"',
+            config={"materialized": "incremental"},
+        ),
+    }
+    (target / "manifest.json").write_text(
+        json.dumps({"nodes": nodes, "sources": {}}), encoding="utf-8"
+    )
+
+    checks, notes = verify_mod.row_population_plan(
+        tmp_path, "duckdb", scope={"fct_orders"}
+    )
+    assert [c.model for c in checks] == ["fct_orders"]
+    # The incremental model is outside the scope, so its skip is not this
+    # caller's business either.
+    assert notes == []
+
+    everything, all_notes = verify_mod.row_population_plan(tmp_path, "duckdb")
+    assert {c.model for c in everything} == {"stg_orders", "fct_orders"}
+    assert any("incremental_events" in n for n in all_notes)
+
+
+def test_the_row_count_handshake_can_be_injected(tmp_path: Path):
+    """The gate primitive differs by caller and nothing else does: a standalone
+    sweep prices a whole command, a sweep folded onto a build prices a phase
+    against the reservation that build already holds."""
+
+    class _Adapter:
+        name = "fake"
+        dialect = "duckdb"
+        cost_gate = object()  # billed: the catalog answers where it can
+
+        def query_estimate(self, sql):
+            return 4096.0
+
+    asked: list[tuple[float, int]] = []
+
+    def handshake(estimate, relation_count):
+        asked.append((estimate, relation_count))
+        return None  # admitted: proceed to count
+
+    class _Meta:
+        def __init__(self, identifier, row_count=None):
+            self.identifier = identifier
+            self.row_count = row_count
+
+    adapter = _Adapter()
+    adapter.run_query = lambda sql, **kw: types.SimpleNamespace(
+        columns=["dex_rows_0"], cells=[[7]]
+    )
+    measured = verify_mod.relation_counts(
+        adapter,
+        ["wh.main.a_view"],
+        [_Meta("wh.main.a_view", None)],
+        timeout_seconds=5.0,
+        handshake=handshake,
+    )
+    assert asked == [(4096.0, 1)]
+    assert measured.counts == {"wh.main.a_view": 7}
+    assert measured.counted == {"wh.main.a_view"}
+    assert measured.offer is None
+
+
+def test_the_injected_handshake_can_defer_the_counts(tmp_path: Path):
+    """A handshake that returns a request means nothing runs and the relations
+    it would have counted are named as deferred, not as absent."""
+
+    class _Adapter:
+        name = "fake"
+        dialect = "duckdb"
+        cost_gate = object()
+
+        def query_estimate(self, sql):
+            return 4096.0
+
+        def run_query(self, sql, **kw):  # pragma: no cover - must not be reached
+            raise AssertionError("a deferred count ran anyway")
+
+    class _Meta:
+        def __init__(self, identifier, row_count=None):
+            self.identifier = identifier
+            self.row_count = row_count
+
+    sentinel = object()
+    measured = verify_mod.relation_counts(
+        _Adapter(),
+        ["wh.main.a_view"],
+        [_Meta("wh.main.a_view", None)],
+        timeout_seconds=5.0,
+        handshake=lambda estimate, count: sentinel,
+    )
+    assert measured.offer is sentinel
+    assert measured.deferred == {"wh.main.a_view"}
+    assert measured.counts == {}

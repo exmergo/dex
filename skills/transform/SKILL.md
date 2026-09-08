@@ -333,6 +333,35 @@ check" note just means no connection was reachable at init time.
   resolve against the project. When the project declares packages
   (`packages.yml`) and `dbt_packages/` is missing, the engine runs `dbt deps`
   automatically before the build.
+- **`transform build --verify` is how you answer "is it right", not just "did it
+  run".** A green build tells you dbt executed. It does not tell you the model
+  holds the rows it should, and that is where the expensive defects live: an
+  inner join written where a left join was meant loses rows, raises nothing, and
+  passes every uniqueness and not-null test over the smaller result. `--verify`
+  sweeps the nodes this build touched and reports the findings in the same
+  envelope, under `data.verification`. Reach for it whenever the build was meant
+  to prove a change is correct, which is most of the time you build at all.
+
+  Read `data.verification.ran` before reading anything else. It is always
+  present, because a build that did not verify and a build that verified and
+  found nothing look identical otherwise, and only the second one means the
+  models are clean. When it ran, `findings` is ranked the way `maintain verify`
+  ranks it, `scope` names the models covered, and `suppressed` names each class
+  that could not run and why. Relay a suppression rather than reading past it:
+  it is the difference between "checked and clean" and "not checked".
+
+  Findings never fail the build and never appear in `errors`. Do not treat one
+  as a build failure or re-run to make it go away: relay the finding, its two
+  counts, and the join it names, and let the user decide. A failed build still
+  reports which node failed and which were skipped because of it, which is
+  usually a faster read than the dbt log.
+
+  On a billed connector the sweep is priced into the build's own estimate as a
+  `(row counts)` line, so the `--budget` you already read off the unconfirmed
+  envelope covers both. Never add a second budget for it. If the envelope comes
+  back `ok` with a `data.offer`, the build is done and billed and the offer buys
+  only the counts it could not afford; relay the number rather than re-running
+  the build.
 - `transform deps` installs dbt packages explicitly (also the refresh path when
   `dbt_packages/` exists but is stale). No confirmation needed: deps writes only
   inside the project and never touches the warehouse.

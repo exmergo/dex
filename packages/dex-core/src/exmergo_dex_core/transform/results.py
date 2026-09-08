@@ -331,6 +331,10 @@ class BuildResult(Result):
     success: bool = False
     summary: dict[str, Any] = Field(default_factory=dict)
     evidence: dict[str, Any] | None = None
+    # What `--verify` swept and found, or the statement that it did not run.
+    # Absent only when the command predates the concept; a run that declined to
+    # verify still says so, because an omitted key would read as "clean".
+    verification: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         payload = dict(self.summary)
@@ -340,4 +344,6 @@ class BuildResult(Result):
                 **payload,
                 "evidence": self.evidence,
             }
+        if self.verification is not None:
+            payload["verification"] = self.verification
         return payload

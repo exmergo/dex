@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import math
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from .adapters.base import Adapter
 from .config import CONFIG_FILE
@@ -309,6 +311,84 @@ def confirmation_request(
     return None
 
 
+def phase_handshake(
+    command: str,
+    adapter: Adapter,
+    estimate: float,
+    *,
+    phase: str,
+    hint: Callable[[float, str, int], str],
+    per_table_key: str | None = None,
+    extra: dict[str, Any] | None = None,
+    notes: list[str] | None = None,
+    skip: bool = False,
+) -> ConfirmationRequest | None:
+    """The mid-command checkpoint every two-phase command shares.
+
+    Some work cannot be priced until earlier work has been paid for: overlap
+    probes need the candidates inference found, a cluster sample needs the
+    profile that chose its features, a build's row counts need the relations
+    the build wrote. All of them run on an already-confirmed command, so they
+    gate on :meth:`CostGate.preflight_phase`, which extends the reservation the
+    command is already holding rather than booking a second one, and asks only
+    when the phase would not fit what remains of the ceiling.
+
+    Returning rather than raising is the rule those callers share and the
+    reason this is one function: a command that has already spent must not
+    discard what it bought in order to ask about the rest, because the caller
+    would then pay for the same scan twice. ``None`` is the ordinary outcome,
+    and it means the confirmed budget already covers the phase.
+
+    ``hint`` is handed the estimate, the paradigm's name, and the whole-command
+    budget a re-run needs, and writes the sentence saying what was found and
+    what to re-run. ``skip`` is the caller's own "nothing to price" test, which
+    differs per phase and is not this function's to guess.
+    """
+
+    gate = cost_gate(adapter)
+    if gate is None or skip:
+        return None
+    try:
+        gate.preflight_phase(estimate)
+    except ConfirmationRequiredError as exc:
+        per_table = {per_table_key: estimate} if per_table_key else None
+        describe = getattr(adapter, "describe_estimate", None)
+        if describe is not None:
+            data = {"command": command, **describe(estimate, per_table)}
+        elif per_table is not None:
+            data = {
+                "command": command,
+                "estimated_bytes": estimate,
+                "per_table_bytes": per_table,
+            }
+        else:
+            data = {"command": command, "estimated_bytes": estimate}
+        data.update(
+            {
+                "phase": phase,
+                **(extra or {}),
+                "hint": hint(
+                    estimate, gate.paradigm.value, math.ceil(exc.cost.estimate)
+                ),
+            }
+        )
+        extra_notes = list(notes or [])
+        if (
+            gate.session_ceiling is not None
+            and gate.session_spent is not None
+            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
+        ):
+            extra_notes.append(
+                "the session budget is the binding ceiling; raising --budget "
+                "alone will not unlock this, raise the session budget in "
+                ".dex/config.yml instead"
+            )
+        if extra_notes:
+            data["notes"] = [*data.get("notes", []), *extra_notes]
+        return ConfirmationRequest(cost=exc.cost, data=data)
+    return None
+
+
 def verify_handshake(
     command: str,
     adapter: Adapter,
@@ -317,70 +397,34 @@ def verify_handshake(
     candidate_count: int,
     object_count: int,
 ) -> ConfirmationRequest | None:
-    """The mid-command checkpoint for the verify phase on billed connectors.
+    """The checkpoint for ``--verify``'s overlap-probe phase.
 
     Verify probes can only be priced after profiling finds the candidate
-    relationships, so this runs after inference on an already-confirmed
-    command: the probes are dry-run priced (free), and only when that estimate
-    does not fit what remains of the confirmed budget does it return the
-    request, which the caller carries on its result as
-    ``pending_confirmation``. Otherwise the confirmed budget already covers
-    verify and the command proceeds in one pass.
-
-    A request rather than a raise, unlike :func:`billed_handshake`, because the
-    profiles and unverified relationships up to this point are already paid for.
-    Raising would discard them and bill the user twice for the same scan.
+    relationships, which is the original case :func:`phase_handshake` exists
+    for. The caller carries the returned request on its result as
+    ``pending_confirmation``, because ``--verify`` is work it was asked for.
     """
 
-    gate = cost_gate(adapter)
-    if gate is None or candidate_count == 0:
-        return None
-    try:
-        gate.preflight_phase(estimate)
-    except ConfirmationRequiredError as exc:
+    return phase_handshake(
+        command,
+        adapter,
+        estimate,
+        phase="verify",
         # Same aggregate key maintain grain uses for probe pricing, so agents
         # see one vocabulary for overlap-probe cost across commands.
-        per_table = {"(join overlap probes)": estimate}
-        describe = getattr(adapter, "describe_estimate", None)
-        if describe is not None:
-            data = {"command": command, **describe(estimate, per_table)}
-        else:
-            data = {
-                "command": command,
-                "estimated_bytes": estimate,
-                "per_table_bytes": per_table,
-            }
-        data.update(
-            {
-                "phase": "verify",
-                "candidate_count": candidate_count,
-                "object_count": object_count,
-                "hint": (
-                    f"found {candidate_count} candidate relationship(s) across "
-                    f"{object_count} object(s); verifying them all is estimated "
-                    f"at {estimate:.0f} {gate.paradigm.value} beyond what "
-                    "remains of the confirmed budget. Profiles and unverified "
-                    "relationships are already saved to the exploration cache; "
-                    "re-run the same command with --confirm --budget "
-                    f"{math.ceil(exc.cost.estimate)} to profile and verify in "
-                    "one pass (a re-run re-profiles first)"
-                ),
-            }
-        )
-        if (
-            gate.session_ceiling is not None
-            and gate.session_spent is not None
-            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
-        ):
-            data.setdefault("notes", [])
-            data["notes"] = [
-                *data["notes"],
-                "the session budget is the binding ceiling; raising --budget "
-                "alone will not unlock this, raise the session budget in "
-                ".dex/config.yml instead",
-            ]
-        return ConfirmationRequest(cost=exc.cost, data=data)
-    return None
+        per_table_key="(join overlap probes)",
+        extra={"candidate_count": candidate_count, "object_count": object_count},
+        skip=candidate_count == 0,
+        hint=lambda cost, paradigm, budget: (
+            f"found {candidate_count} candidate relationship(s) across "
+            f"{object_count} object(s); verifying them all is estimated "
+            f"at {cost:.0f} {paradigm} beyond what "
+            "remains of the confirmed budget. Profiles and unverified "
+            "relationships are already saved to the exploration cache; "
+            f"re-run the same command with --confirm --budget {budget} "
+            "to profile and verify in one pass (a re-run re-profiles first)"
+        ),
+    )
 
 
 def overlap_handshake(
@@ -393,73 +437,43 @@ def overlap_handshake(
     cap: int,
     elided: int,
 ) -> ConfirmationRequest | None:
-    """The mid-command checkpoint for ``--infer-by-overlap``'s sweep phase on
-    billed connectors, structurally the same two-phase pattern as
-    :func:`verify_handshake`.
+    """The checkpoint for ``--infer-by-overlap``'s sweep phase.
 
     The sweep's candidate pool can only be built once inference (and
-    ``--verify``, if also requested) has run, so this prices the sweep's own
-    batch of probes after that, on an already-confirmed command: a dry-run
-    estimate that fits what remains of the confirmed budget proceeds in one
-    pass, and one that doesn't returns the request rather than raising, since
-    everything found so far is already paid for.
+    ``--verify``, if also requested) has run, so it prices its own batch of
+    probes after that.
 
-    ``cap``/``elided`` are carried on the checkpoint payload unconditionally
-    (not only when they bind), so a caller sees the sweep's bound even on a
-    confirmed run and never has to guess whether the reported candidate count
-    is the whole pool or a capped slice of it.
+    ``cap``/``elided`` ride the payload unconditionally (not only when they
+    bind), so a caller sees the sweep's bound even on a confirmed run and never
+    has to guess whether the reported candidate count is the whole pool or a
+    capped slice of it.
     """
 
-    gate = cost_gate(adapter)
-    if gate is None or candidate_count == 0:
-        return None
-    try:
-        gate.preflight_phase(estimate)
-    except ConfirmationRequiredError as exc:
-        per_table = {"(overlap sweep probes)": estimate}
-        describe = getattr(adapter, "describe_estimate", None)
-        if describe is not None:
-            data = {"command": command, **describe(estimate, per_table)}
-        else:
-            data = {
-                "command": command,
-                "estimated_bytes": estimate,
-                "per_table_bytes": per_table,
-            }
-        data.update(
-            {
-                "phase": "overlap",
-                "candidate_count": candidate_count,
-                "object_count": object_count,
-                "cap": cap,
-                "elided": elided,
-                "hint": (
-                    f"found {candidate_count} unmatched key-shaped column "
-                    f"pair(s) across {object_count} object(s) to probe for "
-                    f"value overlap; probing them all is estimated at "
-                    f"{estimate:.0f} {gate.paradigm.value} beyond what "
-                    "remains of the confirmed budget. Relationships found so "
-                    "far are already saved to the exploration cache; re-run "
-                    "the same command with --confirm --budget "
-                    f"{math.ceil(exc.cost.estimate)} to profile, infer, and "
-                    "sweep in one pass (a re-run re-profiles first)"
-                ),
-            }
-        )
-        if (
-            gate.session_ceiling is not None
-            and gate.session_spent is not None
-            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
-        ):
-            data.setdefault("notes", [])
-            data["notes"] = [
-                *data["notes"],
-                "the session budget is the binding ceiling; raising --budget "
-                "alone will not unlock this, raise the session budget in "
-                ".dex/config.yml instead",
-            ]
-        return ConfirmationRequest(cost=exc.cost, data=data)
-    return None
+    return phase_handshake(
+        command,
+        adapter,
+        estimate,
+        phase="overlap",
+        per_table_key="(overlap sweep probes)",
+        extra={
+            "candidate_count": candidate_count,
+            "object_count": object_count,
+            "cap": cap,
+            "elided": elided,
+        },
+        skip=candidate_count == 0,
+        hint=lambda cost, paradigm, budget: (
+            f"found {candidate_count} unmatched key-shaped column "
+            f"pair(s) across {object_count} object(s) to probe for "
+            f"value overlap; probing them all is estimated at "
+            f"{cost:.0f} {paradigm} beyond what "
+            "remains of the confirmed budget. Relationships found so "
+            "far are already saved to the exploration cache; re-run "
+            f"the same command with --confirm --budget {budget} to "
+            "profile, infer, and sweep in one pass (a re-run re-profiles "
+            "first)"
+        ),
+    )
 
 
 def cumulative_handshake(
@@ -470,70 +484,30 @@ def cumulative_handshake(
     candidate_count: int,
     object_count: int,
 ) -> ConfirmationRequest | None:
-    """The mid-command checkpoint for the cumulative-measure phase on billed
-    connectors, ``--check-cumulative``'s analogue of :func:`verify_handshake`.
+    """The checkpoint for ``--check-cumulative``'s window-function phase, which
+    can only be priced once profiling has found an entity/temporal pair to
+    test."""
 
-    The window-function probe can only be priced once profiling finds an
-    entity/temporal pair to test, so this runs after inference on an
-    already-confirmed command: the probes are dry-run priced (free), and only
-    when that estimate does not fit what remains of the confirmed budget does
-    it return the request, which the caller carries on its result as
-    ``pending_confirmation``. Otherwise the confirmed budget already covers
-    the check and the command proceeds in one pass.
-
-    A request rather than a raise, unlike :func:`billed_handshake`: the
-    profiles up to this point are already paid for, and raising would discard
-    them and bill the user twice for the same scan.
-    """
-
-    gate = cost_gate(adapter)
-    if gate is None or candidate_count == 0:
-        return None
-    try:
-        gate.preflight_phase(estimate)
-    except ConfirmationRequiredError as exc:
-        per_table = {"(cumulative-measure probes)": estimate}
-        describe = getattr(adapter, "describe_estimate", None)
-        if describe is not None:
-            data = {"command": command, **describe(estimate, per_table)}
-        else:
-            data = {
-                "command": command,
-                "estimated_bytes": estimate,
-                "per_table_bytes": per_table,
-            }
-        data.update(
-            {
-                "phase": "check-cumulative",
-                "candidate_count": candidate_count,
-                "object_count": object_count,
-                "hint": (
-                    f"found {candidate_count} entity/temporal candidate(s) "
-                    f"across {object_count} object(s); checking them all for "
-                    f"cumulative measures is estimated at {estimate:.0f} "
-                    f"{gate.paradigm.value} beyond what remains of the "
-                    "confirmed budget. Profiles are already saved to the "
-                    "exploration cache; re-run the same command with "
-                    f"--confirm --budget {math.ceil(exc.cost.estimate)} to "
-                    "profile and check in one pass (a re-run re-profiles "
-                    "first)"
-                ),
-            }
-        )
-        if (
-            gate.session_ceiling is not None
-            and gate.session_spent is not None
-            and gate.session_ceiling - gate.session_spent < exc.cost.estimate
-        ):
-            data.setdefault("notes", [])
-            data["notes"] = [
-                *data["notes"],
-                "the session budget is the binding ceiling; raising --budget "
-                "alone will not unlock this, raise the session budget in "
-                ".dex/config.yml instead",
-            ]
-        return ConfirmationRequest(cost=exc.cost, data=data)
-    return None
+    return phase_handshake(
+        command,
+        adapter,
+        estimate,
+        phase="check-cumulative",
+        per_table_key="(cumulative-measure probes)",
+        extra={"candidate_count": candidate_count, "object_count": object_count},
+        skip=candidate_count == 0,
+        hint=lambda cost, paradigm, budget: (
+            f"found {candidate_count} entity/temporal candidate(s) "
+            f"across {object_count} object(s); checking them all for "
+            f"cumulative measures is estimated at {cost:.0f} "
+            f"{paradigm} beyond what remains of the "
+            "confirmed budget. Profiles are already saved to the "
+            "exploration cache; re-run the same command with "
+            f"--confirm --budget {budget} to "
+            "profile and check in one pass (a re-run re-profiles "
+            "first)"
+        ),
+    )
 
 
 def sample_handshake(
@@ -543,48 +517,28 @@ def sample_handshake(
     *,
     notes: list[str] | None = None,
 ) -> ConfirmationRequest | None:
-    """The mid-command checkpoint for a scan whose price needed an earlier scan.
+    """The checkpoint for a scan whose price needed an earlier scan.
 
-    Sibling of :func:`verify_handshake` over the same ``preflight_phase`` gate, for
-    the other shape that cannot be priced up front: clustering picks its feature
-    columns out of a profile, so its sample statement does not exist until that
-    profile has been paid for. Returning rather than raising follows the same rule
-    those two already state, that a command which has already spent must not
-    discard the result and bill for it twice.
-
-    None means the confirmed budget already covers the scan and the command
-    proceeds in one pass, which is the ordinary outcome.
+    Clustering picks its feature columns out of a profile, so its sample
+    statement does not exist until that profile has been paid for. No
+    per-table breakdown: one statement over one object is not a breakdown.
     """
 
-    gate = cost_gate(adapter)
-    if gate is None:
-        return None
-    try:
-        gate.preflight_phase(estimate)
-    except ConfirmationRequiredError as exc:
-        describe = getattr(adapter, "describe_estimate", None)
-        if describe is not None:
-            data = {"command": command, **describe(estimate, None)}
-        else:
-            data = {"command": command, "estimated_bytes": estimate}
-        data.update(
-            {
-                "phase": "sample",
-                "hint": (
-                    "the profile this command needed is done and saved; the "
-                    f"sample scan is estimated at {estimate:.0f} "
-                    f"{gate.paradigm.value} beyond what remains of the confirmed "
-                    "budget. Re-run with --confirm --budget "
-                    f"{math.ceil(exc.cost.estimate)}; the cached profile is "
-                    "reused, so the re-run pays for the sample alone"
-                ),
-            }
-        )
-        if notes:
-            data.setdefault("notes", [])
-            data["notes"] = [*data["notes"], *notes]
-        return ConfirmationRequest(cost=exc.cost, data=data)
-    return None
+    return phase_handshake(
+        command,
+        adapter,
+        estimate,
+        phase="sample",
+        notes=notes,
+        hint=lambda cost, paradigm, budget: (
+            "the profile this command needed is done and saved; the "
+            f"sample scan is estimated at {cost:.0f} "
+            f"{paradigm} beyond what remains of the confirmed "
+            f"budget. Re-run with --confirm --budget {budget}; "
+            "the cached profile is reused, so the re-run pays for the "
+            "sample alone"
+        ),
+    )
 
 
 def stamp_spend(result: Result, adapter: Adapter) -> Result:
