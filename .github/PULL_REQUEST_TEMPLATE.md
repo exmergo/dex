@@ -12,6 +12,8 @@
 - [ ] Eval scoring-core tests pass (`uvx pytest evals`)
 - [ ] If a safety path is touched, the spine still holds: read-only against data,
       cost-guarded, PII flagged not surfaced, propose-don't-impose
+- [ ] PR title is ready for release notes; applicable release-note labels and
+      upgrade guidance are included
 - [ ] `CHANGELOG.md` updated under `[Unreleased]`
 - [ ] Prose is em-dash free (checked in CI)
 - [ ] No credentials, secrets, or raw warehouse rows in code, tests, or fixtures

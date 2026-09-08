@@ -557,6 +557,30 @@ bump it:
 - `.pre-commit-config.yaml` (the `rev:` tag)
 - `packages/dex-core/pyproject.toml` (the `ruff==<version>` pin in the `dev` extra)
 
+## Pull requests and release notes
+
+GitHub generates each release's "What's Changed" section from merged pull
+requests using [.github/release.yml](.github/release.yml). Write a PR title that
+states the resulting behavior in language a user can understand, because it may
+appear in those notes unchanged.
+
+Apply a primary change label before merge: `breaking-change`, `enhancement`,
+`bug`, `documentation`, `dependencies`, or `maintenance`. Add
+`downstream-visible` when it applies. Maintainers make sure suitable labels are
+present. GitHub assigns a PR to the first matching release-note category:
+breaking changes, then downstream-visible changes, features, fixes,
+documentation, dependencies, and maintenance. The final category includes
+anything else, so no merged PR is silently omitted.
+
+`downstream-visible` is for a compatible change a consumer can observe in stored
+or compared command output. Use `breaking-change` when consumers must take an
+incompatible action to upgrade; it takes precedence in the generated notes.
+Keep `CHANGELOG.md` updated under `[Unreleased]` for context, migration steps,
+or detail that does not fit a PR title. Before publishing a release, generate
+and review GitHub's notes, then add any necessary highlights or upgrade
+instructions. The tag workflow publishes packages but does not create the
+GitHub release or its notes.
+
 
 ## Maintainers
 

@@ -1,7 +1,6 @@
 # Release notes are GitHub's generated "What's Changed" list: one line per merged
-# pull request, in merge order. This file adds one heading to that list so a
-# consumer can tell, before bumping, which lines change something they store,
-# pin, or compare. Everything without the label renders exactly as today.
+# pull request, in merge order. Labels make that list useful to consumers before
+# they bump, while the catch-all keeps every merged pull request visible.
 #
 # When to apply `downstream-visible`: a consumer who stores or compares this
 # command's output would observe a difference. That is broader than "breaking":
@@ -13,9 +12,27 @@
 # of an error.
 changelog:
   categories:
+    - title: Breaking changes
+      labels:
+        - breaking-change
     - title: Downstream-visible changes
       labels:
         - downstream-visible
+    - title: Features and improvements
+      labels:
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Maintenance
+      labels:
+        - maintenance
     - title: Other changes
       labels:
         - "*"
