@@ -117,6 +117,94 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   compiled models may call; it is empty by default, and `explore query` never
   consults it.
 
+- **`transform build --verify` sweeps the nodes it just built and reports the
+  findings in the same envelope** ([#231]). `transform build` runs dbt, parses
+  `run_results.json`, and reports node status. A caller who reads
+  `"success": true` learns that dbt executed without erroring. They do not
+  learn whether the relations it produced are right, and that is the question
+  they asked.
+
+  `maintain verify` has answered that question since the last release, but
+  behind a command a caller has to know about and choose. Verification that has
+  to be remembered is verification most callers will not run, so this attaches
+  it to the command they already run to validate their work. Opt-in on every
+  connector, free ones included: one flag meaning one thing everywhere is worth
+  more than saving the flag on the connector where it costs nothing.
+
+  The payload is `data.verification`, and `ran` is always in it. A build that
+  did not verify and a build that verified and found nothing are different
+  answers, and only the second one means the models are clean; an absent key
+  would let the first read as the second. A run that swept adds `scope` (the
+  models it covered), `findings` and `finding_count` in the shape `maintain
+  verify` returns them, and `suppressed`, naming each class that could not run
+  and why.
+
+  **Findings never fail the build.** A build dbt completed is a build that
+  completed, and whether a `row_loss` should stop a pipeline is a policy its
+  caller owns. Findings stay out of `errors`, the status is unchanged, and a
+  pointer line in `warnings` names the count so a caller reading warnings alone
+  still learns of them. A build that failed partway still reports the
+  build-status half, which is when naming the failed node and what it took down
+  with it is worth most; row population is suppressed there, because a
+  half-built dev target is a mix of this run's output and the last one's.
+  `no_relation` is suppressed always: dbt's run results are a better authority
+  on what it just built than the catalog is.
+
+  **One estimate covers both phases.** The row counts a verdict needs are
+  priced during the build's own pricing pass, off the manifest the free `dbt
+  compile` wrote, and folded into the same number under a `(row counts)` entry
+  in the per-table breakdown, so one `--budget` buys the build and the
+  verification. Which relations need a real count is decided from the declared
+  materialization rather than the catalog, because on a cold dev target the
+  relations do not exist yet to be asked about; no warehouse keeps a row count
+  for a view, and a view is dbt's default. Where that pricing cannot run at all
+  (the first build of a project, where the dev namespace itself is absent) a
+  note says so and the counts are priced again after the build, as a phase
+  drawn against the reservation the build is already holding rather than as a
+  second command. A phase that does not fit returns `ok` with the counts in
+  `data.offer`: the build is finished and billed, and `needs_confirmation`
+  would tell a host nothing had run and invite it to pay for the whole build
+  twice.
+
+  **It reads the namespace dbt writes to, and only it does.** Every other
+  command refuses that namespace as a source, so exploration can never mistake
+  a built model for a source table, and `transform init` enforces it. That rule
+  is exactly what would make this feature inert on a metered connector: the
+  relations to judge are the ones the allowlist excludes. Found in the dogfood
+  for the previous release, where the dev dataset had to be added to
+  `bigquery.datasets` by hand between the build and the sweep. `--verify` now
+  adds that one namespace to its own source scope for the length of one
+  command, spelled in each connector's own vocabulary, visible in the
+  envelope's `connection.target`, and written back nowhere. Where the built
+  relations still cannot be seen, row population is suppressed with a reason
+  that names the gap rather than comparing nothing and reporting clean.
+
+  On a live BigQuery run: one handshake at 450,887,680 bytes with 41,943,040 of
+  it the `(row counts)` line, and three findings back in the build's own
+  envelope, two judged from free catalog metadata (`exact: false`) and the
+  third, a view, from the count that estimate bought (`exact: true`). On DuckDB
+  the same build returns both of the demo warehouse's planted defects with
+  every verdict exact, because counting there bills nothing.
+
+- **A build names the nodes that warned, and `maintain verify` ranks them**
+  ([#231]). Field evidence from a BigQuery session: a green build reported
+  `counts: {success: 38, pass: 246, warn: 17}`, and the envelope gave no way to
+  learn *which* 17 tests warned, so it could not answer the only question a
+  green-with-warnings build raises, which is whether these are the same 17 as
+  last time. Reading `target/run_results.json` directly was the only route.
+
+  Two causes, both fixed. Each node's `name` came from the last segment of
+  dbt's unique id, and a generic test's id ends in a content hash, so every
+  test in the envelope read as something like `3249b83c15`. Names are now taken
+  from the segment that holds the name, and `unique_id` rides alongside, since
+  it is the only unambiguous identifier and it is what scopes the sweep. And
+  `warn` was neither a failure nor a skip, so it fell through both branches of
+  the build-status check and was reported nowhere; `node_warned` reports it, at
+  low severity, for `maintain verify` as well as for a verified build. Low
+  because a project that runs relationship tests at `severity: warn` over
+  documented gaps has warnings by design: the point is a ranked list to compare
+  against last run's, not a verdict.
+
 - **`maintain verify` reports row loss and fanout against a model's driving
   parent** ([#226]). A model that quietly returns fewer rows than the relation
   it is built from is the most common silent defect in a dbt project: an inner
@@ -152,6 +240,20 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   findings that are already final. On a dogfood against BigQuery, two of three
   findings came back for zero bytes and the third was offered at the per-query
   floor.
+
+### Changed
+
+- **The four mid-command cost checkpoints are one function** ([#231]).
+  `verify_handshake`, `overlap_handshake`, `cumulative_handshake` and
+  `sample_handshake` were four copies of the same forty lines, differing only
+  in a per-table key, a phase name, the counts they carry, and their hint text.
+  Adding a fifth for a build's row counts would have made five. They now share
+  `phase_handshake`, which owns the one rule they exist to enforce: a command
+  that has already spent must not discard what it bought in order to ask about
+  the rest. Behavior is unchanged for all four, with one exception worth
+  naming: `sample_handshake` was the copy that had never grown the
+  session-ceiling note, so `explore cluster` now says when the day's cap rather
+  than the command's budget is what is binding.
 
 ### Fixed
 

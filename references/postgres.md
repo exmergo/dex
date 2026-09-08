@@ -142,6 +142,20 @@ as `PGOPTIONS="-c statement_timeout=<ceiling>s"`, the per-statement
 server-side cap (the `maximum_bytes_billed` analogue). Actual per-node
 execution time is summed into `billed_seconds` and recorded to the ledger.
 
+`transform build --verify` inherits that: its row counts cannot be priced
+upfront either, so they are gated after the build as a phase drawn against the
+reservation the build already holds, and their execution time is billed into the
+same settlement. Only a relation the warehouse keeps no row count for is counted
+at all, which is any view (dbt's default materialization); a table's count is
+free catalog metadata, and a verdict resting on it is reported `exact: false` to
+say so.
+
+`--verify` also folds `postgres.dev_schema` into its read scope for the length of that one
+command, because dbt writes the relations it is judging there and that namespace
+is refused as a source everywhere else. The widening shows in the envelope's
+`connection.target`; nothing is written back to `.dex/config.yml`.
+
+
 `transform init` content-checks the dev schema (and, with `--layered-schemas`,
 the sibling `staging_dev` / `intermediate_dev` / `marts_dev` layer schemas)
 with one `pg_class` catalog lookup per schema, warning when one already holds

@@ -22,6 +22,7 @@ from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, PIIFlag
 from exmergo_dex_core.config import DexConfig
 from exmergo_dex_core.engine import DexEngine
+from exmergo_dex_core.errors import DexError
 from exmergo_dex_core.explore.diagram import render_er_mermaid
 from exmergo_dex_core.results import to_envelope
 from exmergo_dex_core.storage import FilesystemStore, MemoryStore
@@ -603,6 +604,137 @@ def test_row_attribution_never_spends_unasked_on_a_metered_connector(
     assert changes and all(not c.attributed for c in changes)
     assert all("--attribute-rows" in (c.reason or "") for c in changes)
     assert outcome.adapter is None and outcome.pending is None
+
+
+@pytest.mark.parametrize(
+    "connector",
+    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+)
+def test_build_verification_never_spends_unasked_on_a_metered_connector(
+    connector, dbt_project_dir: Path, monkeypatch
+):
+    """`transform build` verifies only when asked, on every connector.
+
+    The build-status half of the sweep is free and connectionless, so it is
+    always safe to run; the row-population half counts rows, which is a scan
+    everywhere but DuckDB. A build that reached for a connection without
+    `--verify` would spend on work nobody asked for, which is the failure this
+    family exists to catch. The opener raises here, so any attempt to open one
+    fails the test rather than silently succeeding against a fake.
+    """
+
+    from exmergo_dex_core.transform.commands import _verify_build
+
+    target = dbt_project_dir / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "model.dex_test.fct_orders": {
+                        "name": "fct_orders",
+                        "resource_type": "model",
+                        "relation_name": "warehouse.dbt_dev.fct_orders",
+                        "config": {"materialized": "view"},
+                        "compiled_code": "select * from warehouse.raw.orders",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "run_results.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    {"unique_id": "model.dex_test.fct_orders", "status": "success"}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a build opened a connection without --verify")
+
+    monkeypatch.setattr(DexEngine, "_adapter", refuse)
+    engine = DexEngine(
+        connector=connector,
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector=connector),
+    )
+    summary = {
+        "success": True,
+        "nodes": [{"unique_id": "model.dex_test.fct_orders", "status": "success"}],
+    }
+    verification = _verify_build(engine, dbt_project_dir, summary, False)
+    assert verification.ran is False
+    assert "--verify" in (verification.reason or "")
+    assert verification.findings == [] and verification.offer is None
+
+
+def test_build_verification_findings_never_become_errors(
+    dbt_project_dir: Path, monkeypatch
+):
+    """Propose, do not impose, applied to a verdict rather than an edit.
+
+    A build dbt completed is a build that completed. Whether a row-loss finding
+    should stop a pipeline is a policy its caller owns, so the finding is
+    reported beside the result and never promoted into `errors` or into a
+    non-zero exit.
+    """
+
+    from exmergo_dex_core.transform.commands import _verify_build
+
+    target = dbt_project_dir / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "test.dex_test.relationships_orders.abc": {
+                        "name": "relationships_orders",
+                        "resource_type": "test",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "run_results.json").write_text(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "unique_id": "test.dex_test.relationships_orders.abc",
+                        "status": "warn",
+                        "message": "got 12 results",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def refuse(*args, **kwargs):
+        raise DexError("no warehouse in this test")
+
+    monkeypatch.setattr(DexEngine, "_adapter", refuse)
+    engine = DexEngine(
+        connector="duckdb",
+        repo_root=str(dbt_project_dir.parent),
+        store=FilesystemStore(dbt_project_dir.parent),
+        config=DexConfig(connector="duckdb"),
+    )
+    verification = _verify_build(
+        engine, dbt_project_dir, {"success": True, "nodes": []}, True
+    )
+    assert [f.code for f in verification.findings] == ["node_warned"]
+    payload = verification.payload()
+    assert payload["ran"] is True and payload["finding_count"] == 1
+    # The whole payload is data. Nothing here is an error string.
+    assert "errors" not in payload
 
 
 @pytest.mark.parametrize(

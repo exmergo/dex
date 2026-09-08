@@ -132,8 +132,13 @@ Offer it once at setup. It is not something to run before an ordinary command.
   now"**, and it needs no baseline at all, so it works on a project that was
   never correct and on one somebody else just built. Two classes of finding.
   Build status: nodes that failed, nodes skipped because a parent failed (naming
-  the one that actually failed), and models the project declares that built no
-  relation. Row population: `row_loss` where a model holds materially fewer rows
+  the one that actually failed), nodes that warned rather than failed, and models
+  the project declares that built no relation. A warning ranks low deliberately:
+  a project that runs relationship tests at `severity: warn` over documented gaps
+  has warnings by design, so this is a list to compare against last run's rather
+  than a defect on its own. What it must not be is missing, which is what leaves
+  a caller counting statuses in a run's raw node list to find out which tests
+  warned. Row population: `row_loss` where a model holds materially fewer rows
   than its **driving parent** (the relation in its FROM clause, followed through
   the CTE chain, as distinct from anything it joins) and nothing in its SQL
   accounts for the shortfall, and `row_fanout` where it holds materially more,
@@ -150,6 +155,12 @@ Offer it once at setup. It is not something to run before an ordinary command.
   else, since a manifest a broken project could not have produced is not
   evidence. Read `data.suppressed` before reading an empty `data.findings` as a
   clean bill of health.
+
+  The same sweep runs from the other side of the loop, as
+  `transform build --verify`, scoped to the nodes one build touched. Use that
+  when the question is whether a change you just made is right; use this one
+  when the question is the whole project, or when the build was somebody
+  else's.
 - `maintain reconcile [<class>]` proposes the dbt edits that bring the project
   back in sync, as reviewable diffs. Optionally scope it to one class (`schema`,
   `volume`, `grain`, or `semantic`). It composes every layer's declarations
