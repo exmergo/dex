@@ -1,0 +1,76 @@
+{
+  "name": "build-partial",
+  "contract": "build-evidence",
+  "description": "Some of the nodes the change required ran and some did not.",
+  "payload": {
+    "run_results": [
+      {
+        "unique_id": "model.dex_test.mart",
+        "status": "success"
+      }
+    ]
+  },
+  "expect": {
+    "outcome": "partial",
+    "result": {
+      "outcome": "partial",
+      "invocation": {
+        "invocation_id": "conformance",
+        "generated_at": "2026-09-08T01:04:26.733626+00:00",
+        "dbt_version": "1.11.11",
+        "command": "build",
+        "target": "dev",
+        "select": null,
+        "elapsed_seconds": null
+      },
+      "selection": {
+        "requested": null,
+        "matched": [
+          "mart"
+        ],
+        "empty": false,
+        "complete": true,
+        "unmatched": []
+      },
+      "digests": {
+        "manifest_sha256": "sha256:1ec72846b43af6a798f532fc15c66811c7ada95cb25b1e4a7c433a6df8797ce0",
+        "run_results_sha256": "sha256:11d68271b12a23cf94229a1c285f0c28f795ea77ea86f5e26c46627358d45ec2",
+        "source_digest": null,
+        "plan_digest": null
+      },
+      "generated": [
+        "dev.main.mart"
+      ],
+      "errors": [],
+      "stale_artifacts": true,
+      "plan_drift": [],
+      "nodes": [
+        {
+          "unique_id": "model.dex_test.mart",
+          "name": "mart",
+          "resource_type": "model",
+          "status": "success",
+          "materialization": "view",
+          "relation": "dev.main.mart"
+        }
+      ],
+      "coverage": {
+        "required": [
+          "mart",
+          "other"
+        ],
+        "covered": [
+          "mart"
+        ],
+        "missing": [
+          "other"
+        ],
+        "basis": [
+          "models/staging/mart.sql: builds 'mart'",
+          "models/staging/mart.yml: documents mart",
+          "models/staging/other.sql: builds 'other'"
+        ]
+      }
+    }
+  }
+}

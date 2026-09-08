@@ -1,0 +1,73 @@
+{
+  "name": "build-validated",
+  "contract": "build-evidence",
+  "description": "Every node the change required ran and passed, against current artifacts.",
+  "payload": {
+    "run_results": [
+      {
+        "unique_id": "model.dex_test.mart",
+        "status": "success"
+      }
+    ],
+    "select": null
+  },
+  "expect": {
+    "outcome": "validated",
+    "result": {
+      "outcome": "validated",
+      "invocation": {
+        "invocation_id": "conformance",
+        "generated_at": "2026-09-08T01:04:26.718402+00:00",
+        "dbt_version": "1.11.11",
+        "command": "build",
+        "target": "dev",
+        "select": null,
+        "elapsed_seconds": null
+      },
+      "selection": {
+        "requested": null,
+        "matched": [
+          "mart"
+        ],
+        "empty": false,
+        "complete": true,
+        "unmatched": []
+      },
+      "digests": {
+        "manifest_sha256": "sha256:1ec72846b43af6a798f532fc15c66811c7ada95cb25b1e4a7c433a6df8797ce0",
+        "run_results_sha256": "sha256:a79bb424c7ac60dd8be4c780be2622dee2ebf3049228f83ff081f2c508d83aa7",
+        "source_digest": null,
+        "plan_digest": null
+      },
+      "generated": [
+        "dev.main.mart"
+      ],
+      "errors": [],
+      "stale_artifacts": false,
+      "plan_drift": [],
+      "nodes": [
+        {
+          "unique_id": "model.dex_test.mart",
+          "name": "mart",
+          "resource_type": "model",
+          "status": "success",
+          "materialization": "view",
+          "relation": "dev.main.mart"
+        }
+      ],
+      "coverage": {
+        "required": [
+          "mart"
+        ],
+        "covered": [
+          "mart"
+        ],
+        "missing": [],
+        "basis": [
+          "models/staging/mart.sql: builds 'mart'",
+          "models/staging/mart.yml: documents mart"
+        ]
+      }
+    }
+  }
+}

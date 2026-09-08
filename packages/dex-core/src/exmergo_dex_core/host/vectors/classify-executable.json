@@ -1,0 +1,29 @@
+{
+  "name": "classify-executable",
+  "contract": "classification",
+  "description": "The same kind of file, carrying a post-hook. Applying it makes the warehouse run SQL the repository chose, so the verdict is executable and the signal names where.",
+  "payload": {
+    "path": "models/staging/mart.yml",
+    "content": "version: 2\nmodels:\n  - name: mart\n    config:\n      post-hook: \"{{ log('built', info=true) }}\"\n"
+  },
+  "expect": {
+    "artifact_class": "executable",
+    "result": {
+      "path": "models/staging/mart.yml",
+      "artifact_class": "executable",
+      "basis": "content",
+      "parsed": true,
+      "signals": [
+        {
+          "signal": "post_hook",
+          "where": "models[0].config.post-hook"
+        },
+        {
+          "signal": "macro_call",
+          "where": "models[0].config.post-hook: line 1",
+          "detail": "log"
+        }
+      ]
+    }
+  }
+}

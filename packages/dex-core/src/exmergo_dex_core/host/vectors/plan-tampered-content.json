@@ -1,0 +1,58 @@
+{
+  "name": "plan-tampered-content",
+  "contract": "portable-plan",
+  "description": "Content changed and the hashes left alone. The naive tamper, caught by recomputing the content hash before anything is written.",
+  "payload": {
+    "schema_version": 1,
+    "plan_id": "pconformance1",
+    "intent": "a mart and its schema",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "project_dir": "analytics",
+    "edit_target": "project",
+    "engine_version": "1.10.1.dev32+gb057fca4a.d20260906",
+    "edits": [
+      {
+        "path": "models/staging/mart.sql",
+        "op": "upsert",
+        "kind": "model_sql",
+        "old_content_hash": null,
+        "new_content_hash": "3bc49b7d9d33b36f48259d78e79a835f89254c2f17099574439828710e7aa564",
+        "new_content": "select o.order_id, c.region\nfrom {{ ref('stg_orders') }} o\nleft join {{ ref('stg_customers') }} c on o.customer_id = c.id\n\n-- added after authoring\n",
+        "classification": {
+          "path": "models/staging/mart.sql",
+          "artifact_class": "executable",
+          "signals": [
+            {
+              "signal": "sql_statement",
+              "where": "line 1",
+              "detail": null
+            }
+          ],
+          "basis": "content",
+          "parsed": false
+        }
+      },
+      {
+        "path": "models/staging/mart.yml",
+        "op": "upsert",
+        "kind": "schema_yml",
+        "old_content_hash": null,
+        "new_content_hash": "e2df90aceeeba5f8b8d8c9caa7149acdc9b0af304fb88b642cabbd454b2e6002",
+        "new_content": "version: 2\nmodels:\n  - name: mart\n    description: A mart.\n",
+        "classification": {
+          "path": "models/staging/mart.yml",
+          "artifact_class": "declarative",
+          "signals": [],
+          "basis": "content",
+          "parsed": true
+        }
+      }
+    ],
+    "digest": "sha256:97a82ad9e2cce5eb16bc1a875a8c84f675596bf3081561946422a09b7632fc8b"
+  },
+  "expect": {
+    "verifies": false,
+    "error": "PlanDigestMismatchError",
+    "names": "models/staging/mart.sql"
+  }
+}

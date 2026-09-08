@@ -501,6 +501,57 @@ def test_the_wheel_ships_the_typed_marker(wheel: str):
     )
 
 
+def test_the_wheel_ships_the_host_conformance_vectors(wheel: str):
+    """The fixtures have to travel with the reader that validates them.
+
+    A host installs the package and gets `verify_plan_document`; without the
+    vectors beside it, it has the reader and nothing concrete to prove its own
+    integration against, which is the whole point of shipping them.
+    """
+
+    import zipfile
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    vectors = [n for n in names if n.startswith("exmergo_dex_core/host/vectors/")]
+    assert vectors, (
+        "no host conformance vectors in the wheel, so a consumer that installs "
+        "the package has the reader and none of the fixtures"
+    )
+    assert any(n.endswith("plan-valid.json") for n in vectors), sorted(vectors)[:10]
+
+
+def test_the_host_boundary_is_reachable_on_a_bare_install(wheel: str):
+    """The offline half of the lifecycle runs where there is no connector extra.
+
+    A disposable checkout with no warehouse client still has to verify and apply
+    a plan document, which is the one thing it exists to do.
+    """
+
+    code = """
+from exmergo_dex_core.host import (
+    conformance_vectors,
+    verify_plan_document,
+    PlanDigestMismatchError,
+)
+
+vectors = {v["name"]: v for v in conformance_vectors()}
+plan = verify_plan_document(vectors["plan-valid"]["payload"])
+assert plan.digest == vectors["plan-valid"]["expect"]["digest"]
+
+try:
+    verify_plan_document(vectors["plan-tampered-content"]["payload"])
+except PlanDigestMismatchError:
+    pass
+else:
+    raise AssertionError("a tampered document verified")
+print("ok")
+"""
+    done = _run_isolated(wheel, code)
+    assert done.returncode == 0, done.stderr
+    assert "ok" in done.stdout
+
+
 # A full-tier backend, and a durable one: two instances built from the same key
 # share state, with nothing anywhere resetting it. Both properties are deliberate
 # and both were once absent, which is how a released version shipped a suite that

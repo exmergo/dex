@@ -1,0 +1,19 @@
+{
+  "name": "classify-unknown",
+  "contract": "classification",
+  "description": "Content dex could not read. Unknown, never declarative: silence must not read as safe.",
+  "payload": {
+    "path": "models/staging/mart.yml",
+    "content": "a: [1, 2\n  b: :::\n"
+  },
+  "expect": {
+    "artifact_class": "unknown",
+    "result": {
+      "path": "models/staging/mart.yml",
+      "artifact_class": "unknown",
+      "basis": "content",
+      "parsed": false,
+      "signals": []
+    }
+  }
+}

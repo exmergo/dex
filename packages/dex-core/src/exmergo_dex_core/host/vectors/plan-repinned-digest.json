@@ -1,0 +1,59 @@
+{
+  "name": "plan-repinned-digest",
+  "contract": "portable-plan",
+  "description": "Content, its hash, and the digest all recomputed together. Self-consistent, and not the plan that was authored. Only a digest the caller carried through a channel it trusts catches this, which is why expect_digest exists.",
+  "payload": {
+    "schema_version": 1,
+    "plan_id": "pconformance1",
+    "intent": "a mart and its schema",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "project_dir": "analytics",
+    "edit_target": "project",
+    "engine_version": "1.10.1.dev32+gb057fca4a.d20260906",
+    "edits": [
+      {
+        "path": "models/staging/mart.sql",
+        "op": "upsert",
+        "kind": "model_sql",
+        "old_content_hash": null,
+        "new_content_hash": "6af45159b02d0f19ae92621382fd38303d25f79056db53cdab178e8c5b521e9f",
+        "new_content": "select o.order_id, c.region\nfrom {{ ref('stg_orders') }} o\nleft join {{ ref('stg_customers') }} c on o.customer_id = c.id\n\n-- added after authoring\n",
+        "classification": {
+          "path": "models/staging/mart.sql",
+          "artifact_class": "executable",
+          "signals": [
+            {
+              "signal": "sql_statement",
+              "where": "line 1",
+              "detail": null
+            }
+          ],
+          "basis": "content",
+          "parsed": false
+        }
+      },
+      {
+        "path": "models/staging/mart.yml",
+        "op": "upsert",
+        "kind": "schema_yml",
+        "old_content_hash": null,
+        "new_content_hash": "e2df90aceeeba5f8b8d8c9caa7149acdc9b0af304fb88b642cabbd454b2e6002",
+        "new_content": "version: 2\nmodels:\n  - name: mart\n    description: A mart.\n",
+        "classification": {
+          "path": "models/staging/mart.yml",
+          "artifact_class": "declarative",
+          "signals": [],
+          "basis": "content",
+          "parsed": true
+        }
+      }
+    ],
+    "digest": "sha256:110f0268d71e0d563ec68e5ea87053ff3747acdcd2702823e697ec96b1bb0338"
+  },
+  "expect": {
+    "verifies": true,
+    "verifies_against_expected_digest": false,
+    "expect_digest": "sha256:97a82ad9e2cce5eb16bc1a875a8c84f675596bf3081561946422a09b7632fc8b",
+    "error": "PlanDigestMismatchError"
+  }
+}

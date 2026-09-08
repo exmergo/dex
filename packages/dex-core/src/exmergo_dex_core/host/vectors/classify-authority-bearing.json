@@ -1,0 +1,24 @@
+{
+  "name": "classify-authority-bearing",
+  "contract": "classification",
+  "description": "A grants block: it confers rights rather than running anything.",
+  "payload": {
+    "path": "models/staging/mart.yml",
+    "content": "version: 2\nmodels:\n  - name: mart\n    config:\n      grants:\n        select: ['reporter']\n"
+  },
+  "expect": {
+    "artifact_class": "authority_bearing",
+    "result": {
+      "path": "models/staging/mart.yml",
+      "artifact_class": "authority_bearing",
+      "basis": "content",
+      "parsed": true,
+      "signals": [
+        {
+          "signal": "grants",
+          "where": "models[0].config.grants"
+        }
+      ]
+    }
+  }
+}
