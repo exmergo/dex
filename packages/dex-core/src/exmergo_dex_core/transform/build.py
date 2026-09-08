@@ -22,10 +22,12 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import BaseModel
 
 from ..dbt_project import (
     PROFILES_FILE,
@@ -36,8 +38,8 @@ from ..dbt_project import (
     profiles_dir,
 )
 from ..dbt_project import load as load_project
-from ..envelope import Cost, Paradigm, redact
-from ..errors import DexError
+from ..envelope import Cost, EstimateQuality, Paradigm, redact
+from ..errors import DexError, PrerequisiteError
 from ..guards.cost_guard import preflight
 
 # Names that mean production no matter what the config says. The build target
@@ -55,6 +57,21 @@ _MESSAGE_MAX_CHARS = 400
 _MESSAGE_CAP = 20
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+class DependencyPolicy(str, Enum):
+    """What a build does when a declared package is not installed.
+
+    ``INSTALL`` is what an interactive user wants and what every build did before
+    this existed: run ``dbt deps`` post-gate so a first build never fails on a
+    step the agent has no verb for. ``REFUSE`` is what a sandbox wants: no
+    network, a pinned dependency set, and a build that must not quietly reach out
+    and resolve a package. The refusal names the packages, which a dbt failure
+    would not.
+    """
+
+    INSTALL = "install"
+    REFUSE = "refuse"
 
 
 class ProdTargetRefusedError(DexError):
@@ -98,9 +115,12 @@ def build(
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
     connector: str | None = None,
     estimate: float | None = None,
+    estimate_quality: EstimateQuality | None = None,
     dev_target_check: Callable[[], list[str]] | None = None,
     runner: Runner | None = None,
     timeout: float = _DBT_TIMEOUT_SECONDS,
+    dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
+    approved_functions: frozenset[str] | None = None,
 ) -> tuple[dict[str, Any], Cost]:
     """Run ``dbt build`` against a dev target, gated. Returns (summary, cost).
 
@@ -134,12 +154,28 @@ def build(
 
     target_warnings = dev_target_check() if dev_target_check is not None else []
 
+    if dependencies is DependencyPolicy.REFUSE:
+        assert_packages_installed(project)
+
     gate_estimate = 0.0 if paradigm is Paradigm.FREE_LOCAL else estimate
-    cost = preflight(gate_estimate, ceiling, paradigm=paradigm, confirmed=confirmed)
+    cost = preflight(
+        gate_estimate,
+        ceiling,
+        paradigm=paradigm,
+        confirmed=confirmed,
+        # Carried so a finished build reports its estimate's worth exactly as the
+        # confirmation ask did. Without it the handshake said `exact` and the run
+        # it authorized came back claiming nothing had been priced.
+        estimate_quality=estimate_quality,
+    )
 
     # Most real projects carry a packages.yml, and dbt refuses to compile until
     # its packages are installed; running deps here (post-gate) means the first
     # build never fails on a missing `dbt deps` step the agent has no verb for.
+    # A sandbox with no network asks for the refusal before the subprocess, so
+    # the policy is read ahead of the presence check rather than inside it: the
+    # useful message names the packages, and `dbt deps` failing to reach a
+    # registry does not.
     deps_ran = False
     if needs_deps(project):
         deps_summary = deps(project, runner=runner)
@@ -186,6 +222,17 @@ def build(
     run = runner or _default_runner(
         timeout, project, env=_build_env(connector, paradigm, ceiling)
     )
+    if approved_functions:
+        from ..adapters import get_dialect
+
+        _compile_project(project, target=target, select=select, runner=run)
+        _assert_compiled_functions(
+            project,
+            dialect=get_dialect(connector or "duckdb"),
+            approved_functions=approved_functions,
+        )
+        # Compilation also writes run_results; it is not build evidence.
+        (project / "target" / "run_results.json").unlink(missing_ok=True)
     completed = run(argv)
 
     summary = _summarize(project, target, completed)
@@ -322,6 +369,212 @@ def has_package_spec(project_dir: Path | str) -> bool:
     return False
 
 
+class DeclaredPackage(BaseModel):
+    """One entry from ``packages.yml`` or ``dependencies.yml``.
+
+    ``install_name`` is the directory dbt installs it into, which is what a
+    presence check compares against, and it is ``None`` wherever the declaration
+    does not determine it. A git URL names a repository and a dbt package names
+    itself, and those disagree often enough that guessing would report an
+    installed package as missing. ``None`` means dex cannot check this one, never
+    that it is fine.
+    """
+
+    source: str
+    name: str
+    version: str | None = None
+    install_name: str | None = None
+
+    def describe(self) -> str:
+        return f"{self.name}@{self.version}" if self.version else self.name
+
+
+def _package_entries(project: Path) -> list[dict[str, Any]]:
+    """The raw ``packages:`` list, from whichever file declares it."""
+
+    for filename in ("packages.yml", "dependencies.yml"):
+        candidate = project / filename
+        if not candidate.is_file():
+            continue
+        try:
+            parsed = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("packages"), list):
+            return [e for e in parsed["packages"] if isinstance(e, dict)]
+    return []
+
+
+def declared_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+    """Every package the project declares, in the three forms dbt accepts.
+
+    Read rather than resolved: this says what the project asks for, not what a
+    registry would hand back. That is the right half for a refusal, whose whole
+    job is to name what the sandbox was expected to already have.
+    """
+
+    project = Path(project_dir)
+    packages: list[DeclaredPackage] = []
+    for entry in _package_entries(project):
+        if isinstance(entry.get("package"), str):
+            name = entry["package"]
+            packages.append(
+                DeclaredPackage(
+                    source="hub",
+                    name=name,
+                    version=_version_text(entry.get("version")),
+                    install_name=name.rsplit("/", 1)[-1] or None,
+                )
+            )
+        elif isinstance(entry.get("git"), str):
+            packages.append(
+                DeclaredPackage(
+                    source="git",
+                    name=entry["git"],
+                    version=_version_text(entry.get("revision")),
+                    # A repository name is not a dbt package name, and dbt
+                    # installs under the latter. Left unknown rather than guessed.
+                    install_name=None,
+                )
+            )
+        elif isinstance(entry.get("local"), str):
+            local = entry["local"]
+            packages.append(
+                DeclaredPackage(
+                    source="local",
+                    name=local,
+                    install_name=Path(local).name or None,
+                )
+            )
+        elif isinstance(entry.get("tarball"), str):
+            packages.append(
+                DeclaredPackage(
+                    source="tarball", name=entry["tarball"], install_name=None
+                )
+            )
+    return packages
+
+
+def _version_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def installed_packages(project_dir: Path | str) -> set[str]:
+    """What is actually in ``dbt_packages/``, by directory and by declared name.
+
+    Both, because dbt installs a hub package into a directory named after the
+    package's second segment while the package's own ``dbt_project.yml`` may say
+    something else, and a check that reads only one of them reports a present
+    package as absent.
+    """
+
+    installed: set[str] = set()
+    root = Path(project_dir) / "dbt_packages"
+    if not root.is_dir():
+        return installed
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        installed.add(child.name)
+        manifest = child / "dbt_project.yml"
+        if not manifest.is_file():
+            continue
+        try:
+            parsed = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("name"), str):
+            installed.add(parsed["name"])
+    return installed
+
+
+def missing_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+    """Declared packages this project does not have installed.
+
+    An empty ``dbt_packages/`` means every declaration is missing, which is the
+    common sandbox case and the one where naming them all is most useful.
+    Otherwise only the ones dex can check are reported: a declaration whose
+    install name is unknown is left out rather than named on a guess, and
+    :func:`unverifiable_packages` is how a caller learns that happened.
+    """
+
+    project = Path(project_dir)
+    declared = declared_packages(project)
+    if not declared:
+        return []
+    installed = installed_packages(project)
+    if not installed:
+        return declared
+    return [
+        package
+        for package in declared
+        if package.install_name is not None and package.install_name not in installed
+    ]
+
+
+def unverifiable_packages(project_dir: Path | str) -> list[DeclaredPackage]:
+    """Declared packages whose presence dex cannot check by name."""
+
+    if not installed_packages(project_dir):
+        return []
+    return [p for p in declared_packages(project_dir) if p.install_name is None]
+
+
+class MissingPackagesError(PrerequisiteError):
+    """A build refused because a declared package is not installed.
+
+    A :class:`~..errors.PrerequisiteError` because that is the one refusal family
+    a caller can resolve automatically: run the named command and retry. In a
+    sandbox with no network the command is not runnable there, and the refusal
+    still names what the image was supposed to bake in, which is the actionable
+    half.
+    """
+
+    def __init__(
+        self,
+        packages: list[DeclaredPackage],
+        unverifiable: list[DeclaredPackage] | None = None,
+    ):
+        self.packages = packages
+        self.unverifiable = unverifiable or []
+        detail = (
+            "these declared dbt packages are not installed: "
+            + ", ".join(p.describe() for p in packages)
+            if packages
+            else "the declared dbt package installation cannot be verified"
+        )
+        if self.unverifiable:
+            detail += (
+                "; dex could not check "
+                + ", ".join(p.describe() for p in self.unverifiable)
+                + " by name, so those may be missing too"
+            )
+        super().__init__(
+            f"this build may not install dependencies, and {detail}. "
+            "Run `transform deps` "
+            "where the network is available, or bake dbt_packages/ into the "
+            "environment before the build"
+        )
+
+
+def assert_packages_installed(project_dir: Path | str) -> None:
+    """Check every declaration, even when some packages are already installed.
+
+    REFUSE cannot establish an installation whose declared name is unknown;
+    report that uncertainty instead of admitting it as an installed package.
+    The interactive installation heuristic remains separate.
+    """
+
+    missing = missing_packages(project_dir)
+    unverifiable = unverifiable_packages(project_dir)
+    if missing or unverifiable or needs_deps(project_dir):
+        raise MissingPackagesError(missing, unverifiable)
+
+
 def needs_deps(project_dir: Path | str) -> bool:
     """True when declared packages are not installed yet (dbt_packages/ missing
     or empty). Lockfile staleness is not tracked; `transform deps` is the
@@ -390,6 +643,7 @@ def compile_estimate(
     runner: Runner | None = None,
     env: dict[str, str] | None = None,
     timeout: float = _COMPILE_TIMEOUT_SECONDS,
+    approved_functions: frozenset[str] | None = None,
 ) -> tuple[float, dict[str, float], list[str]]:
     """Price a ``dbt build`` upfront, for free, by dry-running its compiled SQL.
 
@@ -419,32 +673,29 @@ def compile_estimate(
 
     project = Path(project_dir).resolve()
     estimator = getattr(adapter, "query_estimate", None)
-    if estimator is None:
+    if estimator is None and not approved_functions:
         return (
             0.0,
             {},
             ["connector exposes no estimator; build cost not priced upfront"],
         )
 
-    argv = [
-        _dbt_executable(),
-        "compile",
-        "--target",
-        target,
-        "--project-dir",
-        str(project),
-        "--profiles-dir",
-        str(profiles_dir(project).resolve()),
-        "--log-format",
-        "json",
-    ]
-    if select:
-        argv += ["--select", select]
-    run = runner or _default_runner(timeout, project, env)
-    completed = run(argv)
-    if completed.returncode != 0:
-        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
-        raise DbtRunError(messages[0] if messages else "dbt compile failed")
+    _compile_project(
+        project,
+        target=target,
+        select=select,
+        runner=runner or _default_runner(timeout, project, env),
+    )
+    if approved_functions:
+        _assert_compiled_functions(
+            project, dialect=adapter.dialect, approved_functions=approved_functions
+        )
+    if estimator is None:
+        return (
+            0.0,
+            {},
+            ["connector exposes no estimator; build cost not priced upfront"],
+        )
 
     compiled = _compiled_nodes(project)
     total = 0.0
@@ -472,6 +723,74 @@ def compile_estimate(
     if not per_node and not skipped:
         notes.append("no scanning build nodes to price; the estimate is zero")
     return total, per_node, notes
+
+
+def _compile_project(
+    project: Path, *, target: str, select: str | None, runner: Runner
+) -> None:
+    """Compile the selection afresh; never reuse a prior invocation's results."""
+
+    (project / "target" / "run_results.json").unlink(missing_ok=True)
+    argv = [
+        _dbt_executable(),
+        "compile",
+        "--target",
+        target,
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(profiles_dir(project).resolve()),
+        "--log-format",
+        "json",
+    ]
+    if select:
+        argv += ["--select", select]
+    completed = runner(argv)
+    if completed.returncode != 0:
+        messages = _collect_messages(completed, log_hint=project / "logs" / "dbt.log")
+        raise DbtRunError(messages[0] if messages else "dbt compile failed")
+
+
+def _assert_compiled_functions(
+    project: Path, *, dialect: str, approved_functions: frozenset[str]
+) -> None:
+    """Adjudicate every selected SQL node before pricing or building it.
+
+    Pricing may omit unreadable nodes. An enabled execution restriction cannot,
+    so missing artifacts or compiled SQL are hard failures on this path.
+    """
+
+    from ..guards.execution import guarded_statement_verdict
+    from ..guards.sql_guard import NotSelectOnlyError, RefusalReason
+
+    try:
+        results = json.loads((project / "target/run_results.json").read_text())
+        manifest = json.loads((project / "target/manifest.json").read_text())
+        selected = results["results"]
+        nodes = manifest["nodes"]
+        if not isinstance(selected, list) or not isinstance(nodes, dict):
+            raise ValueError("invalid compile artifact shape")
+        for result in selected:
+            uid = result["unique_id"]
+            node = nodes[uid]
+            if node.get("resource_type") == "seed":
+                continue
+            code = node.get("compiled_code")
+            if not isinstance(code, str) or not code.strip():
+                raise ValueError(f"{uid}: no compiled SQL available")
+            verdict = guarded_statement_verdict(
+                code,
+                node=uid,
+                dialect=dialect,
+                approved_functions=approved_functions,
+            )
+            if not verdict.allowed:
+                raise NotSelectOnlyError(
+                    f"{uid}: {verdict.detail}",
+                    reason=RefusalReason(verdict.reason),
+                )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DbtRunError(f"cannot enforce guards.approved_functions: {exc}") from exc
 
 
 def _compiled_nodes(project: Path) -> list[tuple[str, str]]:
