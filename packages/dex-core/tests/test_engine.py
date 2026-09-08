@@ -123,6 +123,7 @@ _METHOD_NAMES = {
     ("maintain", "grain"): "grain_drift",
     ("maintain", "semantic"): "semantic_drift",
     ("transform", "init"): "init_project",
+    ("transform", "export"): "export_plan",
 }
 
 

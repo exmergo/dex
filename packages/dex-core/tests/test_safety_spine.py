@@ -3031,6 +3031,194 @@ def test_an_in_memory_session_budget_still_binds(fake_bq_client):
         gate.preflight_command(500)
 
 
+# The host boundary (#441) is family 4 seen from a second process: a plan that
+# crossed a filesystem is still propose-don't-impose, and the propose half is
+# now something the applying side can check for itself rather than trust.
+
+
+def test_a_plan_document_changed_in_transit_writes_nothing(dbt_project_dir: Path):
+    """Content that does not hash to what the plan recorded is refused before
+    any file is touched, and the whole plan is withheld rather than the one
+    edit."""
+
+    import json as _json
+
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+    from exmergo_dex_core.transform.portable import PlanDigestMismatchError
+
+    repo = dbt_project_dir.parent
+    with DexEngine.from_repo(str(repo)) as engine:
+        stored = engine.plan(
+            "two files",
+            edits=[
+                PlanEdit(
+                    path="models/staging/a.sql",
+                    new_content="select 1 as id\n",
+                    op=EditOp.UPSERT,
+                    kind=EditKind.MODEL_SQL,
+                ),
+                PlanEdit(
+                    path="models/staging/b.sql",
+                    new_content="select 2 as id\n",
+                    op=EditOp.UPSERT,
+                    kind=EditKind.MODEL_SQL,
+                ),
+            ],
+        )
+        document = engine.export_plan(stored.plan_id).plan
+
+    tampered = _json.loads(_json.dumps(document))
+    tampered["edits"][0]["new_content"] = "select 999 as id\n"
+
+    elsewhere = dbt_project_dir.parent.parent / "elsewhere"
+    elsewhere.mkdir()
+    shutil.copytree(dbt_project_dir, elsewhere / "analytics")
+
+    with (
+        DexEngine.from_repo(str(elsewhere), confirmed=True) as engine,
+        pytest.raises(PlanDigestMismatchError),
+    ):
+        engine.apply_plan_document(tampered)
+
+    # Neither edit landed. Confirmation is the handshake for a human edit
+    # somebody can look at, and nobody accepts content that does not match the
+    # plan it claims to be.
+    assert not (elsewhere / "analytics" / "models" / "staging" / "a.sql").exists()
+    assert not (elsewhere / "analytics" / "models" / "staging" / "b.sql").exists()
+
+
+def test_a_plan_document_cannot_write_outside_the_applying_checkouts_surface(
+    dbt_project_dir: Path,
+):
+    """Containment is re-checked against the checkout being written to.
+
+    The document is an artifact that crossed a boundary, and what it was
+    validated against is not what it is being written into. A hard refusal, not
+    a conflict: `--confirm` accepts a human edit, never a write outside the
+    surface the project itself declares.
+    """
+
+    from exmergo_dex_core.edits import content_hash as _hash
+    from exmergo_dex_core.transform.portable import PortablePlan, plan_digest
+
+    document = {
+        "schema_version": 1,
+        "plan_id": "pescape",
+        "intent": "escape",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "project_dir": "analytics",
+        "edit_target": "project",
+        "engine_version": "0.0.0",
+        "edits": [
+            {
+                "path": "../../../dex_was_here.sql",
+                "op": "upsert",
+                "kind": "model_sql",
+                "old_content_hash": None,
+                "new_content_hash": _hash("select 1\n"),
+                "new_content": "select 1\n",
+            }
+        ],
+        "digest": "",
+    }
+    document["digest"] = plan_digest(PortablePlan.model_validate(document))
+
+    repo = dbt_project_dir.parent
+    with (
+        DexEngine.from_repo(str(repo), confirmed=True) as engine,
+        pytest.raises(Exception) as caught,
+    ):
+        engine.apply_plan_document(document)
+    assert "outside" in str(caught.value) or "surface" in str(caught.value)
+    assert not (repo.parent / "dex_was_here.sql").exists()
+    assert not (repo / "dex_was_here.sql").exists()
+
+
+def test_a_build_that_validated_nothing_never_reports_that_it_did(
+    dbt_project_dir: Path,
+):
+    """dbt's exit code is not evidence about a change.
+
+    An empty selection and a build of an unrelated model both exit zero, which
+    is the reproduction on #441. `success` still means what dbt means; `outcome`
+    is what a host reads.
+    """
+
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.transform.evidence import BuildOutcome, build_evidence
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+
+    project = dbt_project_dir
+    (project / "target").mkdir(exist_ok=True)
+    (project / "target" / "run_results.json").write_text(
+        json.dumps({"metadata": {}, "results": []}), encoding="utf-8"
+    )
+    edits = [
+        PlanEdit(
+            path="models/staging/mart.sql",
+            new_content="select 1 as id\n",
+            op=EditOp.UPSERT,
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+    evidence = build_evidence(project, target="dev", select="tag:nothing", edits=edits)
+    assert evidence.outcome is BuildOutcome.EMPTY_SELECTION
+    assert evidence.coverage.covered == []
+
+
+def test_a_guarded_build_refuses_a_missing_package_before_it_reaches_the_network(
+    dbt_project_dir: Path,
+):
+    """The sandbox case: no network, a pinned dependency set, and a refusal that
+    names the package rather than a dbt failure to reach a registry."""
+
+    from exmergo_dex_core import MissingPackagesError
+    from exmergo_dex_core.transform.build import DependencyPolicy
+    from exmergo_dex_core.transform.build import build as run_build
+
+    (dbt_project_dir / "packages.yml").write_text(
+        "packages:\n  - package: dbt-labs/dbt_utils\n    version: 1.3.0\n",
+        encoding="utf-8",
+    )
+
+    def refuse(_argv):
+        raise AssertionError("a subprocess ran before the dependency refusal")
+
+    with pytest.raises(MissingPackagesError, match="dbt-labs/dbt_utils"):
+        run_build(
+            dbt_project_dir,
+            target="dev",
+            runner=refuse,
+            dependencies=DependencyPolicy.REFUSE,
+        )
+
+
+def test_a_prod_target_is_still_refused_before_the_dependency_policy_is_read(
+    dbt_project_dir: Path,
+):
+    """Order matters: a prod target is refused outright, and no new gate may
+    move ahead of it."""
+
+    from exmergo_dex_core.transform.build import (
+        DependencyPolicy,
+        ProdTargetRefusedError,
+    )
+    from exmergo_dex_core.transform.build import build as run_build
+
+    (dbt_project_dir / "packages.yml").write_text(
+        "packages:\n  - package: dbt-labs/dbt_utils\n    version: 1.3.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProdTargetRefusedError):
+        run_build(
+            dbt_project_dir,
+            target="prod",
+            runner=lambda _argv: None,
+            dependencies=DependencyPolicy.REFUSE,
+        )
+
+
 # --- Family 5: credentials and raw rows never enter stdout data ---------------
 
 

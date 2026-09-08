@@ -86,11 +86,14 @@ _EXPORTS = {
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
+    "MissingPackagesError": "transform.build",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
     "OssieDependencyError": "ossie.loader",
     "OverCeilingError": "guards.cost_guard",
     "Paradigm": "envelope",
+    "PlanDigestMismatchError": "transform.portable",
+    "PlanDocumentError": "transform.portable",
     "PlanError": "transform.plans",
     "PlanNotFoundError": "transform.plans",
     "PrerequisiteError": "errors",
@@ -192,7 +195,9 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         StoreContext,
         StoreFactory,
     )
+    from .transform.build import MissingPackagesError
     from .transform.plans import PlanError, PlanNotFoundError
+    from .transform.portable import PlanDigestMismatchError, PlanDocumentError
 
 try:
     __version__ = version("exmergo-dex-core")
@@ -238,11 +243,14 @@ __all__ = [
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
+    "MissingPackagesError",
     "NoBaselineError",
     "NoConnectorSelectedError",
     "OssieDependencyError",
     "OverCeilingError",
     "Paradigm",
+    "PlanDigestMismatchError",
+    "PlanDocumentError",
     "PlanError",
     "PlanNotFoundError",
     "PrerequisiteError",

@@ -219,6 +219,37 @@ class ReferenceIndex:
             for hit in hits
         ], query_limits
 
+    def references_from(
+        self, paths: set[str] | frozenset[str]
+    ) -> tuple[list[Reference], list[Reference]]:
+        """Every reference written *in* these files, resolved and indeterminate.
+
+        The inverse of :meth:`references_to`, and the question a caller grounding
+        one change asks: not "who points at this name" but "what does this file
+        point at". Both halves come back, because a file whose only unread
+        reference is a dynamic ``{{ ref(var('x')) }}`` has a dependency dex knows
+        exists and cannot name, and dropping it would report that file as fully
+        resolved.
+
+        A definition is not a reference to itself, so the forms that only declare
+        a name are excluded; what is left is what the file depends on.
+        """
+
+        wanted = set(paths)
+        resolved = [
+            reference
+            for bucket in self._by_name.values()
+            for reference in bucket
+            if reference.path in wanted
+            and reference.form not in ("definition", "project_yml_var")
+        ]
+        resolved.sort(key=lambda r: (r.path, r.line, r.kind, r.name or ""))
+        indeterminate = sorted(
+            (r for r in self._indeterminate if r.path in wanted),
+            key=lambda r: (r.path, r.line, r.kind),
+        )
+        return resolved, indeterminate
+
     def indeterminate_for(self, kind: str) -> list[Reference]:
         """Unresolved references that could have been references of ``kind``.
 
@@ -537,6 +568,7 @@ class ReferenceIndex:
 
         columns = {column.name for column in parsed.find_all(exp.Column) if column.name}
         columns |= {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}
+        columns.discard(JINJA_PLACEHOLDER)
         if not columns:
             return
         try:
@@ -1012,6 +1044,14 @@ class _ScalarLines:
         return self._keys.get(value, self.peek(value))
 
 
+#: What :func:`blank_jinja` stands in for an interpolated value, so the
+#: surrounding SQL still parses. It is never an identifier an author wrote, so
+#: every reader of blanked SQL has to exclude it: reporting it as a column would
+#: put a token nobody typed into a reference report and into a plan's dependency
+#: graph.
+JINJA_PLACEHOLDER = "_dx"
+
+
 def blank_jinja(content: str) -> str:
     """``content`` with every jinja region blanked, offsets and newlines intact.
 
@@ -1035,7 +1075,7 @@ def blank_jinja(content: str) -> str:
             # query. Standing an identifier in its place puts a bare token above
             # the SELECT and nothing parses after it.
             continue
-        for offset, char in enumerate("_dx"):
+        for offset, char in enumerate(JINJA_PLACEHOLDER):
             if region.start + offset < region.end:
                 out[region.start + offset] = char
     return "".join(out)

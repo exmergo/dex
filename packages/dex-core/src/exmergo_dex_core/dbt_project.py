@@ -2026,20 +2026,36 @@ def _semantic_from_yaml(
     defs.semantic_source = "yaml"
 
 
-def _flag_stale_manifest(view: DbtProjectView, defs: ProjectDefinitions) -> None:
-    """A manifest older than the newest model source describes a project state
-    that may no longer exist; note it, never refuse on it."""
+def manifest_freshness(view: DbtProjectView) -> dict[str, Any]:
+    """When the compiled manifest was written, against the newest model source.
 
+    Four fields rather than one boolean, because "not stale" and "cannot tell"
+    are different answers and a caller acts differently on each.
+    ``manifest_present`` is whether there is a compiled manifest at all;
+    ``generated_at`` and ``newest_source_at`` are the two timestamps compared;
+    and ``stale`` is ``None`` wherever either timestamp is missing, which is the
+    honest answer for a project that has never been compiled or one whose
+    manifest carries no metadata.
+    """
+
+    freshness: dict[str, Any] = {
+        "manifest_present": view.manifest is not None,
+        "generated_at": None,
+        "newest_source_at": None,
+        "stale": None,
+    }
     metadata = (view.manifest or {}).get("metadata")
     generated = metadata.get("generated_at") if isinstance(metadata, dict) else None
-    if not isinstance(generated, str):
-        return
-    try:
-        generated_at = datetime.fromisoformat(generated.replace("Z", "+00:00"))
-    except ValueError:
-        return
-    if generated_at.tzinfo is None:
-        generated_at = generated_at.replace(tzinfo=UTC)
+    generated_at: datetime | None = None
+    if isinstance(generated, str):
+        try:
+            generated_at = datetime.fromisoformat(generated.replace("Z", "+00:00"))
+        except ValueError:
+            generated_at = None
+        if generated_at is not None:
+            if generated_at.tzinfo is None:
+                generated_at = generated_at.replace(tzinfo=UTC)
+            freshness["generated_at"] = generated_at.isoformat()
 
     root = Path(view.root)
     newest: float | None = None
@@ -2053,9 +2069,19 @@ def _flag_stale_manifest(view: DbtProjectView, defs: ProjectDefinitions) -> None
             mtime = path.stat().st_mtime
             if newest is None or mtime > newest:
                 newest = mtime
-    if newest is None:
-        return
-    if datetime.fromtimestamp(newest, tz=UTC) > generated_at:
+    newest_at = datetime.fromtimestamp(newest, tz=UTC) if newest is not None else None
+    if newest_at is not None:
+        freshness["newest_source_at"] = newest_at.isoformat()
+    if generated_at is not None and newest_at is not None:
+        freshness["stale"] = newest_at > generated_at
+    return freshness
+
+
+def _flag_stale_manifest(view: DbtProjectView, defs: ProjectDefinitions) -> None:
+    """A manifest older than the newest model source describes a project state
+    that may no longer exist; note it, never refuse on it."""
+
+    if manifest_freshness(view).get("stale"):
         defs.manifest_stale = True
         defs.notes.append(
             "compiled dbt artifacts are older than the model sources; "

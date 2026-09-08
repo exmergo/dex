@@ -587,10 +587,41 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "attribute_rows": "attribute_rows",
         },
     },
-    ("transform", "apply"): {"method": "apply", "args": {"argument": _TRANSLATED}},
+    ("transform", "apply"): {
+        # Two engine methods behind one subcommand: a stored plan by id, and a
+        # plan document carried in from another checkout. `--plan-file` picks
+        # which, so the flag maps to the second method's parameter.
+        "method": ("apply", "apply_plan_document"),
+        "args": {
+            "argument": _TRANSLATED,
+            "plan_file": _TRANSLATED,
+            "expect_digest": "expect_digest",
+        },
+    },
     ("transform", "build"): {
         "method": "build",
-        "args": {"target": "target", "select": "select"},
+        "args": {
+            "target": "target",
+            "select": "select",
+            "for_plan": "for_plan",
+            # Read from the file into `for_plan_document`.
+            "for_plan_file": _TRANSLATED,
+            # An off switch the shim turns into a DependencyPolicy value.
+            "no_install_deps": _TRANSLATED,
+        },
+    },
+    ("transform", "export"): {
+        "method": "export_plan",
+        "args": {"argument": _TRANSLATED},
+    },
+    ("transform", "ground"): {"method": "ground", "args": {"argument": _TRANSLATED}},
+    ("transform", "classify"): {
+        "method": "classify",
+        "args": {"argument": _TRANSLATED, "edits_file": _TRANSLATED},
+    },
+    ("transform", "preflight"): {
+        "method": "preflight",
+        "args": {"target": _TRANSLATED},
     },
     ("transform", "deps"): {"method": "deps", "args": {}},
     ("transform", "plans"): {"method": "plans", "args": {}},

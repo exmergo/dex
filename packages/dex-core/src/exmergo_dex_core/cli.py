@@ -70,6 +70,14 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         "remove",
         "place",
         "test",
+        # The host boundary (#441): a plan a second process can carry and check,
+        # what that plan depends on, what its edits actually contain, and what
+        # the warehouse will enforce on the build that validates it. Every one is
+        # repo-only and free except `preflight`, which opens no connection either.
+        "export",
+        "ground",
+        "classify",
+        "preflight",
     ],
     # `define`/`update`/`plan` author the dbt semantic layer; each vendor whose
     # semantic layer is its own project format gets a subcommand of its own name
@@ -206,6 +214,25 @@ _GROUP_HELP: dict[str, str] = {
     "demo": "create a seeded local DuckDB warehouse to try dex against "
     "(no credentials, no network)",
 }
+
+#: Authoring subcommands that read and report rather than author SQL, so the
+#: dialect gate does not apply. `transform references` is routed around the table
+#: entirely for the stronger version of the same reason (it must not even import
+#: the authoring module); these four can import it, and only need not be refused
+#: on an install with no connector extra.
+_NEEDS_NO_DIALECT = frozenset(
+    {
+        ("transform", "export"),
+        ("transform", "classify"),
+        ("transform", "preflight"),
+        # Grounding reads columns through the dialect engine where one is
+        # installed and names its absence as a limit where it is not, exactly as
+        # `transform references` does, so refusing here would turn a degraded
+        # answer into no answer.
+        ("transform", "ground"),
+    }
+)
+
 
 _EPILOG = """\
 Point it at data with --connector/--path, or commit a connector: block to
@@ -422,8 +449,28 @@ def _build_parser() -> argparse.ArgumentParser:
                     )
                 # transform init takes the project name; plan the intent; apply
                 # the plan id; macro the shipped-macro name (none lists them).
-                if group == "transform" and name in {"init", "plan", "apply", "macro"}:
+                if group == "transform" and name in {
+                    "init",
+                    "plan",
+                    "apply",
+                    "macro",
+                    "export",
+                    "ground",
+                    "classify",
+                }:
                     sp.add_argument("argument", nargs="?", default=None)
+                if group == "transform" and name == "apply":
+                    # The offline half of the lifecycle: apply a plan document
+                    # this checkout's store has never seen. `--expect-digest` is
+                    # where authenticity enters, and it is separate from the file
+                    # on purpose, because the point is that it arrives by a
+                    # different route than the document does.
+                    sp.add_argument("--plan-file", default=None)
+                    sp.add_argument("--expect-digest", default=None)
+                if group == "transform" and name == "classify":
+                    sp.add_argument("--edits-file", default=None)
+                if group == "transform" and name == "preflight":
+                    sp.add_argument("--target", default=None)
                 if group == "transform" and name == "init":
                     sp.add_argument(
                         "--layered-schemas", action="store_true", default=False
@@ -459,6 +506,19 @@ def _build_parser() -> argparse.ArgumentParser:
                 if group == "transform" and name == "build":
                     sp.add_argument("--target", default=None)
                     sp.add_argument("--select", default=None)
+                    # Which change this build is meant to validate, so the
+                    # evidence can report coverage rather than leaving a caller to
+                    # infer it from node names.
+                    sp.add_argument("--for-plan", default=None)
+                    # The same change, as the document a sandbox holds instead of
+                    # the store id the authoring process holds.
+                    sp.add_argument("--for-plan-file", default=None)
+                    # An off switch only, like `--no-auto-profile`: installing
+                    # missing packages is what an interactive build should do, and
+                    # the spelling that needs a flag is the sandbox's refusal.
+                    sp.add_argument(
+                        "--no-install-deps", action="store_true", default=False
+                    )
                 if group == "transform" and name == "references":
                     # Variadic like `explore query`: one call answers "where is
                     # each of these used", which is the shape of a rename. `--kind`
@@ -673,6 +733,10 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
         ("transform", "test"): "cmd_test",
+        ("transform", "export"): "cmd_export",
+        ("transform", "ground"): "cmd_ground",
+        ("transform", "classify"): "cmd_classify",
+        ("transform", "preflight"): "cmd_preflight",
         ("semantic", "define"): "cmd_semantic_define",
         ("semantic", "update"): "cmd_semantic_update",
         ("semantic", "plan"): "cmd_semantic_plan",
@@ -706,6 +770,15 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # could never apply, which is the one command that install exists to run.
     # The stored plan says which it is, so ask it and gate only what needs it.
     if args.group == "transform" and args.subcommand == "apply":
+        # A plan document carries its own edits, so there is no stored plan to
+        # ask and, more to the point, nothing on this path parses SQL at all:
+        # gating it on the dialect engine would make the offline apply need a
+        # dependency it never uses, in the one environment least able to install
+        # one.
+        if getattr(args, "plan_file", None):
+            from .transform.commands import cmd_apply_document
+
+            return cmd_apply_document(args, engine)
         if _apply_authors_sql(args, engine):
             ensure_dialect_available()
         from .transform.commands import cmd_apply
@@ -714,7 +787,8 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
     handler = authoring.get((args.group, args.subcommand))
     if handler is not None:
-        ensure_dialect_available()
+        if (args.group, args.subcommand) not in _NEEDS_NO_DIALECT:
+            ensure_dialect_available()
         from .transform import commands as transform_cmds
 
         return getattr(transform_cmds, handler)(args, engine)

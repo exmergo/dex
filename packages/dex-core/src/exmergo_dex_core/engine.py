@@ -87,13 +87,17 @@ if TYPE_CHECKING:
     from .transform.results import (
         ApplyResult,
         BuildResult,
+        ClassificationResult,
         DepsResult,
+        GroundingResult,
         InitResult,
         MacroListResult,
         MacroResult,
         PlacementResult,
+        PlanExportResult,
         PlanListResult,
         PlanResult,
+        PreflightResult,
         PropagationResult,
     )
     from .transform.semantic import DefinitionEdit
@@ -1187,6 +1191,61 @@ class DexEngine:
 
         return transform.plans(self)
 
+    def export_plan(self, plan_id: str | None = None) -> PlanExportResult:
+        """A stored plan as a portable, digest-covered document.
+
+        The host boundary's first half: what :meth:`plan` stored, complete enough
+        for a different process in a different checkout to check and apply. No id
+        exports the latest unapplied plan, matching :meth:`apply`.
+        """
+
+        from .transform import commands as transform
+
+        return transform.export_plan(self, plan_id)
+
+    def apply_plan_document(
+        self, document: Any, *, expect_digest: str | None = None
+    ) -> ApplyResult:
+        """Apply a plan document here, with no plan store and no connector.
+
+        The other half. ``expect_digest`` is where authenticity enters: the
+        document proves it is internally consistent on its own, and pinning the
+        digest the caller carried through a channel it trusts is what makes it
+        the plan that was authored rather than a plan.
+        """
+
+        from .transform import commands as transform
+
+        return transform.apply_document(self, document, expect_digest=expect_digest)
+
+    def ground(self, plan_id: str | None = None) -> GroundingResult:
+        """What a plan depends on, and how much of that dex established.
+
+        The evidence a host checks before it applies a change anywhere: the
+        relations and project nodes the plan reads, what could not be resolved,
+        what more than one thing could have meant, how fresh the artifacts behind
+        the answer are, and a fingerprint of everything it was computed from.
+        Repo-only and free on every connector.
+        """
+
+        from .transform import commands as transform
+
+        return transform.ground(self, plan_id)
+
+    def classify(
+        self, plan_id: str | None = None, *, edits: list[PlanEdit] | None = None
+    ) -> ClassificationResult:
+        """What each edit's content contains, read from the content itself.
+
+        Never from the caller-supplied ``kind`` or the filename: both say where a
+        file goes, and a host deciding whether a change may be applied offline is
+        asking what is in it.
+        """
+
+        from .transform import commands as transform
+
+        return transform.classify(self, plan_id, edits=edits)
+
     def macro(self, name: str | None = None) -> MacroListResult | MacroResult:
         from .transform import commands as transform
 
@@ -1238,16 +1297,60 @@ class DexEngine:
         return transform.place(self, column, targets, expression, explain=explain)
 
     def build(
-        self, *, target: str | None = None, select: str | None = None
+        self,
+        *,
+        target: str | None = None,
+        select: str | None = None,
+        for_plan: str | None = None,
+        for_plan_document: Any = None,
+        dependencies: Any = None,
     ) -> BuildResult:
-        from .transform import commands as transform
+        """Run ``dbt build`` against the dev target, cost-surfaced first.
 
-        return transform.build(self, target=target, select=select)
+        ``for_plan`` (a stored plan id) or ``for_plan_document`` (an exported
+        plan document) names the change this build is meant to validate, which is
+        what turns dbt's exit code into a verdict: the result's ``evidence`` then
+        reports which of the nodes the change required actually ran. The document
+        form is what a sandbox uses, since a sandbox holds the document and no
+        plan store.
+        ``dependencies`` takes a
+        :class:`~.transform.build.DependencyPolicy`; the default installs missing
+        packages as it always has, and ``REFUSE`` names them and stops, which is
+        the right outcome in a sandbox with no network.
+        """
+
+        from .transform import commands as transform
+        from .transform.build import DependencyPolicy
+
+        return transform.build(
+            self,
+            target=target,
+            select=select,
+            for_plan=for_plan,
+            for_plan_document=for_plan_document,
+            dependencies=dependencies or DependencyPolicy.INSTALL,
+        )
 
     def deps(self) -> DepsResult:
         from .transform import commands as transform
 
         return transform.deps(self)
+
+    def preflight(self, target: str | None = None) -> PreflightResult:
+        """What the warehouse will enforce on this project's next guarded build.
+
+        Free and connectionless on every connector: it reads the project's
+        rendered profile and the connector's own declarations, and opens nothing.
+        Worth having separately from :meth:`connect_test`, which proves a
+        credential works and says nothing about what binds a dbt subprocess. On a
+        connector with no provider-side spend control it says so rather than
+        reporting a healthy preflight, because a target named ``dev`` is not by
+        itself evidence of anything.
+        """
+
+        from .transform import commands as transform
+
+        return transform.preflight(self, target)
 
     def semantic_define(
         self,

@@ -547,10 +547,19 @@ def test_missing_dev_db_without_sources_only_warns(
     assert any("does not exist" in w for w in envelope["warnings"])
 
 
+@pytest.mark.parametrize("function_guard", [False, True])
 def test_confirmed_dev_build_runs_dbt_for_real(
-    dbt_project_dir: Path, tmp_path: Path, capsys
+    dbt_project_dir: Path, tmp_path: Path, capsys, function_guard
 ):
     pytest.importorskip("dbt.cli.main")
+    if function_guard:
+        import yaml
+
+        config_path = tmp_path / ".dex/config.yml"
+        config_path.parent.mkdir(exist_ok=True)
+        config = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        config["guards"] = {"approved_functions": ["approved_udf"]}
+        config_path.write_text(yaml.safe_dump(config))
     rc, envelope = _run(
         [
             "--repo-root",
@@ -574,14 +583,37 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         + envelope["data"]["counts"].get("pass", 0)
         >= 2
     )  # the model and its not_null test
-    # No raw dbt log text in data: only the structured summary keys.
+    # No raw dbt log text in data: only the structured summary keys, plus the
+    # typed evidence and the outcome lifted out of it.
     assert set(envelope["data"]) == {
         "target",
         "success",
         "returncode",
         "nodes",
         "counts",
+        "outcome",
+        "evidence",
     }
+    # `success` is dbt's exit code; `outcome` is whether anything was validated,
+    # and this run built real nodes against current artifacts.
+    assert envelope["data"]["outcome"] == "validated"
+    evidence = envelope["data"]["evidence"]
+    assert set(evidence) == {
+        "outcome",
+        "invocation",
+        "selection",
+        "digests",
+        "generated",
+        "errors",
+        "nodes",
+        "stale_artifacts",
+        "plan_drift",
+    }
+    # No plan was named, so there is no coverage to report and the key is absent
+    # rather than empty.
+    assert "coverage" not in evidence
+    assert evidence["selection"]["empty"] is False
+    assert "stg_customers" in evidence["selection"]["matched"]
 
 
 def test_relative_profile_path_resolves_against_project(
@@ -1500,7 +1532,161 @@ def test_prod_refusal_still_beats_the_dev_target_check(
     assert "seed" not in envelope["errors"][0]
 
 
+@pytest.mark.parametrize("connector", ["duckdb", "bigquery"])
+def test_public_build_refuses_partial_installation_before_pricing(
+    dbt_project_dir, monkeypatch, connector
+):
+    from exmergo_dex_core import DexEngine, MissingPackagesError
+    from exmergo_dex_core.transform import commands, dev_target
+    from exmergo_dex_core.transform.build import DependencyPolicy
+
+    (dbt_project_dir / "packages.yml").write_text(
+        "packages:\n  - package: a/installed\n  - package: a/missing\n"
+    )
+    (dbt_project_dir / "dbt_packages/installed").mkdir(parents=True)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+
+    def forbidden(*a, **k):
+        pytest.fail("partial installation reached pricing or a subprocess")
+
+    module = importlib.import_module("exmergo_dex_core.transform.build")
+    monkeypatch.setattr(module, "_default_runner", forbidden)
+    monkeypatch.setattr(commands, "_price_build", forbidden)
+    with (
+        DexEngine.from_repo(dbt_project_dir.parent, connector=connector) as engine,
+        pytest.raises(MissingPackagesError) as caught,
+    ):
+        engine.build(dependencies=DependencyPolicy.REFUSE)
+    assert [p.name for p in caught.value.packages] == ["a/missing"]
+
+
 # --- compile_estimate: pricing a build from a free dbt compile dry-run --------
+
+
+@pytest.mark.parametrize("connector", ["duckdb", "bigquery"])
+@pytest.mark.parametrize(
+    "code,reason",
+    [
+        ("select forbidden_udf(1)", "unapproved_function"),
+        ("CALL forbidden_proc()", "stored_procedure_or_call"),
+    ],
+)
+def test_public_build_enforces_configured_functions_before_execution(
+    dbt_project_dir, monkeypatch, connector, code, reason
+):
+    from types import SimpleNamespace
+
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError
+    from exmergo_dex_core.transform import dev_target
+
+    calls = _guard_compile_runner(monkeypatch, dbt_project_dir, code)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    adapter = SimpleNamespace(
+        dialect=connector,
+        paradigm=Paradigm.BYTES_SCANNED,
+        query_estimate=lambda _: pytest.fail("refused SQL reached provider pricing"),
+    )
+    monkeypatch.setattr(DexEngine, "_adapter", lambda *a, **k: adapter)
+    with DexEngine.from_repo(dbt_project_dir.parent, connector=connector) as engine:
+        engine.config.guards.approved_functions = ["approved_udf"]
+        with pytest.raises(NotSelectOnlyError) as caught:
+            engine.build(select="guarded")
+    assert caught.value.reason.value == reason
+    assert "model.dex_test.guarded" in str(caught.value)
+    assert calls == ["compile"]
+
+
+def _guard_compile_runner(monkeypatch, project, code, *, mode="ok"):
+    """Exercise the real guard with dbt artifacts produced by a controlled runner."""
+    import subprocess
+
+    module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls = []
+
+    def factory(*args, **kwargs):
+        def run(argv):
+            command = argv[1]
+            calls.append(command)
+            if command == "compile":
+                assert argv[argv.index("--select") + 1] == "guarded"
+                if mode == "failed":
+                    return subprocess.CompletedProcess(argv, 1, "", "")
+                if mode != "absent":
+                    target = project / "target"
+                    target.mkdir(exist_ok=True)
+                    uid = "model.dex_test.guarded"
+                    (target / "run_results.json").write_text(
+                        json.dumps(
+                            {"results": [{"unique_id": uid, "status": "success"}]}
+                        )
+                    )
+                    (target / "manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "nodes": {
+                                    uid: {
+                                        "name": "guarded",
+                                        "resource_type": "model",
+                                        "compiled_code": code,
+                                        "config": {},
+                                    }
+                                }
+                            }
+                        )
+                    )
+            else:
+                assert command == "build"
+                assert not (project / "target/run_results.json").exists()
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return run
+
+    monkeypatch.setattr(module, "_default_runner", factory)
+    return calls
+
+
+@pytest.mark.parametrize("approved", [[], ["APPROVED_UDF"]])
+def test_public_local_build_allows_approved_functions_and_preserves_default(
+    dbt_project_dir, monkeypatch, approved
+):
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.transform import dev_target
+
+    calls = _guard_compile_runner(
+        monkeypatch, dbt_project_dir, "select approved_udf(abs(-1))"
+    )
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    with DexEngine.from_repo(dbt_project_dir.parent, connector="duckdb") as engine:
+        engine.config.guards.approved_functions = approved
+        result = engine.build(select="guarded")
+    assert result.success
+    assert calls == (["compile", "build"] if approved else ["build"])
+
+
+@pytest.mark.parametrize(
+    "mode,code",
+    [
+        ("failed", "select 1"),
+        ("absent", "select 1"),
+        ("ok", None),
+    ],
+)
+def test_enabled_function_guard_refuses_unavailable_compile_evidence(
+    dbt_project_dir, monkeypatch, mode, code
+):
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.transform import dev_target
+
+    module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls = _guard_compile_runner(monkeypatch, dbt_project_dir, code, mode=mode)
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+    with DexEngine.from_repo(dbt_project_dir.parent, connector="duckdb") as engine:
+        engine.config.guards.approved_functions = ["approved_udf"]
+        with pytest.raises(module.DbtRunError):
+            engine.build(select="guarded")
+    assert calls == ["compile"]
 
 
 def _compile_runner(

@@ -22,6 +22,7 @@ import argparse
 import contextlib
 import json
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -35,18 +36,28 @@ from ..errors import DexError
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
+
+# `DependencyPolicy` alone, at module scope, because it is a default in
+# `build`'s signature and therefore evaluated at import. It carries no
+# dependency of its own; the rest of the build module stays deferred for
+# the reason stated above.
+from .build import DependencyPolicy
 from .native_semantic import edits_from_payload, plan_hint, read_payload_file
 from .plans import EditKind, PlanEdit, PlanError
 from .results import (
     ApplyResult,
     BuildResult,
+    ClassificationResult,
     DepsResult,
+    GroundingResult,
     InitResult,
     MacroListResult,
     MacroResult,
     PlacementResult,
+    PlanExportResult,
     PlanListResult,
     PlanResult,
+    PreflightResult,
     PropagationResult,
     TestScaffoldResult,
 )
@@ -800,6 +811,282 @@ def cmd_apply(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return env.error_for(exc)
 
 
+def _resolve_plan_id(
+    engine: DexEngine, plan_id: str | None, what: str
+) -> tuple[Store, str]:
+    """The store and the plan id, resolving "the latest unapplied plan" once.
+
+    Shared by every verb that takes an optional plan id, so "no id" means the
+    same thing on `export`, `ground`, and `classify` as it already does on
+    `apply`, rather than each verb inventing its own default.
+    """
+
+    store = engine.require_full_store(what)
+    if plan_id:
+        return store, plan_id
+    latest = store.latest_plan(None)
+    if latest is None:
+        raise ValueError(
+            "no unapplied plan found; run `transform plan` or `semantic "
+            "define|update|plan` first, or pass a plan id"
+        )
+    return store, latest.plan_id
+
+
+def export_plan(engine: DexEngine, plan_id: str | None = None) -> PlanExportResult:
+    """A stored plan as a portable document, for a process that has no store.
+
+    Reads the plan store and the project's current files, opens no connection,
+    and spends nothing on any connector. The project read is only so a delete can
+    be classified from the file it removes; a plan of pure upserts needs it for
+    nothing and still gets it, because a project that cannot be read is a fact
+    worth failing on here rather than at apply time in another process.
+    """
+
+    from .portable import plan_document
+
+    store, plan_id = _resolve_plan_id(engine, plan_id, "exporting a plan")
+    repo_root = Path(engine.require_repo_root("exporting a plan"))
+    stored = store.load_plan(plan_id)
+    project = repo_root / stored.project_dir
+
+    def read_existing(rel_path: str) -> str | None:
+        candidate = project / rel_path
+        if not candidate.is_file():
+            return None
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            return candidate.read_text(encoding="utf-8")
+        return None
+
+    document = plan_document(stored, read_existing=read_existing)
+    return PlanExportResult(
+        plan_id=document.plan_id,
+        digest=document.digest,
+        plan=document.model_dump(mode="json"),
+    )
+
+
+def cmd_export(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        return to_envelope(export_plan(engine, getattr(args, "argument", None)))
+    except (ValueError, PlanError) as exc:
+        return env.error_for(exc)
+
+
+def apply_document(
+    engine: DexEngine,
+    document: Any,
+    *,
+    expect_digest: str | None = None,
+) -> ApplyResult:
+    """Apply a plan document in this checkout, with no plan store involved.
+
+    The offline half of the lifecycle. It needs a repo root and nothing else: no
+    connector, no cache, no snapshot, no dbt, no network. A conflict comes back
+    the way it does from `apply`, because a human edit in the applying checkout is
+    authoritative there exactly as it is in the authoring one.
+    """
+
+    from .portable import apply_document as apply_portable
+
+    repo_root = engine.require_repo_root("applying a plan document")
+    semantic_layer = None
+    candidate = None
+    with contextlib.suppress(Exception):
+        candidate = engine.semantic_catalog_source()
+    if isinstance(candidate, SemanticEditTarget):
+        semantic_layer = candidate
+
+    plan, outcome = apply_portable(
+        document,
+        repo_root,
+        expect_digest=expect_digest,
+        confirmed=engine.confirmed,
+        semantic_layer=semantic_layer,
+    )
+    conflicts = [c.model_dump(mode="json") for c in outcome.conflicts]
+    if outcome.conflicts and not outcome.written:
+        from ..results import ConfirmationRequest
+
+        return ApplyResult(
+            plan_id=plan.plan_id,
+            conflicts=conflicts,
+            diffs=outcome.diffs,
+            pending_confirmation=ConfirmationRequest(
+                data={
+                    "hint": (
+                        "these files differ from what the plan was authored "
+                        "against (human edits are authoritative); re-plan against "
+                        "this checkout, or re-run with --confirm to overwrite "
+                        "deliberately"
+                    )
+                }
+            ),
+        )
+    return ApplyResult(
+        plan_id=plan.plan_id,
+        written=outcome.written,
+        conflicts_overridden=[c.path for c in outcome.conflicts],
+        diffs=outcome.diffs,
+    )
+
+
+def cmd_apply_document(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """``transform apply --plan-file``: the offline half of the lifecycle."""
+
+    try:
+        path = getattr(args, "plan_file", None)
+        raw = sys.stdin.read() if path == "-" else read_payload_file(path)
+        return to_envelope(
+            apply_document(
+                engine, raw, expect_digest=getattr(args, "expect_digest", None)
+            )
+        )
+    except (ValueError, PlanError) as exc:
+        return env.error_for(exc)
+
+
+def preflight(engine: DexEngine, target: str | None = None) -> PreflightResult:
+    """What the warehouse itself will enforce on this project's next build.
+
+    Free and connectionless on every connector: it reads the project's rendered
+    profile and the connector's own declarations, and opens nothing. That is why
+    it is worth having separately from `connect test`, which proves a credential
+    works and says nothing about what binds a dbt subprocess.
+    """
+
+    from ..adapters import adapter_declarations
+    from ..connect import paradigm_for
+    from ..guards.execution import guarded_execution_preflight
+
+    config = engine.config
+    connector = engine.connector or config.connector
+    effective = config.model_copy(update={"connector": connector})
+
+    # Declarations rather than an open adapter: this command must cost nothing
+    # and open nothing, and everything it reads is a declaration rather than a
+    # live fact. Building a real adapter would need a credential to report what
+    # a rendered profile already says.
+    declared = adapter_declarations(connector, paradigm_for(connector, effective))
+
+    project = None
+    with contextlib.suppress(Exception):
+        project = engine.project_dir()
+
+    report = guarded_execution_preflight(
+        declared,
+        project_dir=project,
+        target=target or config.dbt_target or "dev",
+        config=effective,
+    )
+    return PreflightResult(
+        preflight=report.data(), notes=list(report.notes), warnings=[]
+    )
+
+
+def cmd_preflight(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        return to_envelope(preflight(engine, getattr(args, "target", None)))
+    except (ValueError, PlanError, DexError) as exc:
+        return env.error_for(exc)
+
+
+def ground(engine: DexEngine, plan_id: str | None = None) -> GroundingResult:
+    """What a stored plan depends on, and whether resolution finished.
+
+    Repo-only and free on every connector: it reads the project's files and the
+    compiled artifacts, opens no connection, and needs no extra beyond whatever
+    the project format already needs. The semantic half degrades to a named limit
+    rather than an error when the project has no compiled semantic manifest,
+    because a plan that touches no metric is fully grounded without one and
+    refusing would make the common case pay for the rare one.
+    """
+
+    from .grounding import ground_plan
+    from .portable import plan_document
+
+    store, plan_id = _resolve_plan_id(engine, plan_id, "grounding a plan")
+    repo_root = Path(engine.require_repo_root("grounding a plan"))
+    stored = store.load_plan(plan_id)
+    project = repo_root / stored.project_dir
+
+    from ..dbt_project import load
+
+    view = load(project)
+    catalog = None
+    catalog_error = None
+    try:
+        catalog = engine.semantic_catalog_format().semantic_catalog()
+    except Exception as exc:
+        catalog_error = (
+            "the semantic catalog could not be read, so semantic references in "
+            f"this plan were not resolved to the models behind them: {exc}"
+        )
+
+    grounding = ground_plan(
+        view,
+        list(stored.edits),
+        project=project,
+        config=engine.config,
+        catalog=catalog,
+        catalog_error=catalog_error,
+        plan_digest=plan_document(stored).digest,
+    )
+    return GroundingResult(plan_id=plan_id, grounding=grounding.data())
+
+
+def cmd_ground(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        return to_envelope(ground(engine, getattr(args, "argument", None)))
+    except (ValueError, PlanError) as exc:
+        return env.error_for(exc)
+
+
+def classify(
+    engine: DexEngine,
+    plan_id: str | None = None,
+    *,
+    edits: list[PlanEdit] | None = None,
+) -> ClassificationResult:
+    """What each edit's content contains, read from the content.
+
+    Either a stored plan (by id, or the latest unapplied one) or a payload of
+    authored edits, so a caller can classify a change before it is ever planned.
+    Repo-only and free on every connector.
+    """
+
+    from .classify import classify_edit
+
+    if edits is not None:
+        classifications = [classify_edit(edit).data() for edit in edits]
+        return ClassificationResult(classifications=classifications)
+
+    store, plan_id = _resolve_plan_id(engine, plan_id, "classifying a plan")
+    repo_root = Path(engine.require_repo_root("classifying a plan"))
+    stored = store.load_plan(plan_id)
+    project = repo_root / stored.project_dir
+    classifications = []
+    for edit in stored.edits:
+        existing = None
+        candidate = project / edit.path
+        if edit.op is EditOp.DELETE and candidate.is_file():
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                existing = candidate.read_text(encoding="utf-8")
+        classifications.append(classify_edit(edit, existing_content=existing).data())
+    return ClassificationResult(plan_id=plan_id, classifications=classifications)
+
+
+def cmd_classify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    try:
+        payload = getattr(args, "edits_file", None)
+        edits = edits_from_payload(payload) if payload else None
+        return to_envelope(
+            classify(engine, getattr(args, "argument", None), edits=edits)
+        )
+    except (ValueError, PlanError) as exc:
+        return env.error_for(exc)
+
+
 def plans(engine: DexEngine) -> PlanListResult:
     """Stored plans (pending and applied), newest first."""
 
@@ -824,9 +1111,32 @@ def cmd_plans(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 
 
 def build(
-    engine: DexEngine, *, target: str | None = None, select: str | None = None
+    engine: DexEngine,
+    *,
+    target: str | None = None,
+    select: str | None = None,
+    for_plan: str | None = None,
+    for_plan_document: Any = None,
+    dependencies: DependencyPolicy = DependencyPolicy.INSTALL,
 ) -> BuildResult:
     """Run ``dbt build`` against the dev target, cost-surfaced first.
+
+    ``for_plan`` and ``for_plan_document`` name the change this build is meant to
+    validate, which is what turns dbt's exit code into a verdict: the plan's
+    edits say which nodes the change required, and the evidence reports which of
+    them actually ran. Without either there is no coverage to report and the
+    field is absent rather than empty.
+
+    Two parameters rather than one that takes either, because a plan id and a
+    serialized document are both strings and telling them apart by inspection is
+    a guess dex should not be making about which one a caller meant. They are
+    also what the two ends of the lifecycle actually hold: the process that
+    authored the change has a store, and the sandbox that validates it has the
+    document and nothing else.
+
+    ``dependencies`` is the sandbox switch. The default installs missing packages
+    post-gate as it always has; ``REFUSE`` names them and stops, which is the
+    right outcome where there is no network to install from.
 
     The order mirrors the documented gate: the dev-target check runs first (free,
     and it must refuse a broken or undeployable target before anyone weighs a
@@ -846,6 +1156,7 @@ def build(
     from ..envelope import Paradigm
     from ..guards.cost_guard import (
         ConfirmationRequiredError,
+        estimate_quality_of,
         no_session_ceiling_warning,
         skipped_handshake_warning,
         unserialized_ledger_warning,
@@ -855,12 +1166,16 @@ def build(
     # re-exports the build *function* under the same name as the module, and the
     # submodule-path form resolves the module unambiguously.
     from . import dev_target
-    from .build import build as run_build
+    from .build import assert_dev_target, assert_packages_installed
+    from .build import (
+        build as run_build,
+    )
 
     store = engine.store
     config = engine.config
     repo_root = engine.require_repo_root("building the dbt project")
     target = target or config.dbt_target or "dev"
+    assert_dev_target(target, config.dbt_target)
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
     connector = engine.connector or config.connector
 
@@ -892,6 +1207,8 @@ def build(
             paradigm=paradigm,
             connector=connector,
             dev_target_check=dev_check,
+            dependencies=dependencies,
+            approved_functions=frozenset(config.guards.approved_functions),
         )
         return _shape_build_result(
             summary,
@@ -900,9 +1217,21 @@ def build(
             connector,
             store,
             extra_notes=skipped_handshake_warning(paradigm, engine.confirmed),
+            evidence=_build_evidence(
+                engine, project, target, select, for_plan, for_plan_document
+            ),
         )
 
     dev_warnings = dev_check()
+    # Ahead of pricing, for the reason the dev-target check runs ahead of it: a
+    # build that may not install its dependencies and does not have them cannot
+    # succeed, so the caller should learn that rather than be handed an estimate
+    # to weigh for a run that will not happen. It also keeps the refusal free,
+    # which is the whole point in a sandbox: pricing opens a connection and
+    # dry-runs every node.
+    if dependencies is DependencyPolicy.REFUSE:
+        assert_packages_installed(project)
+
     estimate, per_node, price_notes, adapter = _price_build(
         engine, project, target, select
     )
@@ -925,9 +1254,12 @@ def build(
             paradigm=paradigm,
             connector=connector,
             estimate=estimate,
+            estimate_quality=estimate_quality_of(adapter, estimate, paradigm=paradigm),
             # The dev-target check already ran above; passing None keeps the
             # engine from opening its own connection a second time.
             dev_target_check=None,
+            dependencies=dependencies,
+            approved_functions=frozenset(config.guards.approved_functions),
         )
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
@@ -963,7 +1295,19 @@ def build(
         session_ceiling_declined=config.budget.session_ceiling_declined,
         gate=command_args.cost_gate(adapter) if adapter is not None else None,
         adapter=adapter,
+        evidence=_build_evidence(
+            engine, project, target, select, for_plan, for_plan_document
+        ),
     )
+
+
+def _for_plan_document(args: argparse.Namespace) -> Any:
+    """The plan document `--for-plan-file` names, or None."""
+
+    path = getattr(args, "for_plan_file", None)
+    if not path:
+        return None
+    return sys.stdin.read() if path == "-" else read_payload_file(path)
 
 
 def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -973,6 +1317,13 @@ def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 engine,
                 target=getattr(args, "target", None),
                 select=getattr(args, "select", None),
+                for_plan=getattr(args, "for_plan", None),
+                for_plan_document=_for_plan_document(args),
+                dependencies=(
+                    DependencyPolicy.REFUSE
+                    if getattr(args, "no_install_deps", False)
+                    else DependencyPolicy.INSTALL
+                ),
             )
         )
     except BuildFailedError as exc:
@@ -1222,6 +1573,16 @@ def _record_build_spend(
     return {
         spend_field(paradigm): None if billed is None else float(billed),
         "session_spent_today": session_spent,
+        # The one command where settlement can genuinely be unknown. dbt runs the
+        # statements, and dbt-snowflake, dbt-databricks and dbt-redshift report no
+        # billing figure at all, so `billed is None` here means statements ran and
+        # nobody said what they cost. Stated as its own flag rather than left to be
+        # inferred from a null, because a caller summing spend across envelopes has
+        # to be able to tell an unknown apart from a zero without knowing which
+        # adapters report figures.
+        "settled": billed is not None,
+        "unknown_settlement": billed is None,
+        "reserved": None,
     }
 
 
@@ -1271,11 +1632,24 @@ def _price_build(engine: DexEngine, project, target: str, select: str | None):
             engine.budget if engine.budget is not None else engine.config.budget.ceiling
         )
         compile_env = _build_env(connector, adapter.paradigm, ceiling)
+        guard_options = (
+            {"approved_functions": frozenset(engine.config.guards.approved_functions)}
+            if engine.config.guards.approved_functions
+            else {}
+        )
         estimate, per_node, notes = compile_estimate(
-            project, adapter, target=target, select=select, env=compile_env
+            project,
+            adapter,
+            target=target,
+            select=select,
+            env=compile_env,
+            **guard_options,
         )
         return estimate, per_node, notes, adapter
     except Exception as exc:
+        if engine.config.guards.approved_functions:
+            # An enabled execution check cannot degrade to an unchecked build.
+            raise
         if cloud_capacity_required and not cloud_capacity_proved:
             raise
         note = (
@@ -1300,6 +1674,60 @@ def _build_confirmation(target: str, cost, notes=()):
     )
 
 
+def _build_evidence(
+    engine: DexEngine,
+    project,
+    target: str,
+    select: str | None,
+    for_plan: str | None,
+    for_plan_document: Any = None,
+) -> dict | None:
+    """Read dbt's artifacts and say what the build established, or nothing.
+
+    ``None`` rather than a partial block wherever the evidence cannot be built,
+    because an evidence payload that could not read the run is worse than no
+    evidence: it reports an outcome nobody measured. The build's own result is
+    unaffected either way.
+    """
+
+    from .evidence import build_evidence
+
+    edits = None
+    plan_digest = None
+    if for_plan:
+        from .portable import plan_document
+
+        store = engine.require_full_store("checking what a build validated")
+        stored = store.load_plan(for_plan)
+        edits = list(stored.edits)
+        plan_digest = plan_document(stored).digest
+    elif for_plan_document is not None:
+        from .portable import verify_plan_document
+
+        document = verify_plan_document(for_plan_document)
+        edits = [edit.as_edit() for edit in document.edits]
+        plan_digest = document.digest
+
+    source_digest = None
+    with contextlib.suppress(Exception):
+        from ..dbt_project import load
+        from .grounding import source_digest as digest_of
+
+        source_digest = digest_of(load(project))
+
+    try:
+        return build_evidence(
+            project,
+            target=target,
+            select=select,
+            edits=edits,
+            plan_digest=plan_digest,
+            source_digest=source_digest,
+        ).data()
+    except Exception:
+        return None
+
+
 def _shape_build_result(
     summary: dict,
     cost,
@@ -1311,6 +1739,7 @@ def _shape_build_result(
     session_ceiling_declined: bool = False,
     gate=None,
     adapter=None,
+    evidence: dict | None = None,
 ) -> BuildResult:
     """Shape a finished dbt run per paradigm, and ledger what it actually cost.
 
@@ -1426,6 +1855,7 @@ def _shape_build_result(
         return BuildResult(
             success=True,
             summary=summary,
+            evidence=evidence,
             cost=cost,
             spend=spend,
             warnings=[*notes, *messages],
@@ -1443,6 +1873,10 @@ def _shape_build_result(
         result=BuildResult(
             success=False,
             summary=summary,
+            # A failed build is exactly where the evidence is worth most: which
+            # node failed, which were skipped behind it, and whether any of the
+            # nodes the change required ran at all.
+            evidence=evidence,
             cost=cost,
             spend=spend,
             warnings=[*notes, *(messages[1:] if messages else [])],

@@ -216,6 +216,79 @@ class ApplyResult(Result):
         }
 
 
+class PlanExportResult(Result):
+    """One stored plan as a portable document, checkable by whoever receives it.
+
+    ``digest`` is lifted out of ``plan`` and reported beside it because it is the
+    one field a caller has to carry somewhere else. The document travels through
+    whatever channel is convenient; the digest has to travel through one the
+    caller trusts, and separating them in the payload is a small nudge toward
+    doing that rather than shipping the pair together and calling it verified.
+    """
+
+    plan_id: str = ""
+    digest: str = ""
+    plan: dict[str, Any] = Field(default_factory=dict)
+
+    def data(self) -> dict[str, Any]:
+        return {"plan_id": self.plan_id, "digest": self.digest, "plan": self.plan}
+
+
+class ClassificationResult(Result):
+    """What each edit's content actually contains.
+
+    ``always_reports_notes`` because an empty ``notes`` is a positive statement
+    here: nothing was skipped, so every edit in the payload was read.
+    """
+
+    plan_id: str | None = None
+    classifications: list[dict[str, Any]] = Field(default_factory=list)
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"classifications": self.classifications}
+        if self.plan_id is not None:
+            payload = {"plan_id": self.plan_id, **payload}
+        return payload
+
+
+class GroundingResult(Result):
+    """What a plan depends on, and how finished that answer is.
+
+    ``always_reports_notes`` because an empty ``notes`` is a positive statement:
+    nothing was capped and nothing was skipped, so the graph below is the whole
+    graph dex found.
+    """
+
+    plan_id: str | None = None
+    grounding: dict[str, Any] = Field(default_factory=dict)
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        payload = dict(self.grounding)
+        if self.plan_id is not None:
+            payload = {"plan_id": self.plan_id, **payload}
+        return payload
+
+
+class PreflightResult(Result):
+    """What the warehouse will enforce on this project's next guarded build.
+
+    ``always_reports_notes`` because the notes here are the substance rather than
+    an aside: a connector with no provider-side control says so in one, and an
+    empty list is the positive statement that nothing needed saying.
+    """
+
+    preflight: dict[str, Any] = Field(default_factory=dict)
+
+    always_reports_notes: ClassVar[bool] = True
+
+    def data(self) -> dict[str, Any]:
+        return dict(self.preflight)
+
+
 class PlanListResult(Result):
     """Stored plans, pending and applied, newest first."""
 
@@ -244,10 +317,27 @@ class BuildResult(Result):
     ``summary`` is dbt's own per-node accounting, kept as the adapter shaped it
     because each connector reports different figures and flattening them would
     lose the ones that matter for that warehouse.
+
+    ``success`` stays dbt's process outcome, which is the right meaning for the
+    command line and a poor one for a host: an empty selection exits zero.
+    ``evidence`` is the typed answer to the question ``success`` cannot be asked,
+    and it sits beside the released fields rather than replacing them, so a
+    consumer reading ``success`` or ``summary`` keeps reading what it read.
+
+    ``outcome`` is lifted to the top of the payload from inside ``evidence``
+    because it is the one field a reader must not have to go looking for.
     """
 
     success: bool = False
     summary: dict[str, Any] = Field(default_factory=dict)
+    evidence: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
-        return dict(self.summary)
+        payload = dict(self.summary)
+        if self.evidence is not None:
+            payload = {
+                "outcome": self.evidence.get("outcome"),
+                **payload,
+                "evidence": self.evidence,
+            }
+        return payload
