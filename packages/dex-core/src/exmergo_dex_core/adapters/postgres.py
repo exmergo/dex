@@ -39,7 +39,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import PostgresTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -170,6 +170,8 @@ class PostgresAdapter:
     name = "postgres"
     dialect = DIALECT
     paradigm = Paradigm.DB_LOAD
+    # Database-seconds from EXPLAIN, which prices a plan rather than a run.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,

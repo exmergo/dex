@@ -29,38 +29,93 @@ _DIALECTS = {
 }
 
 
-def get_adapter(connector: str, **kwargs: Any):
-    """Construct the adapter for ``connector``."""
+def _adapter_class(connector: str):
+    """The adapter class for ``connector``, imported at the point of use.
+
+    Each import is deferred so a bare install without a connector extra fails at
+    the connector it was asked for rather than at import of this module.
+    """
 
     if connector == "duckdb":
         from .duckdb import DuckDBAdapter
 
-        return DuckDBAdapter(**kwargs)
+        return DuckDBAdapter
     if connector == "bigquery":
         from .bigquery import BigQueryAdapter
 
-        return BigQueryAdapter(**kwargs)
+        return BigQueryAdapter
     if connector == "snowflake":
         from .snowflake import SnowflakeAdapter
 
-        return SnowflakeAdapter(**kwargs)
+        return SnowflakeAdapter
     if connector == "postgres":
         from .postgres import PostgresAdapter
 
-        return PostgresAdapter(**kwargs)
+        return PostgresAdapter
     if connector == "databricks":
         from .databricks import DatabricksAdapter
 
-        return DatabricksAdapter(**kwargs)
+        return DatabricksAdapter
     if connector == "redshift":
         from .redshift import RedshiftAdapter
 
-        return RedshiftAdapter(**kwargs)
+        return RedshiftAdapter
     if connector == "clickhouse":
         from .clickhouse import ClickHouseAdapter
 
-        return ClickHouseAdapter(**kwargs)
+        return ClickHouseAdapter
     raise ValueError(f"unknown connector '{connector}'")
+
+
+class AdapterDeclarations:
+    """A connector's static facts, without opening a connection.
+
+    An adapter is normally the authority on its own name, paradigm, and estimate
+    quality, and normally you have one because you have a credential. A preflight
+    that must cost nothing and open nothing has neither, so this reads the same
+    declarations off the class. It is deliberately not an :class:`~.base.Adapter`
+    and answers no question that needs a warehouse: anything reached through it
+    is a declaration, never a measurement.
+    """
+
+    def __init__(self, name: str, paradigm: Any, estimate_quality: Any) -> None:
+        self.name = name
+        self.paradigm = paradigm
+        self.estimate_quality = estimate_quality
+
+
+def adapter_declarations(connector: str, paradigm: Any = None) -> AdapterDeclarations:
+    """What ``connector`` declares about itself, with no connection opened.
+
+    ``paradigm`` is passed in because ClickHouse's spans two and is decided by
+    the deployment in configuration rather than by the class; every other
+    connector's class attribute agrees with what a caller resolves and is used
+    when nothing is passed.
+    """
+
+    cls = _adapter_class(connector)
+    return AdapterDeclarations(
+        name=getattr(cls, "name", connector),
+        paradigm=paradigm if paradigm is not None else getattr(cls, "paradigm", None),
+        estimate_quality=getattr(cls, "estimate_quality", None),
+    )
+
+
+def get_adapter(connector: str, **kwargs: Any):
+    """Construct the adapter for ``connector``.
+
+    One exit rather than seven, because a fact every adapter declares has to
+    reach its cost gate exactly once. The gate is built before the adapter that
+    owns it (it is a constructor argument), so the gate cannot ask; stamping here
+    keeps the adapter class the single declaring authority and leaves the gate
+    with a value it can report without reaching back.
+    """
+
+    adapter = _adapter_class(connector)(**kwargs)
+    gate = getattr(adapter, "cost_gate", None)
+    if gate is not None:
+        gate.estimate_quality = getattr(adapter, "estimate_quality", None)
+    return adapter
 
 
 def get_dialect(connector: str) -> str:

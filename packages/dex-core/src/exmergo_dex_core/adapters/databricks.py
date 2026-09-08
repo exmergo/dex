@@ -33,7 +33,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import DatabricksTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -205,6 +205,9 @@ class DatabricksAdapter:
     name = "databricks"
     dialect = DIALECT
     paradigm = Paradigm.COMPUTE_TIME
+    # A floor that sharpens itself inside the confirmed budget rather than a
+    # prediction, which is approximate in the direction a caller can act on.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,

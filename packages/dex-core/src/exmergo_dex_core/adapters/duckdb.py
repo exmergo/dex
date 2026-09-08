@@ -87,6 +87,9 @@ class DuckDBAdapter:
     name = "duckdb"
     dialect = "duckdb"
     paradigm = Paradigm.FREE_LOCAL
+    # Nothing is priced because nothing is billed. Absent rather than
+    # `unknown`: no estimate was attempted, and there is none to attempt.
+    estimate_quality = None
 
     def __init__(
         self,

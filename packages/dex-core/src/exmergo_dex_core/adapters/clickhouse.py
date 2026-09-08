@@ -55,7 +55,7 @@ import re
 from typing import Any
 
 from ..config import ClickHouseTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -289,6 +289,9 @@ class ClickHouseAdapter:
     """
 
     name = "clickhouse"
+    # EXPLAIN ESTIMATE prices after primary-key pruning, which is a good
+    # model of the scan and still a model, on both deployments.
+    estimate_quality = EstimateQuality.APPROXIMATE
     dialect = DIALECT
 
     def __init__(

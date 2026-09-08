@@ -229,7 +229,16 @@ def test_gate_spend_summary_reports_actuals_not_estimates():
     gate.charge(700.0)
     gate.record_billed(100.0)
     summary = gate.spend_summary()
-    assert summary == {"bytes_billed": 100.0, "session_spent_today": 150.0}
+    assert summary == {
+        "bytes_billed": 100.0,
+        "session_spent_today": 150.0,
+        # A gate settles from figures the warehouse handed back, so what it
+        # reports is always settled; the flag is present anyway, because a key
+        # on some spend blocks and absent on others reads as a default.
+        "settled": True,
+        "unknown_settlement": False,
+        "reserved": None,
+    }
 
 
 def test_gate_cost_prefers_the_command_estimate():
@@ -531,6 +540,9 @@ def test_settlement_reports_the_days_total_not_this_commands_share():
     assert gate.spend_summary() == {
         "bytes_billed": 200.0,
         "session_spent_today": 500.0,
+        "settled": True,
+        "unknown_settlement": False,
+        "reserved": None,
     }
 
 

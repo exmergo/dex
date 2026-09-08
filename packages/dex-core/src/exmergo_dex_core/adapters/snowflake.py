@@ -31,7 +31,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import SnowflakeTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -168,6 +168,8 @@ class SnowflakeAdapter:
     name = "snowflake"
     dialect = DIALECT
     paradigm = Paradigm.COMPUTE_TIME
+    # Warehouse-seconds modelled from table statistics and the pinned size.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,

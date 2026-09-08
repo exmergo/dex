@@ -44,7 +44,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..config import RedshiftTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -254,6 +254,9 @@ class RedshiftAdapter:
     name = "redshift"
     dialect = DIALECT
     paradigm = Paradigm.COMPUTE_TIME
+    # Compute-seconds from the planner's cost, plus the Serverless wake
+    # minimum where it applies.
+    estimate_quality = EstimateQuality.APPROXIMATE
 
     def __init__(
         self,

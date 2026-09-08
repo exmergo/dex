@@ -18,7 +18,7 @@ import sys
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .errors import DexError
 
@@ -52,12 +52,53 @@ class Paradigm(str, Enum):
     HOSTED = "hosted"
 
 
+class EstimateQuality(str, Enum):
+    """How much an estimate is worth, which is not the same as how large it is.
+
+    A host deciding whether to admit a build needs this separately from the
+    number: BigQuery's figure comes from a free dry run and is what the job will
+    bill, while Snowflake's is a heuristic over table statistics and Databricks's
+    is a floor that sharpens as the run proceeds. Treating those alike is how a
+    budget sized against one connector's exactness gets applied to another's
+    guess.
+
+    ``UNKNOWN`` is a produced verdict, not an absence: it means dex tried to
+    price the work and could not (no reachable connection, a compile that failed),
+    so the ceiling and the server-side per-statement cap are the only things
+    still binding. Where no estimate was attempted at all the field is ``None``.
+    """
+
+    EXACT = "exact"
+    APPROXIMATE = "approximate"
+    UNKNOWN = "unknown"
+
+
+#: The unit each paradigm's magnitudes are counted in. Here rather than in the
+#: cost guard because it belongs to the paradigm, and the envelope is what
+#: reports it; the guard's own ledger and spend keys are different spellings of
+#: the same fact and stay where they are.
+PARADIGM_UNITS: dict[Paradigm, str | None] = {
+    Paradigm.FREE_LOCAL: None,
+    Paradigm.BYTES_SCANNED: "bytes",
+    Paradigm.COMPUTE_TIME: "seconds",
+    Paradigm.DB_LOAD: "seconds",
+    Paradigm.HOSTED: None,
+}
+
+
+def paradigm_unit(paradigm: Paradigm | None) -> str | None:
+    """What this paradigm counts in, or ``None`` where it counts nothing."""
+
+    return PARADIGM_UNITS.get(paradigm) if paradigm is not None else None
+
+
 class Cost(BaseModel):
     """A preflight cost estimate, surfaced before any spend.
 
     ``estimate`` and ``ceiling`` are paradigm-relative magnitudes (bytes, credits,
-    DBUs, or a load score); the unit is carried by ``paradigm``. For DuckDB both
-    are ``None`` because the work is free and only resource-bounded.
+    DBUs, or a load score); the unit is carried by ``paradigm``, and spelled out
+    in ``unit`` for a caller that would otherwise have to keep its own table. For
+    DuckDB both are ``None`` because the work is free and only resource-bounded.
 
     ``paradigm`` names **the connector this command ran against**, so a caller
     reading a free metadata command still learns what a billed one will cost in.
@@ -65,11 +106,34 @@ class Cost(BaseModel):
     is load-bearing: a refusal built without a paradigm has to say nothing rather
     than claim ``free_local``, which is a positive assertion a host branching on
     this field would read as "this refusal was not about money".
+
+    ``estimate_quality`` defaults to ``None`` for the same reason, and the
+    distinction is the sharper one here: ``None`` means nothing was priced, while
+    :attr:`EstimateQuality.UNKNOWN` means pricing was attempted and produced no
+    number. A host that collapses the two admits an unpriced build believing it
+    was priced.
     """
+
+    # `validate_assignment` so the derivation below also runs when a field is
+    # set after construction, which the CLI does: it stamps the paradigm onto
+    # every envelope centrally, and without this the unit stayed null on exactly
+    # the refusals that had one.
+    model_config = ConfigDict(validate_assignment=True)
 
     paradigm: Paradigm | None = None
     estimate: float | None = None
     ceiling: float | None = None
+    estimate_quality: EstimateQuality | None = None
+    unit: str | None = None
+
+    @model_validator(mode="after")
+    def _unit_follows_paradigm(self) -> Cost:
+        # Derived rather than passed, so no call site can report a magnitude in
+        # one unit and label it another. `object.__setattr__` rather than a
+        # plain assignment because with `validate_assignment` on, assigning here
+        # would re-enter this validator.
+        object.__setattr__(self, "unit", paradigm_unit(self.paradigm))
+        return self
 
 
 class Connection(BaseModel):

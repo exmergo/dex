@@ -47,8 +47,9 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from ..envelope import Cost, Paradigm
+from ..envelope import Cost, EstimateQuality, Paradigm
 from ..errors import DexError
 from ..results import ConfirmationRequest
 
@@ -580,12 +581,46 @@ def calibration_clause(
     )
 
 
+#: Distinguishes "the caller passed no ceiling" from "the caller passed
+#: None", which is a real ceiling value meaning unbounded.
+_UNSET: Any = object()
+
+
+def estimate_quality_of(
+    adapter: Any, estimate: float | None, *, paradigm: Paradigm
+) -> EstimateQuality | None:
+    """How much this connector's estimate is worth, for this estimate.
+
+    Two inputs, because the answer is a property of both. The connector declares
+    what its pricing method can achieve at best (an ``estimate_quality`` class
+    attribute, exact on a dry run and approximate on every model of one). This
+    call then downgrades to :attr:`~..envelope.EstimateQuality.UNKNOWN` whenever
+    pricing was attempted and produced nothing, which is a different state from a
+    connector that prices nothing because it bills nothing.
+
+    Duck-typed on the adapter rather than required by the protocol, following
+    ``query_estimate``: a third-party adapter that has not declared one reports
+    ``unknown`` on a billed paradigm rather than being credited with exactness it
+    never claimed.
+    """
+
+    if paradigm is Paradigm.FREE_LOCAL:
+        return None
+    if estimate is None:
+        return EstimateQuality.UNKNOWN
+    declared = getattr(adapter, "estimate_quality", None)
+    if isinstance(declared, EstimateQuality):
+        return declared
+    return EstimateQuality.UNKNOWN
+
+
 def preflight(
     estimate: float | None,
     ceiling: float | None,
     *,
     paradigm: Paradigm = Paradigm.FREE_LOCAL,
     confirmed: bool = False,
+    estimate_quality: EstimateQuality | None = None,
 ) -> Cost:
     """Gate a spending command. Returns the cost to stamp into the envelope.
 
@@ -601,7 +636,12 @@ def preflight(
     not. Every other paradigm is unaffected.
     """
 
-    cost = Cost(paradigm=paradigm, estimate=estimate, ceiling=ceiling)
+    cost = Cost(
+        paradigm=paradigm,
+        estimate=estimate,
+        ceiling=ceiling,
+        estimate_quality=estimate_quality,
+    )
 
     if estimate is not None and ceiling is not None and estimate > ceiling:
         raise OverCeilingError(
@@ -704,6 +744,11 @@ class CostGate:
         self.paradigm = paradigm
         self.ceiling = ceiling
         self.session_ceiling = session_ceiling
+        # What this connector's pricing method can achieve at best. Set by the
+        # adapter after construction (the gate is built before the adapter that
+        # owns it), and read only where a cost is reported, so a gate nobody set
+        # it on reports nothing rather than claiming exactness.
+        self.estimate_quality: EstimateQuality | None = None
         # The two inputs to the one-time cumulative-ceiling ask (issue #283),
         # beside `session_ceiling` itself: whether this project already declined
         # one, and whether there is a committed config to record an answer in.
@@ -752,6 +797,28 @@ class CostGate:
             None if callable(session_spent) else self._read_session_spent()
         )
 
+    def _cost(self, estimate: float | None, ceiling: float | None = _UNSET) -> Cost:
+        """Every cost this gate reports, built one way.
+
+        Six call sites used to construct this by hand, and the seventh field
+        added to :class:`~..envelope.Cost` was missed by all but one of them, so
+        a priced refusal came back claiming nothing had been priced. Routing them
+        through here is what makes the estimate and its quality inseparable.
+
+        ``ceiling`` defaults to the effective one (the tighter of the command's
+        and what is left of the day's), which is what a caller sizing a re-run
+        needs; a site with a narrower ceiling in hand passes it.
+        """
+
+        return Cost(
+            paradigm=self.paradigm,
+            estimate=estimate,
+            ceiling=self.effective_ceiling() if ceiling is _UNSET else ceiling,
+            estimate_quality=estimate_quality_of(
+                self, estimate, paradigm=self.paradigm
+            ),
+        )
+
     @property
     def serialized(self) -> bool:
         """Whether the spend admission is safe from being raced.
@@ -792,11 +859,7 @@ class CostGate:
                 f"could not take the spend lock ({exc}); another billed command "
                 "is being admitted. Nothing ran, so re-issuing the same command "
                 "is safe",
-                cost=Cost(
-                    paradigm=self.paradigm,
-                    estimate=self._command_estimate,
-                    ceiling=self.ceiling,
-                ),
+                cost=self._cost(self._command_estimate, self.ceiling),
             ) from exc
 
     def _refresh(self, *, strict: bool = True) -> None:
@@ -815,11 +878,7 @@ class CostGate:
                     "is what the cumulative ceiling is measured against, so "
                     "nothing was admitted. Nothing ran, so re-issuing the same "
                     "command is safe",
-                    cost=Cost(
-                        paradigm=self.paradigm,
-                        estimate=self._command_estimate,
-                        ceiling=self.ceiling,
-                    ),
+                    cost=self._cost(self._command_estimate, self.ceiling),
                 ) from exc
             self.session_spent = None
             return
@@ -925,7 +984,7 @@ class CostGate:
         try:
             with self._admission():
                 ceiling = self.effective_ceiling()
-                cost = Cost(paradigm=self.paradigm, estimate=estimate, ceiling=ceiling)
+                cost = self._cost(estimate, ceiling)
                 if ceiling is not None and estimate > ceiling:
                     raise OverCeilingError(
                         f"estimated cost {estimate} exceeds the ceiling {ceiling} "
@@ -1016,13 +1075,7 @@ class CostGate:
         if not self.session_ceiling_pending(estimate):
             return
         raise SessionCeilingDecisionRequiredError(
-            cost
-            if cost is not None
-            else Cost(
-                paradigm=self.paradigm,
-                estimate=estimate,
-                ceiling=self.effective_ceiling(),
-            ),
+            cost if cost is not None else self._cost(estimate),
             suggested=suggested_session_ceiling(estimate),
         )
 
@@ -1065,7 +1118,7 @@ class CostGate:
         with self._admission():
             ceiling = self.effective_ceiling()
             needed = self._estimated + estimate
-            cost = Cost(paradigm=self.paradigm, estimate=needed, ceiling=ceiling)
+            cost = self._cost(needed, ceiling)
             if (
                 self.paradigm is not Paradigm.FREE_LOCAL
                 and ceiling is not None
@@ -1159,11 +1212,7 @@ class CostGate:
         if remaining is not None and remaining < floor:
             raise OverCeilingError(
                 _cap_shortfall(remaining, floor, unit),
-                cost=Cost(
-                    paradigm=self.paradigm,
-                    estimate=self._estimated,
-                    ceiling=self.effective_ceiling(),
-                ),
+                cost=self._cost(self._estimated),
             )
         return remaining
 
@@ -1308,11 +1357,7 @@ class CostGate:
             if self._command_estimate is not None
             else self._estimated
         )
-        return Cost(
-            paradigm=self.paradigm,
-            estimate=estimate,
-            ceiling=self.effective_ceiling(),
-        )
+        return self._cost(estimate)
 
     def spend_summary(self) -> dict:
         """Actual spend for the envelope's ``data`` (the ``cost`` field stays a
@@ -1340,4 +1385,13 @@ class CostGate:
                 if self.session_spent is not None
                 else None
             ),
+            # A gate settles from figures the warehouse handed back statement by
+            # statement, so what it reports is always settled. The flag is
+            # reported anyway, and always, because a key present on some spend
+            # blocks and absent on others reads as a default rather than as a key
+            # to look for elsewhere. `transform build` is where it varies: dbt
+            # runs the statements there, and some adapters report no figure.
+            "settled": True,
+            "unknown_settlement": False,
+            "reserved": self._reserved or None,
         }

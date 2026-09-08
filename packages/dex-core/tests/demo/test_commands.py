@@ -75,7 +75,15 @@ def test_demo_names_no_paradigm_because_it_resolved_no_connector(capsys):
     opens no connection at all, so it claims nothing."""
 
     payload = _run(["demo"], capsys)
-    assert payload["cost"] == {"paradigm": None, "estimate": None, "ceiling": None}
+    assert payload["cost"] == {
+        "paradigm": None,
+        "estimate": None,
+        "ceiling": None,
+        # Both absent for the same reason `paradigm` is: nothing was priced,
+        # which is a different state from priced-and-unknowable.
+        "estimate_quality": None,
+        "unit": None,
+    }
 
 
 def test_demo_takes_a_target_path(tmp_path: Path, capsys):

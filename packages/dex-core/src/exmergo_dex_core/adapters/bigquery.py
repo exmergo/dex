@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..config import BigQueryTarget
-from ..envelope import Paradigm
+from ..envelope import EstimateQuality, Paradigm
 from ..errors import ConnectorError, PrerequisiteError
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
@@ -169,6 +169,9 @@ class BigQueryAdapter:
     name = "bigquery"
     dialect = DIALECT
     paradigm = Paradigm.BYTES_SCANNED
+    # A dry run is what the job will bill, not a model of it, so this is the
+    # one connector whose estimate is exact.
+    estimate_quality = EstimateQuality.EXACT
 
     def __init__(
         self,

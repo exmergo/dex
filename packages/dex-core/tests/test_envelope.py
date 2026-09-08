@@ -40,6 +40,11 @@ def test_an_unstamped_cost_claims_no_paradigm():
         "paradigm": None,
         "estimate": None,
         "ceiling": None,
+        # The same argument one level down: a refusal built without a paradigm
+        # claims no estimate quality and no unit either, rather than claiming
+        # `unknown`, which would read as "this was priced and could not be".
+        "estimate_quality": None,
+        "unit": None,
     }
 
 
