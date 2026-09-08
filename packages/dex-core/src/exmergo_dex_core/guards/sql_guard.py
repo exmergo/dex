@@ -19,6 +19,8 @@ which is what lets a caller with no dialect engine reach them.
 
 from __future__ import annotations
 
+from enum import Enum
+
 import sqlglot
 from sqlglot import expressions as exp
 from sqlglot.tokens import TokenType
@@ -26,8 +28,38 @@ from sqlglot.tokens import TokenType
 from ..errors import DexError, RequestError
 
 
+class RefusalReason(str, Enum):
+    """Why a statement was refused, named rather than left as a node type.
+
+    ``Command`` is sqlglot's catch-all for statements it models no node for, so
+    ``CALL proc()``, ``EXEC``, and ``EXECUTE IMMEDIATE`` all arrive as the same
+    class and a message quoting that class tells a host nothing it can act on.
+    These are the names, read from the statement's leading keyword.
+
+    A code rather than prose because a host branches on it. The message still
+    carries the detail; this carries the decision.
+    """
+
+    MULTI_STATEMENT = "multi_statement"
+    WRITE = "write"
+    DDL = "ddl"
+    STORED_PROCEDURE_OR_CALL = "stored_procedure_or_call"
+    DYNAMIC_SQL = "dynamic_sql"
+    UNAPPROVED_FUNCTION = "unapproved_function"
+    NOT_A_QUERY = "not_a_query"
+
+
 class NotSelectOnlyError(DexError):
-    """Raised when SQL is not a single read-only SELECT statement."""
+    """Raised when SQL is not a single read-only SELECT statement.
+
+    ``reason`` is populated on every refusal this module raises. It defaults to
+    ``None`` for a caller constructing one by hand, which is a state a host reads
+    as "unclassified" rather than as any particular refusal.
+    """
+
+    def __init__(self, message: str, *, reason: RefusalReason | None = None):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _read_only_roots() -> tuple[type, ...]:
@@ -82,21 +114,69 @@ def assert_select_only(sql: str, *, dialect: str = "duckdb") -> str:
     statements = [s for s in sqlglot.parse(sql, dialect=dialect) if s is not None]
     if len(statements) != 1:
         raise NotSelectOnlyError(
-            f"expected exactly one statement, parsed {len(statements)}"
+            f"expected exactly one statement, parsed {len(statements)}",
+            reason=RefusalReason.MULTI_STATEMENT,
         )
 
     root = statements[0]
     if not isinstance(root, _ALLOWED_ROOTS):
         raise NotSelectOnlyError(
-            f"only read-only SELECT statements are allowed, got {type(root).__name__}"
+            f"only read-only SELECT statements are allowed, got {type(root).__name__}",
+            reason=classify_refusal(root),
         )
     if _FORBIDDEN:
         forbidden = next(root.find_all(*_FORBIDDEN), None)
         if forbidden is not None:
             raise NotSelectOnlyError(
-                f"write/DDL statement is not allowed: {type(forbidden).__name__}"
+                f"write/DDL statement is not allowed: {type(forbidden).__name__}",
+                reason=classify_refusal(forbidden),
             )
     return sql
+
+
+#: The leading keyword of a `Command` node, mapped to what it actually is. A
+#: procedural call and a dynamic statement are different problems for a host:
+#: the first names something the warehouse may or may not allow, the second is
+#: SQL that does not exist yet and therefore cannot be reviewed at all.
+_COMMAND_REASONS: dict[str, RefusalReason] = {
+    "CALL": RefusalReason.STORED_PROCEDURE_OR_CALL,
+    "EXEC": RefusalReason.STORED_PROCEDURE_OR_CALL,
+    "EXECUTE": RefusalReason.DYNAMIC_SQL,
+    "PREPARE": RefusalReason.DYNAMIC_SQL,
+    "DECLARE": RefusalReason.DYNAMIC_SQL,
+    "BEGIN": RefusalReason.DYNAMIC_SQL,
+}
+
+_DDL_NODES = tuple(
+    c
+    for c in (
+        getattr(exp, "Drop", None),
+        getattr(exp, "Create", None),
+        getattr(exp, "Alter", None),
+        getattr(exp, "AlterTable", None),
+        getattr(exp, "TruncateTable", None),
+    )
+    if isinstance(c, type)
+)
+
+
+def classify_refusal(node: exp.Expression) -> RefusalReason:
+    """Name what this node is, for a refusal a host can branch on.
+
+    Read from the node class where sqlglot models one, and from the leading
+    keyword where it does not, which is the whole reason this exists: every
+    procedural and dynamic form on every dialect collapses into ``Command``, and
+    the difference between them is exactly what a guarded build has to report.
+    """
+
+    if isinstance(node, _DDL_NODES):
+        return RefusalReason.DDL
+    if isinstance(node, exp.Command):
+        keyword = str(node.this or "").strip().split()[0].upper() if node.this else ""
+        return _COMMAND_REASONS.get(keyword, RefusalReason.NOT_A_QUERY)
+    if _FORBIDDEN and isinstance(node, _FORBIDDEN):
+        return RefusalReason.WRITE
+    return RefusalReason.NOT_A_QUERY
 
 
 def referenced_relations(sql: str, *, dialect: str = "duckdb") -> list[str]:

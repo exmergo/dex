@@ -790,6 +790,25 @@ class ProjectConfig(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class GuardConfig(BaseModel):
+    """Opt-in tightening of what a guarded build may execute.
+
+    Empty by default, and the emptiness is the design. ``approved_functions``
+    turns on an allowlist over the functions a compiled model calls, which is
+    right for a sandbox running somebody else's repository and wrong for an
+    interactive user whose warehouse is full of local UDFs the engine has never
+    heard of. Off, nothing changes; on, a call to anything unlisted is refused by
+    name. ``explore query`` never consults this: its firewall governs what a
+    caller may read, and narrowing what SQL may *call* is a different question
+    asked by a different caller.
+    """
+
+    #: Function names a guarded build may call beyond the dialect's own builtins.
+    #: Compared case-insensitively. An empty list leaves the check off entirely
+    #: rather than allowing nothing, because a list nobody wrote is not a policy.
+    approved_functions: list[str] = Field(default_factory=list)
+
+
 class DexConfig(BaseModel):
     """The shape of ``.dex/config.yml``: one optional target per connector plus
     the connector selection, budgets, and engine limits."""
@@ -857,6 +876,9 @@ class DexConfig(BaseModel):
     # unanimously, so a repo with no convention never hears from them.
     conventions: ConventionWarnings = Field(default_factory=ConventionWarnings)
     query: QueryLimits = Field(default_factory=QueryLimits)
+    # Opt-in tightening for a guarded build in a sandbox. Off by default, so an
+    # interactive build behaves exactly as it did before this existed.
+    guards: GuardConfig = Field(default_factory=GuardConfig)
     cluster: ClusterLimits = Field(default_factory=ClusterLimits)
     maintain: MaintainConfig = Field(default_factory=MaintainConfig)
     # How many top-ranked objects `explore map` deep-profiles on a large
