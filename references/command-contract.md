@@ -203,8 +203,53 @@ dex transform place <column>      -> where a derived column shared by several mo
                                      being done quietly. --explain returns the reasoning and stores no
                                      plan. Repo-only and free
 dex transform build --target dev  -> cost preflight FIRST; runs only with --confirm and a budget;
-                                     auto-runs dbt deps when packages are declared but not installed
+    [--for-plan <id>]                auto-runs dbt deps when packages are declared but not installed.
+    [--for-plan-file <f>]            data.outcome says what the run established, which success cannot:
+    [--no-install-deps]              success is dbt's exit code and an empty selection exits zero, so
+                                     empty_selection, unrelated, partial, skipped, stale, failed and
+                                     not_run are all distinguishable from validated. data.evidence
+                                     carries the invocation, typed per-node statuses, the selection
+                                     asked for against what it got, the manifest and run-results
+                                     digests, the relations generated, and the principal errors.
+                                     --for-plan (a stored id) or --for-plan-file (an exported document,
+                                     which is what a sandbox holds) adds coverage: the nodes the change
+                                     required, which of them ran, and how each requirement was derived.
+                                     --no-install-deps refuses a declared-but-uninstalled package by
+                                     name, before any subprocess and before pricing, instead of
+                                     installing it
 dex transform deps                -> install/refresh dbt packages (repo-confined; no warehouse spend)
+dex transform export [plan-id]    -> one stored plan as a portable document a second process can check
+                                     and apply: every edit's operation, kind, preimage hash, content
+                                     hash, content and classification, plus a digest over the whole
+                                     plan, reported beside the document because it is the one field
+                                     that has to travel by a route the caller trusts. Repo-only, free
+dex transform apply               -> applies a plan document in this checkout, with no plan store, no
+    --plan-file <f>                  connector, no dbt, no network and no SQL parsing. Content that
+    [--expect-digest <hex>]          does not hash to what the document records is refused by path; a
+                                     digest that does not recompute is refused; --expect-digest refuses
+                                     a document that verifies on its own terms and is not the plan the
+                                     caller pinned. Containment and kind placement are re-checked
+                                     against this checkout's own surface. A file this checkout edited
+                                     first is a conflict, not an overwrite
+dex transform ground [plan-id]    -> what the plan depends on and how finished the answer is:
+                                     dependencies, the relations behind them, what could not be
+                                     resolved (with file and line), what more than one thing defines,
+                                     how fresh the compiled artifacts are, and a fingerprint of the
+                                     plan, the source tree, the config, the packages and the engine.
+                                     completeness is computed from limits, never asserted, so "depends
+                                     on nothing" and "resolution did not finish" are different answers.
+                                     Repo-only and free on every connector
+dex transform classify [plan-id]  -> what each edit's content contains, from the content and the
+    [--edits-file <f>]               operation and never from the declared kind or the filename:
+                                     declarative, executable, authority_bearing, data, or unknown, with
+                                     the signal that decided it and where it sits. Content that does
+                                     not parse is unknown and never declarative. Repo-only and free
+dex transform preflight           -> what the warehouse will enforce on the next guarded build, read
+                                     from the project's rendered profiles.yml rather than from what dex
+                                     would write there: the provider-side controls, what each binds,
+                                     where each came from, and what this connector cannot be asked for.
+                                     binding is false more often than expected, and on DuckDB it is
+                                     always false and says why. Free and connectionless
 dex transform macro [name]        -> list the shipped dbt macros, or plan scaffolding one into the
                                      project's macro directory (dbt-parse-checked; apply like any plan)
 dex transform test --scaffold <m> -> plan a unit_tests: skeleton for model <m>: a given block per
@@ -500,6 +545,36 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   applies the latest unapplied plan of any kind (semantic plans included; `emit
   dbt` remains the semantic-scoped spelling). `transform plans` lists what is
   stored, pending and applied.
+- **A plan can leave the process that made it.** `transform export` returns the
+  stored plan as a document, and `transform apply --plan-file` applies one in a
+  checkout whose plan store has never seen it. That path needs a repo root and
+  nothing else: no store, no connector, no cache, no dbt, no jinja, no SQL
+  parser, no network. The only repository-controlled content it reads is
+  `dbt_project.yml`, parsed with YAML's non-constructing loader, so it can learn
+  where files may live.
+
+  The document carries a digest, and what that digest is worth is stated rather
+  than implied. It proves the document is internally consistent: recompute every
+  content hash from the content carried, recompute the digest from those, and a
+  byte changed anywhere fails. **It is not a signature and cannot be**, because
+  anything that can rewrite the content can rewrite the digest beside it. The
+  caller closes that gap by carrying the digest across the boundary by a route it
+  trusts and passing it as `--expect-digest`, which is the one check that catches
+  a document re-signed after the fact. A digest presented as tamper-proof is
+  worse than no digest, since it invites skipping the pinning that does the work.
+
+  Containment and kind placement are re-checked against the applying checkout's
+  own declared surface rather than trusted from the document, for the same reason
+  the preimage hashes are re-checked: the document is an artifact that crossed a
+  boundary, and what it was validated against is not what it is being written
+  into. Both are hard refusals, and `--confirm` does not reach them; confirmation
+  is the handshake for a human edit somebody can look at and accept.
+
+  `transform ground` and `transform classify` are the other two halves a caller
+  needs before it decides: what the plan depends on and how complete that answer
+  is, and what its edits actually contain. Both are repo-only and free. See
+  `references/host-integration.md` for the whole seam, including the
+  conformance vectors shipped for a consumer to assert its own reader against.
 - `transform build` accepts `--target` and `--select`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
@@ -519,6 +594,53 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   warning otherwise. On failure the envelope's `errors[0]` carries the first
   real dbt message; the rest land in `warnings`, per-entry capped, deduplicated,
   with a pointer to the full log when anything was trimmed.
+- **`transform build`'s `success` is dbt's exit code, and `data.outcome` is what
+  the run established.** The two are not the same question and the gap between
+  them is not small: a build whose `--select` matched no nodes at all exits zero,
+  and so does a build of a model the change never touched. `success` keeps
+  meaning exactly what it meant, because that is the right meaning for a command
+  line and because consumers read it. `outcome` is `validated` only when every
+  node the change required ran and passed against artifacts that still describe
+  the tree; otherwise it is `empty_selection`, `unrelated`, `partial`, `skipped`,
+  `stale`, `failed`, or `not_run`, each of which a caller acts on differently.
+  `data.evidence` is where the reasoning lives: the dbt invocation, per-node
+  status and materialization and relation, what the selection asked for against
+  what it matched, the manifest and run-results digests, the relations the run
+  generated, and the principal errors.
+
+  `coverage` needs to be told which change the build is for, through `--for-plan`
+  (a stored plan id) or `--for-plan-file` (an exported plan document, which is
+  what a build sandbox holds instead of a store). It reports the nodes the change
+  required, which of them ran, and how each requirement was derived: a model edit
+  requires its own node, a `schema.yml` the nodes it documents, and a semantic
+  YAML the dbt model its semantic model sits on. Without either flag there is no
+  coverage and the key is absent rather than empty, because an empty coverage
+  block reads as "nothing required was built", which is the opposite of "nobody
+  asked what was required".
+
+  `selection.complete` is `null` for any selector using dbt's graph operators or
+  method selectors. dex does not evaluate dbt's selector language, and a second
+  implementation of it would disagree with dbt's own.
+
+  `stale` is worth reading twice. `stale_artifacts` is the obvious version, a
+  manifest older than the model sources, and it is close to unreachable from a
+  build that just ran, because a successful dbt build rewrites its own manifest.
+  `plan_drift` is the reachable one: a file the plan wrote no longer holds what
+  the plan wrote, so the run validated a tree the plan does not describe. It
+  fires on builds that otherwise look perfect.
+- **`transform build --no-install-deps` refuses a missing package instead of
+  installing it.** The default is unchanged and still runs `dbt deps` post-gate,
+  which is what an interactive user wants and what keeps a first build from
+  failing on a step the agent has no verb for. In a sandbox with no network and a
+  pinned dependency set the correct outcome is the opposite, and a dbt failure to
+  reach a registry names nothing useful. The refusal (`reason: prerequisite`)
+  names each declared-but-uninstalled package and its version, and it fires
+  immediately after the dev-target check, before any subprocess and before the
+  free `dbt compile` that prices the run, on the same argument the dev-target
+  check already makes: work that cannot succeed should not be priced first. A
+  declaration dex cannot check by name (a git URL names a repository, and dbt
+  installs under the package's own name) is reported separately rather than named
+  on a guess.
 - `semantic define` refuses names that already exist in the project (use
   `update`); `update` refuses names that do not (use `define`); `semantic plan`
   accepts a mix and classifies per name, reporting `defined`, `updated`,
@@ -917,7 +1039,9 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
   "cost": {
     "estimate": null,
     "ceiling": null,
-    "paradigm": "bytes_scanned | compute_time | db_load | hosted | free_local | null"
+    "paradigm": "bytes_scanned | compute_time | db_load | hosted | free_local | null",
+    "estimate_quality": "exact | approximate | unknown | null",
+    "unit": "bytes | seconds | null"
   },
   "warnings": [],
   "diffs": [],
@@ -932,6 +1056,14 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   on billed connectors; DuckDB is free, so the confirm handshake alone gates it).
   An estimate over the ceiling is refused outright; confirmation cannot override
   it.
+- **An estimate says how much it is worth.** `estimate_quality` is `exact` on
+  BigQuery, where a dry run is what the job will bill, and `approximate` on every
+  connector that models a run instead. `unknown` means dex tried to price the
+  work and could not, so only the ceiling and the server-side per-statement cap
+  are still binding; `null` means nothing was priced at all. Those last two are
+  different states, and a caller that collapses them admits an unpriced command
+  believing it was priced. `unit` spells out what the magnitude counts, derived
+  from the paradigm so no command can report bytes and label them seconds.
 - **A priced phase the caller did not request is an offer, not a refusal.** When
   a command's free half is a complete answer in its own right, the envelope is
   `ok` and the price of the optional half sits in `data.offer`, carrying the

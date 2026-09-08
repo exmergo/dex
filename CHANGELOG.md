@@ -11,6 +11,112 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ### Added
 
+- **Public contracts for running the lifecycle across more than one process**
+  ([#441]). dex assumed one process holding one project directory for the whole
+  lifecycle: `plan()` writes `.dex/plans/<id>.json`, `apply()` reads it back from
+  that same store, and `build()` shells out to dbt in the same working tree.
+  Every step is right for an interactive user, and none of them exposes anything
+  a second process can check. An application that plans where the model runs,
+  applies offline in a disposable checkout, and builds in a sandbox holding only
+  a dev credential had to read a private JSON file whose schema is not a
+  contract, and still had no way to tell a valid plan from an edited one.
+
+  **A plan can leave the process that made it.** `transform export` returns the
+  stored plan as a document carrying every edit's operation, kind, preimage hash,
+  content hash, content, and classification, plus a digest over the whole plan.
+  `transform apply --plan-file` applies one in a checkout whose store has never
+  seen it, needing a repo root and nothing else: no store, no connector, no dbt,
+  no jinja, no SQL parser, no network. Content that does not hash to what the
+  document records is refused by path, a digest that does not recompute is
+  refused, and containment and kind placement are re-checked against the applying
+  checkout's own surface rather than trusted from the document.
+
+  **The digest is not a signature, and the docs say so.** It proves internal
+  consistency, and anything that can rewrite the content can rewrite the digest
+  beside it. `--expect-digest` is where authenticity lives, because only the host
+  knows which channel it trusts. A document that verifies on its own terms and is
+  not the plan the caller pinned is refused on that check and on no other.
+
+  **`transform ground` says what a change depends on, and how finished the answer
+  is.** The dbt models, sources, seeds, snapshots, macros, vars, columns and
+  semantic elements it reads, the warehouse relations behind them, what could not
+  be resolved with the file and line, what more than one thing in scope defines,
+  how fresh the compiled artifacts are, and a fingerprint of the plan, the source
+  tree, the config, the packages and the engine version. `completeness` is
+  computed from the limits rather than asserted, so "this plan depends on
+  nothing" and "resolution did not finish" are different answers instead of the
+  same empty list. Repo-only and free on every connector.
+
+  **`transform classify` says what an edit contains, from the content.** Never
+  from the declared `kind` or the filename, which say where a file goes rather
+  than what is in it. A semantic or schema YAML carrying a `post-hook`, a
+  `grants` block, a macro call, or jinja dex could not read is executable however
+  it was filed. Content that does not parse is `unknown` and never `declarative`,
+  because silence must not read as safe, and a signal is reported even when it
+  did not decide the class.
+
+  **`transform build` reports what it established, not only that dbt exited
+  zero.** `success` is unchanged and still means dbt's process outcome, which is
+  the right meaning for a command line: an empty selection exits zero, and so
+  does a build of a model the change never touched. `data.outcome` tells those
+  apart from `validated`, alongside `unrelated`, `partial`, `skipped`, `stale`,
+  `failed` and `not_run`. `data.evidence` carries the invocation, typed per-node
+  statuses, the selection asked for against what it matched, the manifest and
+  run-results digests, the relations generated, and the principal errors, and
+  `--for-plan` or `--for-plan-file` adds coverage: which nodes the change
+  required, which of them ran, and how each requirement was derived.
+
+  `stale` covers the case that actually reaches a host. A successful dbt build
+  rewrites its own manifest, so "artifacts older than the sources" is close to
+  unreachable from a run that just happened; `plan_drift` is the reachable one, a
+  file the plan wrote that no longer holds what the plan wrote, so the build
+  validated a tree the plan does not describe. It fires on builds that otherwise
+  look perfect.
+
+  **`transform build --no-install-deps` refuses a missing package instead of
+  installing it**, naming each declared-but-uninstalled package and its version,
+  before any subprocess and before the free `dbt compile` that prices the run. In
+  a sandbox with no network that is the correct outcome, and a dbt failure to
+  reach a registry names nothing a caller can act on. The default is unchanged
+  and still installs.
+
+  **`transform preflight` states what the warehouse will enforce on the next
+  build**, read from the project's rendered `profiles.yml` rather than from what
+  dex would have written there. `binding` is false more often than expected:
+  `transform init` writes `maximum_bytes_billed` from the ceiling configured *at
+  init*, so a project initialized before a ceiling was committed has a dev target
+  that looks healthy and caps nothing. On DuckDB it is always false and says why.
+  A target named `dev` is not by itself evidence of anything. Free and
+  connectionless on every connector.
+
+  **`exmergo_dex_core.host` is one import for all of it**, re-exporting the
+  contract types, the verifier, and the edit vocabulary a host builds payloads
+  from and which the package root exports none of. Twenty-one conformance vectors
+  ship in the wheel beside the reader, generated from the engine itself and
+  replayed by its own suite, so a consumer can prove its own reader rather than
+  hope.
+
+- **`cost` says how much its estimate is worth, and in what** ([#441]).
+  `estimate_quality` is `exact` on BigQuery, where a dry run is what the job will
+  bill, and `approximate` on every connector that models a run instead;
+  `unknown` means pricing was attempted and produced no number, and absent means
+  nothing was priced. Those last two are different states and a caller that
+  collapses them admits an unpriced command believing it was priced. `unit` is
+  derived from the paradigm, so no command can report bytes and label them
+  seconds. `spend` gains `settled` and `unknown_settlement` on success and on
+  failure alike, because dbt runs a build's statements and some adapters report
+  no billing figure at all, and "billed nothing" and "billed an amount nobody
+  told us" must not read the same.
+
+- **`NotSelectOnlyError` carries a named reason** ([#441]). sqlglot funnels
+  `CALL`, `EXEC` and `EXECUTE IMMEDIATE` into one catch-all node, so a message
+  quoting the node class told a host nothing it could branch on. The reasons are
+  `multi_statement`, `write`, `ddl`, `stored_procedure_or_call`, `dynamic_sql`,
+  `unapproved_function` and `not_a_query`. `guards.approved_functions` in
+  `.dex/config.yml` additionally allowlists the functions a guarded build's
+  compiled models may call; it is empty by default, and `explore query` never
+  consults it.
+
 - **`maintain verify` reports row loss and fanout against a model's driving
   parent** ([#226]). A model that quietly returns fewer rows than the relation
   it is built from is the most common silent defect in a dbt project: an inner
@@ -48,6 +154,38 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   floor.
 
 ### Fixed
+
+- **The guarded build now enforces its configured function allowlist** ([#441]).
+  A non-empty `guards.approved_functions` checks freshly compiled SQL before
+  provider estimation and before `dbt build`, including on DuckDB. Unapproved
+  calls and unavailable compilation evidence refuse instead of falling back to
+  unchecked execution. An empty allowlist preserves the existing build path.
+
+- **Dependency refusal catches partially installed package sets** ([#441]).
+  `--no-install-deps` checks every declaration even when `dbt_packages/` already
+  contains a package, and names missing or unverifiable packages before pricing
+  or a dbt subprocess. The default installation policy is unchanged.
+
+- **A priced confirmation claimed nothing had been priced** ([#441]). Six call
+  sites in the cost guard built a `Cost` by hand, and five of them missed a newly
+  added field, so an `explore map` that came back with an 83.9 MB estimate
+  reported `estimate_quality: null`, which is the value reserved for "nothing was
+  priced". They now go through one `CostGate._cost` helper, which is what makes
+  an estimate and its worth inseparable. Found by running it.
+
+- **The cost unit went missing on refusals** ([#441]). The CLI stamps the
+  paradigm onto every envelope centrally, after the `Cost` is built, and a
+  pydantic after-validator does not run on assignment, so a refusal carrying
+  `paradigm: bytes_scanned` reported no unit at all. `Cost` now sets
+  `validate_assignment`, so the unit follows the paradigm however the paradigm
+  arrives.
+
+- **`transform references` reported a column nobody wrote** ([#441]). The jinja
+  scanner leaves a short identifier where an interpolated value stood, so the
+  surrounding SQL still parses, and the column reader was picking that
+  placeholder up as a column of the model. It is named once as
+  `references.JINJA_PLACEHOLDER` and excluded at the one place that reads columns
+  out of blanked SQL.
 
 - **A bytes-billed refusal that BigQuery reports as a server error retries like
   the one it reports as a bad request** ([#226]). BigQuery raises the same

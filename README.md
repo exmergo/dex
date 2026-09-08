@@ -318,6 +318,14 @@ two share a word rather than a job.
 The host owns authentication; dex still builds the cost gate from your store, so
 the session budget binds either way.
 
+An application that splits the loop across processes has its own seam,
+`exmergo_dex_core.host`: a stored plan exports as a document a second process can
+verify and apply with no plan store and no network, that plan's dependencies and
+its edits' contents come back as typed evidence, and a build reports what it
+actually established rather than only whether dbt exited zero. Conformance
+vectors ship in the wheel so a consumer can prove its own reader against the
+engine's. See [`references/host-integration.md`](references/host-integration.md).
+
 More info in the package's [`README.md`](packages/dex-core/README.md)
 
 ## Agent References
@@ -325,8 +333,8 @@ More info in the package's [`README.md`](packages/dex-core/README.md)
 - Cross-agent contract: [`AGENTS.md`](AGENTS.md).
 - References: [`references/`](references/), covering the per-connector notes, the
   command contract, the source of truth and the `.dex/` cache, the semantic layer
-  and Ossie compatibility, the project and storage seams, methodology, and
-  evaluation.
+  and Ossie compatibility, the project, storage and host-integration seams,
+  methodology, and evaluation.
 
 ## Contributing
 

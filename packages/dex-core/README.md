@@ -309,6 +309,21 @@ derived column that several models need should be defined, proposing the lowest
 common ancestor in the `ref()` graph along with the reasoning behind the choice.
 All four are repo-only and free on every connector.
 
+The whole lifecycle also runs across more than one process, for an application
+that plans where the model runs, applies offline in a disposable checkout, and
+builds in a sandbox holding only a dev credential. `transform export` turns a
+stored plan into a document a second process can check and apply, digest and all;
+`transform apply --plan-file` applies one where the plan store has never been,
+with no connector, no dbt, and no network; `transform ground` says what the change
+depends on and how complete that answer is; `transform classify` says whether an
+edit's content actually runs anything, from the content rather than from the kind
+it was filed under; and `transform preflight` says what the warehouse itself will
+enforce on the next build. On the build, `data.outcome` says what the run
+established, which `success` cannot: an empty selection exits zero, and so does a
+build of a model the change never touched. See `references/host-integration.md`,
+and the conformance vectors that ship in the wheel for a consumer to assert its
+own reader against.
+
 `maintain`: detects drift against the `.dex/` snapshot on four axes and proposes
 the fix: schema (structure), volume (freshness), grain (uniqueness and fanout),
 and semantic (definitions, dangling references, and dimension cardinality).
