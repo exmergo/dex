@@ -13,6 +13,8 @@ import pytest
 from exmergo_dex_core.maintain import verify as verify_mod
 from exmergo_dex_core.maintain.verify import (
     build_status_findings,
+    column_contract_findings,
+    column_contract_plan,
     compile_check,
     missing_relation_findings,
 )
@@ -191,6 +193,153 @@ def test_a_model_already_explained_by_a_build_status_finding_is_not_repeated():
     assert findings == []
 
 
+# --- column_contract_plan / column_contract_findings: pure (#230) --------------
+
+
+class _ColumnAdapter:
+    """Just ``table_metadata``, keyed by identifier."""
+
+    def __init__(self, columns_by_identifier: dict[str, list[tuple[str, str]]]):
+        self._columns = columns_by_identifier
+
+    def table_metadata(self, identifier: str):
+        cols = [
+            types.SimpleNamespace(name=name, data_type=data_type)
+            for name, data_type in self._columns[identifier]
+        ]
+        return types.SimpleNamespace(identifier=identifier), cols
+
+
+def _node_with_columns(name: str, columns: dict[str, str | None]) -> dict:
+    return {
+        "name": name,
+        "resource_type": "model",
+        "columns": {
+            col_name: ({"data_type": data_type} if data_type else {})
+            for col_name, data_type in columns.items()
+        },
+    }
+
+
+def test_no_manifest_is_a_note_not_a_finding(tmp_path: Path):
+    declared, undeclared, notes = column_contract_plan(tmp_path)
+    assert declared == {}
+    assert undeclared == 0
+    assert notes and "no compiled manifest found" in notes[0]
+
+
+def test_a_model_with_no_columns_key_counts_as_undeclared(tmp_path: Path):
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.a": {"name": "a", "resource_type": "model"},
+            "model.p.b": _node_with_columns("b", {"id": "INTEGER"}),
+        },
+        results=[],
+    )
+    declared, undeclared, notes = column_contract_plan(tmp_path)
+    assert notes == []
+    assert undeclared == 1
+    assert set(declared) == {"b"}
+    assert declared["b"] == {"id": "INTEGER"}
+
+
+def test_a_column_with_no_declared_type_maps_to_none(tmp_path: Path):
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.a": _node_with_columns("a", {"id": None})},
+        results=[],
+    )
+    declared, _undeclared, _notes = column_contract_plan(tmp_path)
+    assert declared["a"] == {"id": None}
+
+
+def test_a_missing_declared_column_is_reported_high_severity():
+    findings, notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
+        declared_by_model={"a": {"id": "INTEGER", "email": "VARCHAR"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+    )
+    assert notes == []
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_missing"
+    assert finding.identifier == "a"
+    assert finding.severity == "high"
+    assert "email" in finding.detail
+    assert finding.data == {"model": "a", "columns": ["email"]}
+
+
+def test_an_undeclared_column_is_reported_low_severity():
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER"), ("extra", "VARCHAR")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_undeclared"
+    assert finding.severity == "low"
+    assert "extra" in finding.detail
+
+
+def test_a_declared_type_that_disagrees_is_a_medium_severity_mismatch():
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "VARCHAR")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_type_mismatch"
+    assert finding.severity == "medium"
+    assert finding.data["mismatches"] == [
+        {"column": "id", "declared": "INTEGER", "actual": "VARCHAR"}
+    ]
+
+
+def test_a_matching_contract_reports_nothing():
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+    )
+    assert findings == []
+
+
+def test_undeclared_models_are_named_once_at_the_summary_level_not_per_model():
+    findings, notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=3,
+    )
+    assert findings == []
+    assert len(notes) == 1
+    assert "3 model(s)" in notes[0]
+
+
+def test_a_model_with_no_matching_relation_is_named_in_notes_not_a_finding():
+    findings, notes = column_contract_findings(
+        _ColumnAdapter({}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=[],
+        undeclared=0,
+    )
+    assert findings == []
+    assert notes and "a" in notes[0]
+
+
 # --- compile_check: wraps shadow_parse -------------------------------------------
 
 
@@ -350,6 +499,132 @@ def test_verify_reports_a_model_with_no_relation_end_to_end(
     assert "no_relation" not in payload["data"]["suppressed"]
 
 
+def test_verify_reports_a_missing_declared_column_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#230: schema.yml declares a column the real, built ``stg_orders``
+    relation does not have. Free on every connector: no ``--confirm`` needed,
+    both sides are metadata."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _node_with_columns(
+                "stg_orders",
+                {
+                    "order_id": "INTEGER",
+                    "customer_id": "INTEGER",
+                    "amount": "DOUBLE",
+                    "status": "VARCHAR",
+                    "ordered_at": "DATE",
+                    "region": "VARCHAR",
+                },
+            )
+            | {"relation_name": '"warehouse"."main"."stg_orders"'}
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [f for f in payload["data"]["findings"] if f["code"] == "column_missing"]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "high"
+    assert "region" in findings[0]["detail"]
+    assert "column_contract" not in payload["data"]["suppressed"]
+
+
+def test_verify_scoped_by_object_name_keeps_the_column_finding(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`maintain verify <object>` narrows the column contract to the object
+    named, both ways: the named model's finding survives, and a request for
+    an unrelated name checks nothing (no finding, no "unchecked" note about
+    a model that was never in scope to begin with)."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _node_with_columns(
+                "stg_orders",
+                {
+                    "order_id": "INTEGER",
+                    "customer_id": "INTEGER",
+                    "amount": "DOUBLE",
+                    "status": "VARCHAR",
+                    "ordered_at": "DATE",
+                    "region": "VARCHAR",
+                },
+            )
+            | {"relation_name": '"warehouse"."main"."stg_orders"'}
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify", "stg_orders")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [f for f in payload["data"]["findings"] if f["code"] == "column_missing"]
+    assert len(findings) == 1
+    assert findings[0]["identifier"] == "stg_orders"
+
+    rc, payload = maintain_repo.dex("maintain", "verify", "customers")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert payload["data"]["findings"] == []
+    assert not any("stg_orders" in w for w in payload["warnings"])
+
+
+def test_verify_reports_an_undeclared_column_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#230's other direction, at lower severity: the built relation has
+    columns schema.yml never declared."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": _node_with_columns(
+                "stg_orders", {"order_id": "INTEGER", "customer_id": "INTEGER"}
+            )
+            | {"relation_name": '"warehouse"."main"."stg_orders"'}
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    findings = [
+        f for f in payload["data"]["findings"] if f["code"] == "column_undeclared"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "low"
+    for name in ("amount", "status", "ordered_at"):
+        assert name in findings[0]["detail"]
+
+
+def test_verify_reports_no_columns_declared_once_at_summary_level(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#230's third acceptance bullet: a model with no schema.yml entry
+    reports nothing per model, and the gap is named once, not per model."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."stg_orders"',
+            }
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] in ("column_missing", "column_undeclared", "column_type_mismatch")
+    ] == []
+    assert any("declare no columns" in w for w in payload["warnings"])
+
+
 def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
     maintain_repo, monkeypatch: pytest.MonkeyPatch
 ):
@@ -386,6 +661,7 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "build_status",
         "no_relation",
         "row_population",
+        "column_contract",
     }
 
 

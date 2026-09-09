@@ -1145,6 +1145,41 @@ def strip_relation_quoting(relation: str) -> str:
     return ".".join(part for part in parts if part)
 
 
+def column_contract_divergence(
+    declared: dict[str, str | None], actual: dict[str, str | None]
+) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
+    """A declared column contract against what actually exists, in both
+    directions, plus type mismatches where both sides state one.
+
+    Shared between `transform plan`'s authored-SELECT-list comparison
+    (#214) and `maintain verify`'s built-relation comparison (#230): both
+    reduce to the same set math over a model's declared and actual columns,
+    and only differ in where each side's names and types come from.
+
+    ``declared``/``actual`` are column name (already lowercased by the
+    caller) -> its type, or ``None`` where the caller has no type for that
+    side -- a plan-time SELECT list names no types at all, so #214's caller
+    never passes one. Returns ``(missing, extra, mismatched)``: names in
+    ``declared`` and not ``actual``, names in ``actual`` and not
+    ``declared``, and ``(name, declared_type, actual_type)`` for a name both
+    sides state with a type that disagrees. A name whose type is absent on
+    either side is not a mismatch: absence is not evidence of a difference.
+    """
+
+    missing = sorted(set(declared) - set(actual))
+    extra = sorted(set(actual) - set(declared))
+    mismatched: list[tuple[str, str, str]] = []
+    for name in sorted(set(declared) & set(actual)):
+        declared_type, actual_type = declared[name], actual[name]
+        if (
+            declared_type
+            and actual_type
+            and declared_type.lower() != actual_type.lower()
+        ):
+            mismatched.append((name, declared_type, actual_type))
+    return missing, extra, mismatched
+
+
 def _parse_relation_ref(value: Any) -> str | None:
     """A ``ref('x')`` / ``source('a', 'b')`` argument as a referable name."""
 

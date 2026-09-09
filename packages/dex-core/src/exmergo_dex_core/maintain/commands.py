@@ -715,22 +715,24 @@ def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     """Is the project correct right now, with no baseline required (#224).
 
-    Two finding classes. Build-status gaps (#225) read the compiled manifest
+    Three finding classes. Build-status gaps (#225) read the compiled manifest
     and the last run's ``run_results.json`` (failed nodes, nodes skipped by a
     failed parent), plus models the project declares that have no relation in
-    the warehouse. Row population (#226) reads each model's compiled SQL for
-    the relation it is built from and compares the two row counts, reporting a
-    model that lost rows with nothing in its SQL to account for it, or one that
-    fanned out on a join.
+    the warehouse. Column contract (#230) compares a built relation's actual
+    columns against what its schema.yml declares, both directions, plus a type
+    check where a type is declared. Row population (#226) reads each model's
+    compiled SQL for the relation it is built from and compares the two row
+    counts, reporting a model that lost rows with nothing in its SQL to
+    account for it, or one that fanned out on a join.
 
     Free wherever the answer is free, which is most of it: the manifest read
-    touches no connection, the relation check and the row counts read cheap
-    object metadata, and on a connector with no cost gate the counts are made
-    exact because doing so bills nothing. Only the counts a warehouse keeps no
-    metadata for cost anything, and those are offered rather than taken: the
-    envelope returns its free findings as the complete answer they are, with
-    the scan priced beside them, exactly as `maintain check` and
-    `maintain semantic` do.
+    touches no connection, the relation check, the column contract, and the
+    row counts all read cheap object metadata, and on a connector with no cost
+    gate the row counts are made exact because doing so bills nothing. Only
+    the row counts a warehouse keeps no metadata for cost anything, and those
+    are offered rather than taken: the envelope returns its free findings as
+    the complete answer they are, with the scan priced beside them, exactly as
+    `maintain check` and `maintain semantic` do.
 
     A project that does not compile is reported first and suppresses every
     other check here, since a finding computed from a manifest a broken
@@ -748,6 +750,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             suppressed={
                 "build_status": str(exc),
                 "no_relation": str(exc),
+                "column_contract": str(exc),
                 "compile": str(exc),
             },
             warnings=[f"maintain verify needs a dbt project: {exc}"],
@@ -764,11 +767,12 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "build_status": reason,
                 "no_relation": reason,
                 "row_population": reason,
+                "column_contract": reason,
             },
             warnings=[
-                "build-status, no-relation and row-population findings "
-                "suppressed: the project does not compile, so its manifest "
-                "cannot be trusted"
+                "build-status, no-relation, row-population and column-contract "
+                "findings suppressed: the project does not compile, so its "
+                "manifest cannot be trusted"
             ],
         )
         return result
@@ -781,12 +785,23 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         suppressed["build_status"] = build_notes[0]
 
     definitions = engine.project_format().definitions()
+    wanted = (
+        {
+            name.strip().lower()
+            for raw in objects
+            for name in raw.split(",")
+            if name.strip()
+        }
+        if objects
+        else None
+    )
     cost = None
     adapter = None
     offer = None
     if not definitions.present:
         suppressed["no_relation"] = "no dbt project found"
         suppressed["row_population"] = "no dbt project found"
+        suppressed["column_contract"] = "no dbt project found"
     else:
         model_relations = {
             name: relation
@@ -798,6 +813,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         except DexError as exc:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
             suppressed["row_population"] = f"warehouse unreachable: {exc}"
+            suppressed["column_contract"] = f"warehouse unreachable: {exc}"
         else:
             cost = command_args.preflight_cost(adapter)
             live = adapter.list_objects()
@@ -807,6 +823,13 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                     model_relations, [o.identifier for o in live], already
                 )
             )
+            column_findings, column_warnings, column_reason = _column_contract(
+                project_dir, adapter, model_relations, live, scope=wanted
+            )
+            findings.extend(column_findings)
+            warnings.extend(column_warnings)
+            if column_reason is not None:
+                suppressed["column_contract"] = column_reason
             row_findings, row_warnings, row_reason, offer = _row_population(
                 engine, adapter, project_dir, live
             )
@@ -815,13 +838,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             if row_reason is not None:
                 suppressed["row_population"] = row_reason
 
-    if objects:
-        wanted = {
-            name.strip().lower()
-            for raw in objects
-            for name in raw.split(",")
-            if name.strip()
-        }
+    if wanted:
         findings = [f for f in findings if (f.identifier or "").lower() in wanted]
 
     result = VerifyResult(
@@ -837,6 +854,45 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         result.pending_offer = offer
         return result
     return result if adapter is None else command_args.stamp_spend(result, adapter)
+
+
+def _column_contract(project_dir, adapter, model_relations, live, *, scope=None):
+    """The column-contract half of `maintain verify`, end to end (#230).
+
+    No cost decision in it at all, unlike row population beside it: both
+    sides are metadata (the compiled manifest's own declared columns, and
+    ``adapter.table_metadata``'s schema lookup), so there is nothing to
+    price and nothing to offer. Returns ``(findings, notes, suppressed_
+    reason)``, the same shape :func:`_row_population` returns minus the
+    offer it has no use for.
+
+    ``scope`` is the same lowered object-name set `verify()` filters its
+    findings down to afterward. Passed through here too so a scoped call
+    considers only the requested models in the first place: the metadata
+    lookup a model outside the scope would cost, and the summary notes
+    naming models the caller never asked about, both go away rather than
+    running and then being discarded by that later filter.
+    """
+
+    declared_by_model, undeclared, plan_notes = verify_mod.column_contract_plan(
+        project_dir, scope=scope
+    )
+    if not declared_by_model and not undeclared:
+        reason = (
+            plan_notes[0]
+            if plan_notes
+            else "no model in the project declares columns in schema.yml"
+        )
+        return [], plan_notes, reason
+
+    findings, finding_notes = verify_mod.column_contract_findings(
+        adapter,
+        declared_by_model,
+        model_relations,
+        [o.identifier for o in live],
+        undeclared,
+    )
+    return findings, plan_notes + finding_notes, None
 
 
 def _row_population(engine: DexEngine, adapter, project_dir, live):

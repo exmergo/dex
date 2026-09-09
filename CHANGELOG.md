@@ -9,6 +9,37 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`maintain verify` reports a built relation whose columns diverge from its
+  declared schema.yml contract** ([#230]). For every selected model that
+  declares columns, the model's actual built columns (read free, from
+  `adapter.table_metadata`, the same schema-only lookup `missing_relation_
+  findings` already uses) are compared against the compiled manifest's own
+  declared set, in both directions, plus a type check where a type is
+  declared. A documented column the relation does not have is a real defect
+  (`column_missing`, high severity); an undocumented column is a
+  documentation gap (`column_undeclared`, low); a type that disagrees ranks
+  between the two (`column_type_mismatch`, medium). A model with no
+  `columns:` entry at all reports nothing per model, and how many such
+  models were considered is named once at the summary level rather than
+  repeated per model.
+
+  Shares its comparison logic with #214's plan-time check rather than
+  duplicating it: `dbt_project.column_contract_divergence` is the one set-math
+  primitive both `transform plan`'s authored-SELECT-list comparison and this
+  built-relation comparison call, differing only in where each side's names
+  and types come from (a static SELECT list carries no type information at
+  all, so #214's call into it never resolves a type mismatch). A project
+  that does not compile suppresses this the same way it already suppresses
+  build-status and no-relation findings, since a finding computed from an
+  untrustworthy manifest is not a finding at all. `maintain verify <object>`
+  narrows the check to the object named, the same as the command's other
+  finding classes: a model outside the request is neither read against the
+  warehouse nor named in the summary notes, and its finding now carries the
+  model name as its identifier like every other finding class here already
+  does, so a scoped request actually keeps it.
+
 ## [1.12.1] - 2026-09-09
 
 ### Fixed

@@ -1,21 +1,25 @@
 """maintain verify: a baseline-free sweep answering "is this project correct
 right now", as opposed to drift's "what changed since the baseline" (#224).
 
-Two finding classes live here. Build-status gaps (#225) read the compiled
+Three finding classes live here. Build-status gaps (#225) read the compiled
 manifest and the last run's ``run_results.json``: failed nodes, nodes skipped
 by a failed parent, models with no relation, and a project that does not
-compile. Row population (#226) reads each model's compiled SQL to find the
-relation it is built *from*, and compares the two row counts: a model holding
-materially fewer rows than its driving parent, with nothing in its SQL that
-would account for the shortfall, has lost rows silently, and one holding
-materially more has fanned out on a join.
+compile. Column contract (#230) compares a built relation's actual columns
+against what its schema.yml declares, in both directions, plus a type check
+where a type is declared. Row population (#226) reads each model's compiled
+SQL to find the relation it is built *from*, and compares the two row counts:
+a model holding materially fewer rows than its driving parent, with nothing
+in its SQL that would account for the shortfall, has lost rows silently, and
+one holding materially more has fanned out on a join.
 
-Detection is pure and reads only artifacts already on disk. The one exception is
-:func:`relation_counts`, which is where the warehouse is touched at all, and it
-is separate for that reason: it decides between the catalog's free metadata, a
-free count, and a count that has to be paid for and is therefore offered rather
-than taken. Keeping that decision in one place is what lets every other function
-here be judged on artifacts alone.
+Detection is pure and reads only artifacts already on disk, with two
+exceptions, both metadata-only and free on every connector rather than a
+scan: the column contract's own ``adapter.table_metadata`` read, and
+:func:`relation_counts`, which is where a warehouse *scan* can happen at all
+and is separate for that reason: it decides between the catalog's free
+metadata, a free count, and a count that has to be paid for and is therefore
+offered rather than taken. Keeping that decision in one place is what lets
+every other function here be judged on artifacts (or free metadata) alone.
 """
 
 from __future__ import annotations
@@ -251,6 +255,196 @@ def missing_relation_findings(
             )
         )
     return findings
+
+
+# --- column contract: a built relation against its declared schema.yml ---------
+
+
+def column_contract_plan(
+    project_dir: Path, *, scope: set[str] | None = None
+) -> tuple[dict[str, dict[str, str | None]], int, list[str]]:
+    """Every selected model's declared column contract, from the compiled
+    manifest, plus how many considered models declare none at all (#230).
+
+    Read from the manifest rather than by re-parsing schema.yml, the way
+    #214's plan-time comparison has to: dbt already reduces every declared
+    column (and its ``data_type``, when one is declared) into each model
+    node's own ``columns``, and a compiled manifest is exactly what this
+    command needs a build to have produced already for its other two finding
+    classes. ``scope`` narrows which models are even considered, so a model
+    outside it is neither checked nor counted toward the undeclared total,
+    the same rule :func:`row_population_plan` follows. Compared lowercase on
+    both sides: the caller here is `maintain verify`'s own ``objects``
+    argument, already lowered before it reaches this function, and a model
+    name is conventionally lowercase already, so this never narrows past
+    what an exact-case match would.
+
+    Returns ``(declared_by_model, undeclared_count, notes)``. A model with no
+    ``columns:`` entry contributes to the count and nothing to the mapping:
+    it has no contract to compare, which is a fact about the project rather
+    than a finding about any one model, so it is named once at the summary
+    level (#230's acceptance) rather than repeated per model. ``notes`` names
+    the one condition that stops this from running at all, the same way
+    :func:`row_population_plan` does for its own manifest read.
+    """
+
+    nodes = _manifest_nodes(project_dir)
+    if nodes is None:
+        return (
+            {},
+            0,
+            [
+                "no compiled manifest found; run `dbt compile` or `dbt build` "
+                "for column-contract findings"
+            ],
+        )
+
+    declared_by_model: dict[str, dict[str, str | None]] = {}
+    undeclared = 0
+    for node in nodes.values():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        name = node.get("name")
+        if not (isinstance(name, str) and name):
+            continue
+        if scope is not None and name.lower() not in scope:
+            continue
+        columns = node.get("columns")
+        if not isinstance(columns, dict) or not columns:
+            undeclared += 1
+            continue
+        declared_by_model[name] = {
+            str(column_name): (
+                column["data_type"]
+                if isinstance(column, dict) and isinstance(column.get("data_type"), str)
+                else None
+            )
+            for column_name, column in columns.items()
+            if isinstance(column_name, str)
+        }
+    return declared_by_model, undeclared, []
+
+
+def column_contract_findings(
+    adapter,
+    declared_by_model: dict[str, dict[str, str | None]],
+    model_relations: dict[str, str],
+    live_identifiers: list[str],
+    undeclared: int,
+) -> tuple[list[DriftFinding], list[str]]:
+    """A built relation's actual columns against what its schema.yml declares,
+    in both directions, plus a type check where a type is declared (#230).
+
+    Two-directional and deliberately asymmetric in severity, per the issue's
+    own framing: a documented column the relation does not have is a real
+    defect (``high``, someone reading the docs to write a query gets a
+    column that is not there), and an undocumented column is a
+    documentation gap (``low``). A type disagreement ranks between the two:
+    the column exists on both sides, so nothing is missing, but a reader
+    trusting the declared type gets the wrong one.
+
+    Free on every connector: both sides come from metadata dex already has
+    to read for this command's other checks (the manifest) or reads no
+    differently than :func:`missing_relation_findings` does
+    (``adapter.table_metadata``, a schema lookup, never a scan).
+
+    A model with no relation in the warehouse, or an ambiguous one, is named
+    in the notes rather than silently skipped: the no-relation finding
+    already explains the missing-entirely case, so naming it again here
+    would only be additive if the model resolved ambiguously, which is worth
+    knowing about but does not deserve its own high-severity finding.
+    """
+
+    from ..dbt_project import column_contract_divergence
+
+    findings: list[DriftFinding] = []
+    unchecked: list[str] = []
+    for model, declared in sorted(declared_by_model.items()):
+        relation = model_relations.get(model)
+        if relation is None:
+            continue
+        matches = match_identifier(relation, live_identifiers)
+        if len(matches) != 1:
+            unchecked.append(model)
+            continue
+
+        declared_lower = {name.lower(): dtype for name, dtype in declared.items()}
+        _meta, columns = adapter.table_metadata(matches[0])
+        actual_lower = {column.name.lower(): column.data_type for column in columns}
+        missing, extra, mismatched = column_contract_divergence(
+            declared_lower, actual_lower
+        )
+
+        if missing:
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="column_missing",
+                    identifier=model,
+                    severity="high",
+                    detail=(
+                        f"'{model}' declares column(s) {', '.join(missing)} in "
+                        "schema.yml that the built relation does not have"
+                    ),
+                    data={"model": model, "columns": missing},
+                )
+            )
+        if extra:
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="column_undeclared",
+                    identifier=model,
+                    severity="low",
+                    detail=(
+                        f"'{model}' builds column(s) {', '.join(extra)} that "
+                        "schema.yml does not declare"
+                    ),
+                    data={"model": model, "columns": extra},
+                )
+            )
+        if mismatched:
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="column_type_mismatch",
+                    identifier=model,
+                    severity="medium",
+                    detail=(
+                        f"'{model}' declares "
+                        + ", ".join(
+                            f"{name} as {declared_type}"
+                            for name, declared_type, _ in mismatched
+                        )
+                        + " in schema.yml, but the built relation has "
+                        + ", ".join(
+                            f"{name} as {actual_type}"
+                            for name, _, actual_type in mismatched
+                        )
+                    ),
+                    data={
+                        "model": model,
+                        "mismatches": [
+                            {"column": name, "declared": d, "actual": a}
+                            for name, d, a in mismatched
+                        ],
+                    },
+                )
+            )
+
+    notes: list[str] = []
+    if unchecked:
+        notes.append(
+            "the column contract was not checked for "
+            + ", ".join(sorted(unchecked))
+            + ": no single relation in the warehouse matched"
+        )
+    if undeclared:
+        notes.append(
+            f"{undeclared} model(s) considered declare no columns in "
+            "schema.yml, so the column contract was not checked for them"
+        )
+    return findings, notes
 
 
 # --- row population: a model against the relation it is built from -------------
