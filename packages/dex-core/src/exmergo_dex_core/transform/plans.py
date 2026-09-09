@@ -856,6 +856,8 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
             if columns:
                 declared_by_model[entry["name"]] = columns
 
+    from ..dbt_project import column_contract_divergence
+
     warnings: list[str] = []
     for edit in edits:
         if (
@@ -868,7 +870,7 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
         declared = declared_by_model.get(model)
         if not declared:
             continue
-        declared_lower = {c.lower() for c in declared}
+        declared_lower = {c.lower(): None for c in declared}
 
         produced = select_columns(edit.new_content)
         if produced is None:
@@ -880,13 +882,17 @@ def column_contract_warnings(edits: list[PlanEdit], view: DbtProjectView) -> lis
             )
             continue
 
-        missing = sorted(declared_lower - produced)
+        # No type info on either side here: a SELECT list names no types at
+        # all, so this call never resolves a mismatch, only the two name-only
+        # directions.
+        missing, extra, _mismatched = column_contract_divergence(
+            declared_lower, dict.fromkeys(produced)
+        )
         if missing:
             warnings.append(
                 f"{edit.path}: schema.yml declares column(s) {', '.join(missing)} "
                 f"for {model} that the SELECT list does not produce"
             )
-        extra = sorted(produced - declared_lower)
         if extra:
             warnings.append(
                 f"{edit.path}: the SELECT list produces column(s) "
