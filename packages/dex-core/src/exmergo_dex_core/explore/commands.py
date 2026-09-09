@@ -2329,6 +2329,12 @@ def map(
     )
     if overlap_warning:
         warnings.append(overlap_warning)
+    # The same sentence `profile` emits when a `pii_overrides` entry names a
+    # column the profiled table does not have (issue #448). `map` is the
+    # command a host schedules, so this is where a rename that orphaned an
+    # override gets seen; over the composed set, fresh and carried alike, so
+    # a cache hit does not hide it.
+    warnings.extend(_override_mismatches(datasets, config.pii_overrides))
 
     # Same ordering the payload's own selection uses: rank first, identifier
     # second. Two orderings derived from one cache inside one envelope would be a

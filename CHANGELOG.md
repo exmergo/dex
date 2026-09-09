@@ -9,6 +9,26 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`explore map` now carries the `pii_overrides` mismatch warning that
+  `explore profile` already emitted** ([#448]). `_override_mismatches` warns
+  when an exact entry names a column its table does not have, or a pattern
+  entry's scope matches profiled tables and none carries the named column;
+  `profile` was its only caller, and `map` built its own `warnings[]` from
+  carry-forward, `--verify` and overlap warnings alone. A host that schedules
+  `map` and runs `profile` by hand therefore had no scheduled run that could
+  say a column rename had left an override pointing at nothing: the override
+  silently stopped clearing, the renamed column came back under the
+  classifier's default flag, and the one command that said so was the one
+  nothing scheduled. `map` now extends its warnings with the same call over
+  the composed set (fresh and carried profiles alike), placed after the
+  overlap warning and before the result is built, so both entry forms reach
+  `map`'s `warnings[]` with the text `profile` uses and a host matching on
+  the `pii_overrides` prefix reads one contract. No new result field: the
+  issue names a `MapResult` field for orphaned entries as the better shape
+  for a host, and that is a larger downstream-visible change than this one.
+
 ## [1.12.1] - 2026-09-09
 
 ### Fixed

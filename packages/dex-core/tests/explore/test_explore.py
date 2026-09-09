@@ -22,7 +22,7 @@ from exmergo_dex_core.cache import (
     ValueDomain,
 )
 from exmergo_dex_core.cli import main
-from exmergo_dex_core.config import DexConfig, save_config
+from exmergo_dex_core.config import DexConfig, PIIOverride, save_config
 from exmergo_dex_core.dbt_project import DeclaredCompositeKey, ProjectDefinitions
 from exmergo_dex_core.explore import summary
 from exmergo_dex_core.explore.commands import _annotate_grain, _merged_hints
@@ -1830,3 +1830,113 @@ def test_the_semantic_read_survives_a_project_with_no_compiled_layer(
 
     assert data["objects"], "the map still describes the warehouse"
     assert all(o["semantic_models"] == [] for o in data["objects"])
+
+
+# --- pii_overrides mismatch warnings reach `map`, not only `profile`: issue #448
+
+
+def _write_exact_override(repo: Path, entry: str) -> None:
+    save_config(DexConfig(pii_overrides=[PIIOverride(column=entry)]), repo)
+
+
+def _write_pattern_override(repo: Path, column_name: str, scope: str) -> None:
+    save_config(
+        DexConfig(pii_overrides=[PIIOverride(column_name=column_name, scope=scope)]),
+        repo,
+    )
+
+
+def _map_warnings(db: Path, repo: Path, capsys) -> tuple[dict, list[str]]:
+    payload = _run(
+        ["explore", "map", "--path", str(db), "--repo-root", str(repo)], capsys
+    )
+    return payload, payload["warnings"]
+
+
+def test_map_warns_when_a_pii_override_entry_matches_no_column(
+    tpch_names_duckdb: Path, tmp_path: Path, capsys
+):
+    """`profile` already says an exact `pii_overrides` entry names a column the
+    table does not have. `map` is the command a host schedules, so the same
+    sentence has to reach its `warnings[]` or a rename goes unnoticed."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_exact_override(repo, "tpch_names.main.hosts.nmae")
+
+    payload, warnings = _map_warnings(tpch_names_duckdb, repo, capsys)
+
+    assert any(
+        "pii_overrides entry 'tpch_names.main.hosts.nmae' matches no column" in w
+        for w in warnings
+    ), warnings
+    # A typo clears nothing: the person-name column is still flagged in the cache.
+    hosts = next(
+        d
+        for d in FilesystemStore(repo).load_cache().datasets
+        if d.identifier == "tpch_names.main.hosts"
+    )
+    assert {c.name: c for c in hosts.columns}["name"].pii is not None
+    assert payload["data"]["pii_column_count"] >= 1
+
+
+def test_map_warns_when_a_pii_override_pattern_matches_no_column(
+    tpch_names_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_pattern_override(repo, "nmae", "tpch_names.main.*")
+
+    _, warnings = _map_warnings(tpch_names_duckdb, repo, capsys)
+
+    assert any(
+        "pii_overrides pattern entry (column_name='nmae', scope='tpch_names.main.*') "
+        "matches no column named 'nmae'" in w
+        for w in warnings
+    ), warnings
+
+
+def test_map_stays_silent_when_the_pii_override_applies(
+    tpch_names_duckdb: Path, tmp_path: Path, capsys
+):
+    """The negative arm: an override that names a real column produces no
+    mismatch warning on `map`, and the column it names is cleared."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_exact_override(repo, "tpch_names.main.hosts.name")
+
+    _, warnings = _map_warnings(tpch_names_duckdb, repo, capsys)
+
+    assert not [w for w in warnings if "pii_overrides" in w], warnings
+    hosts = next(
+        d
+        for d in FilesystemStore(repo).load_cache().datasets
+        if d.identifier == "tpch_names.main.hosts"
+    )
+    person = {c.name: c for c in hosts.columns}["name"]
+    assert person.pii is None
+    assert person.pii_overridden == "name", "the audit trail"
+
+
+def test_map_still_warns_when_every_profile_is_a_cache_hit(
+    tpch_names_duckdb: Path, tmp_path: Path, capsys
+):
+    """The scheduled case: the second nightly `map` re-scans nothing, and the
+    orphaned override has to be reported from the carried profiles, or a host
+    hears it exactly once and never again."""
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_exact_override(repo, "tpch_names.main.hosts.nmae")
+
+    _, first = _map_warnings(tpch_names_duckdb, repo, capsys)
+    payload, second = _map_warnings(tpch_names_duckdb, repo, capsys)
+
+    assert payload["data"]["profiled_count"] == 0, "the second run scanned nothing"
+    assert payload["data"]["cache_hit_count"] >= 1
+    orphaned = [w for w in second if "matches no column" in w]
+    assert orphaned == [w for w in first if "matches no column" in w], (
+        "the same warning, from carried profiles"
+    )
+    assert len(orphaned) == 1, orphaned
