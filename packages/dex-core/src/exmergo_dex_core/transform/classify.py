@@ -40,6 +40,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
+from .. import metricflow_dialect
 from ..dbt_project import jinja_regions
 from ..edits import Edit, EditOp
 
@@ -156,12 +157,21 @@ class ArtifactClassification(BaseModel):
         }
 
 
-def _jinja_signals(content: str, *, where_prefix: str = "") -> list[ArtifactSignal]:
+def _jinja_signals(
+    content: str, *, where_prefix: str = "", in_filter: bool = False
+) -> list[ArtifactSignal]:
     """Every executable signal the jinja in ``content`` carries.
 
     A region with no call at all is still a signal (``jinja_expression``): the
     content's meaning depends on a value dex cannot see, which is the same problem
     for a host as a macro call and a worse one to leave silent.
+
+    ``in_filter`` narrows the MetricFlow-callee exception to exactly the
+    context that grammar is defined for: the value of a ``filter`` key. A
+    repository macro that happens to be named ``Dimension`` and is called from
+    anywhere else (a description, a config value) is still a macro the
+    repository wrote, and reporting it as ``macro_call`` is the correct,
+    unnarrowed answer there.
     """
 
     signals: list[ArtifactSignal] = []
@@ -203,6 +213,21 @@ def _jinja_signals(content: str, *, where_prefix: str = "") -> list[ArtifactSign
                 signals.append(ArtifactSignal(signal="run_query", where=where))
             elif call.callee == "statement":
                 signals.append(ArtifactSignal(signal="statement_block", where=where))
+            elif in_filter and call.callee in metricflow_dialect.FILTER_CALLEES:
+                # A metric filter's own grammar, not a macro the repository
+                # wrote: `Dimension`/`TimeDimension`/`Entity` dispatch into the
+                # semantic layer's resolution against definitions the project
+                # already declares. Still reported, because a host applying
+                # its own policy wants the reference even where it did not
+                # decide the class.
+                token = call.args[0] if call.args and call.args[0] else None
+                signals.append(
+                    ArtifactSignal(
+                        signal="semantic_ref",
+                        where=where,
+                        detail=f"{call.callee}({token})" if token else call.callee,
+                    )
+                )
             elif call.callee not in _DECLARATIVE_CALLEES:
                 signals.append(
                     ArtifactSignal(signal="macro_call", where=where, detail=call.callee)
@@ -212,6 +237,24 @@ def _jinja_signals(content: str, *, where_prefix: str = "") -> list[ArtifactSign
         elif region.kind == "expression" and not callees:
             signals.append(ArtifactSignal(signal="jinja_expression", where=where))
     return signals
+
+
+def _in_filter_clause(path: str) -> bool:
+    """Whether ``path`` names the value of a ``filter`` key under a metric (or
+    an item of a list under one): a metric's own filter, its measure's,
+    ratio's, or an input metric's, and nothing wider.
+
+    ``metrics[...]`` anchors this to where MetricFlow's filter grammar is
+    actually defined. A ``filter`` key elsewhere, ``models[0].config.filter``
+    for instance, names no such grammar: it is not MetricFlow's, dex does not
+    know what it means, and treating it as one would narrow past what #445
+    asks for.
+    """
+
+    if not path.startswith("metrics["):
+        return False
+    stripped = re.sub(r"\[\d+\]$", "", path)
+    return stripped.endswith(".filter")
 
 
 def _walk_yaml(node: Any, path: str, signals: list[ArtifactSignal]) -> None:
@@ -230,7 +273,11 @@ def _walk_yaml(node: Any, path: str, signals: list[ArtifactSignal]) -> None:
             _walk_yaml(item, f"{path}[{i}]", signals)
     elif isinstance(node, str):
         if "{{" in node or "{%" in node:
-            signals.extend(_jinja_signals(node, where_prefix=f"{path}: "))
+            signals.extend(
+                _jinja_signals(
+                    node, where_prefix=f"{path}: ", in_filter=_in_filter_clause(path)
+                )
+            )
         elif _RUN_OPERATION.search(node):
             signals.append(ArtifactSignal(signal="run_operation", where=path))
 

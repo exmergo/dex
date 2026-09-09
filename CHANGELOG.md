@@ -9,6 +9,34 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`classify_content` read a metric filter's `Dimension`/`TimeDimension`/
+  `Entity` calls as an unrecognized macro, so a metric with a filter was
+  never `declarative`** ([#445]). Those three names are MetricFlow's own
+  filter grammar: they dispatch into the semantic layer's resolution against
+  definitions the project already declares, not into a macro the repository
+  wrote, so treating them as an unknown `macro_call` reached the executable
+  verdict on a premise that never held for them. `classify.py` now consults
+  `metricflow_dialect.FILTER_CALLEES`, the same module `#357` already made the
+  owner of this grammar, rather than re-deriving it. The reference is still
+  reported (a new `semantic_ref` signal) so a host applying its own policy
+  keeps the evidence; a filter calling a macro the project actually defines is
+  untouched and still classifies executable, and a document carrying both a
+  filter and a hook is still executable, since execution still outranks
+  everything else in `_verdict`. The exception is scoped to the value of a
+  `filter` key under `metrics[...]` specifically, not the callee name
+  everywhere it appears and not every `filter` key: a repository macro that
+  happens to be named `Dimension` and is called from a description or any
+  other field is still repository-controlled code and still classifies
+  `macro_call`/executable, and so is a `filter` key outside `metrics[...]`
+  (`models[].config.filter`, say), which names no MetricFlow grammar at all.
+  A new `classify-filtered-metric` conformance vector covers it. Also
+  clarified, no behavior change: `Grounding.
+  completeness` docstring now says explicitly that "complete" means every
+  reference was named statically, not that every named reference resolves to
+  something that exists.
+
 ## [1.12.0] - 2026-09-08
 
 ### Added

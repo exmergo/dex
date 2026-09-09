@@ -61,6 +61,16 @@ STANDARD_GRAINS = (
 _DIMENSION_REF = re.compile(r"(?:Time)?Dimension\(\s*['\"]([^'\"]+)['\"]")
 _ENTITY_REF = re.compile(r"Entity\(\s*['\"]([^'\"]+)['\"]")
 
+#: The callee names this filter grammar recognizes. A call by one of these
+#: names dispatches into the semantic layer's own resolution against
+#: definitions the project already declares (a dimension or entity the layer
+#: knows about), not into a macro the repository wrote. Exported so a reader
+#: outside this module (`transform.classify`) has one place to ask "is this
+#: MetricFlow's own vocabulary" rather than re-deriving the grammar; keep this
+#: in step with `_DIMENSION_REF`/`_ENTITY_REF` above, which recognize the same
+#: three names.
+FILTER_CALLEES = frozenset({"Dimension", "TimeDimension", "Entity"})
+
 
 def filter_refs(clauses: list[str]) -> list[str]:
     """Every dimension and entity token a set of Jinja filter clauses names.

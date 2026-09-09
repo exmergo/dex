@@ -55,6 +55,16 @@ models:
 """
 )
 
+FILTERED_METRIC = """metrics:
+  - name: live_sessions
+    label: Live sessions
+    type: simple
+    type_params:
+      measure:
+        name: session_count
+        filter: "{{ Dimension('session__is_deleted') }} = false"
+"""
+
 
 def signals(result) -> set[str]:
     return {s.signal for s in result.signals}
@@ -76,6 +86,121 @@ def test_a_semantic_declaration_beside_a_hook_is_executable():
     # The finding is located where a reviewer will open the file.
     where = next(s.where for s in result.signals if s.signal == "post_hook")
     assert where.endswith("config.post-hook")
+
+
+def test_a_metric_filters_dimension_reference_is_declarative():
+    """`Dimension('...')` dispatches into the semantic layer's own resolution
+    against definitions the project already declares, not into a macro the
+    repository wrote (#445), so it must not read the same as an unknown call."""
+
+    result = classify_content(FILTERED_METRIC, path="models/live_sessions.yml")
+    assert result.artifact_class is ArtifactClass.DECLARATIVE
+    # Still reported: a host applying its own policy wants the reference even
+    # where it did not decide the class.
+    assert "semantic_ref" in signals(result)
+    assert "macro_call" not in signals(result)
+    detail = next(s.detail for s in result.signals if s.signal == "semantic_ref")
+    assert detail == "Dimension(session__is_deleted)"
+
+
+@pytest.mark.parametrize(
+    ("callee", "args"),
+    [
+        ("Dimension", "'session__is_deleted'"),
+        ("TimeDimension", "'metric_time', 'day'"),
+        ("Entity", "'session'"),
+    ],
+)
+def test_every_metricflow_filter_callee_is_declarative(callee, args):
+    """The narrowing covers all three names the vendor's grammar defines, not
+    just the one in the report."""
+
+    content = FILTERED_METRIC.replace(
+        "Dimension('session__is_deleted')", f"{callee}({args})"
+    )
+    result = classify_content(content, path="models/live_sessions.yml")
+    assert result.artifact_class is ArtifactClass.DECLARATIVE
+    assert "semantic_ref" in signals(result)
+
+
+def test_a_filtered_metric_beside_a_hook_is_still_executable():
+    """The stronger-verdict rule is untouched: what changes is only whether a
+    bare dimension reference is evidence of repository-controlled execution."""
+
+    hooked = (
+        FILTERED_METRIC
+        + """
+models:
+  - name: sessions
+    config:
+      post-hook: "select 1"
+"""
+    )
+    result = classify_content(hooked, path="models/live_sessions.yml")
+    assert result.artifact_class is ArtifactClass.EXECUTABLE
+    assert {"semantic_ref", "post_hook"} <= signals(result)
+
+
+def test_a_metric_filter_calling_a_repository_macro_is_still_executable():
+    """The narrowing is to the vendor's own vocabulary, not to filters in
+    general: a macro the project defines is still repository-controlled code."""
+
+    content = FILTERED_METRIC.replace(
+        "Dimension('session__is_deleted')", "my_custom_macro('x')"
+    )
+    result = classify_content(content, path="models/live_sessions.yml")
+    assert result.artifact_class is ArtifactClass.EXECUTABLE
+    assert "macro_call" in signals(result)
+    detail = next(s.detail for s in result.signals if s.signal == "macro_call")
+    assert detail == "my_custom_macro"
+
+
+def test_unparseable_content_with_a_dimension_like_call_stays_unknown():
+    """The new callee narrowing must not weaken the never-declarative-on-
+    silence guarantee: unparseable content is unknown regardless of what it
+    contains."""
+
+    result = classify_content("a: [1, 2\n  Dimension('x')\n", path="models/x.yml")
+    assert result.artifact_class is ArtifactClass.UNKNOWN
+    assert result.parsed is False
+
+
+def test_a_repository_macro_named_dimension_outside_a_filter_is_still_a_macro_call():
+    """The narrowing is scoped to the ``filter:`` value MetricFlow's grammar
+    actually defines, not to the callee name everywhere it appears (#445
+    review). A project is free to define its own macro called ``Dimension``;
+    calling it from a description is calling repository-controlled code, and
+    must classify the same as any other unrecognized macro."""
+
+    content = """version: 2
+models:
+  - name: things
+    description: "{{ Dimension('not_a_real_filter') }}"
+"""
+    result = classify_content(content, path="models/things.yml")
+    assert result.artifact_class is ArtifactClass.EXECUTABLE
+    assert "macro_call" in signals(result)
+    assert "semantic_ref" not in signals(result)
+    detail = next(s.detail for s in result.signals if s.signal == "macro_call")
+    assert detail == "Dimension"
+
+
+def test_a_filter_key_outside_metrics_is_still_a_macro_call():
+    """The narrowing is anchored to ``metrics[...]``, where MetricFlow's
+    filter grammar is actually defined, not to the bare key name ``filter``
+    (#445 review). ``models[].config.filter`` names no such grammar; dex does
+    not know what it means and must not read it as a semantic reference."""
+
+    content = """version: 2
+models:
+  - name: things
+    config:
+      filter: "{{ Dimension('not_metricflow') }}"
+"""
+    result = classify_content(content, path="models/things.yml")
+    assert result.artifact_class is ArtifactClass.EXECUTABLE
+    assert "macro_call" in signals(result)
+    assert "semantic_ref" not in signals(result)
 
 
 def test_a_grant_is_authority_bearing():

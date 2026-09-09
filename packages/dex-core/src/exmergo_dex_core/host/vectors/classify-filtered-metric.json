@@ -1,0 +1,25 @@
+{
+  "name": "classify-filtered-metric",
+  "contract": "classification",
+  "description": "A metric filter naming a dimension through MetricFlow's own grammar. Dimension('...') dispatches into the semantic layer's resolution against definitions the project already declares, not into a macro the repository wrote, so the verdict is declarative and the reference is still reported as a signal.",
+  "payload": {
+    "path": "models/marts/live_sessions.yml",
+    "content": "metrics:\n  - name: live_sessions\n    label: Live sessions\n    type: simple\n    type_params:\n      measure:\n        name: session_count\n        filter: \"{{ Dimension('session__is_deleted') }} = false\"\n"
+  },
+  "expect": {
+    "artifact_class": "declarative",
+    "result": {
+      "path": "models/marts/live_sessions.yml",
+      "artifact_class": "declarative",
+      "basis": "content",
+      "parsed": true,
+      "signals": [
+        {
+          "signal": "semantic_ref",
+          "where": "metrics[0].type_params.measure.filter: line 1",
+          "detail": "Dimension(session__is_deleted)"
+        }
+      ]
+    }
+  }
+}

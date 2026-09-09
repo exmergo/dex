@@ -139,6 +139,15 @@ class GroundingBinding(BaseModel):
 class Grounding(BaseModel):
     """A plan's dependencies, and how much of the answer is finished."""
 
+    # "complete" means every reference in the plan was named statically: no
+    # entry in `unresolved` and nothing in `limits`. It is not a claim that
+    # every named reference resolves to something that exists. `ref(var('x'))`
+    # is unresolved (dex could not read the name at all) and lowers this to
+    # "partial"; `ref('no_such_model')` is named successfully and stays a
+    # `GroundedDependency` with `relation=None`, which does not move this
+    # field. A caller that wants "this plan's build has something to run"
+    # reads `dependencies[].relation` (or `relations`) per entry, not this
+    # field alone.
     completeness: str = "unresolved"
     dependencies: list[GroundedDependency] = Field(default_factory=list)
     relations: list[str] = Field(default_factory=list)
