@@ -9,6 +9,8 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+## [1.12.2] - 2026-09-09
+
 ### Fixed
 
 - **`explore map` now carries the `pii_overrides` mismatch warning that
