@@ -54,6 +54,16 @@ quality (the hard constraints as executable assertions), and uplift versus
 baseline. Three skills share a description budget, so negative cases are
 first-class.
 
+Every one of those triggering cases is written by whoever wrote the
+description it tests, at the same time, and checked with the other skills
+disabled: a structural blind spot a same-author suite cannot see past.
+`evals/corpus/` supplements it with externally authored prompts (ADE-bench
+task text, hand-labeled with the skill each should fire or `none`), run with
+every skill available at once and scored as per-skill precision/recall
+(`python -m evals --corpus evals/corpus/ade_bench_triggering.json`). It never
+gates: a low pass rate is the measurement this corpus exists to produce, not
+a regression to chase away.
+
 ## Tier 3: external benchmarks (published)
 
 Scheduled and cost-capped, not per-commit. Two are published, each with its raw

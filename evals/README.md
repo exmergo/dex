@@ -46,13 +46,43 @@ a workspace with the dex plugin installed. The command exits non-zero unless the
 suite passes (clean triggering and no regression versus baseline), so the same
 invocation works locally and as a release gate.
 
+## The cross-skill triggering corpus
+
+The per-skill `positive`/`negative` lists above have a structural blind spot: they
+are written by the same person who wrote the description they test, at the same
+time, so a positive is often just a paraphrase of the description, and each skill
+is only ever checked with the *other* skills disabled. Neither failure mode is
+visible from inside one skill's own suite.
+
+`evals/corpus/` holds externally authored fixtures for exactly this: real prompts
+from someone with no knowledge of these descriptions, run with every skill
+available at once, each hand-labeled with the skill (or `none`) it should fire.
+`evals/corpus/ade_bench_triggering.json` is the first one, sourced from
+[dbt-labs/ade-bench](https://github.com/dbt-labs/ade-bench) (Apache-2.0); see the
+file's own `source` field for the exact provenance and what was and was not
+carried over.
+
+```
+python -m evals --corpus evals/corpus/ade_bench_triggering.json
+python -m evals --corpus evals/corpus/ade_bench_triggering.json --json
+```
+
+One live call per prompt (not per prompt-per-skill, since every skill is available
+in the same call), and the report is per-skill precision/recall plus which cases
+missed. This mode always exits 0: it is a measurement, not a release gate. Expect
+the first run's numbers to be low and record them as the baseline (there is no
+committed baseline yet; run it and note what you get in the PR, and treat later
+runs as measuring drift from that number rather than pass/fail).
+
 ## Layout
 
-- `suite.py` loads and validates a skill's `evals.json` (stdlib dataclasses).
-- `runner.py` is the deterministic scoring core: triggering, output quality, and
-  uplift. It takes an agent and a judge by dependency injection.
-- `claude_agent.py` is the live backend: the `AgentRunner` and `Judge` driven by
-  the `claude` CLI. A non-Claude agent is a second backend behind the same two
-  protocols, with no change to the core.
+- `suite.py` loads and validates a skill's `evals.json`, and a cross-skill
+  `Corpus` from `evals/corpus/*.json` (stdlib dataclasses both ways).
+- `runner.py` is the deterministic scoring core: triggering, output quality,
+  uplift, and the corpus's per-skill precision/recall. It takes an agent, a judge,
+  or a classifier by dependency injection.
+- `claude_agent.py` is the live backend: the `AgentRunner`/`Judge`/`Classifier`
+  protocols driven by the `claude` CLI. A non-Claude agent is a second backend
+  behind the same protocols, with no change to the core.
 - `__main__.py` is the CLI.
 - `tests/` covers the scoring core with fake backends (no model, free, in CI).
