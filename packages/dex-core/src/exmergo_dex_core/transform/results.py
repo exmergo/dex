@@ -311,6 +311,46 @@ class DepsResult(Result):
         return {"ran": True, **self.summary}
 
 
+class MutationCoverageResult(Result):
+    """Which planted defects a model's tests caught, and which they missed.
+
+    Survivors lead the list. A caller reading this is deciding what test to write
+    next, and the mutants that were caught are the ones they need to read least,
+    so ordering by outcome is the difference between an answer and a table.
+
+    ``score`` is deliberately not the headline and is null rather than zero when
+    nothing ran. It is a ratio of two small integers over one model, and a number
+    that invites comparison between models would be read as a quality metric it
+    cannot support; the survivors themselves are the finding.
+
+    ``baseline`` is the honesty field. Every verdict here is relative to the
+    tests that passed before anything was mutated, so the excluded ones have to
+    be visible: a suite whose only real test was already failing would otherwise
+    report a clean sweep of survivors and read as though it had been measured.
+    """
+
+    model: str = ""
+    target: str = ""
+    baseline: dict[str, Any] = Field(default_factory=dict)
+    mutants: list[dict[str, Any]] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    score: float | None = None
+    cap: dict[str, Any] = Field(default_factory=dict)
+    runs: int = 0
+
+    def data(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "target": self.target,
+            "baseline": self.baseline,
+            "mutants": self.mutants,
+            "counts": self.counts,
+            "score": self.score,
+            "cap": self.cap,
+            "runs": self.runs,
+        }
+
+
 class BuildResult(Result):
     """A finished dbt run, dev-target only and cost-surfaced beforehand.
 

@@ -14,6 +14,7 @@ only a sanitized summary crosses the boundary. Node results come from dbt's own
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -245,6 +246,47 @@ def build(
     return summary, cost
 
 
+@contextlib.contextmanager
+def shadow_project(
+    project_dir: Path | str, edits: Sequence[Edit] = ()
+) -> Iterator[Path]:
+    """A throwaway copy of the project with ``edits`` overlaid, yielded by path.
+
+    The copy is what lets dex run dbt against a hypothetical version of a project
+    without touching the real one: everything dbt writes into it (``target/``,
+    ``logs/``, any stray database a relative profile path would create) lives and
+    dies with the copy.
+
+    ``dbt_packages/`` is deliberately copied, because parsing needs the installed
+    macros. Warehouse files deliberately are not: they can be huge, and a copy of
+    a database is not the database, so a caller that needs the real warehouse must
+    reach it through the profile rather than through the tree. ``.dex`` matters
+    when the project is the repo root.
+    """
+
+    project = Path(project_dir).resolve()
+    view = load_project(project)
+    with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
+        shadow = Path(tmp) / (project.name or "project")
+        shutil.copytree(
+            project,
+            shadow,
+            ignore=shutil.ignore_patterns(
+                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
+            ),
+        )
+        for edit in edits:
+            edit_path = contained_path(shadow, edit.path, view)
+            if edit.op is EditOp.DELETE:
+                # Remove it from the copy so the parse runs against the true
+                # post-deletion tree: a surviving ref() to it fails dbt's parse.
+                edit_path.unlink(missing_ok=True)
+            else:
+                edit_path.parent.mkdir(parents=True, exist_ok=True)
+                edit_path.write_text(edit.new_content, encoding="utf-8")
+        yield shadow
+
+
 def shadow_parse(
     project_dir: Path | str,
     edits: list[Edit],
@@ -293,29 +335,7 @@ def shadow_parse(
             "messages": [],
         }
 
-    view = load_project(project)
-    with tempfile.TemporaryDirectory(prefix="dex-shadow-") as tmp:
-        shadow = Path(tmp) / (project.resolve().name or "project")
-        # dbt_packages/ is deliberately copied (parse needs installed macros);
-        # warehouse files are deliberately not (parse never reads them, and
-        # they can be huge). `.dex` matters when the project is the repo root.
-        shutil.copytree(
-            project,
-            shadow,
-            ignore=shutil.ignore_patterns(
-                "target", "logs", ".git", ".venv", ".dex", "*.duckdb", "*.db"
-            ),
-        )
-        for edit in edits:
-            edit_path = contained_path(shadow, edit.path, view)
-            if edit.op is EditOp.DELETE:
-                # Remove it from the copy so the parse runs against the true
-                # post-deletion tree: a surviving ref() to it fails dbt's parse.
-                edit_path.unlink(missing_ok=True)
-            else:
-                edit_path.parent.mkdir(parents=True, exist_ok=True)
-                edit_path.write_text(edit.new_content, encoding="utf-8")
-
+    with shadow_project(project, edits) as shadow:
         # A profiles.yml edit only takes effect if dbt reads the shadowed copy;
         # pointing --profiles-dir at the real project would parse the edit
         # against the unedited profile. Redirect to the shadow when the
@@ -350,6 +370,202 @@ def shadow_parse(
         if not success and not messages:
             messages = ["dbt parse failed"]
     return {"available": True, "reason": None, "success": success, "messages": messages}
+
+
+# dbt reads these from the environment, and each one can silently change which
+# tests run, what a status means, or where dbt writes. A mutation run has to mean
+# the same thing on every machine, and the one that matters most is
+# `DBT_INDIRECT_SELECTION`: set to `cautious` it drops the tests from the
+# selection, every mutant then survives, and the report says the suite is weak
+# when in fact it was never asked.
+_ISOLATED_ENV_SCRUBBED = (
+    "DBT_TARGET_PATH",
+    "DBT_LOG_PATH",
+    "DBT_STATE",
+    "DBT_DEFER_STATE",
+    "DBT_STORE_FAILURES",
+    "DBT_WARN_ERROR",
+    "DBT_WARN_ERROR_OPTIONS",
+    "DBT_RESOURCE_TYPES",
+    "DBT_EXCLUDE_RESOURCE_TYPES",
+    "DBT_SELECTOR",
+    "DBT_EMPTY",
+    "DBT_FULL_REFRESH",
+    "DBT_INDIRECT_SELECTION",
+    "DBT_DEFER",
+    "DBT_FAVOR_STATE",
+    "DBT_FAIL_FAST",
+)
+
+
+class ShadowRun:
+    """A copied project that dbt can be run against many times, never the real one.
+
+    :func:`shadow_parse` copies a project to parse it once. This is the same
+    isolation held open across a sequence of invocations, which is what mutation
+    coverage needs: one copy, then a compile and N test runs against it, each
+    with a different version of one model's file.
+
+    Stateful by nature, hence a class rather than a function taking the same six
+    arguments each call: it owns the copy's lifetime, and dbt's partial-parse
+    cache inside the copy is what keeps run N+1 from re-parsing the whole project.
+
+    **cwd stays at the real project, and every artifact path is passed as a flag.**
+    That split is deliberate and it is the only arrangement that is safe on every
+    connector. dbt resolves ``target/`` and ``logs/`` against ``--project-dir``,
+    so the flags keep its writes inside the copy; dbt-duckdb resolves a relative
+    ``path:`` in the profile against the *process* cwd, so leaving cwd at the real
+    project is what lets a copied project still reach the real dev database.
+    Copying or linking the database instead would split it from its
+    write-ahead log, which risks the user's data rather than merely confusing dbt.
+    """
+
+    def __init__(
+        self,
+        project_dir: Path | str,
+        *,
+        target: str,
+        connector: str | None = None,
+        paradigm: Paradigm = Paradigm.FREE_LOCAL,
+        ceiling: float | None = None,
+        runner: Runner | None = None,
+        timeout: float = _DBT_TIMEOUT_SECONDS,
+    ):
+        self.project = Path(project_dir).resolve()
+        self.target = target
+        self._connector = connector
+        self._paradigm = paradigm
+        self._ceiling = ceiling
+        self._runner = runner
+        self._timeout = timeout
+        self._stack = contextlib.ExitStack()
+        self.shadow: Path | None = None
+        self.view = None
+
+    def __enter__(self) -> ShadowRun:
+        self.view = load_project(self.project)
+        self.shadow = self._stack.enter_context(shadow_project(self.project))
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stack.close()
+        self.shadow = None
+
+    def write(self, rel_path: str, text: str) -> None:
+        """Put a file into the copy, confined to the project's editing surface."""
+
+        path = contained_path(self._require_shadow(), rel_path, self.view)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def strip_run_hooks(self) -> bool:
+        """Drop ``on-run-start`` and ``on-run-end`` from the copy. True if any went.
+
+        A hook fires once per invocation, and this runs dbt once per mutant, so a
+        project whose hooks grant permissions or write an audit row would do that
+        N+1 times for a command the user thinks of as read-only.
+        """
+
+        manifest = self._require_shadow() / "dbt_project.yml"
+        if not manifest.is_file():
+            return False
+        parsed = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+        present = [key for key in ("on-run-start", "on-run-end") if key in parsed]
+        if not present:
+            return False
+        for key in present:
+            parsed.pop(key)
+        manifest.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+        return True
+
+    def manifest(self) -> dict[str, Any]:
+        path = self._require_shadow() / "target" / "manifest.json"
+        if not path.is_file():
+            raise DbtRunError("dbt wrote no manifest for the copied project")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def compile(self, select: str) -> dict[str, Any]:
+        """Compile one selection in the copy and return the manifest dbt wrote."""
+
+        completed = self._invoke("compile", "--select", select)
+        if completed.returncode != 0:
+            messages = _collect_messages(completed)
+            raise DbtRunError(messages[0] if messages else "dbt compile failed")
+        return self.manifest()
+
+    def test(
+        self, select: str, *, exclude: Sequence[str] = ()
+    ) -> dict[str, Any] | None:
+        """Run one selection's tests. ``None`` when dbt wrote no results at all.
+
+        ``dbt test``, never ``dbt build``. Two reasons, and both are load-bearing.
+        A build runs a model's unit tests before the model, so one failing unit
+        test marks the model skipped and the skip cascades onto every data test
+        attached to it: the run would then report four tests as skipped and the
+        caller could not tell which of them would have caught the defect. And
+        ``dbt test`` executes no model materialization at all, so even a config
+        override that failed to apply could not write a relation.
+        """
+
+        args = ["--select", select]
+        for name in exclude:
+            args += ["--exclude", name]
+        completed = self._invoke("test", *args)
+        results = self._require_shadow() / "target" / "run_results.json"
+        if not results.is_file():
+            return None
+        return _summarize(self._require_shadow(), self.target, completed)
+
+    def _invoke(self, verb: str, *args: str) -> subprocess.CompletedProcess:
+        shadow = self._require_shadow()
+        # Cleared first: dbt writes this as part of running, so a leftover from
+        # the previous mutant would otherwise be read as this one's answer.
+        (shadow / "target" / "run_results.json").unlink(missing_ok=True)
+        argv = [
+            _dbt_executable(),
+            verb,
+            "--target",
+            self.target,
+            "--project-dir",
+            str(shadow),
+            "--profiles-dir",
+            str(profiles_dir(self.project).resolve()),
+            "--target-path",
+            str(shadow / "target"),
+            "--log-path",
+            str(shadow / "logs"),
+            "--log-format",
+            "json",
+            # Pinned rather than inherited, for the reason the environment is
+            # scrubbed: each of these changes what a run means.
+            "--indirect-selection",
+            "eager",
+            "--no-defer",
+            "--no-favor-state",
+            "--no-fail-fast",
+            *args,
+        ]
+        run = self._runner or _default_runner(
+            self._timeout, self.project, env=self._env()
+        )
+        return run(argv)
+
+    def _env(self) -> dict[str, str]:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _ISOLATED_ENV_SCRUBBED
+        }
+        # dbt writes a `.user.yml` into the profiles directory when usage
+        # tracking is on, and the profiles directory here is the real project.
+        env["DO_NOT_TRACK"] = "1"
+        env.update(_build_env(self._connector, self._paradigm, self._ceiling) or {})
+        return env
+
+    def _require_shadow(self) -> Path:
+        if self.shadow is None:
+            raise DbtRunError("the shadow project is only open inside a `with` block")
+        return self.shadow
 
 
 def has_package_spec(project_dir: Path | str) -> bool:

@@ -150,6 +150,13 @@ at all, which is any view (dbt's default materialization); a table's count is
 free catalog metadata, and a verdict resting on it is reported `exact: false` to
 say so.
 
+`transform test --mutate` prices its whole batch as one number and confirms it
+once, then runs one dbt invocation per mutant. Nothing is materialized: a mutant
+builds as an ephemeral model, so the dev namespace holds exactly the relations it
+held before. A budget that runs out partway stops the run, and the remaining
+mutants are reported `not_run` rather than the budget being exceeded.
+
+
 `--verify` also folds `postgres.dev_schema` into its read scope for the length of that one
 command, because dbt writes the relations it is judging there and that namespace
 is refused as a source everywhere else. The widening shows in the envelope's

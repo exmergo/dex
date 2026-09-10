@@ -215,6 +215,20 @@ command, because dbt writes the relations it is judging there and that namespace
 is refused as a source everywhere else. The widening shows in the envelope's
 `connection.target`; nothing is written back to `.dex/config.yml`.
 
+`transform test --mutate` prices the whole batch upfront and confirms it once.
+Each mutant is spliced into each of the model's compiled data tests and dry-run
+priced as the statement the warehouse will actually run, which matters here more
+than on any other connector: dropping or flipping a predicate on a partitioned
+table changes what the scan prunes, so a mutant can legitimately cost more than
+the model it came from and pricing the batch at the baseline's cost would
+under-report it. The breakdown names `(baseline)` and each mutant by id, so one
+`--budget` covers the run and the caller sees where it goes. Unit tests read
+fixtures rather than the warehouse and are not priced. If the confirmed budget
+runs out partway, the run stops and the remaining mutants come back `not_run`.
+Nothing is materialized: mutants build as ephemeral models, so no table or view
+is created in `bigquery.dev_dataset` and none of the run needs cleaning up.
+
+
 
 With `--layered-schemas`, the scaffolded `generate_schema_name` override makes
 each layer build into its own sibling dataset in the profile's project
