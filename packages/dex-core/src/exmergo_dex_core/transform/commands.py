@@ -53,6 +53,7 @@ from .results import (
     InitResult,
     MacroListResult,
     MacroResult,
+    MutationCoverageResult,
     PlacementResult,
     PlanExportResult,
     PlanListResult,
@@ -720,15 +721,633 @@ def test_scaffold(engine: DexEngine, model_name: str | None) -> TestScaffoldResu
     return TestScaffoldResult(**planned.model_dump(), model=model_name, inputs=inputs)
 
 
+def test_mutations(
+    engine: DexEngine,
+    model: str | None,
+    *,
+    max_mutants: int | None = None,
+    target: str | None = None,
+) -> MutationCoverageResult:
+    """Plant standard analytics defects in a model and report which tests miss them.
+
+    The question this answers is the one a passing suite cannot: whether the
+    tests would notice if the model were wrong. Each mutant is one defect, built
+    in a throwaway copy as an ephemeral model so nothing is materialized, and run
+    through the model's own tests.
+
+    The order mirrors `transform build`, and for the same reasons: the free
+    refusals come first, so a model dex cannot mutate costs nothing to find out
+    about; the dev-target check runs next, because a broken target makes every
+    run impossible and the caller should learn that before weighing a budget;
+    then the whole batch is priced and confirmed once. N runs behind one
+    handshake is the only shape that works here, since a per-mutant ask would
+    make the caller answer twenty times for one question.
+    """
+
+    from ..adapters import get_dialect
+    from ..connect import paradigm_for
+    from ..envelope import Paradigm
+    from ..guards.cost_guard import skipped_handshake_warning
+    from . import dev_target
+    from . import mutation as mutation_mod
+    from .build import ShadowRun, assert_dev_target
+
+    if not model:
+        raise ValueError(
+            "transform test needs a model: `transform test --mutate <model>`"
+        )
+    if max_mutants is not None and max_mutants > mutation_mod.MAX_MUTANTS:
+        raise ValueError(
+            f"--max-mutants {max_mutants} is above the engine ceiling of "
+            f"{mutation_mod.MAX_MUTANTS}; every mutant is a dbt run, so the "
+            "ceiling is what keeps this command's cost predictable. Lower it "
+            "to narrow the run"
+        )
+    cap = mutation_mod.MAX_MUTANTS if max_mutants is None else max(0, max_mutants)
+
+    config = engine.config
+    store = engine.store
+    repo_root = engine.require_repo_root("running mutation coverage")
+    target = target or config.dbt_target or "dev"
+    assert_dev_target(target, config.dbt_target)
+    connector = engine.connector or config.connector
+    effective = config.model_copy(update={"connector": connector})
+    paradigm = paradigm_for(connector, effective)
+    ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
+    project = engine.project_dir()
+
+    dev_warnings = dev_target.check(
+        project,
+        target,
+        effective,
+        repo_root,
+        store=store,
+        connection=engine.connection,
+    )
+
+    warnings: list[str] = list(dev_warnings)
+    adapter = None
+    gate = None
+    runs = 0
+    spend: dict[str, float | None] | None = None
+    try:
+        with ShadowRun(
+            project,
+            target=target,
+            connector=connector,
+            paradigm=paradigm,
+            ceiling=ceiling,
+        ) as shadow:
+            if shadow.strip_run_hooks():
+                warnings.append(
+                    "this project's on-run-start/on-run-end hooks are not run: "
+                    "mutation coverage invokes dbt once per mutant, and a hook "
+                    "that grants or audits would otherwise fire once per run"
+                )
+            node, model_path = _mutable_model(engine, shadow, model, mutation_mod)
+            prepared, batch = _plan_mutants(
+                shadow, node, model_path, cap, get_dialect(connector), mutation_mod
+            )
+            warnings.extend(prepared.notes)
+            if batch.unparsed:
+                warnings.append(
+                    f"{batch.unparsed} mutant(s) did not survive a re-read and "
+                    "were dropped rather than run"
+                )
+            if not batch.mutants:
+                raise mutation_mod.MutationError(
+                    f"'{model}' has no SQL dex knows how to plant a defect in "
+                    "(no comparison, filter, join, CASE, division, window frame "
+                    "or aggregate), so there is nothing to measure its tests against"
+                )
+
+            estimate = None
+            if paradigm is not Paradigm.FREE_LOCAL:
+                adapter = engine._adapter("transform test")
+                estimate, per_mutant, price_notes = _price_mutations(
+                    adapter, shadow, model_path, batch, node, mutation_mod
+                )
+                warnings.extend(price_notes)
+                if estimate is not None:
+                    command_args.billed_handshake(
+                        "transform test",
+                        adapter,
+                        estimate,
+                        per_table=per_mutant or None,
+                        notes=price_notes or None,
+                    )
+                gate = command_args.cost_gate(adapter)
+
+            result = _run_mutants(
+                shadow,
+                model_path,
+                batch,
+                model=node["name"],
+                paradigm=paradigm,
+                connector=connector,
+                store=store,
+                ceiling=ceiling,
+                estimate=estimate,
+                mutation_mod=mutation_mod,
+            )
+            runs, spend, run_warnings = result.pop("_meta")
+            warnings.extend(run_warnings)
+            # Released before the day's total is read back, exactly as
+            # `_shape_build_result` releases before reading. Every run settles
+            # while this command still holds its whole-batch reservation, so a
+            # total read during the loop counts that reservation on top of what
+            # the runs actually billed and overstates the day by the estimate.
+            spend = _refresh_session_total(spend, gate, store, paradigm, connector)
+    finally:
+        if gate is not None:
+            gate.settle()
+
+    if paradigm is Paradigm.FREE_LOCAL:
+        warnings.extend(skipped_handshake_warning(paradigm, engine.confirmed))
+
+    survivors = result["counts"].get("survived", 0)
+    if survivors:
+        warnings.append(
+            f"{survivors} planted defect(s) survived this model's tests: no test "
+            "told the mutant apart, on the dev data or on the unit test fixtures. "
+            "They are in data.mutants, each with the test that would catch it"
+        )
+    if batch.elided_total:
+        warnings.append(
+            f"{batch.elided_total} further mutant(s) were not run: the cap is "
+            f"{batch.cap}, and what it cut is in data.cap.elided, per defect class"
+        )
+
+    return MutationCoverageResult(
+        model=node["name"],
+        target=target,
+        baseline=result["baseline"],
+        mutants=result["mutants"],
+        counts=result["counts"],
+        score=result["score"],
+        cap={
+            "limit": batch.cap,
+            "generated": len(batch.mutants),
+            "considered": batch.considered,
+            "elided": batch.elided,
+        },
+        runs=runs,
+        spend=spend,
+        cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
+        warnings=warnings,
+    )
+
+
+def _mutation_cost(paradigm, estimate, ceiling, adapter):
+    from ..envelope import Cost
+    from ..guards.cost_guard import estimate_quality_of
+
+    return Cost(
+        paradigm=paradigm,
+        estimate=estimate,
+        ceiling=ceiling,
+        estimate_quality=estimate_quality_of(adapter, estimate, paradigm=paradigm),
+    )
+
+
+def _mutable_model(engine, shadow, model: str, mutation_mod):
+    """The node to mutate, or the free refusal saying why this model is not one.
+
+    Every check here is answered from the parse alone, before a connection is
+    opened or a mutant is priced, because a model dex cannot mutate should cost
+    nothing to ask about.
+    """
+
+    from ..dbt_project import load as load_project
+
+    view = load_project(shadow.project)
+    original = _model_file(view, model)
+    if original is None:
+        raise mutation_mod.MutationError(
+            f"no model named '{model}' in this project's model paths"
+        )
+    path, content = original
+    # The header is appended rather than prepended: dbt gives a scalar config key
+    # to the last `config()` call in a file, so a model declaring its own
+    # `materialized` would otherwise win and the mutant would build a relation.
+    shadow.write(path, content + "\n" + mutation_mod.EPHEMERAL_HEADER + "\n")
+    manifest = shadow.compile(model)
+
+    matches = [
+        node
+        for uid, node in manifest.get("nodes", {}).items()
+        if uid.startswith("model.") and node.get("name") == model
+    ]
+    if not matches:
+        raise mutation_mod.MutationError(f"dbt compiled no model named '{model}'")
+    node = matches[0]
+    if node.get("language") == "python":
+        raise mutation_mod.MutationError(
+            f"'{model}' is a Python model; mutation coverage plants defects in SQL"
+        )
+    if node.get("package_name") != manifest.get("metadata", {}).get("project_name"):
+        raise mutation_mod.MutationError(
+            f"'{model}' belongs to an installed package rather than this project, "
+            "and dex does not mutate a package's own models"
+        )
+    if (node.get("config") or {}).get("sql_header"):
+        raise mutation_mod.MutationError(
+            f"'{model}' declares a sql_header, which only a materialization emits; "
+            "an ephemeral mutant would run without it and the tests would fail for "
+            "that reason rather than for the defect"
+        )
+    if (node.get("config") or {}).get("materialized") != "ephemeral":
+        # The override is what keeps every mutant from writing a relation, so a
+        # run must not proceed on a project where it silently did not apply.
+        raise mutation_mod.MutationError(
+            f"dex could not make '{model}' ephemeral for the run (it compiled as "
+            f"{(node.get('config') or {}).get('materialized')}), and it will not "
+            "run mutants that would materialize into your dev target"
+        )
+    if not _attached_tests(manifest, node):
+        # Free, and the more useful answer than "nothing to mutate": with no test
+        # to catch anything, every mutant survives by construction and the run
+        # would spend N dbt invocations to say so.
+        raise mutation_mod.MutationError(
+            f"'{model}' has no tests, so there is nothing to measure: every "
+            "planted defect would survive by construction. Write one first "
+            f"(`transform test --scaffold {model}` scaffolds a unit test), "
+            "then measure it"
+        )
+    return node, path
+
+
+def _attached_tests(manifest: dict, node: dict) -> list[str]:
+    """Every test dbt would run for this model, generic, singular and unit alike.
+
+    Read from the manifest rather than from a run, because it is the free answer
+    and it is what makes "this model has no tests" a refusal instead of N dbt
+    invocations that all report a survivor.
+    """
+
+    unique_id = node.get("unique_id")
+    attached = [
+        uid
+        for uid, other in manifest.get("nodes", {}).items()
+        if other.get("resource_type") == "test"
+        and (
+            other.get("attached_node") == unique_id
+            or unique_id in (other.get("depends_on") or {}).get("nodes", [])
+        )
+    ]
+    attached += [
+        uid
+        for uid, unit in (manifest.get("unit_tests") or {}).items()
+        if unique_id in (unit.get("depends_on") or {}).get("nodes", [])
+        or unit.get("model") == node.get("name")
+    ]
+    return attached
+
+
+def _model_file(view, model: str):
+    """The model's path and content, read off the project view."""
+
+    for path, file in view.files.items():
+        if not path.endswith(".sql"):
+            continue
+        if Path(path).stem == model and any(
+            path.startswith(str(Path(root))) for root in view.model_paths
+        ):
+            return path, file.content
+    return None
+
+
+def _plan_mutants(shadow, node, model_path, cap, dialect, mutation_mod):
+    """The compiled model, references restored, and the defects to plant in it."""
+
+    manifest = shadow.manifest()
+    parents = []
+    for uid in node.get("depends_on", {}).get("nodes", []):
+        parent = manifest.get("nodes", {}).get(uid) or manifest.get("sources", {}).get(
+            uid
+        )
+        if parent is None:
+            continue
+        ephemeral = (parent.get("config") or {}).get("materialized") == "ephemeral"
+        rendered = (
+            f"{mutation_mod.DBT_CTE_PREFIX}{parent['name']}"
+            if ephemeral
+            else parent.get("relation_name")
+        )
+        if not rendered:
+            continue
+        parents.append(
+            mutation_mod.ParentRelation(
+                rendered=rendered,
+                jinja=_reference_jinja(parent, uid),
+                ephemeral=ephemeral,
+            )
+        )
+    prepared = mutation_mod.prepare(
+        node.get("compiled_code") or "", dialect=dialect, parents=parents
+    )
+    return prepared, mutation_mod.enumerate_mutants(prepared, cap=cap)
+
+
+def _reference_jinja(parent: dict, unique_id: str) -> str:
+    """How a dbt file has to name this input for a unit test fixture to bind."""
+
+    if unique_id.startswith("source."):
+        return f"{{{{ source('{parent['source_name']}', '{parent['name']}') }}}}"
+    if parent.get("version") is not None:
+        return f"{{{{ ref('{parent['name']}', v={parent['version']}) }}}}"
+    return f"{{{{ ref('{parent['name']}') }}}}"
+
+
+def _price_mutations(adapter, shadow, model_path, batch, node, mutation_mod):
+    """Price the whole batch upfront, per mutant, as one number to confirm.
+
+    Each mutant is priced as the statements the warehouse will actually run,
+    which means splicing it into each test's compiled SQL rather than pricing the
+    model alone: a mutant that drops a partition predicate scans more than the
+    model it came from, and pricing the batch at the baseline's cost would
+    under-report it. Under-reporting is the one direction a cost guard must never
+    round.
+    """
+
+    estimator = getattr(adapter, "query_estimate", None)
+    if estimator is None:
+        return None, {}, ["connector exposes no estimator; the batch is not priced"]
+
+    manifest = shadow.manifest()
+    tests = [
+        node.get("compiled_code")
+        for node in manifest.get("nodes", {}).values()
+        if node.get("resource_type") == "test" and node.get("compiled_code")
+    ]
+    notes: list[str] = []
+    if not tests:
+        notes.append(
+            "only unit tests read this model, and a unit test runs against "
+            "fixtures rather than the warehouse, so the batch prices at zero"
+        )
+
+    def price(body: str) -> float:
+        total = 0.0
+        for test_sql in tests:
+            spliced = mutation_mod.inline_into_test(
+                test_sql, model_name=node["name"], body=body, dialect=adapter.dialect
+            )
+            with contextlib.suppress(Exception):
+                total += estimator(spliced if spliced is not None else test_sql)
+        return total
+
+    per_mutant: dict[str, float] = {}
+    with contextlib.suppress(Exception):
+        per_mutant["(baseline)"] = price(batch.identity)
+    for mutant in batch.mutants:
+        with contextlib.suppress(Exception):
+            per_mutant[f"{mutant.id} {mutant.operator}"] = price(mutant.body)
+    if not per_mutant:
+        return None, {}, [*notes, "the batch could not be priced upfront"]
+    return sum(per_mutant.values()), per_mutant, notes
+
+
+def _run_mutants(
+    shadow,
+    model_path,
+    batch,
+    *,
+    model: str,
+    paradigm,
+    connector: str,
+    store,
+    ceiling: float | None,
+    estimate: float | None,
+    mutation_mod,
+):
+    """The baseline, then one run per mutant, stopping if the budget runs out."""
+
+    from ..envelope import Paradigm
+
+    warnings: list[str] = []
+    runs = 0
+    spent = 0.0
+    spend: dict[str, float | None] | None = None
+
+    shadow.write(model_path, batch.identity)
+    baseline_summary = shadow.test(model)
+    runs += 1
+    spend, _ = _settle_dbt_spend(
+        baseline_summary or {},
+        [],
+        paradigm=paradigm,
+        connector=connector,
+        store=store,
+        estimate=None,
+        command="transform test",
+    )
+    baseline = _test_statuses(baseline_summary)
+    excluded = [
+        {"name": name, "status": status, "reason": _exclusion_reason(status)}
+        for name, status in sorted(baseline.items())
+        if status != "pass"
+    ]
+    if not any(status == "pass" for status in baseline.values()):
+        raise mutation_mod.MutationError(
+            f"no test of '{model}' passes against the unmutated model, so there is "
+            "nothing that could catch a defect. Build its parents first "
+            f"(`transform build --select +{model}`) and fix the failing tests, "
+            "then measure them"
+        )
+
+    mutants: list[dict] = []
+    counts = {"killed": 0, "survived": 0, "rejected": 0, "not_run": 0}
+    per_run = (estimate or 0.0) / max(len(batch.mutants) + 1, 1)
+    for mutant in batch.mutants:
+        if (
+            paradigm is not Paradigm.FREE_LOCAL
+            and ceiling is not None
+            and spent + per_run > ceiling
+        ):
+            # An unknown settlement counts at its estimate, so the guard never
+            # rounds spend down on the way to deciding it can afford another run.
+            for remaining in batch.mutants[len(mutants) :]:
+                mutants.append({**remaining.payload(), "status": "not_run"})
+                counts["not_run"] += 1
+            warnings.append(
+                f"the confirmed budget covered {runs - 1} of {len(batch.mutants)} "
+                "mutants; the rest are reported as not_run. Re-run with a larger "
+                "--budget, or narrow the run with --max-mutants"
+            )
+            break
+        shadow.write(model_path, mutant.body)
+        summary = shadow.test(model)
+        runs += 1
+        run_spend, _ = _settle_dbt_spend(
+            summary or {},
+            [],
+            paradigm=paradigm,
+            connector=connector,
+            store=store,
+            estimate=None,
+            command="transform test",
+        )
+        spent += _spent_in_run(run_spend, paradigm, fallback=per_run)
+        spend = _merge_spend(spend, run_spend)
+        verdict = mutation_mod.classify(baseline, _test_statuses(summary))
+        counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
+        mutants.append(
+            {
+                **mutant.payload(),
+                "status": verdict.outcome,
+                "caught_by": verdict.caught_by,
+                "warn_only": verdict.warn_only,
+            }
+        )
+
+    # Survivors first: the reader is deciding which test to write next, and the
+    # mutants that were caught are the ones they need to read least.
+    order = {"survived": 0, "not_run": 1, "rejected": 2, "killed": 3}
+    mutants.sort(key=lambda m: (order.get(m["status"], 9), m["id"]))
+    decided = counts["killed"] + counts["survived"]
+    return {
+        "baseline": {
+            "tests": [
+                {"name": name, "status": status}
+                for name, status in sorted(baseline.items())
+            ],
+            "excluded": excluded,
+        },
+        "mutants": mutants,
+        "counts": {"generated": len(batch.mutants), **counts},
+        "score": (counts["killed"] / decided) if decided else None,
+        "_meta": (runs, spend, warnings),
+    }
+
+
+def _refresh_session_total(spend, gate, store, paradigm, connector):
+    """Settle the gate, then re-read the day's total the envelope will report.
+
+    A build settles its gate before reading the ledger back for the same reason:
+    the reservation is headroom the command is holding, not spend it has
+    incurred, so a total read while it stands reports work nobody did. This
+    command holds one reservation across N runs, which makes the overstatement
+    exactly the whole batch estimate rather than a rounding difference.
+    """
+
+    from ..envelope import Paradigm
+    from ..guards.cost_guard import ledger_field, utc_day_start
+
+    if gate is None or spend is None or paradigm is Paradigm.FREE_LOCAL:
+        return spend
+    gate.settle()
+    with contextlib.suppress(Exception):
+        spend = {
+            **spend,
+            "session_spent_today": store.spend_since(
+                utc_day_start(), field=ledger_field(paradigm), connector=connector
+            ),
+        }
+    return spend
+
+
+def _test_statuses(summary: dict | None) -> dict[str, str]:
+    """Each test node's status, keyed by the name a caller would recognize."""
+
+    if not summary:
+        return {}
+    return {
+        node["name"]: node["status"]
+        for node in summary.get("nodes", [])
+        if str(node.get("unique_id", "")).startswith(("test.", "unit_test."))
+    }
+
+
+def _exclusion_reason(status: str) -> str:
+    if status == "error":
+        return (
+            "this test could not run against the unmutated model, so it cannot "
+            "testify about a mutant either"
+        )
+    return (
+        "this test was already failing before anything was mutated; counting it "
+        "as a catch would report the suite as strong because it is broken"
+    )
+
+
+def _spent_in_run(spend: dict | None, paradigm, *, fallback: float) -> float:
+    from ..guards.cost_guard import spend_field
+
+    if not spend:
+        return fallback
+    value = spend.get(spend_field(paradigm))
+    # Unknown settlement counts at the estimate rather than at zero.
+    return fallback if value is None else float(value)
+
+
+#: Spend keys that are a reading of the world rather than this command's own
+#: contribution to it, so the newest answer replaces the previous one instead of
+#: being added to it. Summing `session_spent_today` across nine runs reported a
+#: day's total nine times over, which is the one direction a spend report must
+#: not err in.
+_SPEND_LATEST_WINS = {"session_spent_today", "reserved"}
+
+
+def _merge_spend(running: dict | None, latest: dict | None) -> dict | None:
+    """Accumulate what a sequence of dbt runs billed into one command's spend.
+
+    Three kinds of key and three rules, because a spend payload is not uniformly
+    additive. What each run billed sums. A reading of the day's cumulative total
+    is already cumulative, so the latest one wins. The two flags are claims about
+    the whole command: it settled only if every run did, and its settlement is
+    unknown if any run's was, which is why they are combined rather than added.
+    Booleans are integers in Python, so an additive rule silently turned
+    ``settled: true`` into ``settled: 9``.
+    """
+
+    if latest is None:
+        return running
+    if running is None:
+        return dict(latest)
+    merged = dict(running)
+    for key, value in latest.items():
+        previous = merged.get(key)
+        if isinstance(value, bool) or isinstance(previous, bool):
+            if key == "unknown_settlement":
+                merged[key] = bool(previous) or bool(value)
+            else:
+                merged[key] = bool(previous) and bool(value)
+        elif key in _SPEND_LATEST_WINS:
+            merged[key] = value if value is not None else previous
+        elif isinstance(value, (int, float)) and isinstance(previous, (int, float)):
+            merged[key] = previous + value
+        elif previous is None:
+            merged[key] = value
+    return merged
+
+
 def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from .mutation import MutationError
     from .test_scaffold import TestScaffoldError
 
+    scaffold = getattr(args, "scaffold", None)
+    mutate = getattr(args, "mutate", None)
     try:
-        result = test_scaffold(engine, getattr(args, "scaffold", None))
+        if scaffold and mutate:
+            raise ValueError(
+                "--scaffold writes a unit test and --mutate measures the tests "
+                "that exist; run one, then the other"
+            )
+        if mutate:
+            return to_envelope(
+                test_mutations(
+                    engine,
+                    mutate,
+                    max_mutants=getattr(args, "max_mutants", None),
+                    target=getattr(args, "target", None),
+                )
+            )
+        result = test_scaffold(engine, scaffold)
         return to_envelope(result, hints=plan_hint(result))
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
-    except (ValueError, TestScaffoldError) as exc:
+    except (ValueError, TestScaffoldError, MutationError) as exc:
         return env.error_for(exc)
 
 
@@ -1612,12 +2231,15 @@ def _record_build_spend(
     estimate: float | None = None,
     *,
     gate_billed: float = 0.0,
+    command: str = "transform build",
 ) -> dict[str, float | None]:
-    """Account a billed dbt build in the spend ledger and report what it cost.
+    """Account a billed dbt run in the spend ledger and report what it cost.
 
-    The paradigm names both units, so a build draws against the same session
+    The paradigm names both units, so a run draws against the same session
     budget as an explore scan and reports spend under the key every other
-    command reports it under.
+    command reports it under. ``command`` is what the ledger row is filed under,
+    which matters because more than one command now runs dbt: a reader summing
+    what `transform build` spent must not be handed another command's rows.
 
     ``billed`` is ``None`` only where dbt executed statements and reported no
     billing figure for any of them, which is unknown spend rather than none.
@@ -1660,7 +2282,7 @@ def _record_build_spend(
             # settled outside any reservation".
             ledger_row(
                 connector=connector,
-                command="transform build",
+                command=command,
                 entry="settlement",
                 field=field,
                 amount=billed,
@@ -1697,6 +2319,127 @@ def _record_build_spend(
         "unknown_settlement": billed is None,
         "reserved": None,
     }
+
+
+def _settle_dbt_spend(
+    summary: dict,
+    notes: list[str],
+    *,
+    paradigm,
+    connector: str,
+    store: Store,
+    estimate: float | None,
+    adapter=None,
+    gate_billed: float = 0.0,
+    command: str = "transform build",
+) -> tuple[dict[str, float | None] | None, list[str]]:
+    """What one finished dbt run cost, ledgered, with the note that explains it.
+
+    One function per paradigm's accounting rather than three scattered branches,
+    because every caller that runs dbt owes the same three things: read the
+    actual out of the artifact in that paradigm's unit, append a ledger row, and
+    say which server-side cap bound the run. Returns the spend payload and the
+    notes with the cap note in front, since the cap is context for the number
+    rather than an afterthought to it.
+
+    ``command`` names the ledger row's command, so a caller that is not a build
+    settles under its own name and a reader summing one command's spend is not
+    handed another's.
+    """
+
+    from ..envelope import Paradigm
+
+    spend: dict[str, float | None] | None = None
+    if paradigm is Paradigm.BYTES_SCANNED:
+        notes = [
+            "each statement was capped server-side by the profile's "
+            "maximum_bytes_billed (a per-statement cap, not per run)",
+            *notes,
+        ]
+        # Popped, not read: `data.spend` is the one place any command reports
+        # what it billed, and a second copy at the top of `data` that only this
+        # command carried was worse than no copy at all (issue #276). A caller
+        # reading `data.bytes_billed` saw a build's spend and nothing for a
+        # `maintain check` that had just scanned 0.89 GB, and an absent key
+        # defaulted to zero reads as free.
+        billed = summary.pop("bytes_billed", None)
+        if billed is None and summary.get("nodes"):
+            # Statements ran and not one of them reported a billing figure, so
+            # what this run cost is unknown rather than nothing. Reporting the
+            # key as null says exactly that; zero would under-report spend, which
+            # is the one direction a cost guard must never round. A run that
+            # died before executing anything has an empty `nodes` and really did
+            # bill nothing, so it settles at zero like any other free run.
+            notes = [
+                *notes,
+                "dbt reported no billing figure for any statement in this run, "
+                "so spend is unknown rather than zero and nothing was appended "
+                "to the spend ledger",
+            ]
+            if gate_billed:
+                notes = [
+                    *notes,
+                    "the verification row counts did bill, and are in the "
+                    "ledger and in session_spent_today; an unknown build "
+                    "figure plus a known one is still unknown, so they are "
+                    "not added into the reported spend",
+                ]
+        else:
+            billed = float(billed or 0.0)
+        spend = _record_build_spend(
+            store,
+            connector,
+            billed,
+            paradigm,
+            estimate,
+            gate_billed=gate_billed,
+            command=command,
+        )
+    elif paradigm is Paradigm.COMPUTE_TIME:
+        cap_note = _COMPUTE_TIME_CAP_NOTES.get(
+            connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
+        )
+        notes = [cap_note, *notes]
+        # dbt-snowflake, dbt-databricks, and dbt-redshift report no billing figure;
+        # per-node execution time is the honest compute-seconds actual. It is
+        # always known (a run with no nodes burned no seconds), so unlike the
+        # bytes path there is no unknown case to distinguish from zero.
+        seconds = sum(
+            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
+        )
+        spend = _record_build_spend(
+            store,
+            connector,
+            seconds,
+            paradigm,
+            estimate,
+            gate_billed=gate_billed,
+            command=command,
+        )
+        translate = getattr(adapter, "compute_spend_translation", None)
+        if translate is not None:
+            # Unconditional, including at zero seconds: the translated keys
+            # (compute-unit-hours, USD) are part of this connector's spend shape,
+            # and a run that omitted them would be the same present-sometimes key
+            # this issue is about, one level down.
+            spend.update(translate(seconds))
+    elif paradigm is Paradigm.DB_LOAD:
+        notes = [_DB_LOAD_CAP_NOTES.get(connector, _UNCAPPED_BUILD_NOTE), *notes]
+        # The db-load dbt adapters report no billing figure; per-node execution
+        # time is the honest database-seconds actual.
+        seconds = sum(
+            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
+        )
+        spend = _record_build_spend(
+            store,
+            connector,
+            seconds,
+            paradigm,
+            estimate,
+            gate_billed=gate_billed,
+            command=command,
+        )
+    return spend, notes
 
 
 def _price_build(
@@ -1904,7 +2647,6 @@ def _shape_build_result(
     releasing first would overstate it by the whole estimate.
     """
 
-    from ..envelope import Paradigm
     from ..guards.cost_guard import (
         no_session_ceiling_warning,
         unserialized_ledger_warning,
@@ -1927,83 +2669,21 @@ def _shape_build_result(
                 "nodes this build touched; they are reported in "
                 "data.verification.findings and do not change the build's status",
             ]
-    spend: dict[str, float | None] | None = None
     # What the handshake priced this build at, ledgered beside what it billed so
     # a later over-ceiling refusal on this connector can say how far the two
     # have run apart. `None` on the degraded-pricing path, where there was no
     # estimate to compare against and inventing one would be worse than none.
     estimate = getattr(cost, "estimate", None)
-    if paradigm is Paradigm.BYTES_SCANNED:
-        notes = [
-            "each statement was capped server-side by the profile's "
-            "maximum_bytes_billed (a per-statement cap, not per run)",
-            *notes,
-        ]
-        # Popped, not read: `data.spend` is the one place any command reports
-        # what it billed, and a second copy at the top of `data` that only this
-        # command carried was worse than no copy at all (issue #276). A caller
-        # reading `data.bytes_billed` saw a build's spend and nothing for a
-        # `maintain check` that had just scanned 0.89 GB, and an absent key
-        # defaulted to zero reads as free.
-        billed = summary.pop("bytes_billed", None)
-        if billed is None and summary.get("nodes"):
-            # Statements ran and not one of them reported a billing figure, so
-            # what this build cost is unknown rather than nothing. Reporting the
-            # key as null says exactly that; zero would under-report spend, which
-            # is the one direction a cost guard must never round. A build that
-            # died before executing anything has an empty `nodes` and really did
-            # bill nothing, so it settles at zero like any other free run.
-            notes = [
-                *notes,
-                "dbt reported no billing figure for any statement in this run, "
-                "so spend is unknown rather than zero and nothing was appended "
-                "to the spend ledger",
-            ]
-            if gate_billed:
-                notes = [
-                    *notes,
-                    "the verification row counts did bill, and are in the "
-                    "ledger and in session_spent_today; an unknown build "
-                    "figure plus a known one is still unknown, so they are "
-                    "not added into the reported spend",
-                ]
-        else:
-            billed = float(billed or 0.0)
-        spend = _record_build_spend(
-            store, connector, billed, paradigm, estimate, gate_billed=gate_billed
-        )
-    elif paradigm is Paradigm.COMPUTE_TIME:
-        cap_note = _COMPUTE_TIME_CAP_NOTES.get(
-            connector, _DEFAULT_COMPUTE_TIME_CAP_NOTE
-        )
-        notes = [cap_note, *notes]
-        # dbt-snowflake, dbt-databricks, and dbt-redshift report no billing figure;
-        # per-node execution time is the honest compute-seconds actual. It is
-        # always known (a run with no nodes burned no seconds), so unlike the
-        # bytes path there is no unknown case to distinguish from zero.
-        seconds = sum(
-            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
-        )
-        spend = _record_build_spend(
-            store, connector, seconds, paradigm, estimate, gate_billed=gate_billed
-        )
-        translate = getattr(adapter, "compute_spend_translation", None)
-        if translate is not None:
-            # Unconditional, including at zero seconds: the translated keys
-            # (compute-unit-hours, USD) are part of this connector's spend shape,
-            # and a run that omitted them would be the same present-sometimes key
-            # this issue is about, one level down.
-            spend.update(translate(seconds))
-    elif paradigm is Paradigm.DB_LOAD:
-        notes = [_DB_LOAD_CAP_NOTES.get(connector, _UNCAPPED_BUILD_NOTE), *notes]
-        # The db-load dbt adapters report no billing figure; per-node execution
-        # time is the honest database-seconds actual.
-        seconds = sum(
-            float(node.get("execution_time") or 0) for node in summary.get("nodes", [])
-        )
-        spend = _record_build_spend(
-            store, connector, seconds, paradigm, estimate, gate_billed=gate_billed
-        )
+    spend, notes = _settle_dbt_spend(
+        summary,
+        notes,
+        paradigm=paradigm,
+        connector=connector,
+        store=store,
+        estimate=estimate,
+        adapter=adapter,
+        gate_billed=gate_billed,
+    )
     notes = [
         *notes,
         *no_session_ceiling_warning(
