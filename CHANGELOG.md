@@ -9,6 +9,35 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **A cross-skill, externally authored triggering corpus for the Tier-2 eval
+  harness** ([#216]). Each skill's own `evals.json` `positive`/`negative` list
+  is written by whoever wrote the description it tests, at the same time,
+  and checked with every other skill disabled; neither weakness is visible
+  from inside that suite. `evals/corpus/ade_bench_triggering.json` sources 30
+  real analytics-engineering requests from
+  [dbt-labs/ade-bench](https://github.com/dbt-labs/ade-bench) (Apache-2.0),
+  hand-labeled with the skill each should fire (or `none`), and run with
+  every skill available at once, one live call per prompt rather than one
+  per prompt-per-skill.
+
+  `python -m evals --corpus evals/corpus/ade_bench_triggering.json` reports
+  per-skill precision and recall plus which cases missed, and always exits
+  0: it is a measurement against externally authored prompts, not a release
+  gate, since the initial pass rate is expected to be low and that is the
+  signal the corpus exists to produce.
+
+  `Classifier.classify` reports every skill marker a call finds, not a single
+  winner: a prompt where two skills both fire is real evidence of cross-skill
+  contamination, and picking one silently would hide exactly the failure
+  mode this corpus exists to catch. A per-call failure is caught by the
+  classifier itself and recorded per case, excluded from precision/recall;
+  a setup failure (the `claude` binary missing) is left to propagate
+  immediately instead, so it aborts the run once with the existing
+  prerequisite message and exit code 2, rather than being recorded as 30
+  separate case errors while the command still reports a clean exit.
+
 ## [1.12.2] - 2026-09-09
 
 ### Fixed
@@ -1615,23 +1644,6 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
   proposal but are deferred: they need `rank()` to expose per-signal
   contributions rather than only the final score, which is new design work
   the capping fix does not need.
-
-- **A cross-skill, externally authored triggering corpus for the Tier-2 eval
-  harness** ([#216]). Each skill's own `evals.json` `positive`/`negative` list
-  is written by whoever wrote the description it tests, at the same time,
-  and checked with every other skill disabled; neither weakness is visible
-  from inside that suite. `evals/corpus/ade_bench_triggering.json` sources 30
-  real analytics-engineering requests from
-  [dbt-labs/ade-bench](https://github.com/dbt-labs/ade-bench) (Apache-2.0),
-  hand-labeled with the skill each should fire (or `none`), and run with
-  every skill available at once, one live call per prompt rather than one
-  per prompt-per-skill.
-
-  `python -m evals --corpus evals/corpus/ade_bench_triggering.json` reports
-  per-skill precision and recall plus which cases missed, and always exits
-  0: it is a measurement against externally authored prompts, not a release
-  gate, since the initial pass rate is expected to be low and that is the
-  signal the corpus exists to produce.
 
 - **`maintain schema` detects a model added, removed, or content-changed
   since the baseline** ([#164]). The transform layer's fingerprint (model

@@ -48,6 +48,36 @@ class EvalSuite:
     evals: list[EvalCase] = field(default_factory=list)
 
 
+@dataclass
+class CorpusCase:
+    """One externally authored prompt, labeled with the skill it should fire
+    (or ``None`` where no skill should fire)."""
+
+    task_id: str
+    prompt: str
+    expected_skill: str | None
+
+
+@dataclass
+class Corpus:
+    """An externally authored triggering fixture: real requests written by
+    someone with no knowledge of the skill descriptions, each hand-labeled.
+
+    Unlike :class:`EvalSuite`, a corpus is not scoped to one skill: it is run
+    against every skill at once (see ``evals.runner.run_corpus``), which is
+    what makes it able to catch a case a per-skill positive/negative list
+    cannot: two skills' descriptions both plausibly firing on the same prompt,
+    or the right skill losing to a sibling's wording.
+
+    ``source`` carries provenance: where the prompts came from and under what
+    license, since these are someone else's words, reproduced verbatim.
+    """
+
+    name: str
+    source: dict[str, Any]
+    cases: list[CorpusCase] = field(default_factory=list)
+
+
 def load_suite(skill_or_file: Path | str) -> EvalSuite:
     """Load a suite from a skill directory or a direct path to ``evals.json``."""
 
@@ -89,3 +119,47 @@ def _suite_from_dict(raw: dict[str, Any], path: Path) -> EvalSuite:
             )
         )
     return EvalSuite(skill_name=skill_name, triggering=triggering, evals=cases)
+
+
+def load_corpus(path: Path | str) -> Corpus:
+    """Load an externally authored triggering corpus (see :class:`Corpus`)."""
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"no corpus file at {path}")
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise InvalidSuiteError(f"{path}: top level must be an object")
+
+    name = raw.get("name")
+    if not isinstance(name, str) or not name:
+        raise InvalidSuiteError(f"{path}: 'name' is required")
+    source = raw.get("source")
+    if not isinstance(source, dict) or not source:
+        raise InvalidSuiteError(
+            f"{path}: 'source' is required (provenance and license for the "
+            "externally authored prompts)"
+        )
+
+    cases: list[CorpusCase] = []
+    for i, entry in enumerate(raw.get("cases", [])):
+        if "prompt" not in entry:
+            raise InvalidSuiteError(f"{path}: cases[{i}] has no 'prompt'")
+        if "expected_skill" not in entry:
+            raise InvalidSuiteError(f"{path}: cases[{i}] has no 'expected_skill'")
+        # "none" is the on-disk spelling (JSON has nothing better to write for a
+        # case where no skill should fire); a Classifier reports the same
+        # absence as Python None, so the two are reconciled here rather than
+        # everywhere a case gets compared against a classifier's answer.
+        label = entry["expected_skill"]
+        cases.append(
+            CorpusCase(
+                task_id=entry.get("task_id", str(i)),
+                prompt=entry["prompt"],
+                expected_skill=None if label == "none" else label,
+            )
+        )
+    if not cases:
+        raise InvalidSuiteError(f"{path}: 'cases' is empty")
+    return Corpus(name=name, source=source, cases=cases)
