@@ -9,6 +9,48 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **`transform test --mutate <model>` measures whether a model's tests would
+  catch anything** ([#232]). A suite that passes proves the tests ran, not that
+  they would object if the model were wrong, and no count distinguishes the two:
+  a `not_null` on a surrogate key and a unit test pinning the arithmetic both
+  read as "tested". This plants one standard analytics defect at a time in the
+  model's compiled SQL (a boundary flipped, a filter dropped or negated, an
+  inner join swapped for a left join, a `CASE` branch removed, a ratio inverted,
+  a window frame shifted, `sum` reporting a `max`), runs the model's own generic,
+  singular and unit tests against each, and reports which defects nothing caught.
+  Each finding is written as the defect rather than as a diff, and carries the
+  test that would catch it, because the reader's next action is to write a test.
+
+  **Nothing is written and nothing is materialized.** Every mutant is built in a
+  throwaway copy of the project as an ephemeral model, so dbt inlines it into
+  each test and creates no relation: the project is byte-identical afterwards and
+  the dev namespace holds exactly what it held before. The dogfood checked both
+  on all three warehouses. The run uses `dbt test` rather than `dbt build`,
+  which is load-bearing: under a build, one failing unit test marks the model
+  skipped and that skip cascades onto every data test attached to it, so every
+  mutant would read as caught and nothing would be learned about the data tests.
+
+  **The batch is priced and confirmed once.** On a metered connector each mutant
+  is priced as the statement the warehouse will actually run, by splicing it into
+  each test's compiled SQL rather than multiplying the baseline, because a mutant
+  that drops a partition predicate scans more than the model it came from. One
+  estimate names `(baseline)` and each mutant; one `--budget` covers the run. A
+  budget that runs out partway stops the run and reports the remainder as
+  `not_run` rather than overspending. Capped at 20 mutants, ordered round robin
+  across the defect classes so a cap stays representative, with whatever it cut
+  reported per class.
+
+  **Every verdict is relative to what already passed.** A test failing before
+  anything was mutated is excluded and named, so a suite measured against its own
+  broken tests cannot come back looking clean, and a run where nothing passes at
+  baseline is an error rather than a clean sweep. A mutant the warehouse refuses
+  outright is reported as `rejected` rather than `killed`, since a build would
+  have failed on it anyway and counting it would flatter the suite.
+
+  Also available as `DexEngine.test_mutations(model)`.
+
 ## [1.12.2] - 2026-09-09
 
 ### Fixed
