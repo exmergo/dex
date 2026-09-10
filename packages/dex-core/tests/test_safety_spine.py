@@ -3406,7 +3406,7 @@ def test_no_payload_is_keyed_by_a_warehouse_object_name(capsys):
 
 
 _FILE_CANARIES = [
-    "gs://exmergo-docs/2026/CANARY-FILENAME-jane-doe-078-05-1120.pdf",
+    "gs://example-bucket/2026/CANARY-FILENAME-personal.pdf",
     "https://storage.googleapis.com/b/o.pdf?X-Goog-Signature=abc&X-Goog-Expires=600",
     "CANARY-DOC-TEXT Total due 54.00",
     "INVALID_ARGUMENT: CANARY-PROVIDER-ERROR could not read 'Jane Doe'",
@@ -3427,7 +3427,7 @@ def test_file_aggregates_cannot_carry_document_content():
 
     names = TypeAdapter(RelationName)
     summary = {
-        "collection": "exmergo-viz.dex_ci.files_obj",
+        "collection": "my-project.docs.files_obj",
         "kind": "bigquery_object_table",
         "file_count": 0,
         "metadata_refreshed_at": {"reason": "not_reported"},

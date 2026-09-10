@@ -164,7 +164,7 @@ def test_the_walker_catches_the_fields_it_exists_to_catch():
 @pytest.mark.parametrize(
     "hostile",
     [
-        "gs://exmergo-docs/2026/CANARY-FILENAME-jane-doe.pdf",
+        "gs://example-bucket/2026/CANARY-FILENAME-personal.pdf",
         "https://storage.googleapis.com/b/o.pdf?X-Goog-Signature=abc&X-Goog-Expires=600",
         "/Volumes/main/raw/docs/contract.pdf",
         "@stage/docs/contract.pdf",
@@ -181,7 +181,7 @@ def test_a_relation_name_refuses_paths_urls_text_and_quoting(hostile):
 
 
 @pytest.mark.parametrize(
-    "name", ["exmergo-viz.dex_ci.files_obj", "RAW.DOCS.INVOICES", "main.docs"]
+    "name", ["my-project.docs.files_obj", "RAW.DOCS.INVOICES", "main.docs"]
 )
 def test_a_relation_name_accepts_the_identifiers_connectors_report(name):
     assert TypeAdapter(file_results.RelationName).validate_python(name) == name
@@ -241,7 +241,7 @@ def test_a_ratio_carries_both_sides_and_stays_within_its_denominator():
 
 def _inventory(**overrides) -> CollectionInventory:
     fields = {
-        "collection": "exmergo-viz.dex_ci.files_obj",
+        "collection": "my-project.docs.files_obj",
         "kind": CollectionKind.BIGQUERY_OBJECT_TABLE,
         "observed_at": NOW,
         "file_count": 21,
@@ -314,7 +314,7 @@ def test_an_inventory_update_range_runs_forwards():
 
 def test_discovery_reports_a_count_it_did_not_scan_for_as_unavailable():
     summary = CollectionSummary(
-        collection="exmergo-viz.dex_ci.files_obj",
+        collection="my-project.docs.files_obj",
         kind=CollectionKind.BIGQUERY_OBJECT_TABLE,
         file_count=Unavailable(reason=UnavailableReason.NOT_REPORTED),
         metadata_refreshed_at=Unavailable(reason=UnavailableReason.NOT_REPORTED),
@@ -371,9 +371,9 @@ def _diagnostics(**overrides) -> DiagnosticDistributions:
 def _profile(**overrides) -> FileProfile:
     fields = {
         "collection": CollectionScope(
-            collection="exmergo-viz.dex_ci.files_obj",
+            collection="my-project.docs.files_obj",
             kind=CollectionKind.BIGQUERY_OBJECT_TABLE,
-            result_table="exmergo-viz.dex_ci.files_docai_results",
+            result_table="my-project.docs.parsed_documents",
             result_format=ResultFormatName.BIGQUERY_DOCUMENT_AI,
             families=(DocumentFamily.PDF, DocumentFamily.SCANNED_IMAGE),
             metadata_fields=(MetadataField.SIZE, MetadataField.VERSION),
