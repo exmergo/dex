@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -252,6 +253,99 @@ def _route_build(monkeypatch, root: Path, project: Path) -> None:
     monkeypatch.setattr(build_module, "_default_runner", fake)
 
 
+def _route_mutation(monkeypatch, root: Path, project: Path) -> None:
+    """Make a billed `transform test --mutate` run without a warehouse or dbt.
+
+    Same shape as :func:`_route_build` and for the same reason, with one
+    addition: this command prices its batch through the adapter's own
+    ``query_estimate``, so the stub has to answer that, and it settles once per
+    dbt invocation rather than once per command, which is the property the
+    ledger assertions below are here to pin.
+    """
+
+    from exmergo_dex_core.transform import dev_target
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    store = FilesystemStore(root)
+
+    class StubAdapter:
+        paradigm = Paradigm.BYTES_SCANNED
+        name = "bigquery"
+        dialect = "bigquery"
+
+        def __init__(self):
+            self.cost_gate = _billed_gate(store, "transform test")
+
+        def query_estimate(self, sql: str) -> float:
+            return float(MB)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        DexEngine, "_adapter", lambda self, cmd=None, **kw: StubAdapter()
+    )
+    monkeypatch.setattr(dev_target, "check", lambda *a, **k: [])
+
+    manifest = json.dumps(
+        {
+            "metadata": {"project_name": "dex_test"},
+            "nodes": {
+                "model.dex_test.stg_customers": {
+                    "name": "stg_customers",
+                    "unique_id": "model.dex_test.stg_customers",
+                    "package_name": "dex_test",
+                    "language": "sql",
+                    "config": {"materialized": "ephemeral"},
+                    "depends_on": {"nodes": []},
+                    "compiled_code": "select id from raw where id > 1",
+                },
+                "test.dex_test.not_null_stg_customers_id.abc": {
+                    "name": "not_null_stg_customers_id",
+                    "unique_id": "test.dex_test.not_null_stg_customers_id.abc",
+                    "resource_type": "test",
+                    "attached_node": "model.dex_test.stg_customers",
+                    "depends_on": {"nodes": ["model.dex_test.stg_customers"]},
+                    "compiled_code": (
+                        "with __dbt__cte__stg_customers as (select id from raw) "
+                        "select id from __dbt__cte__stg_customers"
+                    ),
+                },
+            },
+            "unit_tests": {},
+        }
+    )
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "test.dex_test.not_null_stg_customers_id.abc",
+                    "status": "pass",
+                    "execution_time": 1.0,
+                    "adapter_response": {"bytes_billed": 3000},
+                }
+            ]
+        }
+    )
+
+    def fake(timeout: float, cwd, env=None):
+        def run(argv: list[str]):
+            target_path = Path(argv[argv.index("--target-path") + 1])
+            target_path.mkdir(parents=True, exist_ok=True)
+            (target_path / "manifest.json").write_text(manifest, encoding="utf-8")
+            if argv[1] == "test":
+                (target_path / "run_results.json").write_text(
+                    run_results, encoding="utf-8"
+                )
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="", stderr=""
+            )
+
+        return run
+
+    monkeypatch.setattr(build_module, "_default_runner", fake)
+
+
 def _seed_query_cache(root: Path) -> None:
     """A cache that already adjudicates `shop.customers`, so `explore query`
     prices the query itself instead of auto-profiling first. The column signature
@@ -373,6 +467,35 @@ def billed_runs(
                 "build",
                 "--target",
                 "dev",
+                "--confirm",
+                "--budget",
+                BUDGET,
+            ],
+            capsys,
+        )["data"]
+
+    # `transform test --mutate` needs a dbt project under its root too, so it
+    # gets a copy rather than sharing the build's: one ledger per command is what
+    # lets a row be attributed to the command that wrote it, and this is the one
+    # billed command that invokes dbt more than once and so settles more than one
+    # row per run.
+    mutation_root = root("transform test")
+    shutil.copytree(bigquery_project, mutation_root / bigquery_project.name)
+    roots["transform test"] = mutation_root
+    with monkeypatch.context() as patch:
+        _route_mutation(patch, mutation_root, mutation_root / bigquery_project.name)
+        payloads["transform test"] = _run(
+            [
+                "--repo-root",
+                str(mutation_root),
+                "--connector",
+                "bigquery",
+                "transform",
+                "test",
+                "--mutate",
+                "stg_customers",
+                "--max-mutants",
+                "1",
                 "--confirm",
                 "--budget",
                 BUDGET,

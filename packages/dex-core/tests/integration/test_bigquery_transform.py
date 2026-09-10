@@ -241,3 +241,127 @@ def test_a_missing_dev_dataset_warns_rather_than_refusing(
     assert "dex_absent_dev_dataset does not exist" in warnings[0]
     assert "bigquery.datasets.create" in warnings[0]
     assert "bq mk --dataset --location=US" in warnings[0]
+
+
+def test_mutation_coverage_prices_the_batch_then_measures_the_tests(
+    tmp_path: Path, capsys, bq_project: str, bq_scratch_dataset: str
+):
+    """Mutation coverage against a metered connector, end to end.
+
+    Two things only a live run can establish. The batch is priced and confirmed
+    as one number before any mutant executes, which is the cost contract for the
+    most expensive command dex has. And nothing the run does materializes:
+    mutants build as ephemeral models, so the dev dataset holds exactly the
+    relations it held before, which a fake dbt cannot demonstrate.
+    """
+
+    pytest.importorskip("dbt.adapters.bigquery")
+    root = str(tmp_path)
+    _seed_transform_repo(tmp_path, bq_project, bq_scratch_dataset)
+
+    rc, envelope = run_cli(
+        ["--repo-root", root, "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+
+    model = "dex_mutation_probe"
+    edits_file = tmp_path / "edits.json"
+    edits_file.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": f"models/staging/{model}.sql",
+                        "kind": "model_sql",
+                        "content": (
+                            "select id, amount from unnest([\n"
+                            "  struct(1 as id, 10 as amount),\n"
+                            "  struct(2 as id, 200 as amount)\n"
+                            "]) where amount > 5\n"
+                        ),
+                    },
+                    {
+                        "path": "models/staging/schema.yml",
+                        "kind": "schema_yml",
+                        "content": (
+                            "version: 2\n"
+                            "models:\n"
+                            f"  - name: {model}\n"
+                            "    columns:\n"
+                            "      - name: id\n"
+                            "        data_tests: [not_null, unique]\n"
+                        ),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, planned = run_cli(
+        [
+            "--repo-root",
+            root,
+            "transform",
+            "plan",
+            "mutation probe",
+            "--edits-file",
+            str(edits_file),
+        ],
+        capsys,
+    )
+    assert rc == 0, planned
+    rc, applied = run_cli(["--repo-root", root, "transform", "apply"], capsys)
+    assert rc == 0, applied
+
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=bq_project)
+    try:
+        before = {
+            t.table_id for t in client.list_tables(f"{bq_project}.{bq_scratch_dataset}")
+        }
+
+        # Unconfirmed: one estimate for the whole batch, and nothing has run.
+        rc, unconfirmed = run_cli(
+            ["--repo-root", root, "transform", "test", "--mutate", model], capsys
+        )
+        assert unconfirmed["status"] == "needs_confirmation", unconfirmed
+        assert unconfirmed["cost"]["estimate"] is not None
+        per_mutant = unconfirmed["data"].get("per_table_bytes") or {}
+        assert "(baseline)" in per_mutant, per_mutant
+
+        rc, measured = run_cli(
+            [
+                "--repo-root",
+                root,
+                "transform",
+                "test",
+                "--mutate",
+                model,
+                "--max-mutants",
+                "2",
+                "--confirm",
+                "--budget",
+                str(MAX_BYTES),
+            ],
+            capsys,
+        )
+        assert rc == 0, measured
+        assert measured["status"] == "ok"
+        data = measured["data"]
+        assert data["counts"]["generated"] == 2
+        assert data["runs"] == 3, data["runs"]
+        assert data["baseline"]["tests"], data["baseline"]
+        assert data["spend"]["bytes_billed"] is not None
+
+        # Ephemeral mutants materialize nothing, so the dataset is unchanged.
+        after = {
+            t.table_id for t in client.list_tables(f"{bq_project}.{bq_scratch_dataset}")
+        }
+        assert after == before
+
+        client.delete_table(
+            f"{bq_project}.{bq_scratch_dataset}.{model}", not_found_ok=True
+        )
+    finally:
+        client.close()

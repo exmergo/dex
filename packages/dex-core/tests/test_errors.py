@@ -104,6 +104,7 @@ INTERNAL_REFUSALS = {
     "DevTargetError",
     "EditValidationError",
     "InitError",
+    "MutationError",
     "PlacementRefusedError",
     "ProdTargetRefusedError",
     "PropagationRefusedError",

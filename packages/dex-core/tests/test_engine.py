@@ -102,7 +102,8 @@ def test_methods_return_domain_objects_never_envelopes(duckdb_file: Path):
 
 
 #: Subcommands that are not engine methods, each for a reason the reader can
-#: check. `test` is `transform test --scaffold`, reached as `test_scaffold`;
+#: check. `test` carries two modes and only one of them is a method: `--mutate`
+#: is `test_mutations`, while `--scaffold` is reached as `test_scaffold`.
 #: `semantic *` is spelled `semantic_*`; `demo` writes a warehouse and is not a
 #: command a library caller drives. Everything else must have a method.
 _NOT_ENGINE_METHODS = {
