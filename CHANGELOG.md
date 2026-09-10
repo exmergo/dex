@@ -9,6 +9,38 @@ tag releases both in lockstep, so entries below are keyed by the engine version.
 
 ## [Unreleased]
 
+### Added
+
+- **The file-exploration contract, with no command yet** ([#450]). A new
+  `exmergo_dex_core.files` package defines how a document collection (a BigQuery
+  object table, a Snowflake directory table, a Databricks volume or manifest) and
+  the processing results already materialized about it will be read. It holds:
+  - the fixed vocabularies: document families, format buckets, processing
+    statuses, and limitation codes
+  - optional connector protocols
+  - the request types
+  - a capability model
+  - the aggregate result types the coming `explore files` commands return
+
+  The protocols sit beside the warehouse adapter rather than inside it, and they
+  are tiered: metadata aggregation, then result assessment, with collection
+  discovery as its own optional capability. A connector that implements none of
+  them reports each capability unavailable with a named reason, and no shipped
+  connector implements one yet.
+
+  The result types are built so that they cannot carry document content:
+  - every field is a strict count, a fixed category, a timestamp, or a relation
+    name that refuses anything shaped like a path or a URL
+  - unknown keys are refused
+  - no field admits `None`, so an absent measurement is always an explicit
+    `{"reason": ...}` and never confused with an observed zero
+
+  Native document processing is reported unavailable with the specific reason:
+  no supported path offers a provider-enforced hard spend cap that dex can
+  verify. It has no settable field, so no configuration or confirmation can
+  report it available. Nothing is exported from the package root yet, and no
+  existing behavior changes.
+
 ## [1.12.2] - 2026-09-09
 
 ### Fixed

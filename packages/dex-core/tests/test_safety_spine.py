@@ -3405,6 +3405,73 @@ def test_no_payload_is_keyed_by_a_warehouse_object_name(capsys):
     assert capsys.readouterr().out
 
 
+_FILE_CANARIES = [
+    "gs://example-bucket/2026/CANARY-FILENAME-personal.pdf",
+    "https://storage.googleapis.com/b/o.pdf?X-Goog-Signature=abc&X-Goog-Expires=600",
+    "CANARY-DOC-TEXT Total due 54.00",
+    "INVALID_ARGUMENT: CANARY-PROVIDER-ERROR could not read 'Jane Doe'",
+]
+
+
+def test_file_aggregates_cannot_carry_document_content():
+    """File exploration returns aggregates only, and the types enforce it rather
+    than trusting every caller to comply: the one string type refuses anything
+    shaped like a path, a URL, extracted text, or a provider's error body, and no
+    aggregate accepts a key it does not declare. ``tests/files/
+    test_file_results.py`` walks every field of every aggregate; this is the
+    spine's statement of the rule."""
+
+    from pydantic import TypeAdapter, ValidationError
+
+    from exmergo_dex_core.files.results import CollectionSummary, RelationName
+
+    names = TypeAdapter(RelationName)
+    summary = {
+        "collection": "my-project.docs.files_obj",
+        "kind": "bigquery_object_table",
+        "file_count": 0,
+        "metadata_refreshed_at": {"reason": "not_reported"},
+    }
+    CollectionSummary.model_validate(summary)
+    for canary in _FILE_CANARIES:
+        with pytest.raises(ValidationError):
+            names.validate_python(canary)
+        with pytest.raises(ValidationError):
+            CollectionSummary.model_validate({**summary, "collection": canary})
+        for key in ("uri", "path", "text", "error", "status_detail"):
+            with pytest.raises(ValidationError):
+                CollectionSummary.model_validate({**summary, key: canary})
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        "duckdb",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "postgres",
+        "redshift",
+        "clickhouse",
+    ],
+)
+def test_no_connector_can_report_native_document_processing(connector):
+    """New document-processing charges need a provider-enforced hard spend cap
+    dex can verify, and none exists, so native processing is unavailable on every
+    connector and cannot be made available by construction or deserialization."""
+
+    from exmergo_dex_core.adapters import _adapter_class
+    from exmergo_dex_core.files.contract import NativeProcessing, file_capabilities
+
+    capabilities = file_capabilities(object.__new__(_adapter_class(connector)))
+    assert capabilities.native_processing.available is False
+    assert capabilities.payload()["native_processing"]["available"] is False
+    with pytest.raises(ValueError):
+        NativeProcessing(available=True)
+    with pytest.raises(ValueError):
+        NativeProcessing.model_validate({"available": True})
+
+
 # --- BigQuery: the billed connector exercises every family ---------------------
 #
 # These run against the fake client (tests/fakes/bigquery.py): deterministic,
