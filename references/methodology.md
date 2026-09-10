@@ -204,6 +204,36 @@ looks: a warehouse keeps no row count for a view, and a view is dbt's default
 materialization, so on a metered connector the models this can judge for free and
 the ones it cannot are split down exactly that line.
 
+## Test strength: measuring the tests rather than the data
+
+Everything above measures data. A dbt project also carries assertions about that
+data, and those assertions are themselves unmeasured: a suite of twenty tests
+that all pass proves the tests ran, not that any of them would object if the
+model were wrong. The two are routinely confused, because the only number the
+ecosystem reports is a count, and a count cannot distinguish a `not_null` on a
+surrogate key from a unit test pinning the arithmetic.
+
+The measurement that does distinguish them is to break the model deliberately and
+see whether anything complains. `transform test --mutate` plants one defect at a
+time, drawn from the same taxonomy the rest of this document is organised around:
+a boundary comparison that now includes or excludes its edge, a filter dropped or
+inverted, an inner join where a left join was meant, a missing `CASE` branch, an
+inverted ratio, a window frame off by one, a `sum` reporting a `max`. Each is
+built and the model's own tests are run against it. A defect nothing catches is
+reported as a gap in the suite, described as the defect rather than as a diff,
+because the reader's next step is to write a test and not to reread SQL they
+already know.
+
+Three properties keep the result honest. Every verdict is relative to the tests
+that passed against the *unmutated* model, so a suite measured against its own
+already-failing tests cannot come back looking clean. A mutant the warehouse
+refuses outright is reported separately from one the tests caught, since a build
+would have failed on it anyway and counting it would flatter the suite. And a
+mutant that survives is a statement about detection, not about correctness: some
+survivors are defects the current data cannot distinguish at all, such as an
+inner join where every key happens to match, which is exactly why the finding
+names the test that would catch it rather than claiming the model is wrong.
+
 ## The draft map: composing and persisting
 
 `explore map` composes the above into the `.dex/` cache (never the source of
