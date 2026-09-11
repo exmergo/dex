@@ -715,7 +715,7 @@ def cmd_grain(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
 def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     """Is the project correct right now, with no baseline required (#224).
 
-    Three finding classes. Build-status gaps (#225) read the compiled manifest
+    Four finding classes. Build-status gaps (#225) read the compiled manifest
     and the last run's ``run_results.json`` (failed nodes, nodes skipped by a
     failed parent), plus models the project declares that have no relation in
     the warehouse. Column contract (#230) compares a built relation's actual
@@ -723,7 +723,10 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
     check where a type is declared. Row population (#226) reads each model's
     compiled SQL for the relation it is built from and compares the two row
     counts, reporting a model that lost rows with nothing in its SQL to
-    account for it, or one that fanned out on a join.
+    account for it, or one that fanned out on a join. Grain (#229) checks that
+    a model's intended grain -- a declared unique test, a semantic model's
+    declared primary entity, or (absent either) a free naming guess -- still
+    holds one row per key in the built relation.
 
     Free wherever the answer is free, which is most of it: the manifest read
     touches no connection, the relation check, the column contract, and the
@@ -751,6 +754,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "build_status": str(exc),
                 "no_relation": str(exc),
                 "column_contract": str(exc),
+                "grain": str(exc),
                 "compile": str(exc),
             },
             warnings=[f"maintain verify needs a dbt project: {exc}"],
@@ -768,11 +772,12 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
                 "no_relation": reason,
                 "row_population": reason,
                 "column_contract": reason,
+                "grain": reason,
             },
             warnings=[
-                "build-status, no-relation, row-population and column-contract "
-                "findings suppressed: the project does not compile, so its "
-                "manifest cannot be trusted"
+                "build-status, no-relation, row-population, column-contract "
+                "and grain findings suppressed: the project does not compile, "
+                "so its manifest cannot be trusted"
             ],
         )
         return result
@@ -802,6 +807,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
         suppressed["no_relation"] = "no dbt project found"
         suppressed["row_population"] = "no dbt project found"
         suppressed["column_contract"] = "no dbt project found"
+        suppressed["grain"] = "no dbt project found"
     else:
         model_relations = {
             name: relation
@@ -814,6 +820,7 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             suppressed["no_relation"] = f"warehouse unreachable: {exc}"
             suppressed["row_population"] = f"warehouse unreachable: {exc}"
             suppressed["column_contract"] = f"warehouse unreachable: {exc}"
+            suppressed["grain"] = f"warehouse unreachable: {exc}"
         else:
             cost = command_args.preflight_cost(adapter)
             live = adapter.list_objects()
@@ -830,6 +837,13 @@ def verify(engine: DexEngine, objects: list[str] | None = None) -> VerifyResult:
             warnings.extend(column_warnings)
             if column_reason is not None:
                 suppressed["column_contract"] = column_reason
+            grain_findings, grain_warnings, grain_reason = _grain_contract(
+                adapter, definitions, model_relations, live, scope=wanted
+            )
+            findings.extend(grain_findings)
+            warnings.extend(grain_warnings)
+            if grain_reason is not None:
+                suppressed["grain"] = grain_reason
             row_findings, row_warnings, row_reason, offer = _row_population(
                 engine, adapter, project_dir, live
             )
@@ -893,6 +907,37 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
         undeclared,
     )
     return findings, plan_notes + finding_notes, None
+
+
+def _grain_contract(adapter, definitions, model_relations, live, *, scope=None):
+    """The grain half of `maintain verify`, end to end (#229).
+
+    No cost decision of its own, unlike row population beside it: a declared
+    grain's exact check and the naming heuristic's escalation are both
+    bounded-and-deliberate by the adapter's own contract (see
+    ``verify.py``'s module docstring), not a scan this command doses out with
+    a handshake the way row population's ``COUNT(*)`` is. Always attempts
+    every selected model, declared or not, so there is no "nothing to check"
+    reason to report the way column contract has for a project with no
+    ``columns:`` blocks at all -- a model's grain is either declared,
+    guessable by name, or reported unknown, and all three are `grain_
+    findings`'s own job to sort out.
+    """
+
+    scoped_models = (
+        {name for name in model_relations if name.lower() in scope}
+        if scope is not None
+        else set(model_relations)
+    )
+    declared = verify_mod.grain_plan(definitions, scope=scope)
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        declared,
+        model_relations,
+        [o.identifier for o in live],
+        scoped_models,
+    )
+    return findings, notes, None
 
 
 def _row_population(engine: DexEngine, adapter, project_dir, live):
